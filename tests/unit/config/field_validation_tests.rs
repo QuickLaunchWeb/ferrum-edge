@@ -662,6 +662,38 @@ fn test_upstream_passive_health_check_validated() {
 }
 
 #[test]
+fn test_upstream_passive_health_threshold_above_recent_failures_cap_rejected() {
+    use ferrum_edge::config::types::MAX_RECENT_FAILURES_PER_TARGET;
+
+    let mut upstream = make_upstream("test");
+    upstream.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck {
+            unhealthy_threshold: MAX_RECENT_FAILURES_PER_TARGET as u32 + 1,
+            ..Default::default()
+        }),
+    });
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("health_checks.passive.unhealthy_threshold")),
+        "expected rejection when threshold exceeds recent-failures cap, got: {:?}",
+        errs
+    );
+
+    // Exactly at the cap should be accepted
+    let mut upstream2 = make_upstream("test2");
+    upstream2.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck {
+            unhealthy_threshold: MAX_RECENT_FAILURES_PER_TARGET as u32,
+            ..Default::default()
+        }),
+    });
+    assert!(upstream2.validate_fields().is_ok());
+}
+
+#[test]
 fn test_upstream_service_discovery_dns_sd_validated() {
     let mut upstream = make_upstream("test");
     upstream.service_discovery = Some(ServiceDiscoveryConfig {
@@ -1572,6 +1604,44 @@ fn test_validate_backend_ip_policy_public_allows_public_proxy() {
     let config = GatewayConfig {
         proxies: vec![Proxy {
             backend_host: "8.8.8.8".to_string(),
+            ..proxy
+        }],
+        ..Default::default()
+    };
+    assert!(
+        config
+            .validate_all_fields_with_ip_policy(30, &BackendAllowIps::Public)
+            .is_ok()
+    );
+}
+
+#[test]
+fn test_validate_backend_ip_policy_public_denies_private_dns_override() {
+    let proxy = make_proxy("test", "/api");
+    let config = GatewayConfig {
+        proxies: vec![Proxy {
+            backend_host: "example.com".to_string(),
+            dns_override: Some("169.254.169.254".to_string()),
+            ..proxy
+        }],
+        ..Default::default()
+    };
+    let result = config.validate_all_fields_with_ip_policy(30, &BackendAllowIps::Public);
+    assert!(result.is_err());
+    let errs = result.unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("dns_override") && e.contains("169.254.169.254"))
+    );
+}
+
+#[test]
+fn test_validate_backend_ip_policy_public_allows_public_dns_override() {
+    let proxy = make_proxy("test", "/api");
+    let config = GatewayConfig {
+        proxies: vec![Proxy {
+            backend_host: "example.com".to_string(),
+            dns_override: Some("8.8.8.8".to_string()),
             ..proxy
         }],
         ..Default::default()

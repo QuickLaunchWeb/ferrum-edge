@@ -78,26 +78,112 @@ impl std::fmt::Display for BackendAllowIps {
 /// Check whether an IP address falls within private/reserved ranges.
 ///
 /// Private/reserved ranges (denied in `Public` mode, allowed in `Private` mode):
-/// - IPv4: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16,
-///   169.254.0.0/16 (link-local / cloud metadata), 0.0.0.0/8, 100.64.0.0/10 (CGNAT)
-/// - IPv6: ::1, ::, fe80::/10 (link-local), fd00::/8 (unique local)
+/// - IPv4: loopback, RFC1918, link-local / cloud metadata, 0.0.0.0/8,
+///   CGNAT, documentation, benchmarking, multicast, and reserved ranges.
+/// - IPv6: loopback, unspecified, IPv4-mapped/compatible private/reserved
+///   addresses, NAT64 private/reserved embeddings, discard-only,
+///   documentation, IETF special-purpose, deprecated 6to4, ULA, link-local,
+///   and multicast ranges.
 pub fn is_private_ip(addr: &std::net::IpAddr) -> bool {
     match addr {
         std::net::IpAddr::V4(ip) => {
+            let [a, b, c, d] = ip.octets();
             ip.is_loopback()                // 127.0.0.0/8
             || ip.is_private()              // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
             || ip.is_link_local()           // 169.254.0.0/16
             || ip.is_unspecified()          // 0.0.0.0
-            || ip.octets()[0] == 0          // 0.0.0.0/8 (full range)
-            || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 64) // 100.64.0.0/10 (CGNAT)
+            || a == 0                       // 0.0.0.0/8 (full range)
+            || (a == 100 && (b & 0xC0) == 64) // 100.64.0.0/10 (CGNAT)
+            || is_non_global_ietf_protocol_assignment_v4(a, b, c, d)
+            || (a == 192 && b == 0 && c == 2) // 192.0.2.0/24 (TEST-NET-1)
+            || (a == 192 && b == 88 && c == 99) // 192.88.99.0/24 (deprecated 6to4 relay)
+            || (a == 198 && (b == 18 || b == 19)) // 198.18.0.0/15 (benchmarking)
+            || (a == 198 && b == 51 && c == 100) // 198.51.100.0/24 (TEST-NET-2)
+            || (a == 203 && b == 0 && c == 113) // 203.0.113.0/24 (TEST-NET-3)
+            || (224..=239).contains(&a)     // 224.0.0.0/4 (multicast)
+            || a >= 240 // 240.0.0.0/4 + 255.255.255.255
         }
         std::net::IpAddr::V6(ip) => {
-            ip.is_loopback()                                // ::1
-            || ip.is_unspecified()                          // ::
-            || (ip.segments()[0] & 0xffc0) == 0xfe80        // fe80::/10 (link-local)
-            || (ip.segments()[0] & 0xff00) == 0xfd00 // fd00::/8 (unique local)
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_private_ip(&std::net::IpAddr::V4(mapped));
+            }
+            if let Some(compatible) = ip.to_ipv4() {
+                return is_private_ip(&std::net::IpAddr::V4(compatible));
+            }
+
+            let segments = ip.segments();
+            ip.is_loopback()                            // ::1
+            || ip.is_unspecified()                      // ::
+            || is_well_known_nat64_private_ip(segments) // 64:ff9b::/96 with private/reserved embedded IPv4
+            || (segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001) // 64:ff9b:1::/48
+            || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0) // 100::/64 (discard-only)
+            || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 1) // 100:0:0:1::/64 (dummy prefix)
+            || is_non_global_ietf_protocol_assignment_v6(segments)
+            || (segments[0] == 0x2001 && segments[1] == 0x0db8) // 2001:db8::/32 (documentation)
+            || segments[0] == 0x2002                  // 2002::/16 (deprecated 6to4)
+            || (segments[0] & 0xfe00) == 0xfc00        // fc00::/7 (unique local)
+            || (segments[0] & 0xffc0) == 0xfe80        // fe80::/10 (link-local)
+            || (segments[0] & 0xff00) == 0xff00 // ff00::/8 (multicast)
         }
     }
+}
+
+fn is_non_global_ietf_protocol_assignment_v4(a: u8, b: u8, c: u8, d: u8) -> bool {
+    if !(a == 192 && b == 0 && c == 0) {
+        return false;
+    }
+
+    // 192.0.0.9/32 and 192.0.0.10/32 are globally reachable anycast
+    // assignments inside the otherwise non-global 192.0.0.0/24 parent.
+    d != 9 && d != 10
+}
+
+fn is_non_global_ietf_protocol_assignment_v6(segments: [u16; 8]) -> bool {
+    if !(segments[0] == 0x2001 && segments[1] < 0x0200) {
+        return false;
+    }
+
+    // Allow the globally reachable more-specific assignments in 2001::/23.
+    if segments[1] == 0x0001
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0
+        && segments[6] == 0
+        && matches!(segments[7], 1..=3)
+    {
+        return false;
+    }
+
+    if segments[1] == 0x0003 {
+        return false;
+    }
+
+    if segments[1] == 0x0004 && segments[2] == 0x0112 {
+        return false;
+    }
+
+    if (segments[1] & 0xfff0) == 0x0020 || (segments[1] & 0xfff0) == 0x0030 {
+        return false;
+    }
+
+    true
+}
+
+fn is_well_known_nat64_private_ip(segments: [u16; 8]) -> bool {
+    if segments[0] != 0x0064
+        || segments[1] != 0xff9b
+        || segments[2] != 0
+        || segments[3] != 0
+        || segments[4] != 0
+        || segments[5] != 0
+    {
+        return false;
+    }
+
+    let [a, b] = segments[6].to_be_bytes();
+    let [c, d] = segments[7].to_be_bytes();
+    is_private_ip(&std::net::IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d)))
 }
 
 /// Check whether an IP is allowed under the given backend IP policy.
@@ -274,6 +360,13 @@ pub struct EnvConfig {
     /// the operation name and elapsed time. Default: disabled (None).
     pub db_slow_query_threshold_ms: Option<u64>,
 
+    /// Maximum rows fetched per query during full config loading from SQL
+    /// databases. Prevents unbounded `SELECT *` from hitting statement
+    /// timeouts or causing memory spikes at scale (100k+ rows). Raw `AnyRow`
+    /// buffers are freed between chunks, so peak memory is proportional to
+    /// this value, not table size. Default: 10000. Range: 100..=100000.
+    pub db_full_load_page_size: u64,
+
     // Database connection pool tuning
     /// Maximum number of connections in the database pool. Default: 10.
     /// Increase for CP mode with many DPs or high admin API concurrency.
@@ -300,7 +393,8 @@ pub struct EnvConfig {
     /// TCP timeout, which can be 60–120s).
     pub db_pool_connect_timeout_seconds: u64,
     /// Maximum execution time (seconds) for any single SQL statement. Default:
-    /// 30. Set via `SET statement_timeout` (PostgreSQL) or `SET SESSION
+    /// 30, max 3600 (1 hour). Values above 3600 are clamped at parse time with
+    /// a warning. Set via `SET statement_timeout` (PostgreSQL) or `SET SESSION
     /// max_execution_time` (MySQL) on every new connection. 0 = disabled.
     /// Ignored for SQLite (not supported).
     pub db_pool_statement_timeout_seconds: u64,
@@ -324,6 +418,11 @@ pub struct EnvConfig {
     // CP/DP
     pub cp_grpc_listen_addr: Option<String>,
     pub cp_dp_grpc_jwt_secret: Option<String>,
+    /// Expected `iss` claim on CP/DP gRPC JWTs. The CP rejects any token whose
+    /// `iss` claim does not exactly match this value, and the DP mints tokens
+    /// with this value. Defaults to "ferrum-edge-cp-dp". Operators rotating
+    /// the issuer must update CP and all DPs together.
+    pub cp_dp_grpc_jwt_issuer: String,
     pub dp_cp_grpc_url: Option<String>,
     /// Comma-separated, priority-ordered list of CP gRPC URLs for DP failover.
     /// When set, takes precedence over `dp_cp_grpc_url`. The DP connects to the
@@ -416,6 +515,10 @@ pub struct EnvConfig {
     /// by closing connections that take too long to send complete request headers.
     /// 0 = disabled (no timeout). Default: 10 seconds.
     pub http_header_read_timeout_seconds: u64,
+    /// Frontend TLS handshake timeout in seconds. Applies before HTTP header
+    /// parsing, so slow TLS handshakes cannot hold connection slots forever.
+    /// 0 = disabled (no timeout). Default: 10 seconds.
+    pub frontend_tls_handshake_timeout_seconds: u64,
 
     // DNS
     pub dns_overrides: HashMap<String, String>,
@@ -455,6 +558,10 @@ pub struct EnvConfig {
     pub dns_num_concurrent_reqs: usize,
     /// Maximum in-flight queries per multiplexed connection. Default: 512.
     pub dns_max_active_requests: usize,
+    /// Maximum number of concurrent stale-while-revalidate background refresh
+    /// tasks system-wide. Prevents unbounded task spawning under DNS storms.
+    /// Default: 64.
+    pub dns_max_concurrent_refreshes: usize,
 
     /// Path to a PEM file containing trusted CA certificates for outbound TLS verification.
     /// Used by backend proxy connections, service discovery, and plugin HTTP calls.
@@ -716,9 +823,11 @@ pub struct EnvConfig {
     /// When true, add a Forwarded header (RFC 7239) alongside X-Forwarded-* headers.
     pub add_forwarded_header: bool,
     /// Header to use as the authoritative source of client IP. When set, this
-    /// header is checked first (e.g., "CF-Connecting-IP" for Cloudflare, or
-    /// "X-Real-IP" for nginx). If the header is absent or the direct connection
-    /// is not from a trusted proxy, falls back to the X-Forwarded-For walk.
+    /// header is checked first (e.g., "CF-Connecting-IP" for Cloudflare,
+    /// "X-Real-IP" for nginx, or CloudFront's "CloudFront-Viewer-Address"
+    /// ip:source-port value). If the configured header is absent, falls back to
+    /// the X-Forwarded-For walk. If it is present but rejected, the socket IP
+    /// remains the source of truth.
     pub real_ip_header: Option<String>,
 
     /// HMAC-SHA256 server secret for the basic_auth plugin. Password hashes
@@ -770,6 +879,22 @@ pub struct EnvConfig {
     /// Default: false.
     pub migrate_dry_run: bool,
 
+    /// When true, automatically apply pending custom-plugin database
+    /// migrations at gateway startup in `database` and `cp` modes.
+    ///
+    /// Default: `false` (opt-in). Most operators expect schema changes to
+    /// only run via an explicit `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up`
+    /// step, so the gateway never silently mutates the database. When this
+    /// flag is `false` and pending plugin migrations exist, the gateway
+    /// emits a `warn!` listing them so the operator knows to run the
+    /// migration command before serving traffic that depends on the new
+    /// schema.
+    ///
+    /// Set to `true` for environments where a single binary upgrade should
+    /// also apply bundled custom-plugin schema changes (e.g. embedded
+    /// SQLite deployments where the binary owns the database).
+    pub auto_apply_plugin_migrations: bool,
+
     // ── Runtime & listener tuning ────────────────────────────────────────
     /// Number of tokio worker threads. Default: number of CPU cores.
     pub worker_threads: Option<usize>,
@@ -798,6 +923,19 @@ pub struct EnvConfig {
     /// target churn in dynamic environments (e.g., Kubernetes pod cycling).
     /// Default: 10000.
     pub circuit_breaker_cache_max_entries: usize,
+    /// DashMap shard count for hot pool/cache maps (HTTP/H2/gRPC connection
+    /// pools, DNS cache, per-IP request counters, router prefix/regex
+    /// caches). DashMap defaults to `4 * num_cpus`, which is fine for small
+    /// maps but starves on write contention at high cardinality (1K+ unique
+    /// pool keys, distinct DNS hosts, distinct client IPs). Higher shard
+    /// counts give concurrent inserts more independent locks.
+    ///
+    /// Resolution: `0` (default) auto-derives `next_power_of_two(max(64,
+    /// num_cpus * 16))` — 64 on small dev hosts, 256 on a 16-core box,
+    /// 1024 on a 64-core box. Any positive value is rounded up to the
+    /// next power of two (DashMap's API requires power-of-two shard counts).
+    /// Default: 0.
+    pub pool_shard_amount: usize,
     /// Maximum entries in the HTTP status code counters map. Common codes
     /// (200, 404, 500, etc.) are pre-populated at startup. Rare/exotic codes
     /// create entries on first occurrence up to this cap. Prevents unbounded
@@ -968,6 +1106,7 @@ impl Default for EnvConfig {
             db_failover_urls: Vec::new(),
             db_read_replica_url: None,
             db_slow_query_threshold_ms: None,
+            db_full_load_page_size: 10_000,
             db_pool_max_connections: 10,
             db_pool_min_connections: 1,
             db_pool_acquire_timeout_seconds: 30,
@@ -983,6 +1122,7 @@ impl Default for EnvConfig {
             mongo_connect_timeout_seconds: 10,
             cp_grpc_listen_addr: None,
             cp_dp_grpc_jwt_secret: None,
+            cp_dp_grpc_jwt_issuer: "ferrum-edge-cp-dp".to_string(),
             dp_cp_grpc_url: None,
             dp_cp_grpc_urls: Vec::new(),
             dp_cp_failover_primary_retry_secs: 300,
@@ -1009,6 +1149,7 @@ impl Default for EnvConfig {
             websocket_tunnel_mode: false,
             max_credentials_per_type: 2,
             http_header_read_timeout_seconds: 10,
+            frontend_tls_handshake_timeout_seconds: 10,
             dns_overrides: HashMap::new(),
             dns_resolver_address: None,
             dns_resolver_hosts_file: None,
@@ -1025,6 +1166,7 @@ impl Default for EnvConfig {
             dns_try_tcp_on_error: true,
             dns_num_concurrent_reqs: 3,
             dns_max_active_requests: 512,
+            dns_max_concurrent_refreshes: 64,
             tls_ca_bundle_path: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
@@ -1042,13 +1184,13 @@ impl Default for EnvConfig {
             enable_http3: false,
             http3_idle_timeout: 30,
             http3_max_streams: 1000,
-            http3_stream_receive_window: 8_388_608, // 8 MiB
-            http3_receive_window: 33_554_432,       // 32 MiB
-            http3_send_window: 8_388_608,           // 8 MiB
+            http3_stream_receive_window: crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+            http3_receive_window: crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
+            http3_send_window: crate::http3::config::H3_SEND_WINDOW_DEFAULT,
             http3_connections_per_backend: 4,
             http3_pool_idle_timeout_seconds: 120,
-            http3_coalesce_min_bytes: 32_768,
-            http3_coalesce_max_bytes: 32_768,
+            http3_coalesce_min_bytes: crate::http3::config::H3_COALESCE_MAX_DEFAULT,
+            http3_coalesce_max_bytes: crate::http3::config::H3_COALESCE_MAX_DEFAULT,
             http3_flush_interval_micros: 200,
             http3_request_body_channel_capacity: 32,
             h3_request_body_drain_ms: 50,
@@ -1095,6 +1237,7 @@ impl Default for EnvConfig {
             admin_spec_max_body_size_mib: 25,
             migrate_action: "up".into(),
             migrate_dry_run: false,
+            auto_apply_plugin_migrations: false,
             worker_threads: None,
             blocking_threads: None,
             max_connections: 100_000,
@@ -1102,6 +1245,7 @@ impl Default for EnvConfig {
             max_concurrent_requests_per_ip: 0,
             per_ip_cleanup_interval_seconds: 60,
             circuit_breaker_cache_max_entries: 10_000,
+            pool_shard_amount: 0,
             status_counts_max_entries: 200,
             tcp_listen_backlog: 2048,
             accept_threads: 0,
@@ -1205,6 +1349,7 @@ impl EnvConfig {
             db_config_backup_path: Option<String> = "FERRUM_DB_CONFIG_BACKUP_PATH";
             db_read_replica_url: Option<String> = "FERRUM_DB_READ_REPLICA_URL";
             db_slow_query_threshold_ms: Option<u64> = "FERRUM_DB_SLOW_QUERY_THRESHOLD_MS";
+            db_full_load_page_size: u64 = "FERRUM_DB_FULL_LOAD_PAGE_SIZE" => 10_000u64, clamp(100u64, 100_000u64);
             db_pool_max_connections: u32 = "FERRUM_DB_POOL_MAX_CONNECTIONS" => 10u32, max(1u32);
             db_pool_min_connections: u32 = "FERRUM_DB_POOL_MIN_CONNECTIONS" => 1u32;
             db_pool_acquire_timeout_seconds: u64 = "FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS" => 30u64;
@@ -1220,11 +1365,28 @@ impl EnvConfig {
             mongo_connect_timeout_seconds: u64 = "FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS" => 10u64;
         }
 
+        // Clamp statement timeout at parse time so the warning fires once at
+        // startup instead of on every new database connection.
+        const MAX_STATEMENT_TIMEOUT_SECONDS: u64 = 3600;
+        let db_pool_statement_timeout_seconds =
+            if db_pool_statement_timeout_seconds > MAX_STATEMENT_TIMEOUT_SECONDS {
+                tracing::warn!(
+                    configured = db_pool_statement_timeout_seconds,
+                    clamped = MAX_STATEMENT_TIMEOUT_SECONDS,
+                    max = MAX_STATEMENT_TIMEOUT_SECONDS,
+                    "FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS exceeds maximum, clamped"
+                );
+                MAX_STATEMENT_TIMEOUT_SECONDS
+            } else {
+                db_pool_statement_timeout_seconds
+            };
+
         env_config! {
             conf = conf, mode = &mode;
             [cp_dp]
             cp_dp_grpc_jwt_secret: Option<String> = "FERRUM_CP_DP_GRPC_JWT_SECRET"
                 => required_for(["cp", "dp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
+            cp_dp_grpc_jwt_issuer: String = "FERRUM_CP_DP_GRPC_JWT_ISSUER" => "ferrum-edge-cp-dp".to_string();
             dp_cp_grpc_url: Option<String> = "FERRUM_DP_CP_GRPC_URL";
             dp_cp_grpc_urls: Vec<String> = "FERRUM_DP_CP_GRPC_URLS" => Vec::new();
             dp_cp_failover_primary_retry_secs: u64 = "FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS" => 300u64;
@@ -1256,6 +1418,7 @@ impl EnvConfig {
             websocket_tunnel_mode: bool = "FERRUM_WEBSOCKET_TUNNEL_MODE" => false;
             max_credentials_per_type: usize = "FERRUM_MAX_CREDENTIALS_PER_TYPE" => 2usize;
             http_header_read_timeout_seconds: u64 = "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS" => 10u64;
+            frontend_tls_handshake_timeout_seconds: u64 = "FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS" => 10u64;
         }
 
         env_config! {
@@ -1276,6 +1439,7 @@ impl EnvConfig {
             dns_try_tcp_on_error: bool = "FERRUM_DNS_TRY_TCP_ON_ERROR" => true;
             dns_num_concurrent_reqs: usize = "FERRUM_DNS_NUM_CONCURRENT_REQS" => 3usize, clamp(1usize, 10usize);
             dns_max_active_requests: usize = "FERRUM_DNS_MAX_ACTIVE_REQUESTS" => 512usize, clamp(1usize, 4096usize);
+            dns_max_concurrent_refreshes: usize = "FERRUM_DNS_MAX_CONCURRENT_REFRESHES" => 64usize, clamp(1usize, 1000usize);
         }
 
         env_config! {
@@ -1298,9 +1462,9 @@ impl EnvConfig {
             enable_http3: bool = "FERRUM_ENABLE_HTTP3" => false;
             http3_idle_timeout: u64 = "FERRUM_HTTP3_IDLE_TIMEOUT" => 30u64;
             http3_max_streams: u32 = "FERRUM_HTTP3_MAX_STREAMS" => 1000u32;
-            http3_stream_receive_window: u64 = "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW" => 8_388_608u64;
-            http3_receive_window: u64 = "FERRUM_HTTP3_RECEIVE_WINDOW" => 33_554_432u64;
-            http3_send_window: u64 = "FERRUM_HTTP3_SEND_WINDOW" => 8_388_608u64;
+            http3_stream_receive_window: u64 = "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW" => crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT;
+            http3_receive_window: u64 = "FERRUM_HTTP3_RECEIVE_WINDOW" => crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT;
+            http3_send_window: u64 = "FERRUM_HTTP3_SEND_WINDOW" => crate::http3::config::H3_SEND_WINDOW_DEFAULT;
             http3_connections_per_backend: usize = "FERRUM_HTTP3_CONNECTIONS_PER_BACKEND" => 4usize, max(1usize);
             http3_pool_idle_timeout_seconds: u64 = "FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS" => 120u64;
             http3_coalesce_max_bytes: usize = "FERRUM_HTTP3_COALESCE_MAX_BYTES" => crate::http3::config::H3_COALESCE_MAX_DEFAULT, clamp(crate::http3::config::H3_COALESCE_MIN_FLOOR, crate::http3::config::H3_COALESCE_MAX_CAP);
@@ -1353,6 +1517,7 @@ impl EnvConfig {
             admin_spec_max_body_size_mib: usize = "FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB" => 25usize;
             migrate_action: String = "FERRUM_MIGRATE_ACTION" => "up".to_string(), lowercase();
             migrate_dry_run: bool = "FERRUM_MIGRATE_DRY_RUN" => false;
+            auto_apply_plugin_migrations: bool = "FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS" => false;
         }
 
         env_config! {
@@ -1363,6 +1528,7 @@ impl EnvConfig {
             max_concurrent_requests_per_ip: u64 = "FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP" => 0u64;
             per_ip_cleanup_interval_seconds: u64 = "FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS" => 60u64;
             circuit_breaker_cache_max_entries: usize = "FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES" => 10_000usize;
+            pool_shard_amount: usize = "FERRUM_POOL_SHARD_AMOUNT" => 0usize;
             status_counts_max_entries: usize = "FERRUM_STATUS_COUNTS_MAX_ENTRIES" => 200usize;
             tcp_listen_backlog: u32 = "FERRUM_TCP_LISTEN_BACKLOG" => 2048u32, max(128u32);
             server_http2_max_concurrent_streams: u32 = "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS" => 1000u32, max(1u32);
@@ -1547,6 +1713,7 @@ impl EnvConfig {
             db_failover_urls,
             db_read_replica_url,
             db_slow_query_threshold_ms,
+            db_full_load_page_size,
             db_pool_max_connections,
             db_pool_min_connections,
             db_pool_acquire_timeout_seconds,
@@ -1562,6 +1729,7 @@ impl EnvConfig {
             mongo_connect_timeout_seconds,
             cp_grpc_listen_addr,
             cp_dp_grpc_jwt_secret,
+            cp_dp_grpc_jwt_issuer,
             dp_cp_grpc_url,
             dp_cp_grpc_urls,
             dp_cp_failover_primary_retry_secs,
@@ -1588,6 +1756,7 @@ impl EnvConfig {
             websocket_tunnel_mode,
             max_credentials_per_type,
             http_header_read_timeout_seconds,
+            frontend_tls_handshake_timeout_seconds,
             dns_overrides,
             dns_resolver_address,
             dns_resolver_hosts_file,
@@ -1604,6 +1773,7 @@ impl EnvConfig {
             dns_try_tcp_on_error,
             dns_num_concurrent_reqs,
             dns_max_active_requests,
+            dns_max_concurrent_refreshes,
             tls_ca_bundle_path,
             backend_tls_client_cert_path,
             backend_tls_client_key_path,
@@ -1674,6 +1844,7 @@ impl EnvConfig {
             admin_spec_max_body_size_mib,
             migrate_action,
             migrate_dry_run,
+            auto_apply_plugin_migrations,
             worker_threads,
             blocking_threads,
             max_connections,
@@ -1681,6 +1852,7 @@ impl EnvConfig {
             max_concurrent_requests_per_ip,
             per_ip_cleanup_interval_seconds,
             circuit_breaker_cache_max_entries,
+            pool_shard_amount,
             status_counts_max_entries,
             tcp_listen_backlog,
             accept_threads,
@@ -2166,6 +2338,47 @@ impl EnvConfig {
             ));
         }
 
+        // Overload threshold ordering: critical >= pressure for each pair.
+        //
+        // The RED probabilistic shedding ramp in src/overload.rs computes
+        //   probability = (ratio - pressure) / (critical - pressure) * SCALE
+        // When critical == pressure the divisor is 0 → 0/0 = NaN, and
+        // (NaN as u32) saturates to 0 in Rust — so the binary
+        // disable_keepalive flag fires at the pressure threshold while the
+        // RED ramp silently produces 0% drop probability. critical < pressure
+        // is even worse: a negative range yields a negative ratio that also
+        // saturates to 0 on the u32 cast. Reject both at startup so the
+        // disagreement can never reach the hot path.
+        for (pressure_name, pressure_val, critical_name, critical_val) in [
+            (
+                "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD",
+                self.overload_fd_pressure_threshold,
+                "FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD",
+                self.overload_fd_critical_threshold,
+            ),
+            (
+                "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD",
+                self.overload_conn_pressure_threshold,
+                "FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD",
+                self.overload_conn_critical_threshold,
+            ),
+            (
+                "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD",
+                self.overload_req_pressure_threshold,
+                "FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD",
+                self.overload_req_critical_threshold,
+            ),
+        ] {
+            if critical_val <= pressure_val {
+                return Err(format!(
+                    "{critical_name} ({critical_val:.2}) must be greater than {pressure_name} ({pressure_val:.2}). \
+                     The RED probabilistic shedding ramp divides by (critical - pressure); equal or inverted \
+                     thresholds produce NaN/saturated probabilities and cause silent disagreement between the \
+                     binary load-shedding flags and the smooth ramp."
+                ));
+            }
+        }
+
         // Non-fatal security warnings
         if self.tls_no_verify {
             eprintln!(
@@ -2184,5 +2397,83 @@ impl EnvConfig {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_mode_config() -> EnvConfig {
+        EnvConfig {
+            mode: OperatingMode::File,
+            file_config_path: Some("/tmp/dummy.yaml".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_accepts_default_overload_thresholds() {
+        let config = file_mode_config();
+        // Defaults: pressure 0.80/0.85/0.85 < critical 0.95/0.95/0.95.
+        config.validate().expect("default thresholds must validate");
+    }
+
+    #[test]
+    fn validate_rejects_overload_fd_pressure_above_critical() {
+        let mut config = file_mode_config();
+        config.overload_fd_pressure_threshold = 0.85;
+        config.overload_fd_critical_threshold = 0.80;
+        let err = config
+            .validate()
+            .expect_err("inverted FD thresholds must be rejected");
+        assert!(
+            err.contains("FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD")
+                && err.contains("FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD"),
+            "error should name both env vars: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_overload_fd_pressure_equals_critical() {
+        // Equal thresholds yield a zero-width RED ramp — divide-by-zero NaN.
+        let mut config = file_mode_config();
+        config.overload_fd_pressure_threshold = 0.90;
+        config.overload_fd_critical_threshold = 0.90;
+        let err = config
+            .validate()
+            .expect_err("equal FD thresholds must be rejected");
+        assert!(
+            err.contains("FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD"),
+            "error should name FD critical env var: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_overload_conn_pressure_above_critical() {
+        let mut config = file_mode_config();
+        config.overload_conn_pressure_threshold = 0.95;
+        config.overload_conn_critical_threshold = 0.85;
+        let err = config
+            .validate()
+            .expect_err("inverted connection thresholds must be rejected");
+        assert!(
+            err.contains("FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD"),
+            "error should name connection critical env var: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_overload_req_pressure_above_critical() {
+        let mut config = file_mode_config();
+        config.overload_req_pressure_threshold = 0.99;
+        config.overload_req_critical_threshold = 0.50;
+        let err = config
+            .validate()
+            .expect_err("inverted request thresholds must be rejected");
+        assert!(
+            err.contains("FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD"),
+            "error should name request critical env var: {err}"
+        );
     }
 }

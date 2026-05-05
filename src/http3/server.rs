@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
 use h3::server::RequestStream;
@@ -23,18 +24,28 @@ use tracing::{debug, error, info, warn};
 
 use super::config::Http3ServerConfig;
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
+use crate::consumer_index::ConsumerIndex;
+use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary};
-use crate::proxy::headers::{is_backend_request_strip_header, is_backend_response_strip_header};
+use crate::proxy::headers::{
+    is_backend_request_strip_header, is_backend_response_strip_header,
+    parse_connection_listed_from_str_map,
+};
 use crate::proxy::{
     ProxyState, apply_after_proxy_hooks_to_rejection, plugin_result_into_reject_parts,
     run_after_proxy_hooks, run_authentication_phase,
 };
-use crate::tls::TlsPolicy;
+use crate::tls::{CrlList, TlsPolicy};
 
 /// Optional HTTP/3 listener settings that don't affect the core bind contract.
 #[derive(Default)]
 pub struct Http3ListenerOptions {
     pub client_ca_bundle_path: Option<String>,
+    /// Loaded CRLs for client certificate revocation checking. When non-empty
+    /// and `client_ca_bundle_path` is set, the H3 mTLS verifier checks revocation
+    /// with the same policy as H1/H2/DTLS frontend mTLS:
+    /// `allow_unknown_revocation_status` + `only_check_end_entity_revocation`.
+    pub client_crls: CrlList,
     pub started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -44,6 +55,7 @@ pub struct Http3ListenerOptions {
 /// TLS 1.3, this function will override it to force TLS 1.3 for the QUIC listener
 /// and log a warning.
 #[allow(dead_code)] // Used by library consumers and tests; binary startup uses the signaled variant.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_http3_listener(
     addr: SocketAddr,
     state: ProxyState,
@@ -52,6 +64,7 @@ pub async fn start_http3_listener(
     h3_config: Http3ServerConfig,
     tls_policy: &TlsPolicy,
     client_ca_bundle_path: Option<String>,
+    client_crls: CrlList,
 ) -> Result<(), anyhow::Error> {
     start_http3_listener_with_signal(
         addr,
@@ -62,6 +75,7 @@ pub async fn start_http3_listener(
         tls_policy,
         Http3ListenerOptions {
             client_ca_bundle_path,
+            client_crls,
             started_tx: None,
         },
     )
@@ -80,6 +94,7 @@ pub async fn start_http3_listener_with_signal(
 ) -> Result<(), anyhow::Error> {
     let Http3ListenerOptions {
         client_ca_bundle_path,
+        client_crls,
         started_tx,
     } = options;
 
@@ -132,7 +147,7 @@ pub async fn start_http3_listener_with_signal(
     // Reuse the cert chain and key from the original config.
     // Carry forward mTLS (client cert verification) if configured.
     let mut server_tls_config = if let Some(ref ca_path) = client_ca_bundle_path {
-        match crate::tls::build_client_cert_verifier(ca_path) {
+        match crate::tls::build_client_cert_verifier(ca_path, &client_crls) {
             Ok(verifier) => h3_builder
                 .with_client_cert_verifier(verifier)
                 .with_cert_resolver(tls_config.cert_resolver.clone()),
@@ -192,14 +207,14 @@ pub async fn start_http3_listener_with_signal(
     transport_config.max_concurrent_bidi_streams(h3_config.max_concurrent_streams.into());
 
     // QUIC flow-control tuning — larger windows improve throughput on modern networks.
-    transport_config.stream_receive_window(
-        quinn::VarInt::from_u64(h3_config.stream_receive_window)
-            .unwrap_or(quinn::VarInt::from_u32(8_388_608)),
-    );
-    transport_config.receive_window(
-        quinn::VarInt::from_u64(h3_config.receive_window)
-            .unwrap_or(quinn::VarInt::from_u32(33_554_432)),
-    );
+    transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
+        h3_config.stream_receive_window,
+        crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+    ));
+    transport_config.receive_window(crate::http3::config::quic_varint_or_default(
+        h3_config.receive_window,
+        crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
+    ));
     transport_config.send_window(h3_config.send_window);
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
@@ -212,6 +227,12 @@ pub async fn start_http3_listener_with_signal(
     }
 
     let mut shutdown_rx = shutdown;
+    // Captured before the accept loop so each spawned connection task can apply
+    // the same QUIC handshake bound without reading `state.env_config` per-conn.
+    // `Duration::ZERO` preserves the documented "0 disables" semantic.
+    let handshake_timeout = h3_config.handshake_timeout;
+    let drain_seconds = state.env_config.shutdown_drain_seconds;
+    let overload_state = state.overload.clone();
 
     loop {
         tokio::select! {
@@ -229,7 +250,9 @@ pub async fn start_http3_listener_with_signal(
                         tokio::spawn(async move {
                             let _conn_guard =
                                 crate::overload::ConnectionGuard::new(&state.overload);
-                            if let Err(e) = handle_h3_connection(connecting, state).await {
+                            if let Err(e) =
+                                handle_h3_connection(connecting, state, handshake_timeout).await
+                            {
                                 debug!("HTTP/3 connection error: {}", e);
                             }
                         });
@@ -241,20 +264,88 @@ pub async fn start_http3_listener_with_signal(
                 }
             }
             _ = shutdown_rx.changed() => {
-                info!("HTTP/3 listener shutting down");
-                endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
+                info!("HTTP/3 listener shutting down — refusing new connections, draining in-flight");
+                // Stop accepting new server-side QUIC handshakes. Existing
+                // connections continue to serve in-flight streams. Without
+                // this, an immediate `endpoint.close()` would abort live
+                // requests with a CONNECTION_CLOSE frame mid-stream.
+                endpoint.set_server_config(None);
                 break;
             }
         }
     }
 
+    // Wait for in-flight HTTP/3 connections to drain, bounded by
+    // FERRUM_SHUTDOWN_DRAIN_SECONDS. Without this, any subsequent
+    // `endpoint.close()` call would forcefully terminate active streams the
+    // moment the listener task exited — exactly the abrupt-abort behaviour
+    // the soft-shutdown sequence is here to avoid.
+    if drain_seconds > 0 {
+        let drain_timeout = Duration::from_secs(drain_seconds);
+        let drained = tokio::time::timeout(drain_timeout, async {
+            loop {
+                if endpoint.open_connections() == 0 {
+                    break;
+                }
+                // Poll active connections via overload state's notify
+                // signal — the same mechanism the central drain helper
+                // uses, so notifications are coherent across listeners.
+                tokio::select! {
+                    _ = overload_state.drain_complete.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+        })
+        .await
+        .is_ok();
+
+        if drained {
+            info!(
+                phase = "drain",
+                listener = "http3",
+                "HTTP/3 in-flight connections drained"
+            );
+        } else {
+            warn!(
+                phase = "drain",
+                listener = "http3",
+                remaining_connections = endpoint.open_connections(),
+                "HTTP/3 drain timeout — forcing endpoint close"
+            );
+        }
+    }
+
+    // Finally, close any remaining connections cleanly. wait_idle() lets
+    // peers receive the CONNECTION_CLOSE frame before the socket is
+    // dropped — without it some clients see a transport-layer abort.
+    endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
+    endpoint.wait_idle().await;
+
     Ok(())
+}
+
+/// Await `fut` while bounding the wait by `timeout`. Passing `Duration::ZERO`
+/// disables the bound — used so `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS=0`
+/// matches the "0 disables" semantic shared by the TCP/TLS and DTLS frontends.
+async fn await_with_optional_timeout<F, T>(
+    fut: F,
+    timeout: Duration,
+) -> Result<T, tokio::time::error::Elapsed>
+where
+    F: std::future::Future<Output = T>,
+{
+    if timeout.is_zero() {
+        Ok(fut.await)
+    } else {
+        tokio::time::timeout(timeout, fut).await
+    }
 }
 
 /// Handle a single HTTP/3 connection (may carry multiple streams/requests).
 async fn handle_h3_connection(
     connecting: quinn::Incoming,
     state: ProxyState,
+    handshake_timeout: Duration,
 ) -> Result<(), anyhow::Error> {
     let early_data_enabled = !state.early_data_methods.is_empty();
 
@@ -269,6 +360,14 @@ async fn handle_h3_connection(
     // request checks the current state — not the connection-level flag.
     let in_early_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Bound the QUIC handshake so a peer that completes the UDP path-MTU
+    // probe / Initial packets but never finishes TLS 1.3 cannot hold a
+    // connection slot indefinitely. `quinn::TransportConfig::max_idle_timeout`
+    // is a post-handshake idle bound and is NOT a handshake bound — so without
+    // this `tokio::time::timeout`, the gateway has no admission-control
+    // ceiling on QUIC handshake cost. Aligns HTTP/3 with the TCP/TLS
+    // (`accept_with_optional_timeout`) and DTLS (`DtlsServerLimits.handshake_timeout`)
+    // frontends, all gated by `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`.
     let connection = if early_data_enabled {
         let connecting = connecting.accept()?.into_0rtt();
         match connecting {
@@ -280,21 +379,60 @@ async fn handle_h3_connection(
                 in_early_data.store(true, std::sync::atomic::Ordering::Release);
                 // Spawn a task that waits for the handshake to complete, then
                 // clears the early-data flag. Requests dispatched after this
-                // point will see is_early_data = false.
+                // point will see is_early_data = false. The handshake bound
+                // also applies here: if the peer never completes TLS, the
+                // ZeroRttAccepted future never resolves and the connection
+                // would otherwise sit consuming a slot forever. Closing the
+                // connection on timeout fails any in-flight 0.5-RTT streams.
                 let flag = in_early_data.clone();
+                let conn_for_close = conn.clone();
+                let remote = conn.remote_address();
                 tokio::spawn(async move {
-                    zero_rtt_accepted.await;
-                    flag.store(false, std::sync::atomic::Ordering::Release);
+                    match await_with_optional_timeout(zero_rtt_accepted, handshake_timeout).await {
+                        Ok(_accepted) => {
+                            flag.store(false, std::sync::atomic::Ordering::Release);
+                        }
+                        Err(_elapsed) => {
+                            warn!(
+                                "HTTP/3 handshake timed out from {} after {:?} (0-RTT path)",
+                                remote, handshake_timeout
+                            );
+                            conn_for_close.close(quinn::VarInt::from_u32(0), b"handshake timeout");
+                        }
+                    }
                 });
                 conn
             }
             Err(connecting) => {
-                // No 0-RTT — fall back to full handshake
-                connecting.await?
+                // No 0-RTT — fall back to full handshake.
+                match await_with_optional_timeout(connecting, handshake_timeout).await {
+                    Ok(result) => result?,
+                    Err(_elapsed) => {
+                        warn!("HTTP/3 handshake timed out after {:?}", handshake_timeout);
+                        return Err(anyhow::anyhow!(
+                            "HTTP/3 handshake timed out after {:?}",
+                            handshake_timeout
+                        ));
+                    }
+                }
             }
         }
     } else {
-        connecting.await?
+        // `quinn::Incoming` is `IntoFuture` (yielding a `Connecting`); the
+        // explicit `.accept()?` here both surfaces address-validation errors
+        // synchronously and gives us a typed `Connecting` future that
+        // `tokio::time::timeout` can wrap directly.
+        let connecting = connecting.accept()?;
+        match await_with_optional_timeout(connecting, handshake_timeout).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                warn!("HTTP/3 handshake timed out after {:?}", handshake_timeout);
+                return Err(anyhow::anyhow!(
+                    "HTTP/3 handshake timed out after {:?}",
+                    handshake_timeout
+                ));
+            }
+        }
     };
 
     let remote_addr = connection.remote_address();
@@ -565,8 +703,9 @@ async fn handle_h3_request(
     }
 
     // Protocol-level header validation (HTTP/3-applicable subset).
-    // HTTP/3 has no Transfer-Encoding or Host header concerns (uses :authority),
-    // but multiple Content-Length with mismatched values is still a protocol violation.
+    // HTTP/3 carries authority in `:authority`, but a Host field can still be
+    // present during translation. Validate both before routing so backend
+    // dispatch cannot key on a different authority than route/plugin checks.
     if let Some(error_body) =
         crate::proxy::check_protocol_headers(req.headers(), http::Version::HTTP_3)
     {
@@ -579,6 +718,24 @@ async fn handle_h3_request(
             error_body,
             crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
             "Protocol header violation",
+        )
+        .await?;
+        return Ok(());
+    }
+    if let Some(error_body) = crate::proxy::check_host_authority_consistency(
+        req.headers(),
+        req.uri(),
+        http::Version::HTTP_3,
+    ) {
+        warn!("Rejected HTTP/3 request: {}", error_body);
+        record_request(&state, 400);
+        send_h3_error_flavor_aware(
+            &mut stream,
+            http_flavor,
+            StatusCode::BAD_REQUEST,
+            error_body,
+            crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+            "Host and authority mismatch",
         )
         .await?;
         return Ok(());
@@ -666,30 +823,23 @@ async fn handle_h3_request(
     // full HashMap — only 2-3 targeted lookups on the raw HeaderMap.
     if !state.trusted_proxies.is_empty() {
         let socket_addr: std::net::IpAddr = remote_addr.ip();
-        let xff = ctx.raw_header_get("x-forwarded-for");
-        let resolved = if let Some(ref real_ip_header) = state.env_config.real_ip_header {
-            // real_ip_header is already lowercase from env config parsing
-            let header_val = ctx.raw_header_get(real_ip_header.as_str());
-            if let Some(val) = header_val
-                && state.trusted_proxies.contains(&socket_addr)
-            {
-                val.trim().to_string()
-            } else {
-                crate::proxy::client_ip::resolve_client_ip_parsed(
-                    socket_ip,
-                    &socket_addr,
-                    xff,
-                    &state.trusted_proxies,
-                )
-            }
-        } else {
-            crate::proxy::client_ip::resolve_client_ip_parsed(
-                socket_ip,
-                &socket_addr,
-                xff,
-                &state.trusted_proxies,
-            )
-        };
+        let real_ip_header_val =
+            state
+                .env_config
+                .real_ip_header
+                .as_ref()
+                .and_then(|real_ip_header| {
+                    // real_ip_header is already lowercase from env config parsing
+                    ctx.raw_header_get(real_ip_header.as_str())
+                });
+        let resolved = crate::proxy::client_ip::resolve_forwarded_client_ip(
+            socket_ip,
+            &socket_addr,
+            real_ip_header_val,
+            ctx.raw_header_get("x-forwarded-for"),
+            &state.trusted_proxies,
+        )
+        .unwrap_or_else(|| socket_ip.to_string());
         ctx.client_ip = resolved;
     }
 
@@ -738,24 +888,41 @@ async fn handle_h3_request(
     // HTTP/3 uses the :authority pseudo-header (from URI authority).
     // Also check the host header as a fallback. Strip port and lowercase.
     // Uses raw_header_get() to avoid materializing the full HashMap.
-    let request_host: Option<String> = req
+    let raw_host = req
         .uri()
         .authority()
         .map(|a| a.as_str())
-        .or_else(|| ctx.raw_header_get("host"))
-        .map(|h| {
-            let without_port = h.split(':').next().unwrap_or(h);
-            // Strip trailing dot from FQDN (e.g., "example.com." → "example.com").
-            // DNS treats "example.com." and "example.com" as identical, so routing
-            // must normalize to prevent host-matching bypasses.
-            let normalized = without_port.strip_suffix('.').unwrap_or(without_port);
-            normalized.to_lowercase()
-        });
+        .or_else(|| ctx.raw_header_get("host"));
+    let request_host: Option<String> = match raw_host {
+        Some(h) => match crate::proxy::normalize_request_host_for_routing(h) {
+            Some(normalized) => Some(normalized),
+            None => {
+                warn!("Rejected HTTP/3 request: malformed Host/authority value");
+                record_request(&state, 400);
+                send_h3_error_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":"Request contains malformed Host or authority"}"#,
+                    crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                    "Malformed Host or authority",
+                )
+                .await?;
+                return Ok(());
+            }
+        },
+        None => None,
+    };
+
+    let epoch = state.request_epoch.load();
 
     // Route: host + longest prefix match via router cache
-    let route_match = state
-        .router_cache
-        .find_proxy(request_host.as_deref(), &path);
+    let route_match = state.router_cache.find_proxy_in_snapshot(
+        &epoch.route_table,
+        epoch.route_generation,
+        request_host.as_deref(),
+        &path,
+    );
 
     let proxy = match route_match {
         Some(rm) => {
@@ -849,14 +1016,15 @@ async fn handle_h3_request(
         _ => ProxyProtocol::Http,
     };
 
+    // Load plugin-cache values once for this request. Every plugin list,
+    // capability bitset, and buffering flag below is derived from the same
+    // cache generation without retaining the full cache across awaits.
+    let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);
+
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
-    let plugins = state
-        .plugin_cache
-        .get_plugins_for_protocol(&proxy.id, request_protocol);
+    let plugins = plugin_cache_view.plugins();
     // Pre-computed capability bitset — avoids per-request iter().any() scans.
-    let capabilities = state
-        .plugin_cache
-        .get_capabilities(&proxy.id, request_protocol);
+    let capabilities = plugin_cache_view.capabilities();
 
     let mut plugin_execution_ns: u64 = 0;
 
@@ -897,20 +1065,61 @@ async fn handle_h3_request(
     // for HTTP/3 — preserves existing behavior).
     ctx.materialize_query_params_raw();
 
+    // Some auth plugins (e.g. `hmac_auth` with `require_digest=true`) verify
+    // request body integrity at authenticate time. Buffer the body before the
+    // auth phase runs so those plugins can read `ctx.request_body_bytes`.
+    let h3_requires_body_before_authenticate = capabilities
+        .has(crate::plugin_cache::PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
+        && plugins.iter().any(|plugin| {
+            plugin.requires_request_body_before_authenticate()
+                && plugin.should_buffer_request_body(&ctx)
+        });
+
+    let mut prebuffered_body_data: Option<Vec<u8>> = if h3_requires_body_before_authenticate {
+        let mut body_data = Vec::new();
+        let max_body = if matches!(http_flavor, HttpFlavor::Grpc) {
+            state.max_grpc_recv_size_bytes
+        } else {
+            state.max_request_body_size_bytes
+        };
+        while let Some(chunk) = stream.recv_data().await? {
+            let bytes = chunk.chunk();
+            if max_body > 0 && body_data.len() + bytes.len() > max_body {
+                record_request(&state, 413);
+                send_h3_error_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    r#"{"error":"Request body exceeds maximum size"}"#,
+                    crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                    "Request body exceeds maximum size",
+                )
+                .await?;
+                return Ok(());
+            }
+            body_data.extend_from_slice(bytes);
+        }
+        // Auth plugins that need bytes (hmac_auth digest verification) read
+        // `ctx.request_body_bytes`, so always populate the binary-safe handle.
+        crate::proxy::store_request_body_metadata(&mut ctx, &body_data, true);
+        Some(body_data)
+    } else {
+        None
+    };
+
     // Authentication phase (pre-computed auth plugin list — zero allocation).
     // `request_protocol` matches the HTTP/1.1 + HTTP/2 path so H3 gRPC
     // requests load the gRPC auth plugin set (not the HTTP-only set) —
     // same proxy serves all three client versions uniformly.
-    let auth_plugins = state
-        .plugin_cache
-        .get_auth_plugins(&proxy.id, request_protocol);
+    let auth_plugins = plugin_cache_view.auth_plugins();
 
     let auth_phase_start = std::time::Instant::now();
+    let consumer_index = ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index));
     if let Some((status_code, body, mut headers)) = run_authentication_phase(
         proxy.auth_mode.clone(),
         &auth_plugins,
         &mut ctx,
-        &state.consumer_index,
+        &consumer_index,
     )
     .await
     {
@@ -960,9 +1169,7 @@ async fn handle_h3_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
-    let maybe_needs_request_buffering = state
-        .plugin_cache
-        .requires_request_body_buffering(&proxy.id);
+    let maybe_needs_request_buffering = plugin_cache_view.requires_request_body_buffering();
     let plugin_needs_request_buffering = maybe_needs_request_buffering
         && plugins
             .iter()
@@ -976,7 +1183,9 @@ async fn handle_h3_request(
     let h3_needs_body_bytes = needs_request_body_before_before_proxy
         && capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_REQUEST_BODY_BYTES);
 
-    let mut prebuffered_body_data = if needs_request_body_before_before_proxy {
+    // If we already buffered above for the body-before-authenticate path, the
+    // body is already drained from the stream — no extra recv_data work here.
+    if needs_request_body_before_before_proxy && prebuffered_body_data.is_none() {
         let mut body_data = Vec::new();
         // For gRPC requests, enforce the gRPC-specific recv ceiling (matches
         // H1/H2 gRPC). Other flavors use the shared HTTP body limit.
@@ -1003,10 +1212,8 @@ async fn handle_h3_request(
             body_data.extend_from_slice(bytes);
         }
         crate::proxy::store_request_body_metadata(&mut ctx, &body_data, h3_needs_body_bytes);
-        Some(body_data)
-    } else {
-        None
-    };
+        prebuffered_body_data = Some(body_data);
+    }
 
     // before_proxy hooks — only clone headers if at least one plugin modifies them.
     // When no plugin modifies headers, use std::mem::take to avoid a per-request HashMap clone.
@@ -1135,13 +1342,13 @@ async fn handle_h3_request(
         HttpFlavor::Grpc => crate::retry::can_retry_connection_failures(proxy.retry.as_ref()),
         HttpFlavor::WebSocket => false,
     };
+    let maybe_requires_response_body_buffering =
+        plugin_cache_view.requires_response_body_buffering();
     let should_stream_response = crate::proxy::should_stream_response_body(
         &proxy,
         &plugins,
         &ctx,
-        state
-            .plugin_cache
-            .requires_response_body_buffering(&proxy.id),
+        maybe_requires_response_body_buffering,
     );
     let needs_request_buffering = has_retry || plugin_needs_request_buffering;
     let needs_response_buffering = has_retry || !should_stream_response;
@@ -1150,33 +1357,37 @@ async fn handle_h3_request(
     let selection = crate::proxy::backend_dispatch::select_upstream_target(
         &proxy,
         &state,
+        &epoch,
         &ctx.client_ip,
         &proxy_headers,
     );
     let lb_hash_key = selection.lb_hash_key;
     let upstream_target = selection.target;
+    let upstream_balancer = selection.balancer;
 
-    let cb_target_key = match crate::proxy::backend_dispatch::check_circuit_breaker(
-        &proxy,
-        &state,
-        upstream_target.as_deref(),
-    ) {
-        Ok(key) => key,
-        Err(()) => {
-            record_request(&state, 503);
-            let mut rej_headers = HashMap::new();
-            apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, 503, &mut rej_headers).await;
-            send_h3_reject_flavor_aware(
-                &mut stream,
-                http_flavor,
-                StatusCode::SERVICE_UNAVAILABLE,
-                br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
-                &rej_headers,
-            )
-            .await?;
-            return Ok(());
-        }
-    };
+    let (cb_target_key, cb_is_half_open_probe) =
+        match crate::proxy::backend_dispatch::check_circuit_breaker(
+            &proxy,
+            &state,
+            upstream_target.as_deref(),
+        ) {
+            Ok(result) => result,
+            Err(()) => {
+                record_request(&state, 503);
+                let mut rej_headers = HashMap::new();
+                apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, 503, &mut rej_headers)
+                    .await;
+                send_h3_reject_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                    &rej_headers,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
 
     // Build backend URL — target-aware when upstream is configured.
     // Host-only proxies (listen_path None) have no prefix to strip; use 0.
@@ -1280,6 +1491,7 @@ async fn handle_h3_request(
         let outcome =
             crate::http3::cross_protocol::run(crate::http3::cross_protocol::CrossProtocolRequest {
                 state: &state,
+                epoch: &epoch,
                 proxy: &proxy,
                 stream: &mut stream,
                 method: &method,
@@ -1289,12 +1501,15 @@ async fn handle_h3_request(
                 backend_url: &backend_url,
                 lb_hash_key: lb_hash_key.as_deref(),
                 upstream_target: upstream_target.as_deref(),
+                upstream_balancer: upstream_balancer.as_ref(),
                 cb_target_key: cb_target_key.as_deref(),
+                cb_is_half_open_probe,
                 flavor: http_flavor,
                 prebuffered_body: prebuffered,
                 client_ip: &client_ip_owned,
                 ctx: &mut ctx,
                 plugins: &plugins,
+                requires_response_body_buffering: maybe_requires_response_body_buffering,
                 sticky_cookie_needed,
             })
             .await?;
@@ -1320,8 +1535,8 @@ async fn handle_h3_request(
             consumer_username: ctx.effective_identity().map(str::to_owned),
             http_method: method.to_string(),
             request_path: path.clone(),
-            matched_proxy_id: Some(proxy.id.clone()),
-            matched_proxy_name: proxy.name.clone(),
+            proxy_id: Some(proxy.id.clone()),
+            proxy_name: proxy.name.clone(),
             backend_target_url: outcome
                 .backend_target_url
                 .clone()
@@ -1361,10 +1576,12 @@ async fn handle_h3_request(
         // (backend → frontend) without buffering either into memory.
 
         // Track connection for least-connections LB (after all pre-dispatch rejects)
-        if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-            state
-                .load_balancer_cache
-                .record_connection_start(upstream_id, target);
+        if let (Some(_upstream_id), Some(target), Some(balancer)) = (
+            &proxy.upstream_id,
+            &upstream_target,
+            upstream_balancer.as_ref(),
+        ) {
+            balancer.record_connection_start(target);
         }
 
         let client_ip_owned = ctx.client_ip.clone();
@@ -1374,6 +1591,7 @@ async fn handle_h3_request(
             &proxy_headers,
             &client_ip_owned,
             &state,
+            ctx.is_early_data,
         );
         let tls_config_fn = || state.connection_pool.get_tls_config_for_backend(&proxy);
 
@@ -1423,6 +1641,7 @@ async fn handle_h3_request(
                 }
                 error!("Backend request failed (HTTP/3 streaming body): {}", e);
                 let h3_error_class = classify_h3_error(&e);
+                crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
                 // H3 frontend → H3 backend path: QUIC failure here means the
                 // cached H3 capability lied (backend probably lost UDP), so
                 // downgrade the classification. The next H3 request is free
@@ -1444,10 +1663,13 @@ async fn handle_h3_request(
                 crate::proxy::backend_dispatch::record_backend_outcome(
                     &state,
                     &proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer.as_ref(),
                     upstream_target.as_deref(),
                     cb_target_key.as_deref(),
                     502,
                     true,
+                    cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
 
@@ -1467,8 +1689,8 @@ async fn handle_h3_request(
                     consumer_username: ctx.effective_identity().map(str::to_owned),
                     http_method: method.to_string(),
                     request_path: path.clone(),
-                    matched_proxy_id: Some(proxy.id.clone()),
-                    matched_proxy_name: proxy.name.clone(),
+                    proxy_id: Some(proxy.id.clone()),
+                    proxy_name: proxy.name.clone(),
                     backend_target_url: Some(strip_query_params(&backend_url).to_string()),
                     backend_resolved_ip: backend_resolved_ip.clone(),
                     response_status_code: 502,
@@ -1515,10 +1737,13 @@ async fn handle_h3_request(
             crate::proxy::backend_dispatch::record_backend_outcome(
                 &state,
                 &proxy,
+                &epoch.load_balancer,
+                upstream_balancer.as_ref(),
                 upstream_target.as_deref(),
                 cb_target_key.as_deref(),
                 502,
                 false,
+                cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
             record_request(&state, 502);
@@ -1538,7 +1763,7 @@ async fn handle_h3_request(
 
         // Sticky session cookie injection
         inject_sticky_cookie(
-            &state,
+            &epoch,
             &proxy,
             upstream_target.as_deref(),
             sticky_cookie_needed,
@@ -1585,13 +1810,13 @@ async fn handle_h3_request(
             tokio::select! {
                 chunk_result = h3_resp.recv_stream.recv_data(), if !stream_done => {
                     match chunk_result {
-                        Ok(Some(chunk)) => {
-                            let chunk_bytes = chunk.chunk();
+                        Ok(Some(mut chunk)) => {
+                            let chunk_len = chunk.remaining();
                             // Always count received bytes — the graceful-close
                             // recovery below uses this to decide if the body is
                             // semantically complete, even when the body-size
                             // limit is disabled (FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0).
-                            total_streamed += chunk_bytes.len();
+                            total_streamed += chunk_len;
                             if state.max_response_body_size_bytes > 0
                                 && total_streamed > state.max_response_body_size_bytes
                             {
@@ -1603,7 +1828,26 @@ async fn handle_h3_request(
                                 body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
                                 break 'outer;
                             }
-                            coalesce_buf.extend_from_slice(chunk_bytes);
+                            if crate::http3::config::should_direct_send_response_chunk(
+                                coalesce_buf.len(),
+                                chunk_len,
+                                coalesce_min_bytes,
+                            ) {
+                                let data =
+                                    crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                                if stream.send_data(data).await.is_err() {
+                                    client_disconnected = true;
+                                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                                    break 'outer;
+                                }
+                                bytes_streamed += chunk_len as u64;
+                                flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
+                                continue;
+                            }
+
+                            let chunk_bytes =
+                                crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                            coalesce_buf.extend_from_slice(&chunk_bytes);
                             if coalesce_buf.len() >= coalesce_min_bytes {
                                 let data = coalesce_buf.split().freeze();
                                 let data_len = data.len() as u64;
@@ -1686,10 +1930,13 @@ async fn handle_h3_request(
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
+            &epoch.load_balancer,
+            upstream_balancer.as_ref(),
             upstream_target.as_deref(),
             cb_target_key.as_deref(),
             response_status,
             false,
+            cb_is_half_open_probe,
             backend_start.elapsed(),
         );
 
@@ -1710,15 +1957,19 @@ async fn handle_h3_request(
             consumer_username: ctx.effective_identity().map(str::to_owned),
             http_method: method.to_string(),
             request_path: path.clone(),
-            matched_proxy_id: Some(proxy.id.clone()),
-            matched_proxy_name: proxy.name.clone(),
+            proxy_id: Some(proxy.id.clone()),
+            proxy_name: proxy.name.clone(),
             backend_target_url: Some(strip_query_params(&backend_url).to_string()),
             backend_resolved_ip: backend_resolved_ip.clone(),
             response_status_code: response_status,
             latency_total_ms: total_ms,
             latency_gateway_processing_ms: gateway_processing_ms,
             latency_backend_ttfb_ms: backend_total_ms,
-            latency_backend_total_ms: -1.0, // Streaming — total unknown at log time
+            // Native H3 streaming completes the `'outer` loop synchronously
+            // before constructing this summary, so the full backend duration
+            // (TTFB + body relay) is known here. Mirrors the symmetric H3
+            // native streaming path in `proxy_to_backend_h3_streaming`.
+            latency_backend_total_ms: backend_total_ms,
             latency_plugin_execution_ms: plugin_execution_ms,
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: gateway_overhead_ms,
@@ -1831,10 +2082,12 @@ async fn handle_h3_request(
     // Track connection for least-connections LB (after all pre-dispatch rejects).
     // Placed here so the streaming-request path above handles its own tracking,
     // and early returns from body collection/plugin rejects don't leak counts.
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-        state
-            .load_balancer_cache
-            .record_connection_start(upstream_id, target);
+    if let (Some(_upstream_id), Some(target), Some(balancer)) = (
+        &proxy.upstream_id,
+        &upstream_target,
+        upstream_balancer.as_ref(),
+    ) {
+        balancer.record_connection_start(target);
     }
 
     if !needs_response_buffering {
@@ -1858,6 +2111,7 @@ async fn handle_h3_request(
             body_data,
             &client_ip_owned,
             upstream_target.as_deref(),
+            &epoch,
             sticky_cookie_needed,
             &mut stream,
             &plugins,
@@ -1937,10 +2191,13 @@ async fn handle_h3_request(
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
+            &epoch.load_balancer,
+            upstream_balancer.as_ref(),
             upstream_target.as_deref(),
             cb_target_key.as_deref(),
             response_status,
             connection_error,
+            cb_is_half_open_probe,
             backend_start.elapsed(),
         );
 
@@ -1963,8 +2220,8 @@ async fn handle_h3_request(
             consumer_username: ctx.effective_identity().map(str::to_owned),
             http_method: method,
             request_path: path,
-            matched_proxy_id: Some(proxy.id.clone()),
-            matched_proxy_name: proxy.name.clone(),
+            proxy_id: Some(proxy.id.clone()),
+            proxy_name: proxy.name.clone(),
             backend_target_url: Some(strip_query_params(&backend_url).to_string()),
             backend_resolved_ip: backend_resolved_ip.clone(),
             response_status_code: response_status,
@@ -2032,6 +2289,7 @@ async fn handle_h3_request(
                 &body_data,
                 &ctx.client_ip,
                 current_target.as_deref(),
+                ctx.is_early_data,
             )
             .await;
 
@@ -2061,7 +2319,11 @@ async fn handle_h3_request(
                         current_cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(result.status, !result.request_on_wire);
+                    cb.record_failure(
+                        result.status,
+                        !result.request_on_wire,
+                        cb_is_half_open_probe,
+                    );
                 }
 
                 let delay = crate::retry::retry_delay(retry_config, attempt);
@@ -2072,7 +2334,8 @@ async fn handle_h3_request(
                 if let (Some(upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &current_target)
                     && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = state.load_balancer_cache.select_next_target(
+                    && let Some(next) = LoadBalancerCache::select_next_target_from(
+                        &epoch.load_balancer,
                         upstream_id,
                         hash_key,
                         prev_target,
@@ -2117,6 +2380,7 @@ async fn handle_h3_request(
                     &body_data,
                     &ctx.client_ip,
                     current_target.as_deref(),
+                    ctx.is_early_data,
                 )
                 .await;
             }
@@ -2141,6 +2405,7 @@ async fn handle_h3_request(
                 &body_data,
                 &ctx.client_ip,
                 upstream_target.as_deref(),
+                ctx.is_early_data,
             )
             .await;
             (
@@ -2163,10 +2428,13 @@ async fn handle_h3_request(
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
+            &epoch.load_balancer,
+            upstream_balancer.as_ref(),
             final_target.as_deref(),
             final_cb_target_key.as_deref(),
             response_status,
             !h3_request_on_wire,
+            cb_is_half_open_probe,
             backend_start.elapsed(),
         );
 
@@ -2196,7 +2464,7 @@ async fn handle_h3_request(
         // Sticky session cookie injection
         if !after_proxy_rejected {
             inject_sticky_cookie(
-                &state,
+                &epoch,
                 &proxy,
                 upstream_target.as_deref(),
                 sticky_cookie_needed,
@@ -2315,8 +2583,8 @@ async fn handle_h3_request(
             consumer_username: ctx.effective_identity().map(str::to_owned),
             http_method: method,
             request_path: path,
-            matched_proxy_id: Some(proxy.id.clone()),
-            matched_proxy_name: proxy.name.clone(),
+            proxy_id: Some(proxy.id.clone()),
+            proxy_name: proxy.name.clone(),
             backend_target_url: Some(strip_query_params(&backend_url).to_string()),
             backend_resolved_ip,
             response_status_code: response_status,
@@ -2388,6 +2656,7 @@ fn build_h3_backend_headers(
     headers: &HashMap<String, String>,
     client_ip: &str,
     state: &ProxyState,
+    is_early_data: bool,
 ) -> Vec<(http::header::HeaderName, http::header::HeaderValue)> {
     let mut h3_headers = Vec::with_capacity(headers.len() + 5);
 
@@ -2395,6 +2664,7 @@ fn build_h3_backend_headers(
         .map(|t| t.host.as_str())
         .unwrap_or(proxy.backend_host.as_str());
 
+    let connection_listed_strip = parse_connection_listed_from_str_map(headers);
     for (k, v) in headers {
         match k.as_str() {
             "host" | ":authority" => {
@@ -2409,6 +2679,19 @@ fn build_h3_backend_headers(
             }
             // RFC 9110 §7.6.1 hop-by-hop strip — see `proxy::headers`.
             n if is_backend_request_strip_header(n) => continue,
+            // RFC 9110 §7.6.1 Connection-listed strip — see
+            // `parse_connection_listed_from_str_map`.
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
+            // RFC 8470 §5.2: `Early-Data` is set by the intermediary that
+            // forwarded the request over 0-RTT, never by the originating
+            // client. Strip any client-supplied value here so a malicious
+            // or buggy client cannot trick the backend into believing the
+            // request was carried over 0-RTT (or, conversely, suppress our
+            // own injection of `Early-Data: 1` below). Treated as a
+            // hop-by-hop-style header on the request path: gateway
+            // re-injects the correct value only when the request actually
+            // arrived as 0-RTT early data.
+            "early-data" => continue,
             k if k.starts_with(':') => continue,
             _ => {
                 if let (Ok(name), Ok(val)) = (
@@ -2419,6 +2702,19 @@ fn build_h3_backend_headers(
                 }
             }
         }
+    }
+
+    // RFC 8470 §5.2: when this request arrived over TLS 1.3 0-RTT early data
+    // and the gateway forwards it to the backend, advertise `Early-Data: 1`
+    // so the origin server can apply its own replay-safety policy (return
+    // 425 Too Early, defer the response, etc.). The gateway has already
+    // gated by `state.early_data_methods`, but the backend may have
+    // stricter policy than the gateway's allow-list.
+    if is_early_data {
+        h3_headers.push((
+            http::header::HeaderName::from_static("early-data"),
+            http::header::HeaderValue::from_static("1"),
+        ));
     }
 
     // X-Forwarded-For
@@ -2476,7 +2772,7 @@ fn build_h3_backend_headers(
 /// Inject a sticky-session `Set-Cookie` header when the LB strategy is cookie-based
 /// and the cookie was not present in the original request.
 pub(crate) fn inject_sticky_cookie(
-    state: &ProxyState,
+    epoch: &crate::request_epoch::RequestEpoch,
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
     sticky_cookie_needed: bool,
@@ -2485,9 +2781,10 @@ pub(crate) fn inject_sticky_cookie(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
     {
-        let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+        let strategy =
+            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id);
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()
@@ -2600,13 +2897,21 @@ async fn proxy_to_backend_h3_streaming(
     body_bytes: Vec<u8>,
     client_ip: &str,
     upstream_target: Option<&UpstreamTarget>,
+    epoch: &crate::request_epoch::RequestEpoch,
     sticky_cookie_needed: bool,
     h3_stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     plugin_execution_ns: &mut u64,
 ) -> Result<H3StreamResult, anyhow::Error> {
-    let h3_headers = build_h3_backend_headers(proxy, upstream_target, headers, client_ip, state);
+    let h3_headers = build_h3_backend_headers(
+        proxy,
+        upstream_target,
+        headers,
+        client_ip,
+        state,
+        ctx.is_early_data,
+    );
     let body = bytes::Bytes::from(body_bytes);
 
     // Dispatch via the h3+quinn connection pool
@@ -2649,6 +2954,7 @@ async fn proxy_to_backend_h3_streaming(
             // that case.
             let request_on_wire = e.request_on_wire();
             let h3_error_class = classify_h3_error(&e);
+            crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
             if crate::proxy::is_h3_transport_error_class(h3_error_class) {
                 state
                     .backend_capabilities
@@ -2725,7 +3031,7 @@ async fn proxy_to_backend_h3_streaming(
 
     // Sticky session cookie injection
     inject_sticky_cookie(
-        state,
+        epoch,
         proxy,
         upstream_target,
         sticky_cookie_needed,
@@ -2787,13 +3093,13 @@ async fn proxy_to_backend_h3_streaming(
         tokio::select! {
             chunk_result = h3_resp.recv_stream.recv_data(), if !stream_done => {
                 match chunk_result {
-                    Ok(Some(chunk)) => {
-                        let chunk_bytes = chunk.chunk();
+                    Ok(Some(mut chunk)) => {
+                        let chunk_len = chunk.remaining();
                         // Always count received bytes — the graceful-close
                         // recovery below uses this to decide if the body is
                         // semantically complete, even when the body-size
                         // limit is disabled (FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0).
-                        total_streamed += chunk_bytes.len();
+                        total_streamed += chunk_len;
                         if state.max_response_body_size_bytes > 0
                             && total_streamed > state.max_response_body_size_bytes
                         {
@@ -2807,7 +3113,26 @@ async fn proxy_to_backend_h3_streaming(
                             break 'outer;
                         }
 
-                        coalesce_buf.extend_from_slice(chunk_bytes);
+                        if crate::http3::config::should_direct_send_response_chunk(
+                            coalesce_buf.len(),
+                            chunk_len,
+                            coalesce_min_bytes,
+                        ) {
+                            let data =
+                                crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                            if h3_stream.send_data(data).await.is_err() {
+                                client_disconnected = true;
+                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                                break 'outer;
+                            }
+                            bytes_streamed += chunk_len as u64;
+                            flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
+                            continue;
+                        }
+
+                        let chunk_bytes =
+                            crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                        coalesce_buf.extend_from_slice(&chunk_bytes);
 
                         if coalesce_buf.len() >= coalesce_min_bytes {
                             let data = coalesce_buf.split().freeze();
@@ -2950,8 +3275,16 @@ async fn proxy_to_backend_h3(
     body_bytes: &[u8],
     client_ip: &str,
     upstream_target: Option<&UpstreamTarget>,
+    is_early_data: bool,
 ) -> H3BufferedDispatchResult {
-    let h3_headers = build_h3_backend_headers(proxy, upstream_target, headers, client_ip, state);
+    let h3_headers = build_h3_backend_headers(
+        proxy,
+        upstream_target,
+        headers,
+        client_ip,
+        state,
+        is_early_data,
+    );
     let body = bytes::Bytes::copy_from_slice(body_bytes);
 
     let tls_config_fn = || state.connection_pool.get_tls_config_for_backend(proxy);
@@ -3031,6 +3364,7 @@ async fn proxy_to_backend_h3(
             // signal correctly reports `false` (no commitment).
             let request_on_wire = e.request_on_wire();
             let h3_error_class = classify_h3_error(&e);
+            crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
             if crate::proxy::is_h3_transport_error_class(h3_error_class) {
                 state
                     .backend_capabilities
@@ -3526,6 +3860,222 @@ mod h3_streaming_outcome_tests {
             !streaming_path_connection_error(None, None, /* request_on_wire = */ true,),
             "backend-emitted 5xx without any error class is a status failure, \
              not a connection failure"
+        );
+    }
+}
+
+#[cfg(test)]
+mod handshake_timeout_helper_tests {
+    //! Regression tests for `await_with_optional_timeout`. The helper backs
+    //! the QUIC frontend handshake bound that aligns HTTP/3 admission control
+    //! with the TCP/TLS and DTLS frontends — see the comment block above the
+    //! `let connection = if early_data_enabled { ... }` arm in
+    //! `handle_h3_connection`.
+
+    use std::time::Duration;
+
+    use super::await_with_optional_timeout;
+
+    #[tokio::test]
+    async fn zero_duration_skips_timeout_and_resolves_when_future_completes() {
+        // `Duration::ZERO` is the documented "0 disables" knob shared with
+        // TCP/TLS and DTLS frontends. The future must run to completion
+        // without being wrapped in `tokio::time::timeout`.
+        let result = await_with_optional_timeout(async { 42_u32 }, Duration::ZERO).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn nonzero_duration_returns_ok_when_future_completes_first() {
+        // Future resolves well before the deadline — the helper must surface
+        // the inner value via `Ok(...)`.
+        let result = await_with_optional_timeout(async { "ok" }, Duration::from_secs(60)).await;
+        assert_eq!(result.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn nonzero_duration_returns_elapsed_when_future_stalls() {
+        // The handshake bound *only* fires when the future never resolves
+        // within the deadline. A pending future + a tiny real timeout keeps
+        // the assertion deterministic without needing tokio's `test-util`
+        // feature on the dev-dependency.
+        let pending = std::future::pending::<()>();
+        let result = await_with_optional_timeout(pending, Duration::from_millis(50)).await;
+        assert!(result.is_err(), "expected Elapsed when the future stalls");
+    }
+}
+
+#[cfg(test)]
+mod build_h3_backend_headers_tests {
+    //! Regression tests for `build_h3_backend_headers` covering the RFC
+    //! 8470 §5.2 `Early-Data: 1` injection on the native H3 backend
+    //! dispatch path. The function is `fn` (module-private) so these
+    //! tests must live inline.
+    //!
+    //! Notes on test fixture:
+    //! - `ProxyState::new` requires a tokio runtime (it spawns health
+    //!   check tasks); empty `GatewayConfig` keeps the spawn list empty.
+    //! - The tests use `via_header_http3 = None` and
+    //!   `add_forwarded_header = false` (default `EnvConfig`) so the
+    //!   output vector contains only host + XFF + XFP + maybe XFH +
+    //!   the `Early-Data` header under test.
+    use std::collections::HashMap;
+
+    use super::build_h3_backend_headers;
+    use crate::config::EnvConfig;
+    use crate::config::types::{GatewayConfig, Proxy};
+    use crate::dns::{DnsCache, DnsConfig};
+    use crate::proxy::ProxyState;
+
+    fn minimal_proxy_state() -> ProxyState {
+        let dns_cache = DnsCache::new(DnsConfig::default());
+        let config = GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![],
+            consumers: vec![],
+            plugin_configs: vec![],
+            upstreams: vec![],
+            loaded_at: chrono::Utc::now(),
+            known_namespaces: Vec::new(),
+        };
+        ProxyState::new(config, dns_cache, EnvConfig::default(), None, None)
+            .expect("minimal ProxyState should construct")
+            .0
+    }
+
+    fn minimal_proxy() -> Proxy {
+        serde_json::from_value(serde_json::json!({
+            "backend_host": "backend.example",
+            "backend_port": 443,
+        }))
+        .expect("minimal proxy should deserialize")
+    }
+
+    fn header_present(
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        name: &str,
+    ) -> bool {
+        headers
+            .iter()
+            .any(|(n, _)| n.as_str().eq_ignore_ascii_case(name))
+    }
+
+    fn header_value<'a>(
+        headers: &'a [(http::header::HeaderName, http::header::HeaderValue)],
+        name: &str,
+    ) -> Option<&'a http::header::HeaderValue> {
+        headers
+            .iter()
+            .find(|(n, _)| n.as_str().eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    }
+
+    #[tokio::test]
+    async fn injects_early_data_header_when_request_is_zero_rtt() {
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("user-agent".to_string(), "test-client".to_string());
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            &state,
+            /* is_early_data = */ true,
+        );
+
+        assert!(
+            header_present(&out, "early-data"),
+            "Early-Data must be injected on outbound H3 backend request when ctx.is_early_data is true"
+        );
+        assert_eq!(
+            header_value(&out, "early-data").map(|v| v.as_bytes()),
+            Some(&b"1"[..]),
+            "RFC 8470 §5.2 mandates the value `1`"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_inject_early_data_header_for_normal_request() {
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("user-agent".to_string(), "test-client".to_string());
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            &state,
+            /* is_early_data = */ false,
+        );
+
+        assert!(
+            !header_present(&out, "early-data"),
+            "Early-Data must NOT be injected when the request is not 0-RTT"
+        );
+    }
+
+    #[tokio::test]
+    async fn strips_client_supplied_early_data_header_when_zero_rtt() {
+        // RFC 8470 §5.2: clients never set `Early-Data`; only intermediaries
+        // do. The gateway must strip and re-inject so the value is
+        // authoritative regardless of what the client sent.
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("early-data".to_string(), "0".to_string());
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            &state,
+            /* is_early_data = */ true,
+        );
+
+        let early_data_count = out
+            .iter()
+            .filter(|(n, _)| n.as_str() == "early-data")
+            .count();
+        assert_eq!(
+            early_data_count, 1,
+            "client-supplied Early-Data must not duplicate or survive — \
+             expected exactly one Early-Data: 1 from the gateway, got {early_data_count}"
+        );
+        assert_eq!(
+            header_value(&out, "early-data").map(|v| v.as_bytes()),
+            Some(&b"1"[..]),
+            "client's `0` must be replaced with the gateway's `1`"
+        );
+    }
+
+    #[tokio::test]
+    async fn strips_client_supplied_early_data_header_when_not_zero_rtt() {
+        // Even when `is_early_data == false`, the gateway must strip a
+        // client-supplied `Early-Data` header. A bogus client cannot
+        // trick the backend into believing the request was 0-RTT.
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("early-data".to_string(), "1".to_string());
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            &state,
+            /* is_early_data = */ false,
+        );
+
+        assert!(
+            !header_present(&out, "early-data"),
+            "client-supplied Early-Data must be stripped, and no value injected when is_early_data == false"
         );
     }
 }

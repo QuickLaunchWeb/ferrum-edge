@@ -43,6 +43,7 @@ The final TTL is always clamped to at least `FERRUM_DNS_MIN_TTL_SECONDS`.
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | `u64` | Disabled | Threshold in milliseconds above which DNS resolutions are logged as slow (`warn` level). Useful for diagnosing upstream DNS latency. When unset, no timing overhead is added. |
 | `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | `u8` | `90` | Percentage of TTL elapsed before the background refresh task proactively re-resolves an entry (1-99). At 90%, a 60s-TTL entry refreshes after 54s. Lower values add safety margin at the cost of more DNS queries. |
 | `FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS` | `u64` | `10` | Interval (seconds) for the background task that retries failed DNS lookups. Error-cached entries whose error TTL has expired are re-attempted at this interval. Logs at `warn` level for each retry attempt and outcome. Set to `0` to disable. |
+| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | `usize` | `64` | Maximum number of concurrent stale-while-revalidate background refresh tasks system-wide. Prevents unbounded task spawning when many distinct stale hostnames are hit simultaneously (e.g., a DNS storm after a long outage). When all permits are taken, additional refresh requests are skipped and the stale entry is served as-is until a permit frees up. Range: 1-1000. |
 
 ### System-Level DNS Settings
 
@@ -82,6 +83,8 @@ When a cached DNS entry expires (past its TTL), Ferrum Edge doesn't block the re
 3. **Expired** (past both TTL and `stale_ttl`): Perform a synchronous DNS lookup (blocking the request).
 
 This ensures that DNS resolution almost never blocks the hot request path, even when entries expire.
+
+Background refresh tasks are bounded by a system-wide semaphore (`FERRUM_DNS_MAX_CONCURRENT_REFRESHES`, default 64). When many distinct stale hostnames are hit simultaneously (e.g., after a prolonged DNS outage), at most this many refresh tasks run concurrently. Excess refresh requests are skipped -- the stale entry is served and the next request retries the semaphore. Per-hostname deduplication prevents duplicate refresh tasks for the same hostname.
 
 **Example:** With a DNS record that has a native 60s TTL and `FERRUM_DNS_STALE_TTL=3600`:
 - For the first 60 seconds: cached result served directly.

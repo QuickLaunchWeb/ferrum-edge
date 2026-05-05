@@ -77,6 +77,7 @@ impl DtlsClient {
             certificate,
             server_name,
             server_cert_verifier: None,
+            connect_timeout_ms: 15_000,
         };
 
         let inner = tokio::time::timeout(

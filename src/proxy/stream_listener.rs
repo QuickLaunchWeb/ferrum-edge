@@ -6,7 +6,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -14,10 +14,8 @@ use tracing::{error, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::types::{BackendScheme, GatewayConfig};
-use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
-use crate::load_balancer::LoadBalancerCache;
-use crate::plugin_cache::PluginCache;
+use crate::request_epoch::RequestEpochStore;
 use crate::tls::TlsPolicy;
 
 use super::tcp_proxy::{TcpListenerConfig, TcpProxyMetrics};
@@ -32,6 +30,26 @@ struct ListenerHandle {
     frontend_tls: bool,
     passthrough: bool,
     started: Arc<AtomicBool>,
+    udp_metrics: Option<Arc<UdpProxyMetrics>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct StreamListenerOverloadSnapshot {
+    pub dtls_demux_sessions_total: u64,
+    pub dtls_demux_sessions: Vec<DtlsDemuxSessionSnapshot>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct DtlsDemuxSessionSnapshot {
+    pub listener_key: String,
+    pub listen_port: u16,
+    pub sessions: u64,
+}
+
+struct DtlsDemuxMetricEntry {
+    listener_key: String,
+    listen_port: u16,
+    sessions: Arc<AtomicU64>,
 }
 
 /// Manages the set of active TCP/UDP stream listeners.
@@ -40,12 +58,11 @@ struct ListenerHandle {
 /// Reconciliation happens only on config reload — not on the hot request path.
 pub struct StreamListenerManager {
     listeners: tokio::sync::Mutex<std::collections::HashMap<String, ListenerHandle>>,
+    dtls_metrics: arc_swap::ArcSwap<Vec<DtlsDemuxMetricEntry>>,
     bind_addr: IpAddr,
     config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     dns_cache: DnsCache,
-    load_balancer_cache: Arc<LoadBalancerCache>,
-    consumer_index: Arc<ConsumerIndex>,
-    plugin_cache: Arc<PluginCache>,
+    request_epoch: Arc<RequestEpochStore>,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// Frontend TLS config for TCP stream proxies with `frontend_tls: true`.
     /// Uses `ArcSwap` because the TLS config may be loaded after `ProxyState::new()`
@@ -68,6 +85,8 @@ pub struct StreamListenerManager {
     /// Hard cap (seconds) on Phase 2 of the TCP bidirectional relay.
     /// Bounds the half-close drain even when `tcp_idle_timeout_seconds = 0`.
     tcp_half_close_max_wait_seconds: u64,
+    /// Frontend TLS handshake timeout in seconds for TCP+TLS stream listeners.
+    frontend_tls_handshake_timeout_seconds: u64,
     /// Maximum concurrent UDP sessions per proxy.
     udp_max_sessions: usize,
     /// UDP session cleanup interval in seconds.
@@ -96,23 +115,88 @@ pub struct StreamListenerManager {
     udp_gso_enabled: bool,
     /// Enable IP_PKTINFO / IPV6_PKTINFO on frontend UDP sockets.
     udp_pktinfo_enabled: bool,
+    /// Global shutdown receiver. When the gateway-wide SIGTERM/SIGINT fires,
+    /// every spawned listener observes it via this receiver in addition to the
+    /// per-listener `shutdown_tx` (which is only fired on config-driven removal).
+    ///
+    /// Stored in `ArcSwap` because it is injected after construction by
+    /// [`Self::set_global_shutdown_rx`] — `StreamListenerManager` is built
+    /// inside `ProxyState::new()` (synchronous) but the watch channel is
+    /// created in `main.rs` and threaded into each mode separately.
+    global_shutdown_rx: arc_swap::ArcSwap<Option<watch::Receiver<bool>>>,
 }
 
 impl StreamListenerManager {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn new(
         bind_addr: IpAddr,
         config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
         dns_cache: DnsCache,
-        load_balancer_cache: Arc<LoadBalancerCache>,
-        consumer_index: Arc<ConsumerIndex>,
-        plugin_cache: Arc<PluginCache>,
+        request_epoch: Arc<RequestEpochStore>,
         circuit_breaker_cache: Arc<CircuitBreakerCache>,
         frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
         tls_no_verify: bool,
         tls_ca_bundle_path: Option<String>,
         tcp_idle_timeout_seconds: u64,
         tcp_half_close_max_wait_seconds: u64,
+        frontend_tls_handshake_timeout_seconds: u64,
+        udp_max_sessions: usize,
+        udp_cleanup_interval_seconds: u64,
+        tls_policy: Option<Arc<TlsPolicy>>,
+        crls: crate::tls::CrlList,
+        adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
+        udp_recvmmsg_batch_size: usize,
+        tcp_fastopen_enabled: bool,
+        overload: Arc<crate::overload::OverloadState>,
+        ktls_enabled: bool,
+        io_uring_splice_enabled: bool,
+        so_busy_poll_us: u32,
+        udp_gro_enabled: bool,
+        udp_gso_enabled: bool,
+        udp_pktinfo_enabled: bool,
+    ) -> Self {
+        Self::new_with_epoch(
+            bind_addr,
+            config,
+            dns_cache,
+            request_epoch,
+            circuit_breaker_cache,
+            frontend_tls_config,
+            tls_no_verify,
+            tls_ca_bundle_path,
+            tcp_idle_timeout_seconds,
+            tcp_half_close_max_wait_seconds,
+            frontend_tls_handshake_timeout_seconds,
+            udp_max_sessions,
+            udp_cleanup_interval_seconds,
+            tls_policy,
+            crls,
+            adaptive_buffer,
+            udp_recvmmsg_batch_size,
+            tcp_fastopen_enabled,
+            overload,
+            ktls_enabled,
+            io_uring_splice_enabled,
+            so_busy_poll_us,
+            udp_gro_enabled,
+            udp_gso_enabled,
+            udp_pktinfo_enabled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_epoch(
+        bind_addr: IpAddr,
+        config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
+        dns_cache: DnsCache,
+        request_epoch: Arc<RequestEpochStore>,
+        circuit_breaker_cache: Arc<CircuitBreakerCache>,
+        frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
+        tls_no_verify: bool,
+        tls_ca_bundle_path: Option<String>,
+        tcp_idle_timeout_seconds: u64,
+        tcp_half_close_max_wait_seconds: u64,
+        frontend_tls_handshake_timeout_seconds: u64,
         udp_max_sessions: usize,
         udp_cleanup_interval_seconds: u64,
         tls_policy: Option<Arc<TlsPolicy>>,
@@ -130,12 +214,11 @@ impl StreamListenerManager {
     ) -> Self {
         Self {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            dtls_metrics: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
             bind_addr,
             config,
             dns_cache,
-            load_balancer_cache,
-            consumer_index,
-            plugin_cache,
+            request_epoch,
             circuit_breaker_cache,
             frontend_tls_config: arc_swap::ArcSwap::new(Arc::new(frontend_tls_config)),
             frontend_dtls_cert_key: arc_swap::ArcSwap::new(Arc::new(None)),
@@ -144,6 +227,7 @@ impl StreamListenerManager {
             tls_ca_bundle_path,
             tcp_idle_timeout_seconds,
             tcp_half_close_max_wait_seconds,
+            frontend_tls_handshake_timeout_seconds,
             udp_max_sessions,
             udp_cleanup_interval_seconds,
             tls_policy,
@@ -158,22 +242,51 @@ impl StreamListenerManager {
             udp_gro_enabled,
             udp_gso_enabled,
             udp_pktinfo_enabled,
+            global_shutdown_rx: arc_swap::ArcSwap::new(Arc::new(None)),
         }
+    }
+
+    /// Inject the gateway-wide shutdown receiver. Each subsequently spawned
+    /// stream listener (TCP/UDP/DTLS) will observe SIGTERM/SIGINT through this
+    /// receiver in addition to its private per-listener channel, so accept
+    /// loops exit promptly during graceful drain.
+    ///
+    /// Must be called once per mode after [`Self::new`] and BEFORE the first
+    /// `reconcile()` so listeners that bind on initial startup pick up the
+    /// receiver. Listeners spawned by later reconciles also pick it up via
+    /// the `ArcSwap` load.
+    pub fn set_global_shutdown_rx(&self, rx: watch::Receiver<bool>) {
+        self.global_shutdown_rx.store(Arc::new(Some(rx)));
     }
 
     /// Update the frontend TLS configuration used for TCP stream proxies with `frontend_tls: true`.
     ///
-    /// Call this once the gateway's TLS certificates are loaded, then call
-    /// `reconcile()` to restart any listeners that need frontend TLS.
-    pub fn set_frontend_tls_config(&self, tls_config: Option<Arc<rustls::ServerConfig>>) {
+    /// After storing the config, automatically reconciles stream listeners so
+    /// any previously deferred TCP listeners (waiting for TLS) are started.
+    /// This is safe to call before the first `reconcile()` — the reconcile is
+    /// a no-op when there are no stream proxies in the config yet.
+    pub async fn set_frontend_tls_config(&self, tls_config: Option<Arc<rustls::ServerConfig>>) {
+        let is_some = tls_config.is_some();
         self.frontend_tls_config.store(Arc::new(tls_config));
+        // Reconcile to start any listeners that were deferred due to missing TLS config.
+        if is_some {
+            let failures = self.reconcile().await;
+            for (proxy_id, port, err) in &failures {
+                warn!(
+                    proxy_id = %proxy_id,
+                    port = port,
+                    "Stream listener failed to bind after TLS config loaded: {}",
+                    err
+                );
+            }
+        }
     }
 
     /// Update the DTLS cert/key paths used for UDP stream proxies with `frontend_tls: true`.
     ///
-    /// Call this after loading DTLS certificates, then call `reconcile()` to start
-    /// any deferred DTLS frontend listeners.
-    pub fn set_frontend_dtls_cert_key(
+    /// After storing the config, automatically reconciles stream listeners so
+    /// any previously deferred UDP/DTLS listeners are started.
+    pub async fn set_frontend_dtls_cert_key(
         &self,
         cert_path: String,
         key_path: String,
@@ -183,6 +296,16 @@ impl StreamListenerManager {
             .store(Arc::new(Some((cert_path, key_path))));
         self.frontend_dtls_client_ca_path
             .store(Arc::new(client_ca_cert_path));
+        // Reconcile to start any listeners that were deferred due to missing DTLS config.
+        let failures = self.reconcile().await;
+        for (proxy_id, port, err) in &failures {
+            warn!(
+                proxy_id = %proxy_id,
+                port = port,
+                "Stream listener failed to bind after DTLS config loaded: {}",
+                err
+            );
+        }
     }
 
     /// Reconcile active listeners against the current config.
@@ -315,7 +438,9 @@ impl StreamListenerManager {
 
             // Skip frontend_tls proxies when the required encryption config is not yet loaded.
             // For TCP: needs rustls ServerConfig. For UDP: needs DTLS cert/key paths.
-            // The mode will call reconcile() again after setting the config.
+            // The set_frontend_tls_config() / set_frontend_dtls_cert_key() methods
+            // automatically call reconcile() after storing the config, so deferred
+            // listeners will be started once TLS materials arrive.
             // Passthrough proxies never terminate TLS, so they skip this check entirely.
             if *frontend_tls && !*passthrough {
                 if scheme.is_udp() {
@@ -367,12 +492,15 @@ impl StreamListenerManager {
             let proxy_id_owned = proxy_id.clone();
             let config = self.config.clone();
             let dns_cache = self.dns_cache.clone();
-            let lb_cache = self.load_balancer_cache.clone();
+            let request_epoch = self.request_epoch.clone();
             let tls_no_verify = self.tls_no_verify;
             let cb_cache = self.circuit_breaker_cache.clone();
             let started = Arc::new(AtomicBool::new(false));
+            // Clone the global shutdown receiver (if injected) so the spawned
+            // listener observes both per-listener removal AND global SIGTERM.
+            let global_shutdown = self.global_shutdown_rx.load().as_ref().clone();
 
-            let join_handle = if scheme.is_udp() {
+            let (join_handle, udp_metrics) = if scheme.is_udp() {
                 let started_for_listener = started.clone();
                 // UDP or DTLS listener
                 // Passthrough proxies forward raw encrypted datagrams — no DTLS termination.
@@ -408,9 +536,8 @@ impl StreamListenerManager {
                 };
                 let metrics = Arc::new(UdpProxyMetrics::default());
                 let udp_max_sessions = self.udp_max_sessions;
+                let frontend_tls_handshake_timeout = self.frontend_tls_handshake_timeout_seconds;
                 let udp_cleanup_interval = self.udp_cleanup_interval_seconds;
-                let consumer_index = self.consumer_index.clone();
-                let plugin_cache = self.plugin_cache.clone();
                 let crls = self.crls.clone();
                 let sni_ids = sni_ids.clone();
                 let adaptive_buf = self.adaptive_buffer.clone();
@@ -420,22 +547,23 @@ impl StreamListenerManager {
                 let udp_gro_enabled = self.udp_gro_enabled;
                 let udp_gso_enabled = self.udp_gso_enabled;
                 let udp_pktinfo_enabled = self.udp_pktinfo_enabled;
-                tokio::spawn(async move {
+                let listener_udp_metrics = Some(metrics.clone());
+                let global_shutdown_for_listener = global_shutdown.clone();
+                let join_handle = tokio::spawn(async move {
                     if let Err(e) = super::udp_proxy::start_udp_listener(UdpListenerConfig {
                         port: port_val,
                         bind_addr,
                         proxy_id: proxy_id_owned.clone(),
-                        config,
                         dns_cache,
-                        load_balancer_cache: lb_cache,
-                        consumer_index,
+                        request_epoch,
                         shutdown: shutdown_rx,
+                        global_shutdown: global_shutdown_for_listener,
                         metrics,
                         frontend_dtls_config,
                         tls_no_verify,
                         max_sessions: udp_max_sessions,
+                        frontend_tls_handshake_timeout_seconds: frontend_tls_handshake_timeout,
                         cleanup_interval_seconds: udp_cleanup_interval,
-                        plugin_cache,
                         circuit_breaker_cache: cb_cache,
                         crls,
                         started: started_for_listener,
@@ -457,7 +585,8 @@ impl StreamListenerManager {
                             e
                         );
                     }
-                })
+                });
+                (join_handle, listener_udp_metrics)
             } else {
                 let started_for_listener = started.clone();
                 // TCP or TcpTls listener
@@ -468,10 +597,9 @@ impl StreamListenerManager {
                     None
                 };
                 let metrics = Arc::new(TcpProxyMetrics::default());
-                let consumer_index = self.consumer_index.clone();
-                let plugin_cache = self.plugin_cache.clone();
                 let tcp_idle_timeout = self.tcp_idle_timeout_seconds;
                 let tcp_half_close_max_wait = self.tcp_half_close_max_wait_seconds;
+                let frontend_tls_handshake_timeout = self.frontend_tls_handshake_timeout_seconds;
                 let tls_policy = self.tls_policy.clone();
                 let crls = self.crls.clone();
                 let tls_ca_bundle_path = self.tls_ca_bundle_path.clone();
@@ -481,23 +609,24 @@ impl StreamListenerManager {
                 let overload = self.overload.clone();
                 let ktls_enabled = self.ktls_enabled;
                 let io_uring_splice_enabled = self.io_uring_splice_enabled;
-                tokio::spawn(async move {
+                let global_shutdown_for_listener = global_shutdown.clone();
+                let join_handle = tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
                         bind_addr,
                         proxy_id: proxy_id_owned.clone(),
                         config,
                         dns_cache,
-                        load_balancer_cache: lb_cache,
-                        consumer_index,
+                        request_epoch,
                         frontend_tls_config: tls_config,
                         shutdown: shutdown_rx,
+                        global_shutdown: global_shutdown_for_listener,
                         metrics,
                         tls_no_verify,
                         tls_ca_bundle_path,
-                        plugin_cache,
                         tcp_idle_timeout_seconds: tcp_idle_timeout,
                         tcp_half_close_max_wait_seconds: tcp_half_close_max_wait,
+                        frontend_tls_handshake_timeout_seconds: frontend_tls_handshake_timeout,
                         circuit_breaker_cache: cb_cache,
                         tls_policy,
                         crls,
@@ -518,7 +647,8 @@ impl StreamListenerManager {
                             e
                         );
                     }
-                })
+                });
+                (join_handle, None)
             };
 
             info!(
@@ -539,11 +669,50 @@ impl StreamListenerManager {
                     frontend_tls: *frontend_tls,
                     passthrough: *passthrough,
                     started,
+                    udp_metrics,
                 },
             );
         }
 
+        let mut dtls_entries: Vec<DtlsDemuxMetricEntry> = listeners
+            .iter()
+            .filter(|(_, h)| h.frontend_tls)
+            .filter_map(|(key, h)| {
+                h.udp_metrics.as_ref().map(|m| DtlsDemuxMetricEntry {
+                    listener_key: key.clone(),
+                    listen_port: h.listen_port,
+                    sessions: m.dtls_demux_sessions.clone(),
+                })
+            })
+            .collect();
+        dtls_entries.sort_by(|a, b| a.listener_key.cmp(&b.listener_key));
+        self.dtls_metrics.store(Arc::new(dtls_entries));
+
         bind_failures
+    }
+
+    /// Lightweight stream-listener diagnostics included in the admin `/overload`
+    /// response. Lock-free: reads pre-built metric references from an `ArcSwap`
+    /// updated during reconciliation, so this never contends with config reloads.
+    pub fn overload_snapshot(&self) -> StreamListenerOverloadSnapshot {
+        let entries = self.dtls_metrics.load();
+        let mut dtls_demux_sessions = Vec::with_capacity(entries.len());
+        let mut dtls_demux_sessions_total = 0;
+
+        for entry in entries.iter() {
+            let sessions = entry.sessions.load(Ordering::Relaxed);
+            dtls_demux_sessions_total += sessions;
+            dtls_demux_sessions.push(DtlsDemuxSessionSnapshot {
+                listener_key: entry.listener_key.clone(),
+                listen_port: entry.listen_port,
+                sessions,
+            });
+        }
+
+        StreamListenerOverloadSnapshot {
+            dtls_demux_sessions_total,
+            dtls_demux_sessions,
+        }
     }
 
     /// Wait until all currently configured stream listeners have successfully
@@ -619,7 +788,14 @@ impl StreamListenerManager {
     }
 
     /// Shut down all active stream listeners.
-    #[allow(dead_code)] // Called during gateway shutdown
+    ///
+    /// Called from each mode's graceful-shutdown path AFTER HTTP listener
+    /// handles have been awaited and BEFORE `wait_for_drain` runs. The
+    /// per-listener watch channel fires alongside the global SIGTERM channel
+    /// (see [`Self::set_global_shutdown_rx`]) so accept loops exit promptly
+    /// regardless of which signal arrives first; calling this here also
+    /// ensures the `JoinHandle` set is cleared even when the global channel
+    /// is not injected (e.g. unit tests that build a manager standalone).
     pub async fn shutdown_all(&self) {
         let mut listeners = self.listeners.lock().await;
         for (proxy_id, handle) in listeners.drain() {

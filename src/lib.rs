@@ -33,6 +33,7 @@ pub mod plugin_cache;
 pub mod plugins;
 pub mod pool;
 pub mod proxy;
+pub mod request_epoch;
 pub mod retry;
 pub mod router_cache;
 pub mod secrets;
@@ -41,6 +42,7 @@ pub mod socket_opts;
 pub mod startup;
 pub mod tls;
 pub mod tls_offload;
+pub mod util;
 
 pub use admin::api_specs::ExtractedBundle;
 pub use admin::spec_codec::{compress_gzip, decompress_gzip_capped, sha256_hex};
@@ -205,6 +207,26 @@ pub mod _test_support {
         config.url_with_resolved_ip(ip)
     }
 
+    /// Username/password observed on the [`redis::Client`] built from `config + url`.
+    ///
+    /// Returns `(username, password)` as parsed/injected by `build_client`. Tests
+    /// use this to assert that explicit `username`/`password` fields override the
+    /// userinfo encoded in `RedisConfig::url`, and that URL-embedded creds flow
+    /// through when the explicit fields are `None`.
+    pub fn redis_client_credentials(
+        config: RedisConfig,
+        url: &str,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        use crate::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
+        let client = RedisRateLimitClient::new(config, None, false, None);
+        let redis_client = client.build_client(url).map_err(|e| e.to_string())?;
+        let info = redis_client.get_connection_info();
+        Ok((
+            info.redis_settings().username().map(|s| s.to_string()),
+            info.redis_settings().password().map(|s| s.to_string()),
+        ))
+    }
+
     // ── config/db_loader ─────────────────────────────────────────────────────
     pub use crate::config::db_loader::DbPoolConfig;
 
@@ -222,6 +244,14 @@ pub mod _test_support {
 
     pub fn parse_auth_mode(s: &str) -> AuthMode {
         crate::config::db_loader::parse_auth_mode(s)
+    }
+
+    pub fn statement_timeout_sql(
+        timeout_seconds: u64,
+        is_postgres: bool,
+        is_mysql: bool,
+    ) -> Option<String> {
+        crate::config::db_loader::statement_timeout_sql(timeout_seconds, is_postgres, is_mysql)
     }
 
     // ── plugins/grpc_web ─────────────────────────────────────────────────────

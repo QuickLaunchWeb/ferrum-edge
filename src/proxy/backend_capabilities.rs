@@ -601,6 +601,162 @@ mod tests {
     }
 
     #[test]
+    fn record_default_starts_with_no_probe_error() {
+        // Regression guard: the periodic refresh path in
+        // `probe_backend_capabilities` (src/proxy/mod.rs) constructs
+        // `BackendCapabilityRecord::default()` per probe and only writes
+        // to `last_probe_error` on genuine probe failure. If `Default`
+        // ever started carrying a non-None error, every successful
+        // refresh would leak a phantom error string into the admin
+        // `GET /backend-capabilities` payload.
+        let record = BackendCapabilityRecord::default();
+        assert!(record.last_probe_error.is_none());
+    }
+
+    #[test]
+    fn successful_refresh_clears_last_probe_error_after_h3_downgrade() {
+        // Regression guard for the admin `last_probe_error` surface.
+        //
+        // Sequence:
+        //   1. A request-path H3 failure stamps `last_probe_error` via
+        //      `mark_h3_unsupported`.
+        //   2. The next periodic refresh re-probes the backend and
+        //      finds it healthy. The refresh path constructs a fresh
+        //      `BackendCapabilityRecord::default()` (pre-cleared
+        //      `last_probe_error`) and `upsert()`s it whole, replacing
+        //      the prior record.
+        //
+        // The post-refresh entry must NOT carry the old error string.
+        // If a future refactor switched `upsert` to a partial merge,
+        // or made the refresh mutate the existing record in place
+        // without explicitly clearing `last_probe_error`, operators
+        // would see a stale "H3 downgraded after connection/protocol
+        // failure" message indefinitely after the backend recovered —
+        // that's the exact misleading-output regression we guard
+        // against here.
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = minimal_proxy();
+        let key = capability_key(&proxy);
+
+        let mut prior = BackendCapabilityRecord::default();
+        prior.plain_http.h3 = ProtocolSupport::Supported;
+        prior.plain_http.h2_tls = ProtocolSupport::Supported;
+        registry.upsert(key.clone(), prior);
+
+        // Simulate a request-path H3 failure that downgrades H3 + stamps the error.
+        registry.mark_h3_unsupported(&proxy, None);
+
+        // Stamp a known-old `last_probe_at_unix_secs` into the downgraded
+        // record so we can later assert the refresh advanced past it.
+        // `now_unix_secs()` resolves to whole seconds, so two calls within
+        // the same test run typically collapse to the same value — the
+        // explicit `STALE_TS = 1` sentinel makes the timestamp-advance
+        // invariant testable without sleeping for a full second.
+        const STALE_TS: u64 = 1;
+        let mut downgraded = (*registry.get(&proxy, None).expect("entry")).clone();
+        assert!(
+            downgraded.last_probe_error.is_some(),
+            "precondition: downgrade must have stamped last_probe_error"
+        );
+        downgraded.last_probe_at_unix_secs = STALE_TS;
+        registry.upsert(key.clone(), downgraded);
+
+        // Simulate a successful periodic refresh: the refresh code
+        // builds a fresh `BackendCapabilityRecord::default()` (whose
+        // `last_probe_error` is already None and whose
+        // `last_probe_at_unix_secs` comes from `now_unix_secs()`) and
+        // upserts it whole.
+        let mut refreshed = BackendCapabilityRecord::default();
+        refreshed.plain_http.h3 = ProtocolSupport::Supported;
+        refreshed.plain_http.h2_tls = ProtocolSupport::Supported;
+        registry.upsert(key, refreshed);
+
+        let fetched = registry.get(&proxy, None).expect("entry must exist");
+        assert!(
+            fetched.last_probe_error.is_none(),
+            "successful refresh must clear stale last_probe_error from prior downgrade"
+        );
+        // Timestamp-freshness invariant: a future refactor that mutates
+        // the existing record in place to clear the error string but
+        // forgets to update the timestamp (or vice versa) must fail this
+        // test. `> STALE_TS` is sufficient — `now_unix_secs()` is
+        // guaranteed to exceed `1` for any reasonable wall clock.
+        assert!(
+            fetched.last_probe_at_unix_secs > STALE_TS,
+            "successful refresh must advance last_probe_at_unix_secs (was {STALE_TS}, now {})",
+            fetched.last_probe_at_unix_secs,
+        );
+        assert_eq!(fetched.plain_http.h3, ProtocolSupport::Supported);
+        assert_eq!(fetched.plain_http.h2_tls, ProtocolSupport::Supported);
+    }
+
+    #[test]
+    fn successful_refresh_clears_last_probe_error_after_h2_tls_downgrade() {
+        // Same regression intent as the H3 variant, but starting from an
+        // ALPN-driven HTTP/1.1 fallback signal that landed via
+        // `mark_h2_tls_unsupported`. A subsequent successful refresh
+        // (backend now serving H2 again) must not leak the old
+        // "H2/TLS downgraded after ALPN-negotiated HTTP/1.1" string out
+        // through `GET /backend-capabilities`.
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = minimal_proxy();
+        let key = capability_key(&proxy);
+
+        let mut prior = BackendCapabilityRecord::default();
+        prior.plain_http.h2_tls = ProtocolSupport::Supported;
+        prior.grpc_transport.h2_tls = ProtocolSupport::Supported;
+        registry.upsert(key.clone(), prior);
+
+        registry.mark_h2_tls_unsupported(&proxy, None);
+
+        // See `successful_refresh_clears_last_probe_error_after_h3_downgrade`
+        // for the rationale behind the stale-timestamp sentinel.
+        const STALE_TS: u64 = 1;
+        let mut downgraded = (*registry.get(&proxy, None).expect("entry")).clone();
+        assert!(downgraded.last_probe_error.is_some());
+        downgraded.last_probe_at_unix_secs = STALE_TS;
+        registry.upsert(key.clone(), downgraded);
+
+        let mut refreshed = BackendCapabilityRecord::default();
+        refreshed.plain_http.h2_tls = ProtocolSupport::Supported;
+        refreshed.grpc_transport.h2_tls = ProtocolSupport::Supported;
+        registry.upsert(key, refreshed);
+
+        let fetched = registry.get(&proxy, None).expect("entry must exist");
+        assert!(
+            fetched.last_probe_error.is_none(),
+            "successful refresh must clear stale last_probe_error from prior H2 downgrade"
+        );
+        assert!(
+            fetched.last_probe_at_unix_secs > STALE_TS,
+            "successful refresh must advance last_probe_at_unix_secs (was {STALE_TS}, now {})",
+            fetched.last_probe_at_unix_secs,
+        );
+        assert_eq!(fetched.plain_http.h2_tls, ProtocolSupport::Supported);
+        assert_eq!(fetched.grpc_transport.h2_tls, ProtocolSupport::Supported);
+    }
+
+    #[test]
+    fn successful_refresh_from_clean_registry_has_no_probe_error() {
+        // Sanity guard: a successful first refresh against a previously
+        // unseen target must never invent a `last_probe_error`. Catches
+        // the obvious regression of `Default` accidentally seeding the
+        // field, or the refresh path stamping a default error message
+        // even on success.
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = minimal_proxy();
+        let key = capability_key(&proxy);
+
+        let mut refreshed = BackendCapabilityRecord::default();
+        refreshed.plain_http.h2_tls = ProtocolSupport::Supported;
+        refreshed.plain_http.h3 = ProtocolSupport::Supported;
+        registry.upsert(key, refreshed);
+
+        let fetched = registry.get(&proxy, None).expect("entry must exist");
+        assert!(fetched.last_probe_error.is_none());
+    }
+
+    #[test]
     fn registry_retain_keys_keeps_active_entries() {
         let registry = BackendCapabilityRegistry::new();
         let proxy = minimal_proxy();

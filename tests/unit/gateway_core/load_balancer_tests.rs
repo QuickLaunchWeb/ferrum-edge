@@ -723,12 +723,12 @@ fn test_least_latency_target_unhealthy_at_startup_then_recovers() {
 
     // host2 has 0 samples, but host0/host1 are warmed up.
     // The algorithm should NOT regress to round-robin for all traffic.
-    // Instead, host2 should be slightly favored (min EWMA - 1) to get
-    // traffic and establish a real baseline.
+    // Instead, host2 should be favored (min EWMA - LATENCY_WARMUP_BIAS_US)
+    // to get traffic and establish a real baseline.
     let sel = lb.select("", Some(&active_health_ctx(&unhealthy))).unwrap();
     assert_eq!(
         sel.target.host, "host2",
-        "Recovered host2 should be slightly favored as a late joiner to establish baseline, got {}",
+        "Recovered host2 should be favored as a late joiner to establish baseline, got {}",
         sel.target.host
     );
 
@@ -777,8 +777,8 @@ fn test_least_latency_late_joiner_does_not_disrupt_routing() {
         .store(0, Ordering::Relaxed);
 
     // The algorithm should NOT fall back to pure round-robin.
-    // host0 (unwarmed) gets min EWMA - 1, so it should be slightly favored
-    // to establish its real baseline.
+    // host0 (unwarmed) gets min EWMA - LATENCY_WARMUP_BIAS_US, so it should
+    // be favored to establish its real baseline.
     let sel = lb.select("", None).unwrap();
     assert_eq!(
         sel.target.host, "host0",
@@ -794,6 +794,87 @@ fn test_least_latency_late_joiner_does_not_disrupt_routing() {
     assert_eq!(
         sel.target.host, "host1",
         "After late joiner warms up with higher latency, host1 should be preferred"
+    );
+}
+
+#[test]
+fn test_least_latency_warmup_bias_applied_to_unsampled_target() {
+    // Verify that the LATENCY_WARMUP_BIAS_US constant is applied via
+    // saturating_sub when selecting among a mix of warmed and unsampled
+    // targets.  The unsampled target gets `min_known_ewma - bias`, which
+    // is strictly less than any warmed EWMA when min_known_ewma > bias.
+    //
+    // Note: any nonzero bias (including 1) produces the same winner --
+    // `saturating_sub(N)` for N >= 1 always yields a value < min_known_ewma
+    // when min_known_ewma > 0.  The named constant (1000 us = 1 ms)
+    // documents the intended preference gap without changing selection
+    // outcomes.
+    let targets = make_targets(3);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
+
+    // Warm up host0 and host1 with low latencies (1.5ms and 2ms).
+    // min_known_ewma converges to ~1500 us after 10 samples.
+    for _ in 0..10 {
+        lb.record_latency(&targets[0], 1_500); // 1.5ms
+        lb.record_latency(&targets[1], 2_000); // 2ms
+    }
+
+    // host2 has 0 samples -- the bias makes its effective latency
+    // ~1500 - 1000 = ~500 us, strictly below both warmed targets.
+    let sel = lb.select("", None).unwrap();
+    assert_eq!(
+        sel.target.host, "host2",
+        "Unsampled host2 should be selected via warm-up bias"
+    );
+
+    // Confirm host0's EWMA is in the expected range (sanity check that
+    // the EWMA arithmetic converged and the bias subtracted from a
+    // meaningful value).
+    let host0_ewma = lb
+        .latency_ewma
+        .get("host0:8080")
+        .unwrap()
+        .load(Ordering::Relaxed);
+    assert!(
+        host0_ewma >= 1_000,
+        "host0 EWMA should be at least 1000 us, got {}",
+        host0_ewma
+    );
+}
+
+#[test]
+fn test_least_latency_warmup_bias_saturates_to_zero() {
+    // When min_known_ewma < LATENCY_WARMUP_BIAS_US, saturating_sub
+    // clamps to 0.  The unsampled target still wins because 0 < any
+    // positive warmed EWMA.
+    //
+    // This also covers the edge case where min_known_ewma == 0: both
+    // the old bias (1) and the new bias (1000) saturate to 0, producing
+    // a tie broken by iteration order (first-in-list wins).
+    let targets = make_targets(2);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
+
+    // Warm up host0 with a sub-millisecond latency (500 us).
+    // min_known_ewma = 500, bias = 1000, so 500.saturating_sub(1000) = 0.
+    // 0 < 500, so unsampled host1 still wins.
+    for _ in 0..10 {
+        lb.record_latency(&targets[0], 500);
+    }
+
+    let sel = lb.select("", None).unwrap();
+    assert_eq!(
+        sel.target.host, "host1",
+        "Unsampled host1 should win even when bias saturates to 0"
     );
 }
 

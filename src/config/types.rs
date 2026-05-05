@@ -85,6 +85,12 @@ pub const MAX_TIMEOUT_MS: u64 = 86_400_000;
 pub const MAX_TIMEOUT_SECONDS: u64 = 86_400;
 /// Maximum for threshold fields (circuit breaker, health checks).
 pub const MAX_THRESHOLD: u32 = 10_000;
+/// Maximum entries in the passive health recent_failures map per target.
+/// Prevents unbounded memory growth during cascading failure scenarios.
+/// Also acts as the upper bound for `PassiveHealthCheck::unhealthy_threshold`
+/// validation — a threshold above this cap could never trip reliably because
+/// the map is hard-capped at this size.
+pub const MAX_RECENT_FAILURES_PER_TARGET: usize = 1000;
 /// Maximum retry count.
 pub const MAX_RETRIES: u32 = 100;
 /// Maximum backoff delay in milliseconds (5 minutes).
@@ -3678,7 +3684,7 @@ impl HealthCheckConfig {
                 "passive.unhealthy_threshold",
                 passive.unhealthy_threshold,
                 1,
-                MAX_THRESHOLD,
+                MAX_RECENT_FAILURES_PER_TARGET as u32,
             ) {
                 errors.push(e);
             }
@@ -3929,6 +3935,27 @@ impl GatewayConfig {
                         "Proxy '{}': backend_host IP {} denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
                         proxy.id, ip, backend_allow_ips
                     ));
+                }
+                if let Some(ref dns_override) = proxy.dns_override {
+                    match dns_override.parse::<std::net::IpAddr>() {
+                        Ok(ip) => {
+                            if !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips) {
+                                errors.push(format!(
+                                    "Proxy '{}': dns_override IP {} denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
+                                    proxy.id, ip, backend_allow_ips
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Proxy '{}': dns_override '{}' is not an IP address, so startup cannot classify it under FERRUM_BACKEND_ALLOW_IPS={} policy: {}",
+                                proxy.id,
+                                dns_override,
+                                backend_allow_ips,
+                                e
+                            );
+                        }
+                    }
                 }
             }
             for upstream in &self.upstreams {

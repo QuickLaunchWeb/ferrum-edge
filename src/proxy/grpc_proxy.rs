@@ -28,13 +28,14 @@ use hyper::Request;
 use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
 
@@ -44,6 +45,7 @@ use crate::dns::{DnsCache, DnsConfig};
 use crate::pool::{GenericPool, PoolManager};
 use crate::proxy::headers::{
     is_backend_response_strip_header, merge_proxy_headers_and_strip_for_grpc,
+    parse_connection_listed_headers,
 };
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{BackendTlsConfigBuilder, BackendTlsConfigCache};
@@ -58,6 +60,18 @@ pub enum GrpcBody {
     /// When `max_bytes > 0`, tracks accumulated bytes and sets the shared
     /// `exceeded` flag if the limit is breached. The caller checks the flag
     /// after `send_request()` completes to return a proper gRPC error.
+    ///
+    /// **Thread-safety of `bytes_seen: usize`**: this counter is only read
+    /// and written inside `poll_frame()`, which requires `Pin<&mut Self>`.
+    /// The mutable-borrow requirement guarantees exclusive ownership, making
+    /// concurrent polling structurally impossible regardless of which task
+    /// drives the poll. Cross-task signaling uses the
+    /// separate `exceeded: Arc<AtomicBool>` flag. This matches the
+    /// `SizeLimitedStreamingResponse` pattern in `body.rs`, which also
+    /// uses a plain `usize` for the same reason. Contrast with
+    /// `SizeLimitedIncoming`, which needs `Arc<AtomicU64>` because callers
+    /// observe `bytes_seen` from another task after `into_reqwest_body()`
+    /// moves ownership — `GrpcBody` has no such cross-task read path.
     Streaming {
         incoming: Incoming,
         bytes_seen: usize,
@@ -125,6 +139,39 @@ impl http_body::Body for GrpcBody {
             GrpcBody::Streaming { incoming, .. } => incoming.size_hint(),
         }
     }
+}
+
+thread_local! {
+    /// Reused per-thread buffer for gRPC pool-key construction on the
+    /// request hot path. Mirrors the zero-allocation strategy used by
+    /// `HTTP2_POOL_KEY_BUF` in `http2_pool.rs` so `get_sender()` performs
+    /// zero `String` allocations on cache-hit calls from the same tokio
+    /// worker thread.
+    ///
+    /// The buffer is reset before each lookup. Owned `String` keys are still
+    /// produced via `.clone()` on the cache-miss path (cold start, new
+    /// backends), so the allocation moves off the cache-hit fast path
+    /// entirely.
+    ///
+    /// Cannot be borrowed across `await`. `with_grpc_pool_key` and the
+    /// pre-/post-await scopes in `get_sender` keep every `borrow_mut()`
+    /// inside a synchronous block.
+    static GRPC_POOL_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(128));
+}
+
+/// Run `f` against a thread-local buffer pre-populated with the gRPC pool
+/// key for `proxy` (no shard suffix). Callers can append `#<shard>` via
+/// `write_grpc_shard_key_inplace` using `buf.len()` as `base_len`.
+///
+/// The closure must be synchronous -- the underlying `RefCell::borrow_mut`
+/// cannot cross an `.await`. `now_or_never(...)` polling and DashMap
+/// lookups are fine.
+fn with_grpc_pool_key<R>(proxy: &Proxy, f: impl FnOnce(&mut String) -> R) -> R {
+    GRPC_POOL_KEY_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        write_grpc_pool_key(&mut buf, &proxy.backend_host, proxy.backend_port, proxy);
+        f(&mut buf)
+    })
 }
 
 fn write_grpc_pool_key(buf: &mut String, host: &str, port: u16, proxy: &Proxy) {
@@ -225,6 +272,7 @@ impl GrpcConnectionPool {
     ) -> Self {
         let cleanup_interval =
             Duration::from_secs(global_env_config.pool_cleanup_interval_seconds.max(1));
+        let shards = crate::util::sharding::pool_shard_amount(global_env_config.pool_shard_amount);
         let manager = Arc::new(GrpcPoolManager {
             global_pool_config: global_pool_config.clone(),
             global_env_config,
@@ -235,8 +283,8 @@ impl GrpcConnectionPool {
         });
 
         Self {
-            pool: GenericPool::new(manager, global_pool_config, cleanup_interval),
-            rr_counters: Arc::new(DashMap::new()),
+            pool: GenericPool::new(manager, global_pool_config, cleanup_interval, shards),
+            rr_counters: Arc::new(DashMap::with_shard_amount(shards)),
         }
     }
 
@@ -255,6 +303,11 @@ impl GrpcConnectionPool {
     ///
     /// Writes the base key (without shard suffix) into `buf`. For shard keys,
     /// `write_shard_key_inplace()` appends `#N` by truncating to the base length.
+    ///
+    /// Not called directly after the thread-local buffer refactor (the free
+    /// function `with_grpc_pool_key` calls `write_grpc_pool_key` instead),
+    /// but retained for parity with the HTTP2 pool's internal API surface.
+    #[allow(dead_code)]
     fn write_pool_key(buf: &mut String, proxy: &Proxy) {
         write_grpc_pool_key(buf, &proxy.backend_host, proxy.backend_port, proxy);
     }
@@ -284,56 +337,90 @@ impl GrpcConnectionPool {
         &self,
         proxy: &Proxy,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
-        let manager = self.pool.manager();
-        let pool_config = manager.global_pool_config.for_proxy(proxy);
+        let pool_config = self.pool.manager().global_pool_config.for_proxy(proxy);
         let shard_count = pool_config.http2_connections_per_host.max(1);
 
-        let mut key_buf = String::with_capacity(128);
-        Self::write_pool_key(&mut key_buf, proxy);
-        let base_len = key_buf.len();
+        // Phase 1 (synchronous): build the pool key in the thread-local
+        // buffer, pick a starting shard via the per-host RR counter, and
+        // probe every shard for an immediately-ready sender. On a cache hit
+        // we return early without ever cloning the key. On a miss we clone
+        // the buffer once into `selected_key` so the await below has an
+        // owned String to hand to `create_or_get_existing_owned`.
+        //
+        // The closure body is synchronous — `now_or_never(sender.ready())`
+        // polls once without yielding, and DashMap lookups never await — so
+        // the `RefCell::borrow_mut()` lifetime stays inside this block.
+        let phase1 = with_grpc_pool_key(proxy, |key_buf| -> GrpcPhase1 {
+            let base_len = key_buf.len();
 
-        // Seed the per-host round-robin counter with a thread-local xorshift
-        // draw so a burst of concurrent gRPC calls on a cold pool fans across
-        // shards from request #1. This matters for gRPC tail latency: under
-        // high concurrency with only 2-4 shards, all requests start by
-        // targeting the same shard if the seed is 0, which creates a queue
-        // behind the first in-flight RPC (p99 = 732 ms at 500 KB payloads).
-        let rr = match self.rr_counters.get(&key_buf) {
-            Some(existing) => existing.value().clone(),
-            None => self
-                .rr_counters
-                .entry(key_buf[..base_len].to_owned())
-                .or_insert_with(|| Arc::new(AtomicUsize::new(crate::proxy::http2_pool::rr_seed())))
-                .clone(),
-        };
-        let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
+            // Round-robin counter is per-host, but on FIRST access we seed it
+            // with a thread-local PRNG offset so a burst of concurrent
+            // requests on a cold pool does not land all on shard 0 before
+            // the atomic counter wraps around. `AtomicUsize::fetch_add(1,
+            // Relaxed)` is wait-free after the seed — the seed only matters
+            // for the first `shard_count` picks per host on this gateway.
+            let rr = match self.rr_counters.get(key_buf.as_str()) {
+                Some(existing) => existing.value().clone(),
+                // Cold-path allocation: `to_owned()` runs only on the first
+                // request to a given backend host — subsequent requests find
+                // the existing entry via the `get()` above.
+                None => self
+                    .rr_counters
+                    .entry(key_buf[..base_len].to_owned())
+                    .or_insert_with(|| {
+                        Arc::new(AtomicUsize::new(crate::proxy::http2_pool::rr_seed()))
+                    })
+                    .clone(),
+            };
+            let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
 
-        // Cheap probe pass — any shard whose cached sender is immediately
-        // ready wins. `now_or_never` never awaits, so this is a quick sweep
-        // of the shard ring with no per-shard stall.
-        for offset in 0..shard_count {
-            let shard = (start + offset) % shard_count;
-            Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
+            // Cheap probe pass — any shard whose cached sender is
+            // immediately ready wins. `now_or_never` never awaits, so this
+            // is a quick sweep of the shard ring with no per-shard stall.
+            for offset in 0..shard_count {
+                let shard = (start + offset) % shard_count;
+                Self::write_shard_key_inplace(key_buf, base_len, shard);
 
-            if let Some(mut sender) = self.pool.cached(&key_buf) {
-                match futures_util::FutureExt::now_or_never(sender.ready()) {
-                    Some(Ok(())) => return Ok(sender),
-                    Some(Err(_)) => self.pool.invalidate(&key_buf),
-                    // Shard exists but is mid-send. Skip — we would rather
-                    // open a fresh h2 connection (per-key-coalesced via
-                    // `create_or_get_existing_owned`, so concurrent callers
-                    // dedupe onto ONE create future) than stall on
-                    // `timeout(ready())`. The previous 1 ms wait still
-                    // serialized under burst concurrency and was the
-                    // largest contributor to gRPC p99 tail latency for
-                    // 100-concurrent 500 KB / 1 MB payloads.
-                    None => {}
+                if let Some(mut sender) = self.pool.cached(key_buf) {
+                    match futures_util::FutureExt::now_or_never(sender.ready()) {
+                        Some(Ok(())) => return GrpcPhase1::Hit(sender),
+                        Some(Err(_)) => {
+                            self.pool.invalidate(key_buf);
+                        }
+                        // Shard exists but is mid-send. Skip — we would
+                        // rather open a fresh h2 connection (per-key-
+                        // coalesced via `create_or_get_existing_owned`, so
+                        // concurrent callers dedupe onto ONE create future)
+                        // than stall on `timeout(ready())`. The previous
+                        // 1 ms wait still serialized under burst concurrency
+                        // and was the largest contributor to gRPC p99 tail
+                        // latency for 100-concurrent 500 KB / 1 MB payloads.
+                        None => {}
+                    }
                 }
             }
-        }
 
-        Self::write_shard_key_inplace(&mut key_buf, base_len, start);
-        let selected_key = key_buf.clone();
+            Self::write_shard_key_inplace(key_buf, base_len, start);
+            // Single allocation: clone the thread-local buffer into the
+            // owned key that `create_or_get_existing_owned` consumes. This
+            // is the only `String` allocation on the cache-miss path now —
+            // cache hits take the early return above without allocating.
+            GrpcPhase1::Miss {
+                selected_key: key_buf.clone(),
+                base_len,
+                start,
+            }
+        });
+
+        let (selected_key, base_len, start) = match phase1 {
+            GrpcPhase1::Hit(sender) => return Ok(sender),
+            GrpcPhase1::Miss {
+                selected_key,
+                base_len,
+                start,
+            } => (selected_key, base_len, start),
+        };
+
         let manager = Arc::clone(self.pool.manager());
         match self
             .pool
@@ -345,17 +432,44 @@ impl GrpcConnectionPool {
         {
             Ok(sender) => Ok(sender),
             Err(err) => {
-                for offset in 1..shard_count {
-                    let shard = (start + offset) % shard_count;
-                    Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
-                    if let Some(sender) = self.pool.cached(&key_buf) {
-                        return Ok(sender);
+                // Phase 2 (synchronous re-borrow): rebuild the pool key in
+                // the same thread-local buffer and probe alternative shards.
+                // The proxy outlives this future and is read-only, so the
+                // build is identical to phase 1's prelude.
+                let recovered = with_grpc_pool_key(proxy, |key_buf| {
+                    debug_assert_eq!(key_buf.len(), base_len);
+                    for offset in 1..shard_count {
+                        let shard = (start + offset) % shard_count;
+                        Self::write_shard_key_inplace(key_buf, base_len, shard);
+                        if let Some(sender) = self.pool.cached(key_buf) {
+                            return Some(sender);
+                        }
                     }
+                    None
+                });
+                match recovered {
+                    Some(sender) => Ok(sender),
+                    None => Err(err),
                 }
-                Err(err)
             }
         }
     }
+}
+
+/// Outcome of the synchronous phase-1 sweep in `get_sender`.
+enum GrpcPhase1 {
+    /// A cached sender was immediately ready — short-circuit to the caller
+    /// without cloning the pool key or hitting `create_or_get_existing_owned`.
+    Hit(http2::SendRequest<GrpcBody>),
+    /// No shard was immediately ready. Carry the cloned shard key (with
+    /// `#<start_shard>` appended) plus the unsharded `base_len` and
+    /// `start` so the post-await error fallback can reconstruct shard
+    /// keys without recomputing them.
+    Miss {
+        selected_key: String,
+        base_len: usize,
+        start: usize,
+    },
 }
 
 impl GrpcPoolManager {
@@ -411,10 +525,10 @@ impl GrpcPoolManager {
             )
             .await
             .map_err(|e| {
-                GrpcProxyError::BackendUnavailable(format!(
-                    "DNS resolution failed for {}: {}",
-                    host, e
-                ))
+                GrpcProxyError::backend_unavailable(
+                    GrpcBackendUnavailableKind::DnsResolution,
+                    format!("DNS resolution failed for {}: {}", host, e),
+                )
             })?;
 
         // Construct SocketAddr from the resolved IpAddr + port directly.
@@ -424,6 +538,7 @@ impl GrpcPoolManager {
         let sock_addr = std::net::SocketAddr::new(resolved_ip, port);
         let addr = sock_addr.to_string();
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+        let connect_started = Instant::now();
 
         // Connect with timeout, using TcpSocket to set IP_BIND_ADDRESS_NO_PORT
         // before connect() so the kernel can co-select ephemeral ports.
@@ -456,7 +571,11 @@ impl GrpcPoolManager {
             } else {
                 warn!("gRPC: failed to connect to backend {}: {}", addr, e);
             }
-            GrpcProxyError::BackendUnavailable(format!("Connection failed: {}", e))
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::Connect,
+                format!("Connection failed: {}", e),
+                e,
+            )
         })?;
 
         // Disable Nagle for lower latency
@@ -471,10 +590,28 @@ impl GrpcPoolManager {
         let use_tls = matches!(proxy.backend_scheme, Some(BackendScheme::Https));
 
         if use_tls {
-            self.create_tls_connection(tcp, host, proxy, &pool_config)
-                .await
+            self.create_tls_connection(
+                tcp,
+                host,
+                proxy,
+                &pool_config,
+                connect_started,
+                connect_timeout,
+            )
+            .await
         } else {
-            self.create_h2c_connection(tcp, &pool_config).await
+            self.create_h2c_connection(tcp, &pool_config, proxy, connect_started, connect_timeout)
+                .await
+        }
+    }
+
+    fn backend_connect_timeout_error(proxy: &Proxy, phase: &str) -> GrpcProxyError {
+        GrpcProxyError::BackendTimeout {
+            kind: GrpcTimeoutKind::Connect,
+            message: format!(
+                "Connect timeout after {}ms during {} to {}:{}",
+                proxy.backend_connect_timeout_ms, phase, proxy.backend_host, proxy.backend_port
+            ),
         }
     }
 
@@ -535,13 +672,29 @@ impl GrpcPoolManager {
         &self,
         tcp: TcpStream,
         pool_config: &PoolConfig,
+        proxy: &Proxy,
+        connect_started: Instant,
+        connect_timeout: Duration,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let io = TokioIo::new(tcp);
         let builder = Self::build_h2_builder(pool_config);
 
-        let (sender, conn) = builder.handshake(io).await.map_err(|e| {
-            GrpcProxyError::BackendUnavailable(format!("h2c handshake failed: {}", e))
-        })?;
+        let Some(remaining) =
+            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
+        else {
+            return Err(Self::backend_connect_timeout_error(proxy, "h2c handshake"));
+        };
+
+        let (sender, conn) = tokio::time::timeout(remaining, builder.handshake(io))
+            .await
+            .map_err(|_| Self::backend_connect_timeout_error(proxy, "h2c handshake"))?
+            .map_err(|e| {
+                GrpcProxyError::backend_unavailable_with_source(
+                    GrpcBackendUnavailableKind::H2cHandshake,
+                    format!("h2c handshake failed: {}", e),
+                    e,
+                )
+            })?;
 
         // Spawn the connection driver
         tokio::spawn(async move {
@@ -560,6 +713,8 @@ impl GrpcPoolManager {
         host: &str,
         proxy: &Proxy,
         pool_config: &PoolConfig,
+        connect_started: Instant,
+        connect_timeout: Duration,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
@@ -567,19 +722,48 @@ impl GrpcPoolManager {
         let tls_config = self.get_tls_config(proxy)?;
         let connector = TlsConnector::from(tls_config);
         let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
-            GrpcProxyError::BackendUnavailable(format!("Invalid server name: {}", e))
+            GrpcProxyError::backend_unavailable(
+                GrpcBackendUnavailableKind::InvalidServerName,
+                format!("Invalid server name: {}", e),
+            )
         })?;
 
-        let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
-            GrpcProxyError::BackendUnavailable(format!("TLS handshake failed: {}", e))
-        })?;
+        let Some(remaining) =
+            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
+        else {
+            return Err(Self::backend_connect_timeout_error(proxy, "TLS handshake"));
+        };
+
+        let tls_stream = tokio::time::timeout(remaining, connector.connect(server_name, tcp))
+            .await
+            .map_err(|_| Self::backend_connect_timeout_error(proxy, "TLS handshake"))?
+            .map_err(|e| {
+                GrpcProxyError::backend_unavailable_with_source(
+                    GrpcBackendUnavailableKind::TlsHandshake,
+                    format!("TLS handshake failed: {}", e),
+                    e,
+                )
+            })?;
 
         let io = TokioIo::new(tls_stream);
         let builder = Self::build_h2_builder(pool_config);
 
-        let (sender, conn) = builder.handshake(io).await.map_err(|e| {
-            GrpcProxyError::BackendUnavailable(format!("h2 handshake failed: {}", e))
-        })?;
+        let Some(remaining) =
+            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
+        else {
+            return Err(Self::backend_connect_timeout_error(proxy, "h2 handshake"));
+        };
+
+        let (sender, conn) = tokio::time::timeout(remaining, builder.handshake(io))
+            .await
+            .map_err(|_| Self::backend_connect_timeout_error(proxy, "h2 handshake"))?
+            .map_err(|e| {
+                GrpcProxyError::backend_unavailable_with_source(
+                    GrpcBackendUnavailableKind::H2Handshake,
+                    format!("h2 handshake failed: {}", e),
+                    e,
+                )
+            })?;
 
         // Spawn the connection driver
         tokio::spawn(async move {
@@ -634,10 +818,99 @@ pub enum GrpcTimeoutKind {
     Read,
 }
 
+/// Why a gRPC backend connection failed.
+///
+/// Attached to [`GrpcProxyError::BackendUnavailable`] so the classifier
+/// ([`crate::retry::classify_grpc_proxy_error`]) reads the cause directly
+/// from the typed kind instead of substring-matching the error message —
+/// the legacy approach that broke whenever `tonic`/`hyper` reworded its
+/// errors.
+///
+/// **Adding a new variant**: extend [`GrpcBackendUnavailableKind`], update
+/// the classifier match arm, and pass the new kind at every relevant
+/// construction site. Drift between construction site and classifier is
+/// now a compile error rather than a silent miscategorisation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcBackendUnavailableKind {
+    /// DNS resolution failed for the backend hostname. Maps to
+    /// [`crate::retry::ErrorClass::DnsLookupError`].
+    DnsResolution,
+    /// TCP connect refused / failed (post-DNS, pre-handshake). Maps to
+    /// [`crate::retry::ErrorClass::ConnectionRefused`] (or
+    /// `ConnectionTimeout` when wrapped via the timeout variant — see
+    /// [`GrpcTimeoutKind::Connect`]).
+    Connect,
+    /// rustls TLS handshake failed (e.g., certificate verification, ALPN
+    /// mismatch, alert from peer). Maps to
+    /// [`crate::retry::ErrorClass::TlsError`].
+    TlsHandshake,
+    /// HTTP/2 handshake failed over an established TLS connection (post-ALPN
+    /// `h2`). Maps to [`crate::retry::ErrorClass::TlsError`] because the
+    /// handshake error is rooted in the secure transport setup.
+    H2Handshake,
+    /// HTTP/2 cleartext (h2c) handshake failed (no TLS). Maps to
+    /// [`crate::retry::ErrorClass::ConnectionRefused`] — the TCP connection
+    /// was established but the H2 protocol negotiation failed BEFORE any
+    /// stream was opened, so the request never reached the backend's
+    /// application layer. Pre-wire under the unified
+    /// [`crate::retry::request_reached_wire`] boundary, which keeps the
+    /// classifier consistent with [`Self::is_connect_class`] (a regression
+    /// test in `tests/unit/gateway_core/retry_tests.rs` enforces that
+    /// every connect-class kind classifies to `request_reached_wire ==
+    /// false`).
+    H2cHandshake,
+    /// `rustls::pki_types::ServerName::try_from` rejected the host. Maps to
+    /// [`crate::retry::ErrorClass::DnsLookupError`] because the failure is
+    /// rooted in the configured/looked-up name, before any wire activity.
+    InvalidServerName,
+    /// The backend rejected an outbound request after the H2 connection was
+    /// established and ALPN had succeeded — e.g., `hyper::Error` from
+    /// `sender.send_request(...).await`. **Post-wire by definition:** the
+    /// request headers may already have been forwarded, so this kind must
+    /// NEVER be treated as a pre-wire failure. Maps to
+    /// [`crate::retry::ErrorClass::ConnectionReset`] (mid-stream reset) so
+    /// `request_reached_wire` returns true and the connect-failure retry
+    /// path does not replay non-idempotent POSTs across the same stream.
+    BackendRequest,
+}
+
+impl GrpcBackendUnavailableKind {
+    /// Returns `true` for kinds that represent a pre-wire failure (DNS,
+    /// connect, handshake) — safe to replay regardless of HTTP method
+    /// idempotency.
+    ///
+    /// Returns `false` for [`Self::BackendRequest`], which is emitted
+    /// post-handshake from `send_request().await` and may have committed the
+    /// request headers / body bytes to the wire. The outer gRPC retry loops
+    /// match on this predicate so `retry_on_connect_failure` doesn't bypass
+    /// `retry_on_methods` for post-wire failures.
+    pub fn is_connect_class(self) -> bool {
+        match self {
+            Self::DnsResolution
+            | Self::Connect
+            | Self::TlsHandshake
+            | Self::H2Handshake
+            | Self::H2cHandshake
+            | Self::InvalidServerName => true,
+            Self::BackendRequest => false,
+        }
+    }
+}
+
 /// Errors specific to gRPC proxying.
+///
+/// `BackendUnavailable` carries a typed [`GrpcBackendUnavailableKind`] and
+/// an optional source so the classifier can downcast typed errors
+/// (`io::Error`, `hyper::Error`, `rustls::Error`) instead of formatting and
+/// substring-matching the message. Construction sites attach the source via
+/// [`GrpcProxyError::backend_unavailable`].
 #[derive(Debug)]
 pub enum GrpcProxyError {
-    BackendUnavailable(String),
+    BackendUnavailable {
+        kind: GrpcBackendUnavailableKind,
+        message: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    },
     BackendTimeout {
         kind: GrpcTimeoutKind,
         message: String,
@@ -646,18 +919,55 @@ pub enum GrpcProxyError {
     Internal(String),
 }
 
+impl GrpcProxyError {
+    /// Build a `BackendUnavailable` variant with no typed source.
+    pub fn backend_unavailable(kind: GrpcBackendUnavailableKind, message: String) -> Self {
+        Self::BackendUnavailable {
+            kind,
+            message,
+            source: None,
+        }
+    }
+
+    /// Build a `BackendUnavailable` variant with a typed source for chain
+    /// walkers (port-exhaustion detection, classification).
+    pub fn backend_unavailable_with_source<E>(
+        kind: GrpcBackendUnavailableKind,
+        message: String,
+        source: E,
+    ) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::BackendUnavailable {
+            kind,
+            message,
+            source: Some(Box::new(source)),
+        }
+    }
+}
+
 impl std::fmt::Display for GrpcProxyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BackendUnavailable(msg) | Self::ResourceExhausted(msg) | Self::Internal(msg) => {
-                write!(f, "{}", msg)
-            }
+            Self::BackendUnavailable { message, .. }
+            | Self::ResourceExhausted(message)
+            | Self::Internal(message) => write!(f, "{}", message),
             Self::BackendTimeout { message, .. } => write!(f, "{}", message),
         }
     }
 }
 
-impl std::error::Error for GrpcProxyError {}
+impl std::error::Error for GrpcProxyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackendUnavailable { source, .. } => {
+                source.as_deref().map(|s| s as &dyn std::error::Error)
+            }
+            _ => None,
+        }
+    }
+}
 
 /// gRPC status codes for gateway-generated errors.
 pub mod grpc_status {
@@ -967,7 +1277,11 @@ pub async fn proxy_grpc_request_streaming(
                     ));
                 }
                 error!("gRPC backend request failed (streaming body): {}", e);
-                GrpcProxyError::BackendUnavailable(format!("Backend request failed: {}", e))
+                GrpcProxyError::backend_unavailable_with_source(
+                    GrpcBackendUnavailableKind::BackendRequest,
+                    format!("Backend request failed: {}", e),
+                    e,
+                )
             })?
     } else {
         sender.send_request(backend_req).await.map_err(|e| {
@@ -978,7 +1292,11 @@ pub async fn proxy_grpc_request_streaming(
                 ));
             }
             error!("gRPC backend request failed (streaming body): {}", e);
-            GrpcProxyError::BackendUnavailable(format!("Backend request failed: {}", e))
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::BackendRequest,
+                format!("Backend request failed: {}", e),
+                e,
+            )
         })?
     };
 
@@ -1004,8 +1322,16 @@ pub async fn proxy_grpc_request_streaming(
     // gRPC response paths cannot drift.
     let status = response.status().as_u16();
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    // Snapshot any Connection-listed names before the canonical strip so
+    // we can also remove them per RFC 9110 §7.6.1. Hyper rejects
+    // `Connection` on H2 frames (RFC 9113 §8.2.2), so this is typically
+    // a no-op for valid gRPC backends — present for defence in depth.
+    let connection_listed = parse_connection_listed_headers(response.headers());
     for (k, v) in response.headers() {
         if is_backend_response_strip_header(k.as_str()) {
+            continue;
+        }
+        if connection_listed.iter().any(|n| n == k) {
             continue;
         }
         if let Ok(vs) = v.to_str() {
@@ -1137,7 +1463,11 @@ pub(crate) async fn proxy_grpc_request_core(
                 message: format!("Backend timeout: {}", e),
             }
         } else {
-            GrpcProxyError::BackendUnavailable(format!("Backend error: {}", e))
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::BackendRequest,
+                format!("Backend error: {}", e),
+                e,
+            )
         }
     };
     let response = if let Some(timeout_ms) = effective_timeout_ms {
@@ -1160,11 +1490,16 @@ pub(crate) async fn proxy_grpc_request_core(
     };
 
     // Extract response status and headers, stripping hop-by-hop headers
-    // per RFC 9110 §7.6.1 (canonical predicate in `proxy::headers`).
+    // per RFC 9110 §7.6.1 (canonical predicate in `proxy::headers`),
+    // including any header NAMED in the response's `Connection` field.
     let status = response.status().as_u16();
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    let connection_listed = parse_connection_listed_headers(response.headers());
     for (k, v) in response.headers() {
         if is_backend_response_strip_header(k.as_str()) {
+            continue;
+        }
+        if connection_listed.iter().any(|n| n == k) {
             continue;
         }
         if let Ok(vs) = v.to_str() {
@@ -1218,11 +1553,20 @@ pub(crate) async fn proxy_grpc_request_core(
                     if let Some(data) = frame.data_ref() {
                         body_bytes.extend_from_slice(data);
                     } else if let Ok(trailer_map) = frame.into_trailers() {
-                        for (k, v) in &trailer_map {
-                            if let Ok(vs) = v.to_str() {
-                                trailers.insert(k.as_str().to_string(), vs.to_string());
-                            }
-                        }
+                        // Strip RFC 9110 §7.6.1 response-direction
+                        // hop-by-hop names from gRPC trailers — same
+                        // predicate used for response headers above.
+                        // Without this, a misbehaving / malicious
+                        // backend can leak `connection: close`,
+                        // `proxy-authenticate`, `keep-alive`,
+                        // `transfer-encoding`, `upgrade`, etc. to the
+                        // downstream client through TRAILERS frames.
+                        // gRPC encodes trailers as response headers in
+                        // the trailers-only forward path further up the
+                        // call stack (see `mod.rs` Buffered branch),
+                        // which is exactly where the hop-by-hop
+                        // distinction matters.
+                        collect_buffered_grpc_trailers(&trailer_map, &mut trailers);
                     }
                 }
                 Err(e) => {
@@ -1256,6 +1600,38 @@ pub(crate) async fn proxy_grpc_request_core(
         body: body_bytes,
         trailers,
     }))
+}
+
+/// Drain a backend `HeaderMap` of gRPC trailers into the buffered-response
+/// `HashMap<String, String>` carried in [`GrpcResponse::trailers`], filtering
+/// RFC 9110 §7.6.1 response-direction hop-by-hop names.
+///
+/// gRPC carries `grpc-status` / `grpc-message` / `grpc-status-details-bin` in
+/// trailers, and at the forward boundary in `mod.rs` they are merged into
+/// the response header map (gRPC trailers-only encoding). A misbehaving or
+/// malicious backend that puts hop-by-hop directives like `connection:
+/// close`, `proxy-authenticate`, `keep-alive`, `transfer-encoding`, or
+/// `upgrade` in the trailer map would otherwise leak past the proxy
+/// boundary, because the response-headers strip earlier in this function
+/// only sees response *headers*, not trailers. Hyper's H2 trailer encoder
+/// rejects some hop-by-hop names at the frame layer but
+/// `proxy-authenticate`, `proxy-connection`, and `keep-alive` are not
+/// blocked, so the proxy must filter them itself.
+///
+/// Mirrors the streaming-path filter in `proxy::body::StripHopByHopTrailers`
+/// so both gRPC response paths apply the same predicate.
+pub(crate) fn collect_buffered_grpc_trailers(
+    trailer_map: &hyper::HeaderMap,
+    out: &mut HashMap<String, String>,
+) {
+    for (k, v) in trailer_map {
+        if is_backend_response_strip_header(k.as_str()) {
+            continue;
+        }
+        if let Ok(vs) = v.to_str() {
+            out.insert(k.as_str().to_string(), vs.to_string());
+        }
+    }
 }
 
 /// Check if a request is a gRPC request based on content-type.
@@ -1320,6 +1696,172 @@ mod tests {
     //!   prevents response streaming". The `proxy_grpc_request` wrapper
     //!   unconditionally returns collected `body_bytes` so the outer
     //!   retry loop in `mod.rs` has them.
+
+    // -----------------------------------------------------------------------
+    // GRPC_POOL_KEY_BUF thread-local helper tests
+    //
+    // Mirrors the HTTP/2 pool-key tests in `http2_pool.rs`. The gRPC pool
+    // uses the same thread-local `String` buffer strategy for zero-allocation
+    // cache hits on the proxy hot path.
+    // -----------------------------------------------------------------------
+
+    use super::*;
+    use crate::config::types::{
+        AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
+    };
+    use chrono::Utc;
+
+    /// Build a minimal `Proxy` for thread-local key tests. Uses HTTPS so the
+    /// gRPC pool path is the realistic codepath (gRPC over TLS).
+    fn grpc_pool_test_proxy() -> Proxy {
+        let now = Utc::now();
+        Proxy {
+            id: "p-grpc".to_string(),
+            namespace: crate::config::types::default_namespace(),
+            name: None,
+            hosts: vec![],
+            listen_path: Some("/".to_string()),
+            backend_scheme: Some(BackendScheme::Https),
+            dispatch_kind: DispatchKind::from(BackendScheme::Https),
+            backend_host: "grpc-backend.test".to_string(),
+            backend_port: 443,
+            backend_path: None,
+            strip_listen_path: true,
+            preserve_host_header: false,
+            backend_connect_timeout_ms: 5_000,
+            backend_read_timeout_ms: 30_000,
+            backend_write_timeout_ms: 30_000,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            resolved_tls: BackendTlsConfig::default_verify(),
+            dns_override: None,
+            dns_cache_ttl_seconds: None,
+            auth_mode: AuthMode::Single,
+            plugins: vec![],
+            pool_idle_timeout_seconds: None,
+            pool_enable_http_keep_alive: None,
+            pool_enable_http2: None,
+            pool_tcp_keepalive_seconds: None,
+            pool_http2_keep_alive_interval_seconds: None,
+            pool_http2_keep_alive_timeout_seconds: None,
+            pool_http2_initial_stream_window_size: None,
+            pool_http2_initial_connection_window_size: None,
+            pool_http2_adaptive_window: None,
+            pool_http2_max_frame_size: None,
+            pool_http2_max_concurrent_streams: None,
+            pool_http3_connections_per_backend: None,
+            upstream_id: None,
+            api_spec_id: None,
+            circuit_breaker: None,
+            retry: None,
+            response_body_mode: ResponseBodyMode::default(),
+            listen_port: None,
+            frontend_tls: false,
+            passthrough: false,
+            udp_idle_timeout_seconds: 60,
+            tcp_idle_timeout_seconds: Some(300),
+            allowed_methods: None,
+            allowed_ws_origins: vec![],
+            udp_max_response_amplification_factor: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Correctness: the thread-local helper must produce the same byte string
+    /// as `grpc_pool_key_owned()`. If these ever diverge the gRPC pool would
+    /// silently fragment (one allocation path inserts keys, the other looks
+    /// them up -- a mismatch would never hit a cached connection).
+    #[test]
+    fn with_grpc_pool_key_matches_grpc_pool_key_owned() {
+        let proxy = grpc_pool_test_proxy();
+        let owned = grpc_pool_key_owned(&proxy);
+        let from_thread_local = with_grpc_pool_key(&proxy, |buf| buf.clone());
+        assert_eq!(
+            owned, from_thread_local,
+            "thread-local key must equal grpc_pool_key_owned bytes — \
+             divergence would split the cache"
+        );
+    }
+
+    /// Correctness across runs: a second `with_grpc_pool_key` invocation
+    /// against the same `Proxy` must produce the identical key even after
+    /// a different proxy with a longer host grows the buffer. Catches a
+    /// future bug where stale buffer contents leak through if `clear()` is
+    /// dropped from `write_grpc_pool_key`.
+    #[test]
+    fn with_grpc_pool_key_is_idempotent_after_buffer_growth() {
+        let proxy = grpc_pool_test_proxy();
+        let k1 = with_grpc_pool_key(&proxy, |buf| buf.clone());
+        // Force the buffer to grow in between by running a different proxy
+        // with a longer host through the helper.
+        let mut other = grpc_pool_test_proxy();
+        other.backend_host =
+            "very-long-grpc-backend-hostname-that-grows-the-buffer.subdomain.example.com"
+                .to_string();
+        let _ = with_grpc_pool_key(&other, |buf| buf.clone());
+        let k2 = with_grpc_pool_key(&proxy, |buf| buf.clone());
+        assert_eq!(k1, k2, "same proxy must always yield the same key");
+    }
+
+    /// Reuse: repeated `with_grpc_pool_key` calls on the same thread must
+    /// reuse the underlying heap buffer, not allocate a fresh one each call.
+    /// We capture the heap pointer of the buffer's storage between
+    /// invocations and assert it never moves once the capacity is large
+    /// enough to hold the key. This is the load-bearing assertion for the
+    /// CLAUDE.md "zero-allocation hot path" rule.
+    #[test]
+    fn with_grpc_pool_key_reuses_heap_buffer_across_calls() {
+        let proxy = grpc_pool_test_proxy();
+
+        // Prime the buffer once so the initial capacity is sized to hold
+        // the key. The thread-local was constructed with capacity 128
+        // (well above the typical key length), so this should not realloc.
+        let (first_ptr, first_capacity) =
+            with_grpc_pool_key(&proxy, |buf| (buf.as_ptr() as usize, buf.capacity()));
+        assert!(
+            first_capacity >= 128,
+            "expected pre-sized capacity (>=128), got {first_capacity}"
+        );
+
+        // Run a tight loop and assert the heap pointer NEVER moves. If the
+        // optimization regresses to per-call `String::with_capacity(...)`,
+        // the pointer would change on every iteration.
+        for i in 0..1024 {
+            let (ptr, cap) =
+                with_grpc_pool_key(&proxy, |buf| (buf.as_ptr() as usize, buf.capacity()));
+            assert_eq!(
+                ptr, first_ptr,
+                "iteration {i}: heap pointer changed (was {first_ptr:#x}, now {ptr:#x}) — \
+                 thread-local buffer was reallocated, defeating the optimization"
+            );
+            assert_eq!(
+                cap, first_capacity,
+                "iteration {i}: capacity changed without a heap move — \
+                 unexpected, would imply ZST or alias chicanery"
+            );
+        }
+    }
+
+    /// Phase-2 (post-await fallback) compatibility: the `debug_assert_eq!`
+    /// in `get_sender`'s error path requires that re-running
+    /// `write_grpc_pool_key` against the same proxy produces a buffer
+    /// whose `len()` equals the `base_len` captured pre-await. If a future
+    /// refactor adds non-deterministic content to the key (e.g. timestamps)
+    /// the assertion would fire under -C debug-assertions=on.
+    #[test]
+    fn with_grpc_pool_key_base_len_is_stable() {
+        let proxy = grpc_pool_test_proxy();
+        let len1 = with_grpc_pool_key(&proxy, |buf| buf.len());
+        let len2 = with_grpc_pool_key(&proxy, |buf| buf.len());
+        assert_eq!(
+            len1, len2,
+            "base_len must be deterministic across calls — \
+             the post-await fallback in get_sender relies on this"
+        );
+    }
 
     /// Fix 3: source-level assertion that the pathological
     /// `unwrap_or(256)` default on buffered body collection is gone.
@@ -1490,5 +2032,103 @@ mod tests {
                 line
             );
         }
+    }
+
+    // ── collect_buffered_grpc_trailers ─────────────────────────────────────
+    //
+    // Buffered-path companion to `proxy::body::StripHopByHopTrailers` for the
+    // streaming gRPC response path. Both must apply the identical RFC 9110
+    // §7.6.1 response-direction strip predicate so a backend cannot leak
+    // hop-by-hop names through TRAILERS regardless of which response mode
+    // (`Buffered` vs `Streaming`) the proxy negotiated.
+
+    #[test]
+    fn collect_buffered_grpc_trailers_strips_hop_by_hop_names() {
+        let mut trailer_map = hyper::HeaderMap::new();
+        trailer_map.insert("grpc-status", "0".parse().unwrap());
+        trailer_map.insert("grpc-message", "ok".parse().unwrap());
+        // Hop-by-hop directives a misbehaving / malicious backend might emit:
+        trailer_map.insert("connection", "close".parse().unwrap());
+        trailer_map.insert(
+            "proxy-authenticate",
+            "Basic realm=internal".parse().unwrap(),
+        );
+        trailer_map.insert("keep-alive", "timeout=5".parse().unwrap());
+        trailer_map.insert("transfer-encoding", "chunked".parse().unwrap());
+        trailer_map.insert("upgrade", "h2c".parse().unwrap());
+        trailer_map.insert("proxy-connection", "close".parse().unwrap());
+        trailer_map.insert("te", "trailers".parse().unwrap());
+        trailer_map.insert("trailer", "grpc-status".parse().unwrap());
+
+        let mut out: HashMap<String, String> = HashMap::new();
+        collect_buffered_grpc_trailers(&trailer_map, &mut out);
+
+        assert_eq!(out.get("grpc-status").map(String::as_str), Some("0"));
+        assert_eq!(out.get("grpc-message").map(String::as_str), Some("ok"));
+        for hop_by_hop in [
+            "connection",
+            "proxy-authenticate",
+            "keep-alive",
+            "transfer-encoding",
+            "upgrade",
+            "proxy-connection",
+            "te",
+            "trailer",
+        ] {
+            assert!(
+                !out.contains_key(hop_by_hop),
+                "buffered-path trailer `{hop_by_hop}` must be stripped — it \
+                 would otherwise be merged into the gRPC trailers-only \
+                 forward in mod.rs and leak past the proxy boundary",
+            );
+        }
+    }
+
+    #[test]
+    fn collect_buffered_grpc_trailers_preserves_legitimate_grpc_and_custom_trailers() {
+        let mut trailer_map = hyper::HeaderMap::new();
+        trailer_map.insert("grpc-status", "0".parse().unwrap());
+        trailer_map.insert("grpc-message", "ok".parse().unwrap());
+        trailer_map.insert("grpc-status-details-bin", "abc==".parse().unwrap());
+        trailer_map.insert("x-custom-trailer", "v".parse().unwrap());
+        trailer_map.insert("x-trace-id", "abc-123".parse().unwrap());
+
+        let mut out: HashMap<String, String> = HashMap::new();
+        collect_buffered_grpc_trailers(&trailer_map, &mut out);
+
+        assert_eq!(out.len(), 5);
+        for name in [
+            "grpc-status",
+            "grpc-message",
+            "grpc-status-details-bin",
+            "x-custom-trailer",
+            "x-trace-id",
+        ] {
+            assert!(
+                out.contains_key(name),
+                "legitimate gRPC trailer `{name}` must be preserved",
+            );
+        }
+    }
+
+    #[test]
+    fn collect_buffered_grpc_trailers_skips_non_utf8_values() {
+        // `to_str()` fails on non-ASCII; the helper silently drops those
+        // entries without leaking them. A malicious backend could otherwise
+        // smuggle binary garbage into the response header map. Legitimate
+        // binary trailers (e.g. `grpc-status-details-bin`) are
+        // base64-encoded by gRPC convention, so they do round-trip through
+        // `to_str()` cleanly.
+        let mut trailer_map = hyper::HeaderMap::new();
+        trailer_map.insert("grpc-status", "0".parse().unwrap());
+        trailer_map.insert(
+            "x-bin-trailer",
+            http::HeaderValue::from_bytes(&[0x80, 0x81]).unwrap(),
+        );
+
+        let mut out: HashMap<String, String> = HashMap::new();
+        collect_buffered_grpc_trailers(&trailer_map, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("grpc-status").map(String::as_str), Some("0"));
     }
 }

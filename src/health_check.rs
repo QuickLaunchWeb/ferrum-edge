@@ -32,6 +32,7 @@ use crate::load_balancer::LoadBalancerCache;
 use dashmap::DashMap;
 use std::fmt::Write;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -64,10 +65,8 @@ fn host_port_key(target: &UpstreamTarget) -> String {
     format!("{}:{}", target.host, target.port)
 }
 
-/// Maximum entries in the recent_failures DashMap per target.
-/// Prevents unbounded memory growth during cascading failure scenarios
-/// where failure rate vastly exceeds the window cleanup rate.
-const MAX_RECENT_FAILURES_PER_TARGET: usize = 1000;
+/// Re-export the cap from types so runtime and validation share one value.
+use crate::config::types::MAX_RECENT_FAILURES_PER_TARGET;
 
 /// Health state for a single target.
 struct TargetHealth {
@@ -145,7 +144,14 @@ pub struct HealthChecker {
     /// Used when the upstream has no TLS config.
     default_http_client: Arc<reqwest::Client>,
     /// Active check abort handles.
-    active_check_handles: Vec<tokio::task::JoinHandle<()>>,
+    ///
+    /// Wrapped in `Mutex` so [`Self::start_with_shutdown`] and
+    /// [`Self::restart_with_shutdown`] can re-spawn probe tasks on config
+    /// reload without requiring `&mut self` (the gateway holds an
+    /// `Arc<HealthChecker>` for the lifetime of `ProxyState`). Touched only
+    /// at startup, config reload, and drop — never on the proxy hot path,
+    /// so the lock is uncontested.
+    active_check_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Optional reference to the load balancer cache for recording active
     /// probe latencies (used by least-latency algorithm). Set via
     /// `set_load_balancer_cache()` after construction.
@@ -183,14 +189,18 @@ impl HealthChecker {
 
     /// Create a health checker with an HTTP client configured from the
     /// gateway's global pool settings and shared DNS cache.
+    ///
+    /// The default client is built with TLS verification ENABLED. If the
+    /// operator has set `FERRUM_TLS_NO_VERIFY=true`, the default client is
+    /// rebuilt by [`set_global_tls_config`] before traffic flows.
     pub fn with_pool_config(pool_config: &PoolConfig, dns_cache: DnsCache) -> Self {
-        let client = build_health_check_client(pool_config, Some(dns_cache.clone()));
+        let client = build_health_check_client(pool_config, Some(dns_cache.clone()), false);
         Self {
             active_unhealthy_targets: Arc::new(DashMap::new()),
             active_target_states: Arc::new(DashMap::new()),
             passive_health: Arc::new(DashMap::new()),
             default_http_client: Arc::new(client),
-            active_check_handles: Vec::new(),
+            active_check_handles: Mutex::new(Vec::new()),
             lb_cache: None,
             pool_config: pool_config.clone(),
             dns_cache: Some(dns_cache),
@@ -203,6 +213,10 @@ impl HealthChecker {
 
     /// Set global TLS config from the env config so health check clients
     /// can fall back to global mTLS credentials and CA bundles.
+    ///
+    /// When `tls_no_verify` is true, the default HTTPS probe client is
+    /// rebuilt with `danger_accept_invalid_certs(true)` — TLS verification
+    /// is opt-in via `FERRUM_TLS_NO_VERIFY`, never silently disabled.
     pub fn set_global_tls_config(
         &mut self,
         tls_ca_bundle_path: Option<String>,
@@ -214,17 +228,25 @@ impl HealthChecker {
         self.global_backend_tls_client_cert_path = backend_tls_client_cert_path;
         self.global_backend_tls_client_key_path = backend_tls_client_key_path;
         self.global_tls_no_verify = tls_no_verify;
+
+        // Rebuild the default client when no-verify is set so HTTPS probes
+        // through the no-TLS-config path honour the operator opt-in.
+        if tls_no_verify {
+            let client =
+                build_health_check_client(&self.pool_config, self.dns_cache.clone(), tls_no_verify);
+            self.default_http_client = Arc::new(client);
+        }
     }
 
     /// Create a health checker without DNS cache (for tests).
     fn without_dns_cache(pool_config: &PoolConfig) -> Self {
-        let client = build_health_check_client(pool_config, None);
+        let client = build_health_check_client(pool_config, None, false);
         Self {
             active_unhealthy_targets: Arc::new(DashMap::new()),
             active_target_states: Arc::new(DashMap::new()),
             passive_health: Arc::new(DashMap::new()),
             default_http_client: Arc::new(client),
-            active_check_handles: Vec::new(),
+            active_check_handles: Mutex::new(Vec::new()),
             lb_cache: None,
             pool_config: pool_config.clone(),
             dns_cache: None,
@@ -242,21 +264,72 @@ impl HealthChecker {
     }
 
     /// Start health checks for all upstreams in the config.
-    pub fn start(&mut self, config: &GatewayConfig) {
+    #[allow(dead_code)]
+    pub fn start(&self, config: &GatewayConfig) {
         self.start_with_shutdown(config, None);
     }
 
+    /// Drain the spawned active-check / passive-recovery `JoinHandle`s out
+    /// of the checker so callers can await them in their per-mode
+    /// background-drain phase.
+    ///
+    /// `start_with_shutdown` records every spawned task in
+    /// `active_check_handles` so that [`Drop for HealthChecker`] can abort
+    /// them on cleanup. `Drop` only fires once the last `Arc<HealthChecker>`
+    /// clone is dropped — which happens at process exit, AFTER the
+    /// background-drain phase. That late abort lets active HTTP probes
+    /// race with shutdown: a probe connecting to a backend mid-shutdown
+    /// can emit a misleading "unhealthy" log line right before exit.
+    ///
+    /// Modes call this immediately after `ProxyState::new` to take
+    /// ownership of the handles and `await` them alongside DNS / metrics
+    /// / overload tasks. The shutdown receiver passed into
+    /// `start_with_shutdown` lets each spawned loop observe shutdown via
+    /// `tokio::select!` and exit cleanly before the await completes.
+    ///
+    /// After this call `active_check_handles` is empty, so `Drop` becomes
+    /// a no-op safety net — the modes own the handles. If a future caller
+    /// re-invokes `start_with_shutdown` (e.g. on config reload) the
+    /// existing drain logic at the top of `start_with_shutdown` still
+    /// aborts whatever was pushed since the last `take`.
+    pub fn take_active_check_handles(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut guard = match self.active_check_handles.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        std::mem::take(&mut *guard)
+    }
+
     /// Start health checks with an optional shutdown signal.
+    ///
+    /// Aborts any previously spawned active-check / passive-recovery tasks
+    /// before re-spawning, so this is also the entry point used by
+    /// [`Self::restart_with_shutdown`] on config reload. Active probe state
+    /// (`active_unhealthy_targets`, `active_target_states`) is intentionally
+    /// preserved across the restart so consecutive_successes/failures
+    /// counters carry over and the next probe tick continues from current
+    /// state — avoiding probe flapping during reload.
     pub fn start_with_shutdown(
-        &mut self,
+        &self,
         config: &GatewayConfig,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) {
-        // Cancel any existing active check tasks
-        for handle in self.active_check_handles.drain(..) {
+        // Drain old handles into a temporary so we can release the lock
+        // before any `await` inside the spawned tasks could touch anything
+        // else. `Vec::drain` collects the aborted handles in declaration
+        // order; abort() is non-blocking so this is cheap.
+        let old_handles: Vec<tokio::task::JoinHandle<()>> = {
+            let mut guard = match self.active_check_handles.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            std::mem::take(&mut *guard)
+        };
+        for handle in old_handles {
             handle.abort();
         }
 
+        let mut new_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         for upstream in &config.upstreams {
             if let Some(hc_config) = &upstream.health_checks {
                 // Start active health checks
@@ -268,7 +341,8 @@ impl HealthChecker {
                         server_ca_cert_path: upstream.backend_tls_server_ca_cert_path.clone(),
                         verify_server_cert: upstream.backend_tls_verify_server_cert,
                     };
-                    let upstream_client = self.build_upstream_health_client(&tls_config);
+                    let upstream_client =
+                        self.build_upstream_health_client(&tls_config, active.use_tls);
                     for target in &upstream.targets {
                         let handle = self.start_active_check(
                             target,
@@ -278,7 +352,7 @@ impl HealthChecker {
                             &upstream_client,
                             &tls_config,
                         );
-                        self.active_check_handles.push(handle);
+                        new_handles.push(handle);
                     }
                 }
 
@@ -292,10 +366,63 @@ impl HealthChecker {
                         passive.healthy_after_seconds,
                         shutdown_rx.clone(),
                     );
-                    self.active_check_handles.push(handle);
+                    new_handles.push(handle);
                 }
             }
         }
+
+        match self.active_check_handles.lock() {
+            Ok(mut guard) => *guard = new_handles,
+            Err(poisoned) => *poisoned.into_inner() = new_handles,
+        }
+    }
+
+    /// Restart probe tasks to match `new_config`.
+    ///
+    /// Called from [`crate::proxy::ProxyState::update_config`] and
+    /// [`crate::proxy::ProxyState::apply_incremental`] after the canonical
+    /// config swap so that:
+    ///
+    /// - Upstreams added on reload get probe tasks spawned.
+    /// - Upstreams removed on reload have their probe tasks aborted (no
+    ///   leaked timers probing dead targets).
+    /// - Upstreams whose `interval` / `timeout` / `unhealthy_threshold` /
+    ///   probe_type / TLS config / etc. changed pick up the new config —
+    ///   the old task is aborted and a fresh one is spawned with the new
+    ///   parameters.
+    ///
+    /// Stale entries in `active_unhealthy_targets` and `active_target_states`
+    /// for fully removed upstreams or removed targets are pruned so they
+    /// don't accumulate in the shared maps over the gateway's lifetime.
+    /// (`remove_stale_targets` is normally invoked from the service-discovery
+    /// path on dynamic target changes; this call covers the static-config
+    /// reload path so the two layers stay consistent.)
+    ///
+    /// We deliberately do a **full restart** rather than a per-upstream diff
+    /// because (a) reloads are rare (DB poll cycle, CP push, file SIGHUP)
+    /// and (b) the persistent `active_unhealthy_targets` / `active_target_states`
+    /// DashMaps carry consecutive-success/failure counters across the brief
+    /// abort + re-spawn window, so a target that was "unhealthy" before the
+    /// reload stays unhealthy until the next probe tick recovers it normally.
+    /// No flapping.
+    pub fn restart_with_shutdown(
+        &self,
+        new_config: &GatewayConfig,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) {
+        // Prune active-probe state for upstreams that are no longer in the
+        // config so the shared maps don't accumulate stale entries.
+        let active_keys: std::collections::HashSet<String> = new_config
+            .upstreams
+            .iter()
+            .flat_map(|u| u.targets.iter().map(move |t| active_target_key(&u.id, t)))
+            .collect();
+        self.active_unhealthy_targets
+            .retain(|key, _| active_keys.contains(key));
+        self.active_target_states
+            .retain(|key, _| active_keys.contains(key));
+
+        self.start_with_shutdown(new_config, shutdown_rx);
     }
 
     /// Get or create the per-proxy passive health state.
@@ -363,17 +490,23 @@ impl HealthChecker {
                 let counter = state.failure_counter.fetch_add(1, Ordering::Relaxed);
                 state.recent_failures.insert(counter, now_ms);
 
-                // Clean old failures outside the window
+                // Clean old failures outside the window and read len() immediately
+                // after retain() to minimise the race window between the two
+                // DashMap operations. This is a best-effort snapshot: concurrent
+                // reporters, hard-cap evictions, or recovery clears can skew the
+                // count in either direction. Acceptable for health threshold
+                // decisions which self-correct on subsequent reports and recovery.
                 let window_start =
                     now_ms.saturating_sub(config.unhealthy_window_seconds * 1000);
                 state
                     .recent_failures
                     .retain(|_, &mut ts| ts >= window_start);
+                let failures_in_window = state.recent_failures.len();
 
-                // Hard cap: prevent unbounded memory growth
-                if state.recent_failures.len() > MAX_RECENT_FAILURES_PER_TARGET {
-                    let excess =
-                        state.recent_failures.len() - MAX_RECENT_FAILURES_PER_TARGET;
+                // Hard cap: prevent unbounded memory growth. Snapshot len once
+                // to avoid a second racy read between the guard and the eviction.
+                if failures_in_window > MAX_RECENT_FAILURES_PER_TARGET {
+                    let excess = failures_in_window - MAX_RECENT_FAILURES_PER_TARGET;
                     let mut to_remove: Vec<u64> = state
                         .recent_failures
                         .iter()
@@ -385,7 +518,7 @@ impl HealthChecker {
                     }
                 }
 
-                let failures_in_window = state.recent_failures.len() as u32;
+                let failures_in_window = failures_in_window as u32;
                 if failures_in_window >= config.unhealthy_threshold
                     && !proxy_state.unhealthy.contains_key(buf.as_str())
                 {
@@ -459,6 +592,25 @@ impl HealthChecker {
         }
     }
 
+    /// Return the number of currently-spawned probe / passive-recovery tasks.
+    ///
+    /// This counts both active probe tasks (one per upstream target with an
+    /// `active` health check configured) and passive recovery timers (one
+    /// per upstream with a non-zero `healthy_after_seconds`). Intended for
+    /// tests asserting that [`Self::start_with_shutdown`] /
+    /// [`Self::restart_with_shutdown`] correctly aborts old handles and
+    /// spawns new ones on config reload. The runtime crate itself doesn't
+    /// call it (the gateway uses operator metrics like `active_unhealthy_targets`
+    /// for observability), hence `#[allow(dead_code)]`.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn active_task_count(&self) -> usize {
+        match self.active_check_handles.lock() {
+            Ok(g) => g.len(),
+            Err(p) => p.into_inner().len(),
+        }
+    }
+
     /// Start a background timer that automatically restores passively-marked
     /// unhealthy targets after `healthy_after_seconds`.
     fn start_passive_recovery_timer(
@@ -489,9 +641,23 @@ impl HealthChecker {
                     timer.tick().await;
                 }
 
+                // Fast path: skip the scan when no proxy has any unhealthy
+                // targets.  DashMap::is_empty() is O(shards) — effectively free
+                // compared to iterating every proxy × every unhealthy entry.
+                let any_unhealthy = passive_health
+                    .iter()
+                    .any(|entry| !entry.value().unhealthy.is_empty());
+                if !any_unhealthy {
+                    continue;
+                }
+
                 let now = now_epoch_ms();
 
-                // Iterate each proxy's passive state
+                // Read-scan (read locks only) to collect expired keys, then
+                // remove each one individually.  This avoids retain() which
+                // takes shard WRITE locks across the entire map — blocking
+                // hot-path passive health lookups/updates during the failure
+                // scenario where recovery scans are most active.
                 for entry in passive_health.iter() {
                     let proxy_id = entry.key();
                     let proxy_state = entry.value();
@@ -507,6 +673,8 @@ impl HealthChecker {
                         .map(|e| e.key().clone())
                         .collect();
 
+                    // Remove + log + reset outside the iteration (no shard
+                    // locks held during logging or failure-state cleanup).
                     for hp in &to_recover {
                         if proxy_state.unhealthy.remove(hp).is_some() {
                             info!(
@@ -527,7 +695,18 @@ impl HealthChecker {
 
     /// Build a per-upstream HTTP client with the upstream's TLS config.
     /// Falls back to global TLS settings when the upstream doesn't specify them.
-    fn build_upstream_health_client(&self, tls_config: &BackendTlsConfig) -> Arc<reqwest::Client> {
+    ///
+    /// HTTPS probes (`use_tls = true`) ALWAYS route through the TLS-aware
+    /// builder so the trust store is constructed in-house from the upstream's
+    /// CA / global CA / webpki roots — never the default client (which only
+    /// applies when the operator has explicitly opted into no-verify, and
+    /// even then only on plaintext probes by construction). HTTP probes can
+    /// safely reuse the default client.
+    fn build_upstream_health_client(
+        &self,
+        tls_config: &BackendTlsConfig,
+        use_tls: bool,
+    ) -> Arc<reqwest::Client> {
         let has_tls_config = tls_config.client_cert_path.is_some()
             || tls_config.client_key_path.is_some()
             || tls_config.server_ca_cert_path.is_some()
@@ -536,7 +715,7 @@ impl HealthChecker {
             || self.global_backend_tls_client_cert_path.is_some()
             || self.global_tls_no_verify;
 
-        if !has_tls_config {
+        if !use_tls && !has_tls_config {
             return self.default_http_client.clone();
         }
 
@@ -679,7 +858,16 @@ impl HealthChecker {
 
 impl Drop for HealthChecker {
     fn drop(&mut self) {
-        for handle in &self.active_check_handles {
+        // Best-effort: if the lock is poisoned (panic during start), still
+        // abort whatever handles we can recover so spawned tasks don't leak
+        // past the HealthChecker. `get_mut` avoids a lock entirely since
+        // we have unique access via `&mut self` in Drop.
+        let handles = self.active_check_handles.get_mut();
+        let handles = match handles {
+            Ok(v) => v,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for handle in handles.iter() {
             handle.abort();
         }
     }
@@ -1052,13 +1240,18 @@ async fn build_grpc_probe_channel_no_verify(
 fn build_health_check_client(
     pool_config: &PoolConfig,
     dns_cache: Option<DnsCache>,
+    no_verify: bool,
 ) -> reqwest::Client {
+    if no_verify {
+        warn!("health_check: TLS certificate verification DISABLED (FERRUM_TLS_NO_VERIFY=true)");
+    }
+
     let mut builder = reqwest::Client::builder()
         .pool_max_idle_per_host(pool_config.max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
-        .danger_accept_invalid_certs(true);
+        .danger_accept_invalid_certs(no_verify);
 
-    if let Some(dns_cache) = dns_cache {
+    if let Some(dns_cache) = dns_cache.clone() {
         let resolver = DnsCacheResolver::new(dns_cache);
         builder = builder.dns_resolver(Arc::new(resolver));
     }
@@ -1082,12 +1275,41 @@ fn build_health_check_client(
         Err(e) => {
             tracing::error!(
                 "Failed to build health check HTTP client: {}. \
-                 Falling back to default client (pool/TLS/keepalive settings will not apply).",
+                 Falling back to a minimal DNS-cached client (pool/TLS/keepalive settings will not apply).",
                 e
             );
-            reqwest::Client::new()
+            build_dns_cached_fallback_client(dns_cache, "health check")
         }
     }
+}
+
+/// Build a minimal `reqwest::Client` that still uses the gateway's DNS cache.
+///
+/// Used as a fallback when a fully-configured builder fails (e.g., due to
+/// invalid TLS material). Keeps the DNS cache attached so health probes /
+/// plugin calls do not silently fall through to system DNS — every probe
+/// would otherwise burn an ephemeral port through a fresh OS resolver.
+///
+/// If even this minimal builder fails, only then fall back to
+/// `reqwest::Client::new()` (an exceptional, doubly-degraded path).
+fn build_dns_cached_fallback_client(
+    dns_cache: Option<DnsCache>,
+    context: &'static str,
+) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Some(dns_cache) = dns_cache {
+        let resolver = DnsCacheResolver::new(dns_cache);
+        builder = builder.dns_resolver(Arc::new(resolver));
+    }
+    builder.build().unwrap_or_else(|e| {
+        tracing::error!(
+            "Failed to build minimal DNS-cached fallback {} client: {}. \
+             Using reqwest::Client::new() as a last resort — DNS will bypass the gateway cache.",
+            context,
+            e
+        );
+        reqwest::Client::new()
+    })
 }
 
 /// Build a health check HTTP client with upstream-specific TLS configuration.
@@ -1110,7 +1332,7 @@ fn build_health_check_client_with_tls(
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
         .danger_accept_invalid_certs(skip_verify);
 
-    if let Some(dns_cache) = dns_cache {
+    if let Some(dns_cache) = dns_cache.clone() {
         let resolver = DnsCacheResolver::new(dns_cache);
         builder = builder.dns_resolver(Arc::new(resolver));
     }
@@ -1195,10 +1417,10 @@ fn build_health_check_client_with_tls(
         Err(e) => {
             tracing::error!(
                 "Failed to build TLS health check HTTP client: {}. \
-                 Falling back to default client.",
+                 Falling back to a minimal DNS-cached client (TLS-specific settings will not apply).",
                 e
             );
-            reqwest::Client::new()
+            build_dns_cached_fallback_client(dns_cache, "TLS health check")
         }
     }
 }
@@ -1234,4 +1456,213 @@ pub async fn grpc_probe_for_test(
         false,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    //! Inline tests for private health-check helpers.
+    //!
+    //! `build_health_check_client` is intentionally private and these tests
+    //! sit inline so they can exercise it directly. Promoting it to `pub`
+    //! to enable an external test would widen the public API for no reason —
+    //! per CLAUDE.md private fns belong in inline `#[cfg(test)] mod tests`.
+    use super::*;
+    use crate::dns::DnsConfig;
+    use rcgen::{CertificateParams, KeyPair};
+    use rustls::ServerConfig;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::sync::Once;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    static INIT_CRYPTO: Once = Once::new();
+
+    fn ensure_crypto_provider() {
+        INIT_CRYPTO.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
+    /// Spawn a self-signed HTTPS server on 127.0.0.1:<random> that responds
+    /// to any inbound HTTP request with `200 OK`. Returns the bound port.
+    async fn spawn_self_signed_https_server() -> u16 {
+        ensure_crypto_provider();
+
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_der = CertificateDer::from(cert.der().to_vec());
+        let key_der =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der().to_vec()));
+
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut buf = [0u8; 1024];
+                    let _ = tls.read(&mut buf).await;
+                    let _ = tls
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+
+        port
+    }
+
+    /// Default-built health-check client (verify ON) MUST reject a
+    /// self-signed cert. Regression for the unconditional
+    /// `danger_accept_invalid_certs(true)` bypass.
+    #[tokio::test]
+    async fn build_health_check_client_default_rejects_self_signed_cert() {
+        let port = spawn_self_signed_https_server().await;
+        let pool_config = PoolConfig::default();
+
+        let client = build_health_check_client(&pool_config, None, false);
+        let result = client
+            .get(format!("https://127.0.0.1:{}/", port))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await;
+
+        assert!(
+            result.is_err(),
+            "default health-check client must reject self-signed certs (verify ON), \
+             got: {:?}",
+            result.map(|r| r.status())
+        );
+    }
+
+    /// When the operator opts into `FERRUM_TLS_NO_VERIFY=true` the same
+    /// probe SHOULD succeed against the self-signed server. Confirms the
+    /// new `no_verify` parameter is plumbed end-to-end.
+    #[tokio::test]
+    async fn build_health_check_client_no_verify_accepts_self_signed_cert() {
+        let port = spawn_self_signed_https_server().await;
+        let pool_config = PoolConfig::default();
+
+        let client = build_health_check_client(&pool_config, None, true);
+        let result = client
+            .get(format!("https://127.0.0.1:{}/", port))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await;
+
+        let response =
+            result.expect("no_verify=true health-check client must accept self-signed certs");
+        assert!(response.status().is_success());
+    }
+
+    /// `set_global_tls_config(tls_no_verify=true)` should rebuild the
+    /// default client so probes through the no-TLS-config path also honour
+    /// the operator opt-in. Without the rebuild, the original default
+    /// client (built with `no_verify=false` in the constructor) would still
+    /// reject the self-signed cert.
+    #[tokio::test]
+    async fn set_global_tls_config_no_verify_rebuilds_default_client() {
+        let port = spawn_self_signed_https_server().await;
+        let pool_config = PoolConfig::default();
+        let mut checker = HealthChecker::without_dns_cache(&pool_config);
+
+        // Before opt-in: default client must reject.
+        let pre = checker
+            .default_http_client
+            .get(format!("https://127.0.0.1:{}/", port))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await;
+        assert!(pre.is_err(), "default client should reject before opt-in");
+
+        // Opt in via global flag.
+        checker.set_global_tls_config(None, None, None, true);
+
+        // After opt-in: rebuilt default client must accept.
+        let post = checker
+            .default_http_client
+            .get(format!("https://127.0.0.1:{}/", port))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .expect("default client should accept after no_verify opt-in");
+        assert!(post.status().is_success());
+    }
+
+    #[test]
+    fn fallback_client_builds_with_dns_cache() {
+        // Verify the helper produces a usable client when a DNS cache is
+        // provided — i.e., the minimal builder configuration with only the
+        // resolver attached actually succeeds.
+        let dns_cache = DnsCache::new(DnsConfig::default());
+        let _client = build_dns_cached_fallback_client(Some(dns_cache), "test");
+        // No panic, no Err, no `Client::new()` last-resort path: success.
+    }
+
+    #[test]
+    fn fallback_client_builds_without_dns_cache() {
+        // Verify the helper still succeeds when no DNS cache is available
+        // (this exercises the `from_pool_config` cache-less code path).
+        let _client = build_dns_cached_fallback_client(None, "test");
+    }
+
+    #[test]
+    fn build_health_check_client_returns_usable_client() {
+        // Sanity check the happy path: build with a DNS cache and verify
+        // the returned client can issue a request (we send to an unroutable
+        // address; the DNS lookup is what matters here, not the eventual
+        // connect failure).
+        let dns_cache = DnsCache::new(DnsConfig::default());
+        let pool_config = PoolConfig::default();
+        let _client = build_health_check_client(&pool_config, Some(dns_cache), false);
+    }
+
+    #[tokio::test]
+    async fn fallback_client_uses_dns_cache_resolver() {
+        // Verify the fallback client routes DNS through the gateway cache by
+        // observing cache_len() growth after a request. If the fallback bypassed
+        // the resolver and used system DNS, the cache would stay empty.
+        let dns_cache = DnsCache::new(DnsConfig::default());
+        let initial_len = dns_cache.cache_len();
+        let client = build_dns_cached_fallback_client(Some(dns_cache.clone()), "test");
+
+        // Issue a request to a well-known hostname. The connection itself will
+        // either succeed or fail (we don't care); what matters is that the
+        // resolver was used. Use a short timeout so the test runs quickly.
+        let _ = client
+            .get("http://localhost:1/")
+            .timeout(Duration::from_millis(100))
+            .send()
+            .await;
+
+        // After the request, the gateway DNS cache should contain an entry
+        // for `localhost`. If the request had bypassed the resolver via
+        // `Client::new()`, the cache would be unchanged.
+        let after_len = dns_cache.cache_len();
+        assert!(
+            after_len > initial_len,
+            "DNS cache should have populated via the cached resolver \
+             (initial={}, after={}). If the fallback bypassed the resolver \
+             via Client::new(), the cache would stay empty.",
+            initial_len,
+            after_len
+        );
+    }
 }

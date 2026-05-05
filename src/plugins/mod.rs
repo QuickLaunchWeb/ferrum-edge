@@ -616,8 +616,17 @@ pub struct TransactionSummary {
     pub consumer_username: Option<String>,
     pub http_method: String,
     pub request_path: String,
-    pub matched_proxy_id: Option<String>,
-    pub matched_proxy_name: Option<String>,
+    /// ID of the proxy that matched this request, or `None` when the request
+    /// was rejected before routing (no proxy matched the host/path). Same
+    /// JSON key as `StreamTransactionSummary.proxy_id` so log consumers see
+    /// a single `proxy_id` field across HTTP, gRPC, WebSocket, TCP, UDP, and
+    /// DTLS transactions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<String>,
+    /// Human-friendly proxy name; same JSON key as
+    /// `StreamTransactionSummary.proxy_name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_name: Option<String>,
     pub backend_target_url: Option<String>,
     /// The DNS-resolved IP address of the backend that was connected to.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -742,6 +751,15 @@ pub struct TransactionSummary {
     /// same schema so existing log queries and dashboards work without changes.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub mirror: bool,
+    /// Plugin-injected metadata. Sensitive keys (authorization, cookie,
+    /// credential/session tokens, secrets — see
+    /// `plugins::utils::metadata_redaction::DEFAULT_SENSITIVE_METADATA_KEYS`
+    /// plus operator extras from `FERRUM_LOG_REDACT_METADATA_KEYS`) are
+    /// replaced with `[REDACTED]` at serialize time. The in-memory value is
+    /// untouched so other plugin phases can still read the original.
+    #[serde(
+        serialize_with = "crate::plugins::utils::metadata_redaction::serialize_redacted_metadata"
+    )]
     pub metadata: HashMap<String, String>,
 }
 
@@ -918,8 +936,15 @@ pub struct StreamTransactionSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sni_hostname: Option<String>,
     /// Plugin-injected metadata (e.g., correlation ID, trace ID) carried
-    /// from `on_stream_connect` to `on_stream_disconnect`.
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    /// from `on_stream_connect` to `on_stream_disconnect`. Sensitive keys
+    /// (authorization, cookie, credential/session tokens, secrets — see
+    /// `plugins::utils::metadata_redaction::DEFAULT_SENSITIVE_METADATA_KEYS`
+    /// plus operator extras from `FERRUM_LOG_REDACT_METADATA_KEYS`) are
+    /// replaced with `[REDACTED]` at serialize time.
+    #[serde(
+        skip_serializing_if = "HashMap::is_empty",
+        serialize_with = "crate::plugins::utils::metadata_redaction::serialize_redacted_metadata"
+    )]
     pub metadata: HashMap<String, String>,
 }
 
@@ -1065,6 +1090,20 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` if this plugin needs the raw request body to be available
+    /// during the `authenticate` phase.
+    ///
+    /// This is even narrower than `requires_request_body_before_before_proxy()`:
+    /// it forces request body buffering BEFORE the authenticate phase runs, so
+    /// auth plugins can verify body integrity (e.g., HMAC signing string that
+    /// covers a `Digest:` header per RFC 9421 / RFC 3230).
+    ///
+    /// Override this only for auth plugins that perform body integrity checks
+    /// at authentication time (e.g., `hmac_auth` with `require_digest = true`).
+    fn requires_request_body_before_authenticate(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin needs binary-safe access to the raw
     /// request body bytes via `ctx.request_body_bytes`.
     ///
@@ -1083,7 +1122,9 @@ pub trait Plugin: Send + Sync {
     /// Request-time body buffering can still remain disabled when
     /// `should_buffer_request_body()` returns `false` for the current request.
     fn requires_request_body_buffering(&self) -> bool {
-        self.modifies_request_body() || self.requires_request_body_before_before_proxy()
+        self.modifies_request_body()
+            || self.requires_request_body_before_before_proxy()
+            || self.requires_request_body_before_authenticate()
     }
 
     /// Called just before the request is proxied to the backend.

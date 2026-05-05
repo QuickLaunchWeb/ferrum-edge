@@ -116,8 +116,8 @@ Key environment variables set by the test runner:
 | `FERRUM_DTLS_CERT_PATH` | `certs/cert.pem` | Gateway DTLS cert |
 | `FERRUM_POOL_HTTP2_*` | (tuned) | H2 flow control: 8 MiB stream, 32 MiB conn windows |
 | `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Server-side H2 stream limit |
-| `FERRUM_HTTP3_*` | (tuned) | H3/QUIC: 8 MiB stream, 32 MiB conn, 1000 max streams |
-| `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | `4` | QUIC connections per backend |
+| `FERRUM_HTTP3_*` | (tuned) | H3/QUIC: 8 MiB stream, 32 MiB conn, 8 MiB send, 1000 max streams |
+| `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | default `4` | QUIC connections per backend; override with `FERRUM_EXTRA_ENV` for experiments |
 | `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | `120` | H3 pool idle eviction timeout |
 | `FERRUM_GRPC_POOL_READY_WAIT_MS` | `1` | gRPC pool sender wait before opening another backend H2 connection |
 | `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | `30` | Pool cleanup sweep interval (all pools) |
@@ -422,3 +422,56 @@ sudo apt-get install protobuf-compiler
 3. Create a gateway config in `configs/<protocol>_perf.yaml`
 4. Add `test_<protocol>()` and `stop_gateway` call in `run_protocol_test.sh`
 5. (Optional) Add an Envoy config in `configs/envoy/<protocol>.yaml` and register in `envoy_compare_protocol()`
+
+## Connection Saturation Benchmark
+
+A separate benchmark mode that finds the **breaking point** — the smallest N at which a gateway can no longer sustain N concurrent long-lived connections — for ferrum-edge, envoy, kong, tyk, and krakend. Distinct from the throughput benchmark above: that one fixes concurrency at 100 and measures RPS; this one ramps concurrency until the gateway falls over.
+
+```bash
+cd tests/performance/multi_protocol
+
+# Run all five gateways at default ramp (1K → 5K → 10K → 25K → 50K)
+./run_connection_saturation_bench.sh
+
+# Subset
+./run_connection_saturation_bench.sh \
+    --gateways "ferrum envoy" \
+    --connection-levels "1000 5000 10000"
+
+# Stop ramping a gateway as soon as it breaks (faster overall run)
+./run_connection_saturation_bench.sh --stop-at-first-break
+```
+
+In CI, this runs as the on-demand `Connection Saturation Benchmark` workflow (`.github/workflows/connection-saturation-benchmark.yml`) — that path applies the host-level sysctl/ulimit tuning required for the headline numbers.
+
+### What "breaking point" means here
+
+`proto_bench saturate --connections N` opens N HTTP/1.1+TLS keep-alive connections to the gateway, ramps them up over `--ramp-seconds`, and holds them open for `--hold-seconds` while each connection sends one tiny POST `/echo` per `--heartbeat-interval-ms`. A run is **`ok`** only if all four of:
+
+- `connect_success_rate ≥ 99%`,
+- `heartbeat_success_rate ≥ 99%`,
+- `peak_alive_connections ≥ 99% × N`, and
+- `survivorship_rate ≥ 99%` — i.e., ≥99% of connections that established also lasted the entire hold window without being dropped.
+
+are true. Otherwise it's **`broken`**. The runner script ramps N upward and records the largest `ok` and the smallest `broken`. The survivorship gate is what catches the "gateway accepts N conns, processes one heartbeat each, RSTs them all" case — without it, peak-alive + heartbeat-success can both be transiently satisfied while the gateway sheds every connection.
+
+### Failure-mode classification
+
+The JSON output breaks connect failures into `refused / timeout / reset / tls_error / other` because **how** a gateway breaks tells you why:
+
+| Failure mode | Typical cause |
+|--------------|---------------|
+| `reset` | nginx-style `worker_connections` exhaustion (Kong default = 16K) |
+| `refused` | FD ceiling hit, accept queue full |
+| `timeout` | gateway is up but accept loop is starved (CPU pegged) |
+| `tls_error` | TLS handshake memory pressure or session cache exhaustion |
+| `disconnects_during_hold` | gateway accepted but later RST'd under load (e.g. shutdown_drain triggered by overload manager) |
+
+### Methodology + caveats
+
+- **Default-config gateways**. Each gateway is started with the minimum env vars required to make it function (TLS certs, basic routing). `worker_connections`, `max_concurrent_conns`, etc. are left at their out-of-the-box defaults. This measures what an operator gets from `docker run`. A separate "tuned" run could be wired up later.
+- **Universal protocol = HTTP/1.1+TLS**. All five gateways speak this end-to-end with matched configs, so it's the apples-to-apples comparison. Other protocols would force per-gateway exclusions (KrakenD CE has no gRPC; Kong has no H2 upstream; etc. — see `run_gateway_protocol_bench.sh` for the full matrix).
+- **All gateways run in Docker with `--ulimit nofile=1048576:1048576`** so no gateway gets a per-container FD-cap advantage. The host-side ulimit/sysctl tuning is applied by the CI workflow before launching anything.
+- **macOS hosts hit ~12K FD ceiling and aren't suitable for headline numbers**. The benchmark runs locally for development and at small N (≤4K), but the comparison numbers should always come from the Linux CI workflow.
+- **Heartbeat is intentionally low-rate** (default 1 req/sec/conn). The point is to test connection capacity, not RPS — a high heartbeat rate would conflate the two and give a different (RPS-bound) breaking point.
+- **Connect attempts are spread over `--ramp-seconds`** so the *client* doesn't SYN-flood itself. With N=50K and ramp=30s that's ~1666 connects/sec, well within typical client capacity given proper ulimit.

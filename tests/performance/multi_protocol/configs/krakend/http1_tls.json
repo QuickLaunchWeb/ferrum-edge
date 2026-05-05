@@ -27,6 +27,7 @@
       "endpoint": "/echo",
       "method": "POST",
       "output_encoding": "no-op",
+      "input_headers": ["*"],
       "backend": [
         {
           "host": [

@@ -666,6 +666,47 @@ fn h3_pool_key_with_index() {
 }
 
 #[test]
+fn h3_warmup_shards_cover_configured_global_pool() {
+    let proxy = minimal_proxy();
+
+    let shards: Vec<_> = Http3ConnectionPool::warmup_shard_indices(&proxy, 4).collect();
+    assert_eq!(shards, vec![0, 1, 2, 3]);
+
+    let keys: Vec<_> = shards
+        .iter()
+        .map(|index| Http3ConnectionPool::pool_key(&proxy, *index))
+        .collect();
+    let unique_keys: std::collections::HashSet<_> = keys.iter().collect();
+    assert_eq!(
+        unique_keys.len(),
+        keys.len(),
+        "warmup should plan a distinct H3 pool key per shard"
+    );
+    assert!(
+        keys.iter().any(|key| key.contains("|3|")),
+        "warmup should include the highest configured shard: {keys:?}"
+    );
+}
+
+#[test]
+fn h3_warmup_shards_honor_proxy_override() {
+    let mut proxy = minimal_proxy();
+    proxy.pool_http3_connections_per_backend = Some(2);
+
+    let shards: Vec<_> = Http3ConnectionPool::warmup_shard_indices(&proxy, 8).collect();
+    assert_eq!(shards, vec![0, 1]);
+}
+
+#[test]
+fn h3_warmup_shards_never_empty() {
+    let mut proxy = minimal_proxy();
+    proxy.pool_http3_connections_per_backend = Some(0);
+
+    let shards: Vec<_> = Http3ConnectionPool::warmup_shard_indices(&proxy, 0).collect();
+    assert_eq!(shards, vec![0]);
+}
+
+#[test]
 fn h3_pool_key_with_ca_cert() {
     let mut proxy = minimal_proxy();
     proxy.backend_tls_server_ca_cert_path = Some("/certs/ca.pem".to_string());

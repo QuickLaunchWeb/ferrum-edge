@@ -102,11 +102,13 @@ use tracing::{debug, error, warn};
 
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::http3::server::h3_http_status_to_grpc_status;
+use crate::load_balancer::LoadBalancer;
 use crate::plugins::{Plugin, PluginResult, RequestContext};
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::record_backend_outcome;
 use crate::proxy::grpc_proxy::{self, GrpcResponseKind, proxy_grpc_request_from_bytes};
-use crate::proxy::headers::is_backend_response_strip_header;
+use crate::proxy::headers::{is_backend_response_strip_header, parse_connection_listed_headers};
+use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
 
 /// Outcome reported back to the H3 listener so it can update request
@@ -151,6 +153,7 @@ where
     S: RecvStream + SendStream<Bytes>,
 {
     pub state: &'a ProxyState,
+    pub epoch: &'a RequestEpoch,
     pub proxy: &'a Proxy,
     pub stream: &'a mut RequestStream<S, Bytes>,
     pub method: &'a str,
@@ -160,51 +163,53 @@ where
     pub backend_url: &'a str,
     pub lb_hash_key: Option<&'a str>,
     pub upstream_target: Option<&'a UpstreamTarget>,
+    pub upstream_balancer: Option<&'a Arc<LoadBalancer>>,
     pub cb_target_key: Option<&'a str>,
+    pub cb_is_half_open_probe: bool,
     pub flavor: HttpFlavor,
     pub prebuffered_body: Option<Vec<u8>>,
     pub client_ip: &'a str,
     pub ctx: &'a mut RequestContext,
     pub plugins: &'a [Arc<dyn Plugin>],
+    pub requires_response_body_buffering: bool,
     pub sticky_cookie_needed: bool,
 }
 
 fn record_cross_protocol_connection_start(
-    state: &ProxyState,
-    proxy: &Proxy,
+    selected_balancer: Option<&Arc<LoadBalancer>>,
     upstream_target: Option<&UpstreamTarget>,
 ) {
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target) {
-        state
-            .load_balancer_cache
-            .record_connection_start(upstream_id, target);
+    if let (Some(target), Some(balancer)) = (upstream_target, selected_balancer) {
+        balancer.record_connection_start(target);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_cross_protocol_retry_failure(
     state: &ProxyState,
     proxy: &Proxy,
+    selected_balancer: Option<&Arc<LoadBalancer>>,
     upstream_target: Option<&UpstreamTarget>,
     cb_target_key: Option<&str>,
     response_status: u16,
     connection_error: bool,
+    is_half_open_probe: bool,
 ) {
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target) {
-        state
-            .load_balancer_cache
-            .record_connection_end(upstream_id, target);
+    if let (Some(target), Some(balancer)) = (upstream_target, selected_balancer) {
+        balancer.record_connection_end(target);
     }
 
     if let Some(cb_config) = &proxy.circuit_breaker {
         let cb = state
             .circuit_breaker_cache
             .get_or_create(&proxy.id, cb_target_key, cb_config);
-        cb.record_failure(response_status, connection_error);
+        cb.record_failure(response_status, connection_error, is_half_open_probe);
     }
 }
 
 fn select_next_cross_protocol_retry_target(
     state: &ProxyState,
+    epoch: &RequestEpoch,
     proxy: &Proxy,
     lb_hash_key: Option<&str>,
     current_target: Option<&Arc<UpstreamTarget>>,
@@ -226,7 +231,8 @@ fn select_next_cross_protocol_retry_target(
             .map(|r| r.value().clone()),
     };
 
-    let next = state.load_balancer_cache.select_next_target(
+    let next = crate::load_balancer::LoadBalancerCache::select_next_target_from(
+        &epoch.load_balancer,
         upstream_id,
         hash_key,
         prev_target,
@@ -293,6 +299,7 @@ where
 {
     let CrossProtocolRequest {
         state,
+        epoch,
         proxy,
         stream,
         method,
@@ -302,12 +309,15 @@ where
         backend_url,
         lb_hash_key,
         upstream_target,
+        upstream_balancer,
         cb_target_key,
+        cb_is_half_open_probe,
         flavor,
         prebuffered_body,
         client_ip,
         ctx,
         plugins,
+        requires_response_body_buffering,
         sticky_cookie_needed,
     } = request;
     let backend_start = Instant::now();
@@ -353,6 +363,7 @@ where
         HttpFlavor::Plain => {
             dispatch_plain(
                 state,
+                epoch,
                 proxy,
                 stream,
                 method,
@@ -362,13 +373,16 @@ where
                 backend_url,
                 lb_hash_key,
                 upstream_target,
+                upstream_balancer,
                 cb_target_key,
+                cb_is_half_open_probe,
                 prebuffered_body,
                 raw_prebuffered_body_bytes,
                 client_ip,
                 backend_start,
                 ctx,
                 plugins,
+                requires_response_body_buffering,
                 sticky_cookie_needed,
             )
             .await
@@ -376,6 +390,7 @@ where
         HttpFlavor::Grpc => {
             dispatch_grpc(
                 state,
+                epoch,
                 proxy,
                 stream,
                 method,
@@ -385,13 +400,16 @@ where
                 backend_url,
                 lb_hash_key,
                 upstream_target,
+                upstream_balancer,
                 cb_target_key,
+                cb_is_half_open_probe,
                 prebuffered_body,
                 raw_prebuffered_body_bytes,
                 client_ip,
                 backend_start,
                 ctx,
                 plugins,
+                requires_response_body_buffering,
                 sticky_cookie_needed,
             )
             .await
@@ -427,6 +445,7 @@ fn build_plain_request_builder(
     backend_url: &str,
     effective_host: &str,
     client_ip: &str,
+    is_early_data: bool,
 ) -> reqwest::RequestBuilder {
     let mut req_builder = client.request(req_method, backend_url);
 
@@ -453,6 +472,12 @@ fn build_plain_request_builder(
                     req_builder = req_builder.header("Host", effective_host);
                 }
             }
+            // RFC 8470 §5.2: strip any client-supplied `Early-Data` header
+            // — only the gateway is permitted to set it on a forwarded
+            // request, and only when the inbound request actually arrived
+            // over TLS 1.3 0-RTT. See the matching strip in
+            // `build_h3_backend_headers` (native H3 backend path).
+            _ if k.as_str() == "early-data" => {}
             _ if should_skip_cross_protocol_backend_header(k.as_str()) => {}
             _ => {
                 req_builder = req_builder.header(k, v);
@@ -474,6 +499,14 @@ fn build_plain_request_builder(
             "Forwarded",
             crate::proxy::build_forwarded_value(client_ip, "https", original_host_header),
         );
+    }
+    // RFC 8470 §5.2: signal to the origin that this request was carried
+    // over TLS 1.3 0-RTT so the backend can apply its own replay-safety
+    // policy (return 425 Too Early, defer the response, etc.). The
+    // gateway has already gated by `state.early_data_methods`, but the
+    // backend may have stricter policy than the gateway's allow-list.
+    if is_early_data {
+        req_builder = req_builder.header("Early-Data", "1");
     }
 
     req_builder
@@ -544,6 +577,7 @@ async fn collect_reqwest_response_body_with_limit(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_plain<S>(
     state: &ProxyState,
+    epoch: &RequestEpoch,
     proxy: &Proxy,
     stream: &mut RequestStream<S, Bytes>,
     method: &str,
@@ -553,13 +587,16 @@ async fn dispatch_plain<S>(
     backend_url: &str,
     lb_hash_key: Option<&str>,
     upstream_target: Option<&UpstreamTarget>,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
     cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
     prebuffered_body: Option<Vec<u8>>,
     raw_prebuffered_body_bytes: u64,
     client_ip: &str,
     backend_start: Instant,
     ctx: &mut RequestContext,
     plugins: &[Arc<dyn Plugin>],
+    requires_response_body_buffering: bool,
     sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
@@ -575,10 +612,13 @@ where
             record_backend_outcome(
                 state,
                 proxy,
+                &epoch.load_balancer,
+                upstream_balancer,
                 upstream_target,
                 cb_target_key,
                 502,
                 true,
+                cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
             let mut outcome = write_error(
@@ -621,9 +661,7 @@ where
             proxy,
             plugins,
             ctx,
-            state
-                .plugin_cache
-                .requires_response_body_buffering(&proxy.id),
+            requires_response_body_buffering,
         );
 
     let (response, request_bytes) = match prebuffered_body {
@@ -631,7 +669,7 @@ where
             let request_bytes = raw_prebuffered_body_bytes;
             let mut attempt = 0u32;
 
-            record_cross_protocol_connection_start(state, proxy, current_target.as_deref());
+            record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
 
             let response = loop {
                 let effective_host = current_target
@@ -647,6 +685,7 @@ where
                     &current_url,
                     effective_host,
                     client_ip,
+                    ctx.is_early_data,
                 )
                 .body(buffered_body.clone())
                 .send()
@@ -673,10 +712,12 @@ where
                             record_cross_protocol_retry_failure(
                                 state,
                                 proxy,
+                                upstream_balancer,
                                 current_target.as_deref(),
                                 current_cb_target_key.as_deref(),
                                 attempt_result.status_code,
                                 false,
+                                cb_is_half_open_probe,
                             );
                             let delay = crate::retry::retry_delay(retry_config, attempt);
                             tokio::time::sleep(delay).await;
@@ -684,6 +725,7 @@ where
                             if let Some((next_target, next_cb_target_key, next_url)) =
                                 select_next_cross_protocol_retry_target(
                                     state,
+                                    epoch,
                                     proxy,
                                     lb_hash_key,
                                     current_target.as_ref(),
@@ -703,8 +745,7 @@ where
                                 "Retrying cross-protocol H3→HTTP backend request"
                             );
                             record_cross_protocol_connection_start(
-                                state,
-                                proxy,
+                                upstream_balancer,
                                 current_target.as_deref(),
                             );
                             continue;
@@ -731,10 +772,12 @@ where
                             record_cross_protocol_retry_failure(
                                 state,
                                 proxy,
+                                upstream_balancer,
                                 current_target.as_deref(),
                                 current_cb_target_key.as_deref(),
                                 attempt_result.status_code,
                                 attempt_result.connection_error,
+                                cb_is_half_open_probe,
                             );
                             let delay = crate::retry::retry_delay(retry_config, attempt);
                             tokio::time::sleep(delay).await;
@@ -742,6 +785,7 @@ where
                             if let Some((next_target, next_cb_target_key, next_url)) =
                                 select_next_cross_protocol_retry_target(
                                     state,
+                                    epoch,
                                     proxy,
                                     lb_hash_key,
                                     current_target.as_ref(),
@@ -761,8 +805,7 @@ where
                                 "Retrying cross-protocol H3→HTTP backend request"
                             );
                             record_cross_protocol_connection_start(
-                                state,
-                                proxy,
+                                upstream_balancer,
                                 current_target.as_deref(),
                             );
                             continue;
@@ -777,10 +820,13 @@ where
                         record_backend_outcome(
                             state,
                             proxy,
+                            &epoch.load_balancer,
+                            upstream_balancer,
                             current_target.as_deref(),
                             current_cb_target_key.as_deref(),
                             attempt_result.status_code,
                             attempt_result.connection_error,
+                            cb_is_half_open_probe,
                             backend_start.elapsed(),
                         );
                         let mut outcome = write_error(
@@ -803,7 +849,7 @@ where
             (response, request_bytes)
         }
         None => {
-            record_cross_protocol_connection_start(state, proxy, current_target.as_deref());
+            record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
 
             let effective_host = current_target
                 .as_deref()
@@ -818,6 +864,7 @@ where
                 &current_url,
                 effective_host,
                 client_ip,
+                ctx.is_early_data,
             );
 
             let max_req_bytes = state.max_request_body_size_bytes;
@@ -988,10 +1035,13 @@ where
                 record_backend_outcome(
                     state,
                     proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
                     413,
                     false,
+                    cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
                 return write_error(
@@ -1024,10 +1074,13 @@ where
                     record_backend_outcome(
                         state,
                         proxy,
+                        &epoch.load_balancer,
+                        upstream_balancer,
                         current_target.as_deref(),
                         current_cb_target_key.as_deref(),
                         attempt_result.status_code,
                         attempt_result.connection_error,
+                        cb_is_half_open_probe,
                         backend_start.elapsed(),
                     );
                     let mut outcome = write_error(
@@ -1063,10 +1116,13 @@ where
         record_backend_outcome(
             state,
             proxy,
+            &epoch.load_balancer,
+            upstream_balancer,
             current_target.as_deref(),
             current_cb_target_key.as_deref(),
             502,
             false,
+            cb_is_half_open_probe,
             backend_start.elapsed(),
         );
         let mut outcome = write_error(
@@ -1095,10 +1151,13 @@ where
         record_backend_outcome(
             state,
             proxy,
+            &epoch.load_balancer,
+            upstream_balancer,
             current_target.as_deref(),
             current_cb_target_key.as_deref(),
             reject.status_code,
             false,
+            cb_is_half_open_probe,
             backend_start.elapsed(),
         );
         let mut outcome = write_reject_with_headers(
@@ -1118,7 +1177,7 @@ where
     // Sticky session cookie injection — only runs if the LB selected a
     // sticky target.
     crate::http3::server::inject_sticky_cookie(
-        state,
+        epoch,
         proxy,
         current_target.as_deref(),
         sticky_cookie_needed,
@@ -1138,10 +1197,13 @@ where
                 record_backend_outcome(
                     state,
                     proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
                     502,
                     false,
+                    cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
                 let empty_headers = HashMap::new();
@@ -1254,10 +1316,13 @@ where
         record_backend_outcome(
             state,
             proxy,
+            &epoch.load_balancer,
+            upstream_balancer,
             current_target.as_deref(),
             current_cb_target_key.as_deref(),
             response_status,
             false,
+            cb_is_half_open_probe,
             backend_start.elapsed(),
         );
 
@@ -1291,10 +1356,13 @@ where
     record_backend_outcome(
         state,
         proxy,
+        &epoch.load_balancer,
+        upstream_balancer,
         current_target.as_deref(),
         current_cb_target_key.as_deref(),
         status,
         false,
+        cb_is_half_open_probe,
         backend_start.elapsed(),
     );
 
@@ -1320,6 +1388,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_grpc<S>(
     state: &ProxyState,
+    epoch: &RequestEpoch,
     proxy: &Proxy,
     stream: &mut RequestStream<S, Bytes>,
     method: &str,
@@ -1329,13 +1398,16 @@ async fn dispatch_grpc<S>(
     backend_url: &str,
     lb_hash_key: Option<&str>,
     upstream_target: Option<&UpstreamTarget>,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
     cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
     prebuffered_body: Option<Vec<u8>>,
     raw_prebuffered_body_bytes: u64,
     client_ip: &str,
     backend_start: Instant,
     ctx: &mut RequestContext,
     plugins: &[Arc<dyn Plugin>],
+    requires_response_body_buffering: bool,
     sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
@@ -1427,6 +1499,13 @@ where
         if should_skip_cross_protocol_backend_header(k.as_str()) {
             continue;
         }
+        // RFC 8470 §5.2: `Early-Data` is set by the intermediary that
+        // forwarded the request over 0-RTT, never by the originating
+        // client. Strip any client-supplied value and let the
+        // `is_early_data` injection below produce the canonical form.
+        if k.as_str() == "early-data" {
+            continue;
+        }
         if let (Ok(name), Ok(val)) = (
             HeaderName::from_bytes(k.as_bytes()),
             HeaderValue::from_str(v),
@@ -1457,6 +1536,14 @@ where
             hmap.insert(hyper::header::FORWARDED, val);
         }
     }
+    // RFC 8470 §5.2: signal to the origin that this request was carried
+    // over TLS 1.3 0-RTT so the gRPC backend can apply its own
+    // replay-safety policy (e.g. reject with `UNAVAILABLE` on a
+    // non-idempotent unary call). The gateway has already gated by
+    // `state.early_data_methods`; the backend may apply additional policy.
+    if ctx.is_early_data {
+        hmap.insert("early-data", HeaderValue::from_static("1"));
+    }
 
     // Stream the response whenever the per-request streaming policy
     // permits it. The previous `!grpc_has_retry &&` gate forced buffering
@@ -1474,12 +1561,10 @@ where
         proxy,
         plugins,
         ctx,
-        state
-            .plugin_cache
-            .requires_response_body_buffering(&proxy.id),
+        requires_response_body_buffering,
     );
     let body_bytes = Bytes::from(body);
-    record_cross_protocol_connection_start(state, proxy, current_target.as_deref());
+    record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
     let mut result = proxy_grpc_request_from_bytes(
         hyper_method.clone(),
         hmap.clone(),
@@ -1496,33 +1581,34 @@ where
     if grpc_has_retry && let Some(retry_config) = &proxy.retry {
         let mut attempt = 0u32;
         loop {
-            // Local pre-wire predicate for the gRPC retry loop. Both
-            // listed `GrpcProxyError` variants are pre-wire by
-            // construction:
-            //   * `BackendUnavailable` is emitted only when the gRPC
-            //     dispatch never gets past TCP / TLS / h2 / h2c
-            //     handshake (no request frame ever leaves the gateway).
-            //   * `BackendTimeout::Connect` is the connect-timeout
-            //     timer, identical semantics.
-            // Both satisfy `request_reached_wire(class) == false` when
-            // mapped through `classify_grpc_proxy_error`, so this
-            // `matches!` agrees with the unified boundary by
-            // construction — but the agreement is invariant-by-listing,
-            // not invariant-by-derivation. If a future `GrpcProxyError`
-            // variant is added (e.g. a "TLS rejected after handshake"
-            // marker that's still pre-wire), it MUST be added to this
-            // arm AND to `classify_grpc_proxy_error` in lockstep. Run
-            // `cargo check` against the new variant; the surrounding
-            // tests in `tests/unit/gateway_core/grpc_*` will catch a
-            // misclassification mismatch.
-            let is_connection_error = matches!(
-                &result,
-                Err(grpc_proxy::GrpcProxyError::BackendUnavailable(_))
-                    | Err(grpc_proxy::GrpcProxyError::BackendTimeout {
-                        kind: grpc_proxy::GrpcTimeoutKind::Connect,
-                        ..
-                    })
-            );
+            // Pre-wire predicate for the H3→gRPC retry loop, derived from
+            // the typed kind (NOT a wildcard match on `BackendUnavailable`).
+            // The retry-on-connect-failure path bypasses `retry_on_methods`,
+            // which is only safe when the request bytes never reached the
+            // backend's application layer — i.e. when the kind is in the
+            // `is_connect_class()` set (DNS / TCP connect / TLS handshake /
+            // H2 handshake / H2c handshake / InvalidServerName).
+            // `BackendUnavailable::BackendRequest` is post-wire by definition
+            // (emitted from `sender.send_request().await` after H2 / ALPN)
+            // and MUST be excluded so non-idempotent gRPC POSTs aren't
+            // silently replayed on a mid-stream failure. `BackendTimeout::Connect`
+            // is the connect-timeout timer — pre-wire by construction.
+            // A regression test
+            // (`test_every_connect_class_kind_classifies_as_pre_wire`)
+            // structurally enforces that every kind in `is_connect_class()`
+            // also satisfies `request_reached_wire(class) == false`, so the
+            // predicate here cannot drift from the unified wire boundary in
+            // [`crate::retry::request_reached_wire`].
+            let is_connection_error = match &result {
+                Err(grpc_proxy::GrpcProxyError::BackendUnavailable { kind, .. }) => {
+                    kind.is_connect_class()
+                }
+                Err(grpc_proxy::GrpcProxyError::BackendTimeout {
+                    kind: grpc_proxy::GrpcTimeoutKind::Connect,
+                    ..
+                }) => true,
+                _ => false,
+            };
             if !is_connection_error
                 || !retry_config.retry_on_connect_failure
                 || attempt >= retry_config.max_retries
@@ -1533,10 +1619,12 @@ where
             record_cross_protocol_retry_failure(
                 state,
                 proxy,
+                upstream_balancer,
                 current_target.as_deref(),
                 current_cb_target_key.as_deref(),
                 502,
                 true,
+                cb_is_half_open_probe,
             );
 
             let delay = crate::retry::retry_delay(retry_config, attempt);
@@ -1546,6 +1634,7 @@ where
             if let Some((next_target, next_cb_target_key, next_url)) =
                 select_next_cross_protocol_retry_target(
                     state,
+                    epoch,
                     proxy,
                     lb_hash_key,
                     current_target.as_ref(),
@@ -1564,7 +1653,7 @@ where
                 max_retries = retry_config.max_retries,
                 "Retrying cross-protocol H3→gRPC backend request"
             );
-            record_cross_protocol_connection_start(state, proxy, current_target.as_deref());
+            record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
 
             // Stream the retry response under the same conditions as the
             // initial attempt. Hard-coding `false` here would silently
@@ -1623,10 +1712,13 @@ where
                 record_backend_outcome(
                     state,
                     proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
                     outcome.response_status,
                     false,
+                    cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
                 outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
@@ -1634,7 +1726,7 @@ where
                 return Ok(outcome);
             }
             crate::http3::server::inject_sticky_cookie(
-                state,
+                epoch,
                 proxy,
                 current_target.as_deref(),
                 sticky_cookie_needed,
@@ -1736,10 +1828,13 @@ where
             record_backend_outcome(
                 state,
                 proxy,
+                &epoch.load_balancer,
+                upstream_balancer,
                 current_target.as_deref(),
                 current_cb_target_key.as_deref(),
                 response_status,
                 false,
+                cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
             Ok(CrossProtocolOutcome {
@@ -1792,10 +1887,13 @@ where
                 record_backend_outcome(
                     state,
                     proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
                     outcome.response_status,
                     false,
+                    cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
                 outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
@@ -1803,7 +1901,7 @@ where
                 return Ok(outcome);
             }
             crate::http3::server::inject_sticky_cookie(
-                state,
+                epoch,
                 proxy,
                 current_target.as_deref(),
                 sticky_cookie_needed,
@@ -1831,10 +1929,13 @@ where
             record_backend_outcome(
                 state,
                 proxy,
+                &epoch.load_balancer,
+                upstream_balancer,
                 current_target.as_deref(),
                 current_cb_target_key.as_deref(),
                 streaming.status,
                 false,
+                cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
             Ok(CrossProtocolOutcome {
@@ -1871,24 +1972,37 @@ where
                 grpc_proxy::GrpcProxyError::Internal(_) => {
                     (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
                 }
-                grpc_proxy::GrpcProxyError::BackendUnavailable(_) => {
+                grpc_proxy::GrpcProxyError::BackendUnavailable { .. } => {
                     (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
                 }
             };
+            // Derive `connection_error` from the unified
+            // `request_reached_wire` boundary instead of hard-coding `true`.
+            // Hard-coding it tripped the circuit breaker / passive-health
+            // counter as a connect-class failure for post-wire errors
+            // (BackendRequest now `ConnectionReset`, read timeouts,
+            // ResourceExhausted/Internal where the request bytes already
+            // crossed the wire). Mirrors the H1/H2 gRPC path so a single
+            // predicate governs `connection_error` everywhere.
+            let connection_error = !crate::retry::request_reached_wire(error_class);
             warn!(
                 proxy_id = %proxy.id,
                 error = %err,
                 class = ?error_class,
                 grpc_status = grpc_status_code,
+                connection_error,
                 "cross-protocol H3→gRPC backend call failed"
             );
             record_backend_outcome(
                 state,
                 proxy,
+                &epoch.load_balancer,
+                upstream_balancer,
                 current_target.as_deref(),
                 current_cb_target_key.as_deref(),
                 502,
-                true,
+                connection_error,
+                cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
             let mut outcome = write_grpc_error(
@@ -1900,7 +2014,7 @@ where
             )
             .await?;
             outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
-            outcome.connection_error = true;
+            outcome.connection_error = connection_error;
             outcome.error_class = Some(error_class);
             outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
             Ok(outcome)
@@ -1976,6 +2090,24 @@ where
                                 break 'outer;
                             }
                         }
+                        let chunk_len = chunk.len();
+                        if crate::http3::config::should_direct_send_response_chunk(
+                            coalesce_buf.len(),
+                            chunk_len,
+                            coalesce.min_bytes,
+                        ) {
+                            if stream.send_data(chunk).await.is_err() {
+                                client_disconnected = true;
+                                body_error_class = Some(ErrorClass::ClientDisconnect);
+                                break 'outer;
+                            }
+                            bytes_streamed += chunk_len as u64;
+                            flush_timer
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + coalesce.flush_interval);
+                            continue;
+                        }
+
                         coalesce_buf.extend_from_slice(&chunk);
                         if coalesce_buf.len() >= coalesce.min_bytes {
                             let data = coalesce_buf.split().freeze();
@@ -2098,6 +2230,24 @@ where
                                     break 'outer;
                                 }
                             }
+                            let data_len = data.len();
+                            if crate::http3::config::should_direct_send_response_chunk(
+                                coalesce_buf.len(),
+                                data_len,
+                                coalesce.min_bytes,
+                            ) {
+                                if stream.send_data(data).await.is_err() {
+                                    client_disconnected = true;
+                                    body_error_class = Some(ErrorClass::ClientDisconnect);
+                                    break 'outer;
+                                }
+                                bytes_streamed += data_len as u64;
+                                flush_timer
+                                    .as_mut()
+                                    .reset(tokio::time::Instant::now() + coalesce.flush_interval);
+                                continue;
+                            }
+
                             coalesce_buf.extend_from_slice(&data);
                             if coalesce_buf.len() >= coalesce.min_bytes {
                                 let out = coalesce_buf.split().freeze();
@@ -2210,12 +2360,20 @@ fn classify_hyper_error(e: &hyper::Error) -> ErrorClass {
 fn collect_reqwest_response_headers(response: &reqwest::Response) -> HashMap<String, String> {
     let mut headers: HashMap<String, String> =
         HashMap::with_capacity(response.headers().keys_len());
+    // RFC 9110 §7.6.1 also requires removing every header NAMED in the
+    // response's `Connection` field. Snapshot the listed names before
+    // iterating so we can strip them in the same pass as the canonical
+    // predicate.
+    let connection_listed = parse_connection_listed_headers(response.headers());
     for (k, v) in response.headers() {
         let name = k.as_str();
         // Strip hop-by-hop response headers per RFC 9110 §7.6.1 — see
         // `proxy::headers` for the canonical predicate. Response-direction
         // set differs from the request-direction set.
         if is_backend_response_strip_header(name) {
+            continue;
+        }
+        if connection_listed.iter().any(|n| n == k) {
             continue;
         }
         if let Ok(val) = v.to_str() {
@@ -2668,11 +2826,16 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        apply_buffered_grpc_plugin_reject, apply_h3_grpc_reject_metadata, normalize_h3_grpc_reject,
-        reject_body_as_h3_grpc_message, sanitize_h3_grpc_message_for_header,
-        should_finish_h3_stream_without_trailers, should_skip_cross_protocol_backend_header,
+        apply_buffered_grpc_plugin_reject, apply_h3_grpc_reject_metadata,
+        build_plain_request_builder, normalize_h3_grpc_reject, reject_body_as_h3_grpc_message,
+        sanitize_h3_grpc_message_for_header, should_finish_h3_stream_without_trailers,
+        should_skip_cross_protocol_backend_header,
     };
+    use crate::config::EnvConfig;
+    use crate::config::types::{GatewayConfig, Proxy};
+    use crate::dns::{DnsCache, DnsConfig};
     use crate::plugins::{PluginResult, RequestContext};
+    use crate::proxy::ProxyState;
     use hyper::{HeaderMap, StatusCode};
 
     #[test]
@@ -3198,6 +3361,194 @@ mod tests {
             "expected `stream_grpc_response` to be threaded into the H3 \
              cross-protocol retry call; argument list was:\n{}",
             call_args
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // RFC 8470 §5.2 `Early-Data: 1` injection on the H3→non-H3 plain
+    // bridge (`build_plain_request_builder`). Tests cover:
+    //   - injection when ctx.is_early_data == true
+    //   - no injection when ctx.is_early_data == false
+    //   - client-supplied Early-Data header is always stripped
+    //
+    // The gRPC bridge uses an inline `HeaderMap` rather than a shared
+    // builder, so its injection is exercised end-to-end via the
+    // integration / functional test suite alongside the rest of the
+    // gRPC dispatch path.
+    // -----------------------------------------------------------------
+
+    fn minimal_proxy_state() -> ProxyState {
+        let dns_cache = DnsCache::new(DnsConfig::default());
+        let config = GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![],
+            consumers: vec![],
+            plugin_configs: vec![],
+            upstreams: vec![],
+            loaded_at: chrono::Utc::now(),
+            known_namespaces: Vec::new(),
+        };
+        ProxyState::new(config, dns_cache, EnvConfig::default(), None, None)
+            .expect("minimal ProxyState should construct")
+            .0
+    }
+
+    fn minimal_proxy() -> Proxy {
+        serde_json::from_value(serde_json::json!({
+            "backend_host": "backend.example",
+            "backend_port": 443,
+        }))
+        .expect("minimal proxy should deserialize")
+    }
+
+    /// Count occurrences of a header (lowercase compare) in a built
+    /// reqwest `Request`. reqwest header names are already lowercased
+    /// by the http crate.
+    fn count_header(req: &reqwest::Request, name: &str) -> usize {
+        req.headers()
+            .iter()
+            .filter(|(n, _)| n.as_str().eq_ignore_ascii_case(name))
+            .count()
+    }
+
+    fn header_value<'a>(req: &'a reqwest::Request, name: &str) -> Option<&'a [u8]> {
+        req.headers()
+            .iter()
+            .find(|(n, _)| n.as_str().eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_bytes())
+    }
+
+    #[tokio::test]
+    async fn build_plain_request_builder_injects_early_data_header_when_zero_rtt() {
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let client = reqwest::Client::new();
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("user-agent".to_string(), "test-client".to_string());
+
+        let builder = build_plain_request_builder(
+            &client,
+            &state,
+            &proxy,
+            reqwest::Method::GET,
+            &headers,
+            "https://backend.example/path",
+            "backend.example",
+            "203.0.113.1",
+            /* is_early_data = */ true,
+        );
+
+        let req = builder.build().expect("request should build");
+        assert_eq!(
+            header_value(&req, "early-data"),
+            Some(&b"1"[..]),
+            "RFC 8470 §5.2: Early-Data: 1 must be injected when ctx.is_early_data is true"
+        );
+        assert_eq!(
+            count_header(&req, "early-data"),
+            1,
+            "exactly one Early-Data header expected"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_plain_request_builder_does_not_inject_early_data_header_for_normal_request() {
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let client = reqwest::Client::new();
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("user-agent".to_string(), "test-client".to_string());
+
+        let builder = build_plain_request_builder(
+            &client,
+            &state,
+            &proxy,
+            reqwest::Method::GET,
+            &headers,
+            "https://backend.example/path",
+            "backend.example",
+            "203.0.113.1",
+            /* is_early_data = */ false,
+        );
+
+        let req = builder.build().expect("request should build");
+        assert_eq!(
+            count_header(&req, "early-data"),
+            0,
+            "Early-Data must NOT be injected when the request is not 0-RTT"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_plain_request_builder_strips_client_supplied_early_data_when_zero_rtt() {
+        // RFC 8470 §5.2: clients never set Early-Data; only intermediaries
+        // do. The gateway must strip and re-inject so the value is
+        // authoritative regardless of what the client sent.
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let client = reqwest::Client::new();
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("early-data".to_string(), "0".to_string());
+
+        let builder = build_plain_request_builder(
+            &client,
+            &state,
+            &proxy,
+            reqwest::Method::GET,
+            &headers,
+            "https://backend.example/path",
+            "backend.example",
+            "203.0.113.1",
+            /* is_early_data = */ true,
+        );
+
+        let req = builder.build().expect("request should build");
+        assert_eq!(
+            count_header(&req, "early-data"),
+            1,
+            "client-supplied Early-Data must not duplicate or survive — \
+             expected exactly one Early-Data: 1 from the gateway"
+        );
+        assert_eq!(
+            header_value(&req, "early-data"),
+            Some(&b"1"[..]),
+            "client's `0` must be replaced with the gateway's `1`"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_plain_request_builder_strips_client_supplied_early_data_when_not_zero_rtt() {
+        // Even when is_early_data is false, the gateway must strip a
+        // client-supplied Early-Data header. A bogus client cannot
+        // trick the backend into believing the request was 0-RTT.
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let client = reqwest::Client::new();
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("early-data".to_string(), "1".to_string());
+
+        let builder = build_plain_request_builder(
+            &client,
+            &state,
+            &proxy,
+            reqwest::Method::GET,
+            &headers,
+            "https://backend.example/path",
+            "backend.example",
+            "203.0.113.1",
+            /* is_early_data = */ false,
+        );
+
+        let req = builder.build().expect("request should build");
+        assert_eq!(
+            count_header(&req, "early-data"),
+            0,
+            "client-supplied Early-Data must be stripped, and no value \
+             injected when is_early_data == false"
         );
     }
 }

@@ -22,6 +22,7 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 | `FERRUM_PROXY_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for proxy listeners (HTTP, HTTPS, HTTP/3). Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_FRONTEND_TLS_CERT_PATH` | If HTTPS | — | PEM certificate the gateway presents to incoming clients (HTTPS, WebSocket, gRPC, TCP/TLS) |
 | `FERRUM_FRONTEND_TLS_KEY_PATH` | If HTTPS | — | PEM private key for the gateway's frontend TLS certificate |
+| `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` | No | `10` | Seconds allowed for frontend TLS/DTLS handshakes before HTTP header parsing or stream proxy handling begins. `0` disables |
 
 ### Admin API
 
@@ -48,6 +49,7 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 | `FERRUM_DB_CONFIG_BACKUP_PATH` | No | — | Path to externally provided JSON config backup. Used as startup fallback when the database is unreachable. |
 | `FERRUM_DB_FAILOVER_URLS` | No | — | Comma-separated failover database URLs. For MongoDB replica sets, prefer listing all members in `FERRUM_DB_URL` instead |
 | `FERRUM_DB_READ_REPLICA_URL` | No | — | Read replica URL for config polling (SQL only). For MongoDB, use `readPreference` in the connection string |
+| `FERRUM_DB_FULL_LOAD_PAGE_SIZE` | No | `10000` | Max rows per query during full config loading (SQL only). Clamped to 100..=100000 |
 
 ### Database TLS
 
@@ -132,6 +134,7 @@ See [size_limits.md](size_limits.md) for detailed sizing guidance.
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | No | Disabled | Log slow DNS resolutions above this threshold (ms) |
 | `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | No | `90` | Percentage of TTL elapsed before background refresh (1-99) |
 | `FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS` | No | `10` | Interval (seconds) for retrying failed DNS lookups. `0` = disabled |
+| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | No | `64` | Maximum concurrent stale-while-revalidate background refresh tasks system-wide. Prevents unbounded task spawning when many stale hostnames are hit simultaneously. Range: 1-1000 |
 
 See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 
@@ -183,6 +186,7 @@ See [docs/http3.md](http3.md) for the full HTTP/3 dispatch model, cross-protocol
 | `FERRUM_DTLS_CERT_PATH` | No | — | PEM certificate for frontend DTLS termination (ECDSA P-256 or Ed25519 only) |
 | `FERRUM_DTLS_KEY_PATH` | No | — | PEM private key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | No | — | PEM CA certificate for verifying DTLS client certs (frontend mTLS) |
+| `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` | No | `10` | Shared frontend TCP+TLS and UDP+DTLS handshake timeout. DTLS peers still in handshake count against `FERRUM_UDP_MAX_SESSIONS` until this deadline releases them |
 
 See [tcp_udp_proxy.md](tcp_udp_proxy.md) for full TCP/UDP proxy documentation.
 

@@ -1866,3 +1866,64 @@ async fn test_protobuf_empty_message_valid() {
     headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
     assert_continue(plugin.on_final_request_body(&headers, &frame).await);
 }
+
+// ─── SSE response buffering bypass ──────────────────────────────────
+
+#[test]
+fn test_sse_request_skips_response_validation_buffering() {
+    // A response-validating body_validator config buffers responses for
+    // the validator to inspect. SSE responses must bypass that buffer or
+    // the gateway 502s once the max-response-body limit is hit.
+    let plugin = BodyValidator::new(&json!({
+        "response_required_fields": ["id"]
+    }))
+    .unwrap();
+    assert!(plugin.requires_response_body_buffering());
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/events".to_string(),
+    );
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+
+    assert!(!plugin.should_buffer_response_body(&ctx));
+}
+
+#[test]
+fn test_non_sse_request_still_validates_response() {
+    // Default behavior must still buffer JSON responses for validation.
+    let plugin = BodyValidator::new(&json!({
+        "response_required_fields": ["id"]
+    }))
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    ctx.headers
+        .insert("accept".to_string(), "application/json".to_string());
+
+    assert!(plugin.should_buffer_response_body(&ctx));
+}
+
+#[test]
+fn test_no_response_validation_never_buffers_even_for_non_sse() {
+    // When response validation is disabled, the buffer flag is false
+    // regardless of Accept — guarding the existing config-driven default.
+    let plugin = BodyValidator::new(&json!({"validate_xml": true})).unwrap();
+    assert!(!plugin.requires_response_body_buffering());
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    ctx.headers
+        .insert("accept".to_string(), "application/json".to_string());
+
+    assert!(!plugin.should_buffer_response_body(&ctx));
+}

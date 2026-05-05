@@ -23,6 +23,13 @@ pub enum ExtractedCredential {
         date: String,
         method: String,
         path: String,
+        /// Value of the `Digest:` (RFC 3230) or `Content-Digest:` (RFC 9421)
+        /// header. Empty string when the plugin is configured with
+        /// `require_digest = false` (legacy mode).
+        digest_header: String,
+        /// Buffered request body bytes used to verify `digest_header`. Empty
+        /// when the plugin is in legacy mode or the request has no body.
+        request_body: Vec<u8>,
     },
     MtlsCert {
         der_bytes: Arc<Vec<u8>>,

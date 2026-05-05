@@ -62,6 +62,7 @@ pub async fn run(
             )
             .await?;
             store.set_slow_query_threshold(env_config.db_slow_query_threshold_ms);
+            store.set_full_load_page_size(env_config.db_full_load_page_size);
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
             store.run_migrations().await?;
@@ -90,6 +91,7 @@ pub async fn run(
             )
             .await?;
             store.set_slow_query_threshold(env_config.db_slow_query_threshold_ms);
+            store.set_full_load_page_size(env_config.db_full_load_page_size);
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
 
@@ -117,6 +119,14 @@ pub async fn run(
     };
     let db: Arc<dyn DatabaseBackend> = Arc::from(db);
 
+    // Custom-plugin migrations: warn on pending, opt-in auto-apply.
+    crate::modes::handle_startup_plugin_migrations(
+        &db,
+        env_config.auto_apply_plugin_migrations,
+        "cp",
+    )
+    .await?;
+
     let config = db.load_full_config(&env_config.namespace).await?;
     info!(
         "CP mode: loaded {} proxies, {} consumers",
@@ -136,14 +146,20 @@ pub async fn run(
         }
     };
 
-    // Create gRPC server with shared DP node registry
+    // Create gRPC server with shared DP node registry. The expected JWT
+    // issuer and namespace are threaded in from EnvConfig: DPs must mint
+    // tokens with the same `iss` value and advertise the same namespace, or
+    // the CP rejects them before streaming any config.
     let dp_registry = Arc::new(crate::grpc::cp_server::DpNodeRegistry::new());
-    let (grpc_server, update_tx) = CpGrpcServer::with_channel_capacity_and_registry(
-        config_arc.clone(),
-        grpc_secret,
-        env_config.cp_broadcast_channel_capacity,
-        dp_registry.clone(),
-    );
+    let (grpc_server, update_tx) =
+        CpGrpcServer::with_channel_capacity_registry_issuer_and_namespace(
+            config_arc.clone(),
+            grpc_secret,
+            env_config.cp_broadcast_channel_capacity,
+            dp_registry.clone(),
+            env_config.cp_dp_grpc_jwt_issuer.clone(),
+            env_config.namespace.clone(),
+        );
 
     // Build TLS hardening policy from environment
     let tls_policy = TlsPolicy::from_env_config(&env_config)?;
@@ -182,7 +198,13 @@ pub async fn run(
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         dp_registry: Some(dp_registry.clone()),
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
+        admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
     };
+    // Clone admin_state before the HTTP listener moves it, so we can reuse
+    // the same JwtManager instance for the HTTPS listener (instead of calling
+    // create_jwt_manager_from_env() a second time).
+    let admin_state_for_https = admin_state.clone();
     let admin_shutdown = shutdown_tx.subscribe();
 
     // Admin HTTP listener (disabled when port is 0)
@@ -207,25 +229,6 @@ pub async fn run(
     ) {
         let admin_https_addr: SocketAddr =
             env_config.admin_socket_addr(env_config.admin_https_port);
-        let admin_state_for_https = AdminState {
-            db: Some(db.clone()),
-            jwt_manager: create_jwt_manager_from_env()
-                .map_err(|e| anyhow::anyhow!("Failed to create JWT manager: {}", e))?,
-            cached_config: Some(config_arc.clone()),
-            proxy_state: None,
-            mode: "cp".into(),
-            read_only: env_config.admin_read_only,
-            startup_ready: Some(startup_ready.clone()),
-            db_available: Some(db_available.clone()),
-            admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
-            admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
-            reserved_ports: reserved_ports.clone(),
-            stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
-            admin_allowed_cidrs: admin_allowed_cidrs.clone(),
-            cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
-            dp_registry: Some(dp_registry.clone()),
-            cp_connection_state: None,
-        };
         let admin_https_shutdown = shutdown_tx.subscribe();
 
         // Load admin TLS configuration
@@ -401,7 +404,10 @@ pub async fn run(
         drop(grpc_server); // consumed by the gRPC spawn when enabled
         None
     };
-    startup_ready.store(true, Ordering::Relaxed);
+    // Mark CP as ready — same rationale as database mode: the initial
+    // `load_full_config()` proved DB connectivity and loaded a complete config.
+    // The polling loop handles ongoing incremental updates, not initial readiness.
+    startup_ready.store(true, Ordering::Release);
     info!("Control plane startup complete; /health now reports ready");
 
     // Database polling loop -> push incremental deltas to DPs (with shutdown).
@@ -439,7 +445,9 @@ pub async fn run(
         try_tcp_on_error: env_config.dns_try_tcp_on_error,
         num_concurrent_reqs: env_config.dns_num_concurrent_reqs,
         max_active_requests: env_config.dns_max_active_requests,
+        max_concurrent_refreshes: env_config.dns_max_concurrent_refreshes,
         backend_allow_ips: env_config.backend_allow_ips.clone(),
+        shard_amount: env_config.pool_shard_amount,
     });
     let db_url_for_reconnect = effective_url.clone();
     let replica_url_for_reconnect = effective_replica_url.clone();
@@ -679,50 +687,65 @@ pub async fn run(
         }
     });
 
-    // Wait for any listener handle to exit, or the shutdown signal if all
-    // listeners are disabled (e.g., admin_http=0, no admin TLS, gRPC port=0).
-    let mut wait_shutdown = shutdown_tx.subscribe();
-    tokio::select! {
-        _ = async {
-            if let Some(handle) = admin_http_handle {
-                let _ = handle.await;
-            } else {
-                std::future::pending::<()>().await;
+    // Wait for ALL listener handles to exit, or the shutdown signal if no
+    // listeners were spawned (e.g., admin_http=0, no admin TLS, gRPC port=0).
+    //
+    // Reuses `crate::modes::file::await_listener_handles` to mirror file/db
+    // mode's shutdown shape:
+    //
+    // 1. On the shutdown signal, every listener observes it via its own
+    //    `shutdown_tx.subscribe()` receiver and exits gracefully —
+    //    `serve_with_incoming_shutdown` for gRPC (so tonic completes
+    //    in-flight RPCs and `TrackedStream`'s `Drop` deregisters the DP
+    //    from `DpNodeRegistry`), and the watch-driven shutdown loops for
+    //    admin HTTP/HTTPS.
+    // 2. If a listener panics, `await_listener_handles` fires the
+    //    `shutdown_on_panic` trigger so the remaining listeners observe
+    //    shutdown and exit promptly. The previous `tokio::select!`
+    //    instead detached the still-serving handles (the inner async
+    //    blocks were cancelled, dropping the moved `JoinHandle`s, which
+    //    detaches rather than aborts) — those listeners then died
+    //    abruptly when the runtime torn down at function return,
+    //    cutting in-flight DP streams without graceful drain and
+    //    yielding a partial-shutdown anomaly.
+    let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if let Some(handle) = admin_http_handle {
+        listener_handles.push(handle);
+    }
+    if let Some(handle) = grpc_handle {
+        listener_handles.push(handle);
+    }
+    if let Some(handle) = admin_https_handle {
+        listener_handles.push(handle);
+    }
+
+    if listener_handles.is_empty() {
+        let mut wait_shutdown = shutdown_tx.subscribe();
+        while !*wait_shutdown.borrow() {
+            if wait_shutdown.changed().await.is_err() {
+                break;
             }
-        } => {}
-        _ = async {
-            if let Some(handle) = grpc_handle {
-                let _ = handle.await;
-            } else {
-                std::future::pending::<()>().await;
+        }
+        info!("Shutdown signal received with no active listeners");
+    } else {
+        let shutdown_on_panic = {
+            let shutdown_tx = shutdown_tx.clone();
+            move || {
+                let _ = shutdown_tx.send(true);
             }
-        } => {}
-        _ = async {
-            if let Some(handle) = admin_https_handle {
-                let _ = handle.await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        } => {}
-        _ = async {
-            while !*wait_shutdown.borrow() {
-                if wait_shutdown.changed().await.is_err() {
-                    return;
-                }
-            }
-        } => {
-            info!("Shutdown signal received with no active listeners");
+        };
+        if let Err(err) =
+            crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic).await
+        {
+            error!("CP listener task failed: {}", err);
         }
     }
 
     // Wait for background tasks to drain cleanly, with a timeout to prevent
-    // hanging if a task is stuck (e.g., blocked on a DB query).
-    if tokio::time::timeout(Duration::from_secs(5), db_poll_handle)
-        .await
-        .is_err()
-    {
-        warn!("Background tasks did not drain within 5s, proceeding with shutdown");
-    }
+    // hanging if a task is stuck (e.g., blocked on a DB query). Same 5 s
+    // cap as the pre-refactor inline timeout — a stuck DB poll is never
+    // allowed to wedge graceful shutdown.
+    crate::modes::file::join_background_handles(vec![db_poll_handle], Duration::from_secs(5)).await;
 
     Ok(())
 }
@@ -822,5 +845,357 @@ fn update_known_ids(
     }
     for id in added {
         known.insert(id.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::db_backend::IncrementalResult;
+    use crate::config::types::*;
+    use chrono::Utc;
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    fn empty_incremental() -> IncrementalResult {
+        IncrementalResult {
+            added_or_modified_proxies: vec![],
+            removed_proxy_ids: vec![],
+            added_or_modified_consumers: vec![],
+            removed_consumer_ids: vec![],
+            added_or_modified_plugin_configs: vec![],
+            removed_plugin_config_ids: vec![],
+            added_or_modified_upstreams: vec![],
+            removed_upstream_ids: vec![],
+            poll_timestamp: Utc::now(),
+        }
+    }
+
+    fn make_proxy(id: &str) -> Proxy {
+        Proxy {
+            id: id.to_string(),
+            namespace: default_namespace(),
+            name: None,
+            hosts: vec![],
+            listen_path: Some(format!("/{id}")),
+            backend_scheme: Some(BackendScheme::Http),
+            dispatch_kind: DispatchKind::from(BackendScheme::Http),
+            backend_host: "localhost".to_string(),
+            backend_port: 8080,
+            backend_path: None,
+            strip_listen_path: true,
+            preserve_host_header: false,
+            backend_connect_timeout_ms: 5000,
+            backend_read_timeout_ms: 30000,
+            backend_write_timeout_ms: 30000,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            resolved_tls: Default::default(),
+            dns_override: None,
+            dns_cache_ttl_seconds: None,
+            auth_mode: AuthMode::Single,
+            plugins: vec![],
+            pool_idle_timeout_seconds: None,
+            pool_enable_http_keep_alive: None,
+            pool_enable_http2: None,
+            pool_tcp_keepalive_seconds: None,
+            pool_http2_keep_alive_interval_seconds: None,
+            pool_http2_keep_alive_timeout_seconds: None,
+            pool_http2_initial_stream_window_size: None,
+            pool_http2_initial_connection_window_size: None,
+            pool_http2_adaptive_window: None,
+            pool_http2_max_frame_size: None,
+            pool_http2_max_concurrent_streams: None,
+            pool_http3_connections_per_backend: None,
+            upstream_id: None,
+            api_spec_id: None,
+            circuit_breaker: None,
+            retry: None,
+            response_body_mode: ResponseBodyMode::default(),
+            listen_port: None,
+            frontend_tls: false,
+            passthrough: false,
+            udp_idle_timeout_seconds: 60,
+            tcp_idle_timeout_seconds: Some(300),
+            allowed_methods: None,
+            allowed_ws_origins: vec![],
+            udp_max_response_amplification_factor: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn make_consumer(id: &str) -> Consumer {
+        Consumer {
+            id: id.to_string(),
+            namespace: default_namespace(),
+            username: format!("user_{id}"),
+            custom_id: None,
+            credentials: std::collections::HashMap::new(),
+            acl_groups: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    // ── upsert_by_id ───────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_replaces_existing_by_id() {
+        let mut items = vec![("a", 1), ("b", 2)];
+        upsert_by_id(&mut items, vec![("b", 99)], |item| item.0.to_string());
+        assert_eq!(items[1].1, 99);
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn upsert_appends_new_items() {
+        let mut items = vec![("a", 1)];
+        upsert_by_id(&mut items, vec![("c", 3)], |item| item.0.to_string());
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1], ("c", 3));
+    }
+
+    #[test]
+    fn upsert_mixed_replace_and_append() {
+        let mut items = vec![("a", 1), ("b", 2)];
+        upsert_by_id(&mut items, vec![("b", 20), ("c", 30)], |item| {
+            item.0.to_string()
+        });
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[1].1, 20); // b replaced
+        assert_eq!(items[2], ("c", 30)); // c appended
+    }
+
+    #[test]
+    fn upsert_empty_updates_is_noop() {
+        let mut items = vec![("a", 1)];
+        upsert_by_id(&mut items, vec![], |item| item.0.to_string());
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn upsert_into_empty_list() {
+        let mut items: Vec<(&str, i32)> = vec![];
+        upsert_by_id(&mut items, vec![("a", 1)], |item| item.0.to_string());
+        assert_eq!(items.len(), 1);
+    }
+
+    // update_known_ids
+
+    #[test]
+    fn update_known_ids_adds_and_removes() {
+        let mut known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        update_known_ids(&mut known, &vec!["d".to_string()], &["b".to_string()]);
+        assert!(known.contains("a"));
+        assert!(!known.contains("b"));
+        assert!(known.contains("c"));
+        assert!(known.contains("d"));
+    }
+
+    #[test]
+    fn update_known_ids_remove_nonexistent_is_noop() {
+        let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
+        update_known_ids(&mut known, &vec![], &["zzz".to_string()]);
+        assert_eq!(known.len(), 1);
+        assert!(known.contains("a"));
+    }
+
+    #[test]
+    fn update_known_ids_empty_operations() {
+        let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
+        update_known_ids(&mut known, &vec![], &[]);
+        assert_eq!(known.len(), 1);
+    }
+
+    // apply_incremental_to_config
+
+    #[test]
+    fn apply_incremental_empty_is_noop() {
+        let mut config = GatewayConfig {
+            proxies: vec![make_proxy("p1")],
+            ..Default::default()
+        };
+        apply_incremental_to_config(&mut config, empty_incremental());
+        assert_eq!(config.proxies.len(), 1);
+    }
+
+    #[test]
+    fn apply_incremental_adds_proxy() {
+        let mut config = GatewayConfig::default();
+        let mut inc = empty_incremental();
+        inc.added_or_modified_proxies = vec![make_proxy("new")];
+        apply_incremental_to_config(&mut config, inc);
+        assert_eq!(config.proxies.len(), 1);
+        assert_eq!(config.proxies[0].id, "new");
+    }
+
+    #[test]
+    fn apply_incremental_removes_proxy() {
+        let mut config = GatewayConfig {
+            proxies: vec![make_proxy("p1"), make_proxy("p2")],
+            ..Default::default()
+        };
+        let mut inc = empty_incremental();
+        inc.removed_proxy_ids = vec!["p1".to_string()];
+        apply_incremental_to_config(&mut config, inc);
+        assert_eq!(config.proxies.len(), 1);
+        assert_eq!(config.proxies[0].id, "p2");
+    }
+
+    #[test]
+    fn apply_incremental_modifies_proxy() {
+        let mut config = GatewayConfig {
+            proxies: vec![make_proxy("p1")],
+            ..Default::default()
+        };
+        let mut updated = make_proxy("p1");
+        updated.backend_port = 9999;
+        let mut inc = empty_incremental();
+        inc.added_or_modified_proxies = vec![updated];
+        apply_incremental_to_config(&mut config, inc);
+        assert_eq!(config.proxies.len(), 1);
+        assert_eq!(config.proxies[0].backend_port, 9999);
+    }
+
+    #[test]
+    fn apply_incremental_mixed_operations() {
+        let mut config = GatewayConfig {
+            proxies: vec![make_proxy("keep"), make_proxy("remove")],
+            consumers: vec![make_consumer("c1")],
+            ..Default::default()
+        };
+        let mut inc = empty_incremental();
+        inc.removed_proxy_ids = vec!["remove".to_string()];
+        inc.added_or_modified_proxies = vec![make_proxy("added")];
+        inc.removed_consumer_ids = vec!["c1".to_string()];
+        inc.added_or_modified_consumers = vec![make_consumer("c2")];
+        apply_incremental_to_config(&mut config, inc);
+
+        assert_eq!(config.proxies.len(), 2);
+        assert!(config.proxies.iter().any(|p| p.id == "keep"));
+        assert!(config.proxies.iter().any(|p| p.id == "added"));
+        assert!(!config.proxies.iter().any(|p| p.id == "remove"));
+        assert_eq!(config.consumers.len(), 1);
+        assert_eq!(config.consumers[0].id, "c2");
+    }
+
+    // Regression: prior to this fix, CP mode used `tokio::select!` over the
+    // admin/HTTPS/gRPC listener handles. The first listener to exit (panic
+    // or otherwise) short-circuited the select and dropped the inner
+    // async blocks for the others. Those `JoinHandle`s were *moved* into
+    // the cancelled inner blocks, so dropping them detached the still
+    // serving listener tasks rather than aborting them. The function then
+    // returned, the runtime tore down at the binary boundary, and the
+    // detached listeners died abruptly mid-flight — DPs subscribing to
+    // the gRPC stream saw their connections cut without a graceful
+    // shutdown signal.
+    //
+    // The fix routes the listener handles through
+    // `crate::modes::file::await_listener_handles`, which both:
+    //   1. Awaits ALL handles concurrently so a single exit does not
+    //      strand the others; and
+    //   2. Fires `shutdown_on_panic` on the first panic so the remaining
+    //      listeners observe the shared shutdown watch channel via their
+    //      own subscribers and exit promptly.
+    //
+    // This test models that with three fake CP listeners (admin_http,
+    // grpc, admin_https). One panics; the other two must still drain
+    // cleanly through the watch trigger fired by `shutdown_on_panic`.
+    // Bound the wait at 2 s — without the trigger, the remaining
+    // listeners would block forever on their watch receivers.
+    #[tokio::test]
+    async fn cp_shutdown_drains_remaining_listeners_when_one_panics() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+        let mut admin_http_rx = shutdown_tx.subscribe();
+        let admin_http = tokio::spawn(async move {
+            let _ = admin_http_rx.changed().await;
+        });
+
+        let grpc = tokio::spawn(async {
+            panic!("simulated gRPC listener crash");
+        });
+
+        let mut admin_https_rx = shutdown_tx.subscribe();
+        let admin_https = tokio::spawn(async move {
+            let _ = admin_https_rx.changed().await;
+        });
+
+        // Mirror the CP run() composition: collect Some-handles into a
+        // Vec, then drive them through await_listener_handles with a
+        // panic trigger that flips the shared shutdown watch.
+        let listener_handles: Vec<tokio::task::JoinHandle<()>> =
+            vec![admin_http, grpc, admin_https];
+
+        let trigger_tx = shutdown_tx.clone();
+        let started = Instant::now();
+        let result = crate::modes::file::await_listener_handles(listener_handles, move || {
+            let _ = trigger_tx.send(true);
+        })
+        .await;
+        let elapsed = started.elapsed();
+
+        // The panicking gRPC listener must surface as a JoinError…
+        let err = result.expect_err("the gRPC listener panicked, helper must return Err");
+        assert!(
+            err.is_panic(),
+            "JoinError should report `is_panic()` for a panicked listener; got {err:?}",
+        );
+        // …and the admin HTTP/HTTPS listeners must have observed the
+        // shutdown trigger and exited promptly. Without the trigger
+        // they would hang on their watch receivers forever.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "remaining listeners should drain via shutdown trigger; took {elapsed:?}",
+        );
+    }
+
+    // Sanity: when no listener panics and the shared shutdown watch is
+    // simply set to true (the normal SIGTERM path), every listener's
+    // own `.subscribe()` receiver fires `changed()` and the helper
+    // returns Ok without ever invoking the panic trigger. This verifies
+    // the "happy path" is preserved end-to-end through the same
+    // composition the CP mode uses.
+    #[tokio::test]
+    async fn cp_shutdown_drains_all_listeners_on_signal() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+        let mut admin_http_rx = shutdown_tx.subscribe();
+        let admin_http = tokio::spawn(async move {
+            let _ = admin_http_rx.changed().await;
+        });
+        let mut grpc_rx = shutdown_tx.subscribe();
+        let grpc = tokio::spawn(async move {
+            let _ = grpc_rx.changed().await;
+        });
+        let mut admin_https_rx = shutdown_tx.subscribe();
+        let admin_https = tokio::spawn(async move {
+            let _ = admin_https_rx.changed().await;
+        });
+
+        let triggered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let triggered_clone = triggered.clone();
+
+        // Fire shutdown after spawning so the listeners are already
+        // parked on changed() — models the SIGTERM path.
+        shutdown_tx
+            .send(true)
+            .expect("watch send must succeed with live receivers");
+
+        let result = crate::modes::file::await_listener_handles(
+            vec![admin_http, grpc, admin_https],
+            move || {
+                triggered_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await;
+        result.expect("no listener panicked; helper must return Ok");
+        assert!(
+            !triggered.load(std::sync::atomic::Ordering::SeqCst),
+            "panic trigger must NOT fire on a clean shutdown",
+        );
     }
 }

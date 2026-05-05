@@ -21,11 +21,12 @@ use crate::tls::backend::BackendTlsConfigBuilder;
 use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
-use crate::load_balancer::LoadBalancerCache;
-use crate::plugin_cache::PluginCache;
+use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
 use crate::plugins::{
     Direction, PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary,
 };
+use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
+use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 use crate::retry::ErrorClass;
 
 pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
@@ -105,20 +106,23 @@ fn both_directions_transferred(c2b_bytes: &AtomicU64, b2c_bytes: &AtomicU64) -> 
     c2b_bytes.load(Ordering::Relaxed) > 0 && b2c_bytes.load(Ordering::Relaxed) > 0
 }
 
-// Shared error-message prefixes used at `anyhow::anyhow!` construction sites
-// AND at the `error_message.contains(...)` check sites in
-// `pre_copy_disconnect_cause` / `dtls_disconnect_cause`. Keeping them as
-// constants means a rename at the construction site is a compile error
-// everywhere — the checkers can't silently fall out of sync with the message
-// wording. Do not inline these strings; route any new "wraps a stream error"
-// site through a constant.
+// Legacy stream-error message prefixes.
+//
+// These are public-API surface for log consumers, dashboards, and
+// integration tests that grep on the wording. They are produced at runtime
+// by [`StreamSetupKind::prefix`] (`StreamSetupError`'s Display delegates to
+// it); a regression test in `stream_error.rs` asserts the constants and the
+// typed prefix stay in lockstep.
+//
+// New construction sites MUST emit a [`StreamSetupError`] rather than a
+// bare `anyhow!()` — typed cause/direction attribution then survives
+// `.context()`, `.into()`, and downstream error wrapping without depending
+// on substring matching.
 pub(crate) const STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED: &str = "Frontend TLS handshake failed";
 pub(crate) const STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED: &str = "Backend TLS handshake failed";
 pub(crate) const STREAM_ERR_REJECTED_BY_PLUGIN: &str = "rejected by plugin";
-pub(crate) const STREAM_ERR_REJECTED_BY_ACL: &str = "rejected by ACL";
-pub(crate) const STREAM_ERR_REJECTED_BY_POLICY: &str = "rejected by policy";
-pub(crate) const STREAM_ERR_THROTTLED: &str = "throttled";
 pub(crate) const STREAM_ERR_NO_HEALTHY_TARGETS: &str = "No healthy targets";
+pub(crate) const STREAM_ERR_CIRCUIT_BREAKER_OPEN: &str = "circuit breaker open";
 
 /// Sentinel prefix used by the Linux splice paths
 /// (`io_uring_splice_direction`, `libc_splice_loop`) to signal that the
@@ -222,13 +226,17 @@ pub fn disconnect_cause_for_failure(
 /// port exhaustion, pool errors) map to `BackendError` so `stream_disconnects`
 /// metrics don't misclassify backend outages as client recv errors.
 ///
-/// `TlsError` is ambiguous — it can come from the frontend TLS handshake
-/// (client-side issue, e.g. invalid client cert) or the backend TLS
-/// origination. We use the error message prefix set at each call site
-/// (`"Frontend TLS handshake failed ..."` vs. backend TLS wrapping) to
-/// disambiguate; when the message doesn't clearly identify the side, we fall
-/// back to the conservative `RecvError` so a client-side TLS error never
-/// trips a backend-error dashboard/alert.
+/// **Typed-kind first.** When the error chain carries a [`StreamSetupError`]
+/// (the canonical wrapper at every construction site that previously emitted
+/// a `STREAM_ERR_*` prefix), its [`StreamSetupKind`] is the authoritative
+/// signal: `is_client_side()` decides `RecvError` vs `BackendError` directly.
+/// The class-based fallback below applies only when the chain has no
+/// typed setup error — for example, when the failure originated outside the
+/// proxy module or pre-dates the typed infrastructure.
+///
+/// `TlsError` would otherwise be ambiguous (frontend handshake vs backend
+/// handshake) — the typed kind resolves this without inspecting the
+/// message.
 ///
 /// Genuinely client-side failures (e.g., `ClientDisconnect`) stay
 /// `RecvError`. Timeouts during connect become `BackendError`, not
@@ -236,14 +244,26 @@ pub fn disconnect_cause_for_failure(
 ///
 /// The match is **exhaustive over `ErrorClass`** (no `_ => ...` catch-all)
 /// so that adding a new variant triggers a compile error here. This
-/// prevents the silent "unhandled class → RecvError" drift that Codex
-/// flagged — every backend-facing variant must be explicitly routed to
-/// `BackendError`, and every client-facing variant to `RecvError`.
+/// prevents the silent "unhandled class → RecvError" drift — every
+/// backend-facing variant must be explicitly routed to `BackendError`, and
+/// every client-facing variant to `RecvError`.
 fn pre_copy_disconnect_cause(
+    error: &anyhow::Error,
     class: &ErrorClass,
-    error_message: &str,
 ) -> crate::plugins::DisconnectCause {
     use crate::plugins::DisconnectCause;
+
+    // Typed-kind shortcut: when the construction site attached a
+    // `StreamSetupError`, we know which side failed without inspecting
+    // the message. Stays in lockstep with `pre_copy_disconnect_direction`.
+    if let Some(setup_err) = find_stream_setup_error(error) {
+        return if setup_err.kind.is_client_side() {
+            DisconnectCause::RecvError
+        } else {
+            DisconnectCause::BackendError
+        };
+    }
+
     match class {
         // Backend-facing failure classes — the client never saw a reply,
         // so these are always backend problems regardless of message.
@@ -259,28 +279,19 @@ fn pre_copy_disconnect_cause(
         | ErrorClass::ReadWriteTimeout
         // Backend oversized its response — by definition backend-side.
         | ErrorClass::ResponseBodyTooLarge => DisconnectCause::BackendError,
-        // `ConnectionReset` / `ConnectionClosed` can originate on either
-        // side: a frontend TLS handshake abort from a client that resets
-        // mid-handshake surfaces here too. Disambiguate by the message
-        // prefix constant set at the construction site.
+        // No typed kind available — `ConnectionReset` / `ConnectionClosed`
+        // without `StreamSetupError` originate from outside the typed
+        // construction sites; treat conservatively as backend-side since the
+        // typed frontend-TLS path would have surfaced via the kind shortcut
+        // above.
         ErrorClass::ConnectionReset | ErrorClass::ConnectionClosed => {
-            if error_message.contains(STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED) {
-                DisconnectCause::RecvError
-            } else {
-                DisconnectCause::BackendError
-            }
+            DisconnectCause::BackendError
         }
-        ErrorClass::TlsError => {
-            if error_message.contains(STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED) {
-                DisconnectCause::RecvError
-            } else if error_message.contains(STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED) {
-                DisconnectCause::BackendError
-            } else {
-                // Unknown TLS side — conservative fallback to avoid
-                // misattributing frontend issues to the backend.
-                DisconnectCause::RecvError
-            }
-        }
+        // No typed kind — fall back conservatively. The typed path above
+        // resolves frontend vs backend TLS without ambiguity; reaching this
+        // arm means the chain has no `StreamSetupError`, which is unexpected
+        // for TLS errors emitted by the proxy.
+        ErrorClass::TlsError => DisconnectCause::RecvError,
         // Client-facing failure classes — the client is the problem or
         // the one that disconnected, so these are always recv-side.
         ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge => {
@@ -292,30 +303,52 @@ fn pre_copy_disconnect_cause(
         // route it. A graceful remote close is backend-initiated, so
         // semantically this matches the `ConnectionClosed` branch above.
         ErrorClass::GracefulRemoteClose => DisconnectCause::BackendError,
-        // `RequestError` is a semantic catch-all emitted across many paths
-        // (plugin rejects, policy denials, upstream resolution failures).
-        // Disambiguate via the prefix constants: plugin/policy rejections
-        // are client-side; backend resolution / "no healthy targets" are
-        // backend-side. Messages mentioning "upstream" or "backend" that
-        // aren't covered by a specific constant are conservatively treated
-        // as backend-facing so outages surface on the right dashboards.
-        ErrorClass::RequestError => {
-            if error_message.contains(STREAM_ERR_REJECTED_BY_PLUGIN)
-                || error_message.contains(STREAM_ERR_REJECTED_BY_ACL)
-                || error_message.contains(STREAM_ERR_REJECTED_BY_POLICY)
-                || error_message.contains(STREAM_ERR_THROTTLED)
-            {
-                DisconnectCause::RecvError
-            } else if error_message.contains(STREAM_ERR_NO_HEALTHY_TARGETS)
-                || error_message.contains("upstream")
-                || error_message.contains("backend")
-            {
-                DisconnectCause::BackendError
-            } else {
-                // Unknown-side request error — conservative fallback.
-                DisconnectCause::RecvError
-            }
+        // `RequestError` is a semantic catch-all. The typed `StreamSetupError`
+        // path above already attributes plugin/ACL/throttle/policy rejects
+        // (client-side) and `NoHealthyTargets` (backend-side); reaching here
+        // means the chain has no typed kind, so defer to a conservative
+        // recv-side fallback rather than substring-matching. Migrate
+        // remaining untyped sites to `StreamSetupError` to remove this fallback.
+        ErrorClass::RequestError => DisconnectCause::RecvError,
+    }
+}
+
+/// Map a pre-copy error to the originating direction.
+///
+/// Mirrors [`pre_copy_disconnect_cause`]: the typed
+/// [`StreamSetupError`] kind is authoritative when present
+/// ([`StreamSetupKind::direction`]); otherwise the error class is the
+/// fallback signal (backend-facing classes → `BackendToClient`,
+/// client-facing classes → `ClientToBackend`, ambiguous → `Unknown`).
+///
+/// Used by every TCP/UDP construction site that builds a
+/// `StreamTransactionSummary` with `disconnect_direction: Some(...)` so log
+/// consumers see consistent attribution across stream-family protocols.
+fn pre_copy_disconnect_direction(error: &anyhow::Error, class: &ErrorClass) -> Direction {
+    if let Some(setup_err) = find_stream_setup_error(error) {
+        return setup_err.kind.direction();
+    }
+    match class {
+        // Backend-facing classes attribute to the b2c half (the half that
+        // tried to talk to the backend).
+        ErrorClass::DnsLookupError
+        | ErrorClass::ConnectionTimeout
+        | ErrorClass::ConnectionRefused
+        | ErrorClass::PortExhaustion
+        | ErrorClass::ConnectionPoolError
+        | ErrorClass::ProtocolError
+        | ErrorClass::ReadWriteTimeout
+        | ErrorClass::ResponseBodyTooLarge
+        | ErrorClass::ConnectionReset
+        | ErrorClass::ConnectionClosed
+        | ErrorClass::GracefulRemoteClose => Direction::BackendToClient,
+        // Client-facing classes attribute to the c2b half.
+        ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge => {
+            Direction::ClientToBackend
         }
+        // Unknown side — leave it ambiguous so log consumers know the proxy
+        // could not attribute the failure.
+        ErrorClass::TlsError | ErrorClass::RequestError => Direction::Unknown,
     }
 }
 
@@ -448,15 +481,18 @@ pub struct TcpListenerConfig {
     pub proxy_id: String,
     pub config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     pub dns_cache: DnsCache,
-    pub load_balancer_cache: Arc<LoadBalancerCache>,
-    pub consumer_index: Arc<ConsumerIndex>,
+    pub request_epoch: Arc<RequestEpochStore>,
     pub frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
     pub shutdown: watch::Receiver<bool>,
+    /// Optional gateway-wide shutdown receiver (SIGTERM/SIGINT). When `Some`,
+    /// the accept loop exits as soon as either this OR the per-listener
+    /// `shutdown` channel fires. Injected by [`StreamListenerManager`] from
+    /// the watch channel created in `main.rs`.
+    pub global_shutdown: Option<watch::Receiver<bool>>,
     pub metrics: Arc<TcpProxyMetrics>,
     pub tls_no_verify: bool,
     /// Global CA bundle path for outbound TLS verification (fallback when proxy has no per-proxy CA).
     pub tls_ca_bundle_path: Option<String>,
-    pub plugin_cache: Arc<PluginCache>,
     /// Global default TCP idle timeout in seconds. Per-proxy `tcp_idle_timeout_seconds` overrides.
     pub tcp_idle_timeout_seconds: u64,
     /// Hard cap (seconds) on Phase 2 of the TCP bidirectional relay — the
@@ -464,6 +500,9 @@ pub struct TcpListenerConfig {
     /// Applies even when the session idle timeout is disabled, so a stuck
     /// peer cannot wedge the relay task forever. `0` disables the cap.
     pub tcp_half_close_max_wait_seconds: u64,
+    /// Frontend TLS handshake timeout in seconds for TCP+TLS stream listeners.
+    /// `0` disables the timeout.
+    pub frontend_tls_handshake_timeout_seconds: u64,
     /// Circuit breaker cache shared with HTTP proxies.
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// TLS hardening policy for backend connections (cipher suites, protocol versions).
@@ -502,16 +541,16 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         proxy_id,
         config,
         dns_cache,
-        load_balancer_cache,
-        consumer_index,
+        request_epoch,
         frontend_tls_config,
         shutdown,
+        global_shutdown,
         metrics,
         tls_no_verify,
         tls_ca_bundle_path,
-        plugin_cache,
         tcp_idle_timeout_seconds: global_tcp_idle_timeout,
         tcp_half_close_max_wait_seconds,
+        frontend_tls_handshake_timeout_seconds,
         circuit_breaker_cache,
         tls_policy,
         crls,
@@ -533,24 +572,6 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         "TCP proxy listener started on {}",
         addr
     );
-
-    // Pre-capture proxy metadata for plugin context (static for this listener's lifetime).
-    let (proxy_name, proxy_namespace, backend_scheme) = {
-        let current_config = config.load();
-        current_config
-            .proxies
-            .iter()
-            .find(|p| *p.id == *proxy_id)
-            .map(|p| (p.name.clone(), p.namespace.clone(), p.effective_scheme()))
-            .unwrap_or((
-                None,
-                crate::config::types::default_namespace(),
-                BackendScheme::Tcp,
-            ))
-    };
-
-    // Pre-resolve plugins for this proxy's protocol (TCP).
-    let plugins = plugin_cache.get_plugins_for_protocol(&proxy_id, ProxyProtocol::Tcp);
 
     // Pre-build backend TLS config if this proxy uses Tcps (TCP+TLS) backend scheme.
     // This avoids reading certificate files from disk on every connection.
@@ -587,6 +608,12 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     };
 
     let mut shutdown_rx = shutdown;
+    // Optional global gateway shutdown — fires on SIGTERM/SIGINT regardless of
+    // per-listener config-driven removal. We watch BOTH so accept loops exit
+    // promptly during graceful drain. When `None` (e.g. tests that build a
+    // listener directly without the manager), we substitute a never-fires
+    // pending future so the existing per-listener channel still works.
+    let mut global_shutdown_rx = global_shutdown;
 
     loop {
         tokio::select! {
@@ -609,16 +636,11 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                 metrics.active_connections.fetch_add(1, Ordering::Relaxed);
 
                 let proxy_id = proxy_id.clone();
-                let config = config.clone();
                 let dns_cache = dns_cache.clone();
-                let lb_cache = load_balancer_cache.clone();
-                let consumer_index = consumer_index.clone();
+                let request_epoch = request_epoch.clone();
                 let frontend_tls = frontend_tls_config.clone();
                 let metrics = metrics.clone();
                 let backend_tls = backend_tls_cache.clone();
-                let plugins = plugins.clone();
-                let proxy_name = proxy_name.clone();
-                let proxy_namespace = proxy_namespace.clone();
                 let cb_cache = circuit_breaker_cache.clone();
                 let sni_proxy_ids = sni_proxy_ids.clone();
                 let adaptive_buf = adaptive_buffer.clone();
@@ -630,15 +652,25 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                     let _conn_guard = crate::overload::ConnectionGuard::new(&overload_for_conn);
 
                     let connected_at = chrono::Utc::now();
+                    let epoch = request_epoch.load();
+                    let base_proxy = epoch
+                        .config
+                        .proxies
+                        .iter()
+                        .find(|p| p.id.as_str() == proxy_id.as_ref());
+                    let consumer_index =
+                        Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
 
                     // Build stream context — plugins run inside handle_tcp_connection
                     // (after TLS handshake for TLS proxies, so client cert is available).
                     let mut stream_ctx = StreamConnectionContext {
                         client_ip: remote_addr.ip().to_string(),
                         proxy_id: proxy_id.to_string(),
-                        proxy_name: proxy_name.clone(),
+                        proxy_name: base_proxy.and_then(|p| p.name.clone()),
                         listen_port: port,
-                        backend_scheme,
+                        backend_scheme: base_proxy
+                            .map(|p| p.effective_scheme())
+                            .unwrap_or(BackendScheme::Tcp),
                         consumer_index,
                         identified_consumer: None,
                         authenticated_identity: None,
@@ -652,15 +684,14 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         stream,
                         remote_addr,
                         &proxy_id,
-                        &config,
+                        &epoch,
                         &dns_cache,
-                        &lb_cache,
                         frontend_tls.as_ref(),
                         backend_tls.as_deref(),
                         global_tcp_idle_timeout,
                         tcp_half_close_max_wait_seconds,
+                        frontend_tls_handshake_timeout_seconds,
                         &cb_cache,
-                        &plugins,
                         &mut stream_ctx,
                         sni_proxy_ids.as_deref(),
                         &adaptive_buf,
@@ -673,6 +704,27 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
 
                     let disconnected_at = chrono::Utc::now();
                     let duration_ms = (disconnected_at - connected_at).num_milliseconds().max(0) as f64;
+                    let final_proxy_id = stream_ctx.proxy_id.clone();
+                    // Keep disconnect hooks/logging on the same epoch that
+                    // admitted the connection. Long-lived TCP streams can span
+                    // config reloads; using the connection epoch preserves a
+                    // consistent view of SNI-selected proxy metadata and
+                    // stream plugins for the full connection lifetime.
+                    let final_proxy = epoch
+                        .config
+                        .proxies
+                        .iter()
+                        .find(|p| p.id == final_proxy_id);
+                    let plugins = epoch
+                        .plugin_cache
+                        .get_plugins_for_protocol(&final_proxy_id, ProxyProtocol::Tcp);
+                    let proxy_name = stream_ctx.proxy_name.clone();
+                    let proxy_namespace = final_proxy
+                        .map(|p| p.namespace.clone())
+                        .unwrap_or_else(crate::config::types::default_namespace);
+                    let backend_scheme = final_proxy
+                        .map(|p| p.effective_scheme())
+                        .unwrap_or(stream_ctx.backend_scheme);
                     let (
                         bytes_in,
                         bytes_out,
@@ -745,19 +797,20 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                             let error_message = e.to_string();
                             let err_class = classify_stream_error(e);
                             // Pre-copy error (DNS, connect, plugin reject, TLS
-                            // handshake). No bytes flowed and direction can't
-                            // be attributed to a specific half, so use Unknown.
-                            // Map backend-facing failure classes (DNS/connect/
-                            // TLS/port exhaustion) to `BackendError` so cause-
-                            // based dashboards aren't misattributed to client
-                            // recv errors.
-                            let cause = pre_copy_disconnect_cause(&err_class, &error_message);
+                            // handshake). No bytes flowed; the typed
+                            // `StreamSetupError` (when present in the chain)
+                            // resolves which side failed without inspecting
+                            // the message string. Direction is derived from
+                            // the same typed kind so cause/direction stay in
+                            // lockstep across protocols.
+                            let cause = pre_copy_disconnect_cause(e, &err_class);
+                            let direction = pre_copy_disconnect_direction(e, &err_class);
                             (
                                 0,
                                 0,
                                 Some(error_message),
                                 Some(err_class),
-                                Some(Direction::Unknown),
+                                Some(direction),
                                 Some(cause),
                             )
                         }
@@ -768,7 +821,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
                         let summary = StreamTransactionSummary {
                             namespace: proxy_namespace,
-                            proxy_id: proxy_id.to_string(),
+                            proxy_id: final_proxy_id,
                             proxy_name,
                             client_ip: remote_addr.ip().to_string(),
                             consumer_username,
@@ -798,6 +851,15 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
             }
             _ = shutdown_rx.changed() => {
                 info!(proxy_id = %proxy_id, "TCP proxy listener shutting down on port {}", port);
+                return Ok(());
+            }
+            _ = async {
+                match global_shutdown_rx.as_mut() {
+                    Some(rx) => { let _ = rx.changed().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                info!(proxy_id = %proxy_id, "TCP proxy listener shutting down on port {} (global SIGTERM)", port);
                 return Ok(());
             }
         }
@@ -835,6 +897,7 @@ struct TcpConnParams {
 struct TcpConnCbInfo {
     cb_config: Option<crate::config::types::CircuitBreakerConfig>,
     cb_target_key: Option<String>,
+    is_half_open_probe: bool,
 }
 
 /// Backend target info resolved during connection setup, available for logging
@@ -876,15 +939,14 @@ async fn handle_tcp_connection(
     client_stream: TcpStream,
     remote_addr: SocketAddr,
     proxy_id: &str,
-    config: &arc_swap::ArcSwap<GatewayConfig>,
+    epoch: &RequestEpoch,
     dns_cache: &DnsCache,
-    lb_cache: &LoadBalancerCache,
     frontend_tls_config: Option<&Arc<rustls::ServerConfig>>,
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
     global_tcp_idle_timeout: u64,
     tcp_half_close_max_wait_seconds: u64,
+    frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: &CircuitBreakerCache,
-    plugins: &[Arc<dyn crate::plugins::Plugin>],
     stream_ctx: &mut StreamConnectionContext,
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
@@ -908,17 +970,16 @@ async fn handle_tcp_connection(
         client_stream,
         remote_addr,
         proxy_id,
-        config,
+        epoch,
         dns_cache,
-        lb_cache,
         frontend_tls_config,
         cached_backend_tls,
         global_tcp_idle_timeout,
         tcp_half_close_max_wait_seconds,
+        frontend_tls_handshake_timeout_seconds,
         circuit_breaker_cache,
         start,
         &mut backend_info,
-        plugins,
         stream_ctx,
         sni_proxy_ids,
         adaptive_buffer,
@@ -942,17 +1003,16 @@ async fn handle_tcp_connection_inner(
     client_stream: TcpStream,
     remote_addr: SocketAddr,
     proxy_id: &str,
-    config: &arc_swap::ArcSwap<GatewayConfig>,
+    epoch: &RequestEpoch,
     dns_cache: &DnsCache,
-    lb_cache: &LoadBalancerCache,
     frontend_tls_config: Option<&Arc<rustls::ServerConfig>>,
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
     global_tcp_idle_timeout: u64,
     tcp_half_close_max_wait_seconds: u64,
+    frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: &CircuitBreakerCache,
     start: Instant,
     backend_info: &mut TcpBackendInfo,
-    plugins: &[Arc<dyn crate::plugins::Plugin>],
     stream_ctx: &mut StreamConnectionContext,
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
@@ -961,16 +1021,28 @@ async fn handle_tcp_connection_inner(
     io_uring_splice_enabled: bool,
     overload: &crate::overload::OverloadState,
 ) -> Result<TcpConnectionSuccess, anyhow::Error> {
+    // Bound the passthrough SNI peek by the same deadline as terminating-TLS
+    // handshakes. Without this, a peer that opens a TCP connection and never
+    // writes a ClientHello would park the connection-handler task indefinitely.
+    // `0` keeps the historical "no timeout" behavior for operators who explicitly
+    // disable the handshake clock.
+    let sni_peek_timeout = if frontend_tls_handshake_timeout_seconds > 0 {
+        Some(std::time::Duration::from_secs(
+            frontend_tls_handshake_timeout_seconds,
+        ))
+    } else {
+        None
+    };
+
     // --- SNI-based proxy resolution for shared passthrough ports ---
     // When multiple passthrough proxies share a listen_port, we must peek at
     // the ClientHello to extract SNI before looking up the proxy config.
     let _resolved_proxy_id: Option<String>;
     let proxy_id = if let Some(sni_ids) = sni_proxy_ids {
-        let sni = super::sni::extract_sni_from_tcp_stream(&client_stream).await;
+        let sni = super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
         stream_ctx.sni_hostname = sni.clone();
 
-        let current_config = config.load();
-        let matched = super::sni::resolve_proxy_by_sni(sni.as_deref(), sni_ids, &current_config)
+        let matched = super::sni::resolve_proxy_by_sni(sni.as_deref(), sni_ids, &epoch.config)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "No matching passthrough proxy for SNI {:?} on port {}",
@@ -981,7 +1053,8 @@ async fn handle_tcp_connection_inner(
         _resolved_proxy_id = Some(matched.to_string());
         // Update stream_ctx to reflect the resolved proxy
         stream_ctx.proxy_id = matched.to_string();
-        stream_ctx.proxy_name = current_config
+        stream_ctx.proxy_name = epoch
+            .config
             .proxies
             .iter()
             .find(|p| p.id == matched)
@@ -993,16 +1066,19 @@ async fn handle_tcp_connection_inner(
     };
 
     // Look up the proxy config and extract only the fields we need.
-    // The ArcSwap guard (and full Proxy) is dropped before any async work.
     let (params, cb_info) = {
-        let current_config = config.load();
-        let proxy = current_config
+        let proxy = epoch
+            .config
             .proxies
             .iter()
             .find(|p| p.id == proxy_id)
             .ok_or_else(|| anyhow::anyhow!("Proxy {} not found in config", proxy_id))?;
 
-        let (backend_host, backend_port) = resolve_backend_target(proxy, lb_cache)?;
+        stream_ctx.proxy_id = proxy.id.clone();
+        stream_ctx.proxy_name = proxy.name.clone();
+        stream_ctx.backend_scheme = proxy.effective_scheme();
+
+        let (backend_host, backend_port) = resolve_backend_target(proxy, &epoch.load_balancer)?;
 
         // Populate backend target as soon as it's known — even if DNS or connect fails,
         // the log will show which target was attempted.
@@ -1016,6 +1092,7 @@ async fn handle_tcp_connection_inner(
         let cb_info = TcpConnCbInfo {
             cb_config: proxy.circuit_breaker.clone(),
             cb_target_key,
+            is_half_open_probe: false,
         };
 
         let params = TcpConnParams {
@@ -1039,18 +1116,22 @@ async fn handle_tcp_connection_inner(
 
         (params, cb_info)
     };
+    let plugins = epoch
+        .plugin_cache
+        .get_plugins_for_protocol(proxy_id, ProxyProtocol::Tcp);
 
     // ----- Passthrough mode: forward encrypted bytes without TLS termination -----
     if params.passthrough {
         // Peek at the ClientHello to extract SNI for logging/routing.
         // Skip if already extracted during SNI-based proxy resolution above.
         if stream_ctx.sni_hostname.is_none() {
-            stream_ctx.sni_hostname = super::sni::extract_sni_from_tcp_stream(&client_stream).await;
+            stream_ctx.sni_hostname =
+                super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
         }
 
         // Run on_stream_connect plugins (they see SNI but not decrypted data).
         if !plugins.is_empty() {
-            for plugin in plugins {
+            for plugin in plugins.iter() {
                 if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
                     debug!(
                         proxy_id = %proxy_id,
@@ -1058,10 +1139,11 @@ async fn handle_tcp_connection_inner(
                         sni = ?stream_ctx.sni_hostname,
                         "TCP passthrough connection rejected by plugin"
                     );
-                    return Err(anyhow::anyhow!(
-                        "Connection {}",
-                        STREAM_ERR_REJECTED_BY_PLUGIN
-                    ));
+                    return Err(StreamSetupError::new(
+                        StreamSetupKind::RejectedByPlugin,
+                        "(passthrough)",
+                    )
+                    .into());
                 }
             }
         }
@@ -1114,7 +1196,7 @@ async fn handle_tcp_connection_inner(
                             cb_info.cb_target_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, true);
+                        cb.record_failure(502, true, cb_info.is_half_open_probe);
                     }
                 })?;
 
@@ -1178,9 +1260,9 @@ async fn handle_tcp_connection_inner(
                 cb_config,
             );
             if copy_result.first_failure.is_some() {
-                cb.record_failure(502, true);
+                cb.record_failure(502, true, cb_info.is_half_open_probe);
             } else {
-                cb.record_success();
+                cb.record_success(cb_info.is_half_open_probe);
             }
         }
 
@@ -1219,17 +1301,16 @@ async fn handle_tcp_connection_inner(
     // For non-TLS proxies, run on_stream_connect plugins before backend connection.
     // TLS proxies defer this until after the TLS handshake so client cert is available.
     if frontend_tls_config.is_none() && !plugins.is_empty() {
-        for plugin in plugins {
+        for plugin in plugins.iter() {
             if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
                 debug!(
                     proxy_id = %proxy_id,
                     client = %remote_addr.ip(),
                     "TCP connection rejected by plugin"
                 );
-                return Err(anyhow::anyhow!(
-                    "Connection {}",
-                    STREAM_ERR_REJECTED_BY_PLUGIN
-                ));
+                return Err(
+                    StreamSetupError::new(StreamSetupKind::RejectedByPlugin, "(TCP)").into(),
+                );
             }
         }
     }
@@ -1240,7 +1321,7 @@ async fn handle_tcp_connection_inner(
                              cb_info: &TcpConnCbInfo| {
         if let Some(ref cb_config) = cb_info.cb_config {
             let cb = cb_cache.get_or_create(proxy_id, cb_info.cb_target_key.as_deref(), cb_config);
-            cb.record_failure(502, true);
+            cb.record_failure(502, true, cb_info.is_half_open_probe);
         }
     };
 
@@ -1261,42 +1342,58 @@ async fn handle_tcp_connection_inner(
     let mut attempt = 0u32;
     let backend_addr = loop {
         // Circuit breaker check — reject before attempting backend connection if open.
-        if let Some(ref cb_config) = current_cb_info.cb_config
-            && circuit_breaker_cache
-                .can_execute(
-                    proxy_id,
-                    current_cb_info.cb_target_key.as_deref(),
-                    cb_config,
-                )
-                .is_err()
-        {
-            if can_retry && attempt < max_retries {
-                // Circuit open on this target — try another
-                if let Some(next) = try_next_target(&params, &current_host, current_port, lb_cache)
-                {
-                    warn!(
-                        proxy_id = %proxy_id,
-                        attempt,
-                        "TCP circuit breaker open for {}:{}, trying {}:{}",
-                        current_host, current_port, next.0, next.1
-                    );
-                    current_host = next.0;
-                    current_port = next.1;
-                    current_cb_info = TcpConnCbInfo {
-                        cb_config: current_cb_info.cb_config.clone(),
-                        cb_target_key: params.upstream_id.as_ref().map(|_| {
-                            crate::circuit_breaker::target_key(&current_host, current_port)
-                        }),
-                    };
-                    // Update backend info to reflect the retry target.
-                    backend_info.backend_target = format!("{}:{}", current_host, current_port);
-                    backend_info.backend_resolved_ip = None;
-                    attempt += 1;
-                    continue;
+        // When admitted, capture whether this is a half-open probe so downstream
+        // record_failure/record_success calls only decrement the in-flight counter
+        // for actual probe requests.
+        if let Some(ref cb_config) = current_cb_info.cb_config {
+            match circuit_breaker_cache.can_execute(
+                proxy_id,
+                current_cb_info.cb_target_key.as_deref(),
+                cb_config,
+            ) {
+                Ok((_cb, is_half_open_probe)) => {
+                    current_cb_info.is_half_open_probe = is_half_open_probe;
+                }
+                Err(_) => {
+                    if can_retry && attempt < max_retries {
+                        // Circuit open on this target — try another
+                        if let Some(next) = try_next_target(
+                            &params,
+                            &current_host,
+                            current_port,
+                            &epoch.load_balancer,
+                        ) {
+                            warn!(
+                                proxy_id = %proxy_id,
+                                attempt,
+                                "TCP circuit breaker open for {}:{}, trying {}:{}",
+                                current_host, current_port, next.0, next.1
+                            );
+                            current_host = next.0;
+                            current_port = next.1;
+                            current_cb_info = TcpConnCbInfo {
+                                cb_config: current_cb_info.cb_config.clone(),
+                                cb_target_key: params.upstream_id.as_ref().map(|_| {
+                                    crate::circuit_breaker::target_key(&current_host, current_port)
+                                }),
+                                is_half_open_probe: false,
+                            };
+                            // Update backend info to reflect the retry target.
+                            backend_info.backend_target =
+                                format!("{}:{}", current_host, current_port);
+                            backend_info.backend_resolved_ip = None;
+                            attempt += 1;
+                            continue;
+                        }
+                    }
+                    warn!(proxy_id = %proxy_id, client = %remote_addr, "TCP connection rejected: circuit breaker open");
+                    return Err(StreamSetupError::new(
+                        StreamSetupKind::CircuitBreakerOpen,
+                        format!("for {}:{}", current_host, current_port),
+                    )
+                    .into());
                 }
             }
-            warn!(proxy_id = %proxy_id, client = %remote_addr, "TCP connection rejected: circuit breaker open");
-            return Err(anyhow::anyhow!("circuit breaker open"));
         }
 
         // Resolve backend IP via DNS
@@ -1315,7 +1412,7 @@ async fn handle_tcp_connection_inner(
                 if can_retry
                     && attempt < max_retries
                     && let Some(next) =
-                        try_next_target(&params, &current_host, current_port, lb_cache)
+                        try_next_target(&params, &current_host, current_port, &epoch.load_balancer)
                 {
                     warn!(
                         proxy_id = %proxy_id,
@@ -1330,6 +1427,7 @@ async fn handle_tcp_connection_inner(
                         cb_target_key: params.upstream_id.as_ref().map(|_| {
                             crate::circuit_breaker::target_key(&current_host, current_port)
                         }),
+                        is_half_open_probe: false,
                     };
                     // Update backend info to reflect the retry target.
                     backend_info.backend_target = format!("{}:{}", current_host, current_port);
@@ -1377,7 +1475,7 @@ async fn handle_tcp_connection_inner(
                 if can_retry
                     && attempt < max_retries
                     && let Some(next) =
-                        try_next_target(&params, &current_host, current_port, lb_cache)
+                        try_next_target(&params, &current_host, current_port, &epoch.load_balancer)
                 {
                     warn!(
                         proxy_id = %proxy_id,
@@ -1393,6 +1491,7 @@ async fn handle_tcp_connection_inner(
                         cb_target_key: params.upstream_id.as_ref().map(|_| {
                             crate::circuit_breaker::target_key(&current_host, current_port)
                         }),
+                        is_half_open_probe: false,
                     };
                     // Update backend info to reflect the retry target.
                     backend_info.backend_target = format!("{}:{}", current_host, current_port);
@@ -1416,20 +1515,27 @@ async fn handle_tcp_connection_inner(
     let mut used_splice = false;
     let copy_result = if let Some(tls_config) = frontend_tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
-        let tls_stream = match acceptor.accept(client_stream).await {
-            Ok(s) => s,
-            Err(e) => {
-                // Frontend TLS failures are client-side — do not penalise the backend CB.
-                // Prefix is a shared constant so `pre_copy_disconnect_cause` can
-                // detect "frontend side" without drifting from the wording here.
-                return Err(anyhow::anyhow!(
-                    "{} from {}: {}",
-                    STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED,
-                    remote_addr,
-                    e
-                ));
-            }
-        };
+        // Frontend TLS failures are client-side — do not penalise the backend CB.
+        // The typed `StreamSetupError` carries the kind so
+        // `pre_copy_disconnect_cause` reads `Frontend` directly from
+        // `StreamSetupKind::FrontendTlsHandshake`, no string match. The accept
+        // helper bounds the handshake under the configured timeout so a stalled
+        // peer cannot wedge a frontend slot indefinitely.
+        let tls_stream = crate::tls::accept_with_optional_timeout(
+            &acceptor,
+            client_stream,
+            frontend_tls_handshake_timeout_seconds,
+            &remote_addr,
+        )
+        .await
+        .map_err(|e| -> anyhow::Error {
+            StreamSetupError::with_source(
+                StreamSetupKind::FrontendTlsHandshake,
+                format!("from {remote_addr}: {e}"),
+                e,
+            )
+            .into()
+        })?;
 
         // Extract peer certificate DER from TLS handshake for plugin use.
         let peer_chain_der = tls_stream.get_ref().1.peer_certificates().map(|certs| {
@@ -1455,17 +1561,18 @@ async fn handle_tcp_connection_inner(
 
         // Run on_stream_connect plugins after TLS handshake so client cert is available.
         if !plugins.is_empty() {
-            for plugin in plugins {
+            for plugin in plugins.iter() {
                 if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
                     debug!(
                         proxy_id = %proxy_id,
                         client = %remote_addr.ip(),
                         "TCP/TLS connection rejected by plugin"
                     );
-                    return Err(anyhow::anyhow!(
-                        "Connection {}",
-                        STREAM_ERR_REJECTED_BY_PLUGIN
-                    ));
+                    return Err(StreamSetupError::new(
+                        StreamSetupKind::RejectedByPlugin,
+                        "(TCP/TLS)",
+                    )
+                    .into());
                 }
             }
         }
@@ -1652,9 +1759,9 @@ async fn handle_tcp_connection_inner(
             cb_config,
         );
         if copy_result.first_failure.is_some() {
-            cb.record_failure(502, true);
+            cb.record_failure(502, true, current_cb_info.is_half_open_probe);
         } else {
-            cb.record_success();
+            cb.record_success(current_cb_info.is_half_open_probe);
         }
     }
 
@@ -1670,18 +1777,18 @@ async fn handle_tcp_connection_inner(
 /// Resolve the backend target — either direct from proxy config or via load balancer.
 fn resolve_backend_target(
     proxy: &Proxy,
-    lb_cache: &LoadBalancerCache,
+    lb_snapshot: &LoadBalancerCacheInner,
 ) -> Result<(String, u16), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
-        let selection = lb_cache
-            .select_target(upstream_id, &proxy.id, None)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{} for upstream {}",
-                    STREAM_ERR_NO_HEALTHY_TARGETS,
-                    upstream_id
-                )
-            })?;
+        let selection =
+            LoadBalancerCache::select_target_from(lb_snapshot, upstream_id, &proxy.id, None)
+                .ok_or_else(|| -> anyhow::Error {
+                    StreamSetupError::new(
+                        StreamSetupKind::NoHealthyTargets,
+                        format!("for upstream {upstream_id}"),
+                    )
+                    .into()
+                })?;
         Ok((selection.target.host.clone(), selection.target.port))
     } else {
         Ok((proxy.backend_host.clone(), proxy.backend_port))
@@ -1702,7 +1809,7 @@ fn try_next_target(
     params: &TcpConnParams,
     current_host: &str,
     current_port: u16,
-    lb_cache: &LoadBalancerCache,
+    lb_snapshot: &LoadBalancerCacheInner,
 ) -> Option<(String, u16)> {
     let upstream_id = params.upstream_id.as_ref()?;
     let exclude = crate::config::types::UpstreamTarget {
@@ -1712,7 +1819,13 @@ fn try_next_target(
         path: None,
         tags: std::collections::HashMap::new(),
     };
-    let next = lb_cache.select_next_target(upstream_id, current_host, &exclude, None)?;
+    let next = LoadBalancerCache::select_next_target_from(
+        lb_snapshot,
+        upstream_id,
+        current_host,
+        &exclude,
+        None,
+    )?;
     Some((next.host.clone(), next.port))
 }
 
@@ -1781,6 +1894,7 @@ async fn connect_backend_tls_cached(
     tcp_fastopen: bool,
     overload: &crate::overload::OverloadState,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, anyhow::Error> {
+    let connect_started = Instant::now();
     let tcp_stream = connect_backend_plain(addr, connect_timeout, tcp_fastopen, overload).await?;
 
     let tls_config = cached_tls
@@ -1791,18 +1905,39 @@ async fn connect_backend_tls_cached(
     let server_name = rustls::pki_types::ServerName::try_from(hostname.to_string())
         .map_err(|e| anyhow::anyhow!("Invalid server name '{}': {}", hostname, e))?;
 
-    // Prefix is a shared constant so `pre_copy_disconnect_cause` can detect
-    // "backend TLS side" without drifting from the wording here.
-    let tls_stream = connector
-        .connect(server_name, tcp_stream)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "{} to {}: {}",
-                STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED,
-                addr,
-                e
+    // Typed `StreamSetupError::BackendTlsHandshake` lets cause mappers read
+    // the side directly from the kind — no substring match against the
+    // legacy `STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED` prefix. Both timeout
+    // arms below funnel through the same kind so a handshake-budget
+    // exhaustion classifies identically to a handshake-error failure.
+    let remaining = crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
+        .ok_or_else(|| -> anyhow::Error {
+            StreamSetupError::new(
+                StreamSetupKind::BackendTlsHandshake,
+                format!("to {addr}: connect budget exhausted before TLS handshake started"),
             )
+            .into()
+        })?;
+
+    let tls_stream = tokio::time::timeout(remaining, connector.connect(server_name, tcp_stream))
+        .await
+        .map_err(|_| -> anyhow::Error {
+            StreamSetupError::new(
+                StreamSetupKind::BackendTlsHandshake,
+                format!(
+                    "to {addr}: handshake timeout after {}ms",
+                    connect_timeout.as_millis()
+                ),
+            )
+            .into()
+        })?
+        .map_err(|e| -> anyhow::Error {
+            StreamSetupError::with_source(
+                StreamSetupKind::BackendTlsHandshake,
+                format!("to {addr}: {e}"),
+                e,
+            )
+            .into()
         })?;
 
     Ok(tls_stream)
@@ -2692,6 +2827,21 @@ async fn bidirectional_splice(
     }
 }
 
+/// Propagate a clean EOF across a splice relay.
+///
+/// `tokio::io::copy_bidirectional` half-closes the opposite write side when
+/// one read side reaches EOF. The splice path works with raw fds, so we must
+/// do that explicitly; otherwise request/response backends can wait forever
+/// for EOF and the connection task never reaches stream-disconnect hooks.
+#[cfg(target_os = "linux")]
+fn shutdown_write_fd(fd: i32) {
+    // Ignore errors: the peer may already have closed/reset the socket. This is
+    // best-effort half-close propagation, not an additional failure source.
+    unsafe {
+        libc::shutdown(fd, libc::SHUT_WR);
+    }
+}
+
 /// Splice-path equivalent of `drain_half_close_copy`. Separate function
 /// because the splice direction future's `Ok` branch returns `anyhow::Error`
 /// rather than `std::io::Error`, and the classifier takes the outer anyhow
@@ -3003,7 +3153,7 @@ fn io_uring_splice_direction(
     timeout_ms: u64,
     shared_activity: &AtomicU64,
 ) -> Result<u64, (StreamIoSide, anyhow::Error)> {
-    match crate::socket_opts::io_uring_splice::io_uring_splice_loop(
+    let result = match crate::socket_opts::io_uring_splice::io_uring_splice_loop(
         src_fd,
         pipe_w,
         pipe_r,
@@ -3034,7 +3184,13 @@ fn io_uring_splice_direction(
                 Err((side, anyhow::anyhow!("io_uring splice error: {}", e.source)))
             }
         }
+    };
+
+    if result.is_ok() {
+        shutdown_write_fd(dst_fd);
     }
+
+    result
 }
 
 /// Fallback libc::splice loop for when io_uring ring creation fails.
@@ -3100,6 +3256,11 @@ fn libc_splice_loop(
                         shared_activity.store(coarse_now_ms(), Ordering::Relaxed);
                     }
                 } else if written == 0 {
+                    // A zero-byte pipe -> destination splice is a clean
+                    // terminal write-side condition. We are returning Ok
+                    // and ending this relay direction, so mirror the read-EOF
+                    // path and propagate a best-effort half-close.
+                    shutdown_write_fd(dst_fd);
                     return Ok(total);
                 } else {
                     let err = std::io::Error::last_os_error();
@@ -3132,6 +3293,7 @@ fn libc_splice_loop(
                 }
             }
         } else if n == 0 {
+            shutdown_write_fd(dst_fd);
             return Ok(total);
         } else {
             let err = std::io::Error::last_os_error();
@@ -3237,6 +3399,10 @@ async fn splice_one_direction_no_guard(
                     remaining -= written as usize;
                     bytes.fetch_add(written as u64, Ordering::Relaxed);
                 } else if written == 0 {
+                    // See the synchronous libc fallback above: a clean
+                    // terminal write-side condition should still propagate
+                    // the relay half-close before this direction exits Ok.
+                    shutdown_write_fd(dst_fd);
                     return Ok(());
                 } else {
                     let err = std::io::Error::last_os_error();
@@ -3255,6 +3421,7 @@ async fn splice_one_direction_no_guard(
             }
         } else if n == 0 {
             // EOF — source closed
+            shutdown_write_fd(dst_fd);
             return Ok(());
         } else {
             let err = std::io::Error::last_os_error();
@@ -3724,5 +3891,123 @@ mod ktls_param_tests {
             ),
         };
         assert!(build_ktls_params(0x0303, &secrets).is_none());
+    }
+}
+
+#[cfg(test)]
+mod cause_direction_tests {
+    //! Tests for `pre_copy_disconnect_cause` / `pre_copy_disconnect_direction`,
+    //! the typed-kind-first cause/direction mappers shared between TCP and UDP
+    //! disconnect logging. Inline because both functions are private to the
+    //! module.
+    use super::{pre_copy_disconnect_cause, pre_copy_disconnect_direction};
+    use crate::plugins::{Direction, DisconnectCause};
+    use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind};
+    use crate::retry::ErrorClass;
+
+    fn err(kind: StreamSetupKind) -> anyhow::Error {
+        StreamSetupError::new(kind, "test detail").into()
+    }
+
+    #[test]
+    fn typed_frontend_tls_maps_to_recv_error_and_client_direction() {
+        let e = err(StreamSetupKind::FrontendTlsHandshake);
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::TlsError),
+            DisconnectCause::RecvError
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::TlsError),
+            Direction::ClientToBackend
+        );
+    }
+
+    #[test]
+    fn typed_backend_tls_maps_to_backend_error_and_backend_direction() {
+        let e = err(StreamSetupKind::BackendTlsHandshake);
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::TlsError),
+            DisconnectCause::BackendError
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::TlsError),
+            Direction::BackendToClient
+        );
+    }
+
+    #[test]
+    fn typed_no_healthy_targets_maps_to_backend_error_and_backend_direction() {
+        let e = err(StreamSetupKind::NoHealthyTargets);
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::RequestError),
+            DisconnectCause::BackendError
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::RequestError),
+            Direction::BackendToClient
+        );
+    }
+
+    #[test]
+    fn typed_circuit_breaker_open_maps_to_backend_error_and_backend_direction() {
+        // Circuit-breaker rejects are gateway shedding traffic away from a
+        // known-bad upstream — backend-side, not client-side. Without the
+        // typed kind they classify as RequestError and the class-based
+        // fallback routes them to RecvError / ClientToBackend (a
+        // misattribution that breaks backend-error dashboards).
+        let e = err(StreamSetupKind::CircuitBreakerOpen);
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::RequestError),
+            DisconnectCause::BackendError
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::RequestError),
+            Direction::BackendToClient
+        );
+    }
+
+    #[test]
+    fn typed_plugin_reject_maps_to_recv_error_and_client_direction() {
+        let e = err(StreamSetupKind::RejectedByPlugin);
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::RequestError),
+            DisconnectCause::RecvError
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::RequestError),
+            Direction::ClientToBackend
+        );
+    }
+
+    #[test]
+    fn typed_kind_takes_precedence_over_misleading_error_class() {
+        // Adversarial: RejectedByPlugin (client-side) classified as
+        // ConnectionTimeout (which the class-fallback would call backend).
+        // The typed kind must win.
+        let e = err(StreamSetupKind::RejectedByPlugin);
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::ConnectionTimeout),
+            DisconnectCause::RecvError,
+            "typed kind must override class-based inference"
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::ConnectionTimeout),
+            Direction::ClientToBackend
+        );
+    }
+
+    #[test]
+    fn untyped_dns_lookup_falls_back_to_backend_via_class() {
+        // No StreamSetupError in the chain — class fallback drives the
+        // mapping. DNS failures attribute to the backend half.
+        let e: anyhow::Error = anyhow::anyhow!("nxdomain");
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::DnsLookupError),
+            DisconnectCause::BackendError
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::DnsLookupError),
+            Direction::BackendToClient
+        );
     }
 }

@@ -2,6 +2,27 @@
 
 use std::time::Duration;
 
+use bytes::{Buf, Bytes};
+
+/// Default HTTP/3 per-stream receive window. Larger than quinn's baseline
+/// while keeping the aggregate connection budget modest by default.
+pub const H3_STREAM_RECEIVE_WINDOW_DEFAULT: u64 = 8 * 1024 * 1024;
+
+/// Default HTTP/3 connection-level receive window. This aggregate connection
+/// budget bounds the sum of active per-stream receive windows.
+pub const H3_RECEIVE_WINDOW_DEFAULT: u64 = 32 * 1024 * 1024;
+
+/// Default HTTP/3 send window. This bounds unacknowledged outbound data per
+/// QUIC connection.
+pub const H3_SEND_WINDOW_DEFAULT: u64 = 8 * 1024 * 1024;
+
+/// Largest value encodable as a QUIC variable-length integer.
+pub const QUIC_VARINT_MAX_U64: u64 = (1 << 62) - 1;
+
+const _: () = assert!(H3_STREAM_RECEIVE_WINDOW_DEFAULT <= QUIC_VARINT_MAX_U64);
+const _: () = assert!(H3_RECEIVE_WINDOW_DEFAULT <= QUIC_VARINT_MAX_U64);
+const _: () = assert!(H3_SEND_WINDOW_DEFAULT <= QUIC_VARINT_MAX_U64);
+
 /// Default value for the H3 response streaming coalesce-buffer initial capacity
 /// and MIN upper bound (when `FERRUM_HTTP3_COALESCE_MAX_BYTES` is unset).
 /// See `FERRUM_HTTP3_COALESCE_MAX_BYTES` for runtime tuning.
@@ -31,6 +52,39 @@ pub const QUIC_INITIAL_MTU_MIN: u16 = 1200;
 /// after accounting for UDP/IP headers).
 pub const QUIC_INITIAL_MTU_MAX: u16 = 65527;
 
+/// Return true when an H3 response DATA chunk is already large enough to send
+/// directly instead of copying it into the coalescing buffer first.
+pub(crate) fn should_direct_send_response_chunk(
+    buffered_bytes: usize,
+    chunk_bytes: usize,
+    coalesce_min_bytes: usize,
+) -> bool {
+    buffered_bytes == 0 && chunk_bytes >= coalesce_min_bytes
+}
+
+/// Copy the complete remaining H3 response DATA chunk into `Bytes`.
+///
+/// `recv_data()` returns `impl Buf`. h3-quinn yields contiguous `Bytes` today,
+/// but using `remaining()` + `copy_to_bytes()` keeps accounting and forwarding
+/// correct if a future implementation returns a chained/non-contiguous buffer.
+pub(crate) fn copy_remaining_response_chunk<B>(chunk: &mut B) -> Bytes
+where
+    B: Buf,
+{
+    let chunk_len = chunk.remaining();
+    chunk.copy_to_bytes(chunk_len)
+}
+
+/// Convert an operator-supplied QUIC flow-control window into a VarInt,
+/// falling back to the compiled default if the supplied value exceeds QUIC's
+/// legal varint range.
+pub(crate) fn quic_varint_or_default(value: u64, default_value: u64) -> quinn::VarInt {
+    quinn::VarInt::from_u64(value).unwrap_or_else(|_| {
+        debug_assert!(default_value <= QUIC_VARINT_MAX_U64);
+        quinn::VarInt::from_u64(default_value).unwrap_or(quinn::VarInt::MAX)
+    })
+}
+
 /// HTTP/3 server configuration
 #[derive(Debug, Clone)]
 pub struct Http3ServerConfig {
@@ -38,6 +92,12 @@ pub struct Http3ServerConfig {
     pub max_concurrent_streams: u32,
     /// Connection idle timeout
     pub idle_timeout: Duration,
+    /// Maximum time a QUIC handshake may take before the in-progress connection
+    /// is aborted. Mirrors the TCP/TLS and DTLS frontend handshake bounds and
+    /// is sourced from `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`.
+    /// `Duration::ZERO` disables the bound (matches the "0 disables" semantic
+    /// shared by the TCP/TLS and DTLS frontends).
+    pub handshake_timeout: Duration,
 
     // ── QUIC transport tuning ────────────────────────────────────────────
     //
@@ -81,6 +141,7 @@ impl Http3ServerConfig {
             receive_window: env.http3_receive_window,
             send_window: env.http3_send_window,
             initial_mtu: env.http3_initial_mtu,
+            handshake_timeout: Duration::from_secs(env.frontend_tls_handshake_timeout_seconds),
         }
     }
 }
@@ -90,10 +151,59 @@ impl Default for Http3ServerConfig {
         Self {
             max_concurrent_streams: 1000,
             idle_timeout: Duration::from_secs(30),
-            stream_receive_window: 8_388_608, // 8 MiB
-            receive_window: 33_554_432,       // 32 MiB
-            send_window: 8_388_608,           // 8 MiB
+            stream_receive_window: H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+            receive_window: H3_RECEIVE_WINDOW_DEFAULT,
+            send_window: H3_SEND_WINDOW_DEFAULT,
             initial_mtu: 1500,
+            // Default mirrors `EnvConfig::default().frontend_tls_handshake_timeout_seconds`
+            // (10 seconds). `Duration::ZERO` here would silently disable the bound.
+            handshake_timeout: Duration::from_secs(10),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::{Buf, Bytes};
+
+    use super::{
+        H3_RECEIVE_WINDOW_DEFAULT, copy_remaining_response_chunk, quic_varint_or_default,
+        should_direct_send_response_chunk,
+    };
+
+    #[test]
+    fn direct_send_requires_empty_buffer_and_large_chunk() {
+        assert!(should_direct_send_response_chunk(0, 32_768, 32_768));
+        assert!(should_direct_send_response_chunk(0, 65_536, 32_768));
+        assert!(!should_direct_send_response_chunk(1, 65_536, 32_768));
+        assert!(!should_direct_send_response_chunk(0, 32_767, 32_768));
+    }
+
+    #[test]
+    fn copy_remaining_response_chunk_handles_non_contiguous_bufs() {
+        let mut chunk = Bytes::from_static(b"hello, ").chain(Bytes::from_static(b"h3"));
+
+        let copied = copy_remaining_response_chunk(&mut chunk);
+
+        assert_eq!(&copied[..], b"hello, h3");
+        assert!(!chunk.has_remaining());
+    }
+
+    #[test]
+    fn quic_varint_falls_back_when_value_exceeds_quic_range() {
+        assert_eq!(
+            quic_varint_or_default(u64::MAX, H3_RECEIVE_WINDOW_DEFAULT),
+            quinn::VarInt::from_u64(H3_RECEIVE_WINDOW_DEFAULT).unwrap()
+        );
+    }
+
+    #[test]
+    fn quic_varint_fallback_does_not_truncate_large_defaults() {
+        let default_above_u32 = u64::from(u32::MAX) + 1;
+
+        assert_eq!(
+            quic_varint_or_default(u64::MAX, default_above_u32),
+            quinn::VarInt::from_u64(default_above_u32).unwrap()
+        );
     }
 }

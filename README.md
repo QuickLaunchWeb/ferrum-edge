@@ -389,6 +389,22 @@ Multi-protocol benchmark results (macOS Apple Silicon, 200 concurrent, 10s, 64-b
 
 See `tests/performance/` for the full benchmark suite.
 
+### Production tuning
+
+**File descriptor limit**. On Unix, Ferrum Edge calls `setrlimit(RLIMIT_NOFILE, rlim_cur=rlim_max)` once at startup, raising the soft cap to whatever the hard cap allows. The call never asks for privileges the process does not already have, so a sandboxed/seccomp-restricted run is a silent no-op rather than a failure. The *hard* cap must be set externally — Ferrum Edge cannot raise it. Recommended floor for production: **65,536**.
+
+| Environment | How to raise the hard cap |
+|---|---|
+| systemd unit | `LimitNOFILE=1048576` in the `[Service]` section |
+| Docker / Podman | `--ulimit nofile=1048576:1048576` |
+| Kubernetes | Configure nofile on the node/container runtime (for example containerd/runc or the kubelet/systemd service); Pod `securityContext` does not expose ulimit/nofile. |
+| Bare shell (dev) | `ulimit -n 1048576` before launching the binary |
+| `/etc/security/limits.conf` | `* hard nofile 1048576` (and matching soft line) |
+
+When the effective soft cap after startup is below 65,536, Ferrum Edge emits one structured `warn!` line at startup (greppable as `"soft FD limit"`) and continues. Below the floor, the gateway will still serve, but its 95% FD-critical threshold will trigger earlier under load.
+
+**Concurrency planning**. Each inbound TCP/TLS connection consumes ~1 FD; HTTP/2 multiplexes many requests onto one. Linux `splice(2)` adds 2 pipe FDs per TCP relay. Plan for ~2–4× the target concurrent-connection count when sizing `nofile`.
+
 ### Gateway Comparison (All-Docker, macOS Apple Silicon, 100 concurrent, 30s)
 
 All gateways run in Docker containers for apples-to-apples comparison:

@@ -11,7 +11,7 @@ See also:
 
 ## Authentication
 
-All endpoints (except `/health`, `/status`, `/overload`, `/metrics`, and `/charges`) require a valid HS256 JWT in the `Authorization: Bearer <token>` header, verified against `FERRUM_ADMIN_JWT_SECRET` (must be at least 32 characters).
+All endpoints (except `/health`, `/status`, `/overload`, and `/metrics`) require a valid HS256 JWT in the `Authorization: Bearer <token>` header, verified against `FERRUM_ADMIN_JWT_SECRET` (must be at least 32 characters). `/charges` also requires JWT authentication because it exposes customer and billing data.
 
 Generate a token:
 ```bash
@@ -309,14 +309,14 @@ See [admin_metrics.md](admin_metrics.md) for the full metrics reference.
 
 ## Charges
 
-The `/charges` endpoint exposes per-consumer API usage charges tracked by the `api_chargeback` plugin. It is unauthenticated (like `/metrics` and `/health`) to allow Prometheus scraping without credentials.
+The `/charges` endpoint exposes per-consumer API usage charges tracked by the `api_chargeback` plugin. It requires the same admin JWT authentication as other sensitive admin endpoints.
 
 ```bash
 # Prometheus text format (default)
-curl http://localhost:9000/charges
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/charges
 
 # JSON format
-curl http://localhost:9000/charges?format=json
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/charges?format=json
 ```
 
 **Prometheus format** returns two counter families:
@@ -348,7 +348,7 @@ curl http://localhost:9000/charges?format=json
 }
 ```
 
-**Multi-node deployments**: Each gateway node accumulates charges independently in memory. In CP/DP topologies, scrape `/charges` from every DP node and aggregate externally. See [plugins.md](plugins.md#api_chargeback) for Prometheus scrape configuration examples.
+**Multi-node deployments**: Each gateway node accumulates charges independently in memory. In CP/DP topologies, scrape `/charges` from every DP node with admin JWT credentials and aggregate externally. See [plugins.md](plugins.md#api_chargeback) for Prometheus scrape configuration examples.
 
 ## API Spec Management
 

@@ -1329,7 +1329,7 @@ async fn validate_bundle(
                 .map(|u| u.id.as_str() == upstream_id.as_str())
                 .unwrap_or(false);
             if !bundled_id_matches {
-                match db.check_upstream_exists(upstream_id).await {
+                match db.check_upstream_exists(upstream_id, namespace).await {
                     Ok(true) => {}
                     Ok(false) => failures.push(ValidationFailure {
                         resource_type: "proxy",

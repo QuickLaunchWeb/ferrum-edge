@@ -205,6 +205,21 @@ const LATENCY_WARMUP_THRESHOLD: u64 = 5;
 /// Sentinel value indicating no latency has been recorded yet.
 const LATENCY_UNSET: u64 = u64::MAX;
 
+/// Warm-up bias subtracted from `min_known_ewma` for unsampled (late-joiner)
+/// targets during the mixed warm-up phase.
+///
+/// **Behavioral note:** any nonzero bias value (including `1`) produces the
+/// same selection outcome because `saturating_sub(N)` for any `N >= 1` makes
+/// the unsampled target strictly less than the minimum warmed EWMA when
+/// `min_known_ewma > 0`, and saturates to `0` (a tie broken by iteration
+/// order) when `min_known_ewma == 0`.
+///
+/// The constant exists as a named policy anchor: 1 ms (1 000 us) documents
+/// the intended preference gap in human-readable latency units and makes the
+/// warm-up strategy greppable and self-documenting, replacing a bare magic
+/// literal.
+const LATENCY_WARMUP_BIAS_US: u64 = 1_000;
+
 /// Result of a target selection, indicating whether the selection was from
 /// healthy targets or a degraded-mode fallback (all targets were unhealthy).
 #[derive(Debug, Clone)]
@@ -220,35 +235,75 @@ pub struct TargetSelection {
     pub is_fallback: bool,
 }
 
+/// All load-balancer state swapped as a single unit so readers never see
+/// new balancer entries paired with a stale upstream index (or vice versa).
+pub struct LoadBalancerCacheInner {
+    balancers: HashMap<String, Arc<LoadBalancer>>,
+    /// O(1) upstream lookup by ID (avoids linear scan of config.upstreams).
+    upstreams: HashMap<String, Arc<Upstream>>,
+}
+
+impl LoadBalancerCacheInner {
+    /// Access the balancers map for custom code that needs direct HashMap access.
+    ///
+    /// Prefer the typed accessors [`LoadBalancerCache::get_hash_on_strategy_from`]
+    /// and [`LoadBalancerCache::select_target_from`] when possible — they cover
+    /// the standard hot-path use cases without exposing internal structure.
+    #[allow(dead_code)] // Public API used by custom plugins
+    #[inline]
+    pub fn balancers(&self) -> &HashMap<String, Arc<LoadBalancer>> {
+        &self.balancers
+    }
+
+    /// Access the upstream index for custom code that needs direct lookup.
+    #[allow(dead_code)] // Public API used by custom plugins
+    #[inline]
+    pub fn upstreams(&self) -> &HashMap<String, Arc<Upstream>> {
+        &self.upstreams
+    }
+
+    #[inline]
+    pub fn get_balancer(&self, upstream_id: &str) -> Option<Arc<LoadBalancer>> {
+        self.balancers.get(upstream_id).cloned()
+    }
+}
+
 /// Load balancer cache, rebuilt atomically on config change.
 ///
 /// Individual `LoadBalancer` instances are wrapped in `Arc` so that
 /// incremental updates can clone the HashMap cheaply (just Arc pointer
 /// copies) and only allocate new `LoadBalancer` instances for changed
-/// upstreams. Unchanged upstreams keep their exact same instance —
+/// upstreams. Unchanged upstreams keep their exact same instance --
 /// round-robin counters, WRR weights, active connection counts, latency
 /// EWMAs, and consistent hash rings are all preserved.
 pub struct LoadBalancerCache {
-    balancers: ArcSwap<HashMap<String, Arc<LoadBalancer>>>,
-    /// O(1) upstream lookup by ID (avoids linear scan of config.upstreams).
-    upstreams: ArcSwap<HashMap<String, Arc<Upstream>>>,
+    inner: ArcSwap<LoadBalancerCacheInner>,
 }
 
 impl LoadBalancerCache {
     pub fn new(config: &GatewayConfig) -> Self {
-        let balancers = Self::build_balancers(config);
-        let upstreams = Self::build_upstream_index(config);
         Self {
-            balancers: ArcSwap::new(Arc::new(balancers)),
-            upstreams: ArcSwap::new(Arc::new(upstreams)),
+            inner: ArcSwap::new(Self::build_inner(config)),
         }
     }
 
     pub fn rebuild(&self, config: &GatewayConfig) {
-        let balancers = Self::build_balancers(config);
-        let upstreams = Self::build_upstream_index(config);
-        self.balancers.store(Arc::new(balancers));
-        self.upstreams.store(Arc::new(upstreams));
+        self.inner.store(Self::build_inner(config));
+    }
+
+    pub(crate) fn build_inner(config: &GatewayConfig) -> Arc<LoadBalancerCacheInner> {
+        Arc::new(LoadBalancerCacheInner {
+            balancers: Self::build_balancers(config),
+            upstreams: Self::build_upstream_index(config),
+        })
+    }
+
+    pub(crate) fn store_inner(&self, inner: Arc<LoadBalancerCacheInner>) {
+        self.inner.store(inner);
+    }
+
+    pub(crate) fn load_inner(&self) -> Arc<LoadBalancerCacheInner> {
+        self.inner.load_full()
     }
 
     fn build_balancers(config: &GatewayConfig) -> HashMap<String, Arc<LoadBalancer>> {
@@ -284,19 +339,22 @@ impl LoadBalancerCache {
     /// - Unchanged upstreams keep their exact same `Arc<LoadBalancer>`, preserving
     ///   round-robin counters, WRR weights, active connection counts, latency
     ///   EWMAs, and hash rings
-    pub fn apply_delta(
-        &self,
+    pub(crate) fn build_delta_inner(
+        current: &LoadBalancerCacheInner,
         full_new_config: &GatewayConfig,
         added: &[Upstream],
         removed_ids: &[String],
         modified: &[Upstream],
-    ) {
+    ) -> Arc<LoadBalancerCacheInner> {
         if added.is_empty() && removed_ids.is_empty() && modified.is_empty() {
-            return;
+            return Arc::new(LoadBalancerCacheInner {
+                balancers: current.balancers.clone(),
+                upstreams: current.upstreams.clone(),
+            });
         }
 
-        // Clone the current map — O(n) Arc pointer copies, no LoadBalancer cloning
-        let mut new_balancers = self.balancers.load().as_ref().clone();
+        // Clone the current map -- O(n) Arc pointer copies, no LoadBalancer cloning
+        let mut new_balancers = current.balancers.clone();
 
         // Remove deleted upstreams
         for id in removed_ids {
@@ -319,14 +377,30 @@ impl LoadBalancerCache {
         // Upstream index is cheap to rebuild (just Arc<Upstream> clones)
         let new_upstream_idx = Self::build_upstream_index(full_new_config);
 
-        self.balancers.store(Arc::new(new_balancers));
-        self.upstreams.store(Arc::new(new_upstream_idx));
+        // Single atomic swap
+        Arc::new(LoadBalancerCacheInner {
+            balancers: new_balancers,
+            upstreams: new_upstream_idx,
+        })
+    }
+
+    pub fn apply_delta(
+        &self,
+        full_new_config: &GatewayConfig,
+        added: &[Upstream],
+        removed_ids: &[String],
+        modified: &[Upstream],
+    ) {
+        let current = self.inner.load();
+        let inner =
+            Self::build_delta_inner(&current, full_new_config, added, removed_ids, modified);
+        self.store_inner(inner);
     }
 
     /// O(1) lookup of an upstream by ID from the pre-built index.
     pub fn get_upstream(&self, upstream_id: &str) -> Option<Arc<Upstream>> {
-        let idx = self.upstreams.load();
-        idx.get(upstream_id).cloned()
+        let inner = self.inner.load();
+        inner.upstreams.get(upstream_id).cloned()
     }
 
     /// Update the targets for a single upstream (used by service discovery).
@@ -341,8 +415,25 @@ impl LoadBalancerCache {
         algorithm: LoadBalancerAlgorithm,
         hash_on: Option<String>,
     ) {
-        // Update the balancer
-        let mut new_balancers = self.balancers.load().as_ref().clone();
+        let current = self.inner.load();
+        self.store_inner(Self::build_update_targets_inner(
+            &current,
+            upstream_id,
+            new_targets,
+            algorithm,
+            hash_on,
+        ));
+    }
+
+    pub(crate) fn build_update_targets_inner(
+        current: &LoadBalancerCacheInner,
+        upstream_id: &str,
+        new_targets: Vec<UpstreamTarget>,
+        algorithm: LoadBalancerAlgorithm,
+        hash_on: Option<String>,
+    ) -> Arc<LoadBalancerCacheInner> {
+        // Clone-and-patch both maps, then swap as a single unit
+        let mut new_balancers = current.balancers.clone();
         new_balancers.insert(
             upstream_id.to_string(),
             Arc::new(LoadBalancer::new(
@@ -352,23 +443,26 @@ impl LoadBalancerCache {
                 hash_on,
             )),
         );
-        self.balancers.store(Arc::new(new_balancers));
 
-        // Update the upstream index
-        let mut new_upstreams = self.upstreams.load().as_ref().clone();
+        let mut new_upstreams = current.upstreams.clone();
         if let Some(existing) = new_upstreams.get(upstream_id) {
             let mut updated = (**existing).clone();
             updated.targets = new_targets;
             new_upstreams.insert(upstream_id.to_string(), Arc::new(updated));
         }
-        self.upstreams.store(Arc::new(new_upstreams));
+
+        Arc::new(LoadBalancerCacheInner {
+            balancers: new_balancers,
+            upstreams: new_upstreams,
+        })
     }
 
     /// Get the pre-parsed hash-on strategy for an upstream.
     /// Returns `HashOnStrategy::Ip` if the upstream is not found.
     pub fn get_hash_on_strategy(&self, upstream_id: &str) -> HashOnStrategy {
-        let balancers = self.balancers.load();
-        balancers
+        let inner = self.inner.load();
+        inner
+            .balancers
             .get(upstream_id)
             .map(|b| b.hash_on_strategy.clone())
             .unwrap_or(HashOnStrategy::Ip)
@@ -388,42 +482,51 @@ impl LoadBalancerCache {
         ctx_key: &str,
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
-        let balancers = self.balancers.load();
-        let balancer = balancers.get(upstream_id)?;
+        let inner = self.inner.load();
+        let balancer = inner.balancers.get(upstream_id)?;
         balancer.select(ctx_key, health)
     }
 
     /// Load the balancers map once and return a guard for multiple lookups.
     ///
     /// Use this when you need both `get_hash_on_strategy()` and `select_target()`
-    /// for the same upstream — saves one `ArcSwap::load()` atomic operation per
+    /// for the same upstream -- saves one `ArcSwap::load()` atomic operation per
     /// request by loading the balancers map once and reusing the guard.
     #[inline]
-    pub fn load(&self) -> arc_swap::Guard<Arc<HashMap<String, Arc<LoadBalancer>>>> {
-        self.balancers.load()
+    pub fn load(&self) -> arc_swap::Guard<Arc<LoadBalancerCacheInner>> {
+        self.inner.load()
     }
 
-    /// Get the hash-on strategy from a pre-loaded balancers guard.
+    /// Get the hash-on strategy from a pre-loaded snapshot.
     #[inline]
     pub fn get_hash_on_strategy_from(
-        balancers: &HashMap<String, Arc<LoadBalancer>>,
+        snapshot: &LoadBalancerCacheInner,
         upstream_id: &str,
     ) -> HashOnStrategy {
-        balancers
+        snapshot
+            .balancers
             .get(upstream_id)
             .map(|b| b.hash_on_strategy.clone())
             .unwrap_or(HashOnStrategy::Ip)
     }
 
-    /// Select a target from a pre-loaded balancers guard.
+    #[inline]
+    pub fn get_upstream_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+    ) -> Option<Arc<Upstream>> {
+        snapshot.upstreams.get(upstream_id).cloned()
+    }
+
+    /// Select a target from a pre-loaded snapshot.
     #[inline]
     pub fn select_target_from(
-        balancers: &HashMap<String, Arc<LoadBalancer>>,
+        snapshot: &LoadBalancerCacheInner,
         upstream_id: &str,
         ctx_key: &str,
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
-        let balancer = balancers.get(upstream_id)?;
+        let balancer = snapshot.balancers.get(upstream_id)?;
         balancer.select(ctx_key, health)
     }
 
@@ -435,16 +538,27 @@ impl LoadBalancerCache {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        let balancers = self.balancers.load();
-        let balancer = balancers.get(upstream_id)?;
+        let inner = self.inner.load();
+        let balancer = inner.balancers.get(upstream_id)?;
+        balancer.select_excluding(ctx_key, exclude, health)
+    }
+
+    pub fn select_next_target_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+        ctx_key: &str,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let balancer = snapshot.balancers.get(upstream_id)?;
         balancer.select_excluding(ctx_key, exclude, health)
     }
 
     /// Snapshot of active connection counts per upstream for metrics.
     pub fn active_connections_snapshot(&self) -> Vec<(String, Vec<(String, i64)>)> {
-        let balancers = self.balancers.load();
+        let inner = self.inner.load();
         let mut result = Vec::new();
-        for (upstream_id, balancer) in balancers.iter() {
+        for (upstream_id, balancer) in inner.balancers.iter() {
             let mut targets = Vec::new();
             for entry in balancer.active_connections.iter() {
                 let count = entry.value().load(Ordering::Relaxed);
@@ -461,39 +575,17 @@ impl LoadBalancerCache {
 
     /// Record that a connection was opened to a target (for least-connections).
     pub fn record_connection_start(&self, upstream_id: &str, target: &UpstreamTarget) {
-        let balancers = self.balancers.load();
-        if let Some(balancer) = balancers.get(upstream_id) {
-            let key = balancer.find_target_key(target).unwrap_or("");
-            if key.is_empty() {
-                return;
-            }
-            // Fast path: get() uses a shared read lock. entry() takes a write
-            // lock and clones the key — avoid it when the counter already exists.
-            if let Some(counter) = balancer.active_connections.get(key) {
-                counter.fetch_add(1, Ordering::Relaxed);
-            } else {
-                balancer
-                    .active_connections
-                    .entry(key.to_owned())
-                    .or_insert_with(|| AtomicI64::new(0))
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+        let inner = self.inner.load();
+        if let Some(balancer) = inner.balancers.get(upstream_id) {
+            balancer.record_connection_start(target);
         }
     }
 
     /// Record that a connection was closed to a target (for least-connections).
     pub fn record_connection_end(&self, upstream_id: &str, target: &UpstreamTarget) {
-        let balancers = self.balancers.load();
-        if let Some(balancer) = balancers.get(upstream_id) {
-            let key = balancer.find_target_key(target).unwrap_or("");
-            if key.is_empty() {
-                return;
-            }
-            if let Some(count) = balancer.active_connections.get(key) {
-                let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    if v > 0 { Some(v - 1) } else { None }
-                });
-            }
+        let inner = self.inner.load();
+        if let Some(balancer) = inner.balancers.get(upstream_id) {
+            balancer.record_connection_end(target);
         }
     }
 
@@ -506,10 +598,10 @@ impl LoadBalancerCache {
     /// Called from one of two sources (active takes precedence):
     /// - **Active path**: `health_check.rs` after each successful probe RTT
     /// - **Passive path**: `proxy/mod.rs` after each successful non-5xx backend
-    ///   response (TTFB) — only when no active health checks are configured
+    ///   response (TTFB) -- only when no active health checks are configured
     pub fn record_latency(&self, upstream_id: &str, target: &UpstreamTarget, latency_us: u64) {
-        let balancers = self.balancers.load();
-        if let Some(balancer) = balancers.get(upstream_id) {
+        let inner = self.inner.load();
+        if let Some(balancer) = inner.balancers.get(upstream_id) {
             balancer.record_latency(target, latency_us);
         }
     }
@@ -518,8 +610,8 @@ impl LoadBalancerCache {
     /// targets. Called when a target recovers from unhealthy status so it gets a
     /// fair chance at traffic instead of being penalized by a stale high EWMA.
     pub fn reset_recovered_target_latency(&self, upstream_id: &str, target: &UpstreamTarget) {
-        let balancers = self.balancers.load();
-        if let Some(balancer) = balancers.get(upstream_id) {
+        let inner = self.inner.load();
+        if let Some(balancer) = inner.balancers.get(upstream_id) {
             balancer.reset_recovered_target_latency(target);
         }
     }
@@ -699,6 +791,35 @@ impl LoadBalancer {
             // handle gracefully for mixed-algorithm recording)
             self.latency_ewma
                 .insert(key.to_owned(), AtomicU64::new(latency_us));
+        }
+    }
+
+    pub fn record_connection_start(&self, target: &UpstreamTarget) {
+        let key = self.find_target_key(target).unwrap_or("");
+        if key.is_empty() {
+            return;
+        }
+        // Fast path: get() uses a shared read lock. entry() takes a write
+        // lock and clones the key -- avoid it when the counter already exists.
+        if let Some(counter) = self.active_connections.get(key) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.active_connections
+                .entry(key.to_owned())
+                .or_insert_with(|| AtomicI64::new(0))
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_connection_end(&self, target: &UpstreamTarget) {
+        let key = self.find_target_key(target).unwrap_or("");
+        if key.is_empty() {
+            return;
+        }
+        if let Some(count) = self.active_connections.get(key) {
+            let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v > 0 { Some(v - 1) } else { None }
+            });
         }
     }
 
@@ -1187,7 +1308,7 @@ impl LoadBalancer {
                     .map(|v| v.load(Ordering::Relaxed))
                     .unwrap_or(LATENCY_UNSET)
             } else if !all_warmed_up && min_known_ewma != LATENCY_UNSET {
-                min_known_ewma.saturating_sub(1)
+                min_known_ewma.saturating_sub(LATENCY_WARMUP_BIAS_US)
             } else {
                 LATENCY_UNSET
             };
@@ -1379,7 +1500,7 @@ impl LoadBalancer {
                     .map(|v| v.load(Ordering::Relaxed))
                     .unwrap_or(LATENCY_UNSET)
             } else if !all_warmed_up && min_known_ewma != LATENCY_UNSET {
-                min_known_ewma.saturating_sub(1)
+                min_known_ewma.saturating_sub(LATENCY_WARMUP_BIAS_US)
             } else {
                 LATENCY_UNSET
             };
@@ -1542,5 +1663,210 @@ mod tests {
         }
         // All 100 hashes should be unique
         assert_eq!(seen.len(), 100);
+    }
+
+    // ── Consistent hash empty-ring guards ──────────────────────────────
+
+    fn make_target(host: &str, port: u16) -> UpstreamTarget {
+        UpstreamTarget {
+            host: host.to_string(),
+            port,
+            weight: 1,
+            tags: HashMap::new(),
+            path: None,
+        }
+    }
+
+    /// A consistent-hash LoadBalancer with zero targets must have an empty
+    /// hash_ring, and `select()` must return `None` without panicking.
+    #[test]
+    fn consistent_hash_empty_targets_returns_none() {
+        let lb = LoadBalancer::new(
+            "upstream-empty",
+            LoadBalancerAlgorithm::ConsistentHashing,
+            &[],
+            None,
+        );
+        assert!(lb.hash_ring.is_empty());
+        let result = lb.select("any-key", None);
+        assert!(result.is_none());
+    }
+
+    /// The bitset-path guard (`select_consistent_hash_bitset`) returns `None`
+    /// when the healthy bitset is empty, even if the hash_ring is populated.
+    /// This exercises the internal empty-bitset early-return, NOT the public
+    /// `select()` all-unhealthy fallback (which rebuilds an all-target bitset).
+    #[test]
+    fn consistent_hash_empty_bitset_guard_returns_none() {
+        let targets = vec![make_target("10.0.0.1", 8080), make_target("10.0.0.2", 8080)];
+        let lb = LoadBalancer::new(
+            "upstream-ch",
+            LoadBalancerAlgorithm::ConsistentHashing,
+            &targets,
+            None,
+        );
+        assert!(!lb.hash_ring.is_empty());
+
+        // With an empty HealthBitset the internal method returns None.
+        let empty = HealthBitset::empty();
+        let result = lb.select_consistent_hash_bitset("key", &empty);
+        assert!(result.is_none());
+    }
+
+    /// The Vec-fallback guard (`select_consistent_hash_vec`) returns `None`
+    /// when the candidate list is empty.
+    #[test]
+    fn consistent_hash_empty_candidates_vec_returns_none() {
+        let targets = vec![make_target("10.0.0.1", 8080), make_target("10.0.0.2", 8080)];
+        let lb = LoadBalancer::new(
+            "upstream-ch",
+            LoadBalancerAlgorithm::ConsistentHashing,
+            &targets,
+            None,
+        );
+        let empty_candidates: Vec<(usize, &Arc<UpstreamTarget>)> = vec![];
+        let result = lb.select_consistent_hash_vec("key", &empty_candidates);
+        assert!(result.is_none());
+    }
+
+    /// Non-consistent-hash algorithms have an empty hash_ring by construction.
+    /// Calling `select()` must work without touching the ring.
+    #[test]
+    fn non_consistent_hash_has_empty_ring() {
+        for algo in [
+            LoadBalancerAlgorithm::RoundRobin,
+            LoadBalancerAlgorithm::Random,
+            LoadBalancerAlgorithm::WeightedRoundRobin,
+            LoadBalancerAlgorithm::LeastConnections,
+            LoadBalancerAlgorithm::LeastLatency,
+        ] {
+            let targets = vec![make_target("10.0.0.1", 8080)];
+            let lb = LoadBalancer::new("upstream-rr", algo, &targets, None);
+            assert!(
+                lb.hash_ring.is_empty(),
+                "{:?} should have empty hash_ring",
+                algo
+            );
+            // select() still works for non-consistent-hash algorithms
+            let result = lb.select("ignored", None);
+            assert!(result.is_some());
+        }
+    }
+
+    /// Consistent hash with targets produces a non-empty ring and selects
+    /// deterministically for the same key.
+    #[test]
+    fn consistent_hash_deterministic_selection() {
+        let targets = vec![
+            make_target("10.0.0.1", 8080),
+            make_target("10.0.0.2", 8080),
+            make_target("10.0.0.3", 8080),
+        ];
+        let lb = LoadBalancer::new(
+            "upstream-ch",
+            LoadBalancerAlgorithm::ConsistentHashing,
+            &targets,
+            None,
+        );
+        // 3 targets * 150 vnodes = 450 ring entries
+        assert_eq!(lb.hash_ring.len(), 450);
+
+        // Same key must always select the same target
+        let first = lb.select("user-123", None).unwrap();
+        for _ in 0..100 {
+            let again = lb.select("user-123", None).unwrap();
+            assert_eq!(first.target.host, again.target.host);
+            assert_eq!(first.target.port, again.target.port);
+        }
+    }
+
+    /// Public `select()` with consistent hashing where all targets are marked
+    /// unhealthy via `HealthContext`. The method should rebuild an all-target
+    /// bitset and return `Some(... is_fallback: true)`.
+    #[test]
+    fn consistent_hash_all_unhealthy_select_returns_fallback() {
+        let targets = vec![
+            make_target("10.0.0.1", 8080),
+            make_target("10.0.0.2", 8080),
+            make_target("10.0.0.3", 8080),
+        ];
+        let lb = LoadBalancer::new(
+            "upstream-ch",
+            LoadBalancerAlgorithm::ConsistentHashing,
+            &targets,
+            None,
+        );
+
+        // Mark every target as active-unhealthy.
+        let active_unhealthy: DashMap<String, u64> = DashMap::new();
+        for t in &targets {
+            active_unhealthy.insert(target_key("upstream-ch", t), 1);
+        }
+        let health = HealthContext {
+            active_unhealthy: &active_unhealthy,
+            proxy_passive: None,
+        };
+
+        let result = lb.select("some-key", Some(&health));
+        let selection = result.expect("all-unhealthy should still return a fallback target");
+        assert!(
+            selection.is_fallback,
+            "selection must be flagged as fallback when all targets are unhealthy"
+        );
+
+        // Determinism: same key always picks the same fallback target.
+        for _ in 0..50 {
+            let again = lb
+                .select("some-key", Some(&health))
+                .expect("fallback must be stable");
+            assert_eq!(selection.target.host, again.target.host);
+            assert_eq!(selection.target.port, again.target.port);
+            assert!(again.is_fallback);
+        }
+    }
+
+    /// Public `select()` with >128 targets exercises the Vec-based fallback
+    /// path for consistent hashing when all targets are unhealthy.
+    #[test]
+    fn consistent_hash_all_unhealthy_vec_fallback_returns_fallback() {
+        let target_count = 130; // exceeds MAX_BITSET_TARGETS (128)
+        let targets: Vec<UpstreamTarget> = (0..target_count)
+            .map(|i| make_target(&format!("10.0.{}.{}", i / 256, i % 256), 8080))
+            .collect();
+        let lb = LoadBalancer::new(
+            "upstream-large",
+            LoadBalancerAlgorithm::ConsistentHashing,
+            &targets,
+            None,
+        );
+        assert!(!lb.hash_ring.is_empty());
+
+        // Mark every target as active-unhealthy.
+        let active_unhealthy: DashMap<String, u64> = DashMap::new();
+        for t in &targets {
+            active_unhealthy.insert(target_key("upstream-large", t), 1);
+        }
+        let health = HealthContext {
+            active_unhealthy: &active_unhealthy,
+            proxy_passive: None,
+        };
+
+        let result = lb.select("vec-key", Some(&health));
+        let selection =
+            result.expect("Vec fallback should return a target even when all unhealthy");
+        assert!(
+            selection.is_fallback,
+            "Vec fallback selection must be flagged as fallback"
+        );
+
+        // Determinism across repeated calls.
+        for _ in 0..50 {
+            let again = lb
+                .select("vec-key", Some(&health))
+                .expect("Vec fallback must be stable");
+            assert_eq!(selection.target.host, again.target.host);
+            assert_eq!(selection.target.port, again.target.port);
+            assert!(again.is_fallback);
+        }
     }
 }

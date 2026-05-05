@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+use super::utils::cache_headers::sanitize_cached_headers;
 use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
@@ -359,7 +360,11 @@ impl Plugin for RequestDeduplication {
                 "request_deduplication: Redis cache hit for key '{}', replaying response",
                 idempotency_value
             );
-            let mut response_headers = cached.headers.clone();
+            // Defense-in-depth: re-sanitize on replay even though insert
+            // already strips. A stored entry written before this fix landed,
+            // or by a peer running an older binary against a shared Redis,
+            // could still carry session-bearing headers.
+            let mut response_headers = sanitize_cached_headers(&cached.headers);
             response_headers.insert("x-idempotent-replayed".to_string(), "true".to_string());
             return PluginResult::RejectBinary {
                 status_code: cached.status_code,
@@ -379,7 +384,12 @@ impl Plugin for RequestDeduplication {
                             "request_deduplication: cache hit for key '{}', replaying response",
                             idempotency_value
                         );
-                        let mut response_headers = cached.headers.clone();
+                        // Defense-in-depth: re-sanitize on replay even though
+                        // insert already strips. Cheap (single HashMap pass)
+                        // and protects against any future code path that
+                        // populates the cache without going through
+                        // `on_final_response_body`.
+                        let mut response_headers = sanitize_cached_headers(&cached.headers);
                         response_headers
                             .insert("x-idempotent-replayed".to_string(), "true".to_string());
                         return PluginResult::RejectBinary {
@@ -444,9 +454,19 @@ impl Plugin for RequestDeduplication {
             None => return PluginResult::Continue,
         };
 
+        // Strip session-bearing headers (Set-Cookie, Authorization, trace
+        // IDs, rate-limit counters, etc.) before persisting. Replaying a
+        // verbatim `Set-Cookie: session=...` to a second client sharing the
+        // same idempotency key — possible when `scope_by_consumer=false`,
+        // for anonymous traffic, or for any user whose session has rotated
+        // since the cached response was captured — is a session-hijack /
+        // pinned-stale-cookie vector. Mirrors `ai_semantic_cache`'s
+        // sanitization on store. See [`super::utils::cache_headers`].
+        let safe_headers = sanitize_cached_headers(response_headers);
+
         let cached = CachedResponse {
             status_code: response_status,
-            headers: response_headers.clone(),
+            headers: safe_headers,
             body: Bytes::from(body.to_vec()),
             inserted_at: Instant::now(),
         };

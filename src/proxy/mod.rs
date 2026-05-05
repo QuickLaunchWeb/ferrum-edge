@@ -39,6 +39,7 @@ pub mod grpc_proxy;
 pub mod headers;
 pub mod http2_pool;
 pub mod sni;
+pub mod stream_error;
 pub mod stream_listener;
 pub mod tcp_proxy;
 pub mod udp_batch;
@@ -58,6 +59,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{
@@ -76,13 +78,14 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
-use crate::load_balancer::{HashOnStrategy, LoadBalancerCache};
+use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
     WebSocketFrameDirection,
 };
 use crate::proxy::headers as headers_mod;
+use crate::request_epoch::{RequestEpoch, RequestEpochStore, StagedRequestEpoch};
 use crate::retry;
 use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
@@ -149,6 +152,317 @@ fn append_probe_error(record: &mut BackendCapabilityRecord, msg: String) {
 /// Returns `Ok(description)` on success or `Err(message)` on failure.
 type WarmupTask =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>;
+
+/// One unique reqwest warmup target captured during candidate collection,
+/// before the task future is built. Held as a separate struct so the HTTPS
+/// gating phase can decide per-target whether to materialize the task at all
+/// (skipping is much cheaper than building a task and dropping it unrun).
+struct ReqwestWarmupCandidate {
+    /// Representative proxy used to build the `reqwest::Client`. Multiple
+    /// proxies sharing the same `(scheme, host, port)` collapse onto the
+    /// first one collected — same as the original warmup behaviour.
+    proxy: Proxy,
+    host: String,
+    port: u16,
+    /// Scheme literal for URL formatting + log lines. `&'static str` instead
+    /// of `String` because the only valid values are the two compile-time
+    /// constants the dispatcher accepts ("http", "https").
+    scheme: &'static str,
+    /// `true` when at least one proxy routing to this `(scheme, host, port)`
+    /// would dispatch via reqwest at runtime — the OR across every proxy
+    /// merged into this candidate. The HTTPS gating phase must NOT skip
+    /// reqwest warmup when this is true, even if the capability registry
+    /// classifies the target as `h2_tls=Supported`: the direct H2 pool only
+    /// covers traffic that satisfies all of `can_use_direct_http2_pool`'s
+    /// guards (`enable_http2`, `!retain_request_body`,
+    /// `!requires_request_body_buffering`), and any proxy that fails one
+    /// of those guards still routes via reqwest.
+    requires_reqwest_warmup: bool,
+}
+
+/// Lookup the capability registry for a specific (proxy, host, port) triple
+/// and decide whether the direct HTTP/2 pool *could* handle this backend
+/// (so the reqwest pool does not need a startup HEAD).
+///
+/// Returns `true` only when `plain_http.h2_tls` is definitively `Supported`.
+/// `Unknown` (probe never ran or timed out) and `Unsupported` (post-ALPN
+/// HTTP/1.1 fallback) both fall back to "warm reqwest" so the fallback pool
+/// is always pre-warmed for any target the H2 pool cannot cover.
+///
+/// **NOT sufficient on its own to skip reqwest warmup.** The runtime
+/// dispatch path also gates on `can_use_direct_http2_pool` (per-proxy
+/// `enable_http2`, retain-request-body retries, request-body-buffering
+/// plugins), so the warmup gating must also consult
+/// `proxy_config_forces_reqwest_dispatch` for every proxy routing to the
+/// target before deciding to skip. See `ReqwestWarmupCandidate.requires_reqwest_warmup`.
+///
+/// Constructed as a free function so the gating predicate is unit-testable
+/// against a stand-alone `BackendCapabilityRegistry` without needing to
+/// instantiate a full `ProxyState`.
+fn target_uses_direct_h2_pool(
+    registry: &BackendCapabilityRegistry,
+    proxy: &Proxy,
+    host: &str,
+    port: u16,
+) -> bool {
+    let target = UpstreamTarget {
+        host: host.to_string(),
+        port,
+        weight: 1,
+        tags: HashMap::new(),
+        path: None,
+    };
+    registry
+        .get(proxy, Some(&target))
+        .map(|record| record.plain_http.h2_tls.is_supported())
+        .unwrap_or(false)
+}
+
+/// Decide whether a proxy's *configuration* would force at least some
+/// requests onto the reqwest dispatch path at runtime, regardless of
+/// what the capability registry says about the backend.
+///
+/// Mirrors the runtime guard set in `can_use_direct_http2_pool` plus the
+/// outer `dispatch_kind == HttpsPool` gate the dispatcher applies before
+/// it. Returns `true` when ANY of the following are true — meaning at
+/// least some traffic for this proxy will land on reqwest and the
+/// warmup gating MUST keep reqwest warmed for this target:
+///
+/// - `proxy.dispatch_kind` is HTTP-not-HTTPS — the direct H2 pool is
+///   never tried for plain-HTTP backends.
+/// - `enable_http2 = false` — operator explicitly disabled backend HTTP/2
+///   on this proxy (`pool_enable_http2: false`).
+/// - `requires_request_body_buffering = true` — at least one of the
+///   proxy's plugins needs to inspect/transform the request body, which
+///   the direct H2 sender path doesn't implement (per
+///   `can_use_direct_http2_pool`).
+/// - `proxy.retry` is configured with non-zero `max_retries` AND can
+///   actually retry something (connection-failure replay or a non-empty
+///   pair of retryable methods + statuses). When retries are effective,
+///   the request body is retained for replay and the direct H2 path is
+///   skipped (`retain_request_body` ⇒ false from `can_use_direct_http2_pool`).
+///
+/// Caller pre-computes the `enable_http2` and
+/// `requires_request_body_buffering` booleans from the
+/// `ConnectionPool::global_pool_config().for_proxy(proxy)` and
+/// `PluginCache::requires_request_body_buffering(&proxy.id)` accessors so
+/// this predicate is a pure function over its inputs and trivially
+/// unit-testable.
+fn proxy_config_forces_reqwest_dispatch(
+    proxy: &Proxy,
+    enable_http2: bool,
+    requires_request_body_buffering: bool,
+) -> bool {
+    if !matches!(proxy.backend_scheme, Some(BackendScheme::Https)) {
+        return true;
+    }
+    if !enable_http2 {
+        return true;
+    }
+    if requires_request_body_buffering {
+        return true;
+    }
+    if let Some(retry) = proxy.retry.as_ref()
+        && retry.max_retries > 0
+        && (retry.retry_on_connect_failure
+            || (!retry.retryable_status_codes.is_empty() && !retry.retryable_methods.is_empty()))
+    {
+        return true;
+    }
+    false
+}
+
+/// Collect reqwest warmup candidates for a single proxy, partitioning by
+/// scheme so the caller can run HTTP-only candidates in parallel with the
+/// capability refresh and apply capability-driven gating to HTTPS-only
+/// candidates after the refresh completes.
+///
+/// HTTP candidates can warm in parallel with the refresh — they hit a
+/// disjoint pool (reqwest plain HTTP) from the gRPC h2c probe. HTTPS
+/// candidates must wait for the refresh so the gating phase can consult
+/// the registry.
+///
+/// `pool_key` is the proxy's `ConnectionPool::pool_key_for_warmup(proxy)` —
+/// the same identity the connection pool uses to keep distinct
+/// `reqwest::Client`s. Including it in the dedup key (instead of just
+/// `(scheme, host, port)`) ensures two proxies that share a backend
+/// `host:port` BUT have different TLS configs (different CA bundle,
+/// different mTLS cert, different DNS override, …) each get their own
+/// warmup task — because they end up with separate `reqwest::Client`s
+/// at runtime. Without TLS-aware dedup, only the first-collected
+/// proxy's client gets warmed and the others pay a cold connect on
+/// the first real request despite warmup being enabled.
+///
+/// `forces_reqwest` is the per-proxy verdict from
+/// `proxy_config_forces_reqwest_dispatch` — `true` when the proxy's
+/// configuration would route some traffic via reqwest at runtime. The
+/// flag is OR-merged into any existing candidate sharing the same
+/// dedup key: if proxy A on the target can use the direct H2 pool but
+/// proxy B (same target, same TLS) requires reqwest, the merged
+/// candidate's `requires_reqwest_warmup` stays `true` so the gating
+/// phase keeps the warmup task. This is the regression guard against
+/// the per-target dedup hiding a single proxy's reqwest dependency.
+///
+/// Maps (not sets) so the OR-merge can mutate the existing entry in
+/// place. Order is irrelevant: the warmup batch runs concurrently and
+/// log lines key off the per-target description, not insertion order.
+///
+/// Free function so it's callable from tests without constructing a full
+/// `ProxyState`. Tests pass arbitrary `pool_key` strings to exercise the
+/// dedup contract directly.
+fn collect_reqwest_warmup_candidates_for_proxy(
+    proxy: &Proxy,
+    pool_key: &str,
+    forces_reqwest: bool,
+    upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
+    http_candidates: &mut HashMap<String, ReqwestWarmupCandidate>,
+    https_candidates: &mut HashMap<String, ReqwestWarmupCandidate>,
+) {
+    let scheme: &'static str = match proxy.backend_scheme {
+        Some(BackendScheme::Http) => "http",
+        _ => "https",
+    };
+
+    let mut targets: Vec<(String, u16)> = Vec::new();
+    if let Some(ref upstream_id) = proxy.upstream_id
+        && let Some(upstream) = upstream_map.get(upstream_id.as_str())
+    {
+        for target in &upstream.targets {
+            targets.push((target.host.clone(), target.port));
+        }
+    }
+    if targets.is_empty() {
+        targets.push((proxy.backend_host.clone(), proxy.backend_port));
+    }
+
+    let bucket = if scheme == "http" {
+        http_candidates
+    } else {
+        https_candidates
+    };
+
+    for (host, port) in targets {
+        // Dedup key composes the connection pool's TLS-aware client key
+        // with the per-target host:port. Multiple targets in one upstream
+        // share a pool key but get distinct dedup keys (each target
+        // connection in reqwest's internal pool needs its own HEAD).
+        // Multiple proxies sharing the same (host, port) but different
+        // TLS configs have distinct pool keys → distinct dedup keys →
+        // each `reqwest::Client` gets its own warmup task.
+        let dedup_key = format!("{}|{}:{}", pool_key, host, port);
+        bucket
+            .entry(dedup_key)
+            .and_modify(|existing| {
+                // OR-merge: any proxy on this target that would use reqwest
+                // at runtime keeps the warmup enabled.
+                existing.requires_reqwest_warmup |= forces_reqwest;
+            })
+            .or_insert_with(|| ReqwestWarmupCandidate {
+                proxy: proxy.clone(),
+                host,
+                port,
+                scheme,
+                requires_reqwest_warmup: forces_reqwest,
+            });
+    }
+}
+
+/// Run a batch of warmup tasks gated by a shared concurrency semaphore and
+/// emit aggregate info-level success/failure counts. Used by both the
+/// HTTP-only warmup phase (running in parallel with the capability refresh)
+/// and the gated HTTPS warmup phase. `label` identifies the batch in log
+/// lines so operators can tell the two phases apart.
+///
+/// The semaphore is the actual concurrency cap — `for_each_concurrent`'s
+/// `buffer` argument is only the *polling-window* size. Phase-1 shares the
+/// semaphore with the capability refresh so the combined fanout never
+/// exceeds `pool_warmup_concurrency`. Without the shared semaphore, two
+/// `tokio::join!`-ed batches each independently respecting that limit
+/// would burst to ~2× (or more, since per-HTTPS-target probes also
+/// `tokio::join!` H2 + H3 internally) — overloading backends and
+/// triggering avoidable startup timeouts in large configs.
+///
+/// `polling_buffer` is the configured `pool_warmup_concurrency` cap, NOT
+/// `semaphore.available_permits()`. The semaphore can be momentarily
+/// drained by the parallel capability refresh at the moment this function
+/// is entered, which would clamp the polling buffer to 1 and serialize
+/// the rest of the batch even after the refresh releases its permits.
+/// Sizing the buffer from the configured cap keeps the polling window
+/// large enough to absorb permit churn.
+async fn run_warmup_task_batch(
+    tasks: Vec<WarmupTask>,
+    semaphore: Arc<Semaphore>,
+    polling_buffer: usize,
+    label: &'static str,
+) {
+    use futures_util::stream;
+
+    if tasks.is_empty() {
+        debug!("Pool warmup ({}): no targets to warm", label);
+        return;
+    }
+
+    let total = tasks.len();
+    info!(
+        "Pool warmup ({}): establishing {} backend connections (shared concurrency cap={})",
+        label, total, polling_buffer
+    );
+
+    let ok = Arc::new(AtomicU64::new(0));
+    let failed = Arc::new(AtomicU64::new(0));
+
+    let buffer = polling_buffer.max(1);
+    stream::iter(tasks)
+        .for_each_concurrent(buffer, |task| {
+            let ok = ok.clone();
+            let failed = failed.clone();
+            let semaphore = semaphore.clone();
+            async move {
+                // The semaphore is owned by `warmup_connection_pools` and
+                // not closed during normal operation, but the codebase
+                // rule (`No .unwrap()/.expect() in production`) prefers
+                // explicit Err handling. Skip the task and count it as
+                // failed if the semaphore ever does close — startup must
+                // not panic.
+                let _permit = match semaphore.acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        warn!("Pool warmup: semaphore closed before acquire ({e}); skipping task");
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                };
+                match task.await {
+                    Ok(desc) => {
+                        debug!("Pool warmup: {} ok", desc);
+                        ok.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(msg) => {
+                        warn!("Pool warmup failed: {}", msg);
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        })
+        .await;
+
+    let ok_count = ok.load(Ordering::Relaxed);
+    let failed_count = failed.load(Ordering::Relaxed);
+    if failed_count > 0 {
+        info!(
+            "Pool warmup complete ({}): {} ok, {} failed out of {} targets",
+            label,
+            ok_count,
+            failed_count,
+            ok_count + failed_count
+        );
+    } else {
+        info!(
+            "Pool warmup complete ({}): all {} targets ok",
+            label, ok_count
+        );
+    }
+}
 
 /// Shared response-body buffering decision used across the H1/H2, H3, and
 /// cross-protocol paths so `response_body_mode` and per-request plugin
@@ -297,12 +611,41 @@ fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
 ///
 /// RFC 6455 §4.1 requires the key to be exactly 16 bytes of random data,
 /// base64-encoded to 24 characters (16 bytes → 22 base64 chars + 2 padding `=`).
+///
+/// Leading/trailing OWS (RFC 9110 §5.5: ASCII space + horizontal tab) is trimmed
+/// before validation. Header parsers are required to strip OWS, but cross-hop
+/// normalization is not guaranteed to be consistent, so we trim defensively here.
+/// `str::trim_ascii` is used (vs. `str::trim`) because OWS is strictly ASCII —
+/// avoiding the Unicode-boundary scan is both faster and more spec-precise.
+/// `ws_accept_from_key` performs the same trim so admission and accept-key
+/// derivation stay byte-for-byte aligned.
 pub fn is_valid_websocket_key(key: &str) -> bool {
     use base64::Engine;
+    let key = key.trim_ascii();
     key.len() == 24
         && base64::engine::general_purpose::STANDARD
             .decode(key)
             .is_ok_and(|bytes| bytes.len() == 16)
+}
+
+/// Derive the `Sec-WebSocket-Accept` response header value from a raw
+/// `Sec-WebSocket-Key` request header.
+///
+/// RFC 6455 §4.2.2 specifies that the Accept value is computed over the EXACT
+/// base64-encoded key the client sent. Any leading/trailing whitespace in the
+/// raw header value would otherwise leak into the SHA-1 input and produce an
+/// Accept value the client rejects, so we trim before hashing.
+/// `str::trim_ascii` is used (vs. `str::trim`) because RFC 9110 §5.5 OWS is
+/// strictly ASCII — avoiding the Unicode-boundary scan is both faster and more
+/// spec-precise. `is_valid_websocket_key` performs the same trim so admission
+/// and derivation agree on what counts as the "key bytes".
+///
+/// An empty / missing key (`""`) is passed through to `derive_accept_key`
+/// unchanged to preserve the prior fallback behavior — admission already
+/// rejects requests without a key, so this branch is only reachable in
+/// pathological / mock cases.
+pub fn ws_accept_from_key(raw: &str) -> String {
+    derive_accept_key(raw.trim_ascii().as_bytes())
 }
 
 /// Parse an HTTP method string into a `reqwest::Method`.
@@ -554,6 +897,33 @@ impl Drop for PerIpRequestGuard {
     }
 }
 
+/// RAII guard for load-balancer connection accounting on upgraded sessions.
+///
+/// WebSocket proxying runs in a spawned task after the HTTP handler returns.
+/// Keeping the accounting in a guard makes the end event fire on normal close,
+/// upgrade failure, task cancellation, or panic unwind.
+struct LoadBalancerConnectionGuard {
+    target: Option<Arc<UpstreamTarget>>,
+    balancer: Option<Arc<LoadBalancer>>,
+}
+
+impl LoadBalancerConnectionGuard {
+    fn new(target: Option<Arc<UpstreamTarget>>, balancer: Option<Arc<LoadBalancer>>) -> Self {
+        if let (Some(target), Some(balancer)) = (target.as_ref(), balancer.as_ref()) {
+            balancer.record_connection_start(target);
+        }
+        Self { target, balancer }
+    }
+}
+
+impl Drop for LoadBalancerConnectionGuard {
+    fn drop(&mut self) {
+        if let (Some(target), Some(balancer)) = (self.target.as_ref(), self.balancer.as_ref()) {
+            balancer.record_connection_end(target);
+        }
+    }
+}
+
 /// Build RFC 7239 Forwarded header value.
 /// IPv6 addresses are quoted per RFC 7239 §6.
 /// Writes directly into a single pre-allocated buffer to avoid intermediate
@@ -665,10 +1035,33 @@ fn reject_result_to_backend_response(
     }
 }
 
+/// Outcome of [`ProxyState::apply_incremental`].
+///
+/// The DB polling loop in `src/modes/database.rs` distinguishes these states
+/// to decide whether to advance `last_poll_at` (the `since` cursor for the
+/// next incremental query). Empty results and applied changes both mean the
+/// poll completed safely and the cursor must move forward; rejected updates
+/// must leave the cursor untouched so the next poll re-fetches the same rows
+/// and gets another chance to apply them. Without that, a row whose
+/// `updated_at` falls outside the 1-second `since_safe` margin would silently
+/// disappear from the gateway's view of the DB, leaving permanent
+/// divergence between DB state and in-memory config until a full reload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncrementalApplyOutcome {
+    /// Changes were applied to in-memory config.
+    Applied,
+    /// `IncrementalResult` was empty — nothing to apply, no error.
+    NoChanges,
+    /// Validation rejected the patched config; in-memory config unchanged.
+    /// Callers tracking a `since` cursor MUST NOT advance it on this outcome.
+    Rejected,
+}
+
 /// Shared state for the proxy engine.
 #[derive(Clone)]
 pub struct ProxyState {
     pub config: Arc<ArcSwap<GatewayConfig>>,
+    pub request_epoch: Arc<RequestEpochStore>,
     pub dns_cache: DnsCache,
     pub connection_pool: Arc<ConnectionPool>,
     pub router_cache: Arc<RouterCache>,
@@ -693,6 +1086,8 @@ pub struct ProxyState {
     pub load_balancer_cache: Arc<LoadBalancerCache>,
     /// Health checker for upstream targets.
     pub health_checker: Arc<HealthChecker>,
+    /// Shutdown receiver reused when config reloads restart health-check tasks.
+    pub health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     /// Circuit breaker cache for proxy-level circuit breaking.
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// Service discovery manager for dynamic upstream target resolution.
@@ -765,12 +1160,31 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
+    /// Construct the gateway state and start the health checker.
+    ///
+    /// `health_check_shutdown_rx` is forwarded to
+    /// [`HealthChecker::start_with_shutdown`] so active HTTP probes and the
+    /// passive recovery timer observe gateway shutdown via `tokio::select!`
+    /// and exit cleanly. Pass `Some(shutdown_tx.subscribe())` from each
+    /// mode's startup; tests that don't drive shutdown can pass `None`.
+    ///
+    /// Returns `(ProxyState, Vec<JoinHandle>)`. The handle vec is populated
+    /// by [`HealthChecker::take_active_check_handles`] — they wrap the
+    /// spawned active-check / passive-recovery tasks. Modes must `await`
+    /// them in the per-mode background-drain phase (alongside DNS / metrics
+    /// / overload). Without that, cleanup falls back to
+    /// `Drop for HealthChecker`, which only aborts tasks once the last
+    /// `Arc<HealthChecker>` clone is dropped — at process exit, AFTER the
+    /// drain window has already closed. That late abort lets a probe
+    /// mid-`http_probe` finish its TCP / TLS / HTTP round-trip and emit
+    /// a misleading "unhealthy" log line right before tear-down.
     pub fn new(
         config: GatewayConfig,
         dns_cache: DnsCache,
         env_config: crate::config::EnvConfig,
         tls_policy: Option<TlsPolicy>,
-    ) -> Result<Self, anyhow::Error> {
+        health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
         let alt_svc_header = if env_config.enable_http3 {
             Some(format!("h3=\":{}\"; ma=86400", env_config.proxy_https_port))
         } else {
@@ -801,6 +1215,8 @@ impl ProxyState {
         let websocket_write_buffer_size = env_config.websocket_write_buffer_size;
         let websocket_tunnel_mode = env_config.websocket_tunnel_mode;
         let max_concurrent_requests_per_ip = env_config.max_concurrent_requests_per_ip;
+        let pool_shard_amount =
+            crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount);
         let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(
             &env_config.trusted_proxies,
         ));
@@ -845,15 +1261,20 @@ impl ProxyState {
             crls.clone(),
         ));
         // Build router cache with pre-sorted route table and HashMap prefix index.
-        // Cache size: explicit env var if set (>0), otherwise auto-scales with proxy count.
+        // Cache size: explicit env var if set (>0), otherwise pass through 0 so
+        // the RouterCache constructor resolves the auto sentinel (single source of truth).
         let max_cache_entries = if env_config_arc.router_cache_max_entries > 0 {
             env_config_arc
                 .router_cache_max_entries
                 .clamp(1_000, 10_000_000)
         } else {
-            (config.proxies.len() * 3).clamp(10_000, 1_000_000)
+            0
         };
-        let router_cache = Arc::new(RouterCache::new(&config, max_cache_entries));
+        let router_cache = Arc::new(RouterCache::with_shard_amount(
+            &config,
+            max_cache_entries,
+            pool_shard_amount,
+        ));
         // Pre-resolve plugins per proxy (fixes rate_limiting state persistence bug).
         // All plugins that make outbound HTTP calls share a pooled client configured
         // with the gateway's connection pool settings (keepalive, idle timeout, etc.).
@@ -865,7 +1286,9 @@ impl ProxyState {
             env_config_arc.plugin_http_retry_delay_ms,
             env_config_arc.tls_no_verify,
             env_config_arc.tls_ca_bundle_path.as_deref(),
+            crls.clone(),
             &env_config_arc.namespace,
+            env_config_arc.backend_allow_ips.clone(),
         );
         let plugin_cache = Arc::new(
             PluginCache::with_http_client(&config, plugin_http_client.clone())
@@ -875,6 +1298,16 @@ impl ProxyState {
         let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
         // Build load balancer cache for upstream target selection
         let load_balancer_cache = Arc::new(LoadBalancerCache::new(&config));
+        let request_epoch = Arc::new(RequestEpochStore::new(RequestEpoch {
+            config: Arc::new(config.clone()),
+            route_table: RouterCache::build_route_table_snapshot(&config),
+            plugin_cache: plugin_cache.load_inner(),
+            consumer_index: consumer_index.load_inner(),
+            load_balancer: load_balancer_cache.load_inner(),
+            config_generation: 1,
+            route_generation: 1,
+            lb_generation: 1,
+        }));
         // Initialize health checker with the gateway's pool settings so active
         // probes share connection tuning (keep-alive, idle timeout, HTTP/2) with
         // regular proxy traffic.
@@ -887,7 +1320,20 @@ impl ProxyState {
             env_config_arc.tls_no_verify,
         );
         health_checker.set_load_balancer_cache(load_balancer_cache.clone());
-        health_checker.start(&config);
+        // Use `start_with_shutdown` so active HTTP probes and the passive
+        // recovery timer race their `interval.tick()` against the shutdown
+        // watch channel. Without the receiver the inner tasks exit only when
+        // `Drop for HealthChecker` aborts them — and `Drop` runs at process
+        // exit, after the background-drain phase has already given up. That
+        // late abort lets a probe that's mid-`http_probe` finish its TCP /
+        // TLS / HTTP round-trip and emit a misleading "unhealthy" log line
+        // immediately before the process tears down.
+        let health_check_restart_rx = health_check_shutdown_rx.clone();
+        health_checker.start_with_shutdown(&config, health_check_shutdown_rx);
+        // Drain the spawned task handles BEFORE wrapping in Arc so the
+        // caller can await them in the background-drain phase. Drop is
+        // a no-op safety net once the Vec is empty.
+        let health_check_handles = health_checker.take_active_check_handles();
         let health_checker = Arc::new(health_checker);
         // Circuit breaker cache
         let circuit_breaker_cache = Arc::new(CircuitBreakerCache::with_max_entries(
@@ -899,6 +1345,7 @@ impl ProxyState {
             dns_cache.clone(),
             health_checker.clone(),
             plugin_http_client,
+            Some(request_epoch.clone()),
         ));
 
         let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
@@ -927,112 +1374,117 @@ impl ProxyState {
 
         let overload = Arc::new(crate::overload::OverloadState::new());
 
-        let stream_listener_manager = Arc::new(stream_listener::StreamListenerManager::new(
-            stream_bind_addr,
-            config_arc.clone(),
-            dns_cache.clone(),
-            load_balancer_cache.clone(),
-            consumer_index.clone(),
-            plugin_cache.clone(),
-            circuit_breaker_cache.clone(),
-            None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
-            env_config_arc.tls_no_verify,
-            env_config_arc.tls_ca_bundle_path.clone(),
-            env_config_arc.tcp_idle_timeout_seconds,
-            env_config_arc.tcp_half_close_max_wait_seconds,
-            env_config_arc.udp_max_sessions,
-            env_config_arc.udp_cleanup_interval_seconds,
-            tls_policy_arc.clone(),
-            crls.clone(),
-            adaptive_buffer.clone(),
-            env_config_arc.udp_recvmmsg_batch_size,
-            {
-                let v = env_config_arc
-                    .tcp_fastopen_enabled
-                    .resolve(crate::socket_opts::is_tcp_fastopen_available);
-                tracing::info!(enabled = v, config = %env_config_arc.tcp_fastopen_enabled, "TCP_FASTOPEN auto-detection");
-                v
-            },
-            overload.clone(),
-            {
-                let v = env_config_arc
-                    .ktls_enabled
-                    .resolve(crate::socket_opts::ktls::is_ktls_available);
-                if v {
-                    tracing::info!("kTLS auto-detection: enabled (full key install probe passed)");
-                } else {
-                    tracing::info!(config = %env_config_arc.ktls_enabled, "kTLS auto-detection: disabled");
-                }
-                v
-            },
-            {
-                let v = env_config_arc
-                    .io_uring_splice_enabled
-                    .resolve(crate::socket_opts::io_uring_splice::check_io_uring_available);
-                if v {
-                    tracing::info!(
-                        "io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"
-                    );
-                    // Warn if the tokio blocking-thread pool is too small for the
-                    // per-stream pattern: io_uring splice spawns 2 `spawn_blocking`
-                    // tasks per TCP connection (one per direction). With the default
-                    // cap of 512, thousands of concurrent streams will saturate the
-                    // pool and new splices will queue, causing latency spikes. 1024
-                    // is the rule-of-thumb floor; operators with very high connection
-                    // counts should set FERRUM_BLOCKING_THREADS much higher or
-                    // disable io_uring splice entirely.
-                    let effective_blocking_threads = env_config_arc.blocking_threads.unwrap_or(512);
-                    if effective_blocking_threads < 1024 {
-                        tracing::warn!(
-                            blocking_threads = effective_blocking_threads,
-                            "FERRUM_IO_URING_SPLICE_ENABLED=true but FERRUM_BLOCKING_THREADS={} is low; \
+        let stream_listener_manager = Arc::new(
+            stream_listener::StreamListenerManager::new_with_epoch(
+                stream_bind_addr,
+                config_arc.clone(),
+                dns_cache.clone(),
+                request_epoch.clone(),
+                circuit_breaker_cache.clone(),
+                None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
+                env_config_arc.tls_no_verify,
+                env_config_arc.tls_ca_bundle_path.clone(),
+                env_config_arc.tcp_idle_timeout_seconds,
+                env_config_arc.tcp_half_close_max_wait_seconds,
+                env_config_arc.frontend_tls_handshake_timeout_seconds,
+                env_config_arc.udp_max_sessions,
+                env_config_arc.udp_cleanup_interval_seconds,
+                tls_policy_arc.clone(),
+                crls.clone(),
+                adaptive_buffer.clone(),
+                env_config_arc.udp_recvmmsg_batch_size,
+                {
+                    let v = env_config_arc
+                        .tcp_fastopen_enabled
+                        .resolve(crate::socket_opts::is_tcp_fastopen_available);
+                    tracing::info!(enabled = v, config = %env_config_arc.tcp_fastopen_enabled, "TCP_FASTOPEN auto-detection");
+                    v
+                },
+                overload.clone(),
+                {
+                    let v = env_config_arc
+                        .ktls_enabled
+                        .resolve(crate::socket_opts::ktls::is_ktls_available);
+                    if v {
+                        tracing::info!(
+                            "kTLS auto-detection: enabled (full key install probe passed)"
+                        );
+                    } else {
+                        tracing::info!(config = %env_config_arc.ktls_enabled, "kTLS auto-detection: disabled");
+                    }
+                    v
+                },
+                {
+                    let v = env_config_arc
+                        .io_uring_splice_enabled
+                        .resolve(crate::socket_opts::io_uring_splice::check_io_uring_available);
+                    if v {
+                        tracing::info!(
+                            "io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"
+                        );
+                        // Warn if the tokio blocking-thread pool is too small for the
+                        // per-stream pattern: io_uring splice spawns 2 `spawn_blocking`
+                        // tasks per TCP connection (one per direction). With the default
+                        // cap of 512, thousands of concurrent streams will saturate the
+                        // pool and new splices will queue, causing latency spikes. 1024
+                        // is the rule-of-thumb floor; operators with very high connection
+                        // counts should set FERRUM_BLOCKING_THREADS much higher or
+                        // disable io_uring splice entirely.
+                        let effective_blocking_threads =
+                            env_config_arc.blocking_threads.unwrap_or(512);
+                        if effective_blocking_threads < 1024 {
+                            tracing::warn!(
+                                blocking_threads = effective_blocking_threads,
+                                "FERRUM_IO_URING_SPLICE_ENABLED=true but FERRUM_BLOCKING_THREADS={} is low; \
                              each TCP stream consumes 2 blocking threads. \
                              Recommended: FERRUM_BLOCKING_THREADS >= 1024 for io_uring splice.",
-                            effective_blocking_threads
-                        );
+                                effective_blocking_threads
+                            );
+                        }
+                    } else {
+                        tracing::info!(config = %env_config_arc.io_uring_splice_enabled, "io_uring splice auto-detection: disabled");
                     }
-                } else {
-                    tracing::info!(config = %env_config_arc.io_uring_splice_enabled, "io_uring splice auto-detection: disabled");
-                }
-                v
-            },
-            env_config_arc.so_busy_poll_us,
-            {
-                let v = env_config_arc
-                    .udp_gro_enabled
-                    .resolve(crate::socket_opts::is_udp_gro_available);
-                // GRO is probed but not active (recv_from lacks cmsg) — log for completeness.
-                tracing::info!(enabled = v, config = %env_config_arc.udp_gro_enabled, "UDP GRO auto-detection (reserved, not active)");
-                v
-            },
-            {
-                let v = env_config_arc
-                    .udp_gso_enabled
-                    .resolve(crate::socket_opts::is_udp_gso_available);
-                if v {
-                    tracing::info!("UDP GSO auto-detection: enabled (setsockopt probe passed)");
-                } else {
-                    tracing::info!(config = %env_config_arc.udp_gso_enabled, "UDP GSO auto-detection: disabled");
-                }
-                v
-            },
-            {
-                let v = env_config_arc
-                    .udp_pktinfo_enabled
-                    .resolve(crate::socket_opts::is_udp_pktinfo_available);
-                if v {
-                    tracing::info!(
-                        "UDP IP_PKTINFO auto-detection: enabled (setsockopt probe passed)"
-                    );
-                } else {
-                    tracing::info!(config = %env_config_arc.udp_pktinfo_enabled, "UDP IP_PKTINFO auto-detection: disabled");
-                }
-                v
-            },
-        ));
+                    v
+                },
+                env_config_arc.so_busy_poll_us,
+                {
+                    let v = env_config_arc
+                        .udp_gro_enabled
+                        .resolve(crate::socket_opts::is_udp_gro_available);
+                    // GRO is probed but not active (recv_from lacks cmsg) — log for completeness.
+                    tracing::info!(enabled = v, config = %env_config_arc.udp_gro_enabled, "UDP GRO auto-detection (reserved, not active)");
+                    v
+                },
+                {
+                    let v = env_config_arc
+                        .udp_gso_enabled
+                        .resolve(crate::socket_opts::is_udp_gso_available);
+                    if v {
+                        tracing::info!("UDP GSO auto-detection: enabled (setsockopt probe passed)");
+                    } else {
+                        tracing::info!(config = %env_config_arc.udp_gso_enabled, "UDP GSO auto-detection: disabled");
+                    }
+                    v
+                },
+                {
+                    let v = env_config_arc
+                        .udp_pktinfo_enabled
+                        .resolve(crate::socket_opts::is_udp_pktinfo_available);
+                    if v {
+                        tracing::info!(
+                            "UDP IP_PKTINFO auto-detection: enabled (setsockopt probe passed)"
+                        );
+                    } else {
+                        tracing::info!(config = %env_config_arc.udp_pktinfo_enabled, "UDP IP_PKTINFO auto-detection: disabled");
+                    }
+                    v
+                },
+            ),
+        );
 
-        Ok(Self {
+        let state = Self {
             config: config_arc,
+            request_epoch,
             dns_cache,
             connection_pool,
             router_cache,
@@ -1040,6 +1492,7 @@ impl ProxyState {
             consumer_index,
             load_balancer_cache,
             health_checker,
+            health_check_shutdown_rx: health_check_restart_rx,
             circuit_breaker_cache,
             service_discovery_manager,
             request_count: Arc::new(AtomicU64::new(0)),
@@ -1087,7 +1540,9 @@ impl ProxyState {
             trusted_proxies,
             websocket_conn_limit,
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
-                Some(Arc::new(dashmap::DashMap::new()))
+                Some(Arc::new(dashmap::DashMap::with_shard_amount(
+                    pool_shard_amount,
+                )))
             } else {
                 None
             },
@@ -1099,26 +1554,34 @@ impl ProxyState {
             crls,
             overload,
             adaptive_buffer,
-        })
+        };
+        Ok((state, health_check_handles))
     }
 
     /// Start a background task that periodically removes stale zero-count
     /// entries from `per_ip_request_counts`. Normally entries are cleaned via
     /// the `PerIpRequestGuard` RAII drop, but this sweep catches edge cases
     /// (e.g., task cancellation without guard drop).
-    pub fn start_per_ip_cleanup_task(&self) {
-        if let Some(ref counts) = self.per_ip_request_counts {
-            let counts = counts.clone();
-            let interval_secs = self.env_config.per_ip_cleanup_interval_seconds.max(1);
-            tokio::spawn(async move {
-                let mut timer =
-                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-                loop {
-                    timer.tick().await;
-                    counts.retain(|_, count| count.load(Ordering::Relaxed) > 0);
-                }
-            });
-        }
+    ///
+    /// Returns `Some(JoinHandle)` when per-IP tracking is enabled so the
+    /// caller can join the task during the background-task drain phase of
+    /// graceful shutdown. Returns `None` when
+    /// `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP=0` (no tracking, no task to
+    /// spawn). The task exits cleanly on `shutdown_rx` change so it doesn't
+    /// wedge shutdown — consistent with `start_backend_capability_refresh_task`,
+    /// `dns_cache.start_background_refresh_with_shutdown`, and the overload /
+    /// metrics monitors.
+    pub fn start_per_ip_cleanup_task(
+        &self,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let counts = self.per_ip_request_counts.as_ref()?.clone();
+        let interval_secs = self.env_config.per_ip_cleanup_interval_seconds.max(1);
+        Some(tokio::spawn(run_per_ip_cleanup_loop(
+            counts,
+            interval_secs,
+            shutdown_rx,
+        )))
     }
 
     /// Reconcile stream proxy listeners at startup.
@@ -1396,6 +1859,34 @@ impl ProxyState {
     }
 
     pub async fn refresh_backend_capabilities(&self) {
+        let cap = self.env_config.pool_warmup_concurrency.max(1);
+        let semaphore = Arc::new(Semaphore::new(cap));
+        self.refresh_backend_capabilities_with_semaphore(semaphore, cap)
+            .await;
+    }
+
+    /// Inner implementation of `refresh_backend_capabilities` that takes an
+    /// externally-supplied semaphore plus the configured polling buffer
+    /// size. The startup `warmup_connection_pools` path uses this entry
+    /// point to share a single concurrency budget across the capability
+    /// refresh AND the parallel HTTP reqwest warmup batch — without it,
+    /// each `for_each_concurrent` independently honours its own
+    /// `pool_warmup_concurrency` cap, doubling (or worse) the effective
+    /// fanout when both batches run via `tokio::join!`. The public
+    /// `refresh_backend_capabilities()` wrapper preserves the
+    /// background-refresh semantics by minting a per-call semaphore.
+    ///
+    /// `polling_buffer` is the configured `pool_warmup_concurrency` cap,
+    /// NOT `semaphore.available_permits()`. The semaphore can be
+    /// momentarily drained by the parallel HTTP warmup batch at the
+    /// moment this function is entered (or vice-versa), which would
+    /// clamp the polling buffer and serialize subsequent work. Passing
+    /// the configured cap keeps the polling window stable.
+    pub(crate) async fn refresh_backend_capabilities_with_semaphore(
+        &self,
+        semaphore: Arc<Semaphore>,
+        polling_buffer: usize,
+    ) {
         use futures_util::stream;
 
         let config = self.config.load_full();
@@ -1405,20 +1896,37 @@ impl ProxyState {
             return;
         }
 
-        let concurrency = self.env_config.pool_warmup_concurrency.max(1);
+        let buffer = polling_buffer.max(1);
         let refreshed = Arc::new(AtomicU64::new(0));
         let h2_supported = Arc::new(AtomicU64::new(0));
         let h3_supported = Arc::new(AtomicU64::new(0));
         let h2c_supported = Arc::new(AtomicU64::new(0));
 
         stream::iter(targets)
-            .for_each_concurrent(concurrency, |target| {
+            .for_each_concurrent(buffer, |target| {
                 let state = self.clone();
                 let refreshed = refreshed.clone();
                 let h2_supported = h2_supported.clone();
                 let h3_supported = h3_supported.clone();
                 let h2c_supported = h2c_supported.clone();
+                let semaphore = semaphore.clone();
                 async move {
+                    // Same rule as `run_warmup_task_batch`: prefer
+                    // explicit Err handling over `.expect()` so a
+                    // future refactor that closes the semaphore can't
+                    // panic the startup path. Skip the probe — the next
+                    // periodic refresh will pick it up.
+                    let _permit = match semaphore.acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(e) => {
+                            warn!(
+                                "Backend capability refresh: semaphore closed before acquire ({e}); skipping target {}:{}",
+                                target.host(),
+                                target.port()
+                            );
+                            return;
+                        }
+                    };
                     let record = state.probe_backend_capabilities(&target).await;
                     if record.plain_http.h2_tls.is_supported() {
                         h2_supported.fetch_add(1, Ordering::Relaxed);
@@ -1529,166 +2037,366 @@ impl ProxyState {
 
     /// Pre-establish backend connections for all HTTP-family proxies.
     ///
-    /// Startup first refreshes the backend capability registry so protocol
-    /// support is learned outside the request hot path. The probes themselves
-    /// warm the gRPC, direct HTTP/2, and HTTP/3 pools for targets that support
-    /// those transports. reqwest clients are then warmed for every HTTP-family
-    /// backend so the fallback/general path is also ready before traffic.
+    /// Two-phase startup:
+    ///
+    /// 1. **Capability refresh in parallel with HTTP-only reqwest warmup.**
+    ///    The capability probes warm the gRPC, direct HTTP/2, and HTTP/3
+    ///    pools for targets that support those transports. They classify
+    ///    backends so the request hot path can decide between the native
+    ///    H2/H3 pools and the reqwest fallback. The reqwest HEAD warmup
+    ///    for plain-HTTP backends has no capability dependency (h2c is
+    ///    only consulted for gRPC dispatch), so it overlaps the refresh
+    ///    via `tokio::join!` — both batches share `for_each_concurrent`
+    ///    parallelism but the wall-clock costs no longer stack.
+    ///
+    /// 2. **HTTPS reqwest warmup with capability + needs-reqwest +
+    ///    H3-frontend gating.** After the refresh has populated the
+    ///    registry, an HTTPS target's reqwest HEAD is skipped iff ALL
+    ///    three guards pass; if any fails we warm reqwest. The guards:
+    ///
+    ///    **(1) Capability**: registry classifies the target
+    ///    `plain_http.h2_tls = Supported`, so the direct H2 pool can
+    ///    talk to it for H1/H2 frontend traffic.
+    ///
+    ///    **(2) Needs-reqwest**: no proxy routing to the target has a
+    ///    configuration that forces reqwest dispatch — i.e.
+    ///    `requires_reqwest_warmup` is `false` after OR-merging across
+    ///    every sharing proxy. See `proxy_config_forces_reqwest_dispatch`
+    ///    for the guard set: `pool_enable_http2`, retain-request-body
+    ///    retries, request-body-buffering plugins.
+    ///
+    ///    **(3) H3 frontend disabled** (`env_config.enable_http3 == false`):
+    ///    the `http3::cross_protocol::run` bridge sends ALL non-native-H3
+    ///    backend traffic from H3 frontend clients through reqwest (gRPC
+    ///    over H3 always; Plain over H3 when backend `h3=Unsupported`),
+    ///    regardless of what the direct H2 pool would do for the same
+    ///    request from an H1/H2 frontend client. With H3 enabled we
+    ///    conservatively warm reqwest for every HTTPS target.
+    ///
+    ///    If H2/TLS silently downgrades at runtime (handled by
+    ///    `mark_h2_tls_unsupported`), the first fallback request pays a
+    ///    cold connect — acceptable recovery cost vs. paying a redundant
+    ///    TLS handshake at startup for every H2/TLS-capable target.
     pub async fn warmup_connection_pools(&self) {
-        use futures_util::stream;
-
-        self.refresh_backend_capabilities().await;
-
         let config = self.config.load_full();
         let concurrency = self.env_config.pool_warmup_concurrency.max(1);
-        let mut seen_reqwest: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut tasks: Vec<WarmupTask> = Vec::new();
+        // Single shared semaphore for the whole warmup. Phase-1 hands one
+        // copy to the capability refresh and another to the HTTP reqwest
+        // warmup batch (running in `tokio::join!`); phase-2 gets the same
+        // semaphore. Without this, each `for_each_concurrent` would
+        // independently honour `pool_warmup_concurrency` and the joined
+        // batches would burst to ~2× (or more, since per-HTTPS-target
+        // probes also `tokio::join!` H2 + H3 internally) — overloading
+        // backends and breaking the operator-set cap.
+        let warmup_semaphore = Arc::new(Semaphore::new(concurrency));
         let upstream_map: HashMap<&str, &crate::config::types::Upstream> = config
             .upstreams
             .iter()
             .map(|upstream| (upstream.id.as_str(), upstream))
             .collect();
 
+        // Collect ALL reqwest warmup candidates upfront, partitioned by
+        // scheme so each phase can build its own task list. Each bucket is
+        // a `HashMap<dedup_key, ReqwestWarmupCandidate>` keyed by
+        // `{pool_key}|{host}:{port}` — the connection pool's TLS-aware
+        // client identity composed with the per-target host:port. This
+        // dedup contract:
+        //   - Same pool_key + same target → one HEAD (multiple proxies
+        //     sharing identical TLS + backend collapse correctly).
+        //   - Same pool_key + different targets → one HEAD per target
+        //     (a load-balanced upstream warms each backend connection
+        //     in the shared `reqwest::Client`'s internal pool).
+        //   - Different pool_keys + same target → one HEAD per pool
+        //     (proxies that point at the same backend with divergent TLS
+        //     end up with separate `reqwest::Client`s — each one needs
+        //     its own warm connection or the first request through
+        //     whichever client wasn't warmed pays a cold connect).
+        // Upper-bound capacity at proxy count. Real candidate count can
+        // exceed this when upstreams expand multiple targets, but the
+        // hint avoids the ~log2(N) rehashes default-sized maps would do
+        // under N inserts; if it's an undercount the HashMap auto-grows
+        // exactly once or twice — still cheaper than starting from 4.
+        let cap_hint = config.proxies.len();
+        let mut http_candidates: HashMap<String, ReqwestWarmupCandidate> =
+            HashMap::with_capacity(cap_hint);
+        let mut https_candidates: HashMap<String, ReqwestWarmupCandidate> =
+            HashMap::with_capacity(cap_hint);
+        let pool_config = self.connection_pool.global_pool_config();
         for proxy in &config.proxies {
             if !proxy.dispatch_kind.is_http_family() {
                 continue;
             }
-            self.collect_reqwest_warmup_tasks(proxy, &upstream_map, &mut seen_reqwest, &mut tasks);
-        }
-
-        if tasks.is_empty() {
-            debug!("Pool warmup: no HTTP-family backends to warm via reqwest");
-            return;
-        }
-
-        info!(
-            "Pool warmup: establishing {} reqwest backend connections (concurrency={})",
-            tasks.len(),
-            concurrency
-        );
-
-        let ok = Arc::new(AtomicU64::new(0));
-        let failed = Arc::new(AtomicU64::new(0));
-
-        stream::iter(tasks)
-            .for_each_concurrent(concurrency, |task| {
-                let ok = ok.clone();
-                let failed = failed.clone();
-                async move {
-                    match task.await {
-                        Ok(desc) => {
-                            debug!("Pool warmup: {} ok", desc);
-                            ok.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(msg) => {
-                            warn!("Pool warmup failed: {}", msg);
-                            failed.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-            })
-            .await;
-
-        let ok_count = ok.load(Ordering::Relaxed);
-        let failed_count = failed.load(Ordering::Relaxed);
-        if failed_count > 0 {
-            info!(
-                "Pool warmup complete: {} ok, {} failed out of {} reqwest targets",
-                ok_count,
-                failed_count,
-                ok_count + failed_count
+            // Mirror the runtime dispatch decision: would this proxy ever
+            // route a request via reqwest? If yes, the warmup gating must
+            // keep the reqwest HEAD even when the capability registry says
+            // h2_tls=Supported. The flag is OR-merged across every proxy
+            // sharing the dedup key — one reqwest-forcing proxy is enough
+            // to keep the pool warm.
+            let per_proxy_pool = pool_config.for_proxy(proxy);
+            let requires_request_body_buffering =
+                self.plugin_cache.requires_request_body_buffering(&proxy.id);
+            let forces_reqwest = proxy_config_forces_reqwest_dispatch(
+                proxy,
+                per_proxy_pool.enable_http2,
+                requires_request_body_buffering,
             );
-        } else {
-            info!("Pool warmup complete: all {} reqwest targets ok", ok_count);
-        }
-    }
-
-    /// Collect reqwest pool warmup tasks for a proxy.
-    ///
-    /// Creates the `reqwest::Client` (TLS config, cert parsing) and then sends
-    /// a lightweight HEAD request to each unique backend host:port to force
-    /// TCP/TLS connection establishment. reqwest caches connections internally
-    /// by host:port, so subsequent requests reuse the warmed connection.
-    fn collect_reqwest_warmup_tasks(
-        &self,
-        proxy: &Proxy,
-        upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
-        seen: &mut std::collections::HashSet<String>,
-        tasks: &mut Vec<WarmupTask>,
-    ) {
-        let scheme = match proxy.backend_scheme {
-            Some(BackendScheme::Http) => "http",
-            _ => "https",
-        };
-
-        let mut targets: Vec<(String, u16)> = Vec::new();
-        if let Some(ref upstream_id) = proxy.upstream_id
-            && let Some(upstream) = upstream_map.get(upstream_id.as_str())
-        {
-            for target in &upstream.targets {
-                targets.push((target.host.clone(), target.port));
-            }
-        }
-        if targets.is_empty() {
-            targets.push((proxy.backend_host.clone(), proxy.backend_port));
+            let pool_key = self.connection_pool.pool_key_for_warmup(proxy);
+            collect_reqwest_warmup_candidates_for_proxy(
+                proxy,
+                &pool_key,
+                forces_reqwest,
+                &upstream_map,
+                &mut http_candidates,
+                &mut https_candidates,
+            );
         }
 
-        let pool_key = self.connection_pool.pool_key_for_warmup(proxy);
-        let _ = seen.insert(pool_key);
+        // Phase 1: capability refresh ‖ HTTP-only reqwest warmup. HTTP
+        // candidates always warm — the direct H2 pool is HTTPS-only, so
+        // HTTP backends have no alternative dispatch path. Both batches
+        // share the same semaphore (concurrency cap) AND get the same
+        // configured polling buffer — see `run_warmup_task_batch` for
+        // why we don't size the buffer from `available_permits()`.
+        let http_tasks: Vec<WarmupTask> = http_candidates
+            .into_values()
+            .map(|c| Self::build_reqwest_warmup_task(self.connection_pool.clone(), c))
+            .collect();
+        let http_label = "reqwest http";
+        let refresh_fut =
+            self.refresh_backend_capabilities_with_semaphore(warmup_semaphore.clone(), concurrency);
+        let http_warmup_fut = run_warmup_task_batch(
+            http_tasks,
+            warmup_semaphore.clone(),
+            concurrency,
+            http_label,
+        );
+        tokio::join!(refresh_fut, http_warmup_fut);
 
-        for (host, port) in targets {
-            let dedup_key = format!("reqwest_conn|{}|{}|{}", scheme, host, port);
-            if !seen.insert(dedup_key) {
+        // Phase 2: HTTPS reqwest warmup with capability + needs-reqwest
+        // gating. Skip iff ALL of these hold for the target:
+        //   1. The capability registry classifies it h2_tls=Supported (so
+        //      the direct H2 pool can talk to the backend for H1/H2
+        //      frontend traffic), AND
+        //   2. No proxy routing to this target has a configuration that
+        //      forces reqwest dispatch — i.e. `requires_reqwest_warmup`
+        //      is `false` after OR-merging all sharing proxies, AND
+        //   3. The HTTP/3 frontend listener is NOT enabled. The
+        //      `http3::cross_protocol::run` bridge sends ALL non-native-H3
+        //      backend traffic from H3 frontend clients through
+        //      `connection_pool.get_client(proxy)` (reqwest), regardless of
+        //      whether the direct H2 pool would have served the same
+        //      request from an H1/H2 frontend client. That means:
+        //      - gRPC over H3 frontend → reqwest (always cross-protocol)
+        //      - Plain over H3 frontend when backend `h3=Unsupported` →
+        //        reqwest (cross-protocol fallback)
+        //      We can't predict at warmup time whether a proxy will see
+        //      H3 frontend traffic of either flavor, so the safe rule is:
+        //      H3 enabled ⇒ keep reqwest warm for every HTTPS target.
+        // If any condition is false we warm reqwest.
+        let h3_frontend_enabled = self.env_config.enable_http3;
+        let total_https_candidates = https_candidates.len();
+        let mut https_tasks: Vec<WarmupTask> = Vec::with_capacity(total_https_candidates);
+        let mut skipped_h2_tls = 0usize;
+        for (_key, candidate) in https_candidates {
+            let h2_tls_covered = target_uses_direct_h2_pool(
+                &self.backend_capabilities,
+                &candidate.proxy,
+                &candidate.host,
+                candidate.port,
+            );
+            if h2_tls_covered && !candidate.requires_reqwest_warmup && !h3_frontend_enabled {
+                debug!(
+                    "Pool warmup: skipping reqwest HEAD for {}:{} (direct H2 pool covers every routing proxy, H3 frontend disabled)",
+                    candidate.host, candidate.port
+                );
+                skipped_h2_tls += 1;
                 continue;
             }
+            https_tasks.push(Self::build_reqwest_warmup_task(
+                self.connection_pool.clone(),
+                candidate,
+            ));
+        }
+        if skipped_h2_tls > 0 {
+            info!(
+                "Pool warmup: gating skipped {} of {} HTTPS reqwest targets (direct H2 pool covers them and no routing proxy forces reqwest)",
+                skipped_h2_tls, total_https_candidates
+            );
+        } else if h3_frontend_enabled && total_https_candidates > 0 {
+            debug!(
+                "Pool warmup: H3 frontend enabled, keeping reqwest warm for all {} HTTPS targets (cross-protocol bridge dispatches non-native-H3 backend traffic via reqwest)",
+                total_https_candidates
+            );
+        }
+        run_warmup_task_batch(https_tasks, warmup_semaphore, concurrency, "reqwest https").await;
+    }
 
-            let pool = self.connection_pool.clone();
-            let proxy = proxy.clone();
-            let scheme = scheme.to_string();
-            tasks.push(Box::pin(async move {
-                let desc = format!("reqwest {}:{}", host, port);
-                let client = pool
-                    .get_client(&proxy)
-                    .await
-                    .map_err(|e| format!("{}: {}", desc, e))?;
+    /// Build a single reqwest HEAD warmup task from a candidate. The
+    /// classification logic is identical across HTTP/HTTPS — the gating
+    /// happens in the caller (which decides whether to build the task at
+    /// all).
+    fn build_reqwest_warmup_task(
+        pool: Arc<ConnectionPool>,
+        candidate: ReqwestWarmupCandidate,
+    ) -> WarmupTask {
+        let ReqwestWarmupCandidate {
+            proxy,
+            host,
+            port,
+            scheme,
+            requires_reqwest_warmup: _,
+        } = candidate;
+        Box::pin(async move {
+            let desc = format!("reqwest {}:{}", host, port);
+            let client = pool
+                .get_client(&proxy)
+                .await
+                .map_err(|e| format!("{}: {}", desc, e))?;
 
-                let url = format!("{}://{}:{}/", scheme, host, port);
-                // Apply the proxy's `backend_connect_timeout_ms` as a per-request
-                // connect timeout, capped by the 5s overall warmup budget. Without
-                // this, the shared `reqwest::Client` carries no client-level
-                // connect timeout (we removed it so per-request overrides can
-                // diverge across pool-sharing siblings), so unreachable backends
-                // would consume the full 5s overall timeout per probe. Operators
-                // who set a tight `backend_connect_timeout_ms` (e.g. 500ms) get
-                // that bound at startup too. `0` disables — fall back to the 5s
-                // overall cap.
-                let mut req = client.head(&url).timeout(Duration::from_secs(5));
-                if proxy.backend_connect_timeout_ms > 0 {
-                    let warmup_cap = Duration::from_secs(5);
-                    let configured = Duration::from_millis(proxy.backend_connect_timeout_ms);
-                    req = req.connect_timeout(configured.min(warmup_cap));
+            let url = format!("{}://{}:{}/", scheme, host, port);
+            // Apply the proxy's `backend_connect_timeout_ms` as a per-request
+            // connect timeout, capped by the 5s overall warmup budget. Without
+            // this, the shared `reqwest::Client` carries no client-level
+            // connect timeout (we removed it so per-request overrides can
+            // diverge across pool-sharing siblings), so unreachable backends
+            // would consume the full 5s overall timeout per probe. Operators
+            // who set a tight `backend_connect_timeout_ms` (e.g. 500ms) get
+            // that bound at startup too. `0` disables — fall back to the 5s
+            // overall cap.
+            let mut req = client.head(&url).timeout(Duration::from_secs(5));
+            if proxy.backend_connect_timeout_ms > 0 {
+                let warmup_cap = Duration::from_secs(5);
+                let configured = Duration::from_millis(proxy.backend_connect_timeout_ms);
+                req = req.connect_timeout(configured.min(warmup_cap));
+            }
+            let result = req.send().await;
+
+            match result {
+                Ok(_) => Ok(desc),
+                // Pool-warmup classification: this is the startup
+                // HEAD probe, not a retry decision. We only want to
+                // surface "couldn't reach the backend at all" as an
+                // error here; a backend that responds with any HTTP
+                // status (including 5xx) is reachable enough to keep
+                // the pool warm. `e.is_connect() || e.is_timeout()`
+                // is the right predicate for that narrow purpose,
+                // and intentionally diverges from the unified
+                // `request_reached_wire` boundary used by the
+                // request-time retry path — different decision,
+                // different criteria. Don't "unify" this call to
+                // the shared classifier without revisiting what the
+                // warmup probe actually needs to gate.
+                Err(e) if e.is_connect() || e.is_timeout() => Err(format!("{}: {}", desc, e)),
+                Err(_) => Ok(desc),
+            }
+        })
+    }
+
+    /// Run the full validation pipeline against a candidate config and reject
+    /// it if any rejecting validator fails. Should be called AFTER
+    /// `resolve_upstream_tls()` / `resolve_dispatch_kind()` and BEFORE the
+    /// `ArcSwap::store()` that publishes the new config to the hot path.
+    ///
+    /// **Validator categories** (matching the long-standing semantics of
+    /// `apply_incremental` — see `db_loader.rs::load_full_config()` and
+    /// `dp_client.rs::handle_full_snapshot` for the corresponding call-site
+    /// gates that pre-filter before this helper runs):
+    ///
+    /// - *Warn-only* — emit `warn!` but never reject:
+    ///   - `validate_all_fields_with_ip_policy` (TLS cert paths, expiry,
+    ///     `FERRUM_BACKEND_ALLOW_IPS` policy). The DB / DP contract is
+    ///     "data is already persisted; warn rather than block reload" so a
+    ///     stale TLS path or a single misconfigured backend IP doesn't
+    ///     freeze the entire control plane.
+    ///   - `validate_hosts` (hostname syntax). Same rationale.
+    ///
+    /// - *Reject* — accumulate into the returned error vector and abort
+    ///   the reload:
+    ///   - `validate_regex_listen_paths` — uncompilable regex would
+    ///     silently skip routes at runtime.
+    ///   - `validate_unique_listen_paths` — overlapping listen paths
+    ///     would route non-deterministically.
+    ///   - `validate_stream_proxies` — stream-family invariants (no
+    ///     `listen_path`, mandatory `listen_port`, etc.).
+    ///   - `validate_upstream_references` — dangling upstream IDs would
+    ///     500 every request through that proxy.
+    ///   - `validate_plugin_references` — dangling plugin IDs / wrong
+    ///     scope.
+    ///   - `validate_stream_proxy_port_conflicts` — rejects in non-DP
+    ///     modes, warns in DP mode (the DP doesn't control its config and
+    ///     one bad stream proxy port shouldn't block all other config
+    ///     updates pushed by the CP).
+    ///
+    /// **Why this lives inside the swap path:** every existing caller
+    /// (`file_loader`, `db_loader`, `dp_client`) already validates before
+    /// calling `update_config` / `apply_incremental`, but the contract
+    /// "validate fully BEFORE swap" must be honored by the swap function
+    /// itself so a future call site (e.g. an admin "import config" handler)
+    /// cannot publish an invalid config to the hot path. Existing call-site
+    /// validation becomes defense-in-depth — the canonical guard is here.
+    ///
+    /// Reject errors are accumulated into a single `Vec<String>` so callers
+    /// can log every reason in one pass instead of discovering them
+    /// iteratively across reloads.
+    fn validate_full_config(&self, config: &GatewayConfig) -> Result<(), Vec<String>> {
+        // Warn-only — TLS field validation (cert paths, expiry, IP policy).
+        if let Err(errors) = config.validate_all_fields_with_ip_policy(
+            self.env_config.tls_cert_expiry_warning_days,
+            &self.env_config.backend_allow_ips,
+        ) {
+            for msg in &errors {
+                warn!("Config field validation: {}", msg);
+            }
+        }
+
+        // Warn-only — hostname syntax.
+        if let Err(errors) = config.validate_hosts() {
+            for msg in &errors {
+                warn!("Config validation: {}", msg);
+            }
+        }
+
+        // Reject — collect all rejecting-validator failures into a single
+        // error vector so callers can log every reason at once instead of
+        // discovering them iteratively across reloads.
+        let mut errors: Vec<String> = Vec::new();
+        if let Err(errs) = config.validate_regex_listen_paths() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = config.validate_unique_listen_paths() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = config.validate_stream_proxies() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = config.validate_upstream_references() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = config.validate_plugin_references() {
+            errors.extend(errs);
+        }
+
+        // Stream proxy port conflicts — reject in non-DP modes, warn in DP
+        // mode. The DP doesn't control its config and one bad stream proxy
+        // port shouldn't block all other config updates pushed by the CP.
+        let reserved_ports = self.env_config.reserved_gateway_ports();
+        if let Err(errs) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
+            if matches!(
+                self.env_config.mode,
+                crate::config::env_config::OperatingMode::DataPlane
+            ) {
+                for msg in &errs {
+                    warn!("Stream proxy port conflict (non-fatal in DP mode): {}", msg);
                 }
-                let result = req.send().await;
+            } else {
+                errors.extend(errs);
+            }
+        }
 
-                match result {
-                    Ok(_) => Ok(desc),
-                    // Pool-warmup classification: this is the startup
-                    // HEAD probe, not a retry decision. We only want to
-                    // surface "couldn't reach the backend at all" as an
-                    // error here; a backend that responds with any HTTP
-                    // status (including 5xx) is reachable enough to keep
-                    // the pool warm. `e.is_connect() || e.is_timeout()`
-                    // is the right predicate for that narrow purpose,
-                    // and intentionally diverges from the unified
-                    // `request_reached_wire` boundary used by the
-                    // request-time retry path — different decision,
-                    // different criteria. Don't "unify" this call to
-                    // the shared classifier without revisiting what the
-                    // warmup probe actually needs to gate.
-                    Err(e) if e.is_connect() || e.is_timeout() => Err(format!("{}: {}", desc, e)),
-                    Err(_) => Ok(desc),
-                }
-            }));
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
         }
     }
 
@@ -1703,34 +2411,156 @@ impl ProxyState {
     ///
     /// Falls back to a full rebuild only on the very first config load (when
     /// there is no previous config to diff against).
+    fn delta_routes_changed(
+        delta: &crate::config_delta::ConfigDelta,
+        old_config: &GatewayConfig,
+    ) -> bool {
+        let is_route_indexed = |proxy: &Proxy| !proxy.dispatch_kind.is_stream();
+
+        if delta.added_proxies.iter().any(is_route_indexed)
+            || delta.modified_proxies.iter().any(is_route_indexed)
+        {
+            return true;
+        }
+
+        if delta.modified_proxies.is_empty() && delta.removed_proxy_ids.is_empty() {
+            return false;
+        }
+
+        let old_route_indexed_proxy_ids: std::collections::HashSet<&str> = old_config
+            .proxies
+            .iter()
+            .filter(|proxy| is_route_indexed(proxy))
+            .map(|proxy| proxy.id.as_str())
+            .collect();
+
+        delta
+            .modified_proxies
+            .iter()
+            .map(|proxy| proxy.id.as_str())
+            .chain(delta.removed_proxy_ids.iter().map(String::as_str))
+            .any(|id| old_route_indexed_proxy_ids.contains(id))
+    }
+
+    fn delta_consumers_changed(delta: &crate::config_delta::ConfigDelta) -> bool {
+        !delta.added_consumers.is_empty()
+            || !delta.modified_consumers.is_empty()
+            || !delta.removed_consumer_ids.is_empty()
+    }
+
+    fn delta_load_balancers_changed(delta: &crate::config_delta::ConfigDelta) -> bool {
+        !delta.added_upstreams.is_empty()
+            || !delta.modified_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+    }
+
+    fn stage_incremental_request_epoch(
+        &self,
+        current: &RequestEpoch,
+        new_config: &GatewayConfig,
+        staged_config: Arc<GatewayConfig>,
+        delta: &crate::config_delta::ConfigDelta,
+    ) -> Result<StagedRequestEpoch, String> {
+        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(new_config);
+        let rebuild_globals = delta
+            .added_plugin_configs
+            .iter()
+            .chain(delta.modified_plugin_configs.iter())
+            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
+            || !delta.removed_plugin_config_ids.is_empty();
+        let route_changed = Self::delta_routes_changed(delta, &current.config);
+        let consumer_changed = Self::delta_consumers_changed(delta);
+        let lb_changed = Self::delta_load_balancers_changed(delta);
+
+        let plugin_inner = self.plugin_cache.build_delta_inner(
+            &current.plugin_cache,
+            new_config,
+            &proxy_ids_to_rebuild,
+            &delta.removed_proxy_ids,
+            rebuild_globals,
+        )?;
+        let consumer_inner = if consumer_changed {
+            ConsumerIndex::build_inner(&new_config.consumers)
+        } else {
+            Arc::clone(&current.consumer_index)
+        };
+        let load_balancer = if lb_changed {
+            LoadBalancerCache::build_delta_inner(
+                &current.load_balancer,
+                new_config,
+                &delta.added_upstreams,
+                &delta.removed_upstream_ids,
+                &delta.modified_upstreams,
+            )
+        } else {
+            Arc::clone(&current.load_balancer)
+        };
+        let route_table = if route_changed {
+            RouterCache::build_route_table_snapshot(new_config)
+        } else {
+            Arc::clone(&current.route_table)
+        };
+
+        Ok(StagedRequestEpoch {
+            config: staged_config,
+            route_table,
+            plugin_cache: plugin_inner,
+            consumer_index: consumer_inner,
+            load_balancer,
+            route_changed,
+            lb_changed,
+        })
+    }
+
+    fn mirror_request_epoch_wrappers(
+        &self,
+        published: &RequestEpoch,
+        route_changed: bool,
+        clear_route_caches: bool,
+    ) {
+        if route_changed {
+            self.router_cache.store_route_table_snapshot(
+                Arc::clone(&published.route_table),
+                published.route_generation,
+            );
+            if clear_route_caches {
+                self.router_cache.clear_lookup_caches();
+            }
+        }
+        self.plugin_cache
+            .store_inner(Arc::clone(&published.plugin_cache));
+        self.consumer_index
+            .store_inner(Arc::clone(&published.consumer_index));
+        self.load_balancer_cache
+            .store_inner(Arc::clone(&published.load_balancer));
+        self.config.store(Arc::clone(&published.config));
+    }
+
     /// Update the proxy configuration. Returns `true` if changes were applied.
     pub fn update_config(&self, mut new_config: GatewayConfig) -> bool {
         use crate::config_delta::ConfigDelta;
 
+        // Normalize hostnames (ASCII-lowercase) and pre-compute each
+        // proxy's `dispatch_kind` for O(1) hot-path dispatch. Both must run
+        // before any request reads `proxy.dispatch_kind`.
+        // `normalize_fields()` calls `resolve_dispatch_kind()` internally
+        // (see `GatewayConfig::normalize_fields` rustdoc) so we don't need
+        // a separate call here.
+        new_config.normalize_fields();
         // Resolve upstream TLS into each proxy's resolved_tls before applying.
         new_config.resolve_upstream_tls();
-        // Pre-compute each proxy's dispatch_kind for O(1) hot-path dispatch.
-        // Must run before any request reads proxy.dispatch_kind.
-        new_config.resolve_dispatch_kind();
 
-        // Validate stream proxy port conflicts before applying any config.
-        // In DP mode, warn but don't reject — the DP doesn't control its config
-        // and one bad stream proxy port shouldn't block all other config updates.
-        let reserved_ports = self.env_config.reserved_gateway_ports();
-        if let Err(errors) = new_config.validate_stream_proxy_port_conflicts(&reserved_ports) {
-            if matches!(
-                self.env_config.mode,
-                crate::config::env_config::OperatingMode::DataPlane
-            ) {
-                for msg in &errors {
-                    warn!("Stream proxy port conflict (non-fatal in DP mode): {}", msg);
-                }
-            } else {
-                for msg in &errors {
-                    error!("Config reload rejected: {}", msg);
-                }
-                return false;
+        // Run the full validation pipeline before swapping. Existing call
+        // sites (`file_loader`, `db_loader`, `dp_client`) validate first, so
+        // this is defense-in-depth for them — but the canonical "validate
+        // fully BEFORE swap" guard must live inside the swap function so a
+        // future caller (e.g. an admin "import config" handler) cannot
+        // publish an invalid config to the hot path.
+        if let Err(errors) = self.validate_full_config(&new_config) {
+            for msg in &errors {
+                error!("Config reload rejected: {}", msg);
             }
+            return false;
         }
 
         let old_config = self.config.load_full();
@@ -1747,16 +2577,47 @@ impl ProxyState {
             && new_config.upstreams.is_empty();
 
         if old_is_empty && !new_is_empty {
-            self.router_cache.rebuild(&new_config);
-            if let Err(e) = self.plugin_cache.rebuild(&new_config) {
-                error!(
-                    "Config reload rejected — security plugin validation failed: {}",
-                    e
-                );
-                return false;
-            }
-            self.consumer_index.rebuild(&new_config.consumers);
-            self.load_balancer_cache.rebuild(&new_config);
+            let route_table = RouterCache::build_route_table_snapshot(&new_config);
+            let plugin_inner = match self
+                .plugin_cache
+                .build_inner_with_existing_client(&new_config)
+            {
+                Ok(inner) => inner,
+                Err(e) => {
+                    error!(
+                        "Config reload rejected — security plugin validation failed: {}",
+                        e
+                    );
+                    return false;
+                }
+            };
+            let consumer_inner = ConsumerIndex::build_inner(&new_config.consumers);
+            let lb_inner = LoadBalancerCache::build_inner(&new_config);
+            let staged_config = Arc::new(new_config.clone());
+            let published = match self.request_epoch.update_config(
+                |_| {
+                    Ok(Some(StagedRequestEpoch {
+                        config: Arc::clone(&staged_config),
+                        route_table: Arc::clone(&route_table),
+                        plugin_cache: Arc::clone(&plugin_inner),
+                        consumer_index: Arc::clone(&consumer_inner),
+                        load_balancer: Arc::clone(&lb_inner),
+                        route_changed: true,
+                        lb_changed: true,
+                    }))
+                },
+                |published| {
+                    self.mirror_request_epoch_wrappers(published, true, true);
+                },
+            ) {
+                Ok(Some(epoch)) => epoch,
+                Ok(None) => return false,
+                Err(e) => {
+                    error!("Config reload rejected: {}", e);
+                    return false;
+                }
+            };
+            PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
             // DNS warmup for all hostnames in the new config
             let mut hostnames: Vec<(String, Option<String>, Option<u64>)> = new_config
@@ -1790,7 +2651,6 @@ impl ProxyState {
             }
 
             warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
-            self.config.store(Arc::new(new_config));
             self.spawn_backend_capability_refresh();
 
             // Reconcile stream proxy listeners (TCP/UDP)
@@ -1810,6 +2670,13 @@ impl ProxyState {
             // Reconcile service discovery tasks
             let new_cfg = self.config.load_full();
             self.service_discovery_manager.reconcile(&new_cfg, None);
+
+            // Restart active health-check probes against the new config so
+            // upstreams added by this reload get their probes spawned and
+            // probe parameters (interval, timeout, threshold, probe_type,
+            // TLS config) for existing upstreams are picked up.
+            self.health_checker
+                .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
 
             info!(
                 "Proxy configuration loaded (full build: router + plugins + consumers + load balancers)"
@@ -1831,45 +2698,36 @@ impl ProxyState {
             return false;
         }
 
-        // --- RouterCache: rebuild route table, surgically invalidate path cache ---
-        let affected_routes = delta.affected_routes(&old_config);
-        self.router_cache.apply_delta(&new_config, &affected_routes);
-
-        // --- PluginCache: only rebuild plugins for affected proxies ---
-        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(&new_config);
-        let rebuild_globals = delta
-            .added_plugin_configs
-            .iter()
-            .chain(delta.modified_plugin_configs.iter())
-            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
-            || !delta.removed_plugin_config_ids.is_empty();
-        if let Err(e) = self.plugin_cache.apply_delta(
-            &new_config,
-            &proxy_ids_to_rebuild,
-            &delta.removed_proxy_ids,
-            rebuild_globals,
-        ) {
-            error!(
-                "Config reload rejected — security plugin validation failed: {}",
-                e
-            );
-            return false;
-        }
-
-        // --- ConsumerIndex: surgical add/remove/update ---
-        self.consumer_index.apply_delta(
-            &delta.added_consumers,
-            &delta.removed_consumer_ids,
-            &delta.modified_consumers,
+        // Stage all request-facing cache inners before publishing any request-visible epoch.
+        let route_changed = Self::delta_routes_changed(&delta, &old_config);
+        let proxy_plugin_rebuild_count = delta.proxy_ids_needing_plugin_rebuild(&new_config).len();
+        let staged_config = Arc::new(new_config.clone());
+        let publish_result = self.request_epoch.update_config(
+            |current| {
+                self.stage_incremental_request_epoch(
+                    current,
+                    &new_config,
+                    Arc::clone(&staged_config),
+                    &delta,
+                )
+                .map(Some)
+            },
+            |published| {
+                self.mirror_request_epoch_wrappers(published, route_changed, false);
+            },
         );
-
-        // --- LoadBalancerCache: only rebuild changed upstreams ---
-        self.load_balancer_cache.apply_delta(
-            &new_config,
-            &delta.added_upstreams,
-            &delta.removed_upstream_ids,
-            &delta.modified_upstreams,
-        );
+        let published = match publish_result {
+            Ok(Some(epoch)) => epoch,
+            Ok(None) => return false,
+            Err(e) => {
+                error!(
+                    "Config reload rejected — security plugin validation failed: {}",
+                    e
+                );
+                return false;
+            }
+        };
+        PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
         // --- CircuitBreakerCache: prune breakers for deleted proxies ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -1932,9 +2790,6 @@ impl ProxyState {
             });
         }
 
-        // Clear cached pool keys when proxy settings change
-        // Swap the canonical config last (readers may still be using old caches
-        // via ArcSwap snapshots until they finish their current request)
         // Prune adaptive buffer state for removed proxies.
         {
             let active_ids: Vec<&str> = new_config.proxies.iter().map(|p| p.id.as_str()).collect();
@@ -1942,7 +2797,6 @@ impl ProxyState {
         }
 
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
-        self.config.store(Arc::new(new_config));
         self.spawn_backend_capability_refresh();
 
         // Reconcile stream proxy listeners if any proxies changed
@@ -1995,7 +2849,7 @@ impl ProxyState {
             delta.added_upstreams.len(),
             delta.removed_upstream_ids.len(),
             delta.modified_upstreams.len(),
-            proxy_ids_to_rebuild.len(),
+            proxy_plugin_rebuild_count,
         );
 
         // Reconcile service discovery tasks for changed upstreams
@@ -2007,13 +2861,27 @@ impl ProxyState {
             self.service_discovery_manager.reconcile(&new_cfg, None);
         }
 
+        // Restart active health-check probes when upstreams or their probe
+        // configuration changed. Without this, probe tasks spawned at startup
+        // keep running with stale parameters, removed upstreams keep probing
+        // forever, and newly added upstreams never get probes.
+        if !delta.added_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+            || !delta.modified_upstreams.is_empty()
+        {
+            let new_cfg = self.config.load_full();
+            self.health_checker
+                .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
+        }
+
         true
     }
 
     /// Start service discovery background tasks for all upstreams in the config.
     ///
     /// Should be called once after `ProxyState::new()` in each mode's startup,
-    /// similar to `health_checker.start()`.
+    /// similar to `HealthChecker::start_with_shutdown` (which `ProxyState::new`
+    /// invokes internally).
     pub fn start_service_discovery(&self, shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>) {
         let config = self.config.load_full();
         self.service_discovery_manager.start(&config, shutdown_rx);
@@ -2026,13 +2894,16 @@ impl ProxyState {
     /// directly from the DB layer's `load_incremental_config()`. This avoids
     /// loading and diffing the full config on every poll cycle.
     ///
-    /// Returns `true` if changes were applied.
+    /// Returns an [`IncrementalApplyOutcome`] so callers can distinguish
+    /// "nothing to do" (`NoChanges`) from "changes were rejected by validation"
+    /// (`Rejected`). The DB poller relies on this to avoid advancing
+    /// `last_poll_at` on rejection — see `src/modes/database.rs`.
     pub async fn apply_incremental(
         &self,
         result: crate::config::db_loader::IncrementalResult,
-    ) -> bool {
+    ) -> IncrementalApplyOutcome {
         if result.is_empty() {
-            return false;
+            return IncrementalApplyOutcome::NoChanges;
         }
 
         // Patch the stored GatewayConfig: clone current, apply mutations, store
@@ -2153,120 +3024,55 @@ impl ProxyState {
 
         new_config.loaded_at = result.poll_timestamp;
 
-        // Validate the patched config before applying (same validations as load_full_config)
+        // Validate the patched config before applying. `validate_full_config`
+        // is the shared validation pipeline used by both `update_config` and
+        // `apply_incremental` so the two swap paths cannot drift in what they
+        // accept. Normalize + resolve must run first so the validators see
+        // canonicalized fields.
         new_config.normalize_fields();
         new_config.resolve_upstream_tls();
-        if let Err(errors) = new_config.validate_all_fields_with_ip_policy(
-            self.env_config.tls_cert_expiry_warning_days,
-            &self.env_config.backend_allow_ips,
-        ) {
-            for msg in &errors {
-                warn!("Incremental config field validation: {}", msg);
-            }
-        }
-        if let Err(errors) = new_config.validate_hosts() {
-            for msg in &errors {
-                warn!("Incremental config validation: {}", msg);
-            }
-        }
-        if let Err(errors) = new_config.validate_regex_listen_paths() {
+        if let Err(errors) = self.validate_full_config(&new_config) {
             for msg in &errors {
                 error!("Incremental config rejected: {}", msg);
             }
-            return false;
-        }
-        if let Err(errors) = new_config.validate_unique_listen_paths() {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
-            }
-            return false;
-        }
-        if let Err(errors) = new_config.validate_stream_proxies() {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
-            }
-            return false;
-        }
-        if let Err(errors) = new_config.validate_upstream_references() {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
-            }
-            return false;
-        }
-        if let Err(errors) = new_config.validate_plugin_references() {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
-            }
-            return false;
-        }
-        let reserved_ports = self.env_config.reserved_gateway_ports();
-        if let Err(errors) = new_config.validate_stream_proxy_port_conflicts(&reserved_ports) {
-            if matches!(
-                self.env_config.mode,
-                crate::config::env_config::OperatingMode::DataPlane
-            ) {
-                for msg in &errors {
-                    warn!(
-                        "Incremental stream proxy port conflict (non-fatal in DP mode): {}",
-                        msg
-                    );
-                }
-            } else {
-                for msg in &errors {
-                    error!("Incremental config rejected: {}", msg);
-                }
-                return false;
-            }
+            return IncrementalApplyOutcome::Rejected;
         }
 
-        // Build a ConfigDelta to feed into existing cache apply_delta() methods.
-        // For incremental results, we treat all changed resources as "modified"
-        // since the DB layer doesn't distinguish adds from modifications.
-        // The cache apply_delta methods handle both cases correctly.
+        // Build a ConfigDelta against old + new to get proper
+        // add/modify/remove classification for the epoch builders.
         let old_config = self.config.load_full();
 
-        // Use ConfigDelta::compute against old + new to get proper add/modify/remove classification
         let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
 
-        // --- RouterCache ---
-        let affected_routes = delta.affected_routes(&old_config);
-        self.router_cache.apply_delta(&new_config, &affected_routes);
-
-        // --- PluginCache ---
-        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(&new_config);
-        let rebuild_globals = delta
-            .added_plugin_configs
-            .iter()
-            .chain(delta.modified_plugin_configs.iter())
-            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
-            || !delta.removed_plugin_config_ids.is_empty();
-        if let Err(e) = self.plugin_cache.apply_delta(
-            &new_config,
-            &proxy_ids_to_rebuild,
-            &delta.removed_proxy_ids,
-            rebuild_globals,
-        ) {
-            error!(
-                "Config reload rejected — security plugin validation failed: {}",
-                e
-            );
-            return false;
-        }
-
-        // --- ConsumerIndex ---
-        self.consumer_index.apply_delta(
-            &delta.added_consumers,
-            &delta.removed_consumer_ids,
-            &delta.modified_consumers,
+        // Stage all request-facing cache inners before publishing any request-visible epoch.
+        let route_changed = Self::delta_routes_changed(&delta, &old_config);
+        let staged_config = Arc::new(new_config.clone());
+        let publish_result = self.request_epoch.update_config(
+            |current| {
+                self.stage_incremental_request_epoch(
+                    current,
+                    &new_config,
+                    Arc::clone(&staged_config),
+                    &delta,
+                )
+                .map(Some)
+            },
+            |published| {
+                self.mirror_request_epoch_wrappers(published, route_changed, false);
+            },
         );
-
-        // --- LoadBalancerCache ---
-        self.load_balancer_cache.apply_delta(
-            &new_config,
-            &delta.added_upstreams,
-            &delta.removed_upstream_ids,
-            &delta.modified_upstreams,
-        );
+        let published = match publish_result {
+            Ok(Some(epoch)) => epoch,
+            Ok(None) => return IncrementalApplyOutcome::NoChanges,
+            Err(e) => {
+                error!(
+                    "Incremental config rejected — security plugin validation failed: {}",
+                    e
+                );
+                return IncrementalApplyOutcome::Rejected;
+            }
+        };
+        PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
         // --- CircuitBreakerCache ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -2331,9 +3137,7 @@ impl ProxyState {
             self.adaptive_buffer.prune_missing(&active_ids);
         }
 
-        // Store updated config
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
-        self.config.store(Arc::new(new_config));
 
         // Trigger a coalesced capability refresh so added/modified HTTPS
         // backends get classified immediately instead of waiting up to the
@@ -2399,11 +3203,57 @@ impl ProxyState {
             self.service_discovery_manager.reconcile(&new_cfg, None);
         }
 
-        true
+        // Restart active health-check probes when upstreams or their probe
+        // configuration changed. Same rationale as the corresponding block
+        // in `update_config` — incremental DB polls and CP gRPC pushes both
+        // route through this method, so without it any upstream churn after
+        // startup is invisible to the probe layer.
+        if !delta.added_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+            || !delta.modified_upstreams.is_empty()
+        {
+            let new_cfg = self.config.load_full();
+            self.health_checker
+                .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
+        }
+
+        IncrementalApplyOutcome::Applied
     }
 
     pub fn current_config(&self) -> Arc<GatewayConfig> {
         self.config.load_full()
+    }
+}
+
+/// Drives the per-IP cleanup interval loop.
+///
+/// Pulled out of `start_per_ip_cleanup_task` so the shutdown semantics can be
+/// unit-tested without constructing a full `ProxyState` (which requires a TLS
+/// policy, listener manager, etc.). When `shutdown_rx` is `Some`, the loop
+/// exits cleanly on watch-channel change so the spawned task can be drained
+/// during graceful shutdown alongside DNS / overload / metrics handles.
+async fn run_per_ip_cleanup_loop(
+    counts: Arc<dashmap::DashMap<String, AtomicU64>>,
+    interval_secs: u64,
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    let mut timer = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+    match shutdown_rx {
+        Some(mut shutdown_rx) => loop {
+            tokio::select! {
+                _ = timer.tick() => {
+                    counts.retain(|_, count| count.load(Ordering::Relaxed) > 0);
+                }
+                _ = shutdown_rx.changed() => {
+                    info!("Per-IP cleanup task shutting down");
+                    break;
+                }
+            }
+        },
+        None => loop {
+            timer.tick().await;
+            counts.retain(|_, count| count.load(Ordering::Relaxed) > 0);
+        },
     }
 }
 
@@ -2412,10 +3262,18 @@ impl ProxyState {
 /// Uses hyper-util's auto builder which accepts both HTTP/1.1 and HTTP/2
 /// connections. h2c (cleartext HTTP/2) is required for gRPC clients that
 /// connect without TLS.
+///
+/// On shutdown, calls `graceful_shutdown()` on the hyper connection so that
+/// HTTP/2 clients receive a GOAWAY frame and HTTP/1.1 keepalive connections
+/// stop accepting new requests. Without this, persistent H2/keepalive
+/// connections continue to accept new streams indefinitely after the listener
+/// exits, forcing every shutdown to wait the full
+/// `FERRUM_SHUTDOWN_DRAIN_SECONDS` timeout.
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
     state: ProxyState,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
@@ -2430,6 +3288,7 @@ async fn handle_connection(
     {
         let mut http1 = builder.http1();
         http1.max_buf_size(state.max_header_size_bytes);
+        http1.writev(true);
         // Slowloris protection: close connections that take too long to send headers.
         if state.env_config.http_header_read_timeout_seconds > 0 {
             http1.timer(hyper_util::rt::TokioTimer::new());
@@ -2466,7 +3325,24 @@ async fn handle_connection(
         let addr = remote_addr;
         async move { handle_proxy_request(req, state, addr, false, None, None).await }
     });
-    if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
+
+    let conn = builder.serve_connection_with_upgrades(io, svc);
+    tokio::pin!(conn);
+
+    let result = tokio::select! {
+        biased;
+        res = conn.as_mut() => res,
+        _ = shutdown_rx.changed() => {
+            // Send GOAWAY (H2) / signal end-of-keepalive (H1) and wait for
+            // in-flight requests to complete on this connection. Continuing
+            // to poll the connection lets streams finish before the connection
+            // future resolves.
+            conn.as_mut().graceful_shutdown();
+            conn.as_mut().await
+        }
+    };
+
+    if let Err(e) = result {
         let err_string = e.to_string();
         if is_client_disconnect_error(&err_string) {
             debug!(
@@ -2537,12 +3413,16 @@ async fn handle_websocket_request_authenticated(
     ctx: RequestContext,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     plugin_execution_ns: u64,
+    epoch: Arc<RequestEpoch>,
     upstream_target: Option<Arc<UpstreamTarget>>,
+    upstream_balancer: Option<Arc<LoadBalancer>>,
     lb_hash_key: Option<String>,
     sticky_cookie_needed: bool,
     start_time: Instant,
     is_h2_websocket: bool,
     is_tls: bool,
+    cb_is_half_open_probe: bool,
+    requires_ws_frame_hooks: bool,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -2645,12 +3525,34 @@ async fn handle_websocket_request_authenticated(
         {
             Ok(stream) => break stream,
             Err(e) => {
-                let ws_error_class = retry::classify_boxed_error(e.as_ref());
+                // `connect_websocket_backend` covers more than TCP+TLS setup:
+                // `connect_async_tls_with_config` ALSO sends the WebSocket
+                // upgrade request and reads the backend's response. A failure
+                // here can be either pre-wire (DNS / TCP connect / TLS
+                // handshake — request bytes never crossed) or post-wire (the
+                // backend received the upgrade request and rejected it with a
+                // protocol error / non-101 response). Use the setup-phase
+                // classifier so handshake-time rustls errors stay pre-wire
+                // (`TlsError`), then gate the retry decision and the
+                // circuit-breaker connect-flag on the unified
+                // `request_reached_wire` boundary so genuinely post-wire
+                // failures (ProtocolError, RequestError surfaced from
+                // tungstenite::Error::Http / Protocol) do NOT replay under
+                // `retry_on_connect_failure` and do NOT charge passive
+                // health as a connect-class failure.
+                let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
                 let is_ws_dns_error = ws_error_class == retry::ErrorClass::DnsLookupError;
+                let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
 
-                // Check if we should retry this connection failure
+                // Retry only on PRE-WIRE failures (DNS / TCP refused / TLS
+                // handshake / port exhaustion). A backend that got the
+                // upgrade request and chose to reject it must not be
+                // retried under retry_on_connect_failure — that bypasses
+                // retry_on_methods and would also lie in transaction logs.
                 let should_retry_ws = if let Some(retry_config) = &proxy.retry {
-                    ws_attempt < retry_config.max_retries && retry_config.retry_on_connect_failure
+                    ws_attempt < retry_config.max_retries
+                        && retry_config.retry_on_connect_failure
+                        && ws_is_pre_wire
                 } else {
                     false
                 };
@@ -2671,7 +3573,16 @@ async fn handle_websocket_request_authenticated(
                         }
                     };
 
-                    // Record circuit breaker failure for current target
+                    // Record circuit breaker failure for current target.
+                    // The second argument is the "is_connect_error" flag
+                    // that drives passive-health connect-class accounting
+                    // — pass `ws_is_pre_wire` so a backend-side upgrade
+                    // rejection (post-wire) doesn't charge the breaker as
+                    // a connect failure. (We're inside the
+                    // `should_retry_ws` branch so `ws_is_pre_wire == true`
+                    // here by construction, but using the same predicate
+                    // value keeps the invariant readable and survives a
+                    // future refactor that moves this block.)
                     if let Some(cb_config) = &proxy.circuit_breaker {
                         let cb_key = current_target
                             .as_ref()
@@ -2681,7 +3592,7 @@ async fn handle_websocket_request_authenticated(
                             cb_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, true);
+                        cb.record_failure(502, ws_is_pre_wire, cb_is_half_open_probe);
                     }
 
                     let delay = retry::retry_delay(retry_config, ws_attempt);
@@ -2692,7 +3603,8 @@ async fn handle_websocket_request_authenticated(
                     if let (Some(upstream_id), Some(prev_target)) =
                         (&proxy.upstream_id, &current_target)
                         && let Some(ref hash_key) = lb_hash_key
-                        && let Some(next) = state.load_balancer_cache.select_next_target(
+                        && let Some(next) = LoadBalancerCache::select_next_target_from(
+                            &epoch.load_balancer,
                             upstream_id,
                             hash_key,
                             prev_target,
@@ -2727,11 +3639,17 @@ async fn handle_websocket_request_authenticated(
                     continue;
                 }
 
-                // No retry — return error
+                // No retry — return error. Use the unified
+                // `error_class_log_kind` so the `error_kind` field matches
+                // the per-protocol log labels emitted everywhere else
+                // (operators grep one set of strings); a backend that
+                // rejected the upgrade will now log
+                // `error_kind=protocol_error` or `request_error` rather
+                // than the misleading hardcoded `connect_failure`.
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %current_backend_url,
-                    error_kind = "connect_failure",
+                    error_kind = retry::error_class_log_kind(ws_error_class),
                     error_class = %ws_error_class,
                     error = %e,
                     "WebSocket backend connection failed"
@@ -2766,8 +3684,8 @@ async fn handle_websocket_request_authenticated(
                             consumer_username: ctx.effective_identity().map(str::to_owned),
                             http_method: ws_err_method.to_string(),
                             request_path: ctx.path.clone(),
-                            matched_proxy_id: Some(proxy.id.clone()),
-                            matched_proxy_name: proxy.name.clone(),
+                            proxy_id: Some(proxy.id.clone()),
+                            proxy_name: proxy.name.clone(),
                             backend_target_url: Some(
                                 strip_query_params(&current_backend_url).to_string(),
                             ),
@@ -2797,6 +3715,9 @@ async fn handle_websocket_request_authenticated(
             }
         }
     };
+
+    let ws_lb_guard =
+        LoadBalancerConnectionGuard::new(current_target.clone(), upstream_balancer.clone());
 
     // Backend verified — record status and log.
     // HTTP/2 Extended CONNECT returns 200 OK; HTTP/1.1 returns 101 Switching Protocols.
@@ -2832,8 +3753,8 @@ async fn handle_websocket_request_authenticated(
         consumer_username: ctx.effective_identity().map(str::to_owned),
         http_method: ws_method.to_string(),
         request_path: ctx.path.clone(),
-        matched_proxy_id: Some(proxy.id.clone()),
-        matched_proxy_name: proxy.name.clone(),
+        proxy_id: Some(proxy.id.clone()),
+        proxy_name: proxy.name.clone(),
         backend_target_url: Some(strip_query_params(&current_backend_url).to_string()),
         backend_resolved_ip: ws_resolved_ip,
         response_status_code: ws_status_code,
@@ -2864,13 +3785,12 @@ async fn handle_websocket_request_authenticated(
             .header("connection", "upgrade")
             .header(
                 "sec-websocket-accept",
-                derive_accept_key(
+                ws_accept_from_key(
                     parts
                         .headers
                         .get("sec-websocket-key")
                         .and_then(|k| k.to_str().ok())
-                        .unwrap_or("")
-                        .as_bytes(),
+                        .unwrap_or(""),
                 ),
             )
     };
@@ -2879,9 +3799,10 @@ async fn handle_websocket_request_authenticated(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
-        let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+        let strategy =
+            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id);
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()
@@ -2896,28 +3817,22 @@ async fn handle_websocket_request_authenticated(
         .body(ProxyBody::empty())
         .unwrap_or_else(|_| Response::new(ProxyBody::empty()));
 
-    // Collect plugins that opted into per-frame WebSocket hooks.
-    // The pre-computed flag avoids iterating the plugin list when no plugin opted in.
-    let all_ws_plugins = if state.plugin_cache.requires_ws_frame_hooks(&proxy.id) {
-        state
-            .plugin_cache
-            .get_plugins_for_protocol(&proxy.id, ProxyProtocol::WebSocket)
+    // Collect plugins that opted into per-frame WebSocket hooks. `plugins`
+    // was resolved from the request's plugin-cache snapshot, so the upgrade
+    // path does not reload the cache and risk mixing generations.
+    let ws_frame_plugins: Vec<Arc<dyn Plugin>> = if requires_ws_frame_hooks {
+        plugins
+            .iter()
+            .filter(|p| p.requires_ws_frame_hooks())
+            .cloned()
+            .collect()
     } else {
-        // Even when no frame hooks are needed, we still need to check for
-        // disconnect hooks — those live on the same WebSocket protocol list.
-        state
-            .plugin_cache
-            .get_plugins_for_protocol(&proxy.id, ProxyProtocol::WebSocket)
+        Vec::new()
     };
-    let ws_frame_plugins: Vec<Arc<dyn Plugin>> = all_ws_plugins
-        .iter()
-        .filter(|p| p.requires_ws_frame_hooks())
-        .cloned()
-        .collect();
     // Collect disconnect-hook plugins separately. These fire exactly once at
     // session end instead of per-frame, so keeping them in their own list
     // avoids the per-frame filter cost paid by the frame-hook path.
-    let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> = all_ws_plugins
+    let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> = plugins
         .iter()
         .filter(|p| p.requires_ws_disconnect_hooks())
         .cloned()
@@ -2930,6 +3845,26 @@ async fn handle_websocket_request_authenticated(
     let ws_write_buf = state.websocket_write_buffer_size;
     let ws_tunnel = state.websocket_tunnel_mode;
     let adaptive_buf = state.adaptive_buffer.clone();
+    // Track the upgraded WebSocket session in `OverloadState.active_connections`
+    // so graceful drain waits for in-flight WS sessions before exiting.
+    //
+    // Why a fresh `ConnectionGuard` rather than reusing the request-side guard:
+    //   - The originating HTTP request's `RequestGuard` is attached to the
+    //     `ProxyBody::empty()` returned upstream (see `handle_proxy_request`).
+    //     Hyper finishes flushing that empty body the moment the 101/200 is
+    //     written, dropping the `RequestGuard` immediately. The HTTP request is
+    //     genuinely complete at that point — its accounting should release.
+    //   - The outer per-connection `_conn_guard` (created in the accept loop in
+    //     `proxy_listener` / `handle_tls_connection`) covers the underlying TCP
+    //     connection only until `serve_connection_with_upgrades` returns, which
+    //     happens shortly after `OnUpgrade` hands off the I/O. The WS session
+    //     lifetime extends well beyond the HTTP layer's view of the connection.
+    //   - A WebSocket session is functionally a long-lived "connection" (one
+    //     persistent client peer using the frontend's connection slot), so
+    //     `ConnectionGuard` is the semantically correct counter.
+    //
+    // Captured by the spawned task below so it lives until the WS session ends.
+    let ws_session_guard = crate::overload::ConnectionGuard::new(&state.overload);
     // Capture session metadata while the originating RequestContext + proxy are
     // still in scope. Passed to run_websocket_proxy so it can construct a
     // WsDisconnectContext at teardown for plugins that opted in to
@@ -2957,6 +3892,11 @@ async fn handle_websocket_request_authenticated(
         session_start: chrono::Utc::now(),
     };
     tokio::spawn(async move {
+        let _ws_lb_guard = ws_lb_guard;
+        // Hold the connection guard for the full WS session lifetime. Drops on
+        // every exit path (upgrade failure, run_websocket_proxy completion or
+        // error), decrementing `active_connections` exactly once.
+        let _ws_session_guard = ws_session_guard;
         match on_upgrade.await {
             Ok(upgraded) => {
                 if let Err(e) = run_websocket_proxy(
@@ -4148,6 +5088,12 @@ async fn run_accept_loop(
 
                         let state = state.clone();
                         let tls_config = tls_config.clone();
+                        // Each connection gets its own subscriber so that
+                        // shutdown can interrupt the per-connection serve
+                        // future (sending GOAWAY on H2 / closing keepalive
+                        // on H1) instead of letting it sit idle until the
+                        // drain timeout fires.
+                        let conn_shutdown_rx = shutdown_rx.clone();
 
                         tokio::spawn(async move {
                             // Hold the permit for the connection lifetime.
@@ -4159,9 +5105,17 @@ async fn run_accept_loop(
                             let _conn_guard = crate::overload::ConnectionGuard::new(&state.overload);
 
                             let result = if let Some(tls_config) = tls_config {
-                                handle_tls_connection(stream, remote_addr, state, tls_config).await
+                                handle_tls_connection(
+                                    stream,
+                                    remote_addr,
+                                    state,
+                                    tls_config,
+                                    conn_shutdown_rx,
+                                )
+                                .await
                             } else {
-                                handle_connection(stream, remote_addr, state).await
+                                handle_connection(stream, remote_addr, state, conn_shutdown_rx)
+                                    .await
                             };
 
                             if let Err(e) = result {
@@ -4183,11 +5137,16 @@ async fn run_accept_loop(
 }
 
 /// Handle TLS connections with HTTP/1.1 and HTTP/2 auto-negotiation via ALPN.
+///
+/// On shutdown, calls `graceful_shutdown()` on the hyper connection so that
+/// HTTP/2 clients receive a GOAWAY frame and HTTP/1.1 keepalive connections
+/// stop accepting new requests. See [`handle_connection`] for rationale.
 async fn handle_tls_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
     state: ProxyState,
     tls_config: Arc<rustls::ServerConfig>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_rustls::TlsAcceptor;
 
@@ -4195,16 +5154,14 @@ async fn handle_tls_connection(
     set_tcp_keepalive(&stream);
 
     let acceptor = TlsAcceptor::from(tls_config);
-    let tls_stream = match acceptor.accept(stream).await {
-        Ok(stream) => {
-            info!("TLS connection established from {}", remote_addr.ip());
-            stream
-        }
-        Err(e) => {
-            warn!("TLS handshake failed from {}: {}", remote_addr.ip(), e);
-            return Err(e.into());
-        }
-    };
+    let tls_stream = crate::tls::accept_with_optional_timeout(
+        &acceptor,
+        stream,
+        state.env_config.frontend_tls_handshake_timeout_seconds,
+        &remote_addr,
+    )
+    .await?;
+    info!("TLS connection established from {}", remote_addr.ip());
 
     // Extract peer certificate and chain before wrapping the stream.
     // This is the only point where the ServerConnection is accessible — once
@@ -4229,6 +5186,7 @@ async fn handle_tls_connection(
     {
         let mut http1 = builder.http1();
         http1.max_buf_size(state.max_header_size_bytes);
+        http1.writev(true);
         // Slowloris protection: close connections that take too long to send headers.
         if state.env_config.http_header_read_timeout_seconds > 0 {
             http1.timer(hyper_util::rt::TokioTimer::new());
@@ -4267,7 +5225,22 @@ async fn handle_tls_connection(
         let chain = client_cert_chain_der.clone();
         async move { handle_proxy_request(req, state, addr, true, cert, chain).await }
     });
-    if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
+
+    let conn = builder.serve_connection_with_upgrades(io, svc);
+    tokio::pin!(conn);
+
+    let result = tokio::select! {
+        biased;
+        res = conn.as_mut() => res,
+        _ = shutdown_rx.changed() => {
+            // Send GOAWAY (H2) / signal end-of-keepalive (H1) and wait for
+            // in-flight requests to complete on this connection.
+            conn.as_mut().graceful_shutdown();
+            conn.as_mut().await
+        }
+    };
+
+    if let Err(e) = result {
         let err_string = e.to_string();
         if is_client_disconnect_error(&err_string) {
             debug!(
@@ -4339,8 +5312,8 @@ pub async fn log_rejected_request(
         consumer_username: ctx.effective_identity().map(str::to_owned),
         http_method: ctx.method.clone(),
         request_path: ctx.path.clone(),
-        matched_proxy_id: proxy.map(|p| p.id.clone()),
-        matched_proxy_name: proxy.and_then(|p| p.name.clone()),
+        proxy_id: proxy.map(|p| p.id.clone()),
+        proxy_name: proxy.and_then(|p| p.name.clone()),
         backend_target_url: proxy.map(|p| {
             // Host-only proxies (listen_path None) have no prefix to strip.
             let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
@@ -4721,11 +5694,14 @@ pub async fn handle_proxy_request(
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     // Global request admission control. Single atomic load (~1ns) on the fast
     // path. Rejects with 503 when request pressure exceeds the critical
-    // threshold (FERRUM_MAX_REQUESTS + FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD).
+    // threshold (FERRUM_MAX_REQUESTS + FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD)
+    // OR when shutdown drain has begun (set by `overload::begin_drain` via
+    // Release; loaded here with Acquire to synchronize-with that store and
+    // also reject new H2/H3 streams on existing connections during drain).
     if state
         .overload
         .reject_new_requests
-        .load(std::sync::atomic::Ordering::Relaxed)
+        .load(std::sync::atomic::Ordering::Acquire)
     {
         let is_grpc = grpc_proxy::is_grpc_request(&req);
         record_request(&state, 503);
@@ -4891,6 +5867,14 @@ async fn handle_proxy_request_inner(
         return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
     }
 
+    if let Some(error_body) =
+        check_host_authority_consistency(req.headers(), req.uri(), req.version())
+    {
+        warn!("Rejected request: {}", error_body);
+        record_request(&state, 400);
+        return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
+    }
+
     // Block TRACE method to prevent Cross-Site Tracing (XST) attacks.
     // TRACE echoes request headers (including cookies and auth tokens) in the
     // response body, which can be exploited to steal credentials.
@@ -4965,38 +5949,27 @@ async fn handle_proxy_request_inner(
     // full HashMap — only 2-3 targeted lookups on the raw HeaderMap.
     if !state.trusted_proxies.is_empty() {
         let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
-        if let Some(ref real_ip_header) = state.env_config.real_ip_header {
-            // real_ip_header is pre-lowercased at config load time — no allocation needed
-            let header_val = ctx.raw_header_get(real_ip_header.as_str());
-            if let Some(val) = header_val {
-                // Validate the direct connection is from a trusted proxy before
-                // trusting this header
-                if socket_addr.is_some_and(|ip| state.trusted_proxies.contains(&ip)) {
-                    let trimmed = val.trim();
-                    // Only allocate if the resolved IP differs from socket_ip
-                    if trimmed != socket_ip {
-                        ctx.client_ip = trimmed.to_owned();
-                    }
-                }
-                // else: untrusted proxy, keep socket_ip (already set in ctx)
-            } else if let Some(ref addr) = socket_addr {
-                ctx.client_ip = client_ip::resolve_client_ip_parsed(
-                    &socket_ip,
-                    addr,
-                    ctx.raw_header_get("x-forwarded-for"),
-                    &state.trusted_proxies,
-                );
-            }
-            // else: no header + unparseable socket_ip, keep socket_ip (already set in ctx)
-        } else if let Some(ref addr) = socket_addr {
-            ctx.client_ip = client_ip::resolve_client_ip_parsed(
+        if let Some(ref addr) = socket_addr {
+            let real_ip_header_val =
+                state
+                    .env_config
+                    .real_ip_header
+                    .as_ref()
+                    .and_then(|real_ip_header| {
+                        // real_ip_header is pre-lowercased at config load time — no allocation needed
+                        ctx.raw_header_get(real_ip_header.as_str())
+                    });
+            if let Some(resolved) = client_ip::resolve_forwarded_client_ip(
                 &socket_ip,
                 addr,
+                real_ip_header_val,
                 ctx.raw_header_get("x-forwarded-for"),
                 &state.trusted_proxies,
-            );
+            ) {
+                ctx.client_ip = resolved;
+            }
         }
-        // else: unparseable socket_ip with no real_ip_header, keep socket_ip (already set in ctx)
+        // else: unparseable socket_ip, keep socket_ip (already set in ctx)
     }
 
     // Per-IP concurrent request limiting. The guard auto-decrements on drop,
@@ -5034,23 +6007,33 @@ async fn handle_proxy_request_inner(
     // HTTP/1.1 uses the Host header; HTTP/2 uses the :authority pseudo-header
     // (exposed via req.uri().authority()). Strip port if present and lowercase.
     // Uses raw_header_get() to avoid materializing the full HashMap.
-    let request_host: Option<String> = ctx
+    let raw_host = ctx
         .raw_header_get("host")
-        .or_else(|| req.uri().authority().map(|a| a.as_str()))
-        .map(|h| {
-            let without_port = h.split(':').next().unwrap_or(h);
-            // Strip trailing dot from FQDN (e.g., "example.com." → "example.com").
-            // DNS treats "example.com." and "example.com" as identical, so routing
-            // must normalize to prevent host-matching bypasses.
-            let normalized = without_port.strip_suffix('.').unwrap_or(without_port);
-            normalized.to_lowercase()
-        });
+        .or_else(|| req.uri().authority().map(|a| a.as_str()));
+    let request_host: Option<String> = match raw_host {
+        Some(h) => match normalize_request_host_for_routing(h) {
+            Some(normalized) => Some(normalized),
+            None => {
+                warn!("Rejected request: malformed Host/authority value");
+                record_request(&state, 400);
+                return Ok(build_response(
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":"Request contains malformed Host or authority"}"#,
+                ));
+            }
+        },
+        None => None,
+    };
     let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
+    let epoch = state.request_epoch.load();
 
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
-    let route_match = state
-        .router_cache
-        .find_proxy(request_host.as_deref(), &path);
+    let route_match = state.router_cache.find_proxy_in_snapshot(
+        &epoch.route_table,
+        epoch.route_generation,
+        request_host.as_deref(),
+        &path,
+    );
 
     let (proxy, strip_len) = match route_match {
         Some(rm) => {
@@ -5165,15 +6148,16 @@ async fn handle_proxy_request_inner(
         return Ok(build_response_from_normalized_reject(reject));
     }
 
+    // Load plugin-cache values once for this request. Every plugin list,
+    // capability bitset, and buffering flag below is derived from the same
+    // cache generation without retaining the full cache across awaits.
+    let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);
+
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
-    let plugins = state
-        .plugin_cache
-        .get_plugins_for_protocol(&proxy.id, request_protocol);
+    let plugins = plugin_cache_view.plugins();
     // Pre-computed capability bitset and phase-specific plugin lists — avoids
     // per-request `iter().filter().collect()` and `iter().any()` scans.
-    let capabilities = state
-        .plugin_cache
-        .get_capabilities(&proxy.id, request_protocol);
+    let capabilities = plugin_cache_view.capabilities();
     let mut client_request_body = ClientRequestBody::Streaming(Box::new(req));
 
     // Accumulator for total wall-clock time spent inside plugin phase callbacks.
@@ -5226,18 +6210,76 @@ async fn handle_proxy_request_inner(
     // and on_request_received so plugin-less early rejects skip the work.
     ctx.materialize_query_params();
 
+    // Some auth plugins (e.g. `hmac_auth` with `require_digest=true`) verify
+    // request body integrity at authenticate time. Buffer the body before the
+    // auth phase runs so those plugins can read `ctx.request_body_bytes`.
+    let requires_body_before_authenticate = capabilities
+        .has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
+        && plugins.iter().any(|plugin| {
+            plugin.requires_request_body_before_authenticate()
+                && plugin.should_buffer_request_body(&ctx)
+        });
+
+    if requires_body_before_authenticate {
+        client_request_body = match client_request_body {
+            ClientRequestBody::Streaming(request) => {
+                match buffer_request_body_for_before_proxy(
+                    *request,
+                    &method,
+                    &ctx.headers,
+                    state.max_request_body_size_bytes,
+                )
+                .await
+                {
+                    Ok(buffered) => {
+                        if let ClientRequestBody::Buffered(body) = &buffered {
+                            // Auth plugins that need bytes (hmac_auth digest
+                            // verification) read `ctx.request_body_bytes`, so
+                            // always populate the binary-safe handle here.
+                            store_request_body_metadata(&mut ctx, body, true);
+                            ctx.request_bytes_observed
+                                .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                        }
+                        buffered
+                    }
+                    Err(RequestBodyBufferError::TooLarge) => {
+                        record_request(&state, 413);
+                        return Ok(build_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            r#"{"error":"Request body exceeds maximum size"}"#,
+                        ));
+                    }
+                    Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
+                        error!(
+                            proxy_id = %proxy.id,
+                            path = %ctx.path,
+                            error_kind = "client_disconnect",
+                            error = %error_message,
+                            "Client disconnected while buffering request body before authenticate"
+                        );
+                        record_request(&state, 499);
+                        return Ok(build_response(
+                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                            r#"{"error":"Client disconnected"}"#,
+                        ));
+                    }
+                }
+            }
+            already_buffered => already_buffered,
+        };
+    }
+
     // Authentication phase (pre-computed auth plugin list — zero allocation)
-    let auth_plugins = state
-        .plugin_cache
-        .get_auth_plugins(&proxy.id, request_protocol);
+    let auth_plugins = plugin_cache_view.auth_plugins();
 
     {
         let auth_phase_start = Instant::now();
+        let consumer_index = ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index));
         if let Some((status_code, body, headers)) = run_authentication_phase(
             proxy.auth_mode.clone(),
             &auth_plugins,
             &mut ctx,
-            &state.consumer_index,
+            &consumer_index,
         )
         .await
         {
@@ -5306,9 +6348,7 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
-    let maybe_requires_request_body_buffering = state
-        .plugin_cache
-        .requires_request_body_buffering(&proxy.id);
+    let maybe_requires_request_body_buffering = plugin_cache_view.requires_request_body_buffering();
     // should_buffer_request_body is request-time (takes &RequestContext), so it
     // must still iterate. But the config-time capability checks use the bitset.
     let requires_request_body_buffering = maybe_requires_request_body_buffering
@@ -5475,18 +6515,24 @@ async fn handle_proxy_request_inner(
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
-    // Resolve upstream target and hash key with a single ArcSwap load.
-    let selection =
-        backend_dispatch::select_upstream_target(&proxy, &state, &ctx.client_ip, proxy_headers);
+    // Resolve upstream target and hash key from the request epoch.
+    let selection = backend_dispatch::select_upstream_target(
+        &proxy,
+        &state,
+        &epoch,
+        &ctx.client_ip,
+        proxy_headers,
+    );
     let lb_hash_key = selection.lb_hash_key;
     let upstream_target = selection.target;
+    let upstream_balancer = selection.balancer;
     let upstream_is_fallback = selection.is_fallback;
     let sticky_cookie_needed = selection.sticky_cookie_needed;
 
     // Circuit breaker check — per-target when upstream is configured, per-proxy otherwise
-    let cb_target_key =
+    let (cb_target_key, cb_is_half_open_probe) =
         match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {
-            Ok(key) => key,
+            Ok(result) => result,
             Err(()) => {
                 let reject = finalize_reject_response_with_after_proxy_hooks(
                     &plugins,
@@ -5553,6 +6599,7 @@ async fn handle_proxy_request_inner(
                 ));
             }
         };
+        let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
         return handle_websocket_request_authenticated(
             request,
             state,
@@ -5561,12 +6608,16 @@ async fn handle_proxy_request_inner(
             ctx,
             plugins,
             plugin_execution_ns,
+            Arc::clone(&epoch),
             upstream_target,
+            upstream_balancer,
             lb_hash_key,
             sticky_cookie_needed,
             start_time,
             is_h2_ws,
             is_tls,
+            cb_is_half_open_probe,
+            requires_ws_frame_hooks,
         )
         .await;
     }
@@ -5617,9 +6668,7 @@ async fn handle_proxy_request_inner(
             &proxy,
             &plugins,
             &ctx,
-            state
-                .plugin_cache
-                .requires_response_body_buffering(&proxy.id),
+            plugin_cache_view.requires_response_body_buffering(),
         );
 
         // When plugins need request body access (e.g., protobuf validation),
@@ -5807,15 +6856,23 @@ async fn handle_proxy_request_inner(
             let mut grpc_current_cb_key = cb_target_key.clone();
 
             loop {
-                // Classify the error and determine if retryable
-                let is_connection_error = matches!(
-                    &grpc_result,
-                    Err(GrpcProxyError::BackendUnavailable(_))
-                        | Err(GrpcProxyError::BackendTimeout {
-                            kind: grpc_proxy::GrpcTimeoutKind::Connect,
-                            ..
-                        })
-                );
+                // Classify the error and determine if retryable. Narrow to
+                // the connect-class kinds via `is_connect_class()` so
+                // `retry_on_connect_failure` cannot replay non-idempotent
+                // gRPC POSTs after a `BackendRequest` failure (post-wire,
+                // emitted from `send_request().await` after the H2 stream
+                // has been opened — request bytes may already be on the
+                // wire). The wildcard `BackendUnavailable { .. }` matcher
+                // previously here let post-wire errors bypass
+                // `retry_on_methods`.
+                let is_connection_error = match &grpc_result {
+                    Err(GrpcProxyError::BackendUnavailable { kind, .. }) => kind.is_connect_class(),
+                    Err(GrpcProxyError::BackendTimeout {
+                        kind: grpc_proxy::GrpcTimeoutKind::Connect,
+                        ..
+                    }) => true,
+                    _ => false,
+                };
                 if grpc_attempt >= retry_config.max_retries
                     || !is_connection_error
                     || !retry_config.retry_on_connect_failure
@@ -5830,7 +6887,7 @@ async fn handle_proxy_request_inner(
                         grpc_current_cb_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true);
+                    cb.record_failure(502, true, cb_is_half_open_probe);
                 }
 
                 let delay = retry::retry_delay(retry_config, grpc_attempt);
@@ -5841,7 +6898,8 @@ async fn handle_proxy_request_inner(
                 if let (Some(upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &grpc_current_target)
                     && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = state.load_balancer_cache.select_next_target(
+                    && let Some(next) = LoadBalancerCache::select_next_target_from(
+                        &epoch.load_balancer,
                         upstream_id,
                         hash_key,
                         prev_target,
@@ -6010,8 +7068,8 @@ async fn handle_proxy_request_inner(
                         consumer_username: ctx.effective_identity().map(str::to_owned),
                         http_method: method,
                         request_path: path,
-                        matched_proxy_id: Some(proxy.id.clone()),
-                        matched_proxy_name: proxy.name.clone(),
+                        proxy_id: Some(proxy.id.clone()),
+                        proxy_name: proxy.name.clone(),
                         backend_target_url: Some(strip_query_params(&grpc_backend_url).to_string()),
                         backend_resolved_ip: grpc_resolved_ip,
                         response_status_code: final_status,
@@ -6081,15 +7139,33 @@ async fn handle_proxy_request_inner(
                 // naturally propagates the h2 error to the client.
 
                 // Stream H2 DATA frames on the gRPC streaming path.
+                //
+                // Wrap the backend body in `StripHopByHopTrailers` (via the
+                // `*_strip_hop_by_hop_trailers` helper) so RFC 9110 §7.6.1
+                // response-direction hop-by-hop names (`connection`,
+                // `keep-alive`, `proxy-authenticate`, `proxy-connection`,
+                // `te`, `trailer`, `transfer-encoding`, `upgrade`) cannot
+                // leak to the downstream client through TRAILERS frames.
+                // Without this filter, a misbehaving backend can punch a
+                // hole in the proxy boundary by emitting `proxy-authenticate`
+                // / `keep-alive` / `connection: close` in the trailer map —
+                // hyper's H2 trailer encoder rejects some hop-by-hop names
+                // at the frame layer but `proxy-authenticate`,
+                // `proxy-connection`, and `keep-alive` are not blocked.
+                // Mirrors the buffered-path strip in `grpc_proxy.rs` so the
+                // two response paths cannot drift.
                 let cl = response_headers
                     .get("content-length")
                     .and_then(|v| v.parse::<u64>().ok());
                 let body = if state.response_buffer_cutoff_bytes == 0
                     && state.max_response_body_size_bytes == 0
                 {
-                    crate::proxy::body::direct_streaming_h2_body(grpc_streaming.body, cl)
+                    crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
+                        grpc_streaming.body,
+                        cl,
+                    )
                 } else {
-                    crate::proxy::body::coalescing_h2_body(
+                    crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
                         cl,
                         state.h2_coalesce_target_bytes,
@@ -6312,8 +7388,8 @@ async fn handle_proxy_request_inner(
                         consumer_username: ctx.effective_identity().map(str::to_owned),
                         http_method: method,
                         request_path: path,
-                        matched_proxy_id: Some(proxy.id.clone()),
-                        matched_proxy_name: proxy.name.clone(),
+                        proxy_id: Some(proxy.id.clone()),
+                        proxy_name: proxy.name.clone(),
                         backend_target_url: Some(strip_query_params(&grpc_backend_url).to_string()),
                         backend_resolved_ip: grpc_resolved_ip,
                         response_status_code: response_status,
@@ -6338,9 +7414,13 @@ async fn handle_proxy_request_inner(
                     && let (Some(upstream_id), Some(target)) =
                         (&proxy.upstream_id, &upstream_target)
                 {
-                    let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+                    let strategy = LoadBalancerCache::get_hash_on_strategy_from(
+                        &epoch.load_balancer,
+                        upstream_id,
+                    );
                     if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-                        let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+                        let upstream =
+                            LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
                         let default_cc = crate::config::types::HashOnCookieConfig::default();
                         let cookie_config = upstream
                             .as_ref()
@@ -6387,7 +7467,7 @@ async fn handle_proxy_request_inner(
                     state.overload.record_port_exhaustion();
                 }
                 let (grpc_code, original_msg) = match &e {
-                    GrpcProxyError::BackendUnavailable(m) => {
+                    GrpcProxyError::BackendUnavailable { message: m, .. } => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
                     }
                     GrpcProxyError::BackendTimeout { message: m, .. } => {
@@ -6443,8 +7523,8 @@ async fn handle_proxy_request_inner(
                             consumer_username: ctx.effective_identity().map(str::to_owned),
                             http_method: ctx.method.clone(),
                             request_path: ctx.path.clone(),
-                            matched_proxy_id: proxy_ref.map(|p| p.id.clone()),
-                            matched_proxy_name: proxy_ref.and_then(|p| p.name.clone()),
+                            proxy_id: proxy_ref.map(|p| p.id.clone()),
+                            proxy_name: proxy_ref.and_then(|p| p.name.clone()),
                             backend_target_url: proxy_ref.map(|p| {
                                 let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
                                 let url = build_backend_url(p, &ctx.path, "", strip_len);
@@ -6493,19 +7573,19 @@ async fn handle_proxy_request_inner(
     let backend_start = Instant::now();
 
     // Track connection for least-connections load balancing
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-        state
-            .load_balancer_cache
-            .record_connection_start(upstream_id, target);
+    if let (Some(_upstream_id), Some(target), Some(balancer)) = (
+        &proxy.upstream_id,
+        &upstream_target,
+        upstream_balancer.as_ref(),
+    ) {
+        balancer.record_connection_start(target);
     }
 
     let should_stream = should_stream_response_body(
         &proxy,
         &plugins,
         &ctx,
-        state
-            .plugin_cache
-            .requires_response_body_buffering(&proxy.id),
+        plugin_cache_view.requires_response_body_buffering(),
     );
 
     // Determine if we can stream the request body to the backend without
@@ -6588,7 +7668,11 @@ async fn handle_proxy_request_inner(
                     current_cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(result.status_code, result.connection_error);
+                cb.record_failure(
+                    result.status_code,
+                    result.connection_error,
+                    cb_is_half_open_probe,
+                );
             }
 
             let delay = retry::retry_delay(retry_config, attempt);
@@ -6604,7 +7688,8 @@ async fn handle_proxy_request_inner(
             // same protocol.
             if let (Some(upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
                 && let Some(ref hash_key) = lb_hash_key
-                && let Some(next) = state.load_balancer_cache.select_next_target(
+                && let Some(next) = LoadBalancerCache::select_next_target_from(
+                    &epoch.load_balancer,
                     upstream_id,
                     hash_key,
                     prev_target,
@@ -6739,10 +7824,13 @@ async fn handle_proxy_request_inner(
     backend_dispatch::record_backend_outcome(
         &state,
         &proxy,
+        &epoch.load_balancer,
+        upstream_balancer.as_ref(),
         upstream_target.as_deref(),
         final_cb_target_key.as_deref(),
         response_status,
         backend_resp.connection_error,
+        cb_is_half_open_probe,
         backend_start.elapsed(),
     );
 
@@ -6934,8 +8022,8 @@ async fn handle_proxy_request_inner(
                 consumer_username: ctx.effective_identity().map(str::to_owned),
                 http_method: method,
                 request_path: path,
-                matched_proxy_id: Some(proxy.id.clone()),
-                matched_proxy_name: proxy.name.clone(),
+                proxy_id: Some(proxy.id.clone()),
+                proxy_name: proxy.name.clone(),
                 backend_target_url: Some(strip_query_params(&backend_url).to_string()),
                 backend_resolved_ip,
                 response_status_code: response_status,
@@ -6985,9 +8073,10 @@ async fn handle_proxy_request_inner(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
     {
-        let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+        let strategy =
+            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id);
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()
@@ -7057,12 +8146,32 @@ async fn handle_proxy_request_inner(
     // Connection: close is applied probabilistically (linear ramp from 0%
     // to 100%) rather than all-or-nothing. This smooths tail latency by
     // gradually shedding keepalive connections as load increases.
-    // Cost: draining check is one AtomicBool::load(Relaxed) ~1ns;
+    // `draining` uses Acquire to synchronize-with the Release-ordered store
+    // in `overload::begin_drain` so the close hint is observed promptly on
+    // weakly-ordered architectures (mirrors the PR #569 startup_ready pattern).
+    //
+    // We OR `disable_keepalive` (the binary pressure-mode flag) with
+    // `should_disable_keepalive_red()` (RED probabilistic shedding). Both
+    // signals must be honored: the binary flag is the authoritative
+    // "pressure-mode active" signal, while RED probability is a separate
+    // adaptive smoothing mechanism. They are independent `Relaxed` writes
+    // in the monitor loop, so a reader can transiently observe
+    // `disable_keepalive = true` while `red_drop_probability` still holds
+    // the prior cycle's value of 0 — and at the exact pressure threshold
+    // the linear ramp produces probability 0 even though `disable_keepalive`
+    // is set. Without the OR, those windows would skip Connection: close
+    // and defeat the purpose of the binary pressure-mode signal.
+    // Cost: draining check is one AtomicBool::load(Acquire) ~1ns (no-op on x86);
+    // disable_keepalive check is one AtomicBool::load(Relaxed) ~1ns;
     // RED check is one AtomicU32::load + one AtomicU64::load + one multiply ~3ns.
     if state
         .overload
         .draining
-        .load(std::sync::atomic::Ordering::Relaxed)
+        .load(std::sync::atomic::Ordering::Acquire)
+        || state
+            .overload
+            .disable_keepalive
+            .load(std::sync::atomic::Ordering::Relaxed)
         || state.overload.should_disable_keepalive_red()
     {
         resp_builder = resp_builder.header("connection", "close");
@@ -7080,64 +8189,23 @@ async fn handle_proxy_request_inner(
     // supplementary log with accurate backend_total_ms.
     // Default (false): streaming responses pass through with zero tracking overhead.
     let body = match response_body {
-        ResponseBody::Streaming(resp) if state.env_config.enable_streaming_latency_tracking => {
-            let cl = response_headers
-                .get("content-length")
-                .and_then(|v| v.parse::<u64>().ok());
-            // When size limits are configured and Content-Length is absent, apply
-            // size-limited streaming before latency tracking to prevent unbounded
-            // transfer for chunked/unknown-length responses.
-            let (tracked_body, metrics) = if state.max_response_body_size_bytes > 0 && cl.is_none()
-            {
-                ProxyBody::streaming_tracked_with_size_limit(
-                    resp,
-                    backend_start,
-                    state.max_response_body_size_bytes,
-                )
-            } else {
-                ProxyBody::streaming_tracked(resp, backend_start)
-            };
-
-            // Spawn a lightweight deferred task to log the final streaming latency.
-            // Wakes once after read_timeout + 5s buffer, reads one atomic, emits one log line.
-            // Skipped when read timeout is disabled (0) — no meaningful deadline to check.
-            if proxy.backend_read_timeout_ms > 0 {
-                let deferred_proxy_id = proxy.id.clone();
-                let deferred_backend_url = strip_query_params(&backend_url).to_string();
-                let read_timeout_ms = proxy.backend_read_timeout_ms;
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms + 5_000))
-                        .await;
-                    let completed = metrics.completed();
-                    let total_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
-                    if completed {
-                        debug!(
-                            proxy_id = %deferred_proxy_id,
-                            backend_url = %deferred_backend_url,
-                            backend_total_ms = total_ms,
-                            "Streaming response completed"
-                        );
-                    } else {
-                        warn!(
-                            proxy_id = %deferred_proxy_id,
-                            backend_url = %deferred_backend_url,
-                            backend_last_frame_ms = total_ms,
-                            "Streaming response incomplete (client disconnect or timeout)"
-                        );
-                    }
-                });
-            }
-
-            tracked_body
-        }
         ResponseBody::Streaming(resp) => {
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
+            // Build the base body from the shared protocol-agnostic builders
+            // first, THEN optionally wrap it in latency tracking via
+            // `into_tracked`. This guarantees the tracked path inherits the
+            // same coalescing / size-limit / fast-path behaviour as the
+            // default streaming path — we have one source of truth for body
+            // construction across the H1/H2-via-reqwest hot paths.
+            //
             // Fast path: skip coalescing when no plugins need body buffering,
             // no size limits apply, and response buffer cutoff is disabled.
             // This eliminates per-frame BytesMut buffering and branch overhead.
-            if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
+            let base = if state.response_buffer_cutoff_bytes == 0
+                && state.max_response_body_size_bytes == 0
+            {
                 crate::proxy::body::direct_streaming_body(resp, cl)
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 // No Content-Length — enforce size limit while streaming instead
@@ -7149,6 +8217,46 @@ async fn handle_proxy_request_inner(
                 )
             } else {
                 crate::proxy::body::coalescing_body(resp, cl)
+            };
+
+            if state.env_config.enable_streaming_latency_tracking {
+                let (tracked_body, metrics) = base.into_tracked(backend_start);
+
+                // Spawn a lightweight deferred task to log the final streaming latency.
+                // Wakes once after read_timeout + 5s buffer, reads one atomic, emits one log line.
+                // Skipped when read timeout is disabled (0) — no meaningful deadline to check.
+                if proxy.backend_read_timeout_ms > 0 {
+                    let deferred_proxy_id = proxy.id.clone();
+                    let deferred_backend_url = strip_query_params(&backend_url).to_string();
+                    let read_timeout_ms = proxy.backend_read_timeout_ms;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            read_timeout_ms + 5_000,
+                        ))
+                        .await;
+                        let completed = metrics.completed();
+                        let total_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
+                        if completed {
+                            debug!(
+                                proxy_id = %deferred_proxy_id,
+                                backend_url = %deferred_backend_url,
+                                backend_total_ms = total_ms,
+                                "Streaming response completed"
+                            );
+                        } else {
+                            warn!(
+                                proxy_id = %deferred_proxy_id,
+                                backend_url = %deferred_backend_url,
+                                backend_last_frame_ms = total_ms,
+                                "Streaming response incomplete (client disconnect or timeout)"
+                            );
+                        }
+                    });
+                }
+
+                tracked_body
+            } else {
+                base
             }
         }
         ResponseBody::StreamingH2(resp) => {
@@ -7447,7 +8555,11 @@ pub(crate) async fn proxy_to_backend_retry(
     }
 
     // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
-    // (canonical predicate in `proxy::headers`).
+    // (canonical predicate in `proxy::headers`). Also strip every header
+    // NAMED in the request's `Connection` field — see
+    // `parse_connection_listed_from_str_map` for the spec rationale and
+    // smuggling defence.
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -7460,6 +8572,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
@@ -7915,7 +9028,9 @@ async fn proxy_to_backend(
     }
 
     // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
-    // (canonical predicate in `proxy::headers`).
+    // (canonical predicate in `proxy::headers`). Also strip every header
+    // NAMED in the request's `Connection` field.
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -7928,6 +9043,7 @@ async fn proxy_to_backend(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
@@ -8498,10 +9614,16 @@ fn record_request(state: &ProxyState, status: u16) {
 /// **except** `Set-Cookie` (RFC 6265) which must be emitted as separate header
 /// lines. We store multiple Set-Cookie values separated by `\n` so they can be
 /// split back into individual headers when building the downstream response.
+///
+/// `connection_listed_strip` carries the lowercase names that the response's
+/// `Connection` header named as additional hop-by-hop headers (RFC 9110
+/// §7.6.1). These are removed in the same pass as the canonical
+/// response-direction strip predicate.
 fn collect_response_headers_generic<'a, I>(
     source_keys_len: usize,
     source: I,
     target: &mut HashMap<String, String>,
+    connection_listed_strip: &[http::header::HeaderName],
 ) where
     I: IntoIterator<Item = (&'a http::header::HeaderName, &'a http::header::HeaderValue)>,
 {
@@ -8511,6 +9633,12 @@ fn collect_response_headers_generic<'a, I>(
         // (canonical predicate in `proxy::headers`; response-direction set
         // differs from the request-direction set).
         if headers_mod::is_backend_response_strip_header(k.as_str()) {
+            continue;
+        }
+        // RFC 9110 §7.6.1: also strip every header NAMED in the response's
+        // `Connection` field. Linear scan is fine — the list is typically
+        // empty and bounded by realistic header counts.
+        if connection_listed_strip.iter().any(|n| n == k) {
             continue;
         }
         if let Ok(vs) = v.to_str() {
@@ -8536,7 +9664,8 @@ fn collect_response_headers(
     source: &reqwest::header::HeaderMap,
     target: &mut HashMap<String, String>,
 ) {
-    collect_response_headers_generic(source.keys_len(), source.iter(), target);
+    let listed = headers_mod::parse_connection_listed_headers(source);
+    collect_response_headers_generic(source.keys_len(), source.iter(), target, &listed);
 }
 
 /// Collect hyper response headers into a HashMap.
@@ -8545,7 +9674,8 @@ fn collect_response_headers(
 /// comma folding for other headers) but for `hyper::HeaderMap` instead of
 /// `reqwest::header::HeaderMap`. Used by the HTTP/2 multiplexing pool path.
 fn collect_hyper_response_headers(source: &hyper::HeaderMap, target: &mut HashMap<String, String>) {
-    collect_response_headers_generic(source.keys_len(), source.iter(), target);
+    let listed = headers_mod::parse_connection_listed_headers(source);
+    collect_response_headers_generic(source.keys_len(), source.iter(), target, &listed);
 }
 
 /// Trim optional whitespace (OWS: SP / HTAB) from both ends of a byte slice.
@@ -8560,6 +9690,192 @@ fn trim_ows(bytes: &[u8]) -> &[u8] {
         .rposition(|&b| b != b' ' && b != b'\t')
         .map_or(start, |i| i + 1);
     &bytes[start..end]
+}
+
+fn is_valid_reg_name(host: &str) -> bool {
+    // RFC 3986 reg-name minus comma. Comma is technically a sub-delim, but it
+    // is also the HTTP list separator (Content-Length, TE, etc.), so accepting
+    // it inside a hostname invites parser-differential mistakes between routing
+    // and any code that splits authority-derived strings on commas later.
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._%~!$&'()*+;=".contains(&b))
+}
+
+/// RFC 3986 IP-literal contents validator: accept IPv6address or IPvFuture
+/// inside `[...]`. Without this, `Host: []` and `Host: [not-an-ip]` would
+/// normalize to opaque strings and fall through to the catch-all routing
+/// tier — bypassing host-scoped routes for a malformed authority.
+fn is_valid_ip_literal_contents(content: &str) -> bool {
+    if content.is_empty() {
+        return false;
+    }
+    if content.parse::<std::net::Ipv6Addr>().is_ok() {
+        return true;
+    }
+    // IPvFuture = "v" 1*HEXDIG "." 1*( unreserved / sub-delims / ":" )
+    //
+    // Note: this validator accepts comma in the `addr` segment because RFC 3986
+    // lists comma as a sub-delim. `is_valid_reg_name` rejects comma instead, to
+    // avoid the HTTP list-separator parser-differential. The asymmetry is
+    // intentional and safe here because IPvFuture content is always wrapped in
+    // `[...]` — downstream code that splits an authority string on commas will
+    // treat the bracketed segment as opaque, so a comma inside cannot be
+    // smuggled out as a second list element the way it could in a bare host.
+    let rest = match content.as_bytes().first() {
+        Some(b'v') | Some(b'V') => &content[1..],
+        _ => return false,
+    };
+    let Some((hex, addr)) = rest.split_once('.') else {
+        return false;
+    };
+    !hex.is_empty()
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        && !addr.is_empty()
+        && addr
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:".contains(&b))
+}
+
+/// Validate an authority port suffix: ASCII digits only and within `u16` range.
+///
+/// Without the range check, values like `host:9999999999` parse as a valid
+/// authority because the only previous gate was `is_ascii_digit()`. The TCP
+/// port space is `0..=65535`; anything larger is broken-client territory and
+/// should be rejected at admission so it never reaches routing or backend
+/// dispatch where the same string would be re-parsed and fail with a
+/// less-specific error.
+fn is_valid_port(port: &str) -> bool {
+    !port.is_empty() && port.parse::<u16>().is_ok()
+}
+
+fn split_request_authority(value: &str) -> Option<(&str, Option<&str>)> {
+    let value = value.trim();
+    if value.is_empty() || value.contains('@') {
+        return None;
+    }
+
+    if value.starts_with('[') {
+        let end = value.find(']')?;
+        // Reject brackets that don't enclose a valid IPv6address/IPvFuture.
+        // RFC 3986 §3.2.2: bracketed authorities exist solely to disambiguate
+        // IP-literal hosts from port colons; opaque content like `[]` or
+        // `[not-an-ip]` is malformed authority syntax.
+        if !is_valid_ip_literal_contents(&value[1..end]) {
+            return None;
+        }
+        let host = &value[..=end];
+        let suffix = &value[end + 1..];
+        if suffix.is_empty() {
+            return Some((host, None));
+        }
+        if let Some(port) = suffix.strip_prefix(':')
+            && is_valid_port(port)
+        {
+            return Some((host, Some(port)));
+        }
+        return None;
+    }
+
+    match value.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => {
+            if is_valid_reg_name(host) && is_valid_port(port) {
+                Some((host, Some(port)))
+            } else {
+                None
+            }
+        }
+        Some(_) => None,
+        None => {
+            if is_valid_reg_name(value) {
+                Some((value, None))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn normalize_authority_host(host: &str) -> String {
+    let normalized = host.strip_suffix('.').unwrap_or(host);
+    normalized.to_ascii_lowercase()
+}
+
+/// Normalize a Host/authority value for host-based routing.
+///
+/// This removes a valid port suffix, preserves bracketed IPv6 literals, strips
+/// DNS trailing dots, and lowercases ASCII hostnames. Invalid authority syntax
+/// returns `None` so callers can avoid routing on ambiguous host data.
+pub fn normalize_request_host_for_routing(value: &str) -> Option<String> {
+    split_request_authority(value)
+        .map(|(host, _)| normalize_authority_host(host))
+        .filter(|h| !h.is_empty())
+}
+
+fn default_port_for_scheme(scheme: Option<&str>) -> Option<&'static str> {
+    match scheme {
+        Some("http" | "ws") => Some("80"),
+        Some("https" | "wss") => Some("443"),
+        _ => None,
+    }
+}
+
+fn normalize_authority_for_consistency(value: &str, scheme: Option<&str>) -> Option<String> {
+    split_request_authority(value).map(|(host, port)| {
+        if let Some(port) = port
+            && Some(port) != default_port_for_scheme(scheme)
+        {
+            let mut normalized = normalize_authority_host(host);
+            normalized.push(':');
+            normalized.push_str(port);
+            return normalized;
+        }
+        normalize_authority_host(host)
+    })
+}
+
+/// Validate HTTP/2 and HTTP/3 `Host`/`:authority` consistency before routing.
+///
+/// RFC 9113 states that `Host` and `:authority` are not permitted to disagree;
+/// RFC 9114 says that if both are present, they must contain the same value.
+/// Rejecting disagreement here prevents routing/plugin decisions from keying on
+/// one authority while a backend sees another during H2/H3-to-H1 translation.
+pub fn check_host_authority_consistency(
+    headers: &hyper::HeaderMap,
+    uri: &hyper::Uri,
+    version: hyper::Version,
+) -> Option<&'static str> {
+    if version != hyper::Version::HTTP_2 && version != hyper::Version::HTTP_3 {
+        return None;
+    }
+
+    let mut host_values = headers.get_all("host").iter();
+    let host = host_values.next();
+    if host_values.next().is_some() {
+        return Some(r#"{"error":"Request contains multiple Host headers"}"#);
+    }
+
+    let host = host?;
+    let Ok(host) = host.to_str() else {
+        return Some(r#"{"error":"Host header contains invalid characters"}"#);
+    };
+    let scheme = uri.scheme_str();
+    let Some(host) = normalize_authority_for_consistency(host, scheme) else {
+        return Some(r#"{"error":"Host header contains invalid authority"}"#);
+    };
+
+    if let Some(authority) = uri.authority() {
+        let Some(authority) = normalize_authority_for_consistency(authority.as_str(), scheme)
+        else {
+            return Some(r#"{"error":"Request authority contains invalid authority"}"#);
+        };
+        if host != authority {
+            return Some(r#"{"error":"Host header and request authority disagree"}"#);
+        }
+    }
+
+    None
 }
 
 /// Validate protocol-level header constraints to block smuggling and desync attacks.
@@ -8580,9 +9896,10 @@ fn trim_ows(bytes: &[u8]) -> &[u8] {
 ///    duplicate Host headers MUST be rejected with 400 to prevent host-header routing
 ///    confusion between the proxy and backend.
 ///
-/// 4. **TE header validation** (HTTP/2 only): RFC 9113 §8.2.2 — the only permitted
-///    value is "trailers"; any other value is a protocol violation that could be used
-///    to confuse HTTP/2-unaware intermediaries.
+/// 4. **TE header validation** (HTTP/2 and HTTP/3): RFC 9113 §8.2.2 and RFC 9114 §4.2 —
+///    the only permitted value is "trailers"; any other value (or an empty list element
+///    such as `,trailers` / `trailers,`) is a protocol violation that could be used to
+///    confuse intermediaries that translate H2/H3 to HTTP/1.x.
 pub fn check_protocol_headers(
     headers: &hyper::HeaderMap,
     version: hyper::Version,
@@ -8619,7 +9936,9 @@ pub fn check_protocol_headers(
             for token in val.as_bytes().split(|&b| b == b',') {
                 let trimmed = trim_ows(token);
                 if trimmed.is_empty() {
-                    continue;
+                    return Some(
+                        r#"{"error":"Content-Length header contains invalid empty value"}"#,
+                    );
                 }
                 // 2a. Must be ASCII digits only (no signs, decimals, hex, or garbage)
                 if !trimmed.iter().all(|&b| b.is_ascii_digit()) {
@@ -8660,10 +9979,15 @@ pub fn check_protocol_headers(
             if let Ok(te_str) = te_val.to_str() {
                 for token in te_str.split(',') {
                     let trimmed = token.trim();
-                    if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("trailers") {
+                    if trimmed.is_empty() {
+                        return Some(r#"{"error":"TE header contains invalid empty value"}"#);
+                    }
+                    if !trimmed.eq_ignore_ascii_case("trailers") {
                         return Some(r#"{"error":"TE header must be 'trailers' or absent"}"#);
                     }
                 }
+            } else {
+                return Some(r#"{"error":"TE header contains invalid characters"}"#);
             }
         }
     }
@@ -8768,6 +10092,7 @@ async fn proxy_to_backend_http2(
     // Clear and rebuild headers from the plugin-processed headers map
     parts.headers.clear();
     let effective_host = &proxy.backend_host;
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -8786,6 +10111,9 @@ async fn proxy_to_backend_http2(
             // value risked an authoritative-size mismatch with the framed
             // body when a request_transformer plugin mutated the body.
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            // RFC 9110 §7.6.1: also strip every header NAMED in the
+            // request's `Connection` field — see `parse_connection_listed_from_str_map`.
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 if let (Ok(name), Ok(val)) = (
                     hyper::header::HeaderName::from_bytes(k.as_bytes()),
@@ -8932,9 +10260,16 @@ fn build_http3_backend_headers(
     content_length: Option<&str>,
 ) -> Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> {
     let mut http3_headers = Vec::with_capacity(headers.len() + 5);
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (name, value) in headers {
         match name.as_str() {
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            // RFC 9110 §7.6.1: also strip every header NAMED in the
+            // request's `Connection` field. Hyper rejects `Connection` on
+            // H2/H3 frames, but the materialised request map can carry it
+            // when the client used H1 — strip on the way out so the H3
+            // backend never sees the listed names.
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
             "host" => {
                 // Apply per-route `preserve_host_header` override on the
                 // first-attempt H3-native backend path. Mirrors
@@ -9157,6 +10492,7 @@ async fn proxy_to_backend_http3(
                                 Ok(body) => body,
                                 Err(e) => {
                                     let (error_kind, error_class) = classify_h3_error(&e);
+                                    record_port_exhaustion_if_class(&state.overload, error_class);
                                     // We have already received response headers and
                                     // started reading the body — the request was on
                                     // the wire and the backend already processed it.
@@ -9268,6 +10604,7 @@ async fn proxy_to_backend_http3(
                             // Trust the pool's typed signal.
                             let is_conn_error = !e.request_on_wire();
                             let (error_kind, error_class) = classify_h3_pool_error(&e);
+                            record_port_exhaustion_if_class(&state.overload, error_class);
                             error!(
                                 proxy_id = %proxy.id,
                                 backend_url = %backend_url,
@@ -9473,6 +10810,7 @@ async fn proxy_to_backend_http3(
                 // the error-class contribution here.
                 let is_conn_error = !e.request_on_wire();
                 let (error_kind, error_class) = classify_h3_pool_error(&e);
+                record_port_exhaustion_if_class(&state.overload, error_class);
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
@@ -9550,6 +10888,7 @@ async fn proxy_to_backend_http3(
                 // H3 branch above for why we drop the class contribution.
                 let is_conn_error = !e.request_on_wire();
                 let (error_kind, error_class) = classify_h3_pool_error(&e);
+                record_port_exhaustion_if_class(&state.overload, error_class);
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
@@ -9595,6 +10934,36 @@ async fn proxy_to_backend_http3(
 fn classify_h3_error(err: &(dyn std::error::Error + 'static)) -> (&'static str, retry::ErrorClass) {
     let class = crate::http3::client::classify_http3_error(err);
     (retry::error_class_log_kind(class), class)
+}
+
+/// Bump the `port_exhaustion_events` counter when `class` is
+/// [`retry::ErrorClass::PortExhaustion`].
+///
+/// Used by the native HTTP/3 dispatch sites (
+/// [`proxy_to_backend_http3`] / [`proxy_to_backend_http3_retry`] in this
+/// module, plus the H3 frontend → H3 backend fast paths in
+/// [`crate::http3::server`]) to bring the H3 native paths in line with
+/// the reqwest path ([`mod@crate::proxy`] line 8113-style sites), the
+/// gRPC pool, the H2 pool, the TCP backend connect, and the H3
+/// cross-protocol bridge — all of which already record port exhaustion
+/// when their per-protocol classifier returns `PortExhaustion`. Without
+/// this, `/overload.port_exhaustion_events` undercounts whenever a
+/// QUIC/H3 dispatch hits ephemeral-port exhaustion (typically
+/// EADDRNOTAVAIL on Linux, EADDRINUSE on macOS) at high RPS.
+///
+/// Returns `true` when the counter was bumped — used by unit tests to
+/// assert the wiring without re-creating a full H3 classification
+/// pipeline.
+pub(crate) fn record_port_exhaustion_if_class(
+    overload: &crate::overload::OverloadState,
+    class: retry::ErrorClass,
+) -> bool {
+    if matches!(class, retry::ErrorClass::PortExhaustion) {
+        overload.record_port_exhaustion();
+        true
+    } else {
+        false
+    }
 }
 
 /// Classifier overload for [`crate::http3::client::H3PoolError`] that
@@ -9662,6 +11031,7 @@ async fn proxy_to_backend_http3_retry(
     // Build HTTP/3 headers from the saved headers map
     let mut http3_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> =
         Vec::new();
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (name, value) in headers {
         match name.as_str() {
             // Hop-by-hop headers per RFC 9110 §7.6.1, plus content-length
@@ -9669,6 +11039,10 @@ async fn proxy_to_backend_http3_retry(
             // is informational and risks mismatch with body length when
             // a request_transformer plugin mutated the body).
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            // RFC 9110 §7.6.1 also requires stripping every header NAMED
+            // in the request's `Connection` field — see
+            // `parse_connection_listed_from_str_map`.
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
             "host" => {
                 // Use effective upstream host unless preserve_host_header is set
                 let host_value = if proxy.preserve_host_header {
@@ -9770,6 +11144,7 @@ async fn proxy_to_backend_http3_retry(
             // H3 branch above for why we drop the class contribution.
             let is_conn_error = !e.request_on_wire();
             let (error_kind, error_class) = classify_h3_pool_error(&e);
+            record_port_exhaustion_if_class(&state.overload, error_class);
             error!(
                 proxy_id = %proxy.id,
                 backend_url = %backend_url,
@@ -9828,6 +11203,99 @@ mod tests {
             }
         }))
         .expect("test proxy should deserialize")
+    }
+
+    fn route_delta_proxy(
+        id: &str,
+        dispatch_kind: DispatchKind,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Proxy {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.id = id.to_string();
+        proxy.dispatch_kind = dispatch_kind;
+        proxy.updated_at = updated_at;
+        proxy.created_at = updated_at;
+        if dispatch_kind.is_stream() {
+            proxy.backend_scheme = Some(BackendScheme::Tcp);
+            proxy.listen_path = None;
+            proxy.listen_port = Some(20_000);
+        } else {
+            proxy.backend_scheme = Some(BackendScheme::Http);
+            proxy.listen_path = Some(format!("/{id}"));
+            proxy.listen_port = None;
+        }
+        proxy
+    }
+
+    fn route_delta_config(proxies: Vec<Proxy>) -> GatewayConfig {
+        GatewayConfig {
+            proxies,
+            ..GatewayConfig::default()
+        }
+    }
+
+    #[test]
+    fn delta_routes_changed_ignores_stream_only_proxy_changes() {
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+
+        let old_config =
+            route_delta_config(vec![route_delta_proxy("tcp", DispatchKind::TcpRaw, t0)]);
+        let added_stream = route_delta_config(vec![
+            old_config.proxies[0].clone(),
+            route_delta_proxy("tcp-added", DispatchKind::TcpRaw, t1),
+        ]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &added_stream);
+        assert!(!ProxyState::delta_routes_changed(&delta, &old_config));
+
+        let mut modified_stream = old_config.proxies[0].clone();
+        modified_stream.backend_port = 9443;
+        modified_stream.updated_at = t1;
+        let modified_config = route_delta_config(vec![modified_stream]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &modified_config);
+        assert!(!ProxyState::delta_routes_changed(&delta, &old_config));
+
+        let removed_stream = route_delta_config(vec![]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &removed_stream);
+        assert!(!ProxyState::delta_routes_changed(&delta, &old_config));
+    }
+
+    #[test]
+    fn delta_routes_changed_detects_http_route_changes_and_transitions() {
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+
+        let empty_config = route_delta_config(vec![]);
+        let added_http =
+            route_delta_config(vec![route_delta_proxy("http", DispatchKind::HttpPool, t1)]);
+        let delta = crate::config_delta::ConfigDelta::compute(&empty_config, &added_http);
+        assert!(ProxyState::delta_routes_changed(&delta, &empty_config));
+
+        let old_http = route_delta_config(vec![route_delta_proxy(
+            "transition",
+            DispatchKind::HttpPool,
+            t0,
+        )]);
+        let new_stream = route_delta_config(vec![route_delta_proxy(
+            "transition",
+            DispatchKind::TcpRaw,
+            t1,
+        )]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_http, &new_stream);
+        assert!(ProxyState::delta_routes_changed(&delta, &old_http));
+
+        let old_stream = route_delta_config(vec![route_delta_proxy(
+            "transition",
+            DispatchKind::TcpRaw,
+            t0,
+        )]);
+        let new_http = route_delta_config(vec![route_delta_proxy(
+            "transition",
+            DispatchKind::HttpPool,
+            t1,
+        )]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_stream, &new_http);
+        assert!(ProxyState::delta_routes_changed(&delta, &old_stream));
     }
 
     #[test]
@@ -10227,6 +11695,98 @@ mod tests {
         );
     }
 
+    // ── `record_port_exhaustion_if_class` (H3 native paths) ─────────────
+    //
+    // The H3 native dispatcher (`proxy_to_backend_http3`,
+    // `proxy_to_backend_http3_retry`) and the H3 frontend → H3 backend
+    // fast path in `http3::server` were missing the `record_port_exhaustion`
+    // bump that every other backend dispatcher performs (reqwest path,
+    // gRPC pool, H2 pool, TCP backend connect, H3 cross-protocol bridge).
+    // Result: `/overload.port_exhaustion_events` undercounted any time
+    // an H3 frontend → H3 backend dispatch hit ephemeral-port exhaustion
+    // (e.g. EADDRNOTAVAIL on a high-RPS gateway with constrained
+    // `ip_local_port_range`). All eight H3 sites now funnel through this
+    // helper, so verifying the helper itself is sufficient regression
+    // protection: if a future H3 dispatch site forgets the call,
+    // `port_exhaustion_events` will silently undercount on that path —
+    // but the helper signature documents the contract.
+
+    #[test]
+    fn record_port_exhaustion_if_class_bumps_counter_only_for_port_exhaustion() {
+        let overload = crate::overload::OverloadState::new();
+        assert_eq!(
+            overload
+                .port_exhaustion_events
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "counter should start at 0"
+        );
+
+        // Synthetic H3 PortExhaustion outcome: the dispatch site obtains
+        // `ErrorClass::PortExhaustion` from the H3 classifier (e.g. via
+        // an EADDRNOTAVAIL surfaced as "bind: address not available")
+        // and hands it to this helper. The helper must bump the counter
+        // and return true.
+        let bumped =
+            super::record_port_exhaustion_if_class(&overload, retry::ErrorClass::PortExhaustion);
+        assert!(bumped, "PortExhaustion must bump the counter");
+        assert_eq!(
+            overload
+                .port_exhaustion_events
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        // Repeated bumps accumulate — every dispatch site that hits
+        // PortExhaustion contributes independently.
+        super::record_port_exhaustion_if_class(&overload, retry::ErrorClass::PortExhaustion);
+        super::record_port_exhaustion_if_class(&overload, retry::ErrorClass::PortExhaustion);
+        assert_eq!(
+            overload
+                .port_exhaustion_events
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+    }
+
+    #[test]
+    fn record_port_exhaustion_if_class_is_no_op_for_non_port_exhaustion() {
+        let overload = crate::overload::OverloadState::new();
+
+        // Every other class the H3 classifier can return — including the
+        // transport-class siblings that DO trigger `mark_h3_unsupported`
+        // — must NOT bump the port-exhaustion counter. The metric is
+        // narrow: only ephemeral-port exhaustion. Other transport
+        // failures have their own diagnostics (FD pressure, conn count,
+        // last_probe_error on the capability registry).
+        for class in [
+            retry::ErrorClass::ConnectionRefused,
+            retry::ErrorClass::ConnectionTimeout,
+            retry::ErrorClass::ConnectionReset,
+            retry::ErrorClass::ConnectionClosed,
+            retry::ErrorClass::TlsError,
+            retry::ErrorClass::ProtocolError,
+            retry::ErrorClass::DnsLookupError,
+            retry::ErrorClass::ConnectionPoolError,
+            retry::ErrorClass::ReadWriteTimeout,
+            retry::ErrorClass::ClientDisconnect,
+            retry::ErrorClass::RequestBodyTooLarge,
+            retry::ErrorClass::ResponseBodyTooLarge,
+            retry::ErrorClass::GracefulRemoteClose,
+            retry::ErrorClass::RequestError,
+        ] {
+            let bumped = super::record_port_exhaustion_if_class(&overload, class);
+            assert!(!bumped, "{class:?} must not bump port_exhaustion_events");
+        }
+        assert_eq!(
+            overload
+                .port_exhaustion_events
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "counter should remain 0 across non-PortExhaustion classes"
+        );
+    }
+
     // ── Fix 5: `should_bypass_h2_coalesce_for_large_response` ───────────
     // Validates the per-response decision that steers plain-HTTPS
     // direct-H2 responses away from `CoalescingH2Body` when the
@@ -10237,7 +11797,7 @@ mod tests {
         // 1 MiB response, no cap → bypass.
         assert!(super::should_bypass_h2_coalesce_for_large_response(
             Some(1_048_576),
-            0
+            0,
         ));
     }
 
@@ -10246,7 +11806,7 @@ mod tests {
         // Threshold is 512 KiB; exactly 512 KiB should qualify (>=, not >).
         assert!(super::should_bypass_h2_coalesce_for_large_response(
             Some(512 * 1024),
-            0
+            0,
         ));
     }
 
@@ -10255,12 +11815,12 @@ mod tests {
         // Under 512 KiB → coalescer still wins.
         assert!(!super::should_bypass_h2_coalesce_for_large_response(
             Some(64 * 1024),
-            0
+            0,
         ));
         // 256 KiB is still under threshold.
         assert!(!super::should_bypass_h2_coalesce_for_large_response(
             Some(256 * 1024),
-            0
+            0,
         ));
     }
 
@@ -10424,5 +11984,887 @@ mod tests {
              call to proxy_grpc_request_from_bytes; argument list was:\n{}",
             call_args
         );
+    }
+
+    // ----- Pool warmup partition + gating tests --------------------------
+    //
+    // These cover the dual optimization in `warmup_connection_pools`:
+    //   1. Phase-1 partitioning sends HTTP-only candidates to the parallel
+    //      warmup batch (which runs alongside the capability refresh) and
+    //      HTTPS candidates to the gated phase-2 batch.
+    //   2. Phase-2 gating skips reqwest HEADs for HTTPS targets the
+    //      capability registry has already classified as covered by the
+    //      direct HTTP/2 pool, while still warming `Unknown` /
+    //      `Unsupported` targets so the fallback pool is ready.
+
+    use super::backend_capabilities::{
+        BackendCapabilityRecord, BackendCapabilityRegistry, ProtocolSupport, capability_key,
+    };
+    use crate::config::types::{BackendScheme, DispatchKind, Upstream};
+
+    /// Build a minimal HTTPS proxy at `host:port`. The proxy carries the
+    /// default TLS config so it shares a capability key with the registry
+    /// fixtures below.
+    fn warmup_test_proxy(id: &str, scheme: BackendScheme, host: &str, port: u16) -> Proxy {
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "id": id,
+            "backend_host": host,
+            "backend_port": port,
+            "backend_scheme": match scheme {
+                BackendScheme::Http => "http",
+                BackendScheme::Https => "https",
+                _ => "https",
+            },
+            "listen_path": "/",
+        }))
+        .expect("warmup test proxy should deserialize");
+        proxy.dispatch_kind = DispatchKind::from(scheme);
+        proxy
+    }
+
+    fn upstream_with_targets(id: &str, targets: &[(&str, u16)]) -> Upstream {
+        let targets_json: Vec<_> = targets
+            .iter()
+            .map(|(host, port)| {
+                json!({
+                    "host": host,
+                    "port": port,
+                })
+            })
+            .collect();
+        serde_json::from_value(json!({
+            "id": id,
+            "name": id,
+            "algorithm": "round_robin",
+            "targets": targets_json,
+        }))
+        .expect("upstream should deserialize")
+    }
+
+    use crate::config::types::{BackoffStrategy, RetryConfig};
+
+    /// Empty maps for tests that only need one bucket populated.
+    fn empty_candidate_maps() -> (
+        HashMap<String, ReqwestWarmupCandidate>,
+        HashMap<String, ReqwestWarmupCandidate>,
+    ) {
+        (HashMap::new(), HashMap::new())
+    }
+
+    /// Synthesize a stand-in pool key for the test. Real production keys
+    /// come from `ConnectionPool::pool_key_for_warmup(proxy)` and embed
+    /// `(scheme, host, port, dns_override, ca, mtls_*, verify)`. For the
+    /// dedup contract these tests exercise, ANY string serves — same key
+    /// → dedupe, different key → separate candidate. Embedding the proxy
+    /// id by default makes tests where every proxy has a unique pool key
+    /// trivially correct, while tests that need shared keys can pass an
+    /// explicit string.
+    fn fake_pool_key(proxy_id: &str) -> String {
+        format!("test-pool-key|{proxy_id}")
+    }
+
+    #[test]
+    fn collect_partitions_http_and_https_proxies_into_separate_buckets() {
+        let http_proxy = warmup_test_proxy("h", BackendScheme::Http, "plain.test", 80);
+        let https_proxy = warmup_test_proxy("s", BackendScheme::Https, "secure.test", 443);
+
+        let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
+
+        collect_reqwest_warmup_candidates_for_proxy(
+            &http_proxy,
+            &fake_pool_key("h"),
+            true, // HTTP backends always force reqwest dispatch
+            &upstreams,
+            &mut http_candidates,
+            &mut https_candidates,
+        );
+        collect_reqwest_warmup_candidates_for_proxy(
+            &https_proxy,
+            &fake_pool_key("s"),
+            false,
+            &upstreams,
+            &mut http_candidates,
+            &mut https_candidates,
+        );
+
+        assert_eq!(http_candidates.len(), 1);
+        let http = http_candidates.values().next().unwrap();
+        assert_eq!(http.host, "plain.test");
+        assert_eq!(http.port, 80);
+        assert_eq!(http.scheme, "http");
+        assert!(
+            http.requires_reqwest_warmup,
+            "HTTP candidates always require reqwest warmup"
+        );
+
+        assert_eq!(https_candidates.len(), 1);
+        let https = https_candidates.values().next().unwrap();
+        assert_eq!(https.host, "secure.test");
+        assert_eq!(https.port, 443);
+        assert_eq!(https.scheme, "https");
+        assert!(
+            !https.requires_reqwest_warmup,
+            "forces_reqwest=false should leave the flag clear"
+        );
+    }
+
+    #[test]
+    fn collect_dedupes_repeated_targets_when_pool_keys_match() {
+        // Two HTTPS proxies pointing at the same backend host:port AND
+        // with identical TLS configs (same pool_key). They share the same
+        // `reqwest::Client` at runtime, so one warmup HEAD covers both.
+        let proxy_a = warmup_test_proxy("a", BackendScheme::Https, "shared.test", 443);
+        let proxy_b = warmup_test_proxy("b", BackendScheme::Https, "shared.test", 443);
+        let shared_pool_key = "test-pool-key|shared-tls";
+
+        let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
+
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy_a,
+            shared_pool_key,
+            false,
+            &upstreams,
+            &mut http_candidates,
+            &mut https_candidates,
+        );
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy_b,
+            shared_pool_key,
+            false,
+            &upstreams,
+            &mut http_candidates,
+            &mut https_candidates,
+        );
+
+        assert!(
+            http_candidates.is_empty(),
+            "no HTTP candidates expected for HTTPS-only fixtures"
+        );
+        assert_eq!(
+            https_candidates.len(),
+            1,
+            "two HTTPS proxies sharing a pool key + target should dedupe to one warmup task"
+        );
+    }
+
+    #[test]
+    fn collect_keeps_separate_candidates_when_pool_keys_differ_for_same_target() {
+        // TLS-aware dedup regression guard: two HTTPS proxies with the
+        // same backend host:port but DIFFERENT TLS configs (different CA
+        // bundle, different mTLS cert, different DNS override, …) end
+        // up with separate `reqwest::Client`s in the connection pool.
+        // Each client needs its own warmup HEAD or the un-warmed one
+        // pays a cold connect on its first real request despite warmup
+        // being enabled.
+        //
+        // The previous `(scheme, host, port)`-only dedup would have
+        // collapsed these two onto a single candidate, leaving one
+        // client cold. Composing the connection pool's TLS-aware
+        // pool_key into the dedup key fixes that.
+        let proxy_a = warmup_test_proxy("a", BackendScheme::Https, "shared.test", 443);
+        let proxy_b = warmup_test_proxy("b", BackendScheme::Https, "shared.test", 443);
+
+        let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
+
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy_a,
+            "pool-key-tls-A",
+            false,
+            &upstreams,
+            &mut http_candidates,
+            &mut https_candidates,
+        );
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy_b,
+            "pool-key-tls-B",
+            false,
+            &upstreams,
+            &mut http_candidates,
+            &mut https_candidates,
+        );
+
+        assert!(http_candidates.is_empty());
+        assert_eq!(
+            https_candidates.len(),
+            2,
+            "different TLS configs → different pool keys → separate warmup tasks (each `reqwest::Client` must be warmed)",
+        );
+        // Both still target the same host:port.
+        let mut targets: Vec<(&str, u16)> = https_candidates
+            .values()
+            .map(|c| (c.host.as_str(), c.port))
+            .collect();
+        targets.sort();
+        assert_eq!(targets, vec![("shared.test", 443), ("shared.test", 443)]);
+    }
+
+    #[test]
+    fn collect_expands_upstream_targets_into_per_target_candidates() {
+        // An upstream-bearing proxy should produce one candidate per
+        // upstream target. The pool key stays constant across the
+        // upstream's targets (one shared `reqwest::Client`), but each
+        // target gets its own warmup HEAD because reqwest's internal
+        // connection pool keys on host:port too.
+        let proxy = {
+            let mut p = warmup_test_proxy("u", BackendScheme::Https, "fallback.test", 443);
+            p.upstream_id = Some("up1".to_string());
+            p
+        };
+        let upstream = upstream_with_targets(
+            "up1",
+            &[("a.test", 8443), ("b.test", 8443), ("c.test", 8443)],
+        );
+        let mut upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        upstreams.insert("up1", &upstream);
+
+        let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy,
+            "pool-key-upstream-up1",
+            false,
+            &upstreams,
+            &mut http_candidates,
+            &mut https_candidates,
+        );
+
+        assert!(http_candidates.is_empty());
+        let mut hosts: Vec<&str> = https_candidates.values().map(|c| c.host.as_str()).collect();
+        hosts.sort();
+        assert_eq!(hosts, vec!["a.test", "b.test", "c.test"]);
+    }
+
+    #[test]
+    fn collect_or_merges_requires_reqwest_when_any_sharing_proxy_forces_it() {
+        // Regression guard for the dedup-hides-sibling-needs case the
+        // reviewer flagged: if ONE proxy on a shared (pool_key, target)
+        // needs reqwest (e.g. has a body-buffering plugin), the merged
+        // candidate's `requires_reqwest_warmup` must end up `true`
+        // regardless of the order proxies are collected — otherwise the
+        // gating phase would skip the only pool that can serve that
+        // proxy's traffic.
+        let proxy_skip = warmup_test_proxy("skip", BackendScheme::Https, "shared.test", 443);
+        let proxy_force = warmup_test_proxy("force", BackendScheme::Https, "shared.test", 443);
+        let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        // Same pool_key so the two proxies actually share a candidate.
+        let shared_pool_key = "pool-key-shared";
+
+        // Order 1: skip-eligible proxy first, reqwest-forcing proxy second.
+        let (mut http1, mut https1) = empty_candidate_maps();
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy_skip,
+            shared_pool_key,
+            false,
+            &upstreams,
+            &mut http1,
+            &mut https1,
+        );
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy_force,
+            shared_pool_key,
+            true,
+            &upstreams,
+            &mut http1,
+            &mut https1,
+        );
+        assert_eq!(https1.len(), 1, "shared pool_key + target must dedupe");
+        let merged = https1.values().next().unwrap();
+        assert!(
+            merged.requires_reqwest_warmup,
+            "OR-merge order 1 must mark candidate requires_reqwest_warmup=true"
+        );
+
+        // Order 2: reqwest-forcing first, skip-eligible second. The flag
+        // must remain `true` (the skip proxy's `false` must NOT clear it).
+        let (mut http2, mut https2) = empty_candidate_maps();
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy_force,
+            shared_pool_key,
+            true,
+            &upstreams,
+            &mut http2,
+            &mut https2,
+        );
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy_skip,
+            shared_pool_key,
+            false,
+            &upstreams,
+            &mut http2,
+            &mut https2,
+        );
+        let merged = https2.values().next().unwrap();
+        assert!(
+            merged.requires_reqwest_warmup,
+            "OR-merge order 2 must keep requires_reqwest_warmup=true (false must NOT downgrade true)"
+        );
+    }
+
+    #[test]
+    fn proxy_config_forces_reqwest_dispatch_returns_true_for_http_backend() {
+        // HTTP backends never enter the direct H2 pool (HTTPS-only).
+        let proxy = warmup_test_proxy("h", BackendScheme::Http, "plain.test", 80);
+        // enable_http2=true and no body-buffering — yet the scheme alone
+        // forces reqwest.
+        assert!(proxy_config_forces_reqwest_dispatch(&proxy, true, false));
+    }
+
+    #[test]
+    fn proxy_config_forces_reqwest_dispatch_returns_true_when_enable_http2_disabled() {
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "h2.test", 443);
+        // Operator set `pool_enable_http2: false` → direct H2 pool is
+        // never entered, every request goes via reqwest.
+        assert!(proxy_config_forces_reqwest_dispatch(&proxy, false, false));
+    }
+
+    #[test]
+    fn proxy_config_forces_reqwest_dispatch_returns_true_when_body_buffering_required() {
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "h2.test", 443);
+        // A request_transformer or similar plugin requires the request
+        // body to be buffered in-process before forwarding — direct H2
+        // sender path doesn't implement that, so reqwest is mandatory.
+        assert!(proxy_config_forces_reqwest_dispatch(&proxy, true, true));
+    }
+
+    #[test]
+    fn proxy_config_forces_reqwest_dispatch_returns_true_when_effective_retries_configured() {
+        let mut proxy = warmup_test_proxy("p", BackendScheme::Https, "h2.test", 443);
+        // Effective retries (max_retries > 0 + at least one trigger)
+        // force the request body to be retained for replay → reqwest.
+        proxy.retry = Some(RetryConfig {
+            max_retries: 2,
+            backoff: BackoffStrategy::Fixed { delay_ms: 10 },
+            retry_on_connect_failure: true,
+            retryable_status_codes: vec![],
+            retryable_methods: vec![],
+        });
+        assert!(proxy_config_forces_reqwest_dispatch(&proxy, true, false));
+    }
+
+    #[test]
+    fn proxy_config_forces_reqwest_dispatch_returns_false_for_inert_retry_config() {
+        let mut proxy = warmup_test_proxy("p", BackendScheme::Https, "h2.test", 443);
+        // `max_retries=0` → no retries actually fire even though the
+        // struct exists. Body retention does NOT activate, so direct H2
+        // is still eligible.
+        proxy.retry = Some(RetryConfig {
+            max_retries: 0,
+            backoff: BackoffStrategy::Fixed { delay_ms: 10 },
+            retry_on_connect_failure: true,
+            retryable_status_codes: vec![500],
+            retryable_methods: vec!["GET".to_string()],
+        });
+        assert!(!proxy_config_forces_reqwest_dispatch(&proxy, true, false));
+    }
+
+    #[test]
+    fn proxy_config_forces_reqwest_dispatch_returns_false_when_no_retry_triggers() {
+        let mut proxy = warmup_test_proxy("p", BackendScheme::Https, "h2.test", 443);
+        // `max_retries > 0` but neither `retry_on_connect_failure` nor a
+        // populated `retryable_methods + retryable_status_codes` pair —
+        // `has_effective_http_retries` returns false for every method.
+        proxy.retry = Some(RetryConfig {
+            max_retries: 5,
+            backoff: BackoffStrategy::Fixed { delay_ms: 10 },
+            retry_on_connect_failure: false,
+            retryable_status_codes: vec![], // empty
+            retryable_methods: vec!["GET".to_string()],
+        });
+        assert!(!proxy_config_forces_reqwest_dispatch(&proxy, true, false));
+    }
+
+    #[test]
+    fn proxy_config_forces_reqwest_dispatch_returns_false_for_clean_https_proxy() {
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "h2.test", 443);
+        // HTTPS, http2 enabled, no body buffering, no retries → the
+        // direct H2 pool covers every request, reqwest warmup IS
+        // skippable (assuming the registry agrees on h2_tls=Supported).
+        assert!(!proxy_config_forces_reqwest_dispatch(&proxy, true, false));
+    }
+
+    #[tokio::test]
+    async fn run_warmup_task_batch_shares_semaphore_across_concurrent_batches() {
+        // Regression guard for Codex P2: two `run_warmup_task_batch`
+        // invocations driven by `tokio::join!` (Phase-1 capability
+        // refresh ‖ Phase-1 HTTP reqwest warmup) must not each
+        // independently honour `pool_warmup_concurrency` — that would
+        // double the effective fanout and bust the operator-set cap.
+        //
+        // The fix is a single shared `Arc<Semaphore>` consumed by both
+        // batches. This test builds two batches of warmup tasks that
+        // each bump a shared in-flight counter, sleep briefly, then
+        // decrement on exit. Across the joined run the observed peak
+        // in-flight count must never exceed the semaphore's permit
+        // count, regardless of how many tasks each batch holds.
+        use std::sync::atomic::AtomicUsize;
+
+        const PERMITS: usize = 4;
+        const TASKS_PER_BATCH: usize = 20;
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let observed_peak = Arc::new(AtomicUsize::new(0));
+        let semaphore = Arc::new(Semaphore::new(PERMITS));
+
+        fn make_tasks(
+            in_flight: Arc<AtomicUsize>,
+            observed_peak: Arc<AtomicUsize>,
+            count: usize,
+            label: &'static str,
+        ) -> Vec<WarmupTask> {
+            (0..count)
+                .map(|i| {
+                    let in_flight = in_flight.clone();
+                    let observed_peak = observed_peak.clone();
+                    let task: WarmupTask = Box::pin(async move {
+                        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        observed_peak.fetch_max(now, Ordering::SeqCst);
+                        // Sleep just long enough that the scheduler will
+                        // happily start additional tasks if the semaphore
+                        // doesn't stop them.
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        Ok(format!("{label}-{i}"))
+                    });
+                    task
+                })
+                .collect()
+        }
+
+        let batch_a = make_tasks(
+            in_flight.clone(),
+            observed_peak.clone(),
+            TASKS_PER_BATCH,
+            "a",
+        );
+        let batch_b = make_tasks(
+            in_flight.clone(),
+            observed_peak.clone(),
+            TASKS_PER_BATCH,
+            "b",
+        );
+
+        tokio::join!(
+            run_warmup_task_batch(batch_a, semaphore.clone(), PERMITS, "batch-a"),
+            run_warmup_task_batch(batch_b, semaphore.clone(), PERMITS, "batch-b"),
+        );
+
+        let peak = observed_peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= PERMITS,
+            "shared semaphore must cap total in-flight tasks to its permit count: \
+             observed peak={peak}, permits={PERMITS} (Codex P2 regression — \
+             two `for_each_concurrent` batches independently honouring the cap \
+             would burst to 2× as 8)"
+        );
+        assert!(
+            peak >= 1,
+            "sanity: at least one task should have been observed in-flight"
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "every task must release its permit on completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_warmup_task_batch_polling_buffer_survives_initial_permit_drain() {
+        // Codex P3 regression: previously the polling buffer for the
+        // batch's `for_each_concurrent` was sized from
+        // `semaphore.available_permits()` at function entry. If a sibling
+        // task (the parallel capability refresh) had already taken every
+        // permit at that moment, `available_permits()` returned 0, the
+        // buffer clamped to 1, and the rest of the batch was serialized
+        // — the buffer never grew back even after the sibling released
+        // permits. The fix passes the configured cap as a separate
+        // `polling_buffer` parameter.
+        //
+        // This test pre-drains every permit from a small semaphore,
+        // releases them after a brief delay, and then runs a batch of
+        // tasks that record their concurrent count. With the bug, the
+        // batch would observe peak ≈ 1 (serialized). With the fix, the
+        // batch observes peak ≈ permit count.
+        use std::sync::atomic::AtomicUsize;
+
+        const PERMITS: usize = 4;
+        const POLLING_BUFFER: usize = PERMITS;
+        const TASKS: usize = 16;
+
+        let semaphore = Arc::new(Semaphore::new(PERMITS));
+
+        // Pre-drain every permit BEFORE entering `run_warmup_task_batch`.
+        // This simulates the parallel-batch race the bug observes — the
+        // sibling refresh has already grabbed the budget at function
+        // entry. Hold the permits in a separate task that releases them
+        // ~50 ms in (long enough for `run_warmup_task_batch` to enter and
+        // size its polling buffer).
+        let mut held = Vec::with_capacity(PERMITS);
+        for _ in 0..PERMITS {
+            held.push(
+                semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("acquire permit for pre-drain"),
+            );
+        }
+        let release_handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(held);
+        });
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let observed_peak = Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<WarmupTask> = (0..TASKS)
+            .map(|i| {
+                let in_flight = in_flight.clone();
+                let observed_peak = observed_peak.clone();
+                let task: WarmupTask = Box::pin(async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    observed_peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(format!("task-{i}"))
+                });
+                task
+            })
+            .collect();
+
+        run_warmup_task_batch(tasks, semaphore.clone(), POLLING_BUFFER, "buffer-test").await;
+        release_handle.await.expect("release task");
+
+        let peak = observed_peak.load(Ordering::SeqCst);
+        assert!(
+            peak >= 2,
+            "polling buffer must NOT clamp to 1 when permits are momentarily \
+             unavailable at function entry: observed peak={peak} (Codex P3 \
+             regression — sizing buffer from `available_permits()` at entry \
+             would serialize the rest of the batch even after permits free up). \
+             Permit count={PERMITS}, expected peak ~= {PERMITS} once the \
+             pre-drain releases."
+        );
+        assert!(
+            peak <= PERMITS,
+            "polling buffer expansion must still honour the semaphore cap: \
+             observed peak={peak} > permits={PERMITS}"
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "every task must release its permit on completion"
+        );
+    }
+
+    #[test]
+    fn target_uses_direct_h2_pool_returns_true_only_for_supported_classification() {
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "h2.test", 443);
+
+        // Empty registry → conservatively warm reqwest (returns false).
+        assert!(!target_uses_direct_h2_pool(
+            &registry, &proxy, "h2.test", 443
+        ));
+
+        // Pre-populate as Supported. The capability key is derived from
+        // (scheme, host, port, dns_override, ca, mtls_*, verify), so we
+        // build the key from the same proxy that the gating predicate
+        // will look up under.
+        let key = capability_key(&proxy);
+        let mut record = BackendCapabilityRecord::default();
+        record.plain_http.h2_tls = ProtocolSupport::Supported;
+        record.plain_http.h1 = ProtocolSupport::Supported;
+        record.plain_http.h3 = ProtocolSupport::Unsupported;
+        registry.upsert(key, record);
+
+        assert!(
+            target_uses_direct_h2_pool(&registry, &proxy, "h2.test", 443),
+            "h2_tls=Supported target must be skipped by reqwest warmup"
+        );
+    }
+
+    #[test]
+    fn target_uses_direct_h2_pool_does_not_skip_unknown_or_unsupported() {
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "fallback.test", 443);
+        let key = capability_key(&proxy);
+
+        // Classified as Unsupported (post-ALPN HTTP/1.1 fallback): we
+        // still need reqwest to serve traffic, so gating must NOT skip.
+        let mut record = BackendCapabilityRecord::default();
+        record.plain_http.h1 = ProtocolSupport::Supported;
+        record.plain_http.h2_tls = ProtocolSupport::Unsupported;
+        registry.upsert(key.clone(), record);
+        assert!(
+            !target_uses_direct_h2_pool(&registry, &proxy, "fallback.test", 443),
+            "h2_tls=Unsupported must keep reqwest warmup enabled — H1-only backend depends on it"
+        );
+
+        // Classified as Unknown (probe never ran or timed out): also must
+        // NOT skip — we don't know whether the H2 pool will work.
+        let mut record_unknown = BackendCapabilityRecord::default();
+        record_unknown.plain_http.h2_tls = ProtocolSupport::Unknown;
+        registry.upsert(key, record_unknown);
+        assert!(
+            !target_uses_direct_h2_pool(&registry, &proxy, "fallback.test", 443),
+            "h2_tls=Unknown must keep reqwest warmup enabled — classification not yet decided"
+        );
+    }
+
+    #[test]
+    fn target_uses_direct_h2_pool_only_inspects_h2_tls_bucket() {
+        // h3=Supported alone must NOT skip reqwest: only H3 frontends
+        // would dispatch via the native H3 backend pool, and even then
+        // the H3 pool can downgrade. H1/H2 frontends still need a warm
+        // reqwest pool against the same backend.
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "h3only.test", 443);
+        let key = capability_key(&proxy);
+
+        let mut record = BackendCapabilityRecord::default();
+        record.plain_http.h3 = ProtocolSupport::Supported;
+        record.plain_http.h2_tls = ProtocolSupport::Unsupported;
+        record.plain_http.h1 = ProtocolSupport::Supported;
+        registry.upsert(key, record);
+
+        assert!(
+            !target_uses_direct_h2_pool(&registry, &proxy, "h3only.test", 443),
+            "h3=Supported alone is not sufficient — H1/H2 frontends still need reqwest"
+        );
+    }
+
+    // ----- Per-IP cleanup task shutdown wiring ---------------------------
+    //
+    // The cleanup loop must honour the global shutdown watch channel so the
+    // spawned task can be drained during the 5 s background-task drain phase
+    // (mirrors DNS / overload / metrics handles). Before this wiring the task
+    // ran an unbounded `loop { timer.tick().await; ... }` and the handle was
+    // dropped on the floor, so shutdown couldn't await it. Regression test:
+    // signalling the channel must end the task within a tight grace window.
+
+    #[tokio::test]
+    async fn per_ip_cleanup_loop_exits_when_shutdown_signal_fires() {
+        let counts: Arc<dashmap::DashMap<String, AtomicU64>> = Arc::new(dashmap::DashMap::new());
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        // Use a long interval so the test latency is dominated by the
+        // shutdown branch of the `tokio::select!`, not by `timer.tick()`.
+        let handle = tokio::spawn(run_per_ip_cleanup_loop(counts.clone(), 3600, Some(rx)));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "task should still be running before shutdown is signalled"
+        );
+
+        tx.send(true).expect("watch receiver should still be live");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "task should exit within 2s of shutdown signal; got {result:?}"
+        );
+    }
+
+    // Sanity: a `None` shutdown receiver leaves the loop running indefinitely.
+    // Verifies the un-wired path is unchanged (regression cover for the
+    // legacy behaviour while shutdown wiring is opt-in via `Some`).
+    #[tokio::test]
+    async fn per_ip_cleanup_loop_runs_without_shutdown_receiver() {
+        let counts: Arc<dashmap::DashMap<String, AtomicU64>> = Arc::new(dashmap::DashMap::new());
+        let handle = tokio::spawn(run_per_ip_cleanup_loop(counts, 3600, None));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "task without shutdown receiver should keep ticking"
+        );
+        handle.abort();
+    }
+
+    // ── update_config / validate_full_config: validate-before-swap contract ──
+    //
+    // These tests pin down the canonical "validate fully BEFORE swap"
+    // guard inside `update_config`. Existing call sites (file_loader,
+    // db_loader, dp_client) all pre-validate, but the swap function MUST
+    // also reject malformed configs so a future caller (e.g. an admin
+    // "import config" handler that deserializes JSON straight into
+    // `update_config`) cannot publish an invalid config to the hot path.
+    //
+    // See `validate_full_config()` rustdoc for the warn-vs-reject
+    // categorization and rationale.
+
+    fn make_test_proxy_state(initial_config: GatewayConfig) -> ProxyState {
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        ProxyState::new(initial_config, dns_cache, env_config, None, None)
+            .expect("ProxyState construction should succeed in tests")
+            .0
+    }
+
+    fn make_validation_proxy(id: &str, listen_path: &str) -> Proxy {
+        serde_json::from_value(json!({
+            "id": id,
+            "namespace": "ferrum",
+            "name": "test-proxy",
+            "hosts": [],
+            "listen_path": listen_path,
+            "backend_scheme": "http",
+            "backend_host": "backend.example.com",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "preserve_host_header": false,
+            "backend_connect_timeout_ms": 5000,
+            "backend_read_timeout_ms": 30000,
+            "backend_write_timeout_ms": 30000,
+            "backend_tls_verify_server_cert": true,
+        }))
+        .expect("validation test proxy should deserialize")
+    }
+
+    fn make_validation_config(proxies: Vec<Proxy>) -> GatewayConfig {
+        GatewayConfig {
+            version: "1".to_string(),
+            proxies,
+            consumers: vec![],
+            plugin_configs: vec![],
+            upstreams: vec![],
+            loaded_at: chrono::Utc::now(),
+            known_namespaces: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_full_config_rejects_malformed_regex_listen_path() {
+        // "Malformed hosts" in the validate-before-swap sense — a
+        // listen_path that starts with `~` (regex marker) but is not a
+        // compilable regex. `validate_regex_listen_paths` is a hard
+        // reject in `apply_incremental`; the helper must mirror that.
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let bad = make_validation_proxy("p1", "~[unclosed");
+        let bad_config = make_validation_config(vec![bad]);
+
+        let err = state
+            .validate_full_config(&bad_config)
+            .expect_err("malformed regex listen_path must be rejected");
+        assert!(
+            err.iter().any(|e| e.contains("regex listen_path")),
+            "error must mention regex listen_path; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_full_config_rejects_dangling_upstream_reference() {
+        // Stand-in for "out-of-policy backend IP" — a config-shape error
+        // that `apply_incremental` rejects. (`validate_all_fields_with_ip_policy`
+        // is warn-only by design — the DB / DP "data already persisted"
+        // contract — see `validate_full_config` rustdoc.)
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let mut bad = make_validation_proxy("p1", "/api");
+        bad.upstream_id = Some("does-not-exist".to_string());
+        let bad_config = make_validation_config(vec![bad]);
+
+        let err = state
+            .validate_full_config(&bad_config)
+            .expect_err("dangling upstream_id must be rejected");
+        assert!(
+            err.iter().any(|e| e.contains("upstream")),
+            "error must reference the missing upstream; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_full_config_rejects_dangling_plugin_reference() {
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let bad: Proxy = serde_json::from_value(json!({
+            "id": "p1",
+            "namespace": "ferrum",
+            "name": "test-proxy",
+            "hosts": [],
+            "listen_path": "/api",
+            "backend_scheme": "http",
+            "backend_host": "backend.example.com",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "preserve_host_header": false,
+            "backend_connect_timeout_ms": 5000,
+            "backend_read_timeout_ms": 30000,
+            "backend_write_timeout_ms": 30000,
+            "backend_tls_verify_server_cert": true,
+            "plugins": [
+                { "plugin_config_id": "missing-plugin-config-id" }
+            ],
+        }))
+        .expect("plugin-ref validation test proxy should deserialize");
+        let bad_config = make_validation_config(vec![bad]);
+
+        let err = state
+            .validate_full_config(&bad_config)
+            .expect_err("dangling plugin reference must be rejected");
+        assert!(
+            err.iter().any(|e| e.contains("plugin")),
+            "error must reference the missing plugin; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_full_config_accepts_valid_config() {
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let good = make_validation_proxy("p1", "/api");
+        let good_config = make_validation_config(vec![good]);
+
+        assert!(
+            state.validate_full_config(&good_config).is_ok(),
+            "minimal valid config must pass validate_full_config"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_invalid_config_without_swapping() {
+        // End-to-end check: when validate_full_config rejects, the swap
+        // must not happen. This is the security-relevant contract — a
+        // future "import config" admin handler that calls update_config
+        // with attacker-shaped input cannot poison the running config.
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let pre_swap_loaded_at = state.config.load_full().loaded_at;
+
+        let mut bad = make_validation_proxy("p1", "/api");
+        bad.upstream_id = Some("does-not-exist".to_string());
+        let bad_config = make_validation_config(vec![bad]);
+
+        assert!(
+            !state.update_config(bad_config),
+            "update_config must return false when validation rejects the new config"
+        );
+
+        let post_attempt_config = state.config.load_full();
+        assert!(
+            post_attempt_config.proxies.is_empty(),
+            "rejected config must not have been swapped — proxies should still be empty"
+        );
+        assert_eq!(
+            post_attempt_config.loaded_at, pre_swap_loaded_at,
+            "loaded_at must not advance when a config is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_applies_valid_config() {
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let good = make_validation_proxy("p1", "/api");
+        let good_config = make_validation_config(vec![good]);
+
+        assert!(
+            state.update_config(good_config),
+            "update_config must return true for a valid initial config"
+        );
+
+        let post = state.config.load_full();
+        assert_eq!(
+            post.proxies.len(),
+            1,
+            "valid config must be swapped into hot state"
+        );
+        assert_eq!(post.proxies[0].id, "p1");
     }
 }

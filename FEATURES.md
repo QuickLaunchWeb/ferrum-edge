@@ -71,7 +71,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **JWT** (HS256) — bearer token with configurable claim field
 - **API Key** — header or query parameter lookup
 - **Basic Auth** — bcrypt or HMAC-SHA256 password verification
-- **HMAC** — request signature verification
+- **HMAC** — request signature verification with body integrity protection via Digest header (RFC 9421 / RFC 3230)
 - **JWKS Auth** — multi-provider JWKS JWT validation with claim-based authorization
 - **LDAP Auth** — LDAP directory authentication via direct bind or search-then-bind with optional AD group filtering
 - **SOAP WS-Security** — WS-Security header validation with UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML assertion validation, timestamp freshness, and nonce replay protection
@@ -181,6 +181,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - Connection limit semaphore (default 100k) with graceful queuing under overload
 - Server-side HTTP/2 `max_concurrent_streams` (default 1000) to bound per-connection resource usage
 - Configurable tokio worker and blocking thread counts with auto-detection
+- **CPU-scaled DashMap shard counts** for hot pool/cache maps — connection pools (HTTP/H2/gRPC/H3), DNS cache, per-IP request counters, and router prefix/regex caches all size their internal shard arrays to `next_power_of_two(max(64, num_cpus * 16))` (`FERRUM_POOL_SHARD_AMOUNT=0` auto, or operator-set). The DashMap default of `4 * num_cpus` shards starves on writes at high cardinality (1K+ unique pool keys, distinct client IPs); larger shard counts give concurrent inserts/removals enough independent locks to actually parallelise
 - **Linux socket optimizations** :
   - `TCP_FASTOPEN` on server sockets — saves 1 RTT for repeat clients with cached TFO cookies, configurable queue length (`FERRUM_TCP_FASTOPEN_ENABLED`, `FERRUM_TCP_FASTOPEN_QUEUE_LEN`)
   - `IP_BIND_ADDRESS_NO_PORT` on all outbound sockets (HTTP/2 pool, gRPC pool, TCP stream proxy, HTTP/3 QUIC) — defers ephemeral port allocation to `connect()` for 4-tuple co-selection, preventing port exhaustion under high outbound connection rates
@@ -244,7 +245,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 ## DNS Caching
 
 - In-memory async cache with startup warmup (backends, upstreams, plugin endpoints)
-- Background refresh at configurable TTL threshold (default 90%) with stale-while-revalidate
+- Background refresh at configurable TTL threshold (default 90%) with stale-while-revalidate, bounded by `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` (default 64)
 - Per-proxy TTL overrides and static hostname overrides
 - Shared resolver for all outbound HTTP clients including plugins
 

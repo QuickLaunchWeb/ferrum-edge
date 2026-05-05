@@ -30,8 +30,8 @@ pub fn generate_self_signed_certs(dir: &Path) -> anyhow::Result<(PathBuf, PathBu
     let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .context("generating CA key pair")?;
 
-    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new())
-        .context("creating CA cert params")?;
+    let mut ca_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).context("creating CA cert params")?;
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca_params.distinguished_name = rcgen::DistinguishedName::new();
     ca_params
@@ -207,8 +207,8 @@ pub fn make_h3_server_config(
 
 /// Create a `quinn::ClientConfig` that skips server certificate verification.
 ///
-/// Applies optimized QUIC transport settings (8 MiB stream window, 32 MiB
-/// connection window, 8 MiB send window) to match the gateway's tuned defaults
+/// Applies QUIC transport settings (8 MiB stream window, 32 MiB connection
+/// window, 8 MiB send window) to match the gateway's defaults
 /// and ensure the bench client is not the bottleneck.
 pub fn make_h3_client_config_insecure() -> quinn::ClientConfig {
     let mut tls_cfg = rustls::ClientConfig::builder()

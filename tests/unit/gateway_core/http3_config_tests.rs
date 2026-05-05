@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use ferrum_edge::config::EnvConfig;
-use ferrum_edge::http3::config::Http3ServerConfig;
+use ferrum_edge::http3::config::{
+    H3_RECEIVE_WINDOW_DEFAULT, H3_SEND_WINDOW_DEFAULT, H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+    Http3ServerConfig,
+};
 
 #[test]
 fn test_http3_server_config_default_values() {
@@ -9,10 +12,53 @@ fn test_http3_server_config_default_values() {
 
     assert_eq!(config.max_concurrent_streams, 1000);
     assert_eq!(config.idle_timeout, Duration::from_secs(30));
-    assert_eq!(config.stream_receive_window, 8_388_608); // 8 MiB
-    assert_eq!(config.receive_window, 33_554_432); // 32 MiB
-    assert_eq!(config.send_window, 8_388_608); // 8 MiB
+    assert_eq!(
+        config.stream_receive_window,
+        H3_STREAM_RECEIVE_WINDOW_DEFAULT
+    );
+    assert_eq!(config.receive_window, H3_RECEIVE_WINDOW_DEFAULT);
+    assert_eq!(config.send_window, H3_SEND_WINDOW_DEFAULT);
     assert_eq!(config.initial_mtu, 1500);
+    // Default mirrors EnvConfig::default().frontend_tls_handshake_timeout_seconds (10s).
+    assert_eq!(config.handshake_timeout, Duration::from_secs(10));
+}
+
+#[test]
+fn test_http3_server_config_handshake_timeout_from_env_config() {
+    // Non-zero value: forwarded as Duration::from_secs.
+    let env = EnvConfig {
+        frontend_tls_handshake_timeout_seconds: 7,
+        ..Default::default()
+    };
+    let config = Http3ServerConfig::from_env_config(&env);
+    assert_eq!(config.handshake_timeout, Duration::from_secs(7));
+}
+
+#[test]
+fn test_http3_server_config_handshake_timeout_zero_disables() {
+    // 0 disables — forwarded as Duration::ZERO so the listener can branch on
+    // `.is_zero()` to skip the `tokio::time::timeout` wrapper. Mirrors the
+    // TCP/TLS and DTLS frontend "0 disables" semantic.
+    let env = EnvConfig {
+        frontend_tls_handshake_timeout_seconds: 0,
+        ..Default::default()
+    };
+    let config = Http3ServerConfig::from_env_config(&env);
+    assert_eq!(config.handshake_timeout, Duration::ZERO);
+    assert!(config.handshake_timeout.is_zero());
+}
+
+#[test]
+fn test_http3_server_config_default_env_propagates_handshake_timeout() {
+    // EnvConfig::default() default for frontend_tls_handshake_timeout_seconds
+    // is 10 seconds and must round-trip through Http3ServerConfig.
+    let env = EnvConfig::default();
+    let config = Http3ServerConfig::from_env_config(&env);
+    assert_eq!(
+        config.handshake_timeout,
+        Duration::from_secs(env.frontend_tls_handshake_timeout_seconds)
+    );
+    assert_eq!(config.handshake_timeout, Duration::from_secs(10));
 }
 
 #[test]
@@ -34,9 +80,12 @@ fn test_http3_server_config_from_env_config_defaults() {
 
     assert_eq!(config.max_concurrent_streams, 1000);
     assert_eq!(config.idle_timeout, Duration::from_secs(30));
-    assert_eq!(config.stream_receive_window, 8_388_608);
-    assert_eq!(config.receive_window, 33_554_432);
-    assert_eq!(config.send_window, 8_388_608);
+    assert_eq!(
+        config.stream_receive_window,
+        H3_STREAM_RECEIVE_WINDOW_DEFAULT
+    );
+    assert_eq!(config.receive_window, H3_RECEIVE_WINDOW_DEFAULT);
+    assert_eq!(config.send_window, H3_SEND_WINDOW_DEFAULT);
 }
 
 #[test]

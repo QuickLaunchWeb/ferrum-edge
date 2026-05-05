@@ -46,7 +46,9 @@ pub async fn run(
         try_tcp_on_error: env_config.dns_try_tcp_on_error,
         num_concurrent_reqs: env_config.dns_num_concurrent_reqs,
         max_active_requests: env_config.dns_max_active_requests,
+        max_concurrent_refreshes: env_config.dns_max_concurrent_refreshes,
         backend_allow_ips: env_config.backend_allow_ips.clone(),
+        shard_amount: env_config.pool_shard_amount,
     });
 
     // Start DNS background refresh
@@ -54,7 +56,7 @@ pub async fn run(
         dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
 
     // Start background task to retry failed DNS lookups
-    let _dns_retry_handle = dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe()));
+    let dns_retry_handle = dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe()));
 
     // Build TLS hardening policy from environment (needed for both frontend
     // and backend TLS — cipher suites, protocol versions, key exchange groups).
@@ -65,13 +67,27 @@ pub async fn run(
             .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
     );
 
-    // Start with empty config; CP will push the real one via gRPC
-    let proxy_state = ProxyState::new(
+    // Start with empty config; CP will push the real one via gRPC.
+    // The empty initial config means `start_with_shutdown` spawns no
+    // health-check tasks today, so `health_check_handles` is normally
+    // empty here. Plumbed through the per-mode background drain anyway
+    // for symmetry with file/db modes and for forward-compatibility:
+    // if a future change starts health checks at DP startup or on the
+    // first CP push, the drain phase already awaits them cleanly.
+    let (proxy_state, health_check_handles) = ProxyState::new(
         GatewayConfig::default(),
         dns_cache,
         env_config.clone(),
         Some(tls_policy.clone()),
+        Some(shutdown_tx.subscribe()),
     )?;
+    // Wire stream listeners (TCP/UDP/DTLS) to the global SIGTERM channel so
+    // their accept loops exit promptly during graceful drain. Without this,
+    // stream listeners would only react to per-listener (config-driven)
+    // shutdown and keep accepting connections until the runtime is dropped.
+    proxy_state
+        .stream_listener_manager
+        .set_global_shutdown_rx(shutdown_tx.subscribe());
     // DP starts with an empty config — the initial refresh has nothing
     // to probe. The first `apply_incremental` / `update_config` call from
     // the CP gRPC stream will trigger `spawn_backend_capability_refresh`,
@@ -79,7 +95,8 @@ pub async fn run(
     proxy_state.start_backend_capability_refresh_task(false, Some(shutdown_tx.subscribe()));
 
     // Start per-IP request counter cleanup (removes stale zero-count entries)
-    proxy_state.start_per_ip_cleanup_task();
+    let per_ip_cleanup_handle =
+        proxy_state.start_per_ip_cleanup_task(Some(shutdown_tx.subscribe()));
 
     // Start service discovery background tasks (initially no-op with empty config;
     // tasks are reconciled when CP pushes config via update_config)
@@ -116,10 +133,11 @@ pub async fn run(
             cp_urls.len()
         );
     }
-    let jwt_secret = crate::grpc::dp_client::GrpcJwtSecret::new(
+    let jwt_secret = crate::grpc::dp_client::GrpcJwtSecret::with_issuer(
         env_config.cp_dp_grpc_jwt_secret.clone().ok_or_else(|| {
             anyhow::anyhow!("FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode")
         })?,
+        env_config.cp_dp_grpc_jwt_issuer.clone(),
     );
 
     // Build DP gRPC TLS config if any TLS settings are provided
@@ -244,7 +262,8 @@ pub async fn run(
     if let Some(ref tls_cfg) = tls_config {
         proxy_state
             .stream_listener_manager
-            .set_frontend_tls_config(Some(tls_cfg.clone()));
+            .set_frontend_tls_config(Some(tls_cfg.clone()))
+            .await;
     }
 
     // Set DTLS cert/key for UDP proxies with frontend_tls (DTLS termination).
@@ -269,7 +288,8 @@ pub async fn run(
                 cert_path.clone(),
                 key_path.clone(),
                 env_config.dtls_client_ca_cert_path.clone(),
-            );
+            )
+            .await;
     }
 
     // Start separate listeners for HTTP and HTTPS
@@ -337,6 +357,7 @@ pub async fn run(
             let h3_config = crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
             let h3_tls_policy = tls_policy.clone();
             let h3_client_ca = env_config.frontend_tls_client_ca_bundle_path.clone();
+            let h3_client_crls = crls.clone();
             let (h3_started_tx, h3_started_rx) = tokio::sync::oneshot::channel();
             let h3_handle = tokio::spawn(async move {
                 info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
@@ -349,6 +370,7 @@ pub async fn run(
                     &h3_tls_policy,
                     crate::http3::server::Http3ListenerOptions {
                         client_ca_bundle_path: h3_client_ca,
+                        client_crls: h3_client_crls,
                         started_tx: Some(h3_started_tx),
                     },
                 )
@@ -400,7 +422,13 @@ pub async fn run(
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         dp_registry: None,
         cp_connection_state: Some(cp_connection_state.clone()),
+        admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
+        admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
     };
+    // Clone admin_state before the HTTP listener moves it, so we can reuse
+    // the same JwtManager instance for the HTTPS listener (instead of calling
+    // create_jwt_manager_from_env() a second time).
+    let admin_state_for_https = admin_state.clone();
     let admin_shutdown = shutdown_tx.subscribe();
 
     // Admin HTTP listener (disabled when port is 0)
@@ -425,25 +453,6 @@ pub async fn run(
     ) {
         let admin_https_addr: SocketAddr =
             env_config.admin_socket_addr(env_config.admin_https_port);
-        let admin_state_for_https = AdminState {
-            db: None,
-            jwt_manager: create_jwt_manager_from_env()
-                .map_err(|e| anyhow::anyhow!("Failed to create JWT manager: {}", e))?,
-            cached_config: Some(proxy_state.config.clone()),
-            proxy_state: Some(proxy_state.clone()),
-            mode: "dp".into(),
-            read_only: true,
-            startup_ready: Some(startup_ready.clone()),
-            db_available: None,
-            admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
-            admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
-            reserved_ports: reserved_ports.clone(),
-            stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
-            admin_allowed_cidrs: admin_allowed_cidrs.clone(),
-            cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
-            dp_registry: None,
-            cp_connection_state: Some(cp_connection_state.clone()),
-        };
         let admin_https_shutdown = shutdown_tx.subscribe();
 
         // Load admin TLS configuration
@@ -560,7 +569,17 @@ pub async fn run(
         }
     }
 
-    // Graceful connection drain: wait for in-flight requests to complete.
+    // Stop accepting new TCP/UDP/DTLS stream connections. The accept loops
+    // also observe the global shutdown receiver wired above and will already
+    // be exiting; firing each per-listener channel here clears the listener
+    // map (releasing ports) and is a no-op if the loops have already exited.
+    proxy_state.stream_listener_manager.shutdown_all().await;
+
+    // Graceful connection drain: signal drain state to the proxy hot path
+    // (Connection: close + reject new requests) unconditionally so the close
+    // hint fires even when the operator has disabled the wait loop with
+    // FERRUM_SHUTDOWN_DRAIN_SECONDS=0. Only the wait loop itself is gated.
+    crate::overload::begin_drain(&proxy_state.overload);
     let drain_seconds = env_config.shutdown_drain_seconds;
     if drain_seconds > 0 {
         crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))
@@ -569,11 +588,26 @@ pub async fn run(
 
     // Wait for background tasks to drain cleanly, with a timeout to prevent
     // hanging if a task is stuck (e.g., blocked on a gRPC stream read).
+    // `health_check_handles` is normally empty in DP mode (empty initial
+    // config — see comment at `ProxyState::new` call site) but plumbed
+    // through anyway so a future change that starts health checks at DP
+    // startup is already drained by this loop.
+    let mut health_check_handles = health_check_handles;
+    health_check_handles.extend(proxy_state.health_checker.take_active_check_handles());
     let bg_drain = async {
         let _ = dns_handle.await;
+        if let Some(h) = dns_retry_handle {
+            let _ = h.await;
+        }
         let _ = dp_client_handle.await;
         let _ = overload_handle.await;
         let _ = metrics_handle.await;
+        if let Some(h) = per_ip_cleanup_handle {
+            let _ = h.await;
+        }
+        for h in health_check_handles {
+            let _ = h.await;
+        }
     };
     if tokio::time::timeout(Duration::from_secs(5), bg_drain)
         .await

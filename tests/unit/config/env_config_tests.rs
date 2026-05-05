@@ -323,6 +323,9 @@ fn test_env_config_http3_defaults() {
             assert!(!config.enable_http3);
             assert_eq!(config.http3_idle_timeout, 30);
             assert_eq!(config.http3_max_streams, 1000);
+            assert_eq!(config.http3_stream_receive_window, 8_388_608);
+            assert_eq!(config.http3_receive_window, 33_554_432);
+            assert_eq!(config.http3_send_window, 8_388_608);
             assert_eq!(config.server_http2_max_pending_accept_reset_streams, 64);
             assert_eq!(config.server_http2_max_local_error_reset_streams, 256);
             assert_eq!(config.websocket_max_connections, 20_000);
@@ -366,7 +369,7 @@ fn test_http3_coalesce_min_clamped_above_max() {
         &[
             ("FERRUM_MODE", "file"),
             ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
-            ("FERRUM_HTTP3_COALESCE_MIN_BYTES", "65536"),
+            ("FERRUM_HTTP3_COALESCE_MIN_BYTES", "262144"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
@@ -852,6 +855,7 @@ fn test_env_config_request_limits_defaults() {
             assert_eq!(config.max_grpc_recv_size_bytes, 4_194_304);
             assert_eq!(config.max_websocket_frame_size_bytes, 16_777_216);
             assert_eq!(config.http_header_read_timeout_seconds, 10);
+            assert_eq!(config.frontend_tls_handshake_timeout_seconds, 10);
             assert!(config.add_via_header);
             assert_eq!(config.via_pseudonym, "ferrum-edge");
             assert!(!config.add_forwarded_header);
@@ -1536,6 +1540,57 @@ fn test_env_config_http_header_read_timeout_disabled() {
     );
 }
 
+#[test]
+fn test_env_config_frontend_tls_handshake_timeout_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.frontend_tls_handshake_timeout_seconds, 10,
+                "frontend_tls_handshake_timeout_seconds should default to 10"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_frontend_tls_handshake_timeout_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS", "30"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.frontend_tls_handshake_timeout_seconds, 30);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_frontend_tls_handshake_timeout_disabled() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.frontend_tls_handshake_timeout_seconds, 0,
+                "0 should disable the frontend TLS handshake timeout"
+            );
+        },
+    );
+}
+
 // ============================================================================
 // Per-IP Concurrent Request Limit Tests
 // ============================================================================
@@ -1783,10 +1838,26 @@ fn test_is_private_ip_cgnat() {
 }
 
 #[test]
+fn test_is_private_ip_special_use_v4() {
+    assert!(is_private_ip(&"192.0.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"192.0.0.8".parse().unwrap()));
+    assert!(!is_private_ip(&"192.0.0.9".parse().unwrap()));
+    assert!(!is_private_ip(&"192.0.0.10".parse().unwrap()));
+    assert!(is_private_ip(&"192.0.0.170".parse().unwrap()));
+    assert!(is_private_ip(&"192.0.2.5".parse().unwrap()));
+    assert!(is_private_ip(&"192.88.99.1".parse().unwrap()));
+    assert!(is_private_ip(&"198.18.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"198.51.100.5".parse().unwrap()));
+    assert!(is_private_ip(&"203.0.113.5".parse().unwrap()));
+    assert!(is_private_ip(&"224.0.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"240.0.0.1".parse().unwrap()));
+}
+
+#[test]
 fn test_is_private_ip_public_v4() {
     assert!(!is_private_ip(&"8.8.8.8".parse().unwrap()));
     assert!(!is_private_ip(&"1.1.1.1".parse().unwrap()));
-    assert!(!is_private_ip(&"203.0.113.5".parse().unwrap()));
+    assert!(!is_private_ip(&"100.128.0.1".parse().unwrap()));
 }
 
 #[test]
@@ -1794,10 +1865,31 @@ fn test_is_private_ip_ipv6() {
     assert!(is_private_ip(&"::1".parse().unwrap()));
     assert!(is_private_ip(&"::".parse().unwrap()));
     assert!(is_private_ip(&"fe80::1".parse().unwrap()));
+    assert!(is_private_ip(&"fc00::1".parse().unwrap()));
     assert!(is_private_ip(&"fd00::1".parse().unwrap()));
+    assert!(is_private_ip(&"ff02::1".parse().unwrap()));
+    assert!(is_private_ip(&"2001:db8::1".parse().unwrap()));
+    assert!(is_private_ip(&"::ffff:127.0.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"::127.0.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"64:ff9b::192.168.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"100::1".parse().unwrap()));
+    assert!(is_private_ip(&"100:0:0:1::1".parse().unwrap()));
+    assert!(is_private_ip(&"2001::1".parse().unwrap()));
+    assert!(is_private_ip(&"2001:1::4".parse().unwrap()));
+    assert!(is_private_ip(&"2001:2::1".parse().unwrap()));
+    assert!(is_private_ip(&"2001:10::1".parse().unwrap()));
     // Public IPv6
-    assert!(!is_private_ip(&"2001:db8::1".parse().unwrap()));
     assert!(!is_private_ip(&"2607:f8b0:4004:800::200e".parse().unwrap()));
+    assert!(!is_private_ip(&"::8.8.8.8".parse().unwrap()));
+    assert!(!is_private_ip(&"64:ff9b::8.8.8.8".parse().unwrap()));
+    assert!(!is_private_ip(&"100:0:0:2::1".parse().unwrap()));
+    assert!(!is_private_ip(&"2001:1::1".parse().unwrap()));
+    assert!(!is_private_ip(&"2001:1::2".parse().unwrap()));
+    assert!(!is_private_ip(&"2001:1::3".parse().unwrap()));
+    assert!(!is_private_ip(&"2001:3::1".parse().unwrap()));
+    assert!(!is_private_ip(&"2001:4:112::1".parse().unwrap()));
+    assert!(!is_private_ip(&"2001:20::1".parse().unwrap()));
+    assert!(!is_private_ip(&"2001:30::1".parse().unwrap()));
 }
 
 #[test]
@@ -2665,6 +2757,60 @@ fn test_env_config_db_pool_min_connections_zero_allowed() {
 }
 
 #[test]
+fn test_env_config_db_pool_statement_timeout_zero_disables() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_pool_statement_timeout_seconds, 0,
+                "0 should disable statement timeout"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_pool_statement_timeout_at_max() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS", "3600"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_pool_statement_timeout_seconds, 3600,
+                "3600 should be accepted as-is (at the max boundary)"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_pool_statement_timeout_above_max_clamped() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS", "3601"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_pool_statement_timeout_seconds, 3600,
+                "values above 3600 should be clamped to 3600"
+            );
+        },
+    );
+}
+
+#[test]
 fn test_env_config_db_pool_invalid_values_error() {
     with_env_vars(
         &[
@@ -3308,6 +3454,121 @@ fn test_tls_early_data_methods_empty_entries_filtered() {
             assert_eq!(config.tls_early_data_methods.len(), 2);
             assert!(config.tls_early_data_methods.contains("GET"));
             assert!(config.tls_early_data_methods.contains("HEAD"));
+        },
+    );
+}
+
+#[test]
+fn test_db_full_load_page_size_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_DB_FULL_LOAD_PAGE_SIZE");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.db_full_load_page_size, 10_000);
+        },
+    );
+}
+
+#[test]
+fn test_db_full_load_page_size_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_FULL_LOAD_PAGE_SIZE", "20000"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.db_full_load_page_size, 20_000);
+        },
+    );
+}
+
+#[test]
+fn test_db_full_load_page_size_clamped_to_minimum() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_FULL_LOAD_PAGE_SIZE", "10"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_full_load_page_size, 100,
+                "values below 100 should be clamped to the minimum"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_db_full_load_page_size_clamped_to_maximum() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_FULL_LOAD_PAGE_SIZE", "999999"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_full_load_page_size, 100_000,
+                "values above 100000 should be clamped to the maximum"
+            );
+        },
+    );
+}
+
+// ── FERRUM_POOL_SHARD_AMOUNT ────────────────────────────────────────────────
+
+#[test]
+fn test_pool_shard_amount_default_is_zero() {
+    let config = EnvConfig::default();
+    assert_eq!(
+        config.pool_shard_amount, 0,
+        "Default 0 means auto-derive from CPU topology"
+    );
+}
+
+#[test]
+fn test_pool_shard_amount_parsed_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_POOL_SHARD_AMOUNT", "256"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.pool_shard_amount, 256,
+                "operator-supplied override must be passed through verbatim; \
+                 power-of-two rounding happens at the call site",
+            );
+        },
+    );
+}
+
+#[test]
+fn test_pool_shard_amount_zero_kept_as_auto_sentinel() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_POOL_SHARD_AMOUNT", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.pool_shard_amount, 0,
+                "FERRUM_POOL_SHARD_AMOUNT=0 must remain 0 (auto sentinel) — \
+                 the helper resolves it later, not the parser",
+            );
         },
     );
 }

@@ -1,9 +1,11 @@
 //! Database config loader with incremental polling.
 //!
 //! **Incremental polling strategy** (two-phase):
-//! 1. **Change detection**: Indexed `WHERE updated_at > ?` queries on 4 tables to
+//! 1. **Change detection**: Indexed `WHERE updated_at >= ?` queries on 4 tables to
 //!    fetch only rows modified since the last poll. A 1-second safety margin on the
 //!    timestamp prevents missing boundary writes due to clock skew or in-flight commits.
+//!    The `>=` (inclusive) ensures rows written at exactly the boundary are never missed;
+//!    duplicates from the overlap are harmless because the incremental result is merged by ID.
 //! 2. **Deletion detection**: Lightweight `SELECT id` queries on all 4 tables, diffed
 //!    against the poller's known ID sets to find removed rows.
 //!
@@ -98,10 +100,11 @@ pub struct DbPoolConfig {
     /// connect). 0 = no explicit timeout (falls back to OS TCP timeout).
     pub connect_timeout_seconds: u64,
     /// Maximum execution time (seconds) for any single SQL statement. Default:
-    /// 30. Set via `SET statement_timeout` (PostgreSQL) or
-    /// `SET SESSION max_execution_time` (MySQL) on every new connection.
-    /// Prevents runaway queries from holding connections indefinitely.
-    /// 0 = disabled (no per-statement timeout). Ignored for SQLite.
+    /// 30, max 3600 (clamped at `EnvConfig` parse time). Set via
+    /// `SET statement_timeout` (PostgreSQL) or `SET SESSION max_execution_time`
+    /// (MySQL) on every new connection. Prevents runaway queries from holding
+    /// connections indefinitely. 0 = disabled (no per-statement timeout).
+    /// Ignored for SQLite.
     pub statement_timeout_seconds: u64,
 }
 
@@ -116,6 +119,33 @@ impl Default for DbPoolConfig {
             connect_timeout_seconds: 10,
             statement_timeout_seconds: 30,
         }
+    }
+}
+
+/// Build the `SET` SQL for per-statement timeouts, or `None` when disabled.
+///
+/// Returns:
+/// - PostgreSQL: `SET statement_timeout = <ms>` (unquoted numeric)
+/// - MySQL: `SET SESSION max_execution_time = <ms>`
+/// - SQLite / `timeout_seconds == 0`: `None`
+///
+/// The caller is responsible for clamping `timeout_seconds` before calling
+/// (enforced at `EnvConfig` parse time, 0..=3600).
+pub(crate) fn statement_timeout_sql(
+    timeout_seconds: u64,
+    is_postgres: bool,
+    is_mysql: bool,
+) -> Option<String> {
+    if timeout_seconds == 0 {
+        return None;
+    }
+    let timeout_ms = timeout_seconds * 1000;
+    if is_postgres {
+        Some(format!("SET statement_timeout = {timeout_ms}"))
+    } else if is_mysql {
+        Some(format!("SET SESSION max_execution_time = {timeout_ms}"))
+    } else {
+        None
     }
 }
 
@@ -134,6 +164,9 @@ pub struct DatabaseStore {
     failover_urls: Vec<String>,
     pool_config: DbPoolConfig,
     slow_query_threshold_ms: Option<u64>,
+    /// Maximum rows fetched per query during full config loading.
+    /// Configurable via `FERRUM_DB_FULL_LOAD_PAGE_SIZE`. Default: 10000.
+    full_load_page_size: i64,
     cert_expiry_warning_days: u64,
     backend_allow_ips: crate::config::BackendAllowIps,
     /// Set to `true` when the store was created via
@@ -237,22 +270,17 @@ impl DatabaseStore {
                     }
                     // Set per-statement timeout on network databases to prevent
                     // runaway queries from holding connections indefinitely.
-                    if statement_timeout_seconds > 0 {
-                        if is_postgres {
-                            // PostgreSQL statement_timeout is in milliseconds
-                            let sql = format!(
-                                "SET statement_timeout = '{}'",
-                                statement_timeout_seconds * 1000
-                            );
-                            conn.execute(sql.as_str()).await?;
-                        } else if is_mysql {
-                            // MySQL max_execution_time is in milliseconds
-                            let sql = format!(
-                                "SET SESSION max_execution_time = {}",
-                                statement_timeout_seconds * 1000
-                            );
-                            conn.execute(sql.as_str()).await?;
-                        }
+                    //
+                    // Safety: `statement_timeout_seconds` is a `u64` parsed from
+                    // `FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS` and clamped to
+                    // 0..=3600 at `EnvConfig` parse time, so the `format!()`
+                    // interpolation always produces a plain integer literal.
+                    // `SET` commands do not support `$1`/`?` parameterized
+                    // placeholders in sqlx, hence the string interpolation.
+                    if let Some(sql) =
+                        statement_timeout_sql(statement_timeout_seconds, is_postgres, is_mysql)
+                    {
+                        conn.execute(sql.as_str()).await?;
                     }
                     Ok(())
                 })
@@ -316,6 +344,7 @@ impl DatabaseStore {
             failover_urls: Vec::new(),
             pool_config,
             slow_query_threshold_ms: None,
+            full_load_page_size: Self::DEFAULT_FULL_LOAD_PAGE_SIZE,
             cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
             backend_allow_ips: crate::config::BackendAllowIps::Both,
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -393,6 +422,7 @@ impl DatabaseStore {
             failover_urls: failover_urls.to_vec(),
             pool_config,
             slow_query_threshold_ms: None,
+            full_load_page_size: Self::DEFAULT_FULL_LOAD_PAGE_SIZE,
             cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
             backend_allow_ips: crate::config::BackendAllowIps::Both,
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -644,7 +674,7 @@ impl DatabaseStore {
                 &self.q("SELECT * FROM proxies WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
             )
             .bind(namespace)
-            .bind(Self::FULL_LOAD_PAGE_SIZE)
+            .bind(self.full_load_page_size)
             .bind(offset)
             .fetch_all(&self.rpool())
             .await?;
@@ -654,10 +684,10 @@ impl DatabaseStore {
                 let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
                 proxies.push(row_to_proxy(&row, id, plugins)?);
             }
-            if (fetched as i64) < Self::FULL_LOAD_PAGE_SIZE {
+            if (fetched as i64) < self.full_load_page_size {
                 break;
             }
-            offset += Self::FULL_LOAD_PAGE_SIZE;
+            offset += self.full_load_page_size;
         }
 
         self.check_slow_query("load_proxies", start);
@@ -674,7 +704,7 @@ impl DatabaseStore {
                 &self.q("SELECT * FROM consumers WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
             )
             .bind(namespace)
-            .bind(Self::FULL_LOAD_PAGE_SIZE)
+            .bind(self.full_load_page_size)
             .bind(offset)
             .fetch_all(&self.rpool())
             .await?;
@@ -682,10 +712,10 @@ impl DatabaseStore {
             for row in rows {
                 consumers.push(row_to_consumer(&row)?);
             }
-            if (fetched as i64) < Self::FULL_LOAD_PAGE_SIZE {
+            if (fetched as i64) < self.full_load_page_size {
                 break;
             }
-            offset += Self::FULL_LOAD_PAGE_SIZE;
+            offset += self.full_load_page_size;
         }
 
         self.check_slow_query("load_consumers", start);
@@ -705,7 +735,7 @@ impl DatabaseStore {
                 "SELECT * FROM plugin_configs WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?",
             ))
             .bind(namespace)
-            .bind(Self::FULL_LOAD_PAGE_SIZE)
+            .bind(self.full_load_page_size)
             .bind(offset)
             .fetch_all(&self.rpool())
             .await?;
@@ -713,10 +743,10 @@ impl DatabaseStore {
             for row in rows {
                 configs.push(row_to_plugin_config(&row)?);
             }
-            if (fetched as i64) < Self::FULL_LOAD_PAGE_SIZE {
+            if (fetched as i64) < self.full_load_page_size {
                 break;
             }
-            offset += Self::FULL_LOAD_PAGE_SIZE;
+            offset += self.full_load_page_size;
         }
 
         self.check_slow_query("load_plugin_configs", start);
@@ -1167,12 +1197,25 @@ impl DatabaseStore {
         Ok(Some(proxy))
     }
 
-    pub async fn check_proxy_exists(&self, proxy_id: &str) -> Result<bool, anyhow::Error> {
+    /// Check whether a proxy with the given ID exists in `namespace`.
+    ///
+    /// The `namespace` filter is required: admin-API callers must scope
+    /// reference checks to the requesting tenant's namespace so that, for
+    /// example, a `plugin_config.proxy_id` cannot point at a proxy that lives
+    /// in a different namespace (such a config would never load at runtime
+    /// because the polling path filters by namespace).
+    pub async fn check_proxy_exists(
+        &self,
+        proxy_id: &str,
+        namespace: &str,
+    ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let row: Option<AnyRow> = sqlx::query(&self.q("SELECT id FROM proxies WHERE id = ?"))
-            .bind(proxy_id)
-            .fetch_optional(&self.pool())
-            .await?;
+        let row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT id FROM proxies WHERE id = ? AND namespace = ?"))
+                .bind(proxy_id)
+                .bind(namespace)
+                .fetch_optional(&self.pool())
+                .await?;
         self.check_slow_query("check_proxy_exists", start);
         Ok(row.is_some())
     }
@@ -1353,7 +1396,7 @@ impl DatabaseStore {
                 &self.q("SELECT * FROM upstreams WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
             )
             .bind(namespace)
-            .bind(Self::FULL_LOAD_PAGE_SIZE)
+            .bind(self.full_load_page_size)
             .bind(offset)
             .fetch_all(&self.rpool())
             .await?;
@@ -1361,10 +1404,10 @@ impl DatabaseStore {
             for row in rows {
                 upstreams.push(row_to_upstream(&row)?);
             }
-            if (fetched as i64) < Self::FULL_LOAD_PAGE_SIZE {
+            if (fetched as i64) < self.full_load_page_size {
                 break;
             }
-            offset += Self::FULL_LOAD_PAGE_SIZE;
+            offset += self.full_load_page_size;
         }
 
         self.check_slow_query("load_upstreams", start);
@@ -2123,14 +2166,24 @@ impl DatabaseStore {
         Ok(rows.is_empty())
     }
 
-    /// Check if an upstream with the given ID exists.
-    /// Returns `true` if the upstream exists.
-    pub async fn check_upstream_exists(&self, upstream_id: &str) -> Result<bool, anyhow::Error> {
+    /// Check if an upstream with the given ID exists in `namespace`.
+    /// Returns `true` only when the row is in the requested namespace.
+    ///
+    /// The `namespace` filter is mandatory: cross-namespace references would
+    /// pass admin validation but silently 502 at runtime because the proxy
+    /// load path filters upstreams by namespace.
+    pub async fn check_upstream_exists(
+        &self,
+        upstream_id: &str,
+        namespace: &str,
+    ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let row: Option<AnyRow> = sqlx::query(&self.q("SELECT id FROM upstreams WHERE id = ?"))
-            .bind(upstream_id)
-            .fetch_optional(&self.pool())
-            .await?;
+        let row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT id FROM upstreams WHERE id = ? AND namespace = ?"))
+                .bind(upstream_id)
+                .bind(namespace)
+                .fetch_optional(&self.pool())
+                .await?;
         self.check_slow_query("check_upstream_exists", start);
         Ok(row.is_some())
     }
@@ -2138,9 +2191,15 @@ impl DatabaseStore {
     /// Validate that a proxy's plugin associations reference existing
     /// proxy-scoped plugin configs targeted at the same proxy, and that the
     /// resolved plugin names remain unique for that proxy.
+    ///
+    /// Plugin configs are resolved only within `namespace`. References to
+    /// plugin_configs in a different namespace surface as
+    /// `non-existent plugin_config '<id>'` errors so admin validation
+    /// cannot admit cross-namespace pollution.
     pub async fn validate_proxy_plugin_associations(
         &self,
         proxy_id: &str,
+        namespace: &str,
         associations: &[PluginAssociation],
     ) -> Result<Vec<String>, anyhow::Error> {
         if associations.is_empty() {
@@ -2162,7 +2221,9 @@ impl DatabaseStore {
             }
         }
 
-        let plugin_refs = self.load_plugin_config_refs(&requested_ids).await?;
+        let plugin_refs = self
+            .load_plugin_config_refs(&requested_ids, namespace)
+            .await?;
 
         for assoc in associations {
             match plugin_refs.get(assoc.plugin_config_id.as_str()) {
@@ -2206,7 +2267,7 @@ impl DatabaseStore {
     ///
     /// This replaces `load_full_config()` for subsequent polls after the initial
     /// full load, reducing DB I/O from 4 full table scans to 4 indexed
-    /// `WHERE updated_at > ?` queries plus 4 lightweight `SELECT id` queries.
+    /// `WHERE updated_at >= ?` queries plus 4 lightweight `SELECT id` queries.
     pub async fn load_incremental_config(
         &self,
         namespace: &str,
@@ -2305,7 +2366,7 @@ impl DatabaseStore {
     ) -> Result<Vec<Proxy>, anyhow::Error> {
         let start = Instant::now();
         let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM proxies WHERE namespace = ? AND updated_at > ?"))
+            sqlx::query(&self.q("SELECT * FROM proxies WHERE namespace = ? AND updated_at >= ?"))
                 .bind(namespace)
                 .bind(since_str)
                 .fetch_all(&self.rpool())
@@ -2409,7 +2470,7 @@ impl DatabaseStore {
     ) -> Result<Vec<Consumer>, anyhow::Error> {
         let start = Instant::now();
         let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM consumers WHERE namespace = ? AND updated_at > ?"))
+            sqlx::query(&self.q("SELECT * FROM consumers WHERE namespace = ? AND updated_at >= ?"))
                 .bind(namespace)
                 .bind(since_str)
                 .fetch_all(&self.rpool())
@@ -2431,7 +2492,7 @@ impl DatabaseStore {
     ) -> Result<Vec<PluginConfig>, anyhow::Error> {
         let start = Instant::now();
         let rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT * FROM plugin_configs WHERE namespace = ? AND updated_at > ?"),
+            &self.q("SELECT * FROM plugin_configs WHERE namespace = ? AND updated_at >= ?"),
         )
         .bind(namespace)
         .bind(since_str)
@@ -2454,7 +2515,7 @@ impl DatabaseStore {
     ) -> Result<Vec<Upstream>, anyhow::Error> {
         let start = Instant::now();
         let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM upstreams WHERE namespace = ? AND updated_at > ?"))
+            sqlx::query(&self.q("SELECT * FROM upstreams WHERE namespace = ? AND updated_at >= ?"))
                 .bind(namespace)
                 .bind(since_str)
                 .fetch_all(&self.rpool())
@@ -2493,9 +2554,14 @@ impl DatabaseStore {
         Ok(ids)
     }
 
+    /// Load `(id, scope, proxy_id)` for each plugin_config ID **within
+    /// `namespace`**. Rows whose namespace does not match are filtered out
+    /// at the SQL layer, so callers using the result map to validate
+    /// references will report rows in other namespaces as missing.
     async fn load_plugin_config_refs(
         &self,
         ids: &[String],
+        namespace: &str,
     ) -> Result<std::collections::HashMap<String, PluginConfigRef>, anyhow::Error> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -2505,11 +2571,12 @@ impl DatabaseStore {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = self.q(&format!(
-            "SELECT id, scope, proxy_id FROM plugin_configs WHERE id IN ({})",
+            "SELECT id, scope, proxy_id FROM plugin_configs WHERE namespace = ? AND id IN ({})",
             placeholders
         ));
 
         let mut query = sqlx::query(&sql);
+        query = query.bind(namespace);
         for id in ids {
             query = query.bind(id);
         }
@@ -2555,11 +2622,10 @@ impl DatabaseStore {
     /// Keeps transaction WAL/redo log size manageable and reduces lock hold time.
     const BATCH_CHUNK_SIZE: usize = 1000;
 
-    /// Maximum rows fetched per query during full config loading.
-    /// Prevents unbounded `SELECT *` from hitting statement timeouts or causing
-    /// memory spikes at scale (100k+ rows). Raw `AnyRow` buffers are freed
-    /// between chunks, so peak memory is proportional to chunk size, not table size.
-    const FULL_LOAD_PAGE_SIZE: i64 = 5000;
+    /// Fallback page size used only when no runtime override has been set
+    /// via `set_full_load_page_size()`. Matches the default for
+    /// `FERRUM_DB_FULL_LOAD_PAGE_SIZE`.
+    const DEFAULT_FULL_LOAD_PAGE_SIZE: i64 = 10_000;
 
     /// Batch-create multiple proxies, chunked into transactions of
     /// [`BATCH_CHUNK_SIZE`] for large-scale imports.
@@ -4342,6 +4408,10 @@ impl DatabaseBackend for DatabaseStore {
         self.slow_query_threshold_ms = threshold_ms;
     }
 
+    fn set_full_load_page_size(&mut self, page_size: u64) {
+        self.full_load_page_size = page_size as i64;
+    }
+
     fn set_cert_expiry_warning_days(&mut self, days: u64) {
         self.cert_expiry_warning_days = days;
     }
@@ -4391,8 +4461,12 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::get_proxy(self, id).await
     }
 
-    async fn check_proxy_exists(&self, proxy_id: &str) -> Result<bool, anyhow::Error> {
-        DatabaseStore::check_proxy_exists(self, proxy_id).await
+    async fn check_proxy_exists(
+        &self,
+        proxy_id: &str,
+        namespace: &str,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::check_proxy_exists(self, proxy_id, namespace).await
     }
 
     async fn list_proxies_paginated(
@@ -4563,16 +4637,21 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::check_listen_port_unique(self, namespace, port, exclude_proxy_id).await
     }
 
-    async fn check_upstream_exists(&self, upstream_id: &str) -> Result<bool, anyhow::Error> {
-        DatabaseStore::check_upstream_exists(self, upstream_id).await
+    async fn check_upstream_exists(
+        &self,
+        upstream_id: &str,
+        namespace: &str,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::check_upstream_exists(self, upstream_id, namespace).await
     }
 
     async fn validate_proxy_plugin_associations(
         &self,
         proxy_id: &str,
+        namespace: &str,
         plugins: &[crate::config::types::PluginAssociation],
     ) -> Result<Vec<String>, anyhow::Error> {
-        DatabaseStore::validate_proxy_plugin_associations(self, proxy_id, plugins).await
+        DatabaseStore::validate_proxy_plugin_associations(self, proxy_id, namespace, plugins).await
     }
 
     async fn batch_create_proxies(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error> {
@@ -4678,6 +4757,31 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn maybe_apply_deferred_migrations(&self) -> Result<bool, anyhow::Error> {
         DatabaseStore::maybe_apply_deferred_migrations(self).await
+    }
+
+    async fn pending_plugin_migrations(
+        &self,
+        plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
+    ) -> Result<Vec<crate::config::migrations::PendingPluginMigration>, anyhow::Error> {
+        if plugin_migrations.is_empty() {
+            return Ok(Vec::new());
+        }
+        let runner =
+            crate::config::migrations::MigrationRunner::new(self.pool(), self.db_type.clone());
+        let status = runner.plugin_status(plugin_migrations).await?;
+        Ok(status.pending)
+    }
+
+    async fn apply_plugin_migrations(
+        &self,
+        plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
+    ) -> Result<Vec<crate::config::migrations::PluginMigrationRecord>, anyhow::Error> {
+        if plugin_migrations.is_empty() {
+            return Ok(Vec::new());
+        }
+        let runner =
+            crate::config::migrations::MigrationRunner::new(self.pool(), self.db_type.clone());
+        runner.run_plugin_pending(plugin_migrations).await
     }
 
     async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {

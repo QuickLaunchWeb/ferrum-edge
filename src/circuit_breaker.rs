@@ -47,8 +47,14 @@ impl CircuitBreaker {
         }
     }
 
-    /// Check if a request can proceed. Returns Err if circuit is open.
-    pub fn can_execute(&self) -> Result<(), CircuitOpenError> {
+    /// Check if a request can proceed.
+    ///
+    /// Returns `Ok(true)` if the request was admitted as a half-open probe
+    /// (the caller MUST pass `is_half_open_probe=true` to `record_success`/
+    /// `record_failure` so the in-flight counter is decremented correctly).
+    /// Returns `Ok(false)` for normal closed-state admission.
+    /// Returns `Err` if the circuit is open and the request must be rejected.
+    pub fn can_execute(&self) -> Result<bool, CircuitOpenError> {
         // Acquire pairs with the Release in record_failure() when transitioning
         // CLOSED → OPEN, ensuring visibility of last_failure_epoch_ms and
         // failure_count. Using Relaxed here would risk stale reads on ARM/weak-
@@ -57,7 +63,7 @@ impl CircuitBreaker {
         // circuit breaker checks are not the bottleneck at scale.
         let state = self.state.load(Ordering::Acquire);
         match state {
-            STATE_CLOSED => Ok(()),
+            STATE_CLOSED => Ok(false),
             STATE_OPEN => {
                 // Check if timeout has elapsed
                 let now = now_epoch_ms();
@@ -77,7 +83,7 @@ impl CircuitBreaker {
                             self.half_open_in_flight.store(1, Ordering::Relaxed);
                             self.success_count.store(0, Ordering::Relaxed);
                             info!("Circuit breaker transitioning from Open to Half-Open");
-                            Ok(())
+                            Ok(true)
                         }
                         Err(current) => {
                             // CAS loser: another thread already transitioned.
@@ -96,13 +102,13 @@ impl CircuitBreaker {
                                         Ordering::AcqRel,
                                         Ordering::Acquire,
                                     ) {
-                                        Ok(_) => return Ok(()),
+                                        Ok(_) => return Ok(true),
                                         Err(_) => continue,
                                     }
                                 }
                             } else {
                                 // State changed to something else (e.g. Closed)
-                                Ok(())
+                                Ok(false)
                             }
                         }
                     }
@@ -123,28 +129,36 @@ impl CircuitBreaker {
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     ) {
-                        Ok(_) => return Ok(()),
+                        Ok(_) => return Ok(true),
                         Err(_) => continue,
                     }
                 }
             }
-            _ => Ok(()),
+            _ => Ok(false),
         }
     }
 
     /// Record a successful response, transitioning from half-open to closed
     /// after enough successes reach the configured threshold.
+    ///
+    /// `is_half_open_probe` must be `true` when this request was admitted as a
+    /// half-open probe (i.e., `can_execute()` returned `Ok(true)`). Only probe
+    /// requests decrement the `half_open_in_flight` counter. Requests admitted
+    /// during CLOSED state that complete late (after a CLOSED->OPEN transition)
+    /// must NOT decrement the counter since they never held a slot.
     #[allow(dead_code)] // Public API — called by retry/proxy logic when circuit is half-open
-    pub fn record_success(&self) {
+    pub fn record_success(&self, is_half_open_probe: bool) {
         let state = self.state.load(Ordering::Acquire);
         match state {
             STATE_HALF_OPEN => {
-                // Decrement in-flight counter so new probe requests can be admitted
-                let _ = self.half_open_in_flight.fetch_update(
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                    |v| v.checked_sub(1),
-                );
+                if is_half_open_probe {
+                    // Decrement in-flight counter so new probe requests can be admitted
+                    let _ = self.half_open_in_flight.fetch_update(
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                        |v| v.checked_sub(1),
+                    );
+                }
                 // Re-check state: another thread may have reopened the circuit
                 // between our initial load and now.
                 if self.state.load(Ordering::Acquire) != STATE_HALF_OPEN {
@@ -170,6 +184,17 @@ impl CircuitBreaker {
                     }
                 }
             }
+            STATE_OPEN if is_half_open_probe => {
+                // A concurrent record_failure already reopened the circuit between
+                // our can_execute() and this record_success(). We still own a slot
+                // from when the breaker was HALF_OPEN, so decrement it. The
+                // checked_sub prevents underflow if this is a spurious call.
+                let _ = self.half_open_in_flight.fetch_update(
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                    |v| v.checked_sub(1),
+                );
+            }
             STATE_CLOSED
                 // Reset failure count on success
                 if self.failure_count.load(Ordering::Relaxed) > 0 =>
@@ -186,7 +211,18 @@ impl CircuitBreaker {
     /// (TCP refused, DNS, TLS handshake, connect timeout) rather than an actual
     /// HTTP response from the backend. When `true`, the failure is controlled by
     /// `trip_on_connection_errors` independently of `failure_status_codes`.
-    pub fn record_failure(&self, status_code: u16, connection_error: bool) {
+    ///
+    /// `is_half_open_probe` must be `true` when this request was admitted as a
+    /// half-open probe (i.e., `can_execute()` returned `Ok(true)`). Only probe
+    /// requests decrement the `half_open_in_flight` counter. Requests admitted
+    /// during CLOSED state that complete after the breaker has transitioned to
+    /// OPEN must NOT decrement the counter since they never held a slot.
+    pub fn record_failure(
+        &self,
+        status_code: u16,
+        connection_error: bool,
+        is_half_open_probe: bool,
+    ) {
         if connection_error {
             if !self.config.trip_on_connection_errors {
                 return;
@@ -209,16 +245,34 @@ impl CircuitBreaker {
                 }
             }
             STATE_HALF_OPEN => {
-                // Decrement in-flight before reopening
+                if is_half_open_probe {
+                    // Decrement in-flight before reopening. The fetch_update handles
+                    // the count correctly even with concurrent probe failures — each
+                    // thread atomically decrements once. We intentionally do NOT
+                    // follow up with an unconditional store(0): that would race with
+                    // concurrent decrements from other probe threads, potentially
+                    // clobbering a value that hasn't been decremented yet. The count
+                    // reaches 0 naturally as all probes report in, and transitioning
+                    // to OPEN prevents new probes from being admitted.
+                    let _ = self.half_open_in_flight.fetch_update(
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                        |v| v.checked_sub(1),
+                    );
+                }
+                warn!("Circuit breaker reopening (probe failed)");
+                self.state.store(STATE_OPEN, Ordering::SeqCst);
+                self.success_count.store(0, Ordering::Relaxed);
+            }
+            STATE_OPEN if is_half_open_probe => {
+                // A concurrent record_failure already reopened the circuit between
+                // our can_execute() (when it was HALF_OPEN) and now. We still own
+                // a slot, so decrement it.
                 let _ = self.half_open_in_flight.fetch_update(
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                     |v| v.checked_sub(1),
                 );
-                warn!("Circuit breaker reopening (probe failed)");
-                self.state.store(STATE_OPEN, Ordering::SeqCst);
-                self.success_count.store(0, Ordering::Relaxed);
-                self.half_open_in_flight.store(0, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -237,6 +291,13 @@ impl CircuitBreaker {
     /// Current success count (for metrics).
     pub fn success_count(&self) -> u32 {
         self.success_count.load(Ordering::Relaxed)
+    }
+
+    /// Current half-open in-flight counter (for testing).
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn half_open_in_flight(&self) -> u32 {
+        self.half_open_in_flight.load(Ordering::Acquire)
     }
 
     /// Current state name (for metrics/logging).
@@ -329,15 +390,20 @@ impl CircuitBreakerCache {
     ///
     /// `target_key` should be `Some("host:port")` when the proxy uses an upstream,
     /// or `None` for direct backend proxies.
+    ///
+    /// Returns `Ok((cb, is_half_open_probe))`. The caller MUST thread
+    /// `is_half_open_probe` into every subsequent `record_success` /
+    /// `record_failure` call on this breaker so that the half-open in-flight
+    /// counter is decremented only for requests that actually hold a probe slot.
     pub fn can_execute(
         &self,
         proxy_id: &str,
         target_key: Option<&str>,
         config: &CircuitBreakerConfig,
-    ) -> Result<Arc<CircuitBreaker>, CircuitOpenError> {
+    ) -> Result<(Arc<CircuitBreaker>, bool), CircuitOpenError> {
         let cb = self.get_or_create(proxy_id, target_key, config);
-        cb.can_execute()?;
-        Ok(cb)
+        let is_half_open_probe = cb.can_execute()?;
+        Ok((cb, is_half_open_probe))
     }
 
     /// Snapshot of all circuit breaker states for metrics.

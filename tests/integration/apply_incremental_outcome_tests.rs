@@ -1,0 +1,405 @@
+//! Tests for [`ProxyState::apply_incremental`] outcome semantics.
+//!
+//! Regression guard for the bug where the DB polling loop unconditionally
+//! advanced `last_poll_at` after `apply_incremental` returned, even when the
+//! patched config was rejected by validation. With the previous boolean
+//! return type, callers could not distinguish "nothing to apply" from
+//! "rejected by validation", so the cursor advanced past rows that needed
+//! retry — and the 1-second `since_safe` margin was too narrow to ever
+//! re-fetch them, leaving permanent divergence between DB and in-memory
+//! config.
+//!
+//! These tests assert the three [`IncrementalApplyOutcome`] variants are
+//! returned correctly, and simulate a `last_poll_at` update logic identical
+//! to the polling loop in `src/modes/database.rs` to verify the cursor only
+//! advances on `Applied`/`NoChanges`, never on `Rejected`.
+
+use std::collections::HashMap;
+
+use chrono::{Duration, Utc};
+
+use ferrum_edge::config::db_loader::IncrementalResult;
+use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
+use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::proxy::{IncrementalApplyOutcome, ProxyState};
+
+/// Minimal test proxy with safe defaults.
+fn test_proxy(id: &str, listen_path: &str) -> Proxy {
+    Proxy {
+        id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        name: Some(format!("Test Proxy {}", id)),
+        hosts: vec![],
+        listen_path: Some(listen_path.to_string()),
+        backend_scheme: Some(BackendScheme::Http),
+        dispatch_kind: DispatchKind::from(BackendScheme::Http),
+        backend_host: "localhost".to_string(),
+        backend_port: 3000,
+        backend_path: None,
+        strip_listen_path: true,
+        preserve_host_header: false,
+        backend_connect_timeout_ms: 5000,
+        backend_read_timeout_ms: 30000,
+        backend_write_timeout_ms: 30000,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        resolved_tls: Default::default(),
+        dns_override: None,
+        dns_cache_ttl_seconds: None,
+        auth_mode: AuthMode::Single,
+        plugins: vec![],
+
+        pool_idle_timeout_seconds: None,
+        pool_enable_http_keep_alive: None,
+        pool_enable_http2: None,
+        pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
+        pool_http2_initial_stream_window_size: None,
+        pool_http2_initial_connection_window_size: None,
+        pool_http2_adaptive_window: None,
+        pool_http2_max_frame_size: None,
+        pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
+        upstream_id: None,
+        api_spec_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: Default::default(),
+        listen_port: None,
+        frontend_tls: false,
+        passthrough: false,
+        udp_idle_timeout_seconds: 60,
+        tcp_idle_timeout_seconds: Some(300),
+        allowed_methods: None,
+        allowed_ws_origins: vec![],
+        udp_max_response_amplification_factor: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+/// Minimal `EnvConfig` for in-process `ProxyState` construction (file mode).
+fn test_env_config() -> ferrum_edge::config::EnvConfig {
+    ferrum_edge::config::EnvConfig {
+        mode: ferrum_edge::config::env_config::OperatingMode::File,
+        log_level: "info".into(),
+        enable_streaming_latency_tracking: false,
+        proxy_http_port: 8000,
+        proxy_https_port: 8443,
+        frontend_tls_cert_path: None,
+        frontend_tls_key_path: None,
+        proxy_bind_address: "0.0.0.0".into(),
+        admin_http_port: 9000,
+        admin_https_port: 9443,
+        admin_tls_cert_path: None,
+        admin_tls_key_path: None,
+        admin_bind_address: "0.0.0.0".into(),
+        admin_jwt_secret: None,
+        db_type: None,
+        db_url: None,
+        db_poll_interval: 30,
+        db_tls_enabled: false,
+        db_tls_ca_cert_path: None,
+        db_tls_client_cert_path: None,
+        db_tls_client_key_path: None,
+        db_tls_insecure: false,
+        db_ssl_mode: None,
+        db_ssl_root_cert: None,
+        db_ssl_client_cert: None,
+        db_ssl_client_key: None,
+        file_config_path: Some("/tmp/test-config.json".into()),
+        db_config_backup_path: None,
+        db_failover_urls: Vec::new(),
+        db_read_replica_url: None,
+        cp_grpc_listen_addr: None,
+        cp_dp_grpc_jwt_secret: None,
+        dp_cp_grpc_url: None,
+        dp_cp_grpc_urls: Vec::new(),
+        dp_cp_failover_primary_retry_secs: 300,
+        cp_grpc_tls_cert_path: None,
+        cp_grpc_tls_key_path: None,
+        cp_grpc_tls_client_ca_path: None,
+        dp_grpc_tls_ca_cert_path: None,
+        dp_grpc_tls_client_cert_path: None,
+        dp_grpc_tls_client_key_path: None,
+        dp_grpc_tls_no_verify: false,
+        max_header_size_bytes: 32768,
+        max_single_header_size_bytes: 16384,
+        max_request_body_size_bytes: 10_485_760,
+        max_response_body_size_bytes: 10_485_760,
+        response_buffer_cutoff_bytes: 65_536,
+        h2_coalesce_target_bytes: 131_072,
+        dns_ttl_override: None,
+        dns_overrides: HashMap::new(),
+        dns_resolver_address: None,
+        dns_resolver_hosts_file: None,
+        dns_order: None,
+        dns_min_ttl: 5,
+        dns_stale_ttl: 3600,
+        dns_error_ttl: 1,
+        dns_failed_retry_interval: 10,
+        dns_warmup_concurrency: 500,
+        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        tls_ca_bundle_path: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        frontend_tls_client_ca_bundle_path: None,
+        admin_tls_client_ca_bundle_path: None,
+        tls_no_verify: false,
+        admin_read_only: false,
+        admin_tls_no_verify: false,
+        enable_http3: false,
+        http3_idle_timeout: 30,
+        http3_max_streams: 1000,
+        http3_stream_receive_window: 8_388_608,
+        http3_receive_window: 33_554_432,
+        http3_send_window: 8_388_608,
+        http3_connections_per_backend: 4,
+        http3_pool_idle_timeout_seconds: 120,
+        grpc_pool_ready_wait_ms: 1,
+        pool_cleanup_interval_seconds: 30,
+        tcp_idle_timeout_seconds: 300,
+        udp_max_sessions: 10_000,
+        udp_cleanup_interval_seconds: 10,
+        tls_min_version: "1.2".into(),
+        tls_max_version: "1.3".into(),
+        tls_cipher_suites: None,
+        tls_prefer_server_cipher_order: true,
+        tls_curves: None,
+        tls_session_cache_size: 4096,
+        stream_proxy_bind_address: "0.0.0.0".into(),
+        admin_allowed_cidrs: String::new(),
+        trusted_proxies: String::new(),
+        dns_cache_max_size: 10_000,
+        dns_slow_threshold_ms: None,
+        real_ip_header: None,
+        dtls_cert_path: None,
+        dtls_key_path: None,
+        dtls_client_ca_cert_path: None,
+        plugin_http_slow_threshold_ms: 1000,
+        admin_restore_max_body_size_mib: 100,
+        migrate_action: "up".into(),
+        migrate_dry_run: false,
+        worker_threads: None,
+        blocking_threads: None,
+        max_connections: 0,
+        tcp_listen_backlog: 2048,
+        server_http2_max_concurrent_streams: 250,
+        ..Default::default()
+    }
+}
+
+fn empty_proxy_state() -> ProxyState {
+    let dns_cache = DnsCache::new(DnsConfig {
+        global_overrides: HashMap::new(),
+        resolver_addresses: None,
+        hosts_file_path: None,
+        dns_order: None,
+        ttl_override_seconds: None,
+        min_ttl_seconds: 5,
+        stale_ttl_seconds: 3600,
+        error_ttl_seconds: 1,
+        max_cache_size: 10_000,
+        warmup_concurrency: 500,
+        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        slow_threshold_ms: None,
+        refresh_threshold_percent: 90,
+        failed_retry_interval_seconds: 10,
+        try_tcp_on_error: true,
+        num_concurrent_reqs: 3,
+        max_active_requests: 512,
+        max_concurrent_refreshes: 64,
+        shard_amount: 0,
+    });
+    let (state, _health_check_handles) = ProxyState::new(
+        GatewayConfig::default(),
+        dns_cache,
+        test_env_config(),
+        None,
+        None,
+    )
+    .unwrap();
+    state
+}
+
+fn empty_delta_at(poll_timestamp: chrono::DateTime<Utc>) -> IncrementalResult {
+    IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp,
+    }
+}
+
+fn delta_with_proxy(proxy: Proxy, poll_timestamp: chrono::DateTime<Utc>) -> IncrementalResult {
+    IncrementalResult {
+        added_or_modified_proxies: vec![proxy],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp,
+    }
+}
+
+/// Empty incremental result returns `NoChanges` so the polling loop can still
+/// advance `last_poll_at` (no work to retry).
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_incremental_empty_result_returns_no_changes() {
+    let state = empty_proxy_state();
+    let result = state.apply_incremental(empty_delta_at(Utc::now())).await;
+    assert_eq!(result, IncrementalApplyOutcome::NoChanges);
+}
+
+/// A valid incremental result returns `Applied` and the config is patched.
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_incremental_valid_changes_returns_applied() {
+    let state = empty_proxy_state();
+    assert!(state.config.load().proxies.is_empty());
+
+    let delta = delta_with_proxy(test_proxy("p1", "/api/v1"), Utc::now());
+    let result = state.apply_incremental(delta).await;
+
+    assert_eq!(result, IncrementalApplyOutcome::Applied);
+    let cfg = state.config.load();
+    assert_eq!(cfg.proxies.len(), 1);
+    assert_eq!(cfg.proxies[0].id, "p1");
+}
+
+/// Two proxies sharing a non-regex `listen_path` violate
+/// `validate_unique_listen_paths` and the patch is rejected. The returned
+/// outcome must be `Rejected` so the polling loop can leave `last_poll_at`
+/// untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_incremental_rejected_returns_rejected_variant() {
+    let state = empty_proxy_state();
+
+    // Build a delta that violates uniqueness: two proxies with the same
+    // `listen_path` and overlapping (empty/catch-all) `hosts`.
+    let mut p1 = test_proxy("p1", "/dup");
+    let mut p2 = test_proxy("p2", "/dup");
+    p1.hosts = vec![];
+    p2.hosts = vec![];
+
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![p1, p2],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+
+    let result = state.apply_incremental(delta).await;
+    assert_eq!(result, IncrementalApplyOutcome::Rejected);
+
+    // Critical: the in-memory config must remain unchanged on rejection.
+    assert!(
+        state.config.load().proxies.is_empty(),
+        "rejected delta must not be partially applied"
+    );
+}
+
+/// Reproduces the polling-loop cursor logic from `src/modes/database.rs` and
+/// asserts that:
+///   - `Applied` advances `last_poll_at`.
+///   - `NoChanges` advances `last_poll_at`.
+///   - `Rejected` leaves `last_poll_at` unchanged (so the next poll's
+///     `since` parameter equals the prior `last_poll_at`, meaning the
+///     rejected rows will be re-fetched).
+///
+/// Without the fix, `last_poll_at` advanced unconditionally and the
+/// `since_safe = since - 1s` margin was insufficient to re-fetch a rejected
+/// resource whose `updated_at` was older than that one-second window, so the
+/// rejected row silently disappeared from the gateway's view of the DB.
+#[tokio::test(flavor = "multi_thread")]
+async fn polling_cursor_only_advances_on_applied_or_no_changes() {
+    let state = empty_proxy_state();
+
+    // ------ Cycle 1: rejected delta. ------
+    let cursor_before = Utc::now() - Duration::seconds(60);
+    let mut last_poll_at = Some(cursor_before);
+
+    let mut p1 = test_proxy("p1", "/dup");
+    let mut p2 = test_proxy("p2", "/dup");
+    p1.hosts = vec![];
+    p2.hosts = vec![];
+    let rejected_ts = Utc::now();
+    let rejected_delta = IncrementalResult {
+        added_or_modified_proxies: vec![p1, p2],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: rejected_ts,
+    };
+
+    let outcome = state.apply_incremental(rejected_delta).await;
+    assert_eq!(outcome, IncrementalApplyOutcome::Rejected);
+    // Mirror the polling loop: advance only on Applied or NoChanges.
+    match outcome {
+        IncrementalApplyOutcome::Applied | IncrementalApplyOutcome::NoChanges => {
+            last_poll_at = Some(rejected_ts);
+        }
+        IncrementalApplyOutcome::Rejected => { /* intentionally do not advance */ }
+    }
+    assert_eq!(
+        last_poll_at,
+        Some(cursor_before),
+        "Rejected outcome must NOT advance last_poll_at — the rejected rows \
+         would otherwise fall outside the 1-second since_safe margin and \
+         silently disappear from the gateway's view of the DB"
+    );
+
+    // ------ Cycle 2: empty delta. ------
+    let empty_ts = Utc::now();
+    let outcome = state.apply_incremental(empty_delta_at(empty_ts)).await;
+    assert_eq!(outcome, IncrementalApplyOutcome::NoChanges);
+    match outcome {
+        IncrementalApplyOutcome::Applied | IncrementalApplyOutcome::NoChanges => {
+            last_poll_at = Some(empty_ts);
+        }
+        IncrementalApplyOutcome::Rejected => {}
+    }
+    assert_eq!(
+        last_poll_at,
+        Some(empty_ts),
+        "NoChanges must advance last_poll_at — there is no work to retry"
+    );
+
+    // ------ Cycle 3: applied delta. ------
+    let applied_ts = Utc::now();
+    let applied_delta = delta_with_proxy(test_proxy("p3", "/api/v3"), applied_ts);
+    let outcome = state.apply_incremental(applied_delta).await;
+    assert_eq!(outcome, IncrementalApplyOutcome::Applied);
+    match outcome {
+        IncrementalApplyOutcome::Applied | IncrementalApplyOutcome::NoChanges => {
+            last_poll_at = Some(applied_ts);
+        }
+        IncrementalApplyOutcome::Rejected => {}
+    }
+    assert_eq!(
+        last_poll_at,
+        Some(applied_ts),
+        "Applied must advance last_poll_at"
+    );
+    assert_eq!(state.config.load().proxies.len(), 1);
+    assert_eq!(state.config.load().proxies[0].id, "p3");
+}

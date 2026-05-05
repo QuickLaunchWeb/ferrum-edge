@@ -14,6 +14,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [WebSocket over HTTP/3 — not supported](#websocket-over-http3--not-supported)
 - [QUIC connection migration](#quic-connection-migration)
 - [Header size limits](#header-size-limits)
+- [Flow-control window tuning](#flow-control-window-tuning)
 - [Environment variables](#environment-variables)
 
 ## Listener and enablement
@@ -203,6 +204,10 @@ The H3 listener enforces its own per-header and total-header size limits:
 
 These are enforced separately from hyper's built-in validation because the H3 listener parses headers via the `h3` crate, not via hyper. The `Host` value used for routing is extracted from an already-validated header, so separate host-length validation is unnecessary.
 
+## Flow-control window tuning
+
+The default QUIC flow-control windows are moderate by design: 8 MiB per stream, 32 MiB receive budget per connection, and 8 MiB send budget per connection. The connection-level receive window is the aggregate governor, so active per-stream receive windows cannot exceed the connection receive budget in total. Memory budget per QUIC connection scales with `FERRUM_HTTP3_RECEIVE_WINDOW + FERRUM_HTTP3_SEND_WINDOW`; raise these values only after benchmarking a workload that benefits from larger windows. Explicit env values continue to override these defaults.
+
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -215,8 +220,8 @@ These are enforced separately from hyper's built-in validation because the H3 li
 | `FERRUM_HTTP3_SEND_WINDOW` | `8,388,608` | Connection-level send window (8 MiB) |
 | `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | `4` | H3 backend pool connections per target |
 | `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | `120` | H3 backend connection idle eviction |
-| `FERRUM_HTTP3_COALESCE_MIN_BYTES` | `32,768` | Response coalesce flush target |
-| `FERRUM_HTTP3_COALESCE_MAX_BYTES` | `32,768` | Response coalesce buffer capacity |
-| `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | `200` | Response coalesce time-based flush interval |
+| `FERRUM_HTTP3_COALESCE_MIN_BYTES` | `32,768` | Response coalesce flush target. Clamped to `[H3_COALESCE_MIN_FLOOR=1 KiB, H3_COALESCE_MAX_CAP=1 MiB]`. |
+| `FERRUM_HTTP3_COALESCE_MAX_BYTES` | `32,768` | Response coalesce buffer capacity. Same H3-specific bounds — see [docs/response_body_streaming.md](response_body_streaming.md#response-body-coalescing) for the cross-protocol coalescing architecture. |
+| `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | `200` | Response coalesce time-based flush interval. H3-specific (the H1/H2-via-reqwest path uses opportunistic Pending-flush instead, so it has no flush-interval knob). |
 | `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` | `32` | Cross-protocol bridge mpsc capacity (range: 1–1024) |
 | `FERRUM_HTTP3_INITIAL_MTU` | `1500` | Initial QUIC path MTU (quinn clamps 1200–65527) |

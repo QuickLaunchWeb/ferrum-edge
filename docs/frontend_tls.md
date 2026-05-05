@@ -33,6 +33,20 @@ Optional for mTLS mode:
 export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="/path/to/client-ca-bundle.pem"
 ```
 
+### Handshake Timeout
+
+```bash
+# Seconds allowed for a client to complete frontend TLS or DTLS negotiation.
+# Default: 10. Set to 0 only when an upstream load balancer enforces an
+# equivalent pre-handshake deadline.
+export FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS=10
+```
+
+This timeout applies before HTTP header parsing begins, so it protects HTTPS,
+WSS, gRPC-over-TLS, TCP+TLS stream listeners, and UDP+DTLS listeners from slow
+or stalled handshakes. After TLS completes, HTTP requests are governed by
+`FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS`.
+
 ## Configuration Scenarios
 
 ### 1. HTTP Only (Default)

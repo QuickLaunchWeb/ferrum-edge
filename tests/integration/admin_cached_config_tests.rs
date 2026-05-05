@@ -64,6 +64,21 @@ fn generate_test_token(config: &TestConfig) -> String {
     encode(&header, &claims, &key).unwrap()
 }
 
+fn generate_expired_test_token(config: &TestConfig) -> String {
+    let now = chrono::Utc::now();
+    let claims = json!({
+        "iss": config.jwt_issuer,
+        "sub": "test-user",
+        "iat": (now - chrono::Duration::seconds(900)).timestamp(),
+        "nbf": (now - chrono::Duration::seconds(900)).timestamp(),
+        "exp": (now - chrono::Duration::seconds(300)).timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string()
+    });
+    let header = Header::new(jsonwebtoken::Algorithm::HS256);
+    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+    encode(&header, &claims, &key).unwrap()
+}
+
 fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Proxy {
     Proxy {
         id: id.to_string(),
@@ -281,6 +296,8 @@ async fn test_list_proxies_falls_back_to_cached_config() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -323,6 +340,8 @@ async fn test_list_consumers_falls_back_to_cached_config() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -360,6 +379,8 @@ async fn test_list_plugin_configs_falls_back_to_cached_config() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -401,6 +422,8 @@ async fn test_get_proxy_by_id_falls_back_to_cached_config() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -437,6 +460,8 @@ async fn test_get_proxy_not_found_in_cache() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -471,6 +496,8 @@ async fn test_get_consumer_by_id_falls_back_to_cached_config() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -507,6 +534,8 @@ async fn test_get_consumer_not_found_in_cache() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -541,6 +570,8 @@ async fn test_get_plugin_config_by_id_falls_back_to_cached_config() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -578,6 +609,8 @@ async fn test_get_plugin_config_not_found_in_cache() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -612,6 +645,8 @@ async fn test_list_proxies_no_db_no_cache_returns_503() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -649,6 +684,8 @@ async fn test_list_consumers_no_db_no_cache_returns_503() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -686,6 +723,8 @@ async fn test_get_proxy_no_db_no_cache_returns_503() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -727,6 +766,8 @@ async fn test_health_endpoint_shows_cached_config_info() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -769,6 +810,8 @@ async fn test_health_endpoint_shows_no_cached_config() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -809,6 +852,8 @@ async fn test_health_endpoint_returns_503_until_startup_is_ready() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -823,7 +868,7 @@ async fn test_health_endpoint_returns_503_until_startup_is_ready() {
     assert_eq!(body["status"], "starting");
     assert_eq!(body["ready"], false);
 
-    startup_ready.store(true, Ordering::Relaxed);
+    startup_ready.store(true, Ordering::Release);
 
     let resp = client
         .get(format!("{}/health", base_url))
@@ -861,6 +906,8 @@ async fn test_cached_config_reflects_live_updates() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -961,7 +1008,70 @@ fn create_pagination_admin_state(tc: &TestConfig) -> AdminState {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     }
+}
+
+#[tokio::test]
+async fn test_charges_requires_admin_jwt() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let client = reqwest::Client::new();
+
+    let unauthenticated = client
+        .get(format!("{}/charges", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let body: Value = unauthenticated.json().await.unwrap();
+    assert_eq!(body["error"], "Missing Authorization header");
+
+    let token = generate_test_token(&tc);
+    let authenticated_json = client
+        .get(format!("{}/charges?format=json", base_url))
+        .header("authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authenticated_json.status(), reqwest::StatusCode::OK);
+    let body: Value = authenticated_json.json().await.unwrap();
+    assert!(body["consumers"].is_object());
+
+    let authenticated_prometheus = client
+        .get(format!("{}/charges", base_url))
+        .header("authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authenticated_prometheus.status(), reqwest::StatusCode::OK);
+    let content_type = authenticated_prometheus
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(content_type.starts_with("text/plain"));
+    let body = authenticated_prometheus.text().await.unwrap();
+    assert!(body.contains("ferrum_api_chargeable_calls_total"));
+
+    let invalid = client
+        .get(format!("{}/charges", base_url))
+        .header("authorization", "Bearer not.a.jwt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let expired_token = generate_expired_test_token(&tc);
+    let expired = client
+        .get(format!("{}/charges", base_url))
+        .header("authorization", format!("Bearer {}", expired_token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -1123,6 +1233,8 @@ async fn create_db_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDi
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     (state, temp_dir)
 }
@@ -1208,6 +1320,8 @@ async fn create_db_admin_state_with_availability(
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     (state, temp_dir)
 }
@@ -1338,6 +1452,8 @@ async fn test_batch_create_read_only_rejected() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -1655,6 +1771,8 @@ async fn test_restore_read_only_rejected() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -1804,6 +1922,8 @@ async fn test_list_upstreams_falls_back_to_cached_config() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -1846,6 +1966,8 @@ async fn test_get_upstream_by_id_falls_back_to_cached_config() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -1882,6 +2004,8 @@ async fn test_get_upstream_not_found_in_cache() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -1914,6 +2038,8 @@ async fn test_list_upstreams_no_db_no_cache_returns_503() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -1951,6 +2077,8 @@ async fn test_get_upstream_no_db_no_cache_returns_503() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -2266,6 +2394,8 @@ async fn test_backup_falls_back_to_cached_config_when_no_db() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -2307,6 +2437,8 @@ async fn test_backup_no_db_no_cache_returns_503() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -2347,6 +2479,8 @@ async fn test_create_proxy_returns_503_when_no_db() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -2384,6 +2518,8 @@ async fn test_create_upstream_returns_503_when_no_db() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -2467,6 +2603,8 @@ async fn test_cached_config_reflects_upstream_updates() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -2726,6 +2864,8 @@ async fn test_health_endpoint_shows_db_availability() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -2883,6 +3023,8 @@ async fn test_cluster_endpoint_requires_auth() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -2919,6 +3061,8 @@ async fn test_cluster_endpoint_cp_mode_empty_registry() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: Some(registry),
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -2970,6 +3114,8 @@ async fn test_cluster_endpoint_cp_mode_with_connected_dps() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: Some(registry),
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -3021,6 +3167,8 @@ async fn test_cluster_endpoint_dp_mode_connected() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: Some(conn_state),
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -3059,6 +3207,8 @@ async fn test_cluster_endpoint_dp_mode_disconnected() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: Some(conn_state),
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -3093,6 +3243,8 @@ async fn test_cluster_endpoint_database_mode() {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);

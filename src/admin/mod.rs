@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
@@ -62,11 +62,39 @@ pub struct AdminState {
     pub cached_config: Option<Arc<ArcSwap<GatewayConfig>>>,
     pub mode: String,
     pub read_only: bool,
-    /// Startup readiness flag flipped by the mode once listeners are bound and
-    /// the gateway has finished its initial loading work.
+    /// Startup readiness flag — flipped once by the mode after the initial config
+    /// is loaded, all caches are built, DNS/pools are warmed, and every listener
+    /// (proxy, admin, stream) is bound and accepting connections.
+    ///
+    /// While `false`, `/health` returns 503 `"starting"`. Once `true`, `/health`
+    /// returns 200 (possibly `"degraded"` if DB is unreachable).
+    ///
+    /// **Intentionally set before the DB polling loop starts** in database and CP
+    /// modes. Two paths apply in database mode:
+    ///
+    ///   1. Normal — `load_full_config()` succeeded, proving DB connectivity.
+    ///   2. Backup — `load_full_config()` failed but `FERRUM_DB_CONFIG_BACKUP_PATH`
+    ///      was set, so config was restored from the on-disk backup. `db_available`
+    ///      starts `false`, `/health` reports `"degraded"`, and admin writes are
+    ///      blocked until the polling loop reconnects to the DB.
+    ///
+    /// CP mode always requires a live DB (no backup path).
+    ///
+    /// The polling loop handles *ongoing incremental updates*, not initial
+    /// readiness. `/health` independently validates DB connectivity via a
+    /// `SELECT 1` check (cached 15 s via `cached_db_health`), so DB failures
+    /// surface in the health response regardless of polling state. Deferring
+    /// readiness until the first poll tick would add an unnecessary
+    /// `FERRUM_DB_POLL_INTERVAL_SECONDS` (default 30 s) startup delay.
+    ///
+    /// DP mode differs: it starts with an empty config and defers `startup_ready`
+    /// until the first CP snapshot is applied + backend capabilities are classified.
     pub startup_ready: Option<Arc<AtomicBool>>,
     /// Dynamic flag set by the DB polling loop. When `false`, write operations
     /// are rejected early to preserve the cached config until the DB recovers.
+    /// This flag is orthogonal to `startup_ready` — a gateway can be ready to
+    /// serve traffic (`startup_ready=true`) while admin writes are blocked
+    /// (`db_available=false`) during a transient DB outage.
     pub db_available: Option<Arc<AtomicBool>>,
     /// Max request body size in MiB for POST /restore.
     pub admin_restore_max_body_size_mib: usize,
@@ -87,6 +115,10 @@ pub struct AdminState {
     pub dp_registry: Option<Arc<DpNodeRegistry>>,
     /// Connection state to the CP (DP mode only).
     pub cp_connection_state: Option<Arc<ArcSwap<DpCpConnectionState>>>,
+    /// Admin HTTP header read timeout (seconds). 0 disables.
+    pub admin_http_header_read_timeout_seconds: u64,
+    /// Admin TLS handshake timeout (seconds). 0 disables.
+    pub admin_tls_handshake_timeout_seconds: u64,
 }
 
 impl AdminState {
@@ -215,20 +247,16 @@ async fn handle_admin_tls_connection(
     use tokio_rustls::TlsAcceptor;
 
     let acceptor = TlsAcceptor::from(tls_config);
-    let tls_stream = match acceptor.accept(stream).await {
-        Ok(stream) => {
-            info!("Admin TLS connection established from {}", remote_addr.ip());
-            stream
-        }
-        Err(e) => {
-            warn!(
-                "Admin TLS handshake failed from {}: {}",
-                remote_addr.ip(),
-                e
-            );
-            return Err(e.into());
-        }
-    };
+    let tls_handshake_timeout = state.admin_tls_handshake_timeout_seconds;
+    let header_read_timeout = state.admin_http_header_read_timeout_seconds;
+    let tls_stream = crate::tls::accept_with_optional_timeout(
+        &acceptor,
+        stream,
+        tls_handshake_timeout,
+        &remote_addr,
+    )
+    .await?;
+    info!("Admin TLS connection established from {}", remote_addr.ip());
 
     // Convert TLS stream to TokioIo for hyper
     let io = hyper_util::rt::TokioIo::new(tls_stream);
@@ -242,8 +270,15 @@ async fn handle_admin_tls_connection(
     // Use auto builder to support both HTTP/1.1 and HTTP/2 via ALPN negotiation.
     // The TLS config advertises both h2 and http/1.1, so clients can negotiate
     // either protocol.
-    let builder =
+    let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    // This header timer only applies to the HTTP/1 admin path; this builder
+    // does not expose an equivalent HTTP/2 admin header deadline.
+    if header_read_timeout > 0 {
+        let mut http1 = builder.http1();
+        http1.timer(hyper_util::rt::TokioTimer::new());
+        http1.header_read_timeout(Duration::from_secs(header_read_timeout));
+    }
     let conn = builder.serve_connection(io, svc);
 
     if let Err(e) = conn.await {
@@ -260,12 +295,19 @@ async fn handle_admin_connection(
     state: AdminState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let io = TokioIo::new(stream);
+    let header_read_timeout_seconds = state.admin_http_header_read_timeout_seconds;
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
         async move { handle_admin_request(req, state).await }
     });
 
-    if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+    let mut builder = http1::Builder::new();
+    if header_read_timeout_seconds > 0 {
+        builder.timer(hyper_util::rt::TokioTimer::new());
+        builder.header_read_timeout(Duration::from_secs(header_read_timeout_seconds));
+    }
+
+    if let Err(e) = builder.serve_connection(io, svc).await {
         error!("Admin HTTP connection error: {}", e);
     }
 
@@ -464,10 +506,13 @@ pub async fn handle_admin_request(
             health_status["status"] = json!("degraded");
         }
 
+        // Acquire pairs with the Release store in each mode's startup path
+        // (dp_client, file, database, control_plane). On x86 this is free;
+        // on ARM it ensures cross-task visibility of the readiness flip.
         let startup_ready = state
             .startup_ready
             .as_ref()
-            .is_none_or(|flag| flag.load(Ordering::Relaxed));
+            .is_none_or(|flag| flag.load(Ordering::Acquire));
         health_status["ready"] = json!(startup_ready);
 
         // Report cached config availability for resilience visibility
@@ -504,10 +549,15 @@ pub async fn handle_admin_request(
                 crate::overload::OverloadLevel::Pressure => StatusCode::OK,
                 crate::overload::OverloadLevel::Critical => StatusCode::SERVICE_UNAVAILABLE,
             };
-            return Ok(json_response(
-                status,
-                &serde_json::to_value(&snapshot).unwrap_or_default(),
-            ));
+            let mut snapshot_value = serde_json::to_value(&snapshot).unwrap_or_default();
+            if let Some(obj) = snapshot_value.as_object_mut() {
+                obj.insert(
+                    "stream_listeners".to_string(),
+                    serde_json::to_value(proxy_state.stream_listener_manager.overload_snapshot())
+                        .unwrap_or_default(),
+                );
+            }
+            return Ok(json_response(status, &snapshot_value));
         }
         return Ok(json_response(
             StatusCode::OK,
@@ -529,37 +579,6 @@ pub async fn handle_admin_request(
                 Response::new(Full::new(Bytes::from("# error rendering metrics\n")))
             });
         return Ok(resp);
-    }
-
-    // API chargeback endpoint (unauthenticated for scraping, like /metrics)
-    if path == "/charges" && method == Method::GET {
-        let registry = crate::plugins::api_chargeback::global_registry();
-        // Support ?format=json for JSON output, default to Prometheus text format
-        let query = req.uri().query().unwrap_or("");
-        let use_json = query.contains("format=json");
-        if use_json {
-            let json_output = registry.render_json();
-            let resp = Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/json")
-                .header("X-Content-Type-Options", "nosniff")
-                .header("Cache-Control", "no-store")
-                .body(Full::new(Bytes::from(json_output)))
-                .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
-            return Ok(resp);
-        } else {
-            let prom_output = registry.render_prometheus();
-            let resp = Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-                .header("X-Content-Type-Options", "nosniff")
-                .header("Cache-Control", "no-store")
-                .body(Full::new(Bytes::from(prom_output)))
-                .unwrap_or_else(|_| {
-                    Response::new(Full::new(Bytes::from("# error rendering charges\n")))
-                });
-            return Ok(resp);
-        }
     }
 
     // Authenticate
@@ -588,6 +607,38 @@ pub async fn handle_admin_request(
                 StatusCode::UNAUTHORIZED,
                 &json!({"error": format!("Token verification failed: {}", msg)}),
             ));
+        }
+    }
+
+    // API chargeback endpoint. Chargeback output contains customer/business data,
+    // so it stays behind the standard admin JWT gate even though it is scrapeable.
+    if path == "/charges" && method == Method::GET {
+        let registry = crate::plugins::api_chargeback::global_registry();
+        // Support ?format=json for JSON output, default to Prometheus text format
+        let query = req.uri().query().unwrap_or("");
+        let use_json = query.contains("format=json");
+        if use_json {
+            let json_output = registry.render_json();
+            let resp = Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .header("X-Content-Type-Options", "nosniff")
+                .header("Cache-Control", "no-store")
+                .body(Full::new(Bytes::from(json_output)))
+                .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+            return Ok(resp);
+        } else {
+            let prom_output = registry.render_prometheus();
+            let resp = Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                .header("X-Content-Type-Options", "nosniff")
+                .header("Cache-Control", "no-store")
+                .body(Full::new(Bytes::from(prom_output)))
+                .unwrap_or_else(|_| {
+                    Response::new(Full::new(Bytes::from("# error rendering charges\n")))
+                });
+            return Ok(resp);
         }
     }
 
@@ -1294,7 +1345,6 @@ fn validate_plugin_config_definition(pc: &PluginConfig) -> Result<(), String> {
 // ---- Metrics ----
 
 use std::sync::OnceLock;
-use std::time::Duration;
 
 /// Process-global cache for the metrics JSON response.
 static METRICS_CACHE: OnceLock<arc_swap::ArcSwap<Option<(Instant, Bytes)>>> = OnceLock::new();
@@ -1690,12 +1740,23 @@ async fn handle_batch_create(
         if let Some(upstream_id) = proxy.upstream_id.as_deref()
             && !batch_upstream_ids.contains(upstream_id)
         {
-            match db.check_upstream_exists(upstream_id).await {
+            match db.check_upstream_exists(upstream_id, namespace).await {
                 Ok(true) => {}
-                Ok(false) => validation_errors.push(format!(
-                    "Proxy '{}' references non-existent upstream_id '{}'",
-                    proxy.id, upstream_id
-                )),
+                Ok(false) => {
+                    // Distinguish "missing" from "wrong namespace" so the
+                    // operator's diagnostic points at the real problem.
+                    let message = match db.get_upstream(upstream_id).await {
+                        Ok(Some(other)) => format!(
+                            "Proxy '{}' references upstream_id '{}' from namespace '{}' (proxy is in namespace '{}'); cross-namespace references are forbidden",
+                            proxy.id, upstream_id, other.namespace, namespace
+                        ),
+                        _ => format!(
+                            "Proxy '{}' references non-existent upstream_id '{}'",
+                            proxy.id, upstream_id
+                        ),
+                    };
+                    validation_errors.push(message);
+                }
                 Err(err) => validation_errors.push(format!(
                     "Proxy '{}' upstream reference check failed: {}",
                     proxy.id, err
@@ -1736,7 +1797,7 @@ async fn handle_batch_create(
 
         if !unresolved.is_empty() {
             match db
-                .validate_proxy_plugin_associations(&proxy.id, &unresolved)
+                .validate_proxy_plugin_associations(&proxy.id, namespace, &unresolved)
                 .await
             {
                 Ok(errs) => validation_errors.extend(errs),
@@ -1752,12 +1813,24 @@ async fn handle_batch_create(
         if let Some(proxy_id) = plugin_config.proxy_id.as_deref()
             && !batch_proxy_ids.contains(proxy_id)
         {
-            match db.check_proxy_exists(proxy_id).await {
+            match db.check_proxy_exists(proxy_id, namespace).await {
                 Ok(true) => {}
-                Ok(false) => validation_errors.push(format!(
-                    "PluginConfig '{}' references non-existent proxy_id '{}'",
-                    plugin_config.id, proxy_id
-                )),
+                Ok(false) => {
+                    // Distinguish "missing" from "wrong namespace" — the
+                    // referenced proxy may exist in another namespace, in
+                    // which case the operator must move or recreate it.
+                    let message = match db.get_proxy(proxy_id).await {
+                        Ok(Some(other)) => format!(
+                            "PluginConfig '{}' references proxy_id '{}' from namespace '{}' (plugin_config is in namespace '{}'); cross-namespace references are forbidden",
+                            plugin_config.id, proxy_id, other.namespace, namespace
+                        ),
+                        _ => format!(
+                            "PluginConfig '{}' references non-existent proxy_id '{}'",
+                            plugin_config.id, proxy_id
+                        ),
+                    };
+                    validation_errors.push(message);
+                }
                 Err(err) => validation_errors.push(format!(
                     "PluginConfig '{}' proxy reference check failed: {}",
                     plugin_config.id, err

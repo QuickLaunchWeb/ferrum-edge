@@ -23,15 +23,16 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
-use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
+use crate::config::types::{BackendScheme, Proxy};
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
-use crate::load_balancer::LoadBalancerCache;
-use crate::plugin_cache::PluginCache;
+use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
 use crate::plugins::{
-    Plugin, PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary,
-    UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
+    Direction, Plugin, PluginResult, ProxyProtocol, StreamConnectionContext,
+    StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
 };
+use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
+use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 
 /// Maximum datagram size for UDP forwarding.
 const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
@@ -40,6 +41,9 @@ const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
 #[derive(Default)]
 pub struct UdpProxyMetrics {
     pub active_sessions: AtomicU64,
+    /// DTLS demux peers tracked by the frontend DTLS server. Includes peers
+    /// that have not completed the handshake yet.
+    pub dtls_demux_sessions: Arc<AtomicU64>,
     pub total_sessions: AtomicU64,
     pub datagrams_in: AtomicU64,
     pub datagrams_out: AtomicU64,
@@ -89,12 +93,127 @@ struct UdpSession {
     consumer_username: Option<String>,
     /// Plugin metadata from on_stream_connect, carried to on_stream_disconnect.
     metadata: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Plugins and proxy metadata resolved from the RequestEpoch used to create this session.
+    plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    datagram_plugins: Arc<[Arc<dyn Plugin>]>,
+    proxy_id: String,
+    proxy_name: Option<String>,
+    proxy_namespace: String,
+    backend_scheme: BackendScheme,
+    listen_port: u16,
+    idle_timeout_ms: u64,
+    /// RAII guard that increments [`crate::overload::OverloadState::active_connections`]
+    /// on construction and decrements on drop. Each UDP session counts as one
+    /// connection toward the global pressure-shedding threshold so pure-UDP
+    /// gateways and mixed deployments contribute correctly to overload state
+    /// (parity with TCP/H3, which carry their own `ConnectionGuard` in the
+    /// per-connection task). Field is prefixed with `_` because it is held
+    /// solely for its `Drop` side-effect — the counter decrements automatically
+    /// when the session is removed (idle expiry, backend disconnect, or
+    /// ungraceful drop on listener shutdown).
+    _overload_guard: Option<crate::overload::ConnectionGuard>,
 }
 
 /// UDP session map using ahash (AES-NI accelerated) for faster per-datagram lookups.
 /// SocketAddr keys are kernel-provided (not attacker-controlled), so cryptographic
 /// hashing is unnecessary — speed wins here.
 type SessionMap = Arc<DashMap<SocketAddr, Arc<UdpSession>, ahash::RandomState>>;
+
+struct UdpSessionEpochView {
+    proxy: Proxy,
+    plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    datagram_plugins: Arc<[Arc<dyn Plugin>]>,
+    consumer_index: Arc<ConsumerIndex>,
+    sni_hostname: Option<String>,
+}
+
+fn resolve_udp_session_epoch_view(
+    listener_proxy_id: &str,
+    epoch: &RequestEpoch,
+    initial_data: &[u8],
+    sni_proxy_ids: Option<&[String]>,
+    listen_port: u16,
+) -> Result<UdpSessionEpochView, anyhow::Error> {
+    let base_proxy = epoch
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.id == listener_proxy_id)
+        .ok_or_else(|| anyhow::anyhow!("Proxy {} not found", listener_proxy_id))?;
+
+    let sni_hostname = if base_proxy.passthrough {
+        super::sni::extract_sni_from_dtls_client_hello(initial_data)
+    } else {
+        None
+    };
+
+    let resolved_proxy_id = if let Some(sni_ids) = sni_proxy_ids {
+        super::sni::resolve_proxy_by_sni(sni_hostname.as_deref(), sni_ids, &epoch.config)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No matching passthrough proxy for SNI {:?} on port {}",
+                    sni_hostname,
+                    listen_port
+                )
+            })?
+    } else {
+        listener_proxy_id
+    };
+
+    let proxy = epoch
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.id == resolved_proxy_id)
+        .ok_or_else(|| anyhow::anyhow!("Proxy {} not found", resolved_proxy_id))?
+        .clone();
+    let plugins = epoch
+        .plugin_cache
+        .get_plugins_for_protocol(&proxy.id, ProxyProtocol::Udp);
+    let datagram_plugins: Arc<[Arc<dyn Plugin>]> = plugins
+        .iter()
+        .filter(|p| p.requires_udp_datagram_hooks())
+        .cloned()
+        .collect();
+    let consumer_index = Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
+
+    Ok(UdpSessionEpochView {
+        proxy,
+        plugins,
+        datagram_plugins,
+        consumer_index,
+        sni_hostname,
+    })
+}
+
+async fn udp_datagram_allowed(
+    datagram_plugins: &[Arc<dyn Plugin>],
+    client_addr: SocketAddr,
+    proxy_id: &str,
+    proxy_name: Option<&str>,
+    listen_port: u16,
+    datagram_size: usize,
+    direction: UdpDatagramDirection,
+) -> bool {
+    if datagram_plugins.is_empty() {
+        return true;
+    }
+
+    let ctx = UdpDatagramContext {
+        client_ip: Arc::from(client_addr.ip().to_string()),
+        proxy_id: Arc::from(proxy_id),
+        proxy_name: proxy_name.map(Arc::from),
+        listen_port,
+        datagram_size,
+        direction,
+    };
+    for plugin in datagram_plugins {
+        if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
+            return false;
+        }
+    }
+    true
+}
 
 struct UdpDisconnectContext<'a> {
     namespace: &'a str,
@@ -321,11 +440,14 @@ pub struct UdpListenerConfig {
     pub port: u16,
     pub bind_addr: IpAddr,
     pub proxy_id: String,
-    pub config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     pub dns_cache: DnsCache,
-    pub load_balancer_cache: Arc<LoadBalancerCache>,
-    pub consumer_index: Arc<ConsumerIndex>,
+    pub request_epoch: Arc<RequestEpochStore>,
     pub shutdown: watch::Receiver<bool>,
+    /// Optional gateway-wide shutdown receiver (SIGTERM/SIGINT). When `Some`,
+    /// the receive loop exits as soon as either this OR the per-listener
+    /// `shutdown` channel fires. Injected by [`crate::proxy::stream_listener::StreamListenerManager`]
+    /// from the watch channel created in `main.rs`.
+    pub global_shutdown: Option<watch::Receiver<bool>>,
     pub metrics: Arc<UdpProxyMetrics>,
     /// DTLS server config for frontend termination. When `Some`, the listener
     /// accepts DTLS connections from clients instead of plain UDP.
@@ -333,9 +455,10 @@ pub struct UdpListenerConfig {
     pub tls_no_verify: bool,
     /// Maximum concurrent sessions per proxy (from `FERRUM_UDP_MAX_SESSIONS`, default 10000).
     pub max_sessions: usize,
+    /// Frontend TLS/DTLS handshake timeout in seconds. 0 disables the deadline.
+    pub frontend_tls_handshake_timeout_seconds: u64,
     /// Session cleanup interval in seconds (from `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS`, default 10).
     pub cleanup_interval_seconds: u64,
-    pub plugin_cache: Arc<PluginCache>,
     /// Circuit breaker cache shared with HTTP proxies.
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// Certificate Revocation Lists for backend DTLS verification.
@@ -378,17 +501,16 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         port,
         bind_addr,
         proxy_id,
-        config,
         dns_cache,
-        load_balancer_cache,
-        consumer_index,
+        request_epoch,
         shutdown,
+        global_shutdown,
         metrics,
         frontend_dtls_config,
         tls_no_verify,
         max_sessions,
+        frontend_tls_handshake_timeout_seconds,
         cleanup_interval_seconds,
-        plugin_cache,
         circuit_breaker_cache,
         crls,
         started,
@@ -410,16 +532,15 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             port,
             bind_addr,
             proxy_id,
-            config,
             dns_cache,
-            load_balancer_cache,
-            consumer_index,
+            request_epoch,
             shutdown,
+            global_shutdown,
             metrics,
             dtls_config,
             tls_no_verify,
             max_sessions,
-            plugin_cache,
+            frontend_tls_handshake_timeout_seconds,
             circuit_breaker_cache,
             crls,
             started,
@@ -501,51 +622,21 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
 
     let sessions: SessionMap = Arc::new(DashMap::with_hasher(ahash::RandomState::default()));
 
-    // Pre-resolve plugins and proxy metadata for this listener.
-    let plugins = plugin_cache.get_plugins_for_protocol(&proxy_id, ProxyProtocol::Udp);
-    let has_datagram_plugins = plugins.iter().any(|p| p.requires_udp_datagram_hooks());
-    let (proxy_name, proxy_namespace, backend_scheme) = {
-        let current = config.load();
-        current
-            .proxies
-            .iter()
-            .find(|p| p.id == proxy_id)
-            .map(|p| (p.name.clone(), p.namespace.clone(), p.effective_scheme()))
-            .unwrap_or((
-                None,
-                crate::config::types::default_namespace(),
-                BackendScheme::Udp,
-            ))
-    };
-
-    // Look up idle timeout from config
-    let idle_timeout = {
-        let current = config.load();
-        current
-            .proxies
-            .iter()
-            .find(|p| p.id == proxy_id)
-            .map(|p| p.udp_idle_timeout_seconds)
-            .unwrap_or(60)
-    };
-
     // Spawn session cleanup task
     spawn_session_cleanup(
         sessions.clone(),
         metrics.clone(),
         proxy_id.clone(),
-        idle_timeout,
         shutdown.clone(),
         cleanup_interval_seconds,
-        plugins.clone(),
-        proxy_name.clone(),
-        proxy_namespace.clone(),
-        backend_scheme,
-        port,
     );
 
     let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
     let mut shutdown_rx = shutdown;
+    // Optional gateway-wide shutdown — fires on SIGTERM/SIGINT regardless of
+    // per-listener config-driven removal. We watch BOTH so the recv loop
+    // exits promptly during graceful drain.
+    let mut global_shutdown_rx = global_shutdown;
 
     // Pre-allocate recvmmsg batch buffers (Linux only). On non-Linux, this is a no-op stub.
     #[cfg(target_os = "linux")]
@@ -622,9 +713,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     chunk,
                                                     addr2,
                                                     &proxy_id,
-                                                    &config,
+                                                    &request_epoch,
                                                     &dns_cache,
-                                                    &load_balancer_cache,
                                                     &frontend_socket,
                                                     &sessions,
                                                     &metrics,
@@ -633,19 +723,14 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &mut last_client,
                                                     &mut batch_dgrams_out,
                                                     &mut batch_bytes_out,
-                                                    &plugins,
-                                                    proxy_name.as_deref(),
-                                                    &proxy_namespace,
-                                                    backend_scheme,
                                                     port,
                                                     &circuit_breaker_cache,
-                                                    &consumer_index,
-                                                    has_datagram_plugins,
                                                     &crls,
                                                     sni_proxy_ids.as_deref(),
                                                     &adaptive_buffer,
                                                     udp_gso_enabled,
                                                     local2,
+                                                    &overload,
                                                 )
                                                 .await;
                                                 if let Err(e) = result {
@@ -665,9 +750,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         data,
                                         addr2,
                                         &proxy_id,
-                                        &config,
+                                        &request_epoch,
                                         &dns_cache,
-                                        &load_balancer_cache,
                                         &frontend_socket,
                                         &sessions,
                                         &metrics,
@@ -676,19 +760,14 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &mut last_client,
                                         &mut batch_dgrams_out,
                                         &mut batch_bytes_out,
-                                        &plugins,
-                                        proxy_name.as_deref(),
-                                        &proxy_namespace,
-                                        backend_scheme,
                                         port,
                                         &circuit_breaker_cache,
-                                        &consumer_index,
-                                        has_datagram_plugins,
                                         &crls,
                                         sni_proxy_ids.as_deref(),
                                         &adaptive_buffer,
                                         udp_gso_enabled,
                                         local2,
+                                        &overload,
                                     )
                                     .await;
                                     if let Err(e) = result {
@@ -745,9 +824,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     &buf[..len],
                     client_addr,
                     &proxy_id,
-                    &config,
+                    &request_epoch,
                     &dns_cache,
-                    &load_balancer_cache,
                     &frontend_socket,
                     &sessions,
                     &metrics,
@@ -756,19 +834,14 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     &mut last_client,
                     &mut batch_dgrams_out,
                     &mut batch_bytes_out,
-                    &plugins,
-                    proxy_name.as_deref(),
-                    &proxy_namespace,
-                    backend_scheme,
                     port,
                     &circuit_breaker_cache,
-                    &consumer_index,
-                    has_datagram_plugins,
                     &crls,
                     sni_proxy_ids.as_deref(),
                     &adaptive_buffer,
                     udp_gso_enabled,
                     None,
+                    &overload,
                 )
                 .await;
                 if let Err(e) = result {
@@ -816,9 +889,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     chunk,
                                                     addr2,
                                                     &proxy_id,
-                                                    &config,
+                                                    &request_epoch,
                                                     &dns_cache,
-                                                    &load_balancer_cache,
                                                     &frontend_socket,
                                                     &sessions,
                                                     &metrics,
@@ -827,19 +899,14 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &mut last_client,
                                                     &mut batch_dgrams_out,
                                                     &mut batch_bytes_out,
-                                                    &plugins,
-                                                    proxy_name.as_deref(),
-                                                    &proxy_namespace,
-                                                    backend_scheme,
                                                     port,
                                                     &circuit_breaker_cache,
-                                                    &consumer_index,
-                                                    has_datagram_plugins,
                                                     &crls,
                                                     sni_proxy_ids.as_deref(),
                                                     &adaptive_buffer,
                                                     udp_gso_enabled,
                                                     local2,
+                                                    &overload,
                                                 )
                                                 .await;
                                                 if let Err(e) = result {
@@ -859,9 +926,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         data,
                                         addr2,
                                         &proxy_id,
-                                        &config,
+                                        &request_epoch,
                                         &dns_cache,
-                                        &load_balancer_cache,
                                         &frontend_socket,
                                         &sessions,
                                         &metrics,
@@ -870,19 +936,14 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &mut last_client,
                                         &mut batch_dgrams_out,
                                         &mut batch_bytes_out,
-                                        &plugins,
-                                        proxy_name.as_deref(),
-                                        &proxy_namespace,
-                                        backend_scheme,
                                         port,
                                         &circuit_breaker_cache,
-                                        &consumer_index,
-                                        has_datagram_plugins,
                                         &crls,
                                         sni_proxy_ids.as_deref(),
                                         &adaptive_buffer,
                                         udp_gso_enabled,
                                         local2,
+                                        &overload,
                                     )
                                     .await;
                                     if let Err(e) = result {
@@ -908,9 +969,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     &buf[..len2],
                                     addr2,
                                     &proxy_id,
-                                    &config,
+                                    &request_epoch,
                                     &dns_cache,
-                                    &load_balancer_cache,
                                     &frontend_socket,
                                     &sessions,
                                     &metrics,
@@ -919,19 +979,14 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     &mut last_client,
                                     &mut batch_dgrams_out,
                                     &mut batch_bytes_out,
-                                    &plugins,
-                                    proxy_name.as_deref(),
-                                    &proxy_namespace,
-                                    backend_scheme,
                                     port,
                                     &circuit_breaker_cache,
-                                    &consumer_index,
-                                    has_datagram_plugins,
                                     &crls,
                                     sni_proxy_ids.as_deref(),
                                     &adaptive_buffer,
                                     udp_gso_enabled,
                                     None,
+                                    &overload,
                                 )
                                 .await;
                                 if let Err(e) = result {
@@ -956,6 +1011,15 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 info!(proxy_id = %proxy_id, "UDP proxy listener shutting down on port {}", port);
                 return Ok(());
             }
+            _ = async {
+                match global_shutdown_rx.as_mut() {
+                    Some(rx) => { let _ = rx.changed().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                info!(proxy_id = %proxy_id, "UDP proxy listener shutting down on port {} (global SIGTERM)", port);
+                return Ok(());
+            }
         }
     }
 }
@@ -969,9 +1033,8 @@ async fn process_datagram(
     data: &[u8],
     client_addr: SocketAddr,
     proxy_id: &str,
-    config: &arc_swap::ArcSwap<GatewayConfig>,
+    request_epoch: &RequestEpochStore,
     dns_cache: &DnsCache,
-    lb_cache: &LoadBalancerCache,
     frontend_socket: &Arc<UdpSocket>,
     sessions: &SessionMap,
     metrics: &Arc<UdpProxyMetrics>,
@@ -980,41 +1043,15 @@ async fn process_datagram(
     last_client: &mut Option<(SocketAddr, Arc<UdpSession>)>,
     batch_dgrams_out: &mut u64,
     batch_bytes_out: &mut u64,
-    plugins: &[Arc<dyn Plugin>],
-    proxy_name: Option<&str>,
-    proxy_namespace: &str,
-    backend_scheme: BackendScheme,
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
-    consumer_index: &Arc<ConsumerIndex>,
-    has_datagram_plugins: bool,
     crls: &crate::tls::CrlList,
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_gso_enabled: bool,
     local_addr: Option<crate::socket_opts::PktinfoLocal>,
+    overload: &Arc<crate::overload::OverloadState>,
 ) -> Result<(), anyhow::Error> {
-    // Run per-datagram plugins (e.g., udp_rate_limiting) before session
-    // allocation so dropped datagrams don't consume session slots or trigger
-    // backend connection setup.
-    if has_datagram_plugins {
-        let ctx = UdpDatagramContext {
-            client_ip: Arc::from(client_addr.ip().to_string()),
-            proxy_id: Arc::from(proxy_id),
-            proxy_name: proxy_name.map(Arc::from),
-            listen_port,
-            datagram_size: data.len(),
-            direction: UdpDatagramDirection::ClientToBackend,
-        };
-        for plugin in plugins {
-            if plugin.requires_udp_datagram_hooks()
-                && matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop)
-            {
-                return Ok(()); // Silent drop — standard UDP behavior
-            }
-        }
-    }
-
     // Fast path: check last-client cache before hitting DashMap.
     // Skip the cache when the cached session has been flagged expired
     // by the idle-cleanup task — that path removes the session from
@@ -1022,37 +1059,68 @@ async fn process_datagram(
     // this check we'd keep forwarding through a session the cleanup
     // task already declared dead and the configured
     // `udp_idle_timeout_seconds` would be quietly ignored.
-    let session = if let Some((cached_addr, ref cached_session)) = *last_client
+    let existing_session = if let Some((cached_addr, ref cached_session)) = *last_client
         && cached_addr == client_addr
         && !cached_session
             .expired
             .load(std::sync::atomic::Ordering::Acquire)
     {
-        cached_session.clone()
+        Some(cached_session.clone())
     } else {
+        sessions
+            .get(&client_addr)
+            .map(|entry| entry.value().clone())
+    };
+
+    let session = if let Some(session) = existing_session {
+        if !udp_datagram_allowed(
+            &session.datagram_plugins,
+            client_addr,
+            &session.proxy_id,
+            session.proxy_name.as_deref(),
+            session.listen_port,
+            data.len(),
+            UdpDatagramDirection::ClientToBackend,
+        )
+        .await
+        {
+            return Ok(());
+        }
+        session
+    } else {
+        let epoch = request_epoch.load();
+        let view =
+            resolve_udp_session_epoch_view(proxy_id, &epoch, data, sni_proxy_ids, listen_port)?;
+        if !udp_datagram_allowed(
+            &view.datagram_plugins,
+            client_addr,
+            &view.proxy.id,
+            view.proxy.name.as_deref(),
+            listen_port,
+            data.len(),
+            UdpDatagramDirection::ClientToBackend,
+        )
+        .await
+        {
+            return Ok(());
+        }
         lookup_or_create_session(
             client_addr,
-            proxy_id,
-            config,
+            &epoch,
+            view,
             dns_cache,
-            lb_cache,
             frontend_socket,
             sessions,
             metrics,
             tls_no_verify,
             max_sessions,
-            plugins,
-            proxy_name,
-            proxy_namespace,
-            backend_scheme,
             listen_port,
             circuit_breaker_cache,
-            consumer_index,
             crls,
             data,
-            sni_proxy_ids,
             adaptive_buffer,
             udp_gso_enabled,
+            overload,
         )
         .await?
     };
@@ -1102,27 +1170,21 @@ async fn process_datagram(
 #[allow(clippy::too_many_arguments)]
 async fn lookup_or_create_session(
     client_addr: SocketAddr,
-    proxy_id: &str,
-    config: &arc_swap::ArcSwap<GatewayConfig>,
+    epoch: &RequestEpoch,
+    view: UdpSessionEpochView,
     dns_cache: &DnsCache,
-    lb_cache: &LoadBalancerCache,
     frontend_socket: &Arc<UdpSocket>,
     sessions: &SessionMap,
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
     max_sessions: usize,
-    plugins: &[Arc<dyn Plugin>],
-    proxy_name: Option<&str>,
-    proxy_namespace: &str,
-    backend_scheme: BackendScheme,
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
-    consumer_index: &Arc<ConsumerIndex>,
     crls: &crate::tls::CrlList,
     initial_data: &[u8],
-    sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_gso_enabled: bool,
+    overload: &Arc<crate::overload::OverloadState>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     if let Some(existing) = sessions.get(&client_addr) {
         return Ok(existing.value().clone());
@@ -1141,27 +1203,21 @@ async fn lookup_or_create_session(
     }
 
     match create_session(
-        proxy_id,
-        config,
+        epoch,
+        view,
         dns_cache,
-        lb_cache,
         frontend_socket,
         client_addr,
         sessions,
         metrics,
         tls_no_verify,
-        plugins,
-        proxy_name,
-        proxy_namespace,
-        backend_scheme,
         listen_port,
         circuit_breaker_cache,
-        consumer_index,
         crls,
         initial_data,
-        sni_proxy_ids,
         adaptive_buffer,
         udp_gso_enabled,
+        overload,
     )
     .await
     {
@@ -1180,17 +1236,9 @@ fn spawn_session_cleanup(
     sessions: SessionMap,
     metrics: Arc<UdpProxyMetrics>,
     proxy_id: String,
-    idle_timeout_seconds: u64,
     mut shutdown: watch::Receiver<bool>,
     cleanup_interval_seconds: u64,
-    plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    proxy_name: Option<String>,
-    proxy_namespace: String,
-    backend_scheme: BackendScheme,
-    listen_port: u16,
 ) {
-    let idle_timeout_ms = idle_timeout_seconds * 1000;
-
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(Duration::from_secs(cleanup_interval_seconds.max(1)));
@@ -1202,7 +1250,7 @@ fn spawn_session_cleanup(
 
                     for entry in sessions.iter() {
                         let last = entry.value().last_activity.load(Ordering::Relaxed);
-                        if now.saturating_sub(last) > idle_timeout_ms {
+                        if now.saturating_sub(last) > entry.value().idle_timeout_ms {
                             expired.push(*entry.key());
                         }
                     }
@@ -1233,15 +1281,15 @@ fn spawn_session_cleanup(
                             );
 
                             emit_udp_stream_disconnect(
-                                &plugins,
+                                session.plugins.as_ref(),
                                 UdpDisconnectContext {
-                                    namespace: &proxy_namespace,
-                                    proxy_id: &proxy_id,
-                                    proxy_name: proxy_name.as_deref(),
+                                    namespace: &session.proxy_namespace,
+                                    proxy_id: &session.proxy_id,
+                                    proxy_name: session.proxy_name.as_deref(),
                                     client_addr: *addr,
                                     session: &session,
-                                    backend_scheme,
-                                    listen_port,
+                                    backend_scheme: session.backend_scheme,
+                                    listen_port: session.listen_port,
                                     disconnected_ms: now,
                                     connection_error: None,
                                     error_class: None,
@@ -1273,43 +1321,38 @@ async fn start_dtls_frontend_listener(
     port: u16,
     bind_addr: IpAddr,
     proxy_id: String,
-    config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     dns_cache: DnsCache,
-    load_balancer_cache: Arc<LoadBalancerCache>,
-    consumer_index: Arc<ConsumerIndex>,
+    request_epoch: Arc<RequestEpochStore>,
     shutdown: watch::Receiver<bool>,
+    global_shutdown: Option<watch::Receiver<bool>>,
     metrics: Arc<UdpProxyMetrics>,
     dtls_config: crate::dtls::FrontendDtlsConfig,
     tls_no_verify: bool,
     max_sessions: usize,
-    plugin_cache: Arc<PluginCache>,
+    frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
     crls: crate::tls::CrlList,
     started: Arc<AtomicBool>,
     overload: Arc<crate::overload::OverloadState>,
 ) -> Result<(), anyhow::Error> {
     let addr = SocketAddr::new(bind_addr, port);
-    let server = Arc::new(crate::dtls::DtlsServer::bind(addr, dtls_config).await?);
+    let admission_overload = overload.clone();
+    let dtls_limits = crate::dtls::DtlsServerLimits {
+        max_sessions: Some(max_sessions),
+        handshake_timeout: (frontend_tls_handshake_timeout_seconds > 0)
+            .then_some(Duration::from_secs(frontend_tls_handshake_timeout_seconds)),
+        allow_new_session: Some(Arc::new(move || {
+            !admission_overload
+                .reject_new_connections
+                .load(Ordering::Relaxed)
+        })),
+        active_session_mirror: Some(metrics.dtls_demux_sessions.clone()),
+    };
+    let server =
+        Arc::new(crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?);
     ensure_coarse_timer_started();
     started.store(true, Ordering::Release);
     info!(proxy_id = %proxy_id, "DTLS frontend listener started on {}", addr);
-
-    // Pre-resolve plugins and proxy metadata for this listener.
-    let plugins = plugin_cache.get_plugins_for_protocol(&proxy_id, ProxyProtocol::Udp);
-    let has_datagram_plugins = plugins.iter().any(|p| p.requires_udp_datagram_hooks());
-    let (proxy_name, proxy_namespace, backend_scheme) = {
-        let current = config.load();
-        current
-            .proxies
-            .iter()
-            .find(|p| p.id == proxy_id)
-            .map(|p| (p.name.clone(), p.namespace.clone(), p.effective_scheme()))
-            .unwrap_or((
-                None,
-                crate::config::types::default_namespace(),
-                BackendScheme::Dtls,
-            ))
-    };
 
     // Spawn the server's recv loop in a background task
     let server_runner = server.clone();
@@ -1321,6 +1364,10 @@ async fn start_dtls_frontend_listener(
     });
 
     let mut shutdown_rx = shutdown;
+    // Optional gateway-wide shutdown — fires on SIGTERM/SIGINT regardless of
+    // per-listener config-driven removal. Watch BOTH so the DTLS accept loop
+    // exits promptly during graceful drain.
+    let mut global_shutdown_rx = global_shutdown;
 
     loop {
         tokio::select! {
@@ -1353,14 +1400,36 @@ async fn start_dtls_frontend_listener(
                     continue;
                 }
 
+                let epoch = request_epoch.load();
+                let Some(proxy) = epoch.config.proxies.iter().find(|p| p.id == proxy_id).cloned()
+                else {
+                    metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+                    client_conn.close().await;
+                    warn!(proxy_id = %proxy_id, "DTLS listener proxy no longer exists in request epoch");
+                    continue;
+                };
+                let plugins = epoch
+                    .plugin_cache
+                    .get_plugins_for_protocol(&proxy.id, ProxyProtocol::Udp);
+                let datagram_plugins: Arc<[Arc<dyn Plugin>]> = plugins
+                    .iter()
+                    .filter(|p| p.requires_udp_datagram_hooks())
+                    .cloned()
+                    .collect();
+                let consumer_index =
+                    Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
+                let proxy_name = proxy.name.clone();
+                let proxy_namespace = proxy.namespace.clone();
+                let backend_scheme = proxy.effective_scheme();
+
                 // Run on_stream_connect plugins (with DTLS client cert if available)
                 let mut stream_ctx = StreamConnectionContext {
                     client_ip: client_addr.ip().to_string(),
-                    proxy_id: proxy_id.clone(),
+                    proxy_id: proxy.id.clone(),
                     proxy_name: proxy_name.clone(),
                     listen_port: port,
                     backend_scheme,
-                    consumer_index: consumer_index.clone(),
+                    consumer_index,
                     identified_consumer: None,
                     authenticated_identity: None,
                     metadata: None,
@@ -1394,13 +1463,26 @@ async fn start_dtls_frontend_listener(
                     "DTLS frontend connection accepted"
                 );
 
+                // Acquire the OverloadState connection guard for the accepted
+                // (post-handshake) DTLS session. Pre-handshake demux peers are
+                // tracked separately in `metrics.dtls_demux_sessions` and via
+                // the `allow_new_session` callback; we intentionally only
+                // contribute to `OverloadState.active_connections` after the
+                // handshake completed and plugin checks passed, so the global
+                // counter reflects committed sessions (parity with TCP/H3).
+                // The guard is moved into the per-client handler task below
+                // and decrements automatically when the task exits, regardless
+                // of which exit path (graceful, error, or shutdown) ran.
+                let handler_overload_guard =
+                    crate::overload::ConnectionGuard::new(&overload);
+
                 // Spawn per-client handler
-                let handler_proxy_id = proxy_id.clone();
-                let handler_config = config.clone();
+                let handler_proxy_id = proxy.id.clone();
+                let handler_epoch = Arc::clone(&epoch);
                 let handler_dns = dns_cache.clone();
-                let handler_lb = load_balancer_cache.clone();
                 let handler_metrics = metrics.clone();
                 let handler_plugins = plugins.clone();
+                let handler_datagram_plugins = Arc::clone(&datagram_plugins);
                 let handler_proxy_name = proxy_name.clone();
                 let handler_proxy_namespace = proxy_namespace.clone();
                 let handler_consumer_username = stream_ctx.effective_identity().map(str::to_owned);
@@ -1408,51 +1490,60 @@ async fn start_dtls_frontend_listener(
                 let handler_cb_cache = circuit_breaker_cache.clone();
                 let connected_at = chrono::Utc::now();
 
-                let handler_has_dgram_plugins = has_datagram_plugins;
                 let handler_crls = crls.clone();
                 tokio::spawn(async move {
+                    // Hold the guard for the lifetime of the handler task. Drop
+                    // at task exit decrements `OverloadState.active_connections`.
+                    let _overload_guard = handler_overload_guard;
                     let result = handle_dtls_client(
                         client_conn,
                         client_addr,
                         &handler_proxy_id,
-                        &handler_config,
+                        &handler_epoch,
                         &handler_dns,
-                        &handler_lb,
                         &handler_metrics,
                         tls_no_verify,
                         &handler_cb_cache,
-                        &handler_plugins,
+                        &handler_datagram_plugins,
                         handler_proxy_name.as_deref(),
                         port,
-                        handler_has_dgram_plugins,
                         &handler_crls,
                     )
                     .await;
-                    let (err_msg, error_class, disconnect_cause) = match &result.outcome {
-                        Ok(()) => (
-                            None,
-                            None,
-                            Some(crate::plugins::DisconnectCause::GracefulShutdown),
-                        ),
-                        Err(e) => {
-                            debug!(
-                                proxy_id = %handler_proxy_id,
-                                client = %client_addr,
-                                "DTLS client session ended: {}",
-                                e
-                            );
-                            let error_message = e.to_string();
-                            let err_class = crate::retry::classify_boxed_error(e.as_ref());
-                            // handle_dtls_client_inner can fail on backend-side
-                            // setup (DNS, backend UDP bind, backend DTLS
-                            // handshake) as well as client-side session errors.
-                            // Infer cause from the classified error + message
-                            // prefix so DTLS stream_disconnects metrics don't
-                            // collapse every failure into `recv_error`.
-                            let cause = dtls_disconnect_cause(&err_class, &error_message);
-                            (Some(error_message), Some(err_class), Some(cause))
-                        }
-                    };
+                    let (err_msg, error_class, disconnect_cause, disconnect_direction) =
+                        match &result.outcome {
+                            Ok(()) => (
+                                None,
+                                None,
+                                Some(crate::plugins::DisconnectCause::GracefulShutdown),
+                                None,
+                            ),
+                            Err(e) => {
+                                debug!(
+                                    proxy_id = %handler_proxy_id,
+                                    client = %client_addr,
+                                    "DTLS client session ended: {}",
+                                    e
+                                );
+                                let error_message = e.to_string();
+                                let err_class = crate::retry::classify_boxed_error(e.as_ref());
+                                // handle_dtls_client_inner can fail on
+                                // backend-side setup (DNS, backend UDP bind,
+                                // backend DTLS handshake) as well as
+                                // client-side session errors. The typed
+                                // `StreamSetupError` (when present) drives
+                                // both cause and direction; otherwise we fall
+                                // back to error-class inference.
+                                let cause = dtls_disconnect_cause(e, &err_class);
+                                let direction = dtls_disconnect_direction(e, &err_class);
+                                (
+                                    Some(error_message),
+                                    Some(err_class),
+                                    Some(cause),
+                                    Some(direction),
+                                )
+                            }
+                        };
 
                     // Fire on_stream_disconnect plugins
                     if !handler_plugins.is_empty() {
@@ -1473,7 +1564,7 @@ async fn start_dtls_frontend_listener(
                             bytes_received: result.bytes_received,
                             connection_error: err_msg,
                             error_class,
-                            disconnect_direction: None,
+                            disconnect_direction,
                             disconnect_cause,
                             metadata: &handler_metadata,
                         });
@@ -1489,6 +1580,17 @@ async fn start_dtls_frontend_listener(
             }
             _ = shutdown_rx.changed() => {
                 info!(proxy_id = %proxy_id, "DTLS frontend listener shutting down on port {}", port);
+                server.close().await;
+                let _ = server_task.await;
+                return Ok(());
+            }
+            _ = async {
+                match global_shutdown_rx.as_mut() {
+                    Some(rx) => { let _ = rx.changed().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                info!(proxy_id = %proxy_id, "DTLS frontend listener shutting down on port {} (global SIGTERM)", port);
                 server.close().await;
                 let _ = server_task.await;
                 return Ok(());
@@ -1527,16 +1629,14 @@ async fn handle_dtls_client(
     client_conn: crate::dtls::DtlsServerConn,
     client_addr: SocketAddr,
     proxy_id: &str,
-    config: &arc_swap::ArcSwap<GatewayConfig>,
+    epoch: &RequestEpoch,
     dns_cache: &DnsCache,
-    lb_cache: &LoadBalancerCache,
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
     circuit_breaker_cache: &CircuitBreakerCache,
-    plugins: &[Arc<dyn Plugin>],
+    datagram_plugins: &Arc<[Arc<dyn Plugin>]>,
     proxy_name: Option<&str>,
     listen_port: u16,
-    has_datagram_plugins: bool,
     crls: &crate::tls::CrlList,
 ) -> DtlsHandlerResult {
     let mut backend_info = DtlsBackendInfo {
@@ -1550,9 +1650,8 @@ async fn handle_dtls_client(
         client_conn,
         client_addr,
         proxy_id,
-        config,
+        epoch,
         dns_cache,
-        lb_cache,
         metrics,
         tls_no_verify,
         circuit_breaker_cache,
@@ -1560,10 +1659,9 @@ async fn handle_dtls_client(
         Arc::clone(&bytes_sent),
         Arc::clone(&bytes_received),
         Arc::clone(&last_request_size),
-        plugins,
+        datagram_plugins,
         proxy_name,
         listen_port,
-        has_datagram_plugins,
         crls,
     )
     .await;
@@ -1575,24 +1673,42 @@ async fn handle_dtls_client(
     }
 }
 
-/// Shared error-message prefix. Used at the `anyhow::anyhow!` construction
-/// site AND at the `error_message.contains(...)` check site in
-/// `dtls_disconnect_cause` — keeping this as a constant means a rename of
-/// the prefix is a compile error everywhere rather than a silent drift.
+/// Legacy DTLS error-message prefix.
+///
+/// Now produced by [`StreamSetupKind::BackendDtlsHandshake`] via
+/// [`StreamSetupError`]; the constant remains as a public-API surface for
+/// log consumers and integration tests. New construction sites MUST use the
+/// typed error wrapper. See [`crate::proxy::stream_error`] for the rationale.
 pub(crate) const STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED: &str = "Backend DTLS handshake failed";
 
-/// Map a DTLS session failure to a `DisconnectCause`. Backend-facing classes
-/// (DNS, connect, port exhaustion, pool) map to `BackendError` so DTLS
-/// stream_disconnects metrics don't collapse every failure into
-/// `recv_error`. TLS is ambiguous so disambiguate by the shared prefix
-/// constant (`STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED`) — generic
-/// session/decrypt errors remain client-side (`RecvError`).
+/// Map a DTLS session failure to a `DisconnectCause`.
+///
+/// **Typed-kind first.** When the chain carries a [`StreamSetupError`] (the
+/// canonical wrapper at every DTLS construction site that previously used the
+/// `STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED` prefix), its
+/// [`StreamSetupKind`] is the authoritative signal and the error class is
+/// only used as a backup for non-setup failures (raw recv errors, generic
+/// I/O timeouts).
+///
+/// Backend-facing classes (DNS, connect, port exhaustion, pool) map to
+/// `BackendError` so DTLS `stream_disconnects` metrics don't collapse every
+/// failure into `recv_error`. Generic decrypt errors remain client-side
+/// (`RecvError`).
 fn dtls_disconnect_cause(
+    error: &anyhow::Error,
     class: &crate::retry::ErrorClass,
-    error_message: &str,
 ) -> crate::plugins::DisconnectCause {
     use crate::plugins::DisconnectCause;
     use crate::retry::ErrorClass;
+
+    if let Some(setup_err) = find_stream_setup_error(error) {
+        return if setup_err.kind.is_client_side() {
+            DisconnectCause::RecvError
+        } else {
+            DisconnectCause::BackendError
+        };
+    }
+
     match class {
         ErrorClass::DnsLookupError
         | ErrorClass::ConnectionTimeout
@@ -1603,13 +1719,38 @@ fn dtls_disconnect_cause(
         | ErrorClass::ConnectionPoolError
         | ErrorClass::ProtocolError => DisconnectCause::BackendError,
         ErrorClass::TlsError => {
-            if error_message.contains(STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED) {
-                DisconnectCause::BackendError
-            } else {
-                DisconnectCause::RecvError
-            }
+            // Untyped TLS error in the chain — conservative default. Migrate
+            // remaining sites to `StreamSetupError` to remove this fallback.
+            DisconnectCause::RecvError
         }
         _ => DisconnectCause::RecvError,
+    }
+}
+
+/// Direction attribution for DTLS session failures, mirroring
+/// [`dtls_disconnect_cause`]. Used to populate
+/// [`StreamTransactionSummary::disconnect_direction`] for UDP/DTLS sessions
+/// — historically `None`, now derived from the typed kind (when present) or
+/// inferred from the error class so operators can tell whether the client or
+/// the backend tore down the session.
+fn dtls_disconnect_direction(error: &anyhow::Error, class: &crate::retry::ErrorClass) -> Direction {
+    use crate::retry::ErrorClass;
+    if let Some(setup_err) = find_stream_setup_error(error) {
+        return setup_err.kind.direction();
+    }
+    match class {
+        ErrorClass::DnsLookupError
+        | ErrorClass::ConnectionTimeout
+        | ErrorClass::ConnectionRefused
+        | ErrorClass::ConnectionReset
+        | ErrorClass::ConnectionClosed
+        | ErrorClass::PortExhaustion
+        | ErrorClass::ConnectionPoolError
+        | ErrorClass::ProtocolError => Direction::BackendToClient,
+        ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge => {
+            Direction::ClientToBackend
+        }
+        _ => Direction::Unknown,
     }
 }
 
@@ -1618,9 +1759,8 @@ async fn handle_dtls_client_inner(
     client_conn: crate::dtls::DtlsServerConn,
     client_addr: SocketAddr,
     proxy_id: &str,
-    config: &arc_swap::ArcSwap<GatewayConfig>,
+    epoch: &RequestEpoch,
     dns_cache: &DnsCache,
-    lb_cache: &LoadBalancerCache,
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
     circuit_breaker_cache: &CircuitBreakerCache,
@@ -1628,15 +1768,14 @@ async fn handle_dtls_client_inner(
     bytes_sent: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
     last_request_size: Arc<AtomicU64>,
-    plugins: &[Arc<dyn Plugin>],
+    datagram_plugins: &Arc<[Arc<dyn Plugin>]>,
     proxy_name: Option<&str>,
     listen_port: u16,
-    has_datagram_plugins: bool,
     crls: &crate::tls::CrlList,
 ) -> Result<(), anyhow::Error> {
     // Look up proxy config
-    let current_config = config.load();
-    let proxy = current_config
+    let proxy = epoch
+        .config
         .proxies
         .iter()
         .find(|p| p.id == proxy_id)
@@ -1644,26 +1783,37 @@ async fn handle_dtls_client_inner(
         .clone();
 
     // Resolve backend target
-    let (backend_host, backend_port) = resolve_backend_target(&proxy, lb_cache)?;
+    let (backend_host, backend_port) = resolve_backend_target(&proxy, &epoch.load_balancer)?;
     // Populate backend target as soon as it's known — even if DNS or connect fails.
     backend_info.backend_target = format!("{}:{}", backend_host, backend_port);
 
     // Circuit breaker check — reject before creating backend connection if open.
+    // When admitted, capture whether this is a half-open probe so downstream
+    // record_failure/record_success calls only decrement the in-flight counter
+    // for actual probe requests.
     let cb_target_key = proxy
         .upstream_id
         .as_ref()
         .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
-    if let Some(ref cb_config) = proxy.circuit_breaker
-        && circuit_breaker_cache
-            .can_execute(proxy_id, cb_target_key.as_deref(), cb_config)
-            .is_err()
-    {
-        warn!(
-            proxy_id = %proxy_id,
-            client = %client_addr,
-            "DTLS session rejected: circuit breaker open"
-        );
-        return Err(anyhow::anyhow!("circuit breaker open"));
+    let mut cb_is_half_open_probe = false;
+    if let Some(ref cb_config) = proxy.circuit_breaker {
+        match circuit_breaker_cache.can_execute(proxy_id, cb_target_key.as_deref(), cb_config) {
+            Ok((_cb, is_half_open_probe)) => {
+                cb_is_half_open_probe = is_half_open_probe;
+            }
+            Err(_) => {
+                warn!(
+                    proxy_id = %proxy_id,
+                    client = %client_addr,
+                    "DTLS session rejected: circuit breaker open"
+                );
+                return Err(StreamSetupError::new(
+                    StreamSetupKind::CircuitBreakerOpen,
+                    "(DTLS session)",
+                )
+                .into());
+            }
+        }
     }
 
     let resolved_ip = match dns_cache
@@ -1682,7 +1832,7 @@ async fn handle_dtls_client_inner(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502, true);
+                cb.record_failure(502, true, cb_is_half_open_probe);
             }
             return Err(anyhow::anyhow!(
                 "DNS resolution failed for {}: {}",
@@ -1716,7 +1866,7 @@ async fn handle_dtls_client_inner(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true);
+                    cb.record_failure(502, true, cb_is_half_open_probe);
                 }
                 return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", e));
             }
@@ -1728,7 +1878,7 @@ async fn handle_dtls_client_inner(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502, true);
+                cb.record_failure(502, true, cb_is_half_open_probe);
             }
             return Err(anyhow::anyhow!(
                 "Failed to connect to backend {}: {}",
@@ -1747,13 +1897,22 @@ async fn handle_dtls_client_inner(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true);
+                    cb.record_failure(502, true, cb_is_half_open_probe);
                 }
-                return Err(anyhow::anyhow!(
-                    "{}: {}",
-                    STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED,
-                    e
-                ));
+                // dtls::DtlsConnection::connect returns anyhow::Error, which
+                // doesn't implement std::error::Error directly — render the
+                // chain into the message so log lines and source-walking
+                // consumers still see the underlying cause.
+                //
+                // `with_colon_detail` joins as `"{prefix}: {detail}"`,
+                // matching the legacy `anyhow!("{}: {}", STREAM_ERR_..., e)`
+                // wording byte-for-byte so exact-match log pipelines keyed
+                // on the old token keep working.
+                return Err(StreamSetupError::with_colon_detail(
+                    StreamSetupKind::BackendDtlsHandshake,
+                    format!("{e:#}"),
+                )
+                .into());
             }
         };
         debug!(
@@ -1773,7 +1932,7 @@ async fn handle_dtls_client_inner(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true);
+                    cb.record_failure(502, true, cb_is_half_open_probe);
                 }
                 return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", e));
             }
@@ -1785,7 +1944,7 @@ async fn handle_dtls_client_inner(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502, true);
+                cb.record_failure(502, true, cb_is_half_open_probe);
             }
             return Err(anyhow::anyhow!(
                 "Failed to connect to backend {}: {}",
@@ -1799,7 +1958,7 @@ async fn handle_dtls_client_inner(
     // Record circuit breaker success — backend connection established.
     if let Some(ref cb_config) = proxy.circuit_breaker {
         let cb = circuit_breaker_cache.get_or_create(proxy_id, cb_target_key.as_deref(), cb_config);
-        cb.record_success();
+        cb.record_success(cb_is_half_open_probe);
     }
 
     debug!(
@@ -1823,15 +1982,7 @@ async fn handle_dtls_client_inner(
     let last_request_size_fwd = Arc::clone(&last_request_size);
     // Pre-compute datagram plugin list once, share between both direction tasks.
     // Arc<[...]> avoids the per-session filter+collect being done twice.
-    let dgram_plugins: Arc<[Arc<dyn Plugin>]> = if has_datagram_plugins {
-        plugins
-            .iter()
-            .filter(|p| p.requires_udp_datagram_hooks())
-            .cloned()
-            .collect()
-    } else {
-        Arc::from([])
-    };
+    let dgram_plugins = Arc::clone(datagram_plugins);
     // Pre-compute context strings as Arc<str> — per-datagram "clone" is a pointer
     // bump (~5ns) instead of heap allocation + memcpy.
     let dgram_client_ip: Arc<str> = Arc::from(client_addr.ip().to_string());
@@ -2008,74 +2159,43 @@ async fn handle_dtls_client_inner(
 /// Create a new UDP session for a client (plain UDP frontend path).
 #[allow(clippy::too_many_arguments)]
 async fn create_session(
-    proxy_id: &str,
-    config: &arc_swap::ArcSwap<GatewayConfig>,
+    epoch: &RequestEpoch,
+    view: UdpSessionEpochView,
     dns_cache: &DnsCache,
-    lb_cache: &LoadBalancerCache,
     frontend_socket: &Arc<UdpSocket>,
     client_addr: SocketAddr,
     sessions: &SessionMap,
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
-    plugins: &[Arc<dyn Plugin>],
-    proxy_name: Option<&str>,
-    proxy_namespace: &str,
-    backend_scheme: BackendScheme,
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
-    consumer_index: &Arc<ConsumerIndex>,
     crls: &crate::tls::CrlList,
-    initial_data: &[u8],
-    sni_proxy_ids: Option<&[String]>,
+    _initial_data: &[u8],
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_gso_enabled: bool,
+    overload: &Arc<crate::overload::OverloadState>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
-    // Check if this proxy uses passthrough mode (extract from config once).
-    let is_passthrough = {
-        let current = config.load();
-        current
-            .proxies
-            .iter()
-            .find(|p| p.id == proxy_id)
-            .map(|p| p.passthrough)
-            .unwrap_or(false)
-    };
-
-    // In passthrough mode, extract SNI from the first DTLS ClientHello datagram.
-    let sni_hostname = if is_passthrough {
-        super::sni::extract_sni_from_dtls_client_hello(initial_data)
-    } else {
-        None
-    };
-
-    // --- SNI-based proxy resolution for shared passthrough ports ---
-    let _resolved_proxy_id: Option<String>;
-    let proxy_id = if let Some(sni_ids) = sni_proxy_ids {
-        let current_config = config.load();
-        let matched =
-            super::sni::resolve_proxy_by_sni(sni_hostname.as_deref(), sni_ids, &current_config)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No matching passthrough proxy for SNI {:?} on port {}",
-                        sni_hostname,
-                        listen_port
-                    )
-                })?;
-        _resolved_proxy_id = Some(matched.to_string());
-        _resolved_proxy_id.as_deref().unwrap_or(proxy_id)
-    } else {
-        _resolved_proxy_id = None;
-        proxy_id
-    };
+    let UdpSessionEpochView {
+        proxy,
+        plugins,
+        datagram_plugins,
+        consumer_index,
+        sni_hostname,
+    } = view;
+    let proxy_id = proxy.id.as_str();
+    let proxy_name = proxy.name.clone();
+    let proxy_namespace = proxy.namespace.clone();
+    let backend_scheme = proxy.effective_scheme();
+    let is_passthrough = proxy.passthrough;
 
     // Run on_stream_connect plugins before creating backend connection
     let mut stream_ctx = StreamConnectionContext {
         client_ip: client_addr.ip().to_string(),
         proxy_id: proxy_id.to_string(),
-        proxy_name: proxy_name.map(|s| s.to_string()),
+        proxy_name: proxy_name.clone(),
         listen_port,
         backend_scheme,
-        consumer_index: consumer_index.clone(),
+        consumer_index,
         identified_consumer: None,
         authenticated_identity: None,
         metadata: None,
@@ -2083,39 +2203,44 @@ async fn create_session(
         tls_client_cert_chain_der: None,
         sni_hostname,
     };
-    for plugin in plugins {
+    for plugin in plugins.iter() {
         if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
-            return Err(anyhow::anyhow!("UDP session rejected by plugin"));
+            return Err(
+                StreamSetupError::new(StreamSetupKind::RejectedByPlugin, "(UDP session)").into(),
+            );
         }
     }
 
-    let current_config = config.load();
-    let proxy = current_config
-        .proxies
-        .iter()
-        .find(|p| p.id == proxy_id)
-        .ok_or_else(|| anyhow::anyhow!("Proxy {} not found", proxy_id))?
-        .clone();
-
     // Resolve backend target
-    let (backend_host, backend_port) = resolve_backend_target(&proxy, lb_cache)?;
+    let (backend_host, backend_port) = resolve_backend_target(&proxy, &epoch.load_balancer)?;
 
     // Circuit breaker check — reject before creating backend socket if open.
+    // When admitted, capture whether this is a half-open probe so downstream
+    // record_failure/record_success calls only decrement the in-flight counter
+    // for actual probe requests.
     let cb_target_key = proxy
         .upstream_id
         .as_ref()
         .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
-    if let Some(ref cb_config) = proxy.circuit_breaker
-        && circuit_breaker_cache
-            .can_execute(proxy_id, cb_target_key.as_deref(), cb_config)
-            .is_err()
-    {
-        warn!(
-            proxy_id = %proxy_id,
-            client = %client_addr,
-            "UDP session rejected: circuit breaker open"
-        );
-        return Err(anyhow::anyhow!("circuit breaker open"));
+    let mut cb_is_half_open_probe = false;
+    if let Some(ref cb_config) = proxy.circuit_breaker {
+        match circuit_breaker_cache.can_execute(proxy_id, cb_target_key.as_deref(), cb_config) {
+            Ok((_cb, is_half_open_probe)) => {
+                cb_is_half_open_probe = is_half_open_probe;
+            }
+            Err(_) => {
+                warn!(
+                    proxy_id = %proxy_id,
+                    client = %client_addr,
+                    "UDP session rejected: circuit breaker open"
+                );
+                return Err(StreamSetupError::new(
+                    StreamSetupKind::CircuitBreakerOpen,
+                    "(UDP session)",
+                )
+                .into());
+            }
+        }
     }
 
     // DNS resolve
@@ -2135,7 +2260,7 @@ async fn create_session(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502, true);
+                cb.record_failure(502, true, cb_is_half_open_probe);
             }
             return Err(anyhow::anyhow!(
                 "DNS resolution failed for {}: {}",
@@ -2167,7 +2292,7 @@ async fn create_session(
                             cb_target_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, true);
+                        cb.record_failure(502, true, cb_is_half_open_probe);
                     }
                     return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", e));
                 }
@@ -2179,7 +2304,7 @@ async fn create_session(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true);
+                    cb.record_failure(502, true, cb_is_half_open_probe);
                 }
                 return Err(anyhow::anyhow!(
                     "Failed to connect UDP socket to {}: {}",
@@ -2199,9 +2324,19 @@ async fn create_session(
                             cb_target_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, true);
+                        cb.record_failure(502, true, cb_is_half_open_probe);
                     }
-                    return Err(anyhow::anyhow!("DTLS handshake failed: {}", e));
+                    // dtls::DtlsConnection::connect returns anyhow::Error,
+                    // which doesn't implement std::error::Error directly —
+                    // render the chain into the message so consumers still
+                    // see the underlying cause. See the sibling DTLS site
+                    // above for the `with_colon_detail` rationale (legacy
+                    // `"{prefix}: {err}"` wording stability).
+                    return Err(StreamSetupError::with_colon_detail(
+                        StreamSetupKind::BackendDtlsHandshake,
+                        format!("{e:#}"),
+                    )
+                    .into());
                 }
             };
             debug!(
@@ -2222,7 +2357,7 @@ async fn create_session(
                             cb_target_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, true);
+                        cb.record_failure(502, true, cb_is_half_open_probe);
                     }
                     return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", e));
                 }
@@ -2234,7 +2369,7 @@ async fn create_session(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true);
+                    cb.record_failure(502, true, cb_is_half_open_probe);
                 }
                 return Err(anyhow::anyhow!(
                     "Failed to connect UDP socket to {}: {}",
@@ -2248,7 +2383,7 @@ async fn create_session(
     // Record circuit breaker success — backend socket established.
     if let Some(ref cb_config) = proxy.circuit_breaker {
         let cb = circuit_breaker_cache.get_or_create(proxy_id, cb_target_key.as_deref(), cb_config);
-        cb.record_success();
+        cb.record_success(cb_is_half_open_probe);
     }
 
     let now = coarse_epoch_millis();
@@ -2268,6 +2403,19 @@ async fn create_session(
         consumer_username,
         metadata: std::sync::Mutex::new(stream_ctx.take_metadata()),
         local_addr: std::sync::OnceLock::new(),
+        plugins: Arc::clone(&plugins),
+        datagram_plugins: Arc::clone(&datagram_plugins),
+        proxy_id: proxy_id.to_string(),
+        proxy_name: proxy_name.clone(),
+        proxy_namespace: proxy_namespace.clone(),
+        backend_scheme,
+        listen_port,
+        idle_timeout_ms: proxy.udp_idle_timeout_seconds.saturating_mul(1000),
+        // Increment OverloadState.active_connections for each accepted UDP
+        // session so per-session pressure shedding works the same as TCP/H3.
+        // Decrements automatically on session drop (idle expiry, backend
+        // disconnect, listener shutdown).
+        _overload_guard: Some(crate::overload::ConnectionGuard::new(overload)),
     });
 
     sessions.insert(client_addr, session.clone());
@@ -2290,24 +2438,15 @@ async fn create_session(
     let reply_sessions = sessions.clone();
     let reply_dtls = dtls_conn;
     let reply_plugins = plugins.to_vec();
-    let reply_proxy_name = proxy_name.map(str::to_string);
-    let reply_proxy_namespace = proxy_namespace.to_string();
+    let reply_proxy_name = proxy_name.clone();
+    let reply_proxy_namespace = proxy_namespace.clone();
     let reply_backend_scheme = backend_scheme;
     let reply_amplification_factor = proxy.udp_max_response_amplification_factor;
     let reply_adaptive_buffer = adaptive_buffer.clone();
-    let reply_has_datagram_plugins = plugins.iter().any(|p| p.requires_udp_datagram_hooks());
-    let reply_datagram_plugins: Vec<Arc<dyn Plugin>> = if reply_has_datagram_plugins {
-        plugins
-            .iter()
-            .filter(|p| p.requires_udp_datagram_hooks())
-            .cloned()
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let reply_datagram_plugins = Arc::clone(&datagram_plugins);
     let reply_dgram_client_ip: Arc<str> = Arc::from(client_addr.ip().to_string());
     let reply_dgram_proxy_id: Arc<str> = Arc::from(proxy_id);
-    let reply_dgram_proxy_name2: Option<Arc<str>> = proxy_name.map(Arc::from);
+    let reply_dgram_proxy_name2: Option<Arc<str>> = proxy_name.as_deref().map(Arc::from);
     let reply_listen_port = listen_port;
     let is_dtls = reply_dtls.is_some();
     #[cfg(target_os = "linux")]
@@ -2429,7 +2568,7 @@ async fn create_session(
             }
 
             // Run backend→client per-datagram plugin hooks.
-            if reply_has_datagram_plugins {
+            if !reply_datagram_plugins.is_empty() {
                 let ctx = UdpDatagramContext {
                     client_ip: reply_dgram_client_ip.clone(),
                     proxy_id: reply_dgram_proxy_id.clone(),
@@ -2439,7 +2578,7 @@ async fn create_session(
                     direction: UdpDatagramDirection::BackendToClient,
                 };
                 let mut drop = false;
-                for plugin in &reply_datagram_plugins {
+                for plugin in reply_datagram_plugins.iter() {
                     if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
                         drop = true;
                         break;
@@ -2533,7 +2672,7 @@ async fn create_session(
                                 }
                             }
                             // Backend→client plugin hooks on batched datagram
-                            if reply_has_datagram_plugins {
+                            if !reply_datagram_plugins.is_empty() {
                                 let ctx = UdpDatagramContext {
                                     client_ip: reply_dgram_client_ip.clone(),
                                     proxy_id: reply_dgram_proxy_id.clone(),
@@ -2543,7 +2682,7 @@ async fn create_session(
                                     direction: UdpDatagramDirection::BackendToClient,
                                 };
                                 let mut drop = false;
-                                for plugin in &reply_datagram_plugins {
+                                for plugin in reply_datagram_plugins.iter() {
                                     if matches!(
                                         plugin.on_udp_datagram(&ctx).await,
                                         UdpDatagramVerdict::Drop
@@ -2786,14 +2925,29 @@ async fn create_session(
 }
 
 /// Resolve the backend target — either direct from proxy config or via load balancer.
+///
+/// Returns a typed [`StreamSetupError`] (boxed into `anyhow::Error`) on
+/// load-balancer failure so [`dtls_disconnect_cause`] /
+/// [`dtls_disconnect_direction`] read the kind directly via
+/// [`find_stream_setup_error`] rather than falling through to the
+/// `RequestError` class fallback (which would attribute the disconnect to
+/// the client-side `RecvError` instead of the correct backend-side
+/// `BackendError`). Mirrors the TCP resolver in
+/// [`crate::proxy::tcp_proxy::resolve_backend_target`].
 fn resolve_backend_target(
     proxy: &Proxy,
-    lb_cache: &LoadBalancerCache,
+    lb_snapshot: &LoadBalancerCacheInner,
 ) -> Result<(String, u16), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
-        let selection = lb_cache
-            .select_target(upstream_id, &proxy.id, None)
-            .ok_or_else(|| anyhow::anyhow!("No healthy targets for upstream {}", upstream_id))?;
+        let selection =
+            LoadBalancerCache::select_target_from(lb_snapshot, upstream_id, &proxy.id, None)
+                .ok_or_else(|| -> anyhow::Error {
+                    StreamSetupError::new(
+                        StreamSetupKind::NoHealthyTargets,
+                        format!("for upstream {upstream_id}"),
+                    )
+                    .into()
+                })?;
         Ok((selection.target.host.clone(), selection.target.port))
     } else {
         Ok((proxy.backend_host.clone(), proxy.backend_port))
@@ -2843,8 +2997,8 @@ fn epoch_millis_precise() -> u64 {
 mod tests {
     use super::{
         DtlsDisconnectContext, STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED, UdpDisconnectContext,
-        UdpSession, build_dtls_stream_summary, build_udp_stream_summary,
-        emit_udp_stream_disconnect,
+        UdpSession, build_dtls_stream_summary, build_udp_stream_summary, dtls_disconnect_cause,
+        dtls_disconnect_direction, emit_udp_stream_disconnect,
     };
     use crate::config::types::BackendScheme;
     use crate::plugins::{Plugin, StreamTransactionSummary};
@@ -2875,6 +3029,19 @@ mod tests {
                 "stream-123".to_string(),
             )])),
             local_addr: std::sync::OnceLock::new(),
+            plugins: Arc::new(Vec::new()),
+            datagram_plugins: Arc::from([]),
+            proxy_id: "udp-proxy".to_string(),
+            proxy_name: Some("UDP Proxy".to_string()),
+            proxy_namespace: "ferrum".to_string(),
+            backend_scheme: BackendScheme::Udp,
+            listen_port: 5300,
+            idle_timeout_ms: 60_000,
+            // Tests build sessions without an overload state; the
+            // `Option<ConnectionGuard>` keeps the type constructible without
+            // pulling in `OverloadState` for unit tests that exercise summary
+            // emission only.
+            _overload_guard: None,
         }
     }
 
@@ -3045,5 +3212,171 @@ mod tests {
             summary.error_class,
             Some(crate::retry::ErrorClass::TlsError)
         );
+    }
+
+    // --- typed cause/direction tests for DTLS sessions (Gap 2 + Gap 4) ---
+
+    #[test]
+    fn typed_dtls_kind_drives_cause_and_direction() {
+        use crate::plugins::{Direction, DisconnectCause};
+        use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind};
+        use crate::retry::ErrorClass;
+
+        // Backend DTLS handshake = backend-side, b2c direction.
+        let e: anyhow::Error =
+            StreamSetupError::new(StreamSetupKind::BackendDtlsHandshake, ": handshake failed")
+                .into();
+        assert_eq!(
+            dtls_disconnect_cause(&e, &ErrorClass::TlsError),
+            DisconnectCause::BackendError
+        );
+        assert_eq!(
+            dtls_disconnect_direction(&e, &ErrorClass::TlsError),
+            Direction::BackendToClient
+        );
+    }
+
+    #[test]
+    fn untyped_dtls_session_falls_back_to_class() {
+        use crate::plugins::{Direction, DisconnectCause};
+        use crate::retry::ErrorClass;
+
+        // Generic recv error from the DTLS session — no typed kind in chain.
+        // Falls back to class: ConnectionReset → backend-side / b2c.
+        let e: anyhow::Error = anyhow::anyhow!("decrypt error mid-session");
+        assert_eq!(
+            dtls_disconnect_cause(&e, &ErrorClass::ConnectionReset),
+            DisconnectCause::BackendError
+        );
+        assert_eq!(
+            dtls_disconnect_direction(&e, &ErrorClass::ConnectionReset),
+            Direction::BackendToClient
+        );
+    }
+
+    #[test]
+    fn typed_kind_overrides_class_for_dtls_too() {
+        use crate::plugins::{Direction, DisconnectCause};
+        use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind};
+        use crate::retry::ErrorClass;
+
+        // RejectedByPlugin (client-side) classified misleadingly as
+        // ConnectionReset (which the class fallback calls backend-side).
+        // Typed kind must win.
+        let e: anyhow::Error =
+            StreamSetupError::new(StreamSetupKind::RejectedByPlugin, "(UDP session)").into();
+        assert_eq!(
+            dtls_disconnect_cause(&e, &ErrorClass::ConnectionReset),
+            DisconnectCause::RecvError
+        );
+        assert_eq!(
+            dtls_disconnect_direction(&e, &ErrorClass::ConnectionReset),
+            Direction::ClientToBackend
+        );
+    }
+
+    // --- OverloadState.active_connections parity (UDP <-> TCP/H3) ---
+
+    /// Build a `UdpSession` that holds a real `ConnectionGuard` against
+    /// `state`. Mirrors the production construction in `create_session()` —
+    /// every field except the guard is filler. This is the smallest faithful
+    /// reproduction of the production code path that exercises the guard
+    /// lifecycle without spinning up a UDP listener.
+    fn make_udp_session_with_overload(state: &Arc<crate::overload::OverloadState>) -> UdpSession {
+        UdpSession {
+            backend_socket: None,
+            dtls_conn: None,
+            last_activity: AtomicU64::new(0),
+            created_at: AtomicU64::new(0),
+            expired: std::sync::atomic::AtomicBool::new(false),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+            last_request_size: AtomicU64::new(0),
+            backend_target: "10.0.0.50:5353".to_string(),
+            backend_resolved_ip: "10.0.0.50".to_string(),
+            sni_hostname: None,
+            consumer_username: None,
+            metadata: std::sync::Mutex::new(HashMap::new()),
+            local_addr: std::sync::OnceLock::new(),
+            plugins: Arc::new(Vec::new()),
+            datagram_plugins: Arc::from([]),
+            proxy_id: "udp-proxy".to_string(),
+            proxy_name: Some("UDP Proxy".to_string()),
+            proxy_namespace: "ferrum".to_string(),
+            backend_scheme: BackendScheme::Udp,
+            listen_port: 5300,
+            idle_timeout_ms: 60_000,
+            _overload_guard: Some(crate::overload::ConnectionGuard::new(state)),
+        }
+    }
+
+    #[test]
+    fn udp_session_increments_overload_active_connections_on_create() {
+        let state = Arc::new(crate::overload::OverloadState::new());
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
+
+        let session = make_udp_session_with_overload(&state);
+        assert_eq!(
+            state.active_connections.load(Ordering::Relaxed),
+            1,
+            "creating a UDP session must increment OverloadState.active_connections (parity with TCP/H3)"
+        );
+
+        drop(session);
+        assert_eq!(
+            state.active_connections.load(Ordering::Relaxed),
+            0,
+            "dropping the UDP session must release the global connection slot"
+        );
+    }
+
+    #[test]
+    fn multiple_udp_sessions_track_concurrent_load() {
+        let state = Arc::new(crate::overload::OverloadState::new());
+
+        let s1 = make_udp_session_with_overload(&state);
+        let s2 = make_udp_session_with_overload(&state);
+        let s3 = make_udp_session_with_overload(&state);
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 3);
+
+        // Drop in non-LIFO order to exercise per-session ownership.
+        drop(s2);
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 2);
+
+        drop(s1);
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
+
+        drop(s3);
+        assert_eq!(
+            state.active_connections.load(Ordering::Relaxed),
+            0,
+            "all UDP sessions released — global counter must return to 0"
+        );
+    }
+
+    #[test]
+    fn udp_session_decrement_via_arc_unwrap_lifecycle() {
+        // The production code stores sessions as `Arc<UdpSession>` in the
+        // session map and clones them into the recv-loop fast-path cache and
+        // the spawned reply task. The guard must only fire when the LAST Arc
+        // is dropped. Verify Arc ref-counting interacts correctly.
+        let state = Arc::new(crate::overload::OverloadState::new());
+
+        let session = Arc::new(make_udp_session_with_overload(&state));
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
+
+        let cloned = session.clone();
+        let cloned2 = session.clone();
+        // Cloning the Arc must not double-count.
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
+
+        drop(cloned);
+        drop(cloned2);
+        // Dropping clones leaves one Arc — guard still alive.
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
+
+        drop(session);
+        // Last Arc dropped → UdpSession dropped → guard dropped → counter 0.
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
     }
 }

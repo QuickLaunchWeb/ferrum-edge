@@ -4,6 +4,7 @@ use ferrum_edge::ConsumerIndex;
 use ferrum_edge::plugins::{Plugin, RequestContext, jwt_auth::JwtAuth};
 use serde_json::json;
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use ferrum_edge::config::types::Consumer;
 use serde_json::Value;
@@ -320,6 +321,158 @@ async fn test_jwt_auth_multi_secret_wrong_secret_rejected() {
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
     let token = create_jwt_token(&json!({"sub": "testuser"}), "wrong-secret");
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+// ---- Algorithm confusion / alg:none security regression tests ----
+//
+// The jsonwebtoken crate v10 does not include Algorithm::None in its enum,
+// so alg:"none" tokens fail header deserialization. These tests serve as
+// regression guards: if the crate or our code ever changes, they catch it.
+
+/// Build a raw JWT string with an arbitrary header (bypassing the
+/// jsonwebtoken encoder so we can forge headers the library refuses to create).
+fn forge_jwt(header_json: &str, claims: &serde_json::Value, signature: &str) -> String {
+    let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+    let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+    format!("{}.{}.{}", header_b64, claims_b64, signature)
+}
+
+#[tokio::test]
+async fn test_jwt_auth_rejects_alg_none_unsigned() {
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+
+    // Forge a token with alg:"none" and an empty signature
+    let token = forge_jwt(
+        r#"{"alg":"none","typ":"JWT"}"#,
+        &json!({"sub": "testuser", "exp": 9999999999u64}),
+        "",
+    );
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn test_jwt_auth_rejects_alg_none_case_variations() {
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+
+    for alg in &["none", "None", "NONE", "nOnE"] {
+        let header = format!(r#"{{"alg":"{}","typ":"JWT"}}"#, alg);
+        let token = forge_jwt(
+            &header,
+            &json!({"sub": "testuser", "exp": 9999999999u64}),
+            "",
+        );
+
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("authorization".to_string(), format!("Bearer {}", token));
+
+        let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+        assert_reject(result, Some(401));
+        assert!(
+            ctx.identified_consumer.is_none(),
+            "alg:{} must not authenticate",
+            alg
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_jwt_auth_rejects_alg_none_with_valid_consumer_secret_as_signature() {
+    // An attacker might set alg:none but still attach a real HMAC signature,
+    // hoping the server ignores the algorithm field and verifies anyway.
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+
+    // Create a legitimately signed token to steal its signature
+    let legit_token = create_jwt_token(
+        &json!({"sub": "testuser", "exp": 9999999999u64}),
+        "test-jwt-secret",
+    );
+    let legit_sig = legit_token.rsplit('.').next().unwrap_or("");
+
+    // Forge a token with alg:none but the legit signature
+    let token = forge_jwt(
+        r#"{"alg":"none","typ":"JWT"}"#,
+        &json!({"sub": "testuser", "exp": 9999999999u64}),
+        legit_sig,
+    );
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_jwt_auth_rejects_algorithm_mismatch_rs256_header_with_hmac_secret() {
+    // Algorithm confusion: attacker sets alg:RS256 in header but the consumer
+    // only has an HMAC secret. The library must reject the family mismatch.
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+
+    let token = forge_jwt(
+        r#"{"alg":"RS256","typ":"JWT"}"#,
+        &json!({"sub": "testuser", "exp": 9999999999u64}),
+        "fakesignature",
+    );
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn test_jwt_auth_rejects_expired_token() {
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+
+    // exp in the past (before the 60s leeway)
+    let token = create_jwt_token(
+        &json!({"sub": "testuser", "exp": 1000000000u64}),
+        "test-jwt-secret",
+    );
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_jwt_auth_rejects_completely_empty_signature() {
+    // A properly-structured 3-part JWT with a valid HS256 header but empty signature
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+
+    let token = forge_jwt(
+        r#"{"alg":"HS256","typ":"JWT"}"#,
+        &json!({"sub": "testuser", "exp": 9999999999u64}),
+        "",
+    );
+
     let mut ctx = make_ctx();
     ctx.headers
         .insert("authorization".to_string(), format!("Bearer {}", token));

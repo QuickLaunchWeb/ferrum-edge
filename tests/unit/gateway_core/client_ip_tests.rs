@@ -1,6 +1,8 @@
 //! Tests for client IP resolution module
 
-use ferrum_edge::proxy::client_ip::{TrustedProxies, resolve_client_ip};
+use ferrum_edge::proxy::client_ip::{
+    TrustedProxies, resolve_client_ip, resolve_forwarded_client_ip, resolve_real_ip_header,
+};
 
 // ── TrustedProxies parsing ───────────────────────────────────────────
 
@@ -132,12 +134,109 @@ fn all_xff_entries_trusted_falls_back_to_socket() {
 }
 
 #[test]
-fn unparseable_xff_entry_treated_as_client() {
+fn unparseable_xff_entry_is_skipped() {
     let tp = TrustedProxies::parse("10.0.0.0/8");
-    // Garbage in XFF — stop at the unparseable entry
+    // Garbage in left side of XFF — skipped, valid IP returned
     assert_eq!(
         resolve_client_ip("10.0.0.1", Some("unknown, 203.0.113.50"), &tp),
         "203.0.113.50"
+    );
+}
+
+#[test]
+fn unparseable_rightmost_xff_entry_stops_walk_falls_back_to_socket() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    // Rightmost entry is garbage — stop the walk, fall back to socket.
+    // Continuing leftward into 203.0.113.50 is unsafe because that value
+    // is attacker-controlled (prepended before the trusted suffix).
+    assert_eq!(
+        resolve_client_ip("10.0.0.1", Some("203.0.113.50, not-an-ip"), &tp),
+        "10.0.0.1"
+    );
+}
+
+#[test]
+fn all_unparseable_xff_entries_fall_back_to_socket() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    // All XFF entries are garbage — fall back to socket IP
+    assert_eq!(
+        resolve_client_ip("10.0.0.1", Some("garbage, not-an-ip, !!!"), &tp),
+        "10.0.0.1"
+    );
+}
+
+#[test]
+fn mixed_garbage_trusted_and_valid_xff_stops_at_garbage() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    // XFF: "203.0.113.50, <script>alert(1)</script>, 10.0.0.2"
+    // Walk right-to-left: 10.0.0.2 is trusted (skip), script tag is
+    // unparseable — STOP. Fall back to socket address. 203.0.113.50
+    // is to the left of the garbage and therefore attacker-controlled.
+    assert_eq!(
+        resolve_client_ip(
+            "10.0.0.1",
+            Some("203.0.113.50, <script>alert(1)</script>, 10.0.0.2"),
+            &tp
+        ),
+        "10.0.0.1"
+    );
+}
+
+#[test]
+fn garbage_between_trusted_entries_stops_walk() {
+    let tp = TrustedProxies::parse("10.0.0.0/8, 172.16.0.0/12");
+    // XFF: "198.51.100.1, malicious\ninjection, 172.16.0.1, 10.0.0.2"
+    // Walk right-to-left: 10.0.0.2 trusted, 172.16.0.1 trusted,
+    // malicious\ninjection is malformed — STOP. Fall back to socket.
+    // 198.51.100.1 is to the left and attacker-controlled.
+    assert_eq!(
+        resolve_client_ip(
+            "10.0.0.1",
+            Some("198.51.100.1, malicious\ninjection, 172.16.0.1, 10.0.0.2"),
+            &tp
+        ),
+        "10.0.0.1"
+    );
+}
+
+#[test]
+fn only_garbage_and_trusted_entries_fall_back_to_socket() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    // XFF: "not-an-ip, also-garbage, 10.0.0.2"
+    // Walk right-to-left: 10.0.0.2 trusted, rest unparseable — socket fallback
+    assert_eq!(
+        resolve_client_ip("10.0.0.1", Some("not-an-ip, also-garbage, 10.0.0.2"), &tp),
+        "10.0.0.1"
+    );
+}
+
+#[test]
+fn malformed_entry_between_valid_entries_stops_walk() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    // XFF: "198.51.100.23, not-an-ip, 203.0.113.50"
+    // Walk right-to-left: 203.0.113.50 is NOT trusted → return it as
+    // the real client IP. The malformed entry is never reached because
+    // the walk already found a valid untrusted IP.
+    assert_eq!(
+        resolve_client_ip(
+            "10.0.0.1",
+            Some("198.51.100.23, not-an-ip, 203.0.113.50"),
+            &tp
+        ),
+        "203.0.113.50"
+    );
+}
+
+#[test]
+fn malformed_entry_after_trusted_suffix_stops_walk() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    // XFF: "198.51.100.23, not-an-ip, 10.0.0.2"
+    // Walk right-to-left: 10.0.0.2 is trusted (skip), not-an-ip is
+    // malformed — STOP. 198.51.100.23 is to the left and therefore
+    // attacker-controlled. Fall back to socket address.
+    assert_eq!(
+        resolve_client_ip("10.0.0.1", Some("198.51.100.23, not-an-ip, 10.0.0.2"), &tp),
+        "10.0.0.1"
     );
 }
 
@@ -160,5 +259,166 @@ fn real_world_cloudflare_pattern() {
     assert_eq!(
         resolve_client_ip("10.0.0.1", Some("198.51.100.23, 173.245.49.1"), &tp),
         "198.51.100.23"
+    );
+}
+
+// ── resolve_real_ip_header ──────────────────────────────────────────────
+
+#[test]
+fn real_ip_header_accepts_single_ip_from_trusted_proxy() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header("10.0.0.1", &socket_addr, " 203.0.113.50 ", &tp).as_deref(),
+        Some("203.0.113.50")
+    );
+}
+
+#[test]
+fn real_ip_header_normalizes_single_ip_value() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header(
+            "10.0.0.1",
+            &socket_addr,
+            " 2001:0db8:0000:0000:0000:0000:0000:0001 ",
+            &tp
+        )
+        .as_deref(),
+        Some("2001:db8::1")
+    );
+}
+
+#[test]
+fn real_ip_header_accepts_cloudfront_viewer_address_with_port() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header("10.0.0.1", &socket_addr, "198.51.100.10:46532", &tp).as_deref(),
+        Some("198.51.100.10")
+    );
+}
+
+#[test]
+fn real_ip_header_accepts_bracketed_ipv6_with_port() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header(
+            "10.0.0.1",
+            &socket_addr,
+            "[2001:0db8:0000:0000:0000:0000:0000:0001]:46532",
+            &tp
+        )
+        .as_deref(),
+        Some("2001:db8::1")
+    );
+}
+
+#[test]
+fn real_ip_header_rejects_empty_value() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header("10.0.0.1", &socket_addr, "  ", &tp),
+        None
+    );
+}
+
+#[test]
+fn real_ip_header_rejects_comma_separated_chain() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header("10.0.0.1", &socket_addr, "198.51.100.23, 203.0.113.50", &tp,),
+        None
+    );
+}
+
+// ── resolve_forwarded_client_ip ─────────────────────────────────────────────
+
+#[test]
+fn absent_real_ip_header_falls_back_to_xff_resolution() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_forwarded_client_ip("10.0.0.1", &socket_addr, None, Some("203.0.113.50"), &tp)
+            .as_deref(),
+        Some("203.0.113.50")
+    );
+}
+
+#[test]
+fn present_empty_real_ip_header_keeps_socket_ip_instead_of_xff() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_forwarded_client_ip(
+            "10.0.0.1",
+            &socket_addr,
+            Some("  "),
+            Some("203.0.113.50"),
+            &tp
+        ),
+        None
+    );
+}
+
+#[test]
+fn present_real_ip_header_from_untrusted_peer_keeps_socket_ip_instead_of_xff() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "198.51.100.2".parse().unwrap();
+
+    assert_eq!(
+        resolve_forwarded_client_ip(
+            "198.51.100.2",
+            &socket_addr,
+            Some("203.0.113.50"),
+            Some("192.0.2.9"),
+            &tp
+        ),
+        None
+    );
+}
+
+#[test]
+fn real_ip_header_rejects_malformed_value() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header("10.0.0.1", &socket_addr, "not-an-ip", &tp),
+        None
+    );
+}
+
+#[test]
+fn real_ip_header_rejects_malformed_source_port() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header("10.0.0.1", &socket_addr, "198.51.100.10:not-a-port", &tp),
+        None
+    );
+}
+
+#[test]
+fn real_ip_header_rejects_untrusted_direct_peer() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "198.51.100.2".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header("198.51.100.2", &socket_addr, "203.0.113.50", &tp),
+        None
     );
 }

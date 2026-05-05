@@ -410,12 +410,11 @@ async fn run_h3_server(addr: SocketAddr, server_config: quinn::ServerConfig) -> 
                         }
                         let resp = http::Response::builder()
                             .status(StatusCode::OK)
+                            .header("content-length", body_data.len().to_string())
                             .body(())
                             .unwrap();
                         let _ = stream.send_response(resp).await;
-                        let _ = stream
-                            .send_data(bytes::Bytes::from(body_data))
-                            .await;
+                        let _ = stream.send_data(bytes::Bytes::from(body_data)).await;
                         let _ = stream.finish().await;
                         return;
                     }
@@ -501,21 +500,16 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
                 let mut dtls = Dtls::new_auto(config, cert, std::time::Instant::now());
                 let mut out_buf = vec![0u8; 65536];
                 let mut connected = false;
-                let mut next_timeout: Option<std::time::Instant> = None;
 
                 // Initialize server state (random, etc.) — required before
                 // handle_packet or dimpl panics in send_server_hello.
                 let _ = dtls.handle_timeout(std::time::Instant::now());
                 // Drain the resulting Timeout output
-                loop {
-                    match dtls.poll_output(&mut out_buf) {
-                        Output::Timeout(t) => {
-                            next_timeout = Some(t);
-                            break;
-                        }
-                        _ => {}
+                let mut next_timeout = loop {
+                    if let Output::Timeout(t) = dtls.poll_output(&mut out_buf) {
+                        break Some(t);
                     }
-                }
+                };
 
                 loop {
                     let sleep_dur = next_timeout
@@ -563,7 +557,8 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
                                 connected = true;
                             }
                             Output::ApplicationData(d) if connected => {
-                                if dtls.send_application_data(d).is_err() {
+                                let echo_failed = dtls.send_application_data(d).is_err();
+                                if echo_failed {
                                     break;
                                 }
                             }
@@ -583,9 +578,10 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
                                     next_timeout = Some(t);
                                     break;
                                 }
+                                // Late app data arrival — echo it.
                                 Output::ApplicationData(d) => {
-                                    // Late app data arrival — echo it
-                                    if dtls.send_application_data(d).is_err() {
+                                    let echo_failed = dtls.send_application_data(d).is_err();
+                                    if echo_failed {
                                         break;
                                     }
                                 }
@@ -665,9 +661,7 @@ async fn main() -> anyhow::Result<()> {
                 .context("building h2-tls server config")?,
         );
         tokio::spawn(async move {
-            if let Err(e) =
-                run_h2_tls_server("127.0.0.1:3443".parse().unwrap(), h2_tls).await
-            {
+            if let Err(e) = run_h2_tls_server("127.0.0.1:3443".parse().unwrap(), h2_tls).await {
                 eprintln!("h2-tls server error: {e}");
             }
         });
@@ -717,12 +711,8 @@ async fn main() -> anyhow::Result<()> {
         let grpcs_cert = cert_path.clone();
         let grpcs_key = key_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_grpcs_server(
-                "127.0.0.1:50053".parse().unwrap(),
-                &grpcs_cert,
-                &grpcs_key,
-            )
-            .await
+            if let Err(e) =
+                run_grpcs_server("127.0.0.1:50053".parse().unwrap(), &grpcs_cert, &grpcs_key).await
             {
                 eprintln!("grpcs server error: {e}");
             }

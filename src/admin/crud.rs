@@ -668,7 +668,7 @@ impl AdminResource for PluginConfig {
     async fn after_validate(
         db: &dyn DatabaseBackend,
         _state: &AdminState,
-        _namespace: &str,
+        namespace: &str,
         resource: &Self,
         _existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
@@ -682,13 +682,20 @@ impl AdminResource for PluginConfig {
         }
 
         if let Some(proxy_id) = resource.proxy_id.as_deref() {
-            match db.check_proxy_exists(proxy_id).await {
+            match db.check_proxy_exists(proxy_id, namespace).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    return Err(AfterValidateError::BadRequest(vec![format!(
-                        "proxy_id '{}' does not exist",
-                        proxy_id
-                    )]));
+                    // Distinguish "missing" from "wrong namespace" so the
+                    // operator can fix the actual problem instead of
+                    // chasing a phantom "does not exist".
+                    let message = match db.get_proxy(proxy_id).await {
+                        Ok(Some(other)) => format!(
+                            "Cross-namespace reference forbidden: proxy_id '{}' belongs to namespace '{}' but plugin_config is in namespace '{}'",
+                            proxy_id, other.namespace, namespace
+                        ),
+                        _ => format!("proxy_id '{}' does not exist", proxy_id),
+                    };
+                    return Err(AfterValidateError::BadRequest(vec![message]));
                 }
                 Err(error) => return Err(AfterValidateError::Db(error)),
             }
@@ -915,26 +922,33 @@ impl AdminResource for Proxy {
     async fn after_validate(
         db: &dyn DatabaseBackend,
         _state: &AdminState,
-        _namespace: &str,
+        namespace: &str,
         resource: &Self,
         existing: Option<&Self>,
         ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
         if let Some(upstream_id) = resource.upstream_id.as_deref() {
-            match db.check_upstream_exists(upstream_id).await {
+            match db.check_upstream_exists(upstream_id, namespace).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    return Err(AfterValidateError::BadRequest(vec![format!(
-                        "upstream_id '{}' does not exist",
-                        upstream_id
-                    )]));
+                    // Distinguish "missing" from "wrong namespace" so the
+                    // operator gets a precise diagnostic instead of a
+                    // misleading "does not exist".
+                    let message = match db.get_upstream(upstream_id).await {
+                        Ok(Some(other)) => format!(
+                            "Cross-namespace reference forbidden: upstream_id '{}' belongs to namespace '{}' but proxy is in namespace '{}'",
+                            upstream_id, other.namespace, namespace
+                        ),
+                        _ => format!("upstream_id '{}' does not exist", upstream_id),
+                    };
+                    return Err(AfterValidateError::BadRequest(vec![message]));
                 }
                 Err(error) => return Err(AfterValidateError::Db(error)),
             }
         }
 
         match db
-            .validate_proxy_plugin_associations(resource.id(), &resource.plugins)
+            .validate_proxy_plugin_associations(resource.id(), namespace, &resource.plugins)
             .await
         {
             Ok(errors) if !errors.is_empty() => {

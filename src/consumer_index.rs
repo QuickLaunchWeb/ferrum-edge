@@ -1,30 +1,41 @@
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{error, warn};
 
 use crate::config::types::Consumer;
+
+/// All consumer-index data swapped as a single unit so readers never see a
+/// mix of old and new credential mappings (e.g., a new keyauth entry paired
+/// with a stale identity index).
+pub(crate) struct ConsumerIndexInner {
+    /// Separate indexes per credential type — avoids format!() allocation per lookup.
+    keyauth_index: HashMap<String, Arc<Consumer>>,
+    basic_index: HashMap<String, Arc<Consumer>>,
+    identity_index: HashMap<String, Arc<Consumer>>,
+    /// mTLS identity index: maps `mtls_auth.identity` -> Consumer for O(1) cert-based auth.
+    mtls_index: HashMap<String, Arc<Consumer>>,
+    /// Full consumer list for plugins that need iteration (jwt_auth, jwks_auth).
+    /// Wrapped in `Arc` so `consumers()` can return a cheap clone without O(n) Vec cloning.
+    all_consumers: Arc<Vec<Arc<Consumer>>>,
+    /// Pre-computed credential counts for auth types that share the identity index.
+    jwt_credential_count: usize,
+    hmac_credential_count: usize,
+}
 
 /// Pre-indexed consumer lookup for O(1) credential matching on the hot path.
 ///
 /// Uses separate HashMaps per credential type to avoid `format!()` string
 /// allocation on every lookup. Built once at config load time and atomically
-/// swapped on config changes via ArcSwap — reads are lock-free.
+/// swapped on config changes via a single `ArcSwap` — reads are lock-free
+/// and always see a consistent generation across all credential types.
 pub struct ConsumerIndex {
-    /// Separate indexes per credential type — avoids format!() allocation per lookup.
-    keyauth_index: ArcSwap<HashMap<String, Arc<Consumer>>>,
-    basic_index: ArcSwap<HashMap<String, Arc<Consumer>>>,
-    identity_index: ArcSwap<HashMap<String, Arc<Consumer>>>,
-    /// mTLS identity index: maps `mtls_auth.identity` → Consumer for O(1) cert-based auth.
-    mtls_index: ArcSwap<HashMap<String, Arc<Consumer>>>,
-    /// Full consumer list for plugins that need iteration (jwt_auth, jwks_auth)
-    all_consumers: ArcSwap<Vec<Arc<Consumer>>>,
-    /// Pre-computed credential counts for auth types that share the identity index.
-    /// These count credential entries (not index entries) since jwt/hmac consumers
-    /// are looked up via the shared identity_index but have distinct credential data.
-    jwt_credential_count: AtomicUsize,
-    hmac_credential_count: AtomicUsize,
+    inner: ConsumerIndexStorage,
+}
+
+enum ConsumerIndexStorage {
+    Shared(ArcSwap<ConsumerIndexInner>),
+    Snapshot(Arc<ConsumerIndexInner>),
 }
 
 struct IndexMaps {
@@ -42,58 +53,86 @@ impl ConsumerIndex {
     pub fn new(consumers: &[Consumer]) -> Self {
         let maps = Self::build_index(consumers);
         Self {
-            keyauth_index: ArcSwap::new(Arc::new(maps.keyauth)),
-            basic_index: ArcSwap::new(Arc::new(maps.basic)),
-            identity_index: ArcSwap::new(Arc::new(maps.identity)),
-            mtls_index: ArcSwap::new(Arc::new(maps.mtls)),
-            all_consumers: ArcSwap::new(Arc::new(maps.all)),
-            jwt_credential_count: AtomicUsize::new(maps.jwt_count),
-            hmac_credential_count: AtomicUsize::new(maps.hmac_count),
+            inner: ConsumerIndexStorage::Shared(ArcSwap::new(Arc::new(
+                ConsumerIndexInner::from_maps(maps),
+            ))),
+        }
+    }
+
+    /// Build a lightweight facade over an already-published consumer snapshot.
+    ///
+    /// This avoids constructing an ArcSwap-backed wrapper on request paths that
+    /// already loaded a RequestEpoch.
+    pub(crate) fn from_inner(inner: Arc<ConsumerIndexInner>) -> Self {
+        Self {
+            inner: ConsumerIndexStorage::Snapshot(inner),
+        }
+    }
+
+    pub(crate) fn build_inner(consumers: &[Consumer]) -> Arc<ConsumerIndexInner> {
+        Arc::new(ConsumerIndexInner::from_maps(Self::build_index(consumers)))
+    }
+
+    pub(crate) fn store_inner(&self, inner: Arc<ConsumerIndexInner>) {
+        match &self.inner {
+            ConsumerIndexStorage::Shared(shared) => shared.store(inner),
+            ConsumerIndexStorage::Snapshot(_) => {
+                debug_assert!(
+                    false,
+                    "attempted to mutate a snapshot-backed ConsumerIndex facade"
+                );
+                error!("attempted to mutate a snapshot-backed ConsumerIndex facade");
+            }
+        }
+    }
+
+    pub(crate) fn load_inner(&self) -> Arc<ConsumerIndexInner> {
+        match &self.inner {
+            ConsumerIndexStorage::Shared(shared) => shared.load_full(),
+            ConsumerIndexStorage::Snapshot(inner) => Arc::clone(inner),
+        }
+    }
+
+    fn with_inner<R>(&self, f: impl FnOnce(&ConsumerIndexInner) -> R) -> R {
+        match &self.inner {
+            ConsumerIndexStorage::Shared(shared) => {
+                let inner = shared.load();
+                f(&inner)
+            }
+            ConsumerIndexStorage::Snapshot(inner) => f(inner),
         }
     }
 
     /// Atomically rebuild the index when config changes.
     pub fn rebuild(&self, consumers: &[Consumer]) {
-        let maps = Self::build_index(consumers);
-        self.keyauth_index.store(Arc::new(maps.keyauth));
-        self.basic_index.store(Arc::new(maps.basic));
-        self.identity_index.store(Arc::new(maps.identity));
-        self.mtls_index.store(Arc::new(maps.mtls));
-        self.all_consumers.store(Arc::new(maps.all));
-        self.jwt_credential_count
-            .store(maps.jwt_count, Ordering::Relaxed);
-        self.hmac_credential_count
-            .store(maps.hmac_count, Ordering::Relaxed);
+        self.store_inner(Self::build_inner(consumers));
     }
 
     /// O(1) lookup by API key (for key_auth plugin). No allocation.
     pub fn find_by_api_key(&self, api_key: &str) -> Option<Arc<Consumer>> {
-        let idx = self.keyauth_index.load();
-        idx.get(api_key).cloned()
+        self.with_inner(|inner| inner.find_by_api_key(api_key))
     }
 
     /// O(1) lookup by username (for basic_auth plugin). No allocation.
     pub fn find_by_username(&self, username: &str) -> Option<Arc<Consumer>> {
-        let idx = self.basic_index.load();
-        idx.get(username).cloned()
+        self.with_inner(|inner| inner.find_by_username(username))
     }
 
     /// O(1) lookup by username or ID (for jwt_auth/jwks_auth claim matching). No allocation.
     pub fn find_by_identity(&self, identity: &str) -> Option<Arc<Consumer>> {
-        let idx = self.identity_index.load();
-        idx.get(identity).cloned()
+        self.with_inner(|inner| inner.find_by_identity(identity))
     }
 
     /// O(1) lookup by mTLS identity (for mtls_auth plugin). No allocation.
     pub fn find_by_mtls_identity(&self, identity: &str) -> Option<Arc<Consumer>> {
-        let idx = self.mtls_index.load();
-        idx.get(identity).cloned()
+        self.with_inner(|inner| inner.find_by_mtls_identity(identity))
     }
 
     /// Returns the full consumer list for custom plugins that need to iterate.
-    #[allow(dead_code)] // Public API used by custom plugins
+    ///
+    /// Returns `Arc<Vec<…>>` — cheap pointer clone, no O(n) Vec copy.
     pub fn consumers(&self) -> Arc<Vec<Arc<Consumer>>> {
-        self.all_consumers.load_full()
+        self.with_inner(|inner| inner.consumers())
     }
 
     /// Incrementally update the consumer index by applying only the changes.
@@ -106,12 +145,16 @@ impl ConsumerIndex {
             return;
         }
 
-        // Clone current state for patching
-        let mut keyauth = self.keyauth_index.load().as_ref().clone();
-        let mut basic = self.basic_index.load().as_ref().clone();
-        let mut identity = self.identity_index.load().as_ref().clone();
-        let mut mtls = self.mtls_index.load().as_ref().clone();
-        let mut all: Vec<Arc<Consumer>> = self.all_consumers.load().as_ref().clone();
+        // Load the current snapshot and clone its fields for patching
+        let current = match &self.inner {
+            ConsumerIndexStorage::Shared(shared) => shared.load_full(),
+            ConsumerIndexStorage::Snapshot(inner) => Arc::clone(inner),
+        };
+        let mut keyauth = current.keyauth_index.clone();
+        let mut basic = current.basic_index.clone();
+        let mut identity = current.identity_index.clone();
+        let mut mtls = current.mtls_index.clone();
+        let mut all: Vec<Arc<Consumer>> = current.all_consumers.as_ref().clone();
 
         // Collect all IDs that need removal (deleted + modified consumers being re-inserted)
         let ids_to_remove: std::collections::HashSet<&str> = removed_ids
@@ -126,7 +169,7 @@ impl ConsumerIndex {
         let mut hmac_delta: isize = 0;
 
         if !ids_to_remove.is_empty() {
-            // Build a reverse index: consumer_id → old credential keys, so we can
+            // Build a reverse index: consumer_id -> old credential keys, so we can
             // do O(1) HashMap::remove instead of O(n) retain loops.
             // Scan the all-consumers list once to find old entries for removed/modified IDs.
             let mut old_keyauth_keys: Vec<String> = Vec::new();
@@ -235,40 +278,31 @@ impl ConsumerIndex {
         }
 
         // Apply jwt/hmac credential count deltas
-        let jwt_count = (self.jwt_credential_count.load(Ordering::Relaxed) as isize + jwt_delta)
-            .max(0) as usize;
-        let hmac_count = (self.hmac_credential_count.load(Ordering::Relaxed) as isize + hmac_delta)
-            .max(0) as usize;
+        let jwt_count = (current.jwt_credential_count as isize + jwt_delta).max(0) as usize;
+        let hmac_count = (current.hmac_credential_count as isize + hmac_delta).max(0) as usize;
 
-        // Swap all indexes. Store all_consumers last so that a concurrent reader
-        // that finds a consumer via a credential index can also find it in the
-        // all-consumers list (the new list is a superset of the old for additions).
-        // For removals, storing credential indexes first ensures the removed
-        // consumer is unreachable via credentials before it disappears from the
-        // all-consumers list, avoiding stale auth lookups.
-        self.keyauth_index.store(Arc::new(keyauth));
-        self.basic_index.store(Arc::new(basic));
-        self.identity_index.store(Arc::new(identity));
-        self.mtls_index.store(Arc::new(mtls));
-        self.all_consumers.store(Arc::new(all));
-        self.jwt_credential_count
-            .store(jwt_count, Ordering::Relaxed);
-        self.hmac_credential_count
-            .store(hmac_count, Ordering::Relaxed);
+        // Single atomic swap — readers see old or new, never a partial state.
+        self.store_inner(Arc::new(ConsumerIndexInner {
+            keyauth_index: keyauth,
+            basic_index: basic,
+            identity_index: identity,
+            mtls_index: mtls,
+            all_consumers: Arc::new(all),
+            jwt_credential_count: jwt_count,
+            hmac_credential_count: hmac_count,
+        }));
     }
 
     /// Number of indexed entries (for testing).
-    #[allow(dead_code)]
     pub fn index_len(&self) -> usize {
-        self.keyauth_index.load().len()
-            + self.basic_index.load().len()
-            + self.identity_index.load().len()
+        self.with_inner(|inner| {
+            inner.keyauth_index.len() + inner.basic_index.len() + inner.identity_index.len()
+        })
     }
 
     /// Number of consumers (for testing).
-    #[allow(dead_code)]
     pub fn consumer_count(&self) -> usize {
-        self.all_consumers.load().len()
+        self.with_inner(|inner| inner.all_consumers.len())
     }
 
     /// Per-auth-type credential counts for metrics.
@@ -279,15 +313,7 @@ impl ConsumerIndex {
     /// - identity: shared identity index size (serves jwt, jwks, hmac, ldap lookups)
     /// - total_consumers: total consumer count
     pub fn auth_type_counts(&self) -> (usize, usize, usize, usize, usize, usize, usize) {
-        (
-            self.keyauth_index.load().len(),
-            self.basic_index.load().len(),
-            self.mtls_index.load().len(),
-            self.jwt_credential_count.load(Ordering::Relaxed),
-            self.hmac_credential_count.load(Ordering::Relaxed),
-            self.identity_index.load().len(),
-            self.all_consumers.load().len(),
-        )
+        self.with_inner(|inner| inner.auth_type_counts())
     }
 
     fn build_index(consumers: &[Consumer]) -> IndexMaps {
@@ -378,5 +404,55 @@ impl ConsumerIndex {
             jwt_count,
             hmac_count,
         }
+    }
+}
+
+impl ConsumerIndexInner {
+    fn from_maps(maps: IndexMaps) -> Self {
+        Self {
+            keyauth_index: maps.keyauth,
+            basic_index: maps.basic,
+            identity_index: maps.identity,
+            mtls_index: maps.mtls,
+            all_consumers: Arc::new(maps.all),
+            jwt_credential_count: maps.jwt_count,
+            hmac_credential_count: maps.hmac_count,
+        }
+    }
+
+    /// O(1) lookup by API key (for key_auth plugin). No allocation.
+    pub fn find_by_api_key(&self, api_key: &str) -> Option<Arc<Consumer>> {
+        self.keyauth_index.get(api_key).cloned()
+    }
+
+    /// O(1) lookup by username (for basic_auth plugin). No allocation.
+    pub fn find_by_username(&self, username: &str) -> Option<Arc<Consumer>> {
+        self.basic_index.get(username).cloned()
+    }
+
+    /// O(1) lookup by username or ID (for jwt_auth/jwks_auth claim matching). No allocation.
+    pub fn find_by_identity(&self, identity: &str) -> Option<Arc<Consumer>> {
+        self.identity_index.get(identity).cloned()
+    }
+
+    /// O(1) lookup by mTLS identity (for mtls_auth plugin). No allocation.
+    pub fn find_by_mtls_identity(&self, identity: &str) -> Option<Arc<Consumer>> {
+        self.mtls_index.get(identity).cloned()
+    }
+
+    pub fn consumers(&self) -> Arc<Vec<Arc<Consumer>>> {
+        Arc::clone(&self.all_consumers)
+    }
+
+    pub fn auth_type_counts(&self) -> (usize, usize, usize, usize, usize, usize, usize) {
+        (
+            self.keyauth_index.len(),
+            self.basic_index.len(),
+            self.mtls_index.len(),
+            self.jwt_credential_count,
+            self.hmac_credential_count,
+            self.identity_index.len(),
+            self.all_consumers.len(),
+        )
     }
 }

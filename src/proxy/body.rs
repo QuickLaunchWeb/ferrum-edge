@@ -7,7 +7,7 @@
 
 use bytes::{Bytes, BytesMut};
 use http_body::Frame;
-use http_body_util::{Full, StreamBody};
+use http_body_util::Full;
 use hyper::body::Incoming;
 use pin_project_lite::pin_project;
 use std::pin::Pin;
@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tracing::debug;
 
 pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -277,71 +278,54 @@ impl ProxyBody {
         }
     }
 
-    /// Create a streaming body with lightweight completion tracking.
+    /// Wrap a streaming body in lightweight completion tracking.
     ///
-    /// Returns the body and a shared `Arc<StreamingMetrics>` that a deferred
-    /// task can read to get the final transfer time after `read_timeout + buffer`.
-    pub fn streaming_tracked(
-        response: reqwest::Response,
-        baseline: Instant,
-    ) -> (Self, Arc<StreamingMetrics>) {
-        use futures_util::StreamExt;
-
+    /// Returns the tracked body and a shared `Arc<StreamingMetrics>` that a
+    /// deferred task can read to get the final transfer time after
+    /// `read_timeout + buffer`. Cost per frame: one `Instant::now()` + one
+    /// atomic store.
+    ///
+    /// Composes with the protocol-agnostic body builders
+    /// (`coalescing_body`, `direct_streaming_body`,
+    /// `size_limited_streaming_body`, `coalescing_h2_body`,
+    /// `direct_streaming_h2_body`, `coalescing_h3_body`,
+    /// `direct_streaming_h3_body`) — pick the right base body for the
+    /// dispatch path, then call `into_tracked()` so the tracked path inherits
+    /// the same coalescing / size-limit / fast-path behaviour as the default
+    /// streaming path. No-op (returns unchanged kind) on `Full` or
+    /// already-tracked bodies; in those cases the returned `metrics` are
+    /// inert.
+    pub fn into_tracked(mut self, baseline: Instant) -> (Self, Arc<StreamingMetrics>) {
         let metrics = Arc::new(StreamingMetrics::new(baseline));
-
-        let stream = response.bytes_stream().map(|result| {
-            result
-                .map(Frame::data)
-                .map_err(|e| Box::new(e) as ProxyBodyError)
-        });
-        let inner = Box::pin(StreamBody::new(stream));
-        let tracked = TrackedBody::new(inner, Arc::clone(&metrics));
-        (
-            Self {
-                kind: ProxyBodyKind::Tracked(tracked),
-                _request_guard: None,
-                logger: None,
-                bytes_streamed: AtomicU64::new(0),
-                polled: AtomicBool::new(false),
-            },
-            metrics,
-        )
-    }
-
-    /// Create a streaming body with both completion tracking and frame-by-frame
-    /// size enforcement. Used when `enable_streaming_latency_tracking=true` AND
-    /// `max_response_body_size_bytes > 0` AND Content-Length is absent.
-    pub fn streaming_tracked_with_size_limit(
-        response: reqwest::Response,
-        baseline: Instant,
-        max_bytes: usize,
-    ) -> (Self, Arc<StreamingMetrics>) {
-        use futures_util::StreamExt;
-
-        let metrics = Arc::new(StreamingMetrics::new(baseline));
-
-        let stream = response.bytes_stream().map(|result| {
-            result
-                .map(Frame::data)
-                .map_err(|e| Box::new(e) as ProxyBodyError)
-        });
-        let limited = SizeLimitedStreamingResponse {
-            inner: stream,
-            max_bytes,
-            bytes_seen: 0,
+        // `ProxyBody: Drop` blocks destructuring, so swap the kind out via
+        // `mem::replace` (cheap — `Full(Full::default())` allocates nothing).
+        let placeholder = ProxyBodyKind::Full(Full::default());
+        let prev = std::mem::replace(&mut self.kind, placeholder);
+        self.kind = match prev {
+            ProxyBodyKind::Stream(body) => {
+                ProxyBodyKind::Tracked(TrackedBody::new(body, Arc::clone(&metrics)))
+            }
+            other => {
+                // Latent-trap diagnostic: production callers should only
+                // reach here from `ResponseBody::Streaming` arms (which
+                // produce `Stream` variants). If a future refactor passes
+                // a `Full` or already-`Tracked` body here, the returned
+                // metrics stay inert — the deferred log task will then
+                // warn "Streaming response incomplete" after
+                // `read_timeout + 5s`. Surfacing it as a debug line makes
+                // that failure mode trivial to diagnose.
+                debug!(
+                    kind = match &other {
+                        ProxyBodyKind::Full(_) => "Full",
+                        ProxyBodyKind::Tracked(_) => "Tracked",
+                        ProxyBodyKind::Stream(_) => "Stream",
+                    },
+                    "ProxyBody::into_tracked called on non-Stream body — returning unchanged with inert metrics"
+                );
+                other
+            }
         };
-        let inner = Box::pin(StreamBody::new(limited));
-        let tracked = TrackedBody::new(inner, Arc::clone(&metrics));
-        (
-            Self {
-                kind: ProxyBodyKind::Tracked(tracked),
-                _request_guard: None,
-                logger: None,
-                bytes_streamed: AtomicU64::new(0),
-                polled: AtomicBool::new(false),
-            },
-            metrics,
-        )
+        (self, metrics)
     }
 }
 
@@ -495,24 +479,35 @@ impl Drop for ProxyBody {
 // -- SyncBody wrapper ---------------------------------------------------------
 
 pin_project! {
-    /// Wraps a `Send` body to also implement `Sync`, enabling use with
-    /// `reqwest::Body::wrap()` which requires `Send + Sync + 'static`.
+    /// Wraps a body that already implements `Send + Sync` so that the
+    /// `Sync` bound is preserved through `pin_project!`'s synthesized
+    /// generics, enabling use with `reqwest::Body::wrap()` (which requires
+    /// `Send + Sync + 'static`).
     ///
-    /// # Safety
-    /// Bodies are only polled from a single tokio task (`poll_frame` takes
-    /// `Pin<&mut Self>`). The `&self` methods (`is_end_stream`, `size_hint`)
-    /// only read immutable state. There are no concurrent mutable accesses
-    /// from different threads.
+    /// The wrapper itself adds no extra concurrency capability beyond what
+    /// `B` already provides — it is a thin `#[pin]`-projected newtype. The
+    /// `unsafe impl Sync` below delegates the `Sync` claim to `B` at
+    /// compile time via the `B: Send + Sync` bound; there is no runtime
+    /// invariant required.
+    ///
+    /// Use [`reqwest::Body::wrap_stream`] instead if `B` is `Send` but
+    /// `!Sync`. That path loses the `size_hint()` from the underlying body
+    /// (forcing chunked transfer encoding even when `Content-Length` is
+    /// known), so it is only worth taking when the inner body genuinely
+    /// cannot be made `Sync`.
     pub(crate) struct SyncBody<B> {
         #[pin]
         inner: B,
     }
 }
 
-// SAFETY: See doc comment on `SyncBody`. The body is only ever mutated
-// through `Pin<&mut Self>` (poll_frame) from a single task. The immutable
-// accessors (is_end_stream, size_hint) are safe to call concurrently.
-unsafe impl<B: Send> Sync for SyncBody<B> {}
+// SAFETY: The bound `B: Send + Sync` makes this `Sync` claim a compile-time
+// delegation to the inner body. `SyncBody<B>` is a transparent newtype over
+// `B` (one `#[pin]`-projected field, no interior mutability of its own), so
+// `&SyncBody<B>` exposes only `&B`'s API surface, which is `Sync`-safe by
+// the bound. No runtime invariant (such as "polled from a single task") is
+// required for soundness.
+unsafe impl<B: Send + Sync> Sync for SyncBody<B> {}
 
 impl<B> SyncBody<B> {
     pub(crate) fn new(inner: B) -> Self {
@@ -889,7 +884,10 @@ where
     }
 }
 
+/// Default flush target for the [`Coalescing`] adapter when no explicit
+/// target is supplied (HTTP/1.1 + HTTP/2-via-reqwest path).
 const COALESCE_TARGET: usize = 128 * 1024;
+
 pub(crate) trait FrameSource {
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -1137,9 +1135,8 @@ impl<S: FrameSource> Coalescing<S> {
     }
 
     fn buffer_data(&mut self, data: &Bytes) {
-        let buffer_was_empty = self.buffer.is_empty();
         self.buffer.extend_from_slice(data);
-        if buffer_was_empty {
+        if self.flush_after.is_some() && !self.flush_timer_armed {
             self.arm_flush_timer();
         }
     }
@@ -1391,6 +1388,150 @@ pub(crate) fn direct_streaming_h2_body(body: Incoming, content_length: Option<u6
         content_length,
     };
     ProxyBody::streaming(Box::pin(direct.map_err(|e| Box::new(e) as BoxError)))
+}
+
+/// HTTP/2 streaming body wrapped in a [`StripHopByHopTrailers`] filter so
+/// hop-by-hop names (RFC 9110 §7.6.1, response-direction set) cannot leak
+/// downstream via TRAILERS frames. Used for the gRPC streaming response path
+/// — gRPC always rides on HTTP/2 and the backend's `grpc-status` /
+/// `grpc-message` arrive as trailers, so a backend that puts `connection`,
+/// `keep-alive`, `proxy-authenticate`, or `proxy-connection` in the trailer
+/// map would otherwise punch a hole in the proxy boundary. See
+/// `proxy::headers::is_backend_response_strip_header`.
+///
+/// The wrapper is interposed BEFORE the `Coalescing` adapter so the stash-
+/// then-flush trailer logic in `Coalescing<Incoming>` still works on the
+/// already-filtered map.
+pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers(
+    body: Incoming,
+    content_length: Option<u64>,
+    coalesce_target: usize,
+) -> ProxyBody {
+    let stripped = StripHopByHopTrailers::new(body);
+    let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
+    ProxyBody::streaming(Box::pin(coalescing))
+}
+
+/// Direct (non-coalesced) HTTP/2 streaming body wrapped in
+/// [`StripHopByHopTrailers`]. Counterpart of
+/// [`coalescing_h2_body_strip_hop_by_hop_trailers`] for the gRPC streaming
+/// path's `response_buffer_cutoff_bytes == 0 && max_response_body_size_bytes
+/// == 0` zero-buffering branch.
+pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
+    body: Incoming,
+    content_length: Option<u64>,
+) -> ProxyBody {
+    use http_body_util::BodyExt;
+
+    let direct = DirectH2Body {
+        inner: body,
+        content_length,
+    };
+    let stripped = StripHopByHopTrailers::new(direct);
+    ProxyBody::streaming(Box::pin(stripped.map_err(|e| Box::new(e) as BoxError)))
+}
+
+/// A body wrapper that filters hop-by-hop response headers out of any
+/// [`Frame::trailers`] frames as they pass through. DATA frames pass
+/// through unchanged. The predicate is
+/// [`crate::proxy::headers::is_backend_response_strip_header`] (RFC 9110
+/// §7.6.1, response-direction set: `connection`, `keep-alive`,
+/// `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
+/// `transfer-encoding`, `upgrade`).
+///
+/// This is intentionally generic over any body whose `Data` is `Bytes` so
+/// the same wrapper can be composed over `hyper::body::Incoming`,
+/// `DirectH2Body`, or future stream types — there is one strip predicate
+/// and one filter implementation, regardless of dispatch path.
+///
+/// The wrapper preserves the `Frame::trailers` shape even when the strip
+/// would leave the trailer map empty, because hyper's HTTP/2 server-side
+/// writer still needs the END_STREAM trailers signal. An empty trailer
+/// frame is functionally equivalent to "no trailers" on the wire and
+/// matches what hyper does when a backend emits an empty trailer frame
+/// natively, so this is safe.
+pub(crate) struct StripHopByHopTrailers<B> {
+    inner: B,
+}
+
+impl<B> StripHopByHopTrailers<B> {
+    pub(crate) fn new(inner: B) -> Self {
+        Self { inner }
+    }
+}
+
+impl<B> http_body::Body for StripHopByHopTrailers<B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if frame.is_trailers() {
+                    let mut trailers = match frame.into_trailers() {
+                        Ok(map) => map,
+                        // Frame reported `is_trailers()` so this branch is
+                        // unreachable; preserve the frame defensively.
+                        Err(other) => return Poll::Ready(Some(Ok(other))),
+                    };
+                    let to_remove: Vec<http::HeaderName> = trailers
+                        .keys()
+                        .filter(|name| {
+                            crate::proxy::headers::is_backend_response_strip_header(name.as_str())
+                        })
+                        .cloned()
+                        .collect();
+                    for name in to_remove {
+                        trailers.remove(&name);
+                    }
+                    Poll::Ready(Some(Ok(Frame::trailers(trailers))))
+                } else {
+                    Poll::Ready(Some(Ok(frame)))
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+// `StripHopByHopTrailers<B>` is also a `FrameSource` so it composes
+// directly into `Coalescing<S>`. The production wrapper interposes
+// `StripHopByHopTrailers<Incoming>` before `Coalescing` on the gRPC
+// streaming response path; the test harness composes it over
+// `FrameSourceAsBody<MockSource>`. Both satisfy the `B::Error: Error`
+// bound (`hyper::Error` and `std::io::Error` respectively), so the
+// single generic impl covers both call sites.
+impl<B> FrameSource for StripHopByHopTrailers<B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        match http_body::Body::poll_frame(self, cx) {
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(Box::new(err) as BoxError))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 pub(crate) fn coalescing_h3_body(
@@ -1723,6 +1864,159 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn coalescing_flush_timer_rearms_after_expiry() {
+        // Simulate: frame A arrives (timer armed), timer fires, buffer flushed,
+        // then frames B+C arrive into a non-empty buffer. The timer must be
+        // re-armed after the first flush so B+C are flushed by the timer
+        // rather than sitting in the buffer indefinitely.
+        let mut body = Box::pin(Coalescing::with_flush_after(
+            MockSource::new(vec![
+                // Phase 1: single frame, then source stalls.
+                MockStep::Frame(Ok(Frame::data(Bytes::from("aaa")))),
+                MockStep::Pending,
+                // Phase 2: two frames in rapid succession, then source stalls.
+                MockStep::Frame(Ok(Frame::data(Bytes::from("bbb")))),
+                MockStep::Frame(Ok(Frame::data(Bytes::from("ccc")))),
+                MockStep::Pending,
+            ]),
+            1_000, // high threshold — never hit by these small frames
+            None,
+            Some(Duration::from_millis(2)),
+        ));
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Phase 1: poll buffers "aaa", returns Pending (timer not yet expired).
+        assert!(matches!(body.as_mut().poll_frame(&mut cx), Poll::Pending));
+
+        // Let the timer fire.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Timer-driven flush of "aaa".
+        match body.as_mut().poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(frame.data_ref().unwrap().as_ref(), b"aaa");
+            }
+            other => panic!("expected timer-driven flush of phase-1 data, got {other:?}"),
+        }
+
+        // Phase 2: next poll picks up "bbb" and "ccc", then source stalls.
+        // Timer must be re-armed for this new batch.
+        assert!(matches!(body.as_mut().poll_frame(&mut cx), Poll::Pending));
+
+        // Let the re-armed timer fire.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Timer-driven flush of "bbb"+"ccc".
+        match body.as_mut().poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(frame.data_ref().unwrap().as_ref(), b"bbbccc");
+            }
+            other => panic!("expected timer-driven flush of phase-2 data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn coalescing_append_to_unarmed_non_empty_buffer_arms_flush_timer() {
+        let mut body = Box::pin(Coalescing::with_flush_after(
+            MockSource::new(vec![MockStep::Pending]),
+            1_000,
+            None,
+            Some(Duration::from_millis(2)),
+        ));
+
+        body.buffer.extend_from_slice(b"stashed-");
+        assert!(!body.buffer.is_empty());
+        assert!(!body.flush_timer_armed);
+
+        body.buffer_data(&Bytes::from_static(b"tail"));
+        assert!(body.flush_timer_armed);
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match body.as_mut().poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(frame.data_ref().unwrap().as_ref(), b"stashed-tail");
+            }
+            other => panic!("expected timer-driven flush from rearmed buffer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn into_tracked_swaps_stream_kind_to_tracked_and_drives_metrics() {
+        use std::time::Instant;
+
+        // Build a streaming ProxyBody from a coalescing source over the
+        // shared MockSource — this is the same path the production
+        // reqwest dispatch takes (`coalescing_body` → `Coalescing<S>`).
+        let mock = MockSource::new(vec![
+            MockStep::Frame(Ok(Frame::data(Bytes::from("alpha")))),
+            MockStep::Frame(Ok(Frame::data(Bytes::from("beta")))),
+            MockStep::End,
+        ]);
+        let inner = Coalescing::new(mock, COALESCE_TARGET, None);
+        let base = ProxyBody::streaming(Box::pin(inner));
+        assert!(matches!(base.kind, ProxyBodyKind::Stream(_)));
+
+        let baseline = Instant::now();
+        let (mut tracked, metrics) = base.into_tracked(baseline);
+
+        // Kind transitioned Stream → Tracked.
+        assert!(matches!(tracked.kind, ProxyBodyKind::Tracked(_)));
+
+        // Drive the body to completion via repeated polls.
+        let mut frames: Vec<Bytes> = Vec::new();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            match Pin::new(&mut tracked).poll_frame(&mut cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Some(data) = frame.data_ref() {
+                        frames.push(data.clone());
+                    }
+                }
+                Poll::Ready(Some(Err(e))) => panic!("unexpected error: {e:?}"),
+                Poll::Ready(None) => break,
+                Poll::Pending => panic!("MockSource never returns Pending here"),
+            }
+        }
+
+        // Coalescer batched both data frames into a single buffered output.
+        assert_eq!(frames.len(), 1, "coalescer should fold both frames");
+        assert_eq!(&frames[0][..], b"alphabeta");
+
+        // Metrics observed completion via TrackedBody's poll_frame.
+        assert!(metrics.completed());
+        assert!(metrics.last_frame_elapsed_ms().is_some());
+    }
+
+    #[test]
+    fn into_tracked_on_already_tracked_body_is_noop() {
+        use std::time::Instant;
+
+        // First wrap: Stream → Tracked drives the original metrics.
+        let mock = MockSource::new(vec![MockStep::End]);
+        let inner = Coalescing::new(mock, COALESCE_TARGET, None);
+        let base = ProxyBody::streaming(Box::pin(inner));
+
+        let baseline_a = Instant::now();
+        let (tracked, metrics_a) = base.into_tracked(baseline_a);
+        assert!(matches!(tracked.kind, ProxyBodyKind::Tracked(_)));
+
+        // Second wrap: Tracked → Tracked must be a no-op. The kind stays
+        // `Tracked` (the inner `TrackedBody` keeps reporting into
+        // `metrics_a`); the freshly-allocated `metrics_b` is inert.
+        let baseline_b = Instant::now();
+        let (rewrapped, metrics_b) = tracked.into_tracked(baseline_b);
+        assert!(matches!(rewrapped.kind, ProxyBodyKind::Tracked(_)));
+        assert!(!Arc::ptr_eq(&metrics_a, &metrics_b));
+        assert_eq!(Arc::strong_count(&metrics_b), 1);
+    }
+
     #[test]
     fn h3_frame_source_transitions_from_data_to_trailers_to_done() {
         let mut trailers = http::HeaderMap::new();
@@ -1764,5 +2058,319 @@ mod tests {
         }
 
         assert!(matches!(poll_source(&mut source), Poll::Ready(None)));
+    }
+
+    // ── StripHopByHopTrailers ───────────────────────────────────────────────
+    //
+    // The wrapper sits between the backend body (`Incoming`, `DirectH2Body`,
+    // any `Body<Data = Bytes>`) and the downstream-facing layer (`Coalescing`
+    // for the gRPC streaming response, or directly into `ProxyBody` for the
+    // small-buffer fast path). It must:
+    //
+    //   1. Strip RFC 9110 §7.6.1 response-direction hop-by-hop names from
+    //      `Frame::trailers` frames as they pass through.
+    //   2. Pass DATA frames through unchanged — no copy, no reorder.
+    //   3. Preserve legitimate gRPC trailers (`grpc-status`, `grpc-message`,
+    //      `grpc-status-details-bin`, custom `x-*` trailers).
+    //
+    // We exercise it via a small helper that wraps a `MockSource`-backed body.
+    // `MockSource` only impls `FrameSource`, not `http_body::Body`, so we use
+    // a thin shim that adapts `FrameSource` to `Body`. The shim is local to
+    // the test mod — it would be unused in production.
+
+    use std::marker::PhantomData;
+
+    /// Adapter: any `FrameSource` becomes a `Body<Data = Bytes>`. Used by
+    /// tests to feed a synthetic frame stream into `StripHopByHopTrailers`
+    /// without needing a real `Incoming`. Errors use `std::io::Error` —
+    /// `Sized + Error + Send + Sync` — so the wrapper composes with
+    /// `Coalescing<S>` via the test-only `FrameSource` impl below.
+    struct FrameSourceAsBody<S> {
+        inner: S,
+        _marker: PhantomData<()>,
+    }
+
+    impl<S: FrameSource + Unpin> http_body::Body for FrameSourceAsBody<S> {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            match Pin::new(&mut self.get_mut().inner).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+                Poll::Ready(Some(Err(_))) => {
+                    Poll::Ready(Some(Err(std::io::Error::other("test FrameSource error"))))
+                }
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    fn make_strip_wrapper(
+        steps: Vec<MockStep>,
+    ) -> StripHopByHopTrailers<FrameSourceAsBody<MockSource>> {
+        let body = FrameSourceAsBody {
+            inner: MockSource::new(steps),
+            _marker: PhantomData,
+        };
+        StripHopByHopTrailers::new(body)
+    }
+
+    /// Drive a `Body` to `Ready(None)`, returning the collected frames.
+    /// Generic over `Error: Display` so the same helper handles both
+    /// `Error = std::io::Error` (the test `FrameSourceAsBody`) and
+    /// `Error = BoxError` (the Coalescing wrapper). Errors are recorded as
+    /// their `Display` rendering — none of the tests below intentionally
+    /// emit errors.
+    fn poll_all_strip<B>(body: &mut B) -> Vec<Frame<Bytes>>
+    where
+        B: http_body::Body<Data = Bytes> + Unpin,
+        B::Error: std::fmt::Display,
+    {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut frames = Vec::new();
+        loop {
+            match Pin::new(&mut *body).poll_frame(&mut cx) {
+                Poll::Ready(Some(Ok(frame))) => frames.push(frame),
+                Poll::Ready(Some(Err(e))) => panic!("unexpected body error: {e}"),
+                Poll::Ready(None) => return frames,
+                Poll::Pending => panic!("MockSource never returns Pending here"),
+            }
+        }
+    }
+
+    // --- SyncBody trait-bound assertions -------------------------------------
+    //
+    // The `unsafe impl<B: Send + Sync> Sync for SyncBody<B>` claim below is
+    // future-proofed by these compile-time assertions. They will fail to
+    // build if either:
+    //   1. The bound on `SyncBody`'s `Sync` impl is loosened back to just
+    //      `B: Send` AND a future caller wraps a `!Sync` body (latent UB).
+    //   2. A current call-site type (`SizeLimitedIncoming`, `CountingIncoming`)
+    //      gains a `!Sync` field, breaking the assumption that all current
+    //      callers happen to satisfy the tighter bound.
+    //
+    // The negative case is enforced by a `must_be_sync<T: Sync>` helper that
+    // would refuse to monomorphize over a `!Sync` body. See `phantom_not_sync`
+    // below for the local witness type used by the tests.
+    fn must_be_sync<T: Sync>() {}
+    fn must_be_send<T: Send>() {}
+
+    #[test]
+    fn sync_body_preserves_send_sync_for_current_callers() {
+        // Both wrapped types must remain `Send + Sync` — they are the only
+        // current consumers of `SyncBody::new(...)` (in `into_reqwest_body`).
+        must_be_send::<SyncBody<SizeLimitedIncoming>>();
+        must_be_sync::<SyncBody<SizeLimitedIncoming>>();
+        must_be_send::<SyncBody<CountingIncoming>>();
+        must_be_sync::<SyncBody<CountingIncoming>>();
+    }
+
+    /// A `Send`-but-`!Sync` witness body. Used purely for compile-time
+    /// negative tests below — the inclusion of a `Cell<()>` field makes
+    /// the type `!Sync` while leaving it `Send`.
+    ///
+    /// If the `Sync` bound on `SyncBody` is ever loosened to `B: Send`,
+    /// `must_be_sync::<SyncBody<NotSyncBody>>()` would compile, signaling
+    /// the latent unsoundness has returned.
+    struct NotSyncBody {
+        _marker: std::cell::Cell<()>,
+    }
+
+    impl http_body::Body for NotSyncBody {
+        type Data = Bytes;
+        type Error = BoxError;
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            Poll::Ready(None)
+        }
+    }
+
+    #[test]
+    fn strip_hop_by_hop_trailers_passes_through_data_frames_unchanged() {
+        let mut body = make_strip_wrapper(vec![
+            MockStep::Frame(Ok(Frame::data(Bytes::from("hello")))),
+            MockStep::Frame(Ok(Frame::data(Bytes::from(" world")))),
+            MockStep::End,
+        ]);
+
+        let frames = poll_all_strip(&mut body);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].data_ref().unwrap().as_ref(), b"hello");
+        assert_eq!(frames[1].data_ref().unwrap().as_ref(), b" world");
+    }
+
+    #[test]
+    fn strip_hop_by_hop_trailers_removes_connection_close_from_trailer_map() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+        trailers.insert("grpc-message", "ok".parse().unwrap());
+        // Hop-by-hop directives a malicious / misbehaving backend might emit:
+        trailers.insert("connection", "close".parse().unwrap());
+        trailers.insert(
+            "proxy-authenticate",
+            "Basic realm=internal".parse().unwrap(),
+        );
+        trailers.insert("keep-alive", "timeout=5".parse().unwrap());
+        trailers.insert("transfer-encoding", "chunked".parse().unwrap());
+        trailers.insert("upgrade", "h2c".parse().unwrap());
+        trailers.insert("proxy-connection", "close".parse().unwrap());
+        trailers.insert("te", "trailers".parse().unwrap());
+        trailers.insert("trailer", "grpc-status".parse().unwrap());
+
+        let mut body = make_strip_wrapper(vec![
+            MockStep::Frame(Ok(Frame::trailers(trailers))),
+            MockStep::End,
+        ]);
+
+        let frames = poll_all_strip(&mut body);
+        assert_eq!(frames.len(), 1, "exactly one trailer frame after strip");
+        let trailer_map = frames[0].trailers_ref().expect("expected trailer frame");
+        assert_eq!(
+            trailer_map.get("grpc-status").map(|v| v.to_str().unwrap()),
+            Some("0"),
+            "grpc-status must be preserved",
+        );
+        assert_eq!(
+            trailer_map.get("grpc-message").map(|v| v.to_str().unwrap()),
+            Some("ok"),
+            "grpc-message must be preserved",
+        );
+        for hop_by_hop in [
+            "connection",
+            "proxy-authenticate",
+            "keep-alive",
+            "transfer-encoding",
+            "upgrade",
+            "proxy-connection",
+            "te",
+            "trailer",
+        ] {
+            assert!(
+                trailer_map.get(hop_by_hop).is_none(),
+                "hop-by-hop trailer `{hop_by_hop}` must be stripped",
+            );
+        }
+    }
+
+    #[test]
+    fn strip_hop_by_hop_trailers_preserves_grpc_and_custom_trailers() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+        trailers.insert("grpc-message", "ok".parse().unwrap());
+        trailers.insert("grpc-status-details-bin", "abc==".parse().unwrap());
+        trailers.insert("x-custom-trailer", "v".parse().unwrap());
+        trailers.insert("x-trace-id", "abc-123".parse().unwrap());
+
+        let mut body = make_strip_wrapper(vec![
+            MockStep::Frame(Ok(Frame::trailers(trailers))),
+            MockStep::End,
+        ]);
+
+        let frames = poll_all_strip(&mut body);
+        assert_eq!(frames.len(), 1);
+        let trailer_map = frames[0].trailers_ref().expect("expected trailer frame");
+        assert_eq!(trailer_map.len(), 5, "all legitimate trailers preserved");
+        for name in [
+            "grpc-status",
+            "grpc-message",
+            "grpc-status-details-bin",
+            "x-custom-trailer",
+            "x-trace-id",
+        ] {
+            assert!(
+                trailer_map.get(name).is_some(),
+                "legitimate trailer `{name}` must be preserved",
+            );
+        }
+    }
+
+    #[test]
+    fn strip_hop_by_hop_trailers_emits_empty_trailer_frame_when_all_stripped() {
+        // Edge case: backend trailer map contained ONLY hop-by-hop names.
+        // After strip, the trailer map is empty. We still emit the trailer
+        // frame so hyper signals END_STREAM to the client; an empty trailer
+        // map is functionally equivalent to "no trailers" on the wire.
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("connection", "close".parse().unwrap());
+        trailers.insert("keep-alive", "timeout=5".parse().unwrap());
+
+        let mut body = make_strip_wrapper(vec![
+            MockStep::Frame(Ok(Frame::trailers(trailers))),
+            MockStep::End,
+        ]);
+
+        let frames = poll_all_strip(&mut body);
+        assert_eq!(frames.len(), 1);
+        let trailer_map = frames[0].trailers_ref().expect("expected trailer frame");
+        assert!(trailer_map.is_empty(), "all hop-by-hop names stripped");
+    }
+
+    #[test]
+    fn strip_hop_by_hop_trailers_composes_with_coalescing() {
+        // The production gRPC streaming dispatch wraps `Incoming` in
+        // `StripHopByHopTrailers`, then in `Coalescing<S>`. Verify the
+        // stash-then-flush trailer logic in `Coalescing` still works on the
+        // already-stripped trailer map: data frames must be flushed BEFORE
+        // the trailer frame is emitted, even when the strip leaves the
+        // trailer map non-empty.
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+        trailers.insert("connection", "close".parse().unwrap()); // stripped
+
+        let stripped = make_strip_wrapper(vec![
+            MockStep::Frame(Ok(Frame::data(Bytes::from("first")))),
+            MockStep::Frame(Ok(Frame::data(Bytes::from("second")))),
+            MockStep::Frame(Ok(Frame::trailers(trailers))),
+            MockStep::End,
+        ]);
+        let mut body = Coalescing::new(stripped, 100, None);
+
+        let frames = poll_all_strip(&mut body);
+        // Coalescer batched both data frames into one buffered output, then
+        // emitted the (stripped) trailer frame.
+        assert_eq!(frames.len(), 2, "data flushed before trailer frame");
+        assert_eq!(frames[0].data_ref().unwrap().as_ref(), b"firstsecond",);
+        let trailer_map = frames[1].trailers_ref().expect("expected trailer frame");
+        assert_eq!(trailer_map.get("grpc-status").unwrap(), "0");
+        assert!(
+            trailer_map.get("connection").is_none(),
+            "hop-by-hop name stripped before reaching Coalescing",
+        );
+    }
+
+    #[test]
+    fn not_sync_body_is_indeed_send_but_not_sync() {
+        // Sanity: confirm the witness type has the expected trait shape.
+        // (`NotSyncBody` is `Send` because `Cell<()>` is `Send`, but `!Sync`.)
+        must_be_send::<NotSyncBody>();
+        // The next line would refuse to compile — it is the negative test:
+        //
+        //     must_be_sync::<NotSyncBody>();
+        //     must_be_sync::<SyncBody<NotSyncBody>>();
+        //
+        // Both are commented out. Uncommenting them will produce
+        // `the trait bound `std::cell::Cell<()>: Sync` is not satisfied`,
+        // which is the desired guarantee: the tightened bound on the
+        // `unsafe impl Sync for SyncBody<B>` block correctly refuses to
+        // synthesize `Sync` for a `!Sync` inner body.
+    }
+
+    /// Compile-fail witness: forcibly attempting `SyncBody<NotSyncBody>: Sync`
+    /// must NOT compile. Gated under `#[cfg(any())]` so it is parsed for
+    /// syntactic correctness but never actually monomorphized — the gate
+    /// keeps the test in source as documentation of the bound's intent
+    /// without breaking `cargo test`. Flip the gate to `#[cfg(test)]` (or
+    /// remove it) to manually verify the bound's negative case: it should
+    /// produce `the trait bound `std::cell::Cell<()>: Sync` is not satisfied`.
+    #[cfg(any())]
+    fn _compile_fail_sync_body_over_not_sync() {
+        must_be_sync::<SyncBody<NotSyncBody>>();
     }
 }

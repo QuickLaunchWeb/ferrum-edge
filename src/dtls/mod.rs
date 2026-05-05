@@ -12,6 +12,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -39,6 +40,7 @@ const DEFAULT_DTLS_RECORD_OVERHEAD: usize = 64;
 ///
 /// Override: `FERRUM_DTLS_MAX_PLAINTEXT_BYTES` (default: 16384).
 const DEFAULT_DTLS_MAX_PLAINTEXT: usize = 16_384;
+const DEFAULT_DTLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Cached DTLS buffer configuration, initialized from `EnvConfig` at startup.
 struct DtlsBufConfig {
@@ -83,6 +85,35 @@ pub struct FrontendDtlsConfig {
     pub dimpl_config: Arc<Config>,
     pub certificate: DtlsCertificate,
     pub client_cert_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+}
+
+/// Admission controls for the frontend DTLS demuxer.
+#[derive(Clone)]
+pub struct DtlsServerLimits {
+    /// Maximum number of DTLS peers tracked by the demuxer, including peers
+    /// still in the handshake and not yet visible through `accept()`.
+    pub max_sessions: Option<usize>,
+    /// Maximum time a peer may occupy demux state before completing its handshake.
+    /// `None` disables the deadline.
+    pub handshake_timeout: Option<Duration>,
+    /// Optional gate checked before allocating per-peer handshake state.
+    pub allow_new_session: Option<Arc<dyn Fn() -> bool + Send + Sync + 'static>>,
+    /// Optional diagnostic mirror for surfaces that need to report demux state
+    /// outside this server object, such as the admin `/overload` endpoint. This
+    /// is eventually consistent with `active_sessions` and is not used for
+    /// admission control.
+    pub active_session_mirror: Option<Arc<AtomicU64>>,
+}
+
+impl Default for DtlsServerLimits {
+    fn default() -> Self {
+        Self {
+            max_sessions: None,
+            handshake_timeout: Some(DEFAULT_DTLS_HANDSHAKE_TIMEOUT),
+            allow_new_session: None,
+            active_session_mirror: None,
+        }
+    }
 }
 
 /// Build a DTLS client config for backend connections (gateway → backend).
@@ -137,6 +168,7 @@ pub fn build_backend_dtls_config(
         certificate,
         server_name,
         server_cert_verifier,
+        connect_timeout_ms: proxy.backend_connect_timeout_ms,
     })
 }
 
@@ -146,6 +178,15 @@ pub struct BackendDtlsParams {
     pub certificate: DtlsCertificate,
     pub server_name: Option<rustls::pki_types::ServerName<'static>>,
     pub server_cert_verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
+    /// End-to-end deadline for the DTLS handshake, in milliseconds.
+    ///
+    /// Sourced from `Proxy.backend_connect_timeout_ms` for proxy backends, or
+    /// from caller-supplied values for plugin/test contexts. Matches the
+    /// gRPC/TCP TLS handshake budget semantics: the value is consumed verbatim
+    /// via `Duration::from_millis(...)`, so `0` behaves like an immediate
+    /// timeout (not "unbounded"), keeping behavior consistent with sibling
+    /// backend handshake paths.
+    pub connect_timeout_ms: u64,
 }
 
 /// Build a DTLS server config for frontend termination (client → gateway).
@@ -216,6 +257,13 @@ pub struct DtlsConnection {
 impl DtlsConnection {
     /// Perform a DTLS client handshake over the given connected socket and return
     /// an established `DtlsConnection`.
+    ///
+    /// The handshake is bounded by `params.connect_timeout_ms`, which is the
+    /// per-proxy `backend_connect_timeout_ms` for proxy backends. The semantic
+    /// matches sibling backend handshake paths (gRPC h2/h2c in
+    /// `proxy/grpc_proxy.rs`, TCP TLS in `proxy/tcp_proxy.rs`): the value is
+    /// consumed verbatim via `Duration::from_millis(...)`, so `0` behaves like
+    /// an immediate timeout rather than "unbounded".
     pub async fn connect(
         socket: UdpSocket,
         params: BackendDtlsParams,
@@ -223,6 +271,8 @@ impl DtlsConnection {
         let socket = Arc::new(socket);
         let server_name = params.server_name;
         let server_cert_verifier = params.server_cert_verifier;
+        let connect_timeout = Duration::from_millis(params.connect_timeout_ms);
+        let handshake_deadline = Instant::now() + connect_timeout;
         let mut dtls = Dtls::new_auto(params.config, params.certificate, Instant::now());
         dtls.set_active(true); // client role
 
@@ -243,16 +293,20 @@ impl DtlsConnection {
         )
         .await?;
 
-        let handshake_deadline = Instant::now() + Duration::from_secs(10);
-
         loop {
-            if Instant::now() > handshake_deadline {
-                return Err(anyhow::anyhow!("DTLS handshake timed out"));
+            // Top-of-loop deadline check guards against a sustained datagram
+            // flood starving the deadline arm in the select below.
+            if Instant::now() >= handshake_deadline {
+                return Err(anyhow::anyhow!(
+                    "DTLS handshake timed out after {}ms",
+                    connect_timeout.as_millis()
+                ));
             }
 
             let sleep_dur = next_timeout
                 .map(|t| t.saturating_duration_since(Instant::now()))
                 .unwrap_or(Duration::from_secs(1));
+            let deadline_sleep_dur = handshake_deadline.saturating_duration_since(Instant::now());
 
             tokio::select! {
                 result = socket.recv(&mut recv_buf) => {
@@ -270,6 +324,15 @@ impl DtlsConnection {
                         }
                         next_timeout = None;
                     }
+                }
+                // Defense in depth: ensure the deadline fires even if the
+                // socket recv arm and the dimpl retransmit timer never wake
+                // up (e.g., backend silently drops every datagram).
+                _ = tokio::time::sleep(deadline_sleep_dur) => {
+                    return Err(anyhow::anyhow!(
+                        "DTLS handshake timed out after {}ms",
+                        connect_timeout.as_millis()
+                    ));
                 }
             }
 
@@ -422,6 +485,8 @@ pub struct DtlsServer {
     config: Arc<Config>,
     certificate: DtlsCertificate,
     sessions: Arc<DashMap<SocketAddr, DtlsSessionState>>,
+    active_sessions: Arc<AtomicUsize>,
+    limits: DtlsServerLimits,
     /// Channel to deliver accepted (post-handshake) connections.
     accept_tx: mpsc::Sender<(DtlsServerConn, SocketAddr)>,
     accept_rx: tokio::sync::Mutex<mpsc::Receiver<(DtlsServerConn, SocketAddr)>>,
@@ -435,6 +500,38 @@ struct DtlsSessionState {
     incoming_tx: mpsc::Sender<Vec<u8>>,
     /// Signal this session's driver task to shut down.
     shutdown_tx: mpsc::Sender<()>,
+}
+
+fn remove_session(
+    sessions: &DashMap<SocketAddr, DtlsSessionState>,
+    active_sessions: &AtomicUsize,
+    active_session_mirror: Option<&AtomicU64>,
+    peer_addr: &SocketAddr,
+) {
+    if sessions.remove(peer_addr).is_some() {
+        active_sessions.fetch_sub(1, Ordering::Relaxed);
+        if let Some(mirror) = active_session_mirror {
+            mirror.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+struct SessionGuard {
+    sessions: Arc<DashMap<SocketAddr, DtlsSessionState>>,
+    active_sessions: Arc<AtomicUsize>,
+    active_session_mirror: Option<Arc<AtomicU64>>,
+    peer_addr: SocketAddr,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        remove_session(
+            &self.sessions,
+            &self.active_sessions,
+            self.active_session_mirror.as_deref(),
+            &self.peer_addr,
+        );
+    }
 }
 
 /// A server-side DTLS connection for a single accepted client.
@@ -513,16 +610,36 @@ impl DtlsServerConn {
     }
 }
 
+impl Drop for DtlsServerConn {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.try_send(());
+    }
+}
+
 impl DtlsServer {
     /// Create a new DTLS server bound to the given address.
+    #[allow(dead_code)] // Public helper used by tests and external DTLS backends.
     pub async fn bind(
         addr: SocketAddr,
         frontend_config: FrontendDtlsConfig,
     ) -> Result<Self, anyhow::Error> {
+        Self::bind_with_limits(addr, frontend_config, DtlsServerLimits::default()).await
+    }
+
+    /// Create a new DTLS server bound to the given address with admission limits.
+    pub async fn bind_with_limits(
+        addr: SocketAddr,
+        frontend_config: FrontendDtlsConfig,
+        limits: DtlsServerLimits,
+    ) -> Result<Self, anyhow::Error> {
         let socket = UdpSocket::bind(addr)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to bind DTLS server on {}: {}", addr, e))?;
-        Ok(Self::from_socket(socket, frontend_config))
+        Ok(Self::from_socket_with_limits(
+            socket,
+            frontend_config,
+            limits,
+        ))
     }
 
     /// Create a `DtlsServer` from an already-bound `UdpSocket`. Useful when the
@@ -531,7 +648,17 @@ impl DtlsServer {
     /// reserve-then-construct gap to avoid the bind-drop-rebind race) and
     /// wants to hand the socket directly to the DTLS server without any
     /// release/rebind window.
+    #[allow(dead_code)] // Public helper used by tests and scripted DTLS backends.
     pub fn from_socket(socket: UdpSocket, frontend_config: FrontendDtlsConfig) -> Self {
+        Self::from_socket_with_limits(socket, frontend_config, DtlsServerLimits::default())
+    }
+
+    /// Create a `DtlsServer` from an already-bound `UdpSocket` with admission limits.
+    pub fn from_socket_with_limits(
+        socket: UdpSocket,
+        frontend_config: FrontendDtlsConfig,
+        limits: DtlsServerLimits,
+    ) -> Self {
         let socket = Arc::new(socket);
         let (accept_tx, accept_rx) = mpsc::channel(256);
         let (shutdown_tx, _) = watch::channel(false);
@@ -541,6 +668,8 @@ impl DtlsServer {
             config: frontend_config.dimpl_config,
             certificate: frontend_config.certificate,
             sessions: Arc::new(DashMap::new()),
+            active_sessions: Arc::new(AtomicUsize::new(0)),
+            limits,
             accept_tx,
             accept_rx: tokio::sync::Mutex::new(accept_rx),
             client_cert_verifier: frontend_config.client_cert_verifier,
@@ -554,6 +683,12 @@ impl DtlsServer {
         self.socket
             .local_addr()
             .expect("DTLS server socket has no local address")
+    }
+
+    /// Number of peers currently tracked by the DTLS demuxer.
+    #[allow(dead_code)] // Used by tests and useful for diagnostics.
+    pub fn active_session_count(&self) -> usize {
+        self.active_sessions.load(Ordering::Relaxed)
     }
 
     /// Accept the next fully-handshaked DTLS client connection.
@@ -603,7 +738,12 @@ impl DtlsServer {
                 if session.incoming_tx.send(data).await.is_err() {
                     // Driver task exited — remove stale session
                     drop(session);
-                    self.sessions.remove(&peer_addr);
+                    remove_session(
+                        &self.sessions,
+                        &self.active_sessions,
+                        self.limits.active_session_mirror.as_deref(),
+                        &peer_addr,
+                    );
                 }
             } else {
                 // New client — spawn a session driver
@@ -613,7 +753,52 @@ impl DtlsServer {
     }
 
     /// Spawn a driver task for a new client session.
+    ///
+    /// Admission ordering is intentional and not jointly atomic:
+    ///   1. `allow_new_session` is a *soft* gate (e.g. an overload-state flag).
+    ///      It is read once before the cap check, so a brief burst between the
+    ///      gate read and the CAS below can let a few sessions in past the
+    ///      gate's intent. This is acceptable because the gate's job is
+    ///      coarse-grained backpressure, not exact admission.
+    ///   2. `max_sessions` is the *hard* cap, enforced via a CAS loop on
+    ///      `active_sessions`. This is the authoritative bound — even if the
+    ///      soft gate races, the hard cap cannot be exceeded.
     fn spawn_session(&self, peer_addr: SocketAddr, initial_packet: Vec<u8>) {
+        if let Some(ref allow) = self.limits.allow_new_session
+            && !allow()
+        {
+            trace!(client = %peer_addr, "DTLS new session rejected by admission gate");
+            return;
+        }
+
+        if let Some(max_sessions) = self.limits.max_sessions {
+            let mut current = self.active_sessions.load(Ordering::Relaxed);
+            loop {
+                if current >= max_sessions {
+                    debug!(
+                        client = %peer_addr,
+                        max_sessions,
+                        "DTLS pre-handshake session limit reached, dropping datagram"
+                    );
+                    return;
+                }
+                match self.active_sessions.compare_exchange_weak(
+                    current,
+                    current + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
+        } else {
+            self.active_sessions.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(mirror) = self.limits.active_session_mirror.as_deref() {
+            mirror.fetch_add(1, Ordering::Relaxed);
+        }
+
         let (incoming_tx, mut incoming_rx) = mpsc::channel::<Vec<u8>>(256);
         let (app_out_tx, app_out_rx) = mpsc::channel::<Vec<u8>>(256);
         let mut app_out_rx = Some(app_out_rx);
@@ -633,9 +818,22 @@ impl DtlsServer {
         let certificate = self.certificate.clone();
         let accept_tx = self.accept_tx.clone();
         let sessions = self.sessions.clone();
+        let active_sessions = self.active_sessions.clone();
+        let active_session_mirror = self.limits.active_session_mirror.clone();
         let client_cert_verifier = self.client_cert_verifier.clone();
+        let handshake_deadline = self
+            .limits
+            .handshake_timeout
+            .map(|timeout| Instant::now() + timeout);
 
         tokio::spawn(async move {
+            let _session_guard = SessionGuard {
+                sessions: sessions.clone(),
+                active_sessions: active_sessions.clone(),
+                active_session_mirror: active_session_mirror.clone(),
+                peer_addr,
+            };
+
             let mut dtls = Dtls::new_auto(config, certificate, Instant::now());
             // Server role (default — is_active=false)
             // Initialize server state (random, etc.) — required before handle_packet.
@@ -662,7 +860,6 @@ impl DtlsServer {
             // Process the initial ClientHello packet
             if let Err(e) = dtls.handle_packet(&initial_packet) {
                 warn!(client = %peer_addr, "DTLS initial packet error: {}", e);
-                sessions.remove(&peer_addr);
                 return;
             }
 
@@ -679,24 +876,34 @@ impl DtlsServer {
                 Ok(_) => {}
                 Err(e) => {
                     warn!(client = %peer_addr, "DTLS initial drain error: {}", e);
-                    sessions.remove(&peer_addr);
                     return;
                 }
             }
 
             loop {
+                // Check the handshake deadline at the top of each iteration so
+                // a sustained datagram flood cannot starve the timeout arm
+                // in the select below.
+                if !connected
+                    && let Some(deadline) = handshake_deadline
+                    && Instant::now() >= deadline
+                {
+                    warn!(client = %peer_addr, "DTLS handshake timed out");
+                    break;
+                }
+
+                let handshake_sleep_dur = if connected {
+                    Duration::from_secs(60)
+                } else {
+                    handshake_deadline
+                        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                        .unwrap_or(Duration::from_secs(60))
+                };
                 let sleep_dur = next_timeout
                     .map(|t| t.saturating_duration_since(Instant::now()))
                     .unwrap_or(Duration::from_secs(60));
 
                 tokio::select! {
-                    // Incoming UDP packet from this client (demuxed by the server)
-                    Some(data) = incoming_rx.recv() => {
-                        if let Err(e) = dtls.handle_packet(&data) {
-                            trace!(client = %peer_addr, "DTLS handle_packet error: {}", e);
-                            break;
-                        }
-                    }
                     // Application data to send back to this client
                     Some(data) = app_in_rx.recv(), if connected => {
                         if data.len() > dtls_buf_config().max_plaintext {
@@ -713,7 +920,27 @@ impl DtlsServer {
                             break;
                         }
                     }
-                    // Timer fired
+                    // Shutdown signal — drain any queued replies before
+                    // exiting so a final reply pushed right before
+                    // `DtlsServerConn::Drop` is not lost.
+                    _ = shutdown_rx.recv() => {
+                        while let Ok(data) = app_in_rx.try_recv() {
+                            if connected
+                                && data.len() <= dtls_buf_config().max_plaintext
+                            {
+                                let _ = dtls.send_application_data(&data);
+                            }
+                        }
+                        break;
+                    }
+                    // Incoming UDP packet from this client (demuxed by the server)
+                    Some(data) = incoming_rx.recv() => {
+                        if let Err(e) = dtls.handle_packet(&data) {
+                            trace!(client = %peer_addr, "DTLS handle_packet error: {}", e);
+                            break;
+                        }
+                    }
+                    // DTLS retransmit timer
                     _ = tokio::time::sleep(sleep_dur) => {
                         if let Some(t) = next_timeout
                             && Instant::now() >= t
@@ -725,7 +952,10 @@ impl DtlsServer {
                             next_timeout = None;
                         }
                     }
-                    _ = shutdown_rx.recv() => {
+                    // Handshake deadline (top-of-loop check is primary;
+                    // this is defense in depth).
+                    _ = tokio::time::sleep(handshake_sleep_dur), if !connected && handshake_deadline.is_some() => {
+                        warn!(client = %peer_addr, "DTLS handshake timed out");
                         break;
                     }
                 }
@@ -774,8 +1004,6 @@ impl DtlsServer {
                                 tls_client_cert_chain_der: chain_certs,
                             };
                             if accept_tx.send((conn, peer_addr)).await.is_err() {
-                                // Server shut down
-                                sessions.remove(&peer_addr);
                                 return;
                             }
                         }
@@ -784,7 +1012,6 @@ impl DtlsServer {
                                 && let Err(e) = validate_client_cert(der, verifier)
                             {
                                 warn!(client = %peer_addr, "Client cert validation failed: {}", e);
-                                sessions.remove(&peer_addr);
                                 return;
                             }
                             // Store the certificate DER for plugin access after Connected
@@ -803,7 +1030,16 @@ impl DtlsServer {
                 }
             }
 
-            sessions.remove(&peer_addr);
+            // Flush any DTLS-buffered data produced by the shutdown
+            // handler's reply drain so it reaches the wire.
+            for _ in 0..MAX_OUTPUTS_PER_DRAIN {
+                match dtls.poll_output(&mut out_buf) {
+                    Output::Packet(data) => {
+                        let _ = socket.send_to(data, peer_addr).await;
+                    }
+                    _ => break,
+                }
+            }
         });
     }
 
@@ -1074,4 +1310,161 @@ async fn drain_server_outputs(
         }
     }
     Ok(connected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_server(limits: DtlsServerLimits) -> DtlsServer {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind UDP");
+        let config = Config::builder().build().expect("build DTLS config");
+        let certificate =
+            dimpl::certificate::generate_self_signed_certificate().expect("generate cert");
+        DtlsServer::from_socket_with_limits(
+            socket,
+            FrontendDtlsConfig {
+                dimpl_config: Arc::new(config),
+                certificate,
+                client_cert_verifier: None,
+            },
+            limits,
+        )
+    }
+
+    fn client_hello_packet() -> Vec<u8> {
+        let config = Arc::new(Config::builder().build().expect("build DTLS config"));
+        let certificate =
+            dimpl::certificate::generate_self_signed_certificate().expect("generate client cert");
+        let mut client = Dtls::new_auto(config, certificate, Instant::now());
+        client.set_active(true);
+        let mut buf = vec![0u8; 4096];
+
+        for _ in 0..MAX_OUTPUTS_PER_DRAIN {
+            if let Output::Packet(data) = client.poll_output(&mut buf) {
+                return data.to_vec();
+            }
+        }
+
+        panic!("client did not emit a ClientHello packet");
+    }
+
+    #[tokio::test]
+    async fn dtls_server_rejects_new_peer_when_pre_handshake_cap_is_full() {
+        let server = test_server(DtlsServerLimits {
+            max_sessions: Some(0),
+            ..DtlsServerLimits::default()
+        })
+        .await;
+
+        server.spawn_session("127.0.0.1:12345".parse().unwrap(), vec![0x16; 32]);
+
+        assert_eq!(server.active_session_count(), 0);
+        assert!(server.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dtls_server_rejects_new_peer_when_admission_gate_is_closed() {
+        let server = test_server(DtlsServerLimits {
+            allow_new_session: Some(Arc::new(|| false)),
+            ..DtlsServerLimits::default()
+        })
+        .await;
+
+        server.spawn_session("127.0.0.1:12346".parse().unwrap(), vec![0x16; 32]);
+
+        assert_eq!(server.active_session_count(), 0);
+        assert!(server.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dtls_server_rejects_second_peer_at_cap_and_releases_mirror_on_timeout() {
+        let mirror = Arc::new(AtomicU64::new(0));
+        let server = test_server(DtlsServerLimits {
+            max_sessions: Some(1),
+            handshake_timeout: Some(Duration::from_millis(50)),
+            active_session_mirror: Some(mirror.clone()),
+            ..DtlsServerLimits::default()
+        })
+        .await;
+
+        server.spawn_session("127.0.0.1:12347".parse().unwrap(), client_hello_packet());
+        assert_eq!(server.active_session_count(), 1);
+        assert_eq!(mirror.load(Ordering::Relaxed), 1);
+
+        server.spawn_session("127.0.0.1:12348".parse().unwrap(), client_hello_packet());
+        assert_eq!(server.active_session_count(), 1);
+        assert_eq!(mirror.load(Ordering::Relaxed), 1);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while server.active_session_count() != 0 || mirror.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("DTLS handshake timeout should release the reserved slot");
+
+        assert!(server.sessions.is_empty());
+    }
+
+    /// Backend DTLS handshake honors the configured `connect_timeout_ms`
+    /// instead of the previously hardcoded 10s budget.
+    ///
+    /// Sets `connect_timeout_ms = 500` against a UDP socket whose peer is a
+    /// silent black-hole (binds + drops every datagram). The handshake must
+    /// fail well before the legacy 10s budget — generous slack of 5s catches
+    /// loaded CI runners while still distinguishing the configured budget
+    /// from the legacy default.
+    #[tokio::test]
+    async fn dtls_backend_handshake_honors_connect_timeout_ms() {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
+
+        // Black-hole peer: bind a UDP socket that never replies. The client
+        // socket is `connect()`-ed to it so all datagrams go to /dev/null.
+        let blackhole = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole");
+        let blackhole_addr = blackhole.local_addr().expect("blackhole local addr");
+
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        client_socket
+            .connect(blackhole_addr)
+            .await
+            .expect("client connect");
+
+        let certificate =
+            dimpl::certificate::generate_self_signed_certificate().expect("generate client cert");
+        let params = BackendDtlsParams {
+            config: Arc::new(Config::default()),
+            certificate,
+            server_name: None,
+            server_cert_verifier: None,
+            connect_timeout_ms: 500,
+        };
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            DtlsConnection::connect(client_socket, params),
+        )
+        .await
+        .expect("outer guard should not fire — connect_timeout_ms=500 must bound the handshake");
+        let elapsed = started.elapsed();
+
+        let err = match result {
+            Ok(_) => panic!("handshake against black hole should fail"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("DTLS handshake timed out"),
+            "expected timeout error, got: {msg}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "handshake should fail close to the configured 500ms budget, took {elapsed:?}"
+        );
+    }
 }
