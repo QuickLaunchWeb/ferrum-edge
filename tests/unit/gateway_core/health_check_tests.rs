@@ -571,6 +571,7 @@ fn config_with_upstreams(upstreams: Vec<Upstream>) -> GatewayConfig {
         upstreams,
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        mesh: None,
     }
 }
 
