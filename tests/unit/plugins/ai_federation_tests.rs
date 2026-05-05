@@ -1,5 +1,9 @@
 use ferrum_edge::plugins::ai_federation;
 use ferrum_edge::plugins::ai_federation::test_helpers;
+use ferrum_edge::{
+    config::{BackendAllowIps, PoolConfig},
+    dns::{DnsCache, DnsConfig},
+};
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -279,6 +283,136 @@ fn test_glob_all_wildcard() {
 fn test_glob_empty_pattern() {
     assert!(test_helpers::glob_match("", ""));
     assert!(!test_helpers::glob_match("", "something"));
+}
+
+// ---------------------------------------------------------------------------
+// Glob security tightening — `*` must not consume URL-structural separators.
+//
+// Regression coverage for the URL-injection class where a permissive
+// operator pattern (`gemini-*`) would otherwise match a malicious user
+// input (`gemini-../foo:streamGenerateContent?key=stolen`) and route it
+// to the matching provider.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_glob_wildcard_does_not_cross_path_separator() {
+    // Without tightening, `*` would consume `../foo` and the glob would
+    // match. With the security fix, `/` inside the wildcard window
+    // breaks the match.
+    assert!(!test_helpers::glob_match("gemini-*", "gemini-../foo"));
+    assert!(!test_helpers::glob_match(
+        "gemini-*",
+        "gemini-../foo:streamGenerateContent"
+    ));
+}
+
+#[test]
+fn test_glob_wildcard_does_not_cross_query_or_fragment() {
+    assert!(!test_helpers::glob_match("gpt-*", "gpt-4o?key=leaked"));
+    assert!(!test_helpers::glob_match("gpt-*", "gpt-4o#admin"));
+    assert!(!test_helpers::glob_match("claude-*", "claude-3&x=y"));
+}
+
+#[test]
+fn test_glob_wildcard_does_not_cross_whitespace_or_backslash() {
+    assert!(!test_helpers::glob_match("model-*", "model-foo bar"));
+    assert!(!test_helpers::glob_match("model-*", "model-foo\\bar"));
+    assert!(!test_helpers::glob_match("model-*", "model-foo\nbar"));
+}
+
+#[test]
+fn test_glob_legitimate_versions_with_dots_and_colons_still_match() {
+    // Bedrock-style IDs contain `:` and `.` — both must remain matchable
+    // through `*` since they are legal in URL path segments and are
+    // load-bearing for AWS model identifiers.
+    assert!(test_helpers::glob_match(
+        "anthropic.*",
+        "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    ));
+    assert!(test_helpers::glob_match(
+        "*claude*",
+        "anthropic.claude-3-sonnet"
+    ));
+    assert!(test_helpers::glob_match("gemini-*", "gemini-1.5-pro"));
+}
+
+// ---------------------------------------------------------------------------
+// URL-path-component validator (CVE-class: URL injection via `model` field)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_url_model_component_accepts_legit_gemini_names() {
+    assert!(test_helpers::is_valid_url_model_component("gemini-1.5-pro"));
+    assert!(test_helpers::is_valid_url_model_component("gemini-pro"));
+    assert!(test_helpers::is_valid_url_model_component(
+        "gemini-2.0-flash"
+    ));
+}
+
+#[test]
+fn test_url_model_component_accepts_legit_bedrock_ids() {
+    assert!(test_helpers::is_valid_url_model_component(
+        "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    ));
+    assert!(test_helpers::is_valid_url_model_component(
+        "meta.llama3-70b-instruct-v1:0"
+    ));
+    assert!(test_helpers::is_valid_url_model_component(
+        "anthropic.claude-3-sonnet-20240229-v1:0"
+    ));
+}
+
+#[test]
+fn test_url_model_component_rejects_path_traversal() {
+    assert!(!test_helpers::is_valid_url_model_component("gemini-../foo"));
+    assert!(!test_helpers::is_valid_url_model_component(
+        "gemini-../foo:streamGenerateContent"
+    ));
+    assert!(!test_helpers::is_valid_url_model_component(
+        "gemini-../foo:streamGenerateContent?key=stolen"
+    ));
+    // Even a bare `..` is rejected — both individual `.`s would otherwise
+    // pass the per-character allowlist.
+    assert!(!test_helpers::is_valid_url_model_component(".."));
+    assert!(!test_helpers::is_valid_url_model_component("a..b"));
+}
+
+#[test]
+fn test_url_model_component_rejects_url_separators() {
+    assert!(!test_helpers::is_valid_url_model_component("foo/bar"));
+    assert!(!test_helpers::is_valid_url_model_component("foo?x=y"));
+    assert!(!test_helpers::is_valid_url_model_component("foo#frag"));
+    assert!(!test_helpers::is_valid_url_model_component("foo&x=y"));
+    assert!(!test_helpers::is_valid_url_model_component("foo\\bar"));
+    assert!(!test_helpers::is_valid_url_model_component("foo bar"));
+    assert!(!test_helpers::is_valid_url_model_component("foo\nbar"));
+    assert!(!test_helpers::is_valid_url_model_component("foo\tbar"));
+}
+
+#[test]
+fn test_url_model_component_rejects_empty_string() {
+    assert!(!test_helpers::is_valid_url_model_component(""));
+}
+
+#[test]
+fn test_url_model_component_rejects_unicode_lookalikes() {
+    // Non-ASCII characters fall outside the allow-list. Reject so that
+    // homoglyph attacks (e.g. Cyrillic `р`) cannot bypass the validator.
+    assert!(!test_helpers::is_valid_url_model_component("gpt-4о"));
+    assert!(!test_helpers::is_valid_url_model_component("modеl"));
+}
+
+#[test]
+fn test_provider_embeds_model_in_url_correctness() {
+    // Only Gemini, Vertex, and Bedrock embed the resolved model directly
+    // in the URL path. Other providers put it in the request body.
+    assert!(test_helpers::provider_embeds_model_in_url("google_gemini").unwrap());
+    assert!(test_helpers::provider_embeds_model_in_url("google_vertex").unwrap());
+    assert!(test_helpers::provider_embeds_model_in_url("aws_bedrock").unwrap());
+    assert!(!test_helpers::provider_embeds_model_in_url("openai").unwrap());
+    assert!(!test_helpers::provider_embeds_model_in_url("anthropic").unwrap());
+    assert!(!test_helpers::provider_embeds_model_in_url("cohere").unwrap());
+    assert!(!test_helpers::provider_embeds_model_in_url("azure_openai").unwrap());
 }
 
 // ---------------------------------------------------------------------------
@@ -848,9 +982,244 @@ fn test_url_template_explicit_base_url_overrides_provider_logic() {
 }
 
 // ---------------------------------------------------------------------------
+// SSRF guard: scheme + IP allowlist on operator-supplied base_url.
+//
+// Construction-time validation prevents an admin-API attacker who
+// compromises plugin config from pivoting through the gateway to
+// internal services (cloud metadata, RFC 1918, loopback). Tests use
+// the `validate_base_url_test` helper to thread the policy directly,
+// avoiding `std::env` mutation that would race other tests.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_base_url_https_accepted() {
+    // Default policy (`both`) lets any host through; only the scheme matters.
+    let res = test_helpers::validate_base_url_test("openai", "https://example.com", false, "both");
+    assert!(
+        res.is_ok(),
+        "https://example.com should be accepted: {res:?}"
+    );
+}
+
+#[test]
+fn test_base_url_http_rejected_without_allow_plaintext() {
+    let err = test_helpers::validate_base_url_test("openai", "http://example.com", false, "both")
+        .unwrap_err();
+    assert!(err.contains("http://"), "got: {err}");
+    assert!(err.contains("allow_plaintext"), "got: {err}");
+}
+
+#[test]
+fn test_base_url_http_accepted_with_allow_plaintext_opt_in() {
+    // Operators on isolated networks (test rigs, on-prem mock providers)
+    // can opt-in to plaintext explicitly.
+    let res = test_helpers::validate_base_url_test("internal", "http://example.com", true, "both");
+    assert!(
+        res.is_ok(),
+        "http with allow_plaintext should be accepted: {res:?}"
+    );
+}
+
+#[test]
+fn test_base_url_aws_metadata_rejected_under_public_policy() {
+    // The exact case from the bug report: an admin-API attacker can no longer
+    // point an AI federation provider at AWS instance metadata.
+    let err = test_helpers::validate_base_url_test(
+        "openai",
+        "https://169.254.169.254/latest/meta-data/",
+        false,
+        "public",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("169.254.169.254"),
+        "should mention metadata IP: {err}"
+    );
+    assert!(
+        err.contains("FERRUM_BACKEND_ALLOW_IPS"),
+        "should reference policy: {err}"
+    );
+}
+
+#[test]
+fn test_base_url_rfc1918_rejected_under_public_policy() {
+    let err = test_helpers::validate_base_url_test("openai", "https://10.0.0.1/", false, "public")
+        .unwrap_err();
+    assert!(err.contains("10.0.0.1"), "got: {err}");
+}
+
+#[test]
+fn test_base_url_loopback_rejected_under_public_policy() {
+    let err = test_helpers::validate_base_url_test("openai", "https://127.0.0.1/", false, "public")
+        .unwrap_err();
+    assert!(err.contains("127.0.0.1"), "got: {err}");
+}
+
+#[test]
+fn test_base_url_link_local_rejected_under_public_policy() {
+    // 169.254.0.0/16 includes AWS IMDS but also any link-local IP.
+    let err =
+        test_helpers::validate_base_url_test("openai", "https://169.254.42.42/", false, "public")
+            .unwrap_err();
+    assert!(err.contains("169.254.42.42"), "got: {err}");
+}
+
+#[test]
+fn test_base_url_ipv6_loopback_rejected_under_public_policy() {
+    let err = test_helpers::validate_base_url_test("openai", "https://[::1]/", false, "public")
+        .unwrap_err();
+    assert!(err.contains("::1"), "got: {err}");
+}
+
+#[test]
+fn test_base_url_private_ip_allowed_under_both_policy() {
+    // Default `both` policy is permissive — operators who set this know
+    // private IPs may be intentional (on-prem, internal DNS).
+    let res = test_helpers::validate_base_url_test("openai", "https://10.0.0.1/", false, "both");
+    assert!(
+        res.is_ok(),
+        "10.0.0.1 should be accepted under 'both' policy: {res:?}"
+    );
+}
+
+#[test]
+fn test_base_url_public_ip_allowed_under_public_policy() {
+    let res =
+        test_helpers::validate_base_url_test("openai", "https://8.8.8.8/api/", false, "public");
+    assert!(res.is_ok(), "8.8.8.8 should be accepted: {res:?}");
+}
+
+#[test]
+fn test_base_url_hostname_passes_under_public_policy() {
+    // Hostnames are not blocked at config time — runtime DNS resolution
+    // through `DnsCacheResolver` re-applies the policy after lookup.
+    // This is documented in `validate_base_url`'s rustdoc.
+    let res = test_helpers::validate_base_url_test(
+        "openai",
+        "https://internal.corp.example.com/v1/chat",
+        false,
+        "public",
+    );
+    assert!(
+        res.is_ok(),
+        "hostnames are deferred to runtime DNS check: {res:?}"
+    );
+}
+
+#[test]
+fn test_base_url_unparseable_rejected() {
+    let err =
+        test_helpers::validate_base_url_test("openai", "not a url", false, "both").unwrap_err();
+    assert!(
+        err.contains("invalid base_url") || err.contains("invalid"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_base_url_unsupported_scheme_rejected() {
+    let err = test_helpers::validate_base_url_test("openai", "file:///etc/passwd", false, "both")
+        .unwrap_err();
+    assert!(err.contains("unsupported scheme"), "got: {err}");
+}
+
+#[test]
+fn test_construction_rejects_metadata_base_url() {
+    // End-to-end: AiFederation::new() must refuse to construct when an
+    // operator base_url uses an unsafe scheme.
+    let config = json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "base_url": "http://attacker.example.com/openai/v1/chat",
+        }]
+    });
+    let http_client = create_test_http_client();
+    let err = ferrum_edge::plugins::ai_federation::AiFederation::new(&config, http_client)
+        .err()
+        .unwrap();
+    assert!(err.contains("http://"), "got: {err}");
+    assert!(err.contains("allow_plaintext"), "got: {err}");
+}
+
+#[test]
+fn test_construction_uses_resolved_backend_allow_ips_policy() {
+    let config = json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "base_url": "https://169.254.169.254/latest/meta-data/",
+        }]
+    });
+    let http_client = create_test_http_client_with_backend_allow_ips(BackendAllowIps::Public);
+    let err = ferrum_edge::plugins::ai_federation::AiFederation::new(&config, http_client)
+        .err()
+        .unwrap();
+    assert!(err.contains("169.254.169.254"), "got: {err}");
+    assert!(err.contains("public"), "got: {err}");
+}
+
+#[test]
+fn test_construction_accepts_plaintext_with_opt_in() {
+    let config = json!({
+        "providers": [{
+            "name": "internal",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "base_url": "http://internal-llm.local:8080/v1/chat",
+            "allow_plaintext": true,
+        }]
+    });
+    let http_client = create_test_http_client();
+    let result = ferrum_edge::plugins::ai_federation::AiFederation::new(&config, http_client);
+    assert!(
+        result.is_ok(),
+        "allow_plaintext: true should permit http://: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_construction_accepts_https_base_url() {
+    let config = json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "base_url": "https://api.openai.com/v1/chat/completions",
+        }]
+    });
+    let http_client = create_test_http_client();
+    assert!(ferrum_edge::plugins::ai_federation::AiFederation::new(&config, http_client).is_ok());
+}
+
+// ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------
 
 fn create_test_http_client() -> ferrum_edge::plugins::PluginHttpClient {
     ferrum_edge::plugins::PluginHttpClient::default()
+}
+
+fn create_test_http_client_with_backend_allow_ips(
+    backend_allow_ips: BackendAllowIps,
+) -> ferrum_edge::plugins::PluginHttpClient {
+    let dns_config = DnsConfig {
+        backend_allow_ips: backend_allow_ips.clone(),
+        ..Default::default()
+    };
+    ferrum_edge::plugins::PluginHttpClient::new(
+        &PoolConfig::default(),
+        DnsCache::new(dns_config),
+        1000,
+        0,
+        100,
+        false,
+        None,
+        std::sync::Arc::new(Vec::new()),
+        ferrum_edge::config::types::DEFAULT_NAMESPACE,
+        backend_allow_ips,
+    )
 }

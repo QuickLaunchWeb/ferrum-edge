@@ -86,7 +86,8 @@ fn admin_state_with_capability_registry(jwt: JwtManager) -> AdminState {
     };
     let env_config = ferrum_edge::config::env_config::EnvConfig::default();
     let dns_cache = DnsCache::new(DnsConfig::default());
-    let proxy_state = ProxyState::new(cfg, dns_cache, env_config, None).expect("proxy state");
+    let (proxy_state, _health_check_handles) =
+        ProxyState::new(cfg, dns_cache, env_config, None, None).expect("proxy state");
 
     // Seed one capability entry — h2_tls=Unsupported, h1=Supported (the
     // post-ALPN-downgrade shape). The exact key value isn't asserted by

@@ -261,6 +261,11 @@ impl LoadBalancerCacheInner {
     pub fn upstreams(&self) -> &HashMap<String, Arc<Upstream>> {
         &self.upstreams
     }
+
+    #[inline]
+    pub fn get_balancer(&self, upstream_id: &str) -> Option<Arc<LoadBalancer>> {
+        self.balancers.get(upstream_id).cloned()
+    }
 }
 
 /// Load balancer cache, rebuilt atomically on config change.
@@ -277,23 +282,28 @@ pub struct LoadBalancerCache {
 
 impl LoadBalancerCache {
     pub fn new(config: &GatewayConfig) -> Self {
-        let balancers = Self::build_balancers(config);
-        let upstreams = Self::build_upstream_index(config);
         Self {
-            inner: ArcSwap::new(Arc::new(LoadBalancerCacheInner {
-                balancers,
-                upstreams,
-            })),
+            inner: ArcSwap::new(Self::build_inner(config)),
         }
     }
 
     pub fn rebuild(&self, config: &GatewayConfig) {
-        let balancers = Self::build_balancers(config);
-        let upstreams = Self::build_upstream_index(config);
-        self.inner.store(Arc::new(LoadBalancerCacheInner {
-            balancers,
-            upstreams,
-        }));
+        self.inner.store(Self::build_inner(config));
+    }
+
+    pub(crate) fn build_inner(config: &GatewayConfig) -> Arc<LoadBalancerCacheInner> {
+        Arc::new(LoadBalancerCacheInner {
+            balancers: Self::build_balancers(config),
+            upstreams: Self::build_upstream_index(config),
+        })
+    }
+
+    pub(crate) fn store_inner(&self, inner: Arc<LoadBalancerCacheInner>) {
+        self.inner.store(inner);
+    }
+
+    pub(crate) fn load_inner(&self) -> Arc<LoadBalancerCacheInner> {
+        self.inner.load_full()
     }
 
     fn build_balancers(config: &GatewayConfig) -> HashMap<String, Arc<LoadBalancer>> {
@@ -329,18 +339,19 @@ impl LoadBalancerCache {
     /// - Unchanged upstreams keep their exact same `Arc<LoadBalancer>`, preserving
     ///   round-robin counters, WRR weights, active connection counts, latency
     ///   EWMAs, and hash rings
-    pub fn apply_delta(
-        &self,
+    pub(crate) fn build_delta_inner(
+        current: &LoadBalancerCacheInner,
         full_new_config: &GatewayConfig,
         added: &[Upstream],
         removed_ids: &[String],
         modified: &[Upstream],
-    ) {
+    ) -> Arc<LoadBalancerCacheInner> {
         if added.is_empty() && removed_ids.is_empty() && modified.is_empty() {
-            return;
+            return Arc::new(LoadBalancerCacheInner {
+                balancers: current.balancers.clone(),
+                upstreams: current.upstreams.clone(),
+            });
         }
-
-        let current = self.inner.load();
 
         // Clone the current map -- O(n) Arc pointer copies, no LoadBalancer cloning
         let mut new_balancers = current.balancers.clone();
@@ -367,10 +378,23 @@ impl LoadBalancerCache {
         let new_upstream_idx = Self::build_upstream_index(full_new_config);
 
         // Single atomic swap
-        self.inner.store(Arc::new(LoadBalancerCacheInner {
+        Arc::new(LoadBalancerCacheInner {
             balancers: new_balancers,
             upstreams: new_upstream_idx,
-        }));
+        })
+    }
+
+    pub fn apply_delta(
+        &self,
+        full_new_config: &GatewayConfig,
+        added: &[Upstream],
+        removed_ids: &[String],
+        modified: &[Upstream],
+    ) {
+        let current = self.inner.load();
+        let inner =
+            Self::build_delta_inner(&current, full_new_config, added, removed_ids, modified);
+        self.store_inner(inner);
     }
 
     /// O(1) lookup of an upstream by ID from the pre-built index.
@@ -392,7 +416,22 @@ impl LoadBalancerCache {
         hash_on: Option<String>,
     ) {
         let current = self.inner.load();
+        self.store_inner(Self::build_update_targets_inner(
+            &current,
+            upstream_id,
+            new_targets,
+            algorithm,
+            hash_on,
+        ));
+    }
 
+    pub(crate) fn build_update_targets_inner(
+        current: &LoadBalancerCacheInner,
+        upstream_id: &str,
+        new_targets: Vec<UpstreamTarget>,
+        algorithm: LoadBalancerAlgorithm,
+        hash_on: Option<String>,
+    ) -> Arc<LoadBalancerCacheInner> {
         // Clone-and-patch both maps, then swap as a single unit
         let mut new_balancers = current.balancers.clone();
         new_balancers.insert(
@@ -412,10 +451,10 @@ impl LoadBalancerCache {
             new_upstreams.insert(upstream_id.to_string(), Arc::new(updated));
         }
 
-        self.inner.store(Arc::new(LoadBalancerCacheInner {
+        Arc::new(LoadBalancerCacheInner {
             balancers: new_balancers,
             upstreams: new_upstreams,
-        }));
+        })
     }
 
     /// Get the pre-parsed hash-on strategy for an upstream.
@@ -471,6 +510,14 @@ impl LoadBalancerCache {
             .unwrap_or(HashOnStrategy::Ip)
     }
 
+    #[inline]
+    pub fn get_upstream_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+    ) -> Option<Arc<Upstream>> {
+        snapshot.upstreams.get(upstream_id).cloned()
+    }
+
     /// Select a target from a pre-loaded snapshot.
     #[inline]
     pub fn select_target_from(
@@ -493,6 +540,17 @@ impl LoadBalancerCache {
     ) -> Option<Arc<UpstreamTarget>> {
         let inner = self.inner.load();
         let balancer = inner.balancers.get(upstream_id)?;
+        balancer.select_excluding(ctx_key, exclude, health)
+    }
+
+    pub fn select_next_target_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+        ctx_key: &str,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let balancer = snapshot.balancers.get(upstream_id)?;
         balancer.select_excluding(ctx_key, exclude, health)
     }
 
@@ -519,21 +577,7 @@ impl LoadBalancerCache {
     pub fn record_connection_start(&self, upstream_id: &str, target: &UpstreamTarget) {
         let inner = self.inner.load();
         if let Some(balancer) = inner.balancers.get(upstream_id) {
-            let key = balancer.find_target_key(target).unwrap_or("");
-            if key.is_empty() {
-                return;
-            }
-            // Fast path: get() uses a shared read lock. entry() takes a write
-            // lock and clones the key -- avoid it when the counter already exists.
-            if let Some(counter) = balancer.active_connections.get(key) {
-                counter.fetch_add(1, Ordering::Relaxed);
-            } else {
-                balancer
-                    .active_connections
-                    .entry(key.to_owned())
-                    .or_insert_with(|| AtomicI64::new(0))
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            balancer.record_connection_start(target);
         }
     }
 
@@ -541,15 +585,7 @@ impl LoadBalancerCache {
     pub fn record_connection_end(&self, upstream_id: &str, target: &UpstreamTarget) {
         let inner = self.inner.load();
         if let Some(balancer) = inner.balancers.get(upstream_id) {
-            let key = balancer.find_target_key(target).unwrap_or("");
-            if key.is_empty() {
-                return;
-            }
-            if let Some(count) = balancer.active_connections.get(key) {
-                let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    if v > 0 { Some(v - 1) } else { None }
-                });
-            }
+            balancer.record_connection_end(target);
         }
     }
 
@@ -755,6 +791,35 @@ impl LoadBalancer {
             // handle gracefully for mixed-algorithm recording)
             self.latency_ewma
                 .insert(key.to_owned(), AtomicU64::new(latency_us));
+        }
+    }
+
+    pub fn record_connection_start(&self, target: &UpstreamTarget) {
+        let key = self.find_target_key(target).unwrap_or("");
+        if key.is_empty() {
+            return;
+        }
+        // Fast path: get() uses a shared read lock. entry() takes a write
+        // lock and clones the key -- avoid it when the counter already exists.
+        if let Some(counter) = self.active_connections.get(key) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.active_connections
+                .entry(key.to_owned())
+                .or_insert_with(|| AtomicI64::new(0))
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_connection_end(&self, target: &UpstreamTarget) {
+        let key = self.find_target_key(target).unwrap_or("");
+        if key.is_empty() {
+            return;
+        }
+        if let Some(count) = self.active_connections.get(key) {
+            let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v > 0 { Some(v - 1) } else { None }
+            });
         }
     }
 

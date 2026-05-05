@@ -336,6 +336,73 @@ impl UrlTemplate {
     }
 }
 
+/// Validate an operator-supplied `base_url` against scheme + IP allowlist policy.
+///
+/// SSRF defense: an admin-API attacker who compromises plugin config can
+/// otherwise point `base_url` at an internal endpoint (`http://127.0.0.1`,
+/// AWS IMDS `http://169.254.169.254/latest/meta-data/`, an RFC 1918 host
+/// inside the gateway's VPC). This guard runs at plugin construction so
+/// the misconfigured provider never ships requests.
+///
+/// Rules:
+/// - Must parse as a URL.
+/// - Scheme is `https` by default. `http` is only allowed when the
+///   per-provider `allow_plaintext: true` opt-in is set.
+/// - If the host is a literal IP, it is checked against the gateway-wide
+///   `FERRUM_BACKEND_ALLOW_IPS` policy via [`check_backend_ip_allowed`].
+/// - If the host is a hostname, no compile-time IP check is possible —
+///   runtime DNS resolution flows through `DnsCacheResolver`, which
+///   re-applies the same policy before each request lands.
+fn validate_base_url(
+    provider_name: &str,
+    base_url: &str,
+    allow_plaintext: bool,
+    backend_allow_ips: &crate::config::BackendAllowIps,
+) -> Result<(), String> {
+    let parsed = url::Url::parse(base_url).map_err(|e| {
+        format!("ai_federation: provider '{provider_name}' invalid base_url '{base_url}': {e}")
+    })?;
+
+    match parsed.scheme() {
+        "https" => {}
+        "http" => {
+            if !allow_plaintext {
+                return Err(format!(
+                    "ai_federation: provider '{provider_name}' base_url uses 'http://' which is rejected by default; set 'allow_plaintext: true' on the provider to override"
+                ));
+            }
+        }
+        other => {
+            return Err(format!(
+                "ai_federation: provider '{provider_name}' base_url has unsupported scheme '{other}' (expected 'https' or 'http' with allow_plaintext)"
+            ));
+        }
+    }
+
+    let host = parsed.host_str().ok_or_else(|| {
+        format!("ai_federation: provider '{provider_name}' base_url '{base_url}' has no host")
+    })?;
+
+    // If the host is a literal IP, enforce the gateway IP policy at config
+    // time. Hostnames are checked at runtime by `DnsCacheResolver`.
+    //
+    // `url::Url::host_str()` keeps the brackets on bracketed IPv6 literals
+    // (e.g. `https://[::1]/` → `"[::1]"`), so strip them before parsing.
+    let host_for_ip = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = host_for_ip.parse::<std::net::IpAddr>()
+        && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
+    {
+        return Err(format!(
+            "ai_federation: provider '{provider_name}' base_url IP {ip} denied by FERRUM_BACKEND_ALLOW_IPS={backend_allow_ips} policy"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Build the URL template for a provider at config-load time.
 ///
 /// The eight-argument shape is intentional: each field comes from a
@@ -427,6 +494,10 @@ impl AiFederation {
 
         let mut providers = Vec::with_capacity(providers_val.len());
 
+        // Use the already-resolved gateway IP allowlist policy so provider
+        // validation honors CLI/env/conf/default precedence.
+        let backend_allow_ips = http_client.backend_allow_ips().clone();
+
         for (i, pv) in providers_val.iter().enumerate() {
             let name = pv["name"]
                 .as_str()
@@ -468,6 +539,16 @@ impl AiFederation {
                 Duration::from_secs(pv["read_timeout_seconds"].as_u64().unwrap_or(60));
 
             let base_url = pv["base_url"].as_str().map(String::from);
+            let allow_plaintext = pv["allow_plaintext"].as_bool().unwrap_or(false);
+
+            // SSRF guard: validate operator-supplied base_url before storing
+            // it. Provider `default_base_url` literals are static `https://`
+            // strings and are inherently safe (covered by inspection — see
+            // `ProviderType::default_base_url`); only the operator override
+            // needs runtime validation.
+            if let Some(ref url) = base_url {
+                validate_base_url(&name, url, allow_plaintext, &backend_allow_ips)?;
+            }
 
             let auth = build_auth(provider_type, pv, &name)?;
 
@@ -707,7 +788,27 @@ fn validate_provider_config(
 // Model routing
 // ---------------------------------------------------------------------------
 
-/// Simple glob match supporting only `*` as a wildcard (matches any sequence).
+/// Characters a `*` wildcard in a `model_patterns` glob is NOT allowed to
+/// consume.
+///
+/// This is the security tightening for `simple_glob_match`. Without this,
+/// an operator pattern like `gemini-*` would match a malicious user input
+/// such as `gemini-../foo:streamGenerateContent?key=stolen` and let
+/// `find_providers_for_model` route the request to a Gemini provider that
+/// then concatenates the user-controlled string into the URL path. The
+/// charset below covers every URL-structural separator (path traversal,
+/// query/fragment introducers, alternate path separators) plus
+/// whitespace and control-style characters that have no business in a
+/// model identifier. Compare with fnmatch(3) where `*` does not cross `/`.
+const GLOB_WILDCARD_FORBIDDEN_CHARS: &[char] = &['/', '?', '#', '&', '\\', ' ', '\t', '\n', '\r'];
+
+/// Simple glob match supporting only `*` as a wildcard.
+///
+/// `*` matches any sequence of characters EXCEPT those listed in
+/// [`GLOB_WILDCARD_FORBIDDEN_CHARS`]. The pattern is implicitly anchored to
+/// the start and end of the input — there is no "starts-with" mode. The
+/// literal segments between `*` markers must appear in order without
+/// overlapping the forbidden character set inside any `*` window.
 fn simple_glob_match(pattern: &str, input: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
     if parts.len() == 1 {
@@ -726,6 +827,15 @@ fn simple_glob_match(pattern: &str, input: &str) -> bool {
             if i == 0 && found != 0 {
                 return false;
             }
+            // The substring `*` consumed (between the previous match end
+            // and the next literal) must not contain any URL-structural
+            // separator. Without this, `gemini-*` would match
+            // `gemini-../foo:streamGenerateContent` and let the dispatcher
+            // route a path-traversing model to a real Gemini provider.
+            let gap = &input[pos..pos + found];
+            if gap.contains(GLOB_WILDCARD_FORBIDDEN_CHARS) {
+                return false;
+            }
             pos += found + part.len();
         } else {
             return false;
@@ -737,7 +847,55 @@ fn simple_glob_match(pattern: &str, input: &str) -> bool {
         return false;
     }
 
+    // Trailing `*` window — the remainder must also not contain URL separators.
+    if pattern.ends_with('*') && input[pos..].contains(GLOB_WILDCARD_FORBIDDEN_CHARS) {
+        return false;
+    }
+
     true
+}
+
+/// Validate that a resolved model name is safe to substitute into a URL
+/// path component.
+///
+/// Three providers (Google Gemini, Google Vertex AI, AWS Bedrock) embed
+/// the resolved model directly in the URL path (`prefix + model +
+/// suffix`). Without validation, a user-supplied `model` field can steer
+/// the request to a different provider API path on the operator's API
+/// key — e.g. `gemini-../streamGenerateContent?key=stolen` collapses to
+/// a different endpoint after URL normalization.
+///
+/// Allowed charset: `[A-Za-z0-9._:-]`. The colon is required for AWS
+/// Bedrock model identifiers like
+/// `anthropic.claude-3-5-sonnet-20240620-v1:0`. The dot is required for
+/// every provider's versioning scheme. The hyphen and underscore cover
+/// the rest of the legitimate model-name space across all three.
+///
+/// Additionally, `..` is rejected outright — even though both `.`
+/// characters are in the allowed set individually, the sequence is the
+/// canonical path-traversal token after URL normalization.
+fn is_valid_url_model_component(model: &str) -> bool {
+    if model.is_empty() {
+        return false;
+    }
+    if model.contains("..") {
+        return false;
+    }
+    model
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-' || b == b':')
+}
+
+/// Whether a provider embeds the resolved model directly in the URL path.
+///
+/// Only these providers are vulnerable to URL injection via the `model`
+/// field — for OpenAI-compatible / Anthropic / Cohere providers the
+/// model goes into the request body, not the URL.
+fn provider_embeds_model_in_url(provider_type: ProviderType) -> bool {
+    matches!(
+        provider_type,
+        ProviderType::GoogleGemini | ProviderType::GoogleVertex | ProviderType::AwsBedrock
+    )
 }
 
 impl AiFederation {
@@ -1574,6 +1732,31 @@ impl Plugin for AiFederation {
             let is_last_provider = idx + 1 == provider_count;
             let resolved_model = Self::resolve_model(provider, &model);
 
+            // Defense against URL injection via the user-controlled `model`
+            // field for providers that embed the resolved model directly in
+            // the URL path (Gemini, Vertex AI, Bedrock). Without this, a
+            // request with `"model": "gemini-../foo:streamGenerateContent"`
+            // and a permissive `model_patterns: ["gemini-*"]` (or no
+            // patterns at all — empty == catch-all) reaches
+            // `build_provider_url` with an attacker-controlled path
+            // component on the operator's API key. Reject early — do not
+            // fall through to the next provider, since the dangerous
+            // payload would just hit a different provider's URL.
+            if provider_embeds_model_in_url(provider.provider_type)
+                && !is_valid_url_model_component(&resolved_model)
+            {
+                warn!(
+                    provider = %provider.name,
+                    provider_type = %provider.provider_type.as_str(),
+                    model = %resolved_model,
+                    "ai_federation: rejected request — resolved model contains characters not permitted in URL path"
+                );
+                return self.error_response(
+                    400,
+                    "Invalid 'model' field: must contain only alphanumeric characters, dot, hyphen, underscore, or colon",
+                );
+            }
+
             let translated = match translate_request(provider, &openai_body, &resolved_model) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1802,6 +1985,17 @@ pub mod test_helpers {
         simple_glob_match(pattern, input)
     }
 
+    /// Expose the URL-path-component validator for tests.
+    pub fn is_valid_url_model_component(model: &str) -> bool {
+        super::is_valid_url_model_component(model)
+    }
+
+    /// Expose the URL-embedding provider classifier for tests.
+    pub fn provider_embeds_model_in_url(provider_type: &str) -> Result<bool, String> {
+        let pt = ProviderType::from_str(provider_type)?;
+        Ok(super::provider_embeds_model_in_url(pt))
+    }
+
     /// Expose request translation for tests.
     pub fn translate_request_test(
         provider_type: &str,
@@ -1898,5 +2092,25 @@ pub mod test_helpers {
             tokens.completion_tokens.unwrap_or(0),
             tokens.total_tokens.unwrap_or(0),
         ))
+    }
+
+    /// Expose `base_url` validation for tests with an explicit IP policy.
+    ///
+    /// Mirrors what `AiFederation::new` does per provider once the policy has
+    /// been resolved by gateway startup.
+    pub fn validate_base_url_test(
+        provider_name: &str,
+        base_url: &str,
+        allow_plaintext: bool,
+        policy: &str,
+    ) -> Result<(), String> {
+        use crate::config::BackendAllowIps;
+        let policy = match policy {
+            "private" => BackendAllowIps::Private,
+            "public" => BackendAllowIps::Public,
+            "both" => BackendAllowIps::Both,
+            other => return Err(format!("invalid policy '{other}'")),
+        };
+        validate_base_url(provider_name, base_url, allow_plaintext, &policy)
     }
 }

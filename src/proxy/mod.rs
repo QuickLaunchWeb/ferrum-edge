@@ -78,13 +78,14 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
-use crate::load_balancer::{HashOnStrategy, LoadBalancerCache};
+use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
     WebSocketFrameDirection,
 };
 use crate::proxy::headers as headers_mod;
+use crate::request_epoch::{RequestEpoch, RequestEpochStore, StagedRequestEpoch};
 use crate::retry;
 use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
@@ -896,6 +897,33 @@ impl Drop for PerIpRequestGuard {
     }
 }
 
+/// RAII guard for load-balancer connection accounting on upgraded sessions.
+///
+/// WebSocket proxying runs in a spawned task after the HTTP handler returns.
+/// Keeping the accounting in a guard makes the end event fire on normal close,
+/// upgrade failure, task cancellation, or panic unwind.
+struct LoadBalancerConnectionGuard {
+    target: Option<Arc<UpstreamTarget>>,
+    balancer: Option<Arc<LoadBalancer>>,
+}
+
+impl LoadBalancerConnectionGuard {
+    fn new(target: Option<Arc<UpstreamTarget>>, balancer: Option<Arc<LoadBalancer>>) -> Self {
+        if let (Some(target), Some(balancer)) = (target.as_ref(), balancer.as_ref()) {
+            balancer.record_connection_start(target);
+        }
+        Self { target, balancer }
+    }
+}
+
+impl Drop for LoadBalancerConnectionGuard {
+    fn drop(&mut self) {
+        if let (Some(target), Some(balancer)) = (self.target.as_ref(), self.balancer.as_ref()) {
+            balancer.record_connection_end(target);
+        }
+    }
+}
+
 /// Build RFC 7239 Forwarded header value.
 /// IPv6 addresses are quoted per RFC 7239 §6.
 /// Writes directly into a single pre-allocated buffer to avoid intermediate
@@ -1007,10 +1035,33 @@ fn reject_result_to_backend_response(
     }
 }
 
+/// Outcome of [`ProxyState::apply_incremental`].
+///
+/// The DB polling loop in `src/modes/database.rs` distinguishes these states
+/// to decide whether to advance `last_poll_at` (the `since` cursor for the
+/// next incremental query). Empty results and applied changes both mean the
+/// poll completed safely and the cursor must move forward; rejected updates
+/// must leave the cursor untouched so the next poll re-fetches the same rows
+/// and gets another chance to apply them. Without that, a row whose
+/// `updated_at` falls outside the 1-second `since_safe` margin would silently
+/// disappear from the gateway's view of the DB, leaving permanent
+/// divergence between DB state and in-memory config until a full reload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncrementalApplyOutcome {
+    /// Changes were applied to in-memory config.
+    Applied,
+    /// `IncrementalResult` was empty — nothing to apply, no error.
+    NoChanges,
+    /// Validation rejected the patched config; in-memory config unchanged.
+    /// Callers tracking a `since` cursor MUST NOT advance it on this outcome.
+    Rejected,
+}
+
 /// Shared state for the proxy engine.
 #[derive(Clone)]
 pub struct ProxyState {
     pub config: Arc<ArcSwap<GatewayConfig>>,
+    pub request_epoch: Arc<RequestEpochStore>,
     pub dns_cache: DnsCache,
     pub connection_pool: Arc<ConnectionPool>,
     pub router_cache: Arc<RouterCache>,
@@ -1035,6 +1086,8 @@ pub struct ProxyState {
     pub load_balancer_cache: Arc<LoadBalancerCache>,
     /// Health checker for upstream targets.
     pub health_checker: Arc<HealthChecker>,
+    /// Shutdown receiver reused when config reloads restart health-check tasks.
+    pub health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     /// Circuit breaker cache for proxy-level circuit breaking.
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// Service discovery manager for dynamic upstream target resolution.
@@ -1107,12 +1160,31 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
+    /// Construct the gateway state and start the health checker.
+    ///
+    /// `health_check_shutdown_rx` is forwarded to
+    /// [`HealthChecker::start_with_shutdown`] so active HTTP probes and the
+    /// passive recovery timer observe gateway shutdown via `tokio::select!`
+    /// and exit cleanly. Pass `Some(shutdown_tx.subscribe())` from each
+    /// mode's startup; tests that don't drive shutdown can pass `None`.
+    ///
+    /// Returns `(ProxyState, Vec<JoinHandle>)`. The handle vec is populated
+    /// by [`HealthChecker::take_active_check_handles`] — they wrap the
+    /// spawned active-check / passive-recovery tasks. Modes must `await`
+    /// them in the per-mode background-drain phase (alongside DNS / metrics
+    /// / overload). Without that, cleanup falls back to
+    /// `Drop for HealthChecker`, which only aborts tasks once the last
+    /// `Arc<HealthChecker>` clone is dropped — at process exit, AFTER the
+    /// drain window has already closed. That late abort lets a probe
+    /// mid-`http_probe` finish its TCP / TLS / HTTP round-trip and emit
+    /// a misleading "unhealthy" log line right before tear-down.
     pub fn new(
         config: GatewayConfig,
         dns_cache: DnsCache,
         env_config: crate::config::EnvConfig,
         tls_policy: Option<TlsPolicy>,
-    ) -> Result<Self, anyhow::Error> {
+        health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
         let alt_svc_header = if env_config.enable_http3 {
             Some(format!("h3=\":{}\"; ma=86400", env_config.proxy_https_port))
         } else {
@@ -1143,6 +1215,8 @@ impl ProxyState {
         let websocket_write_buffer_size = env_config.websocket_write_buffer_size;
         let websocket_tunnel_mode = env_config.websocket_tunnel_mode;
         let max_concurrent_requests_per_ip = env_config.max_concurrent_requests_per_ip;
+        let pool_shard_amount =
+            crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount);
         let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(
             &env_config.trusted_proxies,
         ));
@@ -1188,7 +1262,7 @@ impl ProxyState {
         ));
         // Build router cache with pre-sorted route table and HashMap prefix index.
         // Cache size: explicit env var if set (>0), otherwise pass through 0 so
-        // `RouterCache::new` resolves the auto sentinel (single source of truth).
+        // the RouterCache constructor resolves the auto sentinel (single source of truth).
         let max_cache_entries = if env_config_arc.router_cache_max_entries > 0 {
             env_config_arc
                 .router_cache_max_entries
@@ -1196,7 +1270,11 @@ impl ProxyState {
         } else {
             0
         };
-        let router_cache = Arc::new(RouterCache::new(&config, max_cache_entries));
+        let router_cache = Arc::new(RouterCache::with_shard_amount(
+            &config,
+            max_cache_entries,
+            pool_shard_amount,
+        ));
         // Pre-resolve plugins per proxy (fixes rate_limiting state persistence bug).
         // All plugins that make outbound HTTP calls share a pooled client configured
         // with the gateway's connection pool settings (keepalive, idle timeout, etc.).
@@ -1208,7 +1286,9 @@ impl ProxyState {
             env_config_arc.plugin_http_retry_delay_ms,
             env_config_arc.tls_no_verify,
             env_config_arc.tls_ca_bundle_path.as_deref(),
+            crls.clone(),
             &env_config_arc.namespace,
+            env_config_arc.backend_allow_ips.clone(),
         );
         let plugin_cache = Arc::new(
             PluginCache::with_http_client(&config, plugin_http_client.clone())
@@ -1218,6 +1298,16 @@ impl ProxyState {
         let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
         // Build load balancer cache for upstream target selection
         let load_balancer_cache = Arc::new(LoadBalancerCache::new(&config));
+        let request_epoch = Arc::new(RequestEpochStore::new(RequestEpoch {
+            config: Arc::new(config.clone()),
+            route_table: RouterCache::build_route_table_snapshot(&config),
+            plugin_cache: plugin_cache.load_inner(),
+            consumer_index: consumer_index.load_inner(),
+            load_balancer: load_balancer_cache.load_inner(),
+            config_generation: 1,
+            route_generation: 1,
+            lb_generation: 1,
+        }));
         // Initialize health checker with the gateway's pool settings so active
         // probes share connection tuning (keep-alive, idle timeout, HTTP/2) with
         // regular proxy traffic.
@@ -1230,7 +1320,20 @@ impl ProxyState {
             env_config_arc.tls_no_verify,
         );
         health_checker.set_load_balancer_cache(load_balancer_cache.clone());
-        health_checker.start(&config);
+        // Use `start_with_shutdown` so active HTTP probes and the passive
+        // recovery timer race their `interval.tick()` against the shutdown
+        // watch channel. Without the receiver the inner tasks exit only when
+        // `Drop for HealthChecker` aborts them — and `Drop` runs at process
+        // exit, after the background-drain phase has already given up. That
+        // late abort lets a probe that's mid-`http_probe` finish its TCP /
+        // TLS / HTTP round-trip and emit a misleading "unhealthy" log line
+        // immediately before the process tears down.
+        let health_check_restart_rx = health_check_shutdown_rx.clone();
+        health_checker.start_with_shutdown(&config, health_check_shutdown_rx);
+        // Drain the spawned task handles BEFORE wrapping in Arc so the
+        // caller can await them in the background-drain phase. Drop is
+        // a no-op safety net once the Vec is empty.
+        let health_check_handles = health_checker.take_active_check_handles();
         let health_checker = Arc::new(health_checker);
         // Circuit breaker cache
         let circuit_breaker_cache = Arc::new(CircuitBreakerCache::with_max_entries(
@@ -1242,6 +1345,7 @@ impl ProxyState {
             dns_cache.clone(),
             health_checker.clone(),
             plugin_http_client,
+            Some(request_epoch.clone()),
         ));
 
         let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
@@ -1270,113 +1374,117 @@ impl ProxyState {
 
         let overload = Arc::new(crate::overload::OverloadState::new());
 
-        let stream_listener_manager = Arc::new(stream_listener::StreamListenerManager::new(
-            stream_bind_addr,
-            config_arc.clone(),
-            dns_cache.clone(),
-            load_balancer_cache.clone(),
-            consumer_index.clone(),
-            plugin_cache.clone(),
-            circuit_breaker_cache.clone(),
-            None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
-            env_config_arc.tls_no_verify,
-            env_config_arc.tls_ca_bundle_path.clone(),
-            env_config_arc.tcp_idle_timeout_seconds,
-            env_config_arc.tcp_half_close_max_wait_seconds,
-            env_config_arc.frontend_tls_handshake_timeout_seconds,
-            env_config_arc.udp_max_sessions,
-            env_config_arc.udp_cleanup_interval_seconds,
-            tls_policy_arc.clone(),
-            crls.clone(),
-            adaptive_buffer.clone(),
-            env_config_arc.udp_recvmmsg_batch_size,
-            {
-                let v = env_config_arc
-                    .tcp_fastopen_enabled
-                    .resolve(crate::socket_opts::is_tcp_fastopen_available);
-                tracing::info!(enabled = v, config = %env_config_arc.tcp_fastopen_enabled, "TCP_FASTOPEN auto-detection");
-                v
-            },
-            overload.clone(),
-            {
-                let v = env_config_arc
-                    .ktls_enabled
-                    .resolve(crate::socket_opts::ktls::is_ktls_available);
-                if v {
-                    tracing::info!("kTLS auto-detection: enabled (full key install probe passed)");
-                } else {
-                    tracing::info!(config = %env_config_arc.ktls_enabled, "kTLS auto-detection: disabled");
-                }
-                v
-            },
-            {
-                let v = env_config_arc
-                    .io_uring_splice_enabled
-                    .resolve(crate::socket_opts::io_uring_splice::check_io_uring_available);
-                if v {
-                    tracing::info!(
-                        "io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"
-                    );
-                    // Warn if the tokio blocking-thread pool is too small for the
-                    // per-stream pattern: io_uring splice spawns 2 `spawn_blocking`
-                    // tasks per TCP connection (one per direction). With the default
-                    // cap of 512, thousands of concurrent streams will saturate the
-                    // pool and new splices will queue, causing latency spikes. 1024
-                    // is the rule-of-thumb floor; operators with very high connection
-                    // counts should set FERRUM_BLOCKING_THREADS much higher or
-                    // disable io_uring splice entirely.
-                    let effective_blocking_threads = env_config_arc.blocking_threads.unwrap_or(512);
-                    if effective_blocking_threads < 1024 {
-                        tracing::warn!(
-                            blocking_threads = effective_blocking_threads,
-                            "FERRUM_IO_URING_SPLICE_ENABLED=true but FERRUM_BLOCKING_THREADS={} is low; \
+        let stream_listener_manager = Arc::new(
+            stream_listener::StreamListenerManager::new_with_epoch(
+                stream_bind_addr,
+                config_arc.clone(),
+                dns_cache.clone(),
+                request_epoch.clone(),
+                circuit_breaker_cache.clone(),
+                None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
+                env_config_arc.tls_no_verify,
+                env_config_arc.tls_ca_bundle_path.clone(),
+                env_config_arc.tcp_idle_timeout_seconds,
+                env_config_arc.tcp_half_close_max_wait_seconds,
+                env_config_arc.frontend_tls_handshake_timeout_seconds,
+                env_config_arc.udp_max_sessions,
+                env_config_arc.udp_cleanup_interval_seconds,
+                tls_policy_arc.clone(),
+                crls.clone(),
+                adaptive_buffer.clone(),
+                env_config_arc.udp_recvmmsg_batch_size,
+                {
+                    let v = env_config_arc
+                        .tcp_fastopen_enabled
+                        .resolve(crate::socket_opts::is_tcp_fastopen_available);
+                    tracing::info!(enabled = v, config = %env_config_arc.tcp_fastopen_enabled, "TCP_FASTOPEN auto-detection");
+                    v
+                },
+                overload.clone(),
+                {
+                    let v = env_config_arc
+                        .ktls_enabled
+                        .resolve(crate::socket_opts::ktls::is_ktls_available);
+                    if v {
+                        tracing::info!(
+                            "kTLS auto-detection: enabled (full key install probe passed)"
+                        );
+                    } else {
+                        tracing::info!(config = %env_config_arc.ktls_enabled, "kTLS auto-detection: disabled");
+                    }
+                    v
+                },
+                {
+                    let v = env_config_arc
+                        .io_uring_splice_enabled
+                        .resolve(crate::socket_opts::io_uring_splice::check_io_uring_available);
+                    if v {
+                        tracing::info!(
+                            "io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"
+                        );
+                        // Warn if the tokio blocking-thread pool is too small for the
+                        // per-stream pattern: io_uring splice spawns 2 `spawn_blocking`
+                        // tasks per TCP connection (one per direction). With the default
+                        // cap of 512, thousands of concurrent streams will saturate the
+                        // pool and new splices will queue, causing latency spikes. 1024
+                        // is the rule-of-thumb floor; operators with very high connection
+                        // counts should set FERRUM_BLOCKING_THREADS much higher or
+                        // disable io_uring splice entirely.
+                        let effective_blocking_threads =
+                            env_config_arc.blocking_threads.unwrap_or(512);
+                        if effective_blocking_threads < 1024 {
+                            tracing::warn!(
+                                blocking_threads = effective_blocking_threads,
+                                "FERRUM_IO_URING_SPLICE_ENABLED=true but FERRUM_BLOCKING_THREADS={} is low; \
                              each TCP stream consumes 2 blocking threads. \
                              Recommended: FERRUM_BLOCKING_THREADS >= 1024 for io_uring splice.",
-                            effective_blocking_threads
-                        );
+                                effective_blocking_threads
+                            );
+                        }
+                    } else {
+                        tracing::info!(config = %env_config_arc.io_uring_splice_enabled, "io_uring splice auto-detection: disabled");
                     }
-                } else {
-                    tracing::info!(config = %env_config_arc.io_uring_splice_enabled, "io_uring splice auto-detection: disabled");
-                }
-                v
-            },
-            env_config_arc.so_busy_poll_us,
-            {
-                let v = env_config_arc
-                    .udp_gro_enabled
-                    .resolve(crate::socket_opts::is_udp_gro_available);
-                // GRO is probed but not active (recv_from lacks cmsg) — log for completeness.
-                tracing::info!(enabled = v, config = %env_config_arc.udp_gro_enabled, "UDP GRO auto-detection (reserved, not active)");
-                v
-            },
-            {
-                let v = env_config_arc
-                    .udp_gso_enabled
-                    .resolve(crate::socket_opts::is_udp_gso_available);
-                if v {
-                    tracing::info!("UDP GSO auto-detection: enabled (setsockopt probe passed)");
-                } else {
-                    tracing::info!(config = %env_config_arc.udp_gso_enabled, "UDP GSO auto-detection: disabled");
-                }
-                v
-            },
-            {
-                let v = env_config_arc
-                    .udp_pktinfo_enabled
-                    .resolve(crate::socket_opts::is_udp_pktinfo_available);
-                if v {
-                    tracing::info!(
-                        "UDP IP_PKTINFO auto-detection: enabled (setsockopt probe passed)"
-                    );
-                } else {
-                    tracing::info!(config = %env_config_arc.udp_pktinfo_enabled, "UDP IP_PKTINFO auto-detection: disabled");
-                }
-                v
-            },
-        ));
+                    v
+                },
+                env_config_arc.so_busy_poll_us,
+                {
+                    let v = env_config_arc
+                        .udp_gro_enabled
+                        .resolve(crate::socket_opts::is_udp_gro_available);
+                    // GRO is probed but not active (recv_from lacks cmsg) — log for completeness.
+                    tracing::info!(enabled = v, config = %env_config_arc.udp_gro_enabled, "UDP GRO auto-detection (reserved, not active)");
+                    v
+                },
+                {
+                    let v = env_config_arc
+                        .udp_gso_enabled
+                        .resolve(crate::socket_opts::is_udp_gso_available);
+                    if v {
+                        tracing::info!("UDP GSO auto-detection: enabled (setsockopt probe passed)");
+                    } else {
+                        tracing::info!(config = %env_config_arc.udp_gso_enabled, "UDP GSO auto-detection: disabled");
+                    }
+                    v
+                },
+                {
+                    let v = env_config_arc
+                        .udp_pktinfo_enabled
+                        .resolve(crate::socket_opts::is_udp_pktinfo_available);
+                    if v {
+                        tracing::info!(
+                            "UDP IP_PKTINFO auto-detection: enabled (setsockopt probe passed)"
+                        );
+                    } else {
+                        tracing::info!(config = %env_config_arc.udp_pktinfo_enabled, "UDP IP_PKTINFO auto-detection: disabled");
+                    }
+                    v
+                },
+            ),
+        );
 
-        Ok(Self {
+        let state = Self {
             config: config_arc,
+            request_epoch,
             dns_cache,
             connection_pool,
             router_cache,
@@ -1384,6 +1492,7 @@ impl ProxyState {
             consumer_index,
             load_balancer_cache,
             health_checker,
+            health_check_shutdown_rx: health_check_restart_rx,
             circuit_breaker_cache,
             service_discovery_manager,
             request_count: Arc::new(AtomicU64::new(0)),
@@ -1431,7 +1540,9 @@ impl ProxyState {
             trusted_proxies,
             websocket_conn_limit,
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
-                Some(Arc::new(dashmap::DashMap::new()))
+                Some(Arc::new(dashmap::DashMap::with_shard_amount(
+                    pool_shard_amount,
+                )))
             } else {
                 None
             },
@@ -1443,26 +1554,34 @@ impl ProxyState {
             crls,
             overload,
             adaptive_buffer,
-        })
+        };
+        Ok((state, health_check_handles))
     }
 
     /// Start a background task that periodically removes stale zero-count
     /// entries from `per_ip_request_counts`. Normally entries are cleaned via
     /// the `PerIpRequestGuard` RAII drop, but this sweep catches edge cases
     /// (e.g., task cancellation without guard drop).
-    pub fn start_per_ip_cleanup_task(&self) {
-        if let Some(ref counts) = self.per_ip_request_counts {
-            let counts = counts.clone();
-            let interval_secs = self.env_config.per_ip_cleanup_interval_seconds.max(1);
-            tokio::spawn(async move {
-                let mut timer =
-                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-                loop {
-                    timer.tick().await;
-                    counts.retain(|_, count| count.load(Ordering::Relaxed) > 0);
-                }
-            });
-        }
+    ///
+    /// Returns `Some(JoinHandle)` when per-IP tracking is enabled so the
+    /// caller can join the task during the background-task drain phase of
+    /// graceful shutdown. Returns `None` when
+    /// `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP=0` (no tracking, no task to
+    /// spawn). The task exits cleanly on `shutdown_rx` change so it doesn't
+    /// wedge shutdown — consistent with `start_backend_capability_refresh_task`,
+    /// `dns_cache.start_background_refresh_with_shutdown`, and the overload /
+    /// metrics monitors.
+    pub fn start_per_ip_cleanup_task(
+        &self,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let counts = self.per_ip_request_counts.as_ref()?.clone();
+        let interval_secs = self.env_config.per_ip_cleanup_interval_seconds.max(1);
+        Some(tokio::spawn(run_per_ip_cleanup_loop(
+            counts,
+            interval_secs,
+            shutdown_rx,
+        )))
     }
 
     /// Reconcile stream proxy listeners at startup.
@@ -2173,6 +2292,114 @@ impl ProxyState {
         })
     }
 
+    /// Run the full validation pipeline against a candidate config and reject
+    /// it if any rejecting validator fails. Should be called AFTER
+    /// `resolve_upstream_tls()` / `resolve_dispatch_kind()` and BEFORE the
+    /// `ArcSwap::store()` that publishes the new config to the hot path.
+    ///
+    /// **Validator categories** (matching the long-standing semantics of
+    /// `apply_incremental` — see `db_loader.rs::load_full_config()` and
+    /// `dp_client.rs::handle_full_snapshot` for the corresponding call-site
+    /// gates that pre-filter before this helper runs):
+    ///
+    /// - *Warn-only* — emit `warn!` but never reject:
+    ///   - `validate_all_fields_with_ip_policy` (TLS cert paths, expiry,
+    ///     `FERRUM_BACKEND_ALLOW_IPS` policy). The DB / DP contract is
+    ///     "data is already persisted; warn rather than block reload" so a
+    ///     stale TLS path or a single misconfigured backend IP doesn't
+    ///     freeze the entire control plane.
+    ///   - `validate_hosts` (hostname syntax). Same rationale.
+    ///
+    /// - *Reject* — accumulate into the returned error vector and abort
+    ///   the reload:
+    ///   - `validate_regex_listen_paths` — uncompilable regex would
+    ///     silently skip routes at runtime.
+    ///   - `validate_unique_listen_paths` — overlapping listen paths
+    ///     would route non-deterministically.
+    ///   - `validate_stream_proxies` — stream-family invariants (no
+    ///     `listen_path`, mandatory `listen_port`, etc.).
+    ///   - `validate_upstream_references` — dangling upstream IDs would
+    ///     500 every request through that proxy.
+    ///   - `validate_plugin_references` — dangling plugin IDs / wrong
+    ///     scope.
+    ///   - `validate_stream_proxy_port_conflicts` — rejects in non-DP
+    ///     modes, warns in DP mode (the DP doesn't control its config and
+    ///     one bad stream proxy port shouldn't block all other config
+    ///     updates pushed by the CP).
+    ///
+    /// **Why this lives inside the swap path:** every existing caller
+    /// (`file_loader`, `db_loader`, `dp_client`) already validates before
+    /// calling `update_config` / `apply_incremental`, but the contract
+    /// "validate fully BEFORE swap" must be honored by the swap function
+    /// itself so a future call site (e.g. an admin "import config" handler)
+    /// cannot publish an invalid config to the hot path. Existing call-site
+    /// validation becomes defense-in-depth — the canonical guard is here.
+    ///
+    /// Reject errors are accumulated into a single `Vec<String>` so callers
+    /// can log every reason in one pass instead of discovering them
+    /// iteratively across reloads.
+    fn validate_full_config(&self, config: &GatewayConfig) -> Result<(), Vec<String>> {
+        // Warn-only — TLS field validation (cert paths, expiry, IP policy).
+        if let Err(errors) = config.validate_all_fields_with_ip_policy(
+            self.env_config.tls_cert_expiry_warning_days,
+            &self.env_config.backend_allow_ips,
+        ) {
+            for msg in &errors {
+                warn!("Config field validation: {}", msg);
+            }
+        }
+
+        // Warn-only — hostname syntax.
+        if let Err(errors) = config.validate_hosts() {
+            for msg in &errors {
+                warn!("Config validation: {}", msg);
+            }
+        }
+
+        // Reject — collect all rejecting-validator failures into a single
+        // error vector so callers can log every reason at once instead of
+        // discovering them iteratively across reloads.
+        let mut errors: Vec<String> = Vec::new();
+        if let Err(errs) = config.validate_regex_listen_paths() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = config.validate_unique_listen_paths() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = config.validate_stream_proxies() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = config.validate_upstream_references() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = config.validate_plugin_references() {
+            errors.extend(errs);
+        }
+
+        // Stream proxy port conflicts — reject in non-DP modes, warn in DP
+        // mode. The DP doesn't control its config and one bad stream proxy
+        // port shouldn't block all other config updates pushed by the CP.
+        let reserved_ports = self.env_config.reserved_gateway_ports();
+        if let Err(errs) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
+            if matches!(
+                self.env_config.mode,
+                crate::config::env_config::OperatingMode::DataPlane
+            ) {
+                for msg in &errs {
+                    warn!("Stream proxy port conflict (non-fatal in DP mode): {}", msg);
+                }
+            } else {
+                errors.extend(errs);
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     /// Apply a new configuration, using incremental (surgical) updates when
     /// possible to avoid disrupting the hot request path.
     ///
@@ -2184,34 +2411,156 @@ impl ProxyState {
     ///
     /// Falls back to a full rebuild only on the very first config load (when
     /// there is no previous config to diff against).
+    fn delta_routes_changed(
+        delta: &crate::config_delta::ConfigDelta,
+        old_config: &GatewayConfig,
+    ) -> bool {
+        let is_route_indexed = |proxy: &Proxy| !proxy.dispatch_kind.is_stream();
+
+        if delta.added_proxies.iter().any(is_route_indexed)
+            || delta.modified_proxies.iter().any(is_route_indexed)
+        {
+            return true;
+        }
+
+        if delta.modified_proxies.is_empty() && delta.removed_proxy_ids.is_empty() {
+            return false;
+        }
+
+        let old_route_indexed_proxy_ids: std::collections::HashSet<&str> = old_config
+            .proxies
+            .iter()
+            .filter(|proxy| is_route_indexed(proxy))
+            .map(|proxy| proxy.id.as_str())
+            .collect();
+
+        delta
+            .modified_proxies
+            .iter()
+            .map(|proxy| proxy.id.as_str())
+            .chain(delta.removed_proxy_ids.iter().map(String::as_str))
+            .any(|id| old_route_indexed_proxy_ids.contains(id))
+    }
+
+    fn delta_consumers_changed(delta: &crate::config_delta::ConfigDelta) -> bool {
+        !delta.added_consumers.is_empty()
+            || !delta.modified_consumers.is_empty()
+            || !delta.removed_consumer_ids.is_empty()
+    }
+
+    fn delta_load_balancers_changed(delta: &crate::config_delta::ConfigDelta) -> bool {
+        !delta.added_upstreams.is_empty()
+            || !delta.modified_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+    }
+
+    fn stage_incremental_request_epoch(
+        &self,
+        current: &RequestEpoch,
+        new_config: &GatewayConfig,
+        staged_config: Arc<GatewayConfig>,
+        delta: &crate::config_delta::ConfigDelta,
+    ) -> Result<StagedRequestEpoch, String> {
+        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(new_config);
+        let rebuild_globals = delta
+            .added_plugin_configs
+            .iter()
+            .chain(delta.modified_plugin_configs.iter())
+            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
+            || !delta.removed_plugin_config_ids.is_empty();
+        let route_changed = Self::delta_routes_changed(delta, &current.config);
+        let consumer_changed = Self::delta_consumers_changed(delta);
+        let lb_changed = Self::delta_load_balancers_changed(delta);
+
+        let plugin_inner = self.plugin_cache.build_delta_inner(
+            &current.plugin_cache,
+            new_config,
+            &proxy_ids_to_rebuild,
+            &delta.removed_proxy_ids,
+            rebuild_globals,
+        )?;
+        let consumer_inner = if consumer_changed {
+            ConsumerIndex::build_inner(&new_config.consumers)
+        } else {
+            Arc::clone(&current.consumer_index)
+        };
+        let load_balancer = if lb_changed {
+            LoadBalancerCache::build_delta_inner(
+                &current.load_balancer,
+                new_config,
+                &delta.added_upstreams,
+                &delta.removed_upstream_ids,
+                &delta.modified_upstreams,
+            )
+        } else {
+            Arc::clone(&current.load_balancer)
+        };
+        let route_table = if route_changed {
+            RouterCache::build_route_table_snapshot(new_config)
+        } else {
+            Arc::clone(&current.route_table)
+        };
+
+        Ok(StagedRequestEpoch {
+            config: staged_config,
+            route_table,
+            plugin_cache: plugin_inner,
+            consumer_index: consumer_inner,
+            load_balancer,
+            route_changed,
+            lb_changed,
+        })
+    }
+
+    fn mirror_request_epoch_wrappers(
+        &self,
+        published: &RequestEpoch,
+        route_changed: bool,
+        clear_route_caches: bool,
+    ) {
+        if route_changed {
+            self.router_cache.store_route_table_snapshot(
+                Arc::clone(&published.route_table),
+                published.route_generation,
+            );
+            if clear_route_caches {
+                self.router_cache.clear_lookup_caches();
+            }
+        }
+        self.plugin_cache
+            .store_inner(Arc::clone(&published.plugin_cache));
+        self.consumer_index
+            .store_inner(Arc::clone(&published.consumer_index));
+        self.load_balancer_cache
+            .store_inner(Arc::clone(&published.load_balancer));
+        self.config.store(Arc::clone(&published.config));
+    }
+
     /// Update the proxy configuration. Returns `true` if changes were applied.
     pub fn update_config(&self, mut new_config: GatewayConfig) -> bool {
         use crate::config_delta::ConfigDelta;
 
+        // Normalize hostnames (ASCII-lowercase) and pre-compute each
+        // proxy's `dispatch_kind` for O(1) hot-path dispatch. Both must run
+        // before any request reads `proxy.dispatch_kind`.
+        // `normalize_fields()` calls `resolve_dispatch_kind()` internally
+        // (see `GatewayConfig::normalize_fields` rustdoc) so we don't need
+        // a separate call here.
+        new_config.normalize_fields();
         // Resolve upstream TLS into each proxy's resolved_tls before applying.
         new_config.resolve_upstream_tls();
-        // Pre-compute each proxy's dispatch_kind for O(1) hot-path dispatch.
-        // Must run before any request reads proxy.dispatch_kind.
-        new_config.resolve_dispatch_kind();
 
-        // Validate stream proxy port conflicts before applying any config.
-        // In DP mode, warn but don't reject — the DP doesn't control its config
-        // and one bad stream proxy port shouldn't block all other config updates.
-        let reserved_ports = self.env_config.reserved_gateway_ports();
-        if let Err(errors) = new_config.validate_stream_proxy_port_conflicts(&reserved_ports) {
-            if matches!(
-                self.env_config.mode,
-                crate::config::env_config::OperatingMode::DataPlane
-            ) {
-                for msg in &errors {
-                    warn!("Stream proxy port conflict (non-fatal in DP mode): {}", msg);
-                }
-            } else {
-                for msg in &errors {
-                    error!("Config reload rejected: {}", msg);
-                }
-                return false;
+        // Run the full validation pipeline before swapping. Existing call
+        // sites (`file_loader`, `db_loader`, `dp_client`) validate first, so
+        // this is defense-in-depth for them — but the canonical "validate
+        // fully BEFORE swap" guard must live inside the swap function so a
+        // future caller (e.g. an admin "import config" handler) cannot
+        // publish an invalid config to the hot path.
+        if let Err(errors) = self.validate_full_config(&new_config) {
+            for msg in &errors {
+                error!("Config reload rejected: {}", msg);
             }
+            return false;
         }
 
         let old_config = self.config.load_full();
@@ -2228,16 +2577,47 @@ impl ProxyState {
             && new_config.upstreams.is_empty();
 
         if old_is_empty && !new_is_empty {
-            self.router_cache.rebuild(&new_config);
-            if let Err(e) = self.plugin_cache.rebuild(&new_config) {
-                error!(
-                    "Config reload rejected — security plugin validation failed: {}",
-                    e
-                );
-                return false;
-            }
-            self.consumer_index.rebuild(&new_config.consumers);
-            self.load_balancer_cache.rebuild(&new_config);
+            let route_table = RouterCache::build_route_table_snapshot(&new_config);
+            let plugin_inner = match self
+                .plugin_cache
+                .build_inner_with_existing_client(&new_config)
+            {
+                Ok(inner) => inner,
+                Err(e) => {
+                    error!(
+                        "Config reload rejected — security plugin validation failed: {}",
+                        e
+                    );
+                    return false;
+                }
+            };
+            let consumer_inner = ConsumerIndex::build_inner(&new_config.consumers);
+            let lb_inner = LoadBalancerCache::build_inner(&new_config);
+            let staged_config = Arc::new(new_config.clone());
+            let published = match self.request_epoch.update_config(
+                |_| {
+                    Ok(Some(StagedRequestEpoch {
+                        config: Arc::clone(&staged_config),
+                        route_table: Arc::clone(&route_table),
+                        plugin_cache: Arc::clone(&plugin_inner),
+                        consumer_index: Arc::clone(&consumer_inner),
+                        load_balancer: Arc::clone(&lb_inner),
+                        route_changed: true,
+                        lb_changed: true,
+                    }))
+                },
+                |published| {
+                    self.mirror_request_epoch_wrappers(published, true, true);
+                },
+            ) {
+                Ok(Some(epoch)) => epoch,
+                Ok(None) => return false,
+                Err(e) => {
+                    error!("Config reload rejected: {}", e);
+                    return false;
+                }
+            };
+            PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
             // DNS warmup for all hostnames in the new config
             let mut hostnames: Vec<(String, Option<String>, Option<u64>)> = new_config
@@ -2271,7 +2651,6 @@ impl ProxyState {
             }
 
             warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
-            self.config.store(Arc::new(new_config));
             self.spawn_backend_capability_refresh();
 
             // Reconcile stream proxy listeners (TCP/UDP)
@@ -2291,6 +2670,13 @@ impl ProxyState {
             // Reconcile service discovery tasks
             let new_cfg = self.config.load_full();
             self.service_discovery_manager.reconcile(&new_cfg, None);
+
+            // Restart active health-check probes against the new config so
+            // upstreams added by this reload get their probes spawned and
+            // probe parameters (interval, timeout, threshold, probe_type,
+            // TLS config) for existing upstreams are picked up.
+            self.health_checker
+                .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
 
             info!(
                 "Proxy configuration loaded (full build: router + plugins + consumers + load balancers)"
@@ -2312,45 +2698,36 @@ impl ProxyState {
             return false;
         }
 
-        // --- RouterCache: rebuild route table, surgically invalidate path cache ---
-        let affected_routes = delta.affected_routes(&old_config);
-        self.router_cache.apply_delta(&new_config, &affected_routes);
-
-        // --- PluginCache: only rebuild plugins for affected proxies ---
-        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(&new_config);
-        let rebuild_globals = delta
-            .added_plugin_configs
-            .iter()
-            .chain(delta.modified_plugin_configs.iter())
-            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
-            || !delta.removed_plugin_config_ids.is_empty();
-        if let Err(e) = self.plugin_cache.apply_delta(
-            &new_config,
-            &proxy_ids_to_rebuild,
-            &delta.removed_proxy_ids,
-            rebuild_globals,
-        ) {
-            error!(
-                "Config reload rejected — security plugin validation failed: {}",
-                e
-            );
-            return false;
-        }
-
-        // --- ConsumerIndex: surgical add/remove/update ---
-        self.consumer_index.apply_delta(
-            &delta.added_consumers,
-            &delta.removed_consumer_ids,
-            &delta.modified_consumers,
+        // Stage all request-facing cache inners before publishing any request-visible epoch.
+        let route_changed = Self::delta_routes_changed(&delta, &old_config);
+        let proxy_plugin_rebuild_count = delta.proxy_ids_needing_plugin_rebuild(&new_config).len();
+        let staged_config = Arc::new(new_config.clone());
+        let publish_result = self.request_epoch.update_config(
+            |current| {
+                self.stage_incremental_request_epoch(
+                    current,
+                    &new_config,
+                    Arc::clone(&staged_config),
+                    &delta,
+                )
+                .map(Some)
+            },
+            |published| {
+                self.mirror_request_epoch_wrappers(published, route_changed, false);
+            },
         );
-
-        // --- LoadBalancerCache: only rebuild changed upstreams ---
-        self.load_balancer_cache.apply_delta(
-            &new_config,
-            &delta.added_upstreams,
-            &delta.removed_upstream_ids,
-            &delta.modified_upstreams,
-        );
+        let published = match publish_result {
+            Ok(Some(epoch)) => epoch,
+            Ok(None) => return false,
+            Err(e) => {
+                error!(
+                    "Config reload rejected — security plugin validation failed: {}",
+                    e
+                );
+                return false;
+            }
+        };
+        PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
         // --- CircuitBreakerCache: prune breakers for deleted proxies ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -2413,9 +2790,6 @@ impl ProxyState {
             });
         }
 
-        // Clear cached pool keys when proxy settings change
-        // Swap the canonical config last (readers may still be using old caches
-        // via ArcSwap snapshots until they finish their current request)
         // Prune adaptive buffer state for removed proxies.
         {
             let active_ids: Vec<&str> = new_config.proxies.iter().map(|p| p.id.as_str()).collect();
@@ -2423,7 +2797,6 @@ impl ProxyState {
         }
 
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
-        self.config.store(Arc::new(new_config));
         self.spawn_backend_capability_refresh();
 
         // Reconcile stream proxy listeners if any proxies changed
@@ -2476,7 +2849,7 @@ impl ProxyState {
             delta.added_upstreams.len(),
             delta.removed_upstream_ids.len(),
             delta.modified_upstreams.len(),
-            proxy_ids_to_rebuild.len(),
+            proxy_plugin_rebuild_count,
         );
 
         // Reconcile service discovery tasks for changed upstreams
@@ -2488,13 +2861,27 @@ impl ProxyState {
             self.service_discovery_manager.reconcile(&new_cfg, None);
         }
 
+        // Restart active health-check probes when upstreams or their probe
+        // configuration changed. Without this, probe tasks spawned at startup
+        // keep running with stale parameters, removed upstreams keep probing
+        // forever, and newly added upstreams never get probes.
+        if !delta.added_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+            || !delta.modified_upstreams.is_empty()
+        {
+            let new_cfg = self.config.load_full();
+            self.health_checker
+                .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
+        }
+
         true
     }
 
     /// Start service discovery background tasks for all upstreams in the config.
     ///
     /// Should be called once after `ProxyState::new()` in each mode's startup,
-    /// similar to `health_checker.start()`.
+    /// similar to `HealthChecker::start_with_shutdown` (which `ProxyState::new`
+    /// invokes internally).
     pub fn start_service_discovery(&self, shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>) {
         let config = self.config.load_full();
         self.service_discovery_manager.start(&config, shutdown_rx);
@@ -2507,13 +2894,16 @@ impl ProxyState {
     /// directly from the DB layer's `load_incremental_config()`. This avoids
     /// loading and diffing the full config on every poll cycle.
     ///
-    /// Returns `true` if changes were applied.
+    /// Returns an [`IncrementalApplyOutcome`] so callers can distinguish
+    /// "nothing to do" (`NoChanges`) from "changes were rejected by validation"
+    /// (`Rejected`). The DB poller relies on this to avoid advancing
+    /// `last_poll_at` on rejection — see `src/modes/database.rs`.
     pub async fn apply_incremental(
         &self,
         result: crate::config::db_loader::IncrementalResult,
-    ) -> bool {
+    ) -> IncrementalApplyOutcome {
         if result.is_empty() {
-            return false;
+            return IncrementalApplyOutcome::NoChanges;
         }
 
         // Patch the stored GatewayConfig: clone current, apply mutations, store
@@ -2634,120 +3024,55 @@ impl ProxyState {
 
         new_config.loaded_at = result.poll_timestamp;
 
-        // Validate the patched config before applying (same validations as load_full_config)
+        // Validate the patched config before applying. `validate_full_config`
+        // is the shared validation pipeline used by both `update_config` and
+        // `apply_incremental` so the two swap paths cannot drift in what they
+        // accept. Normalize + resolve must run first so the validators see
+        // canonicalized fields.
         new_config.normalize_fields();
         new_config.resolve_upstream_tls();
-        if let Err(errors) = new_config.validate_all_fields_with_ip_policy(
-            self.env_config.tls_cert_expiry_warning_days,
-            &self.env_config.backend_allow_ips,
-        ) {
-            for msg in &errors {
-                warn!("Incremental config field validation: {}", msg);
-            }
-        }
-        if let Err(errors) = new_config.validate_hosts() {
-            for msg in &errors {
-                warn!("Incremental config validation: {}", msg);
-            }
-        }
-        if let Err(errors) = new_config.validate_regex_listen_paths() {
+        if let Err(errors) = self.validate_full_config(&new_config) {
             for msg in &errors {
                 error!("Incremental config rejected: {}", msg);
             }
-            return false;
-        }
-        if let Err(errors) = new_config.validate_unique_listen_paths() {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
-            }
-            return false;
-        }
-        if let Err(errors) = new_config.validate_stream_proxies() {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
-            }
-            return false;
-        }
-        if let Err(errors) = new_config.validate_upstream_references() {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
-            }
-            return false;
-        }
-        if let Err(errors) = new_config.validate_plugin_references() {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
-            }
-            return false;
-        }
-        let reserved_ports = self.env_config.reserved_gateway_ports();
-        if let Err(errors) = new_config.validate_stream_proxy_port_conflicts(&reserved_ports) {
-            if matches!(
-                self.env_config.mode,
-                crate::config::env_config::OperatingMode::DataPlane
-            ) {
-                for msg in &errors {
-                    warn!(
-                        "Incremental stream proxy port conflict (non-fatal in DP mode): {}",
-                        msg
-                    );
-                }
-            } else {
-                for msg in &errors {
-                    error!("Incremental config rejected: {}", msg);
-                }
-                return false;
-            }
+            return IncrementalApplyOutcome::Rejected;
         }
 
-        // Build a ConfigDelta to feed into existing cache apply_delta() methods.
-        // For incremental results, we treat all changed resources as "modified"
-        // since the DB layer doesn't distinguish adds from modifications.
-        // The cache apply_delta methods handle both cases correctly.
+        // Build a ConfigDelta against old + new to get proper
+        // add/modify/remove classification for the epoch builders.
         let old_config = self.config.load_full();
 
-        // Use ConfigDelta::compute against old + new to get proper add/modify/remove classification
         let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
 
-        // --- RouterCache ---
-        let affected_routes = delta.affected_routes(&old_config);
-        self.router_cache.apply_delta(&new_config, &affected_routes);
-
-        // --- PluginCache ---
-        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(&new_config);
-        let rebuild_globals = delta
-            .added_plugin_configs
-            .iter()
-            .chain(delta.modified_plugin_configs.iter())
-            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
-            || !delta.removed_plugin_config_ids.is_empty();
-        if let Err(e) = self.plugin_cache.apply_delta(
-            &new_config,
-            &proxy_ids_to_rebuild,
-            &delta.removed_proxy_ids,
-            rebuild_globals,
-        ) {
-            error!(
-                "Config reload rejected — security plugin validation failed: {}",
-                e
-            );
-            return false;
-        }
-
-        // --- ConsumerIndex ---
-        self.consumer_index.apply_delta(
-            &delta.added_consumers,
-            &delta.removed_consumer_ids,
-            &delta.modified_consumers,
+        // Stage all request-facing cache inners before publishing any request-visible epoch.
+        let route_changed = Self::delta_routes_changed(&delta, &old_config);
+        let staged_config = Arc::new(new_config.clone());
+        let publish_result = self.request_epoch.update_config(
+            |current| {
+                self.stage_incremental_request_epoch(
+                    current,
+                    &new_config,
+                    Arc::clone(&staged_config),
+                    &delta,
+                )
+                .map(Some)
+            },
+            |published| {
+                self.mirror_request_epoch_wrappers(published, route_changed, false);
+            },
         );
-
-        // --- LoadBalancerCache ---
-        self.load_balancer_cache.apply_delta(
-            &new_config,
-            &delta.added_upstreams,
-            &delta.removed_upstream_ids,
-            &delta.modified_upstreams,
-        );
+        let published = match publish_result {
+            Ok(Some(epoch)) => epoch,
+            Ok(None) => return IncrementalApplyOutcome::NoChanges,
+            Err(e) => {
+                error!(
+                    "Incremental config rejected — security plugin validation failed: {}",
+                    e
+                );
+                return IncrementalApplyOutcome::Rejected;
+            }
+        };
+        PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
         // --- CircuitBreakerCache ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -2812,9 +3137,7 @@ impl ProxyState {
             self.adaptive_buffer.prune_missing(&active_ids);
         }
 
-        // Store updated config
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
-        self.config.store(Arc::new(new_config));
 
         // Trigger a coalesced capability refresh so added/modified HTTPS
         // backends get classified immediately instead of waiting up to the
@@ -2880,11 +3203,57 @@ impl ProxyState {
             self.service_discovery_manager.reconcile(&new_cfg, None);
         }
 
-        true
+        // Restart active health-check probes when upstreams or their probe
+        // configuration changed. Same rationale as the corresponding block
+        // in `update_config` — incremental DB polls and CP gRPC pushes both
+        // route through this method, so without it any upstream churn after
+        // startup is invisible to the probe layer.
+        if !delta.added_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+            || !delta.modified_upstreams.is_empty()
+        {
+            let new_cfg = self.config.load_full();
+            self.health_checker
+                .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
+        }
+
+        IncrementalApplyOutcome::Applied
     }
 
     pub fn current_config(&self) -> Arc<GatewayConfig> {
         self.config.load_full()
+    }
+}
+
+/// Drives the per-IP cleanup interval loop.
+///
+/// Pulled out of `start_per_ip_cleanup_task` so the shutdown semantics can be
+/// unit-tested without constructing a full `ProxyState` (which requires a TLS
+/// policy, listener manager, etc.). When `shutdown_rx` is `Some`, the loop
+/// exits cleanly on watch-channel change so the spawned task can be drained
+/// during graceful shutdown alongside DNS / overload / metrics handles.
+async fn run_per_ip_cleanup_loop(
+    counts: Arc<dashmap::DashMap<String, AtomicU64>>,
+    interval_secs: u64,
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    let mut timer = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+    match shutdown_rx {
+        Some(mut shutdown_rx) => loop {
+            tokio::select! {
+                _ = timer.tick() => {
+                    counts.retain(|_, count| count.load(Ordering::Relaxed) > 0);
+                }
+                _ = shutdown_rx.changed() => {
+                    info!("Per-IP cleanup task shutting down");
+                    break;
+                }
+            }
+        },
+        None => loop {
+            timer.tick().await;
+            counts.retain(|_, count| count.load(Ordering::Relaxed) > 0);
+        },
     }
 }
 
@@ -2893,10 +3262,18 @@ impl ProxyState {
 /// Uses hyper-util's auto builder which accepts both HTTP/1.1 and HTTP/2
 /// connections. h2c (cleartext HTTP/2) is required for gRPC clients that
 /// connect without TLS.
+///
+/// On shutdown, calls `graceful_shutdown()` on the hyper connection so that
+/// HTTP/2 clients receive a GOAWAY frame and HTTP/1.1 keepalive connections
+/// stop accepting new requests. Without this, persistent H2/keepalive
+/// connections continue to accept new streams indefinitely after the listener
+/// exits, forcing every shutdown to wait the full
+/// `FERRUM_SHUTDOWN_DRAIN_SECONDS` timeout.
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
     state: ProxyState,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
@@ -2948,7 +3325,24 @@ async fn handle_connection(
         let addr = remote_addr;
         async move { handle_proxy_request(req, state, addr, false, None, None).await }
     });
-    if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
+
+    let conn = builder.serve_connection_with_upgrades(io, svc);
+    tokio::pin!(conn);
+
+    let result = tokio::select! {
+        biased;
+        res = conn.as_mut() => res,
+        _ = shutdown_rx.changed() => {
+            // Send GOAWAY (H2) / signal end-of-keepalive (H1) and wait for
+            // in-flight requests to complete on this connection. Continuing
+            // to poll the connection lets streams finish before the connection
+            // future resolves.
+            conn.as_mut().graceful_shutdown();
+            conn.as_mut().await
+        }
+    };
+
+    if let Err(e) = result {
         let err_string = e.to_string();
         if is_client_disconnect_error(&err_string) {
             debug!(
@@ -3019,7 +3413,9 @@ async fn handle_websocket_request_authenticated(
     ctx: RequestContext,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     plugin_execution_ns: u64,
+    epoch: Arc<RequestEpoch>,
     upstream_target: Option<Arc<UpstreamTarget>>,
+    upstream_balancer: Option<Arc<LoadBalancer>>,
     lb_hash_key: Option<String>,
     sticky_cookie_needed: bool,
     start_time: Instant,
@@ -3207,7 +3603,8 @@ async fn handle_websocket_request_authenticated(
                     if let (Some(upstream_id), Some(prev_target)) =
                         (&proxy.upstream_id, &current_target)
                         && let Some(ref hash_key) = lb_hash_key
-                        && let Some(next) = state.load_balancer_cache.select_next_target(
+                        && let Some(next) = LoadBalancerCache::select_next_target_from(
+                            &epoch.load_balancer,
                             upstream_id,
                             hash_key,
                             prev_target,
@@ -3319,6 +3716,9 @@ async fn handle_websocket_request_authenticated(
         }
     };
 
+    let ws_lb_guard =
+        LoadBalancerConnectionGuard::new(current_target.clone(), upstream_balancer.clone());
+
     // Backend verified — record status and log.
     // HTTP/2 Extended CONNECT returns 200 OK; HTTP/1.1 returns 101 Switching Protocols.
     let ws_status_code: u16 = if is_h2_websocket { 200 } else { 101 };
@@ -3399,9 +3799,10 @@ async fn handle_websocket_request_authenticated(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
-        let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+        let strategy =
+            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id);
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()
@@ -3444,6 +3845,26 @@ async fn handle_websocket_request_authenticated(
     let ws_write_buf = state.websocket_write_buffer_size;
     let ws_tunnel = state.websocket_tunnel_mode;
     let adaptive_buf = state.adaptive_buffer.clone();
+    // Track the upgraded WebSocket session in `OverloadState.active_connections`
+    // so graceful drain waits for in-flight WS sessions before exiting.
+    //
+    // Why a fresh `ConnectionGuard` rather than reusing the request-side guard:
+    //   - The originating HTTP request's `RequestGuard` is attached to the
+    //     `ProxyBody::empty()` returned upstream (see `handle_proxy_request`).
+    //     Hyper finishes flushing that empty body the moment the 101/200 is
+    //     written, dropping the `RequestGuard` immediately. The HTTP request is
+    //     genuinely complete at that point — its accounting should release.
+    //   - The outer per-connection `_conn_guard` (created in the accept loop in
+    //     `proxy_listener` / `handle_tls_connection`) covers the underlying TCP
+    //     connection only until `serve_connection_with_upgrades` returns, which
+    //     happens shortly after `OnUpgrade` hands off the I/O. The WS session
+    //     lifetime extends well beyond the HTTP layer's view of the connection.
+    //   - A WebSocket session is functionally a long-lived "connection" (one
+    //     persistent client peer using the frontend's connection slot), so
+    //     `ConnectionGuard` is the semantically correct counter.
+    //
+    // Captured by the spawned task below so it lives until the WS session ends.
+    let ws_session_guard = crate::overload::ConnectionGuard::new(&state.overload);
     // Capture session metadata while the originating RequestContext + proxy are
     // still in scope. Passed to run_websocket_proxy so it can construct a
     // WsDisconnectContext at teardown for plugins that opted in to
@@ -3471,6 +3892,11 @@ async fn handle_websocket_request_authenticated(
         session_start: chrono::Utc::now(),
     };
     tokio::spawn(async move {
+        let _ws_lb_guard = ws_lb_guard;
+        // Hold the connection guard for the full WS session lifetime. Drops on
+        // every exit path (upgrade failure, run_websocket_proxy completion or
+        // error), decrementing `active_connections` exactly once.
+        let _ws_session_guard = ws_session_guard;
         match on_upgrade.await {
             Ok(upgraded) => {
                 if let Err(e) = run_websocket_proxy(
@@ -4662,6 +5088,12 @@ async fn run_accept_loop(
 
                         let state = state.clone();
                         let tls_config = tls_config.clone();
+                        // Each connection gets its own subscriber so that
+                        // shutdown can interrupt the per-connection serve
+                        // future (sending GOAWAY on H2 / closing keepalive
+                        // on H1) instead of letting it sit idle until the
+                        // drain timeout fires.
+                        let conn_shutdown_rx = shutdown_rx.clone();
 
                         tokio::spawn(async move {
                             // Hold the permit for the connection lifetime.
@@ -4673,9 +5105,17 @@ async fn run_accept_loop(
                             let _conn_guard = crate::overload::ConnectionGuard::new(&state.overload);
 
                             let result = if let Some(tls_config) = tls_config {
-                                handle_tls_connection(stream, remote_addr, state, tls_config).await
+                                handle_tls_connection(
+                                    stream,
+                                    remote_addr,
+                                    state,
+                                    tls_config,
+                                    conn_shutdown_rx,
+                                )
+                                .await
                             } else {
-                                handle_connection(stream, remote_addr, state).await
+                                handle_connection(stream, remote_addr, state, conn_shutdown_rx)
+                                    .await
                             };
 
                             if let Err(e) = result {
@@ -4697,11 +5137,16 @@ async fn run_accept_loop(
 }
 
 /// Handle TLS connections with HTTP/1.1 and HTTP/2 auto-negotiation via ALPN.
+///
+/// On shutdown, calls `graceful_shutdown()` on the hyper connection so that
+/// HTTP/2 clients receive a GOAWAY frame and HTTP/1.1 keepalive connections
+/// stop accepting new requests. See [`handle_connection`] for rationale.
 async fn handle_tls_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
     state: ProxyState,
     tls_config: Arc<rustls::ServerConfig>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_rustls::TlsAcceptor;
 
@@ -4780,7 +5225,22 @@ async fn handle_tls_connection(
         let chain = client_cert_chain_der.clone();
         async move { handle_proxy_request(req, state, addr, true, cert, chain).await }
     });
-    if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
+
+    let conn = builder.serve_connection_with_upgrades(io, svc);
+    tokio::pin!(conn);
+
+    let result = tokio::select! {
+        biased;
+        res = conn.as_mut() => res,
+        _ = shutdown_rx.changed() => {
+            // Send GOAWAY (H2) / signal end-of-keepalive (H1) and wait for
+            // in-flight requests to complete on this connection.
+            conn.as_mut().graceful_shutdown();
+            conn.as_mut().await
+        }
+    };
+
+    if let Err(e) = result {
         let err_string = e.to_string();
         if is_client_disconnect_error(&err_string) {
             debug!(
@@ -5234,11 +5694,14 @@ pub async fn handle_proxy_request(
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     // Global request admission control. Single atomic load (~1ns) on the fast
     // path. Rejects with 503 when request pressure exceeds the critical
-    // threshold (FERRUM_MAX_REQUESTS + FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD).
+    // threshold (FERRUM_MAX_REQUESTS + FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD)
+    // OR when shutdown drain has begun (set by `overload::begin_drain` via
+    // Release; loaded here with Acquire to synchronize-with that store and
+    // also reject new H2/H3 streams on existing connections during drain).
     if state
         .overload
         .reject_new_requests
-        .load(std::sync::atomic::Ordering::Relaxed)
+        .load(std::sync::atomic::Ordering::Acquire)
     {
         let is_grpc = grpc_proxy::is_grpc_request(&req);
         record_request(&state, 503);
@@ -5573,11 +6036,15 @@ async fn handle_proxy_request_inner(
         None => None,
     };
     let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
+    let epoch = state.request_epoch.load();
 
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
-    let route_match = state
-        .router_cache
-        .find_proxy(request_host.as_deref(), &path);
+    let route_match = state.router_cache.find_proxy_in_snapshot(
+        &epoch.route_table,
+        epoch.route_generation,
+        request_host.as_deref(),
+        &path,
+    );
 
     let (proxy, strip_len) = match route_match {
         Some(rm) => {
@@ -5695,7 +6162,7 @@ async fn handle_proxy_request_inner(
     // Load plugin-cache values once for this request. Every plugin list,
     // capability bitset, and buffering flag below is derived from the same
     // cache generation without retaining the full cache across awaits.
-    let plugin_cache_view = state.plugin_cache.request_view(&proxy.id, request_protocol);
+    let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
     let plugins = plugin_cache_view.plugins();
@@ -5754,16 +6221,76 @@ async fn handle_proxy_request_inner(
     // and on_request_received so plugin-less early rejects skip the work.
     ctx.materialize_query_params();
 
+    // Some auth plugins (e.g. `hmac_auth` with `require_digest=true`) verify
+    // request body integrity at authenticate time. Buffer the body before the
+    // auth phase runs so those plugins can read `ctx.request_body_bytes`.
+    let requires_body_before_authenticate = capabilities
+        .has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
+        && plugins.iter().any(|plugin| {
+            plugin.requires_request_body_before_authenticate()
+                && plugin.should_buffer_request_body(&ctx)
+        });
+
+    if requires_body_before_authenticate {
+        client_request_body = match client_request_body {
+            ClientRequestBody::Streaming(request) => {
+                match buffer_request_body_for_before_proxy(
+                    *request,
+                    &method,
+                    &ctx.headers,
+                    state.max_request_body_size_bytes,
+                )
+                .await
+                {
+                    Ok(buffered) => {
+                        if let ClientRequestBody::Buffered(body) = &buffered {
+                            // Auth plugins that need bytes (hmac_auth digest
+                            // verification) read `ctx.request_body_bytes`, so
+                            // always populate the binary-safe handle here.
+                            store_request_body_metadata(&mut ctx, body, true);
+                            ctx.request_bytes_observed
+                                .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                        }
+                        buffered
+                    }
+                    Err(RequestBodyBufferError::TooLarge) => {
+                        record_request(&state, 413);
+                        return Ok(build_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            r#"{"error":"Request body exceeds maximum size"}"#,
+                        ));
+                    }
+                    Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
+                        error!(
+                            proxy_id = %proxy.id,
+                            path = %ctx.path,
+                            error_kind = "client_disconnect",
+                            error = %error_message,
+                            "Client disconnected while buffering request body before authenticate"
+                        );
+                        record_request(&state, 499);
+                        return Ok(build_response(
+                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                            r#"{"error":"Client disconnected"}"#,
+                        ));
+                    }
+                }
+            }
+            already_buffered => already_buffered,
+        };
+    }
+
     // Authentication phase (pre-computed auth plugin list — zero allocation)
     let auth_plugins = plugin_cache_view.auth_plugins();
 
     {
         let auth_phase_start = Instant::now();
+        let consumer_index = ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index));
         if let Some((status_code, body, headers)) = run_authentication_phase(
             proxy.auth_mode.clone(),
             &auth_plugins,
             &mut ctx,
-            &state.consumer_index,
+            &consumer_index,
         )
         .await
         {
@@ -5999,11 +6526,17 @@ async fn handle_proxy_request_inner(
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
-    // Resolve upstream target and hash key with a single ArcSwap load.
-    let selection =
-        backend_dispatch::select_upstream_target(&proxy, &state, &ctx.client_ip, proxy_headers);
+    // Resolve upstream target and hash key from the request epoch.
+    let selection = backend_dispatch::select_upstream_target(
+        &proxy,
+        &state,
+        &epoch,
+        &ctx.client_ip,
+        proxy_headers,
+    );
     let lb_hash_key = selection.lb_hash_key;
     let upstream_target = selection.target;
+    let upstream_balancer = selection.balancer;
     let upstream_is_fallback = selection.is_fallback;
     let sticky_cookie_needed = selection.sticky_cookie_needed;
 
@@ -6086,7 +6619,9 @@ async fn handle_proxy_request_inner(
             ctx,
             plugins,
             plugin_execution_ns,
+            Arc::clone(&epoch),
             upstream_target,
+            upstream_balancer,
             lb_hash_key,
             sticky_cookie_needed,
             start_time,
@@ -6374,7 +6909,8 @@ async fn handle_proxy_request_inner(
                 if let (Some(upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &grpc_current_target)
                     && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = state.load_balancer_cache.select_next_target(
+                    && let Some(next) = LoadBalancerCache::select_next_target_from(
+                        &epoch.load_balancer,
                         upstream_id,
                         hash_key,
                         prev_target,
@@ -6614,15 +7150,33 @@ async fn handle_proxy_request_inner(
                 // naturally propagates the h2 error to the client.
 
                 // Stream H2 DATA frames on the gRPC streaming path.
+                //
+                // Wrap the backend body in `StripHopByHopTrailers` (via the
+                // `*_strip_hop_by_hop_trailers` helper) so RFC 9110 §7.6.1
+                // response-direction hop-by-hop names (`connection`,
+                // `keep-alive`, `proxy-authenticate`, `proxy-connection`,
+                // `te`, `trailer`, `transfer-encoding`, `upgrade`) cannot
+                // leak to the downstream client through TRAILERS frames.
+                // Without this filter, a misbehaving backend can punch a
+                // hole in the proxy boundary by emitting `proxy-authenticate`
+                // / `keep-alive` / `connection: close` in the trailer map —
+                // hyper's H2 trailer encoder rejects some hop-by-hop names
+                // at the frame layer but `proxy-authenticate`,
+                // `proxy-connection`, and `keep-alive` are not blocked.
+                // Mirrors the buffered-path strip in `grpc_proxy.rs` so the
+                // two response paths cannot drift.
                 let cl = response_headers
                     .get("content-length")
                     .and_then(|v| v.parse::<u64>().ok());
                 let body = if state.response_buffer_cutoff_bytes == 0
                     && state.max_response_body_size_bytes == 0
                 {
-                    crate::proxy::body::direct_streaming_h2_body(grpc_streaming.body, cl)
+                    crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
+                        grpc_streaming.body,
+                        cl,
+                    )
                 } else {
-                    crate::proxy::body::coalescing_h2_body(
+                    crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
                         cl,
                         state.h2_coalesce_target_bytes,
@@ -6871,9 +7425,13 @@ async fn handle_proxy_request_inner(
                     && let (Some(upstream_id), Some(target)) =
                         (&proxy.upstream_id, &upstream_target)
                 {
-                    let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+                    let strategy = LoadBalancerCache::get_hash_on_strategy_from(
+                        &epoch.load_balancer,
+                        upstream_id,
+                    );
                     if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-                        let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+                        let upstream =
+                            LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
                         let default_cc = crate::config::types::HashOnCookieConfig::default();
                         let cookie_config = upstream
                             .as_ref()
@@ -7026,10 +7584,12 @@ async fn handle_proxy_request_inner(
     let backend_start = Instant::now();
 
     // Track connection for least-connections load balancing
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-        state
-            .load_balancer_cache
-            .record_connection_start(upstream_id, target);
+    if let (Some(_upstream_id), Some(target), Some(balancer)) = (
+        &proxy.upstream_id,
+        &upstream_target,
+        upstream_balancer.as_ref(),
+    ) {
+        balancer.record_connection_start(target);
     }
 
     let should_stream = should_stream_response_body(
@@ -7139,7 +7699,8 @@ async fn handle_proxy_request_inner(
             // same protocol.
             if let (Some(upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
                 && let Some(ref hash_key) = lb_hash_key
-                && let Some(next) = state.load_balancer_cache.select_next_target(
+                && let Some(next) = LoadBalancerCache::select_next_target_from(
+                    &epoch.load_balancer,
                     upstream_id,
                     hash_key,
                     prev_target,
@@ -7274,6 +7835,8 @@ async fn handle_proxy_request_inner(
     backend_dispatch::record_backend_outcome(
         &state,
         &proxy,
+        &epoch.load_balancer,
+        upstream_balancer.as_ref(),
         upstream_target.as_deref(),
         final_cb_target_key.as_deref(),
         response_status,
@@ -7521,9 +8084,10 @@ async fn handle_proxy_request_inner(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
     {
-        let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+        let strategy =
+            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id);
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()
@@ -7593,12 +8157,32 @@ async fn handle_proxy_request_inner(
     // Connection: close is applied probabilistically (linear ramp from 0%
     // to 100%) rather than all-or-nothing. This smooths tail latency by
     // gradually shedding keepalive connections as load increases.
-    // Cost: draining check is one AtomicBool::load(Relaxed) ~1ns;
+    // `draining` uses Acquire to synchronize-with the Release-ordered store
+    // in `overload::begin_drain` so the close hint is observed promptly on
+    // weakly-ordered architectures (mirrors the PR #569 startup_ready pattern).
+    //
+    // We OR `disable_keepalive` (the binary pressure-mode flag) with
+    // `should_disable_keepalive_red()` (RED probabilistic shedding). Both
+    // signals must be honored: the binary flag is the authoritative
+    // "pressure-mode active" signal, while RED probability is a separate
+    // adaptive smoothing mechanism. They are independent `Relaxed` writes
+    // in the monitor loop, so a reader can transiently observe
+    // `disable_keepalive = true` while `red_drop_probability` still holds
+    // the prior cycle's value of 0 — and at the exact pressure threshold
+    // the linear ramp produces probability 0 even though `disable_keepalive`
+    // is set. Without the OR, those windows would skip Connection: close
+    // and defeat the purpose of the binary pressure-mode signal.
+    // Cost: draining check is one AtomicBool::load(Acquire) ~1ns (no-op on x86);
+    // disable_keepalive check is one AtomicBool::load(Relaxed) ~1ns;
     // RED check is one AtomicU32::load + one AtomicU64::load + one multiply ~3ns.
     if state
         .overload
         .draining
-        .load(std::sync::atomic::Ordering::Relaxed)
+        .load(std::sync::atomic::Ordering::Acquire)
+        || state
+            .overload
+            .disable_keepalive
+            .load(std::sync::atomic::Ordering::Relaxed)
         || state.overload.should_disable_keepalive_red()
     {
         resp_builder = resp_builder.header("connection", "close");
@@ -7982,7 +8566,11 @@ pub(crate) async fn proxy_to_backend_retry(
     }
 
     // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
-    // (canonical predicate in `proxy::headers`).
+    // (canonical predicate in `proxy::headers`). Also strip every header
+    // NAMED in the request's `Connection` field — see
+    // `parse_connection_listed_from_str_map` for the spec rationale and
+    // smuggling defence.
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -7995,6 +8583,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
@@ -8450,7 +9039,9 @@ async fn proxy_to_backend(
     }
 
     // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
-    // (canonical predicate in `proxy::headers`).
+    // (canonical predicate in `proxy::headers`). Also strip every header
+    // NAMED in the request's `Connection` field.
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -8463,6 +9054,7 @@ async fn proxy_to_backend(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
@@ -9033,10 +9625,16 @@ fn record_request(state: &ProxyState, status: u16) {
 /// **except** `Set-Cookie` (RFC 6265) which must be emitted as separate header
 /// lines. We store multiple Set-Cookie values separated by `\n` so they can be
 /// split back into individual headers when building the downstream response.
+///
+/// `connection_listed_strip` carries the lowercase names that the response's
+/// `Connection` header named as additional hop-by-hop headers (RFC 9110
+/// §7.6.1). These are removed in the same pass as the canonical
+/// response-direction strip predicate.
 fn collect_response_headers_generic<'a, I>(
     source_keys_len: usize,
     source: I,
     target: &mut HashMap<String, String>,
+    connection_listed_strip: &[http::header::HeaderName],
 ) where
     I: IntoIterator<Item = (&'a http::header::HeaderName, &'a http::header::HeaderValue)>,
 {
@@ -9046,6 +9644,12 @@ fn collect_response_headers_generic<'a, I>(
         // (canonical predicate in `proxy::headers`; response-direction set
         // differs from the request-direction set).
         if headers_mod::is_backend_response_strip_header(k.as_str()) {
+            continue;
+        }
+        // RFC 9110 §7.6.1: also strip every header NAMED in the response's
+        // `Connection` field. Linear scan is fine — the list is typically
+        // empty and bounded by realistic header counts.
+        if connection_listed_strip.iter().any(|n| n == k) {
             continue;
         }
         if let Ok(vs) = v.to_str() {
@@ -9071,7 +9675,8 @@ fn collect_response_headers(
     source: &reqwest::header::HeaderMap,
     target: &mut HashMap<String, String>,
 ) {
-    collect_response_headers_generic(source.keys_len(), source.iter(), target);
+    let listed = headers_mod::parse_connection_listed_headers(source);
+    collect_response_headers_generic(source.keys_len(), source.iter(), target, &listed);
 }
 
 /// Collect hyper response headers into a HashMap.
@@ -9080,7 +9685,8 @@ fn collect_response_headers(
 /// comma folding for other headers) but for `hyper::HeaderMap` instead of
 /// `reqwest::header::HeaderMap`. Used by the HTTP/2 multiplexing pool path.
 fn collect_hyper_response_headers(source: &hyper::HeaderMap, target: &mut HashMap<String, String>) {
-    collect_response_headers_generic(source.keys_len(), source.iter(), target);
+    let listed = headers_mod::parse_connection_listed_headers(source);
+    collect_response_headers_generic(source.keys_len(), source.iter(), target, &listed);
 }
 
 /// Trim optional whitespace (OWS: SP / HTAB) from both ends of a byte slice.
@@ -9497,6 +10103,7 @@ async fn proxy_to_backend_http2(
     // Clear and rebuild headers from the plugin-processed headers map
     parts.headers.clear();
     let effective_host = &proxy.backend_host;
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -9515,6 +10122,9 @@ async fn proxy_to_backend_http2(
             // value risked an authoritative-size mismatch with the framed
             // body when a request_transformer plugin mutated the body.
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            // RFC 9110 §7.6.1: also strip every header NAMED in the
+            // request's `Connection` field — see `parse_connection_listed_from_str_map`.
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 if let (Ok(name), Ok(val)) = (
                     hyper::header::HeaderName::from_bytes(k.as_bytes()),
@@ -9661,9 +10271,16 @@ fn build_http3_backend_headers(
     content_length: Option<&str>,
 ) -> Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> {
     let mut http3_headers = Vec::with_capacity(headers.len() + 5);
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (name, value) in headers {
         match name.as_str() {
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            // RFC 9110 §7.6.1: also strip every header NAMED in the
+            // request's `Connection` field. Hyper rejects `Connection` on
+            // H2/H3 frames, but the materialised request map can carry it
+            // when the client used H1 — strip on the way out so the H3
+            // backend never sees the listed names.
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
             "host" => {
                 // Apply per-route `preserve_host_header` override on the
                 // first-attempt H3-native backend path. Mirrors
@@ -9886,6 +10503,7 @@ async fn proxy_to_backend_http3(
                                 Ok(body) => body,
                                 Err(e) => {
                                     let (error_kind, error_class) = classify_h3_error(&e);
+                                    record_port_exhaustion_if_class(&state.overload, error_class);
                                     // We have already received response headers and
                                     // started reading the body — the request was on
                                     // the wire and the backend already processed it.
@@ -9997,6 +10615,7 @@ async fn proxy_to_backend_http3(
                             // Trust the pool's typed signal.
                             let is_conn_error = !e.request_on_wire();
                             let (error_kind, error_class) = classify_h3_pool_error(&e);
+                            record_port_exhaustion_if_class(&state.overload, error_class);
                             error!(
                                 proxy_id = %proxy.id,
                                 backend_url = %backend_url,
@@ -10202,6 +10821,7 @@ async fn proxy_to_backend_http3(
                 // the error-class contribution here.
                 let is_conn_error = !e.request_on_wire();
                 let (error_kind, error_class) = classify_h3_pool_error(&e);
+                record_port_exhaustion_if_class(&state.overload, error_class);
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
@@ -10279,6 +10899,7 @@ async fn proxy_to_backend_http3(
                 // H3 branch above for why we drop the class contribution.
                 let is_conn_error = !e.request_on_wire();
                 let (error_kind, error_class) = classify_h3_pool_error(&e);
+                record_port_exhaustion_if_class(&state.overload, error_class);
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
@@ -10324,6 +10945,36 @@ async fn proxy_to_backend_http3(
 fn classify_h3_error(err: &(dyn std::error::Error + 'static)) -> (&'static str, retry::ErrorClass) {
     let class = crate::http3::client::classify_http3_error(err);
     (retry::error_class_log_kind(class), class)
+}
+
+/// Bump the `port_exhaustion_events` counter when `class` is
+/// [`retry::ErrorClass::PortExhaustion`].
+///
+/// Used by the native HTTP/3 dispatch sites (
+/// [`proxy_to_backend_http3`] / [`proxy_to_backend_http3_retry`] in this
+/// module, plus the H3 frontend → H3 backend fast paths in
+/// [`crate::http3::server`]) to bring the H3 native paths in line with
+/// the reqwest path ([`mod@crate::proxy`] line 8113-style sites), the
+/// gRPC pool, the H2 pool, the TCP backend connect, and the H3
+/// cross-protocol bridge — all of which already record port exhaustion
+/// when their per-protocol classifier returns `PortExhaustion`. Without
+/// this, `/overload.port_exhaustion_events` undercounts whenever a
+/// QUIC/H3 dispatch hits ephemeral-port exhaustion (typically
+/// EADDRNOTAVAIL on Linux, EADDRINUSE on macOS) at high RPS.
+///
+/// Returns `true` when the counter was bumped — used by unit tests to
+/// assert the wiring without re-creating a full H3 classification
+/// pipeline.
+pub(crate) fn record_port_exhaustion_if_class(
+    overload: &crate::overload::OverloadState,
+    class: retry::ErrorClass,
+) -> bool {
+    if matches!(class, retry::ErrorClass::PortExhaustion) {
+        overload.record_port_exhaustion();
+        true
+    } else {
+        false
+    }
 }
 
 /// Classifier overload for [`crate::http3::client::H3PoolError`] that
@@ -10391,6 +11042,7 @@ async fn proxy_to_backend_http3_retry(
     // Build HTTP/3 headers from the saved headers map
     let mut http3_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> =
         Vec::new();
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (name, value) in headers {
         match name.as_str() {
             // Hop-by-hop headers per RFC 9110 §7.6.1, plus content-length
@@ -10398,6 +11050,10 @@ async fn proxy_to_backend_http3_retry(
             // is informational and risks mismatch with body length when
             // a request_transformer plugin mutated the body).
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            // RFC 9110 §7.6.1 also requires stripping every header NAMED
+            // in the request's `Connection` field — see
+            // `parse_connection_listed_from_str_map`.
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
             "host" => {
                 // Use effective upstream host unless preserve_host_header is set
                 let host_value = if proxy.preserve_host_header {
@@ -10499,6 +11155,7 @@ async fn proxy_to_backend_http3_retry(
             // H3 branch above for why we drop the class contribution.
             let is_conn_error = !e.request_on_wire();
             let (error_kind, error_class) = classify_h3_pool_error(&e);
+            record_port_exhaustion_if_class(&state.overload, error_class);
             error!(
                 proxy_id = %proxy.id,
                 backend_url = %backend_url,
@@ -10557,6 +11214,99 @@ mod tests {
             }
         }))
         .expect("test proxy should deserialize")
+    }
+
+    fn route_delta_proxy(
+        id: &str,
+        dispatch_kind: DispatchKind,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Proxy {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.id = id.to_string();
+        proxy.dispatch_kind = dispatch_kind;
+        proxy.updated_at = updated_at;
+        proxy.created_at = updated_at;
+        if dispatch_kind.is_stream() {
+            proxy.backend_scheme = Some(BackendScheme::Tcp);
+            proxy.listen_path = None;
+            proxy.listen_port = Some(20_000);
+        } else {
+            proxy.backend_scheme = Some(BackendScheme::Http);
+            proxy.listen_path = Some(format!("/{id}"));
+            proxy.listen_port = None;
+        }
+        proxy
+    }
+
+    fn route_delta_config(proxies: Vec<Proxy>) -> GatewayConfig {
+        GatewayConfig {
+            proxies,
+            ..GatewayConfig::default()
+        }
+    }
+
+    #[test]
+    fn delta_routes_changed_ignores_stream_only_proxy_changes() {
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+
+        let old_config =
+            route_delta_config(vec![route_delta_proxy("tcp", DispatchKind::TcpRaw, t0)]);
+        let added_stream = route_delta_config(vec![
+            old_config.proxies[0].clone(),
+            route_delta_proxy("tcp-added", DispatchKind::TcpRaw, t1),
+        ]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &added_stream);
+        assert!(!ProxyState::delta_routes_changed(&delta, &old_config));
+
+        let mut modified_stream = old_config.proxies[0].clone();
+        modified_stream.backend_port = 9443;
+        modified_stream.updated_at = t1;
+        let modified_config = route_delta_config(vec![modified_stream]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &modified_config);
+        assert!(!ProxyState::delta_routes_changed(&delta, &old_config));
+
+        let removed_stream = route_delta_config(vec![]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &removed_stream);
+        assert!(!ProxyState::delta_routes_changed(&delta, &old_config));
+    }
+
+    #[test]
+    fn delta_routes_changed_detects_http_route_changes_and_transitions() {
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+
+        let empty_config = route_delta_config(vec![]);
+        let added_http =
+            route_delta_config(vec![route_delta_proxy("http", DispatchKind::HttpPool, t1)]);
+        let delta = crate::config_delta::ConfigDelta::compute(&empty_config, &added_http);
+        assert!(ProxyState::delta_routes_changed(&delta, &empty_config));
+
+        let old_http = route_delta_config(vec![route_delta_proxy(
+            "transition",
+            DispatchKind::HttpPool,
+            t0,
+        )]);
+        let new_stream = route_delta_config(vec![route_delta_proxy(
+            "transition",
+            DispatchKind::TcpRaw,
+            t1,
+        )]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_http, &new_stream);
+        assert!(ProxyState::delta_routes_changed(&delta, &old_http));
+
+        let old_stream = route_delta_config(vec![route_delta_proxy(
+            "transition",
+            DispatchKind::TcpRaw,
+            t0,
+        )]);
+        let new_http = route_delta_config(vec![route_delta_proxy(
+            "transition",
+            DispatchKind::HttpPool,
+            t1,
+        )]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_stream, &new_http);
+        assert!(ProxyState::delta_routes_changed(&delta, &old_stream));
     }
 
     #[test]
@@ -10953,6 +11703,98 @@ mod tests {
         assert!(
             super::is_h3_transport_error_class(class),
             "Post-wire transport failure must still trigger H3 downgrade"
+        );
+    }
+
+    // ── `record_port_exhaustion_if_class` (H3 native paths) ─────────────
+    //
+    // The H3 native dispatcher (`proxy_to_backend_http3`,
+    // `proxy_to_backend_http3_retry`) and the H3 frontend → H3 backend
+    // fast path in `http3::server` were missing the `record_port_exhaustion`
+    // bump that every other backend dispatcher performs (reqwest path,
+    // gRPC pool, H2 pool, TCP backend connect, H3 cross-protocol bridge).
+    // Result: `/overload.port_exhaustion_events` undercounted any time
+    // an H3 frontend → H3 backend dispatch hit ephemeral-port exhaustion
+    // (e.g. EADDRNOTAVAIL on a high-RPS gateway with constrained
+    // `ip_local_port_range`). All eight H3 sites now funnel through this
+    // helper, so verifying the helper itself is sufficient regression
+    // protection: if a future H3 dispatch site forgets the call,
+    // `port_exhaustion_events` will silently undercount on that path —
+    // but the helper signature documents the contract.
+
+    #[test]
+    fn record_port_exhaustion_if_class_bumps_counter_only_for_port_exhaustion() {
+        let overload = crate::overload::OverloadState::new();
+        assert_eq!(
+            overload
+                .port_exhaustion_events
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "counter should start at 0"
+        );
+
+        // Synthetic H3 PortExhaustion outcome: the dispatch site obtains
+        // `ErrorClass::PortExhaustion` from the H3 classifier (e.g. via
+        // an EADDRNOTAVAIL surfaced as "bind: address not available")
+        // and hands it to this helper. The helper must bump the counter
+        // and return true.
+        let bumped =
+            super::record_port_exhaustion_if_class(&overload, retry::ErrorClass::PortExhaustion);
+        assert!(bumped, "PortExhaustion must bump the counter");
+        assert_eq!(
+            overload
+                .port_exhaustion_events
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        // Repeated bumps accumulate — every dispatch site that hits
+        // PortExhaustion contributes independently.
+        super::record_port_exhaustion_if_class(&overload, retry::ErrorClass::PortExhaustion);
+        super::record_port_exhaustion_if_class(&overload, retry::ErrorClass::PortExhaustion);
+        assert_eq!(
+            overload
+                .port_exhaustion_events
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+    }
+
+    #[test]
+    fn record_port_exhaustion_if_class_is_no_op_for_non_port_exhaustion() {
+        let overload = crate::overload::OverloadState::new();
+
+        // Every other class the H3 classifier can return — including the
+        // transport-class siblings that DO trigger `mark_h3_unsupported`
+        // — must NOT bump the port-exhaustion counter. The metric is
+        // narrow: only ephemeral-port exhaustion. Other transport
+        // failures have their own diagnostics (FD pressure, conn count,
+        // last_probe_error on the capability registry).
+        for class in [
+            retry::ErrorClass::ConnectionRefused,
+            retry::ErrorClass::ConnectionTimeout,
+            retry::ErrorClass::ConnectionReset,
+            retry::ErrorClass::ConnectionClosed,
+            retry::ErrorClass::TlsError,
+            retry::ErrorClass::ProtocolError,
+            retry::ErrorClass::DnsLookupError,
+            retry::ErrorClass::ConnectionPoolError,
+            retry::ErrorClass::ReadWriteTimeout,
+            retry::ErrorClass::ClientDisconnect,
+            retry::ErrorClass::RequestBodyTooLarge,
+            retry::ErrorClass::ResponseBodyTooLarge,
+            retry::ErrorClass::GracefulRemoteClose,
+            retry::ErrorClass::RequestError,
+        ] {
+            let bumped = super::record_port_exhaustion_if_class(&overload, class);
+            assert!(!bumped, "{class:?} must not bump port_exhaustion_events");
+        }
+        assert_eq!(
+            overload
+                .port_exhaustion_events
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "counter should remain 0 across non-PortExhaustion classes"
         );
     }
 
@@ -11801,5 +12643,239 @@ mod tests {
             !target_uses_direct_h2_pool(&registry, &proxy, "h3only.test", 443),
             "h3=Supported alone is not sufficient — H1/H2 frontends still need reqwest"
         );
+    }
+
+    // ----- Per-IP cleanup task shutdown wiring ---------------------------
+    //
+    // The cleanup loop must honour the global shutdown watch channel so the
+    // spawned task can be drained during the 5 s background-task drain phase
+    // (mirrors DNS / overload / metrics handles). Before this wiring the task
+    // ran an unbounded `loop { timer.tick().await; ... }` and the handle was
+    // dropped on the floor, so shutdown couldn't await it. Regression test:
+    // signalling the channel must end the task within a tight grace window.
+
+    #[tokio::test]
+    async fn per_ip_cleanup_loop_exits_when_shutdown_signal_fires() {
+        let counts: Arc<dashmap::DashMap<String, AtomicU64>> = Arc::new(dashmap::DashMap::new());
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        // Use a long interval so the test latency is dominated by the
+        // shutdown branch of the `tokio::select!`, not by `timer.tick()`.
+        let handle = tokio::spawn(run_per_ip_cleanup_loop(counts.clone(), 3600, Some(rx)));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "task should still be running before shutdown is signalled"
+        );
+
+        tx.send(true).expect("watch receiver should still be live");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "task should exit within 2s of shutdown signal; got {result:?}"
+        );
+    }
+
+    // Sanity: a `None` shutdown receiver leaves the loop running indefinitely.
+    // Verifies the un-wired path is unchanged (regression cover for the
+    // legacy behaviour while shutdown wiring is opt-in via `Some`).
+    #[tokio::test]
+    async fn per_ip_cleanup_loop_runs_without_shutdown_receiver() {
+        let counts: Arc<dashmap::DashMap<String, AtomicU64>> = Arc::new(dashmap::DashMap::new());
+        let handle = tokio::spawn(run_per_ip_cleanup_loop(counts, 3600, None));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "task without shutdown receiver should keep ticking"
+        );
+        handle.abort();
+    }
+
+    // ── update_config / validate_full_config: validate-before-swap contract ──
+    //
+    // These tests pin down the canonical "validate fully BEFORE swap"
+    // guard inside `update_config`. Existing call sites (file_loader,
+    // db_loader, dp_client) all pre-validate, but the swap function MUST
+    // also reject malformed configs so a future caller (e.g. an admin
+    // "import config" handler that deserializes JSON straight into
+    // `update_config`) cannot publish an invalid config to the hot path.
+    //
+    // See `validate_full_config()` rustdoc for the warn-vs-reject
+    // categorization and rationale.
+
+    fn make_test_proxy_state(initial_config: GatewayConfig) -> ProxyState {
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        ProxyState::new(initial_config, dns_cache, env_config, None, None)
+            .expect("ProxyState construction should succeed in tests")
+            .0
+    }
+
+    fn make_validation_proxy(id: &str, listen_path: &str) -> Proxy {
+        serde_json::from_value(json!({
+            "id": id,
+            "namespace": "ferrum",
+            "name": "test-proxy",
+            "hosts": [],
+            "listen_path": listen_path,
+            "backend_scheme": "http",
+            "backend_host": "backend.example.com",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "preserve_host_header": false,
+            "backend_connect_timeout_ms": 5000,
+            "backend_read_timeout_ms": 30000,
+            "backend_write_timeout_ms": 30000,
+            "backend_tls_verify_server_cert": true,
+        }))
+        .expect("validation test proxy should deserialize")
+    }
+
+    fn make_validation_config(proxies: Vec<Proxy>) -> GatewayConfig {
+        GatewayConfig {
+            version: "1".to_string(),
+            proxies,
+            consumers: vec![],
+            plugin_configs: vec![],
+            upstreams: vec![],
+            loaded_at: chrono::Utc::now(),
+            known_namespaces: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_full_config_rejects_malformed_regex_listen_path() {
+        // "Malformed hosts" in the validate-before-swap sense — a
+        // listen_path that starts with `~` (regex marker) but is not a
+        // compilable regex. `validate_regex_listen_paths` is a hard
+        // reject in `apply_incremental`; the helper must mirror that.
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let bad = make_validation_proxy("p1", "~[unclosed");
+        let bad_config = make_validation_config(vec![bad]);
+
+        let err = state
+            .validate_full_config(&bad_config)
+            .expect_err("malformed regex listen_path must be rejected");
+        assert!(
+            err.iter().any(|e| e.contains("regex listen_path")),
+            "error must mention regex listen_path; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_full_config_rejects_dangling_upstream_reference() {
+        // Stand-in for "out-of-policy backend IP" — a config-shape error
+        // that `apply_incremental` rejects. (`validate_all_fields_with_ip_policy`
+        // is warn-only by design — the DB / DP "data already persisted"
+        // contract — see `validate_full_config` rustdoc.)
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let mut bad = make_validation_proxy("p1", "/api");
+        bad.upstream_id = Some("does-not-exist".to_string());
+        let bad_config = make_validation_config(vec![bad]);
+
+        let err = state
+            .validate_full_config(&bad_config)
+            .expect_err("dangling upstream_id must be rejected");
+        assert!(
+            err.iter().any(|e| e.contains("upstream")),
+            "error must reference the missing upstream; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_full_config_rejects_dangling_plugin_reference() {
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let bad: Proxy = serde_json::from_value(json!({
+            "id": "p1",
+            "namespace": "ferrum",
+            "name": "test-proxy",
+            "hosts": [],
+            "listen_path": "/api",
+            "backend_scheme": "http",
+            "backend_host": "backend.example.com",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "preserve_host_header": false,
+            "backend_connect_timeout_ms": 5000,
+            "backend_read_timeout_ms": 30000,
+            "backend_write_timeout_ms": 30000,
+            "backend_tls_verify_server_cert": true,
+            "plugins": [
+                { "plugin_config_id": "missing-plugin-config-id" }
+            ],
+        }))
+        .expect("plugin-ref validation test proxy should deserialize");
+        let bad_config = make_validation_config(vec![bad]);
+
+        let err = state
+            .validate_full_config(&bad_config)
+            .expect_err("dangling plugin reference must be rejected");
+        assert!(
+            err.iter().any(|e| e.contains("plugin")),
+            "error must reference the missing plugin; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_full_config_accepts_valid_config() {
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let good = make_validation_proxy("p1", "/api");
+        let good_config = make_validation_config(vec![good]);
+
+        assert!(
+            state.validate_full_config(&good_config).is_ok(),
+            "minimal valid config must pass validate_full_config"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_invalid_config_without_swapping() {
+        // End-to-end check: when validate_full_config rejects, the swap
+        // must not happen. This is the security-relevant contract — a
+        // future "import config" admin handler that calls update_config
+        // with attacker-shaped input cannot poison the running config.
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let pre_swap_loaded_at = state.config.load_full().loaded_at;
+
+        let mut bad = make_validation_proxy("p1", "/api");
+        bad.upstream_id = Some("does-not-exist".to_string());
+        let bad_config = make_validation_config(vec![bad]);
+
+        assert!(
+            !state.update_config(bad_config),
+            "update_config must return false when validation rejects the new config"
+        );
+
+        let post_attempt_config = state.config.load_full();
+        assert!(
+            post_attempt_config.proxies.is_empty(),
+            "rejected config must not have been swapped — proxies should still be empty"
+        );
+        assert_eq!(
+            post_attempt_config.loaded_at, pre_swap_loaded_at,
+            "loaded_at must not advance when a config is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_applies_valid_config() {
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let good = make_validation_proxy("p1", "/api");
+        let good_config = make_validation_config(vec![good]);
+
+        assert!(
+            state.update_config(good_config),
+            "update_config must return true for a valid initial config"
+        );
+
+        let post = state.config.load_full();
+        assert_eq!(
+            post.proxies.len(),
+            1,
+            "valid config must be swapped into hot state"
+        );
+        assert_eq!(post.proxies[0].id, "p1");
     }
 }

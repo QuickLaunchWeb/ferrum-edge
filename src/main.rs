@@ -32,6 +32,7 @@ mod plugin_cache;
 mod plugins;
 mod pool;
 mod proxy;
+pub mod request_epoch;
 mod retry;
 mod router_cache;
 mod secrets;
@@ -41,6 +42,7 @@ mod startup;
 mod tls;
 #[allow(dead_code)]
 mod tls_offload;
+mod util;
 
 use clap::Parser;
 use config::{EnvConfig, OperatingMode};

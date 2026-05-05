@@ -9,8 +9,20 @@
 //! - `GetFullConfig` — unary: returns the current full config snapshot on demand.
 //!
 //! Authentication: HS256 JWT in the `authorization` gRPC metadata key.
-//! Required claims: `exp`, `iat`, `sub`. The CP enforces `major.minor` version
-//! compatibility — a DP running a different minor version is rejected.
+//! Required claims: `exp`, `iat`, `sub`, `iss`. The `iss` claim must exactly
+//! match the configured expected issuer (`FERRUM_CP_DP_GRPC_JWT_ISSUER`,
+//! default `"ferrum-edge-cp-dp"`); this prevents a token minted with the same
+//! shared secret for a different audience (e.g. the admin API JWT secret if
+//! it was reused) from authenticating to the gRPC channel. The CP enforces
+//! `major.minor` version compatibility — a DP running a different minor
+//! version is rejected.
+//!
+//! Issuer rotation: changing `FERRUM_CP_DP_GRPC_JWT_ISSUER` is a breaking
+//! change. The CP rejects any token whose `iss` does not match its expected
+//! value, so the CP and all DPs must roll together. Pre-deployment, decide
+//! whether to roll DPs first (CP keeps accepting old issuer until upgraded)
+//! or CP first (CP must temporarily accept multiple issuers — not currently
+//! supported, so prefer DPs-first) and plan accordingly.
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
@@ -30,7 +42,7 @@ use tracing::{error, info, warn};
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
 use crate::FERRUM_VERSION;
-use crate::config::types::GatewayConfig;
+use crate::config::types::{GatewayConfig, default_namespace};
 
 /// Metadata about a connected Data Plane node.
 #[derive(Clone, Serialize)]
@@ -124,19 +136,35 @@ where
     }
 }
 
+/// Default expected issuer for CP/DP gRPC JWTs. Operators override via
+/// `FERRUM_CP_DP_GRPC_JWT_ISSUER`. Kept as a `pub const` so the DP token
+/// minter can fall back to the same constant when constructing tokens
+/// without an `EnvConfig` in scope (tests, library callers).
+pub const DEFAULT_CP_DP_JWT_ISSUER: &str = "ferrum-edge-cp-dp";
+
 /// CP gRPC server state.
 pub struct CpGrpcServer {
     config: Arc<ArcSwap<GatewayConfig>>,
     jwt_secret: String,
+    /// Expected `iss` claim on inbound DP tokens. Tokens whose `iss` does not
+    /// exactly match this string are rejected with `unauthenticated`.
+    expected_issuer: String,
     update_tx: broadcast::Sender<ConfigUpdate>,
     registry: Arc<DpNodeRegistry>,
+    /// CP's configured namespace (`FERRUM_NAMESPACE`). Connecting DPs must
+    /// advertise the same namespace, or `Subscribe` / `GetFullConfig` is
+    /// rejected with `failed_precondition`. A single CP serves a single
+    /// namespace; multi-namespace deployments require multiple CP instances.
+    namespace: String,
 }
 
 impl CpGrpcServer {
-    /// Create a new CP gRPC server with the default broadcast channel capacity (128).
+    /// Create a new CP gRPC server with the default broadcast channel capacity (128)
+    /// plus the default expected issuer and namespace.
     ///
-    /// Used by tests. Production code calls `with_channel_capacity` directly
-    /// to pass the operator-configured capacity from `EnvConfig`.
+    /// Used by tests. Production code calls `with_channel_capacity` (or
+    /// `with_channel_capacity_and_registry`) directly so it can thread the
+    /// operator-configured capacity, issuer, and namespace through from `EnvConfig`.
     #[allow(dead_code)]
     pub fn new(
         config: Arc<ArcSwap<GatewayConfig>>,
@@ -145,6 +173,7 @@ impl CpGrpcServer {
         Self::with_channel_capacity(config, jwt_secret, 128)
     }
 
+    #[allow(dead_code)]
     pub fn with_channel_capacity(
         config: Arc<ArcSwap<GatewayConfig>>,
         jwt_secret: String,
@@ -164,17 +193,99 @@ impl CpGrpcServer {
         channel_capacity: usize,
         registry: Arc<DpNodeRegistry>,
     ) -> (Self, broadcast::Sender<ConfigUpdate>) {
+        Self::with_channel_capacity_registry_issuer_and_namespace(
+            config,
+            jwt_secret,
+            channel_capacity,
+            registry,
+            DEFAULT_CP_DP_JWT_ISSUER.to_string(),
+            default_namespace(),
+        )
+    }
+
+    /// Constructor that threads through the operator-configured expected issuer
+    /// (`FERRUM_CP_DP_GRPC_JWT_ISSUER`) and uses the default namespace.
+    #[allow(dead_code)]
+    pub fn with_channel_capacity_registry_and_issuer(
+        config: Arc<ArcSwap<GatewayConfig>>,
+        jwt_secret: String,
+        channel_capacity: usize,
+        registry: Arc<DpNodeRegistry>,
+        expected_issuer: String,
+    ) -> (Self, broadcast::Sender<ConfigUpdate>) {
+        Self::with_channel_capacity_registry_issuer_and_namespace(
+            config,
+            jwt_secret,
+            channel_capacity,
+            registry,
+            expected_issuer,
+            default_namespace(),
+        )
+    }
+
+    /// Constructor that threads through the CP's configured namespace and uses
+    /// the default CP/DP JWT issuer.
+    #[allow(dead_code)]
+    pub fn with_channel_capacity_registry_and_namespace(
+        config: Arc<ArcSwap<GatewayConfig>>,
+        jwt_secret: String,
+        channel_capacity: usize,
+        registry: Arc<DpNodeRegistry>,
+        namespace: String,
+    ) -> (Self, broadcast::Sender<ConfigUpdate>) {
+        Self::with_channel_capacity_registry_issuer_and_namespace(
+            config,
+            jwt_secret,
+            channel_capacity,
+            registry,
+            DEFAULT_CP_DP_JWT_ISSUER.to_string(),
+            namespace,
+        )
+    }
+
+    /// Production-grade constructor that threads through both the operator-
+    /// configured expected issuer (`FERRUM_CP_DP_GRPC_JWT_ISSUER`) and the
+    /// CP namespace (`FERRUM_NAMESPACE`).
+    pub fn with_channel_capacity_registry_issuer_and_namespace(
+        config: Arc<ArcSwap<GatewayConfig>>,
+        jwt_secret: String,
+        channel_capacity: usize,
+        registry: Arc<DpNodeRegistry>,
+        expected_issuer: String,
+        namespace: String,
+    ) -> (Self, broadcast::Sender<ConfigUpdate>) {
         let (tx, _) = broadcast::channel(channel_capacity.max(1));
         let tx_clone = tx.clone();
         (
             Self {
                 config,
                 jwt_secret,
+                expected_issuer,
                 update_tx: tx,
                 registry,
+                namespace,
             },
             tx_clone,
         )
+    }
+
+    /// Reject DP subscriptions that advertise a namespace different from the
+    /// CP's configured namespace. Without this check the CP would happily
+    /// stream `production`-namespace config to a DP that booted with
+    /// `FERRUM_NAMESPACE=staging`, silently leaking configuration across
+    /// tenant boundaries. A single CP serves a single namespace today;
+    /// operators running multiple namespaces must run multiple CP instances.
+    #[allow(clippy::result_large_err)]
+    fn check_namespace(&self, dp_namespace: &str) -> Result<(), Status> {
+        if dp_namespace != self.namespace {
+            return Err(Status::failed_precondition(format!(
+                "DP namespace '{}' does not match CP namespace '{}'. \
+                 A single CP serves a single namespace; deploy a separate CP \
+                 instance per namespace.",
+                dp_namespace, self.namespace
+            )));
+        }
+        Ok(())
     }
 
     #[allow(clippy::result_large_err)]
@@ -189,13 +300,19 @@ impl CpGrpcServer {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
         // Require standard claims to prevent minimal/forged tokens from authenticating.
+        // `iss` is required AND constrained to the expected issuer below: a token
+        // signed with the same shared secret but bearing a different `iss` (e.g.
+        // a leaked admin-API token if the secret was reused, or a token minted
+        // for an unrelated audience) is rejected here.
         validation.required_spec_claims = {
             let mut claims = std::collections::HashSet::new();
             claims.insert("exp".to_string());
             claims.insert("iat".to_string());
             claims.insert("sub".to_string());
+            claims.insert("iss".to_string());
             claims
         };
+        validation.set_issuer(&[self.expected_issuer.as_str()]);
 
         decode::<Value>(token, &key, &validation)
             .map_err(|e| Status::unauthenticated(format!("Invalid token: {}", e)))?;
@@ -338,6 +455,10 @@ impl ConfigSync for CpGrpcServer {
 
         // Reject DPs with incompatible versions before streaming any config.
         Self::check_version_compatibility(&dp_version)?;
+        // Reject DPs that advertise a different namespace than the CP
+        // serves — otherwise the CP would leak cross-namespace config to
+        // mismatched DPs (multi-tenant security gap).
+        self.check_namespace(&dp_namespace)?;
 
         info!(
             "DP node '{}' (v{}) subscribed for config updates (namespace='{}')",
@@ -418,6 +539,9 @@ impl ConfigSync for CpGrpcServer {
         let req = request.get_ref();
         let dp_version = &req.ferrum_version;
         Self::check_version_compatibility(dp_version)?;
+        // Same cross-namespace guard as `Subscribe` — without it
+        // `GetFullConfig` would leak the wrong namespace's snapshot.
+        self.check_namespace(&req.namespace)?;
 
         info!(
             "DP '{}' (v{}) requested full config (namespace='{}')",
@@ -481,5 +605,44 @@ mod tests {
     fn version_check_unparseable_version_allowed() {
         // Single-component version is unparseable (< 2 parts), so it's allowed
         assert!(CpGrpcServer::check_version_compatibility("1").is_ok());
+    }
+
+    fn cp_with_namespace(namespace: &str) -> CpGrpcServer {
+        let cfg = Arc::new(ArcSwap::new(Arc::new(GatewayConfig::default())));
+        let (server, _tx) = CpGrpcServer::with_channel_capacity_registry_and_namespace(
+            cfg,
+            "test-secret".to_string(),
+            128,
+            Arc::new(DpNodeRegistry::new()),
+            namespace.to_string(),
+        );
+        server
+    }
+
+    #[test]
+    fn check_namespace_accepts_match() {
+        let server = cp_with_namespace("production");
+        assert!(server.check_namespace("production").is_ok());
+    }
+
+    #[test]
+    fn check_namespace_rejects_mismatch_with_both_namespaces_in_message() {
+        let server = cp_with_namespace("production");
+        let err = server.check_namespace("staging").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let msg = err.message();
+        assert!(
+            msg.contains("staging") && msg.contains("production"),
+            "error message should mention both namespaces, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn check_namespace_rejects_empty_dp_namespace_against_default() {
+        // Empty DP namespace must not silently match the default; tests
+        // that the comparison is strict equality, not "default if empty".
+        let server = cp_with_namespace("ferrum");
+        assert!(server.check_namespace("").is_err());
     }
 }

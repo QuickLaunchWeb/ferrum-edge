@@ -487,7 +487,7 @@ async fn functional_protocol_validation_trace_rejected_http2() {
 
     let req = Request::builder()
         .method("TRACE")
-        .uri(format!("http://127.0.0.1:{}/", h.proxy_port))
+        .uri("http://example.com/")
         .header("host", "example.com")
         .body(Full::new(Bytes::new()))
         .expect("build request");

@@ -485,7 +485,7 @@ docker-compose rm ferrum-edge-v1
 ```bash
 #!/bin/bash
 # backup.sh
-docker exec ferrum-postgres pg_dump -U ferrum ferrum > backup.sql
+docker exec ferrum-postgres-db pg_dump -U ferrum ferrum > backup.sql
 gzip backup.sql
 aws s3 cp backup.sql.gz s3://my-backups/$(date +%Y%m%d).sql.gz
 ```
@@ -496,7 +496,7 @@ aws s3 cp backup.sql.gz s3://my-backups/$(date +%Y%m%d).sql.gz
 docker-compose down
 docker volume rm ferrum_postgres_data
 docker-compose up -d postgres
-docker exec -i postgres psql -U ferrum < backup.sql
+docker exec -i ferrum-postgres-db psql -U ferrum < backup.sql
 docker-compose up -d ferrum-postgres
 ```
 

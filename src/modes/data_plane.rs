@@ -48,6 +48,7 @@ pub async fn run(
         max_active_requests: env_config.dns_max_active_requests,
         max_concurrent_refreshes: env_config.dns_max_concurrent_refreshes,
         backend_allow_ips: env_config.backend_allow_ips.clone(),
+        shard_amount: env_config.pool_shard_amount,
     });
 
     // Start DNS background refresh
@@ -66,13 +67,27 @@ pub async fn run(
             .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
     );
 
-    // Start with empty config; CP will push the real one via gRPC
-    let proxy_state = ProxyState::new(
+    // Start with empty config; CP will push the real one via gRPC.
+    // The empty initial config means `start_with_shutdown` spawns no
+    // health-check tasks today, so `health_check_handles` is normally
+    // empty here. Plumbed through the per-mode background drain anyway
+    // for symmetry with file/db modes and for forward-compatibility:
+    // if a future change starts health checks at DP startup or on the
+    // first CP push, the drain phase already awaits them cleanly.
+    let (proxy_state, health_check_handles) = ProxyState::new(
         GatewayConfig::default(),
         dns_cache,
         env_config.clone(),
         Some(tls_policy.clone()),
+        Some(shutdown_tx.subscribe()),
     )?;
+    // Wire stream listeners (TCP/UDP/DTLS) to the global SIGTERM channel so
+    // their accept loops exit promptly during graceful drain. Without this,
+    // stream listeners would only react to per-listener (config-driven)
+    // shutdown and keep accepting connections until the runtime is dropped.
+    proxy_state
+        .stream_listener_manager
+        .set_global_shutdown_rx(shutdown_tx.subscribe());
     // DP starts with an empty config — the initial refresh has nothing
     // to probe. The first `apply_incremental` / `update_config` call from
     // the CP gRPC stream will trigger `spawn_backend_capability_refresh`,
@@ -80,7 +95,8 @@ pub async fn run(
     proxy_state.start_backend_capability_refresh_task(false, Some(shutdown_tx.subscribe()));
 
     // Start per-IP request counter cleanup (removes stale zero-count entries)
-    proxy_state.start_per_ip_cleanup_task();
+    let per_ip_cleanup_handle =
+        proxy_state.start_per_ip_cleanup_task(Some(shutdown_tx.subscribe()));
 
     // Start service discovery background tasks (initially no-op with empty config;
     // tasks are reconciled when CP pushes config via update_config)
@@ -117,10 +133,11 @@ pub async fn run(
             cp_urls.len()
         );
     }
-    let jwt_secret = crate::grpc::dp_client::GrpcJwtSecret::new(
+    let jwt_secret = crate::grpc::dp_client::GrpcJwtSecret::with_issuer(
         env_config.cp_dp_grpc_jwt_secret.clone().ok_or_else(|| {
             anyhow::anyhow!("FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode")
         })?,
+        env_config.cp_dp_grpc_jwt_issuer.clone(),
     );
 
     // Build DP gRPC TLS config if any TLS settings are provided
@@ -340,6 +357,7 @@ pub async fn run(
             let h3_config = crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
             let h3_tls_policy = tls_policy.clone();
             let h3_client_ca = env_config.frontend_tls_client_ca_bundle_path.clone();
+            let h3_client_crls = crls.clone();
             let (h3_started_tx, h3_started_rx) = tokio::sync::oneshot::channel();
             let h3_handle = tokio::spawn(async move {
                 info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
@@ -352,6 +370,7 @@ pub async fn run(
                     &h3_tls_policy,
                     crate::http3::server::Http3ListenerOptions {
                         client_ca_bundle_path: h3_client_ca,
+                        client_crls: h3_client_crls,
                         started_tx: Some(h3_started_tx),
                     },
                 )
@@ -549,7 +568,17 @@ pub async fn run(
         }
     }
 
-    // Graceful connection drain: wait for in-flight requests to complete.
+    // Stop accepting new TCP/UDP/DTLS stream connections. The accept loops
+    // also observe the global shutdown receiver wired above and will already
+    // be exiting; firing each per-listener channel here clears the listener
+    // map (releasing ports) and is a no-op if the loops have already exited.
+    proxy_state.stream_listener_manager.shutdown_all().await;
+
+    // Graceful connection drain: signal drain state to the proxy hot path
+    // (Connection: close + reject new requests) unconditionally so the close
+    // hint fires even when the operator has disabled the wait loop with
+    // FERRUM_SHUTDOWN_DRAIN_SECONDS=0. Only the wait loop itself is gated.
+    crate::overload::begin_drain(&proxy_state.overload);
     let drain_seconds = env_config.shutdown_drain_seconds;
     if drain_seconds > 0 {
         crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))
@@ -558,6 +587,12 @@ pub async fn run(
 
     // Wait for background tasks to drain cleanly, with a timeout to prevent
     // hanging if a task is stuck (e.g., blocked on a gRPC stream read).
+    // `health_check_handles` is normally empty in DP mode (empty initial
+    // config — see comment at `ProxyState::new` call site) but plumbed
+    // through anyway so a future change that starts health checks at DP
+    // startup is already drained by this loop.
+    let mut health_check_handles = health_check_handles;
+    health_check_handles.extend(proxy_state.health_checker.take_active_check_handles());
     let bg_drain = async {
         let _ = dns_handle.await;
         if let Some(h) = dns_retry_handle {
@@ -566,6 +601,12 @@ pub async fn run(
         let _ = dp_client_handle.await;
         let _ = overload_handle.await;
         let _ = metrics_handle.await;
+        if let Some(h) = per_ip_cleanup_handle {
+            let _ = h.await;
+        }
+        for h in health_check_handles {
+            let _ = h.await;
+        }
     };
     if tokio::time::timeout(Duration::from_secs(5), bg_drain)
         .await

@@ -814,3 +814,249 @@ fn test_sql_for_db_returns_reference_to_original_str() {
     let result_default = m.sql_for_db("sqlite");
     assert!(std::ptr::eq(result_default, default_sql));
 }
+
+// ---------------------------------------------------------------------------
+// DatabaseBackend trait — pending_plugin_migrations / apply_plugin_migrations
+// ---------------------------------------------------------------------------
+//
+// These tests verify the trait methods on `DatabaseStore` that drive the
+// startup auto-apply / warn-only behavior in `database` and `cp` modes.
+
+use ferrum_edge::config::db_backend::DatabaseBackend;
+use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+
+/// Spin up a fresh, file-backed SQLite `DatabaseStore` for testing.
+///
+/// File-backed (not `::memory:`) so the multi-connection pool used by
+/// `DatabaseStore` sees a consistent view — `_ferrum_migrations` is created
+/// during `connect_with_tls_config` and must be visible to subsequent
+/// connections checked out from the pool.
+///
+/// Returns both the store and the temp dir so the dir is dropped only after
+/// the test finishes.
+async fn test_store_with_dir() -> (DatabaseStore, tempfile::TempDir) {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let db_path = temp_dir.path().join("plugin_migration_test.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_tls_config(
+        "sqlite",
+        &db_url,
+        false,
+        None,
+        None,
+        None,
+        false,
+        DbPoolConfig::default(),
+    )
+    .await
+    .expect("test store should connect");
+    (store, temp_dir)
+}
+
+#[tokio::test]
+async fn pending_plugin_migrations_returns_pending_when_unapplied() {
+    let (store, _tmp) = test_store_with_dir().await;
+
+    let migrations: Vec<(&str, Vec<CustomPluginMigration>)> = vec![(
+        "trait_pending_test",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_pending",
+            checksum: "v1_pending_chk",
+            sql: "CREATE TABLE IF NOT EXISTS trait_pending_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+
+    let pending = store
+        .pending_plugin_migrations(&migrations)
+        .await
+        .expect("pending probe should succeed");
+
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].plugin_name, "trait_pending_test");
+    assert_eq!(pending[0].version, 1);
+    assert_eq!(pending[0].name, "create_pending");
+}
+
+#[tokio::test]
+async fn pending_plugin_migrations_empty_when_no_plugins_have_migrations() {
+    let (store, _tmp) = test_store_with_dir().await;
+
+    let empty: Vec<(&str, Vec<CustomPluginMigration>)> = vec![];
+    let pending = store
+        .pending_plugin_migrations(&empty)
+        .await
+        .expect("pending probe with empty input should succeed");
+    assert!(pending.is_empty());
+}
+
+#[tokio::test]
+async fn apply_plugin_migrations_runs_pending_and_creates_schema() {
+    // Mirrors the FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true startup path:
+    // a pending migration MUST be applied so subsequent plugin INSERT/SELECT
+    // calls don't fail with "no such table".
+    let (store, _tmp) = test_store_with_dir().await;
+
+    let migrations: Vec<(&str, Vec<CustomPluginMigration>)> = vec![(
+        "trait_auto_apply",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_auto",
+            checksum: "v1_auto_chk",
+            sql: "CREATE TABLE IF NOT EXISTS trait_auto_data (id TEXT PRIMARY KEY, val TEXT NOT NULL)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+
+    let applied = store
+        .apply_plugin_migrations(&migrations)
+        .await
+        .expect("auto-apply should succeed");
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].plugin_name, "trait_auto_apply");
+    assert_eq!(applied[0].version, 1);
+
+    // After auto-apply, the table actually exists — this is the behavior
+    // operators care about: the gateway can come up and the plugin's
+    // INSERT/SELECT in `log()` does not fail with "no such table".
+    sqlx::query("INSERT INTO trait_auto_data (id, val) VALUES ('k1', 'v1')")
+        .execute(&store.pool())
+        .await
+        .expect("table should exist after apply_plugin_migrations");
+
+    // After auto-apply, pending must be empty.
+    let pending = store
+        .pending_plugin_migrations(&migrations)
+        .await
+        .expect("pending probe after apply should succeed");
+    assert!(
+        pending.is_empty(),
+        "no pending migrations should remain after apply"
+    );
+}
+
+#[tokio::test]
+async fn pending_after_partial_apply_only_lists_unapplied() {
+    // Operator scenario: V1 was applied previously, V2 is bundled with the
+    // new gateway binary. Startup should report only V2 as pending.
+    let (store, _tmp) = test_store_with_dir().await;
+
+    let v1_only: Vec<(&str, Vec<CustomPluginMigration>)> = vec![(
+        "partial_pending",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "v1",
+            checksum: "v1_chk",
+            sql: "CREATE TABLE IF NOT EXISTS partial_pending_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+    store.apply_plugin_migrations(&v1_only).await.unwrap();
+
+    let v1_and_v2: Vec<(&str, Vec<CustomPluginMigration>)> = vec![(
+        "partial_pending",
+        vec![
+            CustomPluginMigration {
+                version: 1,
+                name: "v1",
+                checksum: "v1_chk",
+                sql: "CREATE TABLE IF NOT EXISTS partial_pending_data (id TEXT PRIMARY KEY)",
+                sql_postgres: None,
+                sql_mysql: None,
+            },
+            CustomPluginMigration {
+                version: 2,
+                name: "v2",
+                checksum: "v2_chk",
+                sql: "ALTER TABLE partial_pending_data ADD COLUMN extra TEXT",
+                sql_postgres: None,
+                sql_mysql: None,
+            },
+        ],
+    )];
+
+    let pending = store
+        .pending_plugin_migrations(&v1_and_v2)
+        .await
+        .expect("pending probe after partial apply should succeed");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].version, 2, "only V2 should still be pending");
+}
+
+#[tokio::test]
+async fn warn_only_path_does_not_apply_migration() {
+    // Mirrors the FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=false startup path:
+    // the gateway probes `pending_plugin_migrations` for the warn message
+    // but MUST NOT call `apply_plugin_migrations`. The pending migration
+    // should still be reported as pending afterwards, and the table must
+    // not have been created.
+    let (store, _tmp) = test_store_with_dir().await;
+
+    let migrations: Vec<(&str, Vec<CustomPluginMigration>)> = vec![(
+        "warn_only_test",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_warn",
+            checksum: "v1_warn_chk",
+            sql: "CREATE TABLE IF NOT EXISTS warn_only_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+
+    // Warn-only path: probe pending, do NOT apply.
+    let pending = store
+        .pending_plugin_migrations(&migrations)
+        .await
+        .expect("pending probe should succeed");
+    assert_eq!(pending.len(), 1);
+
+    // Verify the table was NOT created — pending is informational only.
+    let result = sqlx::query("INSERT INTO warn_only_data (id) VALUES ('k1')")
+        .execute(&store.pool())
+        .await;
+    assert!(
+        result.is_err(),
+        "warn-only path must NOT have applied the migration; the table should not exist"
+    );
+
+    // And pending is still reported as pending — operators can still see
+    // it on subsequent startups until they run `migrate up`.
+    let still_pending = store
+        .pending_plugin_migrations(&migrations)
+        .await
+        .expect("pending probe should still succeed after warn-only");
+    assert_eq!(still_pending.len(), 1);
+}
+
+#[tokio::test]
+async fn apply_plugin_migrations_is_idempotent() {
+    // Repeated startups with auto-apply enabled must not re-run an
+    // already-applied migration.
+    let (store, _tmp) = test_store_with_dir().await;
+
+    let migrations: Vec<(&str, Vec<CustomPluginMigration>)> = vec![(
+        "idempotent_apply",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "v1",
+            checksum: "v1_chk",
+            sql: "CREATE TABLE IF NOT EXISTS idempotent_apply_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+
+    let first = store.apply_plugin_migrations(&migrations).await.unwrap();
+    assert_eq!(first.len(), 1);
+
+    let second = store.apply_plugin_migrations(&migrations).await.unwrap();
+    assert!(
+        second.is_empty(),
+        "second apply should be a no-op when nothing is pending"
+    );
+}
