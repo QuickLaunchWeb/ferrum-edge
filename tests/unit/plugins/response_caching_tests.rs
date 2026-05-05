@@ -1325,6 +1325,46 @@ async fn test_sse_request_skips_response_buffering() {
 }
 
 #[tokio::test]
+async fn test_sse_request_bypasses_preexisting_cached_response() {
+    let plugin = default_plugin();
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/events",
+        200,
+        &resp_headers,
+        b"{\"cached\":true}",
+    )
+    .await;
+
+    let mut cached_ctx = make_ctx("GET", "/events");
+    let mut cached_headers = HashMap::new();
+    assert!(is_reject(
+        &plugin
+            .before_proxy(&mut cached_ctx, &mut cached_headers)
+            .await
+    ));
+
+    let mut sse_ctx = make_ctx("GET", "/events");
+    let mut sse_headers = HashMap::new();
+    sse_headers.insert("accept".to_string(), "text/event-stream".to_string());
+
+    let result = plugin.before_proxy(&mut sse_ctx, &mut sse_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(sse_ctx.metadata.get("cache_status").unwrap(), "BYPASS");
+    assert!(!sse_ctx.metadata.contains_key("cache_base_key"));
+
+    let mut bypass_headers = HashMap::new();
+    plugin
+        .after_proxy(&mut sse_ctx, 200, &mut bypass_headers)
+        .await;
+    assert_eq!(bypass_headers.get("x-cache-status").unwrap(), "BYPASS");
+}
+
+#[tokio::test]
 async fn test_non_sse_request_still_buffers() {
     // Plain JSON requests must still take the buffered/cacheable path.
     let plugin = default_plugin();

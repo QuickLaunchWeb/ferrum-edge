@@ -23,6 +23,7 @@
 //! check still streams the body via the existing escape hatch. This helper
 //! covers the request-side case.
 use super::super::RequestContext;
+use std::collections::HashMap;
 
 /// Returns `true` when the request's `Accept` header indicates Server-Sent
 /// Events (i.e., contains `text/event-stream`). Matches the WHATWG EventSource
@@ -33,7 +34,14 @@ use super::super::RequestContext;
 /// max-response-size limit is hit instead of streaming events.
 #[inline]
 pub fn is_sse_request(ctx: &RequestContext) -> bool {
-    ctx.headers
+    headers_accept_sse(&ctx.headers)
+}
+
+/// Returns `true` when the supplied request headers include
+/// `Accept: text/event-stream`.
+#[inline]
+pub fn headers_accept_sse(headers: &HashMap<String, String>) -> bool {
+    headers
         .get("accept")
         .is_some_and(|accept| accept_includes_event_stream(accept))
 }

@@ -647,6 +647,12 @@ impl Plugin for ResponseCaching {
             return PluginResult::Continue;
         }
 
+        if super::utils::sse::headers_accept_sse(headers) {
+            ctx.metadata
+                .insert(CACHE_STATUS.to_string(), "BYPASS".to_string());
+            return PluginResult::Continue;
+        }
+
         // Use the `headers` parameter (not `ctx.headers`) — the gateway hot
         // path may have temporarily moved `ctx.headers` out of the context
         // before invoking `before_proxy` (zero-alloc when no plugin modifies
