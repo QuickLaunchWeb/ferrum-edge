@@ -1268,6 +1268,14 @@ async fn validate_bundle(
                 let pid = &assoc.plugin_config_id;
                 match db.get_plugin_config(pid).await {
                     Ok(Some(existing)) => {
+                        if existing.namespace != namespace {
+                            assoc_errors.push(format!(
+                                "plugin_config_id '{}' belongs to namespace '{}', not '{}'",
+                                pid, existing.namespace, namespace
+                            ));
+                            continue;
+                        }
+
                         use crate::config::types::PluginScope;
                         match existing.scope {
                             PluginScope::Global => {

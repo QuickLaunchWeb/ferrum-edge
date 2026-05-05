@@ -191,6 +191,27 @@ impl AdminClient {
         (status, val)
     }
 
+    async fn post_json_in_namespace(
+        &self,
+        path: &str,
+        namespace: &str,
+        body: &Value,
+    ) -> (reqwest::StatusCode, Value) {
+        let resp = self
+            .client
+            .post(self.url(path))
+            .header("authorization", format!("Bearer {}", self.token))
+            .header("content-type", "application/json")
+            .header("x-ferrum-namespace", namespace)
+            .body(serde_json::to_vec(body).unwrap())
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let val: Value = resp.json().await.unwrap_or(json!(null));
+        (status, val)
+    }
+
     async fn post_yaml(&self, path: &str, body: &str) -> (reqwest::StatusCode, Value) {
         let resp = self
             .client
@@ -2490,6 +2511,67 @@ async fn post_proxy_plugin_association_to_other_proxy_returns_422() {
             .iter()
             .any(|f| f["resource_type"].as_str() == Some("proxy_plugin_association")),
         "must have a proxy_plugin_association failure; body: {body}"
+    );
+}
+
+/// POST a spec where x-ferrum-proxy.plugins references a plugin from another
+/// namespace -> 422.
+#[tokio::test]
+async fn post_proxy_plugin_association_to_other_namespace_returns_422() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+
+    let other_namespace = "other-namespace";
+    let shared_plugin_id = uid("shared-plugin");
+    let shared_plugin: ferrum_edge::config::types::PluginConfig =
+        serde_json::from_value(serde_json::json!({
+            "id": shared_plugin_id,
+            "namespace": other_namespace,
+            "plugin_name": "cors",
+            "scope": "proxy_group",
+            "config": {},
+            "enabled": true
+        }))
+        .expect("shared plugin deserialization");
+    store
+        .create_plugin_config(&shared_plugin)
+        .await
+        .expect("create other-namespace plugin");
+
+    let proxy_id = uid("proxy");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Cross namespace plugin test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}"),
+            "plugins": [{"plugin_config_id": shared_plugin_id}]
+        }
+    });
+
+    let (status, body) = client
+        .post_json_in_namespace("/api-specs", "ferrum", &spec)
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "association to another namespace's plugin must return 422; body: {body}"
+    );
+    let failures = body["failures"].as_array().expect("failures array");
+    assert!(
+        failures
+            .iter()
+            .any(|f| f["resource_type"] == "proxy_plugin_association"
+                && f["errors"].as_array().is_some_and(|a| a.iter().any(|e| e
+                    .as_str()
+                    .is_some_and(|s| s.contains(&shared_plugin_id)
+                        && s.contains(other_namespace)
+                        && s.contains("ferrum"))))),
+        "must include the cross-namespace association rejection in failures: {body}"
     );
 }
 
