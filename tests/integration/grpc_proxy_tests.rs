@@ -103,15 +103,10 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         db_type: None,
         db_url: None,
         db_poll_interval: 30,
-        db_tls_enabled: false,
+        db_tls_mode: None,
         db_tls_ca_cert_path: None,
         db_tls_client_cert_path: None,
         db_tls_client_key_path: None,
-        db_tls_insecure: false,
-        db_ssl_mode: None,
-        db_ssl_root_cert: None,
-        db_ssl_client_cert: None,
-        db_ssl_client_key: None,
         file_config_path: Some("/tmp/test-grpc-config.json".into()),
         db_config_backup_path: None,
         db_failover_urls: Vec::new(),
@@ -226,6 +221,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
     let (state, _health_check_handles) =
         ProxyState::new(config, dns_cache, create_test_env_config(), None, None).unwrap();

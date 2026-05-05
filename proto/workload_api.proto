@@ -1,0 +1,138 @@
+// SPIFFE Workload API protocol
+//
+// Vendored from https://github.com/spiffe/spiffe/blob/main/proto/spiffe/workload/workload.proto
+// Vendored locally so the build does not fetch over the network. Keep this file
+// in sync with the upstream .proto when bumping the SPIFFE Workload API version.
+//
+// This is the Workload API as defined by SPIFFE — see
+// https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE_Workload_API.md
+//
+// The Ferrum Edge mesh subsystem implements both the client and the server
+// side of this API: the gRPC client speaks to a SPIRE agent over a Unix
+// domain socket, and the gRPC server is the in-process workload API that
+// Ferrum's own CA exposes to local workloads when Ferrum is acting as the
+// SVID issuer.
+
+syntax = "proto3";
+
+package spiffe.workload;
+
+// DIVERGENCE FROM UPSTREAM SPIFFE WORKLOAD API
+//
+// The only divergence from the upstream proto is the
+// `ValidateJWTSVIDResponse.claims` field: upstream uses
+// `google.protobuf.Struct`, we use a JSON-encoded `bytes` blob so the
+// generated Rust does not pull in `prost-types` for the `Struct` type — the
+// gateway never inspects the claims wire-format directly. When Phase B
+// re-introduces the JWT-SVID validate path, we can either decode JSON
+// ourselves or re-introduce the `Struct` import.
+//
+// All field numbers, names, and types in the X.509 messages match upstream
+// byte-for-byte so this gateway is wire-compatible with real SPIRE agents
+// and any other SPIFFE Workload API implementation.
+
+service SpiffeWorkloadAPI {
+  // Streams X.509 SVIDs to the workload. The workload is identified
+  // implicitly by the caller's socket credentials. The server pushes a fresh
+  // response whenever an SVID is rotated or a federated bundle changes;
+  // clients keep the stream open for the lifetime of the workload.
+  rpc FetchX509SVID(X509SVIDRequest) returns (stream X509SVIDResponse);
+
+  // Streams trust bundle updates without issuing SVIDs (subset of FetchX509SVID
+  // intended for verifiers / proxies that only need to validate peers).
+  rpc FetchX509Bundles(X509BundlesRequest) returns (stream X509BundlesResponse);
+
+  // Issues one or more JWT-SVIDs targeted at the named audiences. Unlike the
+  // X.509 streaming RPCs this is a unary RPC because JWT-SVIDs are short-lived
+  // and minted on demand.
+  rpc FetchJWTSVID(JWTSVIDRequest) returns (JWTSVIDResponse);
+
+  // Streams the current set of JWKS authorities (per trust domain) used to
+  // validate JWT-SVIDs.
+  rpc FetchJWTBundles(JWTBundlesRequest) returns (stream JWTBundlesResponse);
+
+  // Validates a JWT-SVID token presented by a peer.
+  rpc ValidateJWTSVID(ValidateJWTSVIDRequest) returns (ValidateJWTSVIDResponse);
+}
+
+// ─── X.509 ──────────────────────────────────────────────────────────────────
+
+message X509SVIDRequest {}
+
+message X509SVIDResponse {
+  // SVIDs issued to this workload. The first SVID is the default identity for
+  // single-identity callers.
+  repeated X509SVID svids = 1;
+
+  // ASN.1 DER-encoded list of certificate revocation lists. Each entry is
+  // a separate CRL — agents may publish multiple CRLs per response.
+  repeated bytes crl = 2;
+
+  // Federated bundles keyed by trust domain (string form,
+  // e.g. "spiffe://prod.example.com" or "prod.example.com"). ASN.1 DER
+  // encoded.
+  map<string, bytes> federated_bundles = 3;
+}
+
+message X509SVID {
+  // The SPIFFE ID expressed as a URI ("spiffe://trust-domain/path").
+  string spiffe_id = 1;
+  // ASN.1 DER-encoded X.509 certificate chain. Leaf first.
+  bytes x509_svid = 2;
+  // ASN.1 DER-encoded private key (PKCS#8).
+  bytes x509_svid_key = 3;
+  // ASN.1 DER-encoded CA certificates ("trust bundle") for the issuing trust
+  // domain.
+  bytes bundle = 4;
+  // Operator-specified hint string used to pick between multiple SVIDs
+  // returned for the same workload. Optional, opaque to the SPIFFE protocol.
+  string hint = 5;
+}
+
+message X509BundlesRequest {}
+
+message X509BundlesResponse {
+  // ASN.1 DER-encoded list of certificate revocation lists. Each entry is
+  // a separate CRL.
+  repeated bytes crl = 1;
+  // CA bundles keyed by trust domain. ASN.1 DER encoded.
+  map<string, bytes> bundles = 2;
+}
+
+// ─── JWT ────────────────────────────────────────────────────────────────────
+
+message JWTSVIDRequest {
+  // RFC 8693 audience(s) the JWT will be presented to.
+  repeated string audience = 1;
+  // Optional explicit SPIFFE ID — defaults to the workload's default identity.
+  string spiffe_id = 2;
+}
+
+message JWTSVIDResponse {
+  repeated JWTSVID svids = 1;
+}
+
+message JWTSVID {
+  string spiffe_id = 1;
+  string svid = 2;
+  // SVID hint: human-readable audience. Optional.
+  string hint = 3;
+}
+
+message JWTBundlesRequest {}
+
+message JWTBundlesResponse {
+  // JWKS bundles keyed by trust domain.
+  map<string, bytes> bundles = 1;
+}
+
+message ValidateJWTSVIDRequest {
+  string audience = 1;
+  string svid = 2;
+}
+
+message ValidateJWTSVIDResponse {
+  string spiffe_id = 1;
+  // JSON-encoded claims of the SVID. See note at the top of the file.
+  bytes claims_json = 2;
+}

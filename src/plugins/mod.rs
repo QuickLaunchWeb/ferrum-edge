@@ -60,6 +60,7 @@ pub mod response_transformer;
 pub mod serverless_function;
 pub mod soap_ws_security;
 pub mod spec_expose;
+pub mod spiffe_identity;
 pub mod sse;
 pub mod statsd_logging;
 pub mod stdout_logging;
@@ -278,6 +279,12 @@ pub struct RequestContext {
     /// Contains all certificates after the peer cert (index 1+) sent during the handshake.
     /// Used by the mtls_auth plugin for per-proxy CA fingerprint verification.
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+    /// Peer SPIFFE identity, populated by the `mtls_auth` plugin when the
+    /// client certificate carries a `spiffe://` URI SAN. `None` for non-mesh
+    /// deployments and for clients that present a non-SPIFFE certificate.
+    /// Plugins downstream of `mtls_auth` may read this for identity-aware
+    /// authorization (e.g. mesh policy evaluation in Phase C).
+    pub peer_spiffe_id: Option<crate::identity::SpiffeId>,
     /// Cumulative nanoseconds spent by plugins making external HTTP calls
     /// (via `PluginHttpClient::execute_tracked`). Shared across all plugin
     /// invocations for this request — clone-safe via Arc.
@@ -335,6 +342,7 @@ impl RequestContext {
             metadata: HashMap::new(),
             tls_client_cert_der: None,
             tls_client_cert_chain_der: None,
+            peer_spiffe_id: None,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rx: None,
             request_body_bytes: None,
@@ -975,6 +983,7 @@ pub mod priority {
     pub const SSE: u16 = 250;
     pub const GRPC_WEB: u16 = 260;
     pub const GRPC_METHOD_ROUTER: u16 = 275;
+    pub const SPIFFE_IDENTITY: u16 = 940;
     pub const MTLS_AUTH: u16 = 950;
     pub const JWKS_AUTH: u16 = 1000;
     pub const JWT_AUTH: u16 = 1100;
@@ -1486,6 +1495,9 @@ pub fn create_plugin_with_http_client(
         )?))),
         "hmac_auth" => Ok(Some(Arc::new(hmac_auth::HmacAuth::new(config)?))),
         "mtls_auth" => Ok(Some(Arc::new(mtls_auth::MtlsAuth::new(config)?))),
+        "spiffe_identity" => Ok(Some(Arc::new(spiffe_identity::SpiffeIdentity::new(
+            config,
+        )?))),
         "compression" => Ok(Some(Arc::new(compression::CompressionPlugin::new(config)?))),
         "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)?))),
         "access_control" => Ok(Some(Arc::new(access_control::AccessControl::new(config)?))),
@@ -1659,6 +1671,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "ldap_auth",
         "hmac_auth",
         "mtls_auth",
+        "spiffe_identity",
         "compression",
         "cors",
         "access_control",

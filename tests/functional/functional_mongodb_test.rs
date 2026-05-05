@@ -3,6 +3,7 @@
 //! Verifies that ferrum-edge works correctly with MongoDB as the database backend:
 //! - Plaintext MongoDB connection (no TLS)
 //! - TLS-encrypted MongoDB connection
+//! - TLS-encrypted MongoDB connection without server certificate verification
 //! - mTLS MongoDB connection (client certificate authentication)
 //! - Full Admin API CRUD lifecycle (proxies, consumers, plugins, upstreams)
 //! - Proxy traffic routing through a MongoDB-backed gateway
@@ -206,8 +207,9 @@ impl MongoTestHarness {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let binary_path = find_binary()?;
         let ca_cert_path = format!("{}/ca.crt", cert_dir);
-
-        let child = Command::new(binary_path)
+        let tls_mode = if insecure { "require" } else { "verify-full" };
+        let mut command = Command::new(binary_path);
+        command
             .env("FERRUM_MODE", "database")
             .env("FERRUM_ADMIN_JWT_SECRET", &self.jwt_secret)
             .env("FERRUM_ADMIN_JWT_ISSUER", &self.jwt_issuer)
@@ -218,12 +220,12 @@ impl MongoTestHarness {
             .env("FERRUM_PROXY_HTTP_PORT", self.proxy_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
             .env("FERRUM_LOG_LEVEL", "info")
-            .env("FERRUM_DB_TLS_ENABLED", "true")
-            .env("FERRUM_DB_TLS_CA_CERT_PATH", &ca_cert_path)
-            .env(
-                "FERRUM_DB_TLS_INSECURE",
-                if insecure { "true" } else { "false" },
-            )
+            .env("FERRUM_DB_TLS_MODE", tls_mode);
+        if !insecure {
+            command.env("FERRUM_DB_TLS_CA_CERT_PATH", &ca_cert_path);
+        }
+
+        let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
@@ -294,7 +296,7 @@ impl MongoTestHarness {
             .env("FERRUM_PROXY_HTTP_PORT", self.proxy_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
             .env("FERRUM_LOG_LEVEL", "info")
-            .env("FERRUM_DB_TLS_ENABLED", "true")
+            .env("FERRUM_DB_TLS_MODE", "verify-full")
             .env("FERRUM_DB_TLS_CA_CERT_PATH", &ca_cert_path)
             .env("FERRUM_DB_TLS_CLIENT_CERT_PATH", &client_cert_path)
             .env("FERRUM_DB_TLS_CLIENT_KEY_PATH", &client_key_path)
@@ -741,6 +743,43 @@ async fn test_mongodb_tls_connection() {
     run_crud_and_proxy_tests(&harness, backend_port, "tls").await;
 
     println!("\n=== MongoDB TLS Test PASSED ===\n");
+}
+
+// ==========================================================================
+// Test: TLS MongoDB Connection Without Server Certificate Verification
+// ==========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_tls_require_connection() {
+    println!("\n=== MongoDB TLS Require Functional Test ===\n");
+
+    let mongo_url = std::env::var("FERRUM_TEST_MONGO_TLS_REQUIRE_URL")
+        .or_else(|_| std::env::var("FERRUM_TEST_MONGO_TLS_URL"))
+        .unwrap_or_else(|_| "mongodb://localhost:27018/ferrum_test".to_string());
+    let cert_dir = std::env::var("FERRUM_TEST_MONGO_CERT_DIR")
+        .unwrap_or_else(|_| DEFAULT_CERT_DIR.to_string());
+
+    if !mongodb_is_available(&mongo_url).await {
+        return;
+    }
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Bind backend");
+    let backend_port = backend_listener.local_addr().expect("Backend addr").port();
+    drop(backend_listener);
+    let _backend = start_echo_backend(backend_port).await.expect("Start echo");
+
+    let mut harness = MongoTestHarness::new().await.expect("Create harness");
+    harness
+        .start_gateway_tls(&mongo_url, &cert_dir, true)
+        .await
+        .expect("Start gateway with MongoDB TLS require");
+
+    run_crud_and_proxy_tests(&harness, backend_port, "tls-require").await;
+
+    println!("\n=== MongoDB TLS Require Test PASSED ===\n");
 }
 
 // ==========================================================================

@@ -138,6 +138,10 @@ async fn drain_waits_for_spawned_ws_session_to_exit() {
         tokio::time::sleep(Duration::from_millis(75)).await;
     });
 
+    // Production shutdown calls `begin_drain()` before `wait_for_drain()`.
+    // The guard drop path only notifies the waiter once draining has begun.
+    ferrum_edge::overload::begin_drain(&state);
+
     // Kick off drain with a generous timeout. It must NOT return until the
     // session task has exited and the guard has been dropped.
     let state_for_drain = state.clone();

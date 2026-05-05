@@ -219,9 +219,11 @@ async fn test_overload_returns_503_under_request_critical() {
         .mode_file(file_config_yaml(backend_port))
         .log_level("warn")
         .env("FERRUM_MAX_REQUESTS", "4")
+        .env("FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD", "0.25")
         .env("FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD", "0.5")
         .env("FERRUM_OVERLOAD_CHECK_INTERVAL_MS", "200")
         .env("FERRUM_SHUTDOWN_DRAIN_SECONDS", "1")
+        .capture_output()
         .spawn()
         .await
         .expect("spawn file-mode gateway");

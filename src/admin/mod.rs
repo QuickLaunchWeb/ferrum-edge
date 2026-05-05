@@ -1702,6 +1702,7 @@ async fn handle_batch_create(
         upstreams: batch.upstreams.clone(),
         loaded_at: now,
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
 
     match ValidationPipeline::new(&mut batch_config)
@@ -2081,6 +2082,7 @@ async fn handle_restore(
             upstreams: payload.upstreams.clone(),
             loaded_at: Utc::now(),
             known_namespaces: Vec::new(),
+            ..Default::default()
         };
         temp_config.normalize_fields();
         // Set namespace on all resources

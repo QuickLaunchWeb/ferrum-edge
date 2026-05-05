@@ -239,6 +239,7 @@ async fn test_all_plugins_available() {
         "kafka_logging",
         "soap_ws_security",
         "spec_expose",
+        "spiffe_identity",
         "ai_federation",
         "api_chargeback",
     ]
@@ -319,6 +320,7 @@ async fn test_plugin_creation_all_plugins() {
             "cors" => json!({"origins": ["*"]}),
             "response_caching" => json!({"ttl_seconds": 60}),
             "spec_expose" => json!({"spec_url": "https://example.com/openapi.yaml"}),
+            "spiffe_identity" => json!({}),
             "api_chargeback" => {
                 json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}]})
             }

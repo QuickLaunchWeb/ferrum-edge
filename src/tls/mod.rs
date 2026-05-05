@@ -11,10 +11,20 @@
 //! from being MITMed via any public CA.
 //!
 //! **TLS policy**: Optional hardening via `FERRUM_TLS_CIPHER_SUITES`,
-//! `FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_KEY_EXCHANGE_GROUPS`. Applied to
+//! `FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_CURVES`. Applied to
 //! both inbound listeners and outbound backend connections.
 
 pub mod backend;
+// `spiffe` exposes Phase A scaffolding for Phase C — every public item is
+// dead from the binary's perspective until a later phase wires it in.
+#[allow(dead_code)]
+pub mod spiffe;
+
+#[allow(unused_imports)]
+pub use spiffe::{
+    SharedBundleSlot, SpiffeClientCertResolver, SpiffeServerCertResolver, SpiffeTlsError,
+    build_spiffe_inbound_config, build_spiffe_outbound_config,
+};
 
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;

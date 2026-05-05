@@ -3937,6 +3937,7 @@ mod build_h3_backend_headers_tests {
             upstreams: vec![],
             loaded_at: chrono::Utc::now(),
             known_namespaces: Vec::new(),
+            mesh: None,
         };
         ProxyState::new(config, dns_cache, EnvConfig::default(), None, None)
             .expect("minimal ProxyState should construct")

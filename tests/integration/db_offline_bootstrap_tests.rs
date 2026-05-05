@@ -1,4 +1,4 @@
-//! Integration tests for `DatabaseStore::connect_offline_with_tls_config`.
+//! Integration tests for `DatabaseStore::connect_offline_with_pool_config`.
 //!
 //! The offline bootstrap path is the mechanism that supports
 //! `FERRUM_DB_CONFIG_BACKUP_PATH` when every configured DB URL is unreachable
@@ -46,15 +46,10 @@ async fn offline_bootstrap_preserves_failover_urls_and_reconnects() {
 
     // Construct an offline store that knows about both the primary and the
     // failover URL. The lazy pool points at the (unreachable) primary.
-    let store = DatabaseStore::connect_offline_with_tls_config(
+    let store = DatabaseStore::connect_offline_with_pool_config(
         "sqlite",
         &bogus_primary,
         std::slice::from_ref(&failover_url),
-        false,
-        None,
-        None,
-        None,
-        false,
         fast_fail_pool_config(),
     )
     .expect("offline store construction should succeed even with unreachable primary");
@@ -63,7 +58,7 @@ async fn offline_bootstrap_preserves_failover_urls_and_reconnects() {
     // was built with it. If the codex-flagged bug were present — empty
     // `failover_urls` — this would only attempt the primary and fail.
     let recovered_url = store
-        .try_failover_reconnect(&bogus_primary, false, None, None, None, false)
+        .try_failover_reconnect(&bogus_primary)
         .await
         .expect("reconnect via failover URL should succeed");
     assert_eq!(
@@ -97,15 +92,10 @@ async fn offline_bootstrap_runs_migrations_on_first_successful_reconnect() {
 
     let bogus_primary = "sqlite:/nonexistent/migrations-test/bogus.db?mode=ro".to_string();
 
-    let store = DatabaseStore::connect_offline_with_tls_config(
+    let store = DatabaseStore::connect_offline_with_pool_config(
         "sqlite",
         &bogus_primary,
         std::slice::from_ref(&failover_url),
-        false,
-        None,
-        None,
-        None,
-        false,
         fast_fail_pool_config(),
     )
     .expect("offline store construction");
@@ -120,7 +110,7 @@ async fn offline_bootstrap_runs_migrations_on_first_successful_reconnect() {
     // Reconnect via failover. `reconnect()` must run the deferred migrations,
     // otherwise subsequent queries will fail on missing tables.
     store
-        .try_failover_reconnect(&bogus_primary, false, None, None, None, false)
+        .try_failover_reconnect(&bogus_primary)
         .await
         .expect("failover reconnect should succeed");
 
@@ -153,25 +143,16 @@ async fn normal_reconnect_does_not_rerun_migrations() {
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
 
     // Eager connect — migrations run exactly once here.
-    let store = DatabaseStore::connect_with_tls_config(
-        "sqlite",
-        &db_url,
-        false,
-        None,
-        None,
-        None,
-        false,
-        fast_fail_pool_config(),
-    )
-    .await
-    .expect("initial connect");
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, fast_fail_pool_config())
+        .await
+        .expect("initial connect");
 
     // Simulate a DNS-change reconnect to the same URL. Must succeed without
     // error — if migrations were re-run unconditionally they would skip
     // (since they already applied), but exposing an extra noisy log on every
     // DNS blip is avoidable.
     store
-        .reconnect(&db_url, false, None, None, None, false)
+        .reconnect(&db_url)
         .await
         .expect("reconnect should succeed without side effects");
 
@@ -203,15 +184,10 @@ async fn maybe_apply_deferred_migrations_returns_true_only_on_first_apply() {
     // Offline bootstrap against a URL that is immediately reachable — the
     // lazy pool will connect on the first query. `migrations_pending=true`
     // so the first `maybe_apply_deferred_migrations` should actually run.
-    let store = DatabaseStore::connect_offline_with_tls_config(
+    let store = DatabaseStore::connect_offline_with_pool_config(
         "sqlite",
         &db_url,
         &[],
-        false,
-        None,
-        None,
-        None,
-        false,
         fast_fail_pool_config(),
     )
     .expect("offline store construction");
@@ -264,18 +240,9 @@ async fn maybe_apply_deferred_migrations_no_op_on_eager_connected_store() {
     let db_path = temp_dir.path().join("eager.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
 
-    let store = DatabaseStore::connect_with_tls_config(
-        "sqlite",
-        &db_url,
-        false,
-        None,
-        None,
-        None,
-        false,
-        fast_fail_pool_config(),
-    )
-    .await
-    .expect("eager connect");
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, fast_fail_pool_config())
+        .await
+        .expect("eager connect");
 
     // Flag defaults to false on eager-connect path; helper must no-op.
     let ran = store
@@ -300,15 +267,10 @@ async fn lazy_pool_direct_success_is_covered_by_polling_loop_path() {
     let db_path = temp_dir.path().join("direct.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
 
-    let store = DatabaseStore::connect_offline_with_tls_config(
+    let store = DatabaseStore::connect_offline_with_pool_config(
         "sqlite",
         &db_url,
         &[],
-        false,
-        None,
-        None,
-        None,
-        false,
         fast_fail_pool_config(),
     )
     .expect("offline store construction");

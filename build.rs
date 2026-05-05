@@ -10,6 +10,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tonic_prost_build::compile_protos("proto/health.proto")?;
 
+    // SPIFFE Workload API — vendored proto compiled with both client and
+    // server stubs. Ferrum supports being either the workload calling a SPIRE
+    // agent (client) or the in-process SVID issuer for local workloads (server).
+    tonic_prost_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .compile_protos(&["proto/workload_api.proto"], &["proto/"])?;
+
     // ── Auto-discover custom plugins ────────────────────────────────────
     //
     // Scans custom_plugins/*.rs for files that export a `create_plugin`

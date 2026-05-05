@@ -956,6 +956,7 @@ mod tests {
             ],
             loaded_at: Utc::now(),
             known_namespaces: Vec::new(),
+            mesh: None,
         };
 
         let filtered = filter_config_to_namespace(&mut cfg, "production");
@@ -981,6 +982,7 @@ mod tests {
             upstreams: vec![],
             loaded_at: Utc::now(),
             known_namespaces: Vec::new(),
+            mesh: None,
         };
         assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);
         assert_eq!(cfg.proxies.len(), 1);

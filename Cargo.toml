@@ -127,6 +127,21 @@ sha2 = "0.11.0"
 hmac = "0.13.0"
 hex = "0.4"
 x509-parser = "0.18"
+# Used by the mesh identity subsystem to issue X.509 SVIDs (URI-SAN-aware).
+# Pinned to the same `ring` crypto provider already used by rustls so we do
+# not pull in a second crypto stack. Kept as a normal dep (not dev-dep) because
+# `src/identity/ca/internal.rs` and the bootstrap helper need it at runtime.
+# Enable `x509-parser` so `Issuer::from_ca_cert_pem` is available, and `pem`
+# for PEM input/output paths.
+rcgen = { version = "0.14", features = ["x509-parser", "pem"] }
+# Glob-style pattern matching for mesh policy SPIFFE-ID / namespace matchers
+# (`spiffe://prod/ns/foo/sa/*`). Already in the dep tree transitively; pinning
+# here for visibility.
+glob = "0.3"
+# Used by `rcgen::CertificateParams::not_before` / `not_after` (rcgen's
+# choice — it needs `time::OffsetDateTime`). Already in `[dev-dependencies]`
+# for testing; promoting to a regular dep so the mesh CA can reference it.
+time = "0.3"
 
 # Secrets management (optional cloud backends — gate via cargo features)
 vaultrs = { version = "0.8", optional = true }

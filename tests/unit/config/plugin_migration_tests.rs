@@ -829,7 +829,7 @@ use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 ///
 /// File-backed (not `::memory:`) so the multi-connection pool used by
 /// `DatabaseStore` sees a consistent view — `_ferrum_migrations` is created
-/// during `connect_with_tls_config` and must be visible to subsequent
+/// during `connect_with_pool_config` and must be visible to subsequent
 /// connections checked out from the pool.
 ///
 /// Returns both the store and the temp dir so the dir is dropped only after
@@ -838,18 +838,9 @@ async fn test_store_with_dir() -> (DatabaseStore, tempfile::TempDir) {
     let temp_dir = tempfile::TempDir::new().expect("temp dir");
     let db_path = temp_dir.path().join("plugin_migration_test.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
-    let store = DatabaseStore::connect_with_tls_config(
-        "sqlite",
-        &db_url,
-        false,
-        None,
-        None,
-        None,
-        false,
-        DbPoolConfig::default(),
-    )
-    .await
-    .expect("test store should connect");
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("test store should connect");
     (store, temp_dir)
 }
 

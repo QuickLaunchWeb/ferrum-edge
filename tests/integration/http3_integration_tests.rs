@@ -115,6 +115,7 @@ fn create_http3_test_gateway_config() -> GatewayConfig {
         upstreams: vec![],
         loaded_at: chrono::Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -138,10 +139,6 @@ fn create_http3_test_env_config() -> EnvConfig {
         db_type: None,
         db_url: None,
         db_poll_interval: 30,
-        db_ssl_mode: None,
-        db_ssl_root_cert: None,
-        db_ssl_client_cert: None,
-        db_ssl_client_key: None,
         file_config_path: None,
         db_config_backup_path: None,
         db_failover_urls: Vec::new(),
@@ -203,11 +200,10 @@ fn create_http3_test_env_config() -> EnvConfig {
         tcp_idle_timeout_seconds: 300,
         udp_max_sessions: 10_000,
         udp_cleanup_interval_seconds: 10,
-        db_tls_enabled: false,
+        db_tls_mode: None,
         db_tls_ca_cert_path: None,
         db_tls_client_cert_path: None,
         db_tls_client_key_path: None,
-        db_tls_insecure: false,
         tls_min_version: "1.2".into(),
         tls_max_version: "1.3".into(),
         tls_cipher_suites: None,
@@ -790,6 +786,7 @@ async fn test_http3_streaming_decision_logic() {
         upstreams: vec![],
         loaded_at: chrono::Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
 
     let plugin_cache = PluginCache::new(&gc).unwrap();

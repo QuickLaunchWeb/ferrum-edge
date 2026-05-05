@@ -23,6 +23,8 @@ mod grpc;
 mod health_check;
 mod http3;
 #[allow(dead_code)]
+mod identity;
+#[allow(dead_code)]
 mod lazy_timeout;
 mod load_balancer;
 mod metrics;

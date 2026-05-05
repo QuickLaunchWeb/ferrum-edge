@@ -195,6 +195,7 @@ fn test_longest_prefix_match() {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
     let router = RouterCache::new(&config, 10000);
     let matched = router.find_proxy(None, "/api/v1/users");
@@ -215,6 +216,7 @@ fn test_no_match() {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
     let router = RouterCache::new(&config, 10000);
     let matched = router.find_proxy(None, "/other/path");

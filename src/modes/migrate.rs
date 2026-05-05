@@ -38,6 +38,7 @@ pub async fn run(
 async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), anyhow::Error> {
     let effective_url = env_config
         .effective_db_url()
+        .map_err(anyhow::Error::msg)?
         .unwrap_or_else(|| "sqlite://ferrum.db".to_string());
     let db_type = env_config.db_type.as_deref().unwrap_or("sqlite");
 
@@ -61,11 +62,11 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
             env_config.mongo_auth_mechanism.as_deref(),
             env_config.mongo_server_selection_timeout_seconds,
             env_config.mongo_connect_timeout_seconds,
-            env_config.db_tls_enabled,
+            env_config.db_tls_enabled(),
             env_config.db_tls_ca_cert_path.as_deref(),
             env_config.db_tls_client_cert_path.as_deref(),
             env_config.db_tls_client_key_path.as_deref(),
-            env_config.db_tls_insecure,
+            env_config.mongodb_tls_allows_invalid_certs(),
         )
         .await?;
         use crate::config::db_backend::DatabaseBackend;
@@ -153,6 +154,7 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
 async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
     let effective_url = env_config
         .effective_db_url()
+        .map_err(anyhow::Error::msg)?
         .unwrap_or_else(|| "sqlite://ferrum.db".to_string());
     let db_type = env_config.db_type.as_deref().unwrap_or("sqlite");
 

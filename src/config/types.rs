@@ -1056,7 +1056,7 @@ pub struct Proxy {
     pub listen_port: Option<u16>,
     /// Whether to terminate TLS on the gateway side for incoming TCP connections.
     /// For TCP: uses the gateway's TLS certificate for TLS termination.
-    /// For UDP: uses the DTLS certificate for DTLS termination (ECDSA P-256 or Ed25519).
+    /// For UDP: uses the DTLS certificate for DTLS termination (ECDSA P-256 or P-384).
     #[serde(default)]
     pub frontend_tls: bool,
     /// When true, forward encrypted client bytes directly to the backend without
@@ -1271,6 +1271,8 @@ pub struct GatewayConfig {
     /// resources. DB-backed modes use `list_namespaces()` instead.
     #[serde(default)]
     pub known_namespaces: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<Box<crate::config::mesh::MeshConfig>>,
 }
 
 /// The current config schema version. Increment this when adding config migrations.
@@ -3976,6 +3978,34 @@ impl GatewayConfig {
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+
+    /// Validate the mesh portion of the config (Layer 2 — Phase A).
+    ///
+    /// Returns a flat `Vec<String>` of error messages so each mode can
+    /// dispatch the result per its own policy:
+    /// - **File mode**: fatal (bail)
+    /// - **DB mode**: warn (data already in DB)
+    /// - **DP mode**: reject the update, keep the cached config
+    ///
+    /// This is separate from `validate_all_fields_with_ip_policy()` so the
+    /// mesh fields can fail independently — operators may want to
+    /// experiment with mesh resources in dev without bricking their
+    /// existing proxy config.
+    #[allow(dead_code)] // Phase A scaffolding — wired into modes in Phase B/C.
+    pub fn validate_mesh_fields(&self) -> Vec<String> {
+        match &self.mesh {
+            Some(m) => m.validate(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Normalise hostname-bearing mesh fields (lower-case ASCII). Idempotent.
+    #[allow(dead_code)] // Phase A scaffolding — wired into loaders in Phase B/C.
+    pub fn normalize_mesh_fields(&mut self) {
+        if let Some(m) = &mut self.mesh {
+            m.normalize();
         }
     }
 
