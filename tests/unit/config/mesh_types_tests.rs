@@ -295,6 +295,36 @@ fn mesh_normalize_lowercases_policy_header_names() {
 }
 
 #[test]
+fn mesh_normalize_preserves_policy_header_case_collisions() {
+    let mut mesh = MeshConfig {
+        mesh_policies: vec![MeshPolicy {
+            name: "tenant".to_string(),
+            namespace: "default".to_string(),
+            scope: PolicyScope::MeshWide,
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: vec![RequestMatch {
+                    headers: HashMap::from([
+                        ("X-Tenant".to_string(), "prod".to_string()),
+                        ("x-tenant".to_string(), "dev".to_string()),
+                    ]),
+                    ..RequestMatch::default()
+                }],
+                when: Vec::new(),
+                action: PolicyAction::Allow,
+            }],
+        }],
+        ..MeshConfig::default()
+    };
+
+    mesh.normalize();
+
+    let headers = &mesh.mesh_policies[0].rules[0].to[0].headers;
+    assert_eq!(headers.get("X-Tenant").map(String::as_str), Some("prod"));
+    assert_eq!(headers.get("x-tenant").map(String::as_str), Some("dev"));
+}
+
+#[test]
 fn app_protocol_default_is_unknown() {
     assert_eq!(AppProtocol::default(), AppProtocol::Unknown);
 }

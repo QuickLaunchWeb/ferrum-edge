@@ -5,7 +5,7 @@
 //! trait or proxy hot path.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::config::mesh::{ConditionMatch, MeshRule, PolicyAction, PrincipalMatch, RequestMatch};
 use crate::identity::SpiffeId;
@@ -160,7 +160,7 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
         return false;
     }
     for (name, pattern) in &match_.headers {
-        let Some(value) = request.headers.get(name).map(String::as_str) else {
+        let Some(value) = request_header_value(&request.headers, name) else {
             return false;
         };
         if !wildcard_match(pattern, value) {
@@ -168,6 +168,16 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
         }
     }
     true
+}
+
+fn request_header_value<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'a str> {
+    headers.get(name).map(String::as_str).or_else(|| {
+        if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            headers.get(&name.to_ascii_lowercase()).map(String::as_str)
+        } else {
+            None
+        }
+    })
 }
 
 fn matches_conditions(matches: &[ConditionMatch], request: &MeshAuthzRequest) -> bool {
@@ -258,20 +268,31 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
 pub(crate) fn normalize_mesh_policy_header_names(policy: &mut crate::config::mesh::MeshPolicy) {
     for rule in &mut policy.rules {
         for request in &mut rule.to {
-            if request
-                .headers
-                .keys()
-                .all(|key| key.bytes().all(|byte| !byte.is_ascii_uppercase()))
-            {
-                continue;
-            }
-            request.headers = request
-                .headers
-                .drain()
-                .map(|(key, value)| (key.to_ascii_lowercase(), value))
-                .collect();
+            normalize_mesh_policy_header_map(&mut request.headers);
         }
     }
+}
+
+fn normalize_mesh_policy_header_map(headers: &mut std::collections::HashMap<String, String>) {
+    if headers
+        .keys()
+        .all(|key| key.bytes().all(|byte| !byte.is_ascii_uppercase()))
+    {
+        return;
+    }
+
+    let mut lowered = HashSet::with_capacity(headers.len());
+    if headers
+        .keys()
+        .any(|key| !lowered.insert(key.to_ascii_lowercase()))
+    {
+        return;
+    }
+
+    *headers = headers
+        .drain()
+        .map(|(key, value)| (key.to_ascii_lowercase(), value))
+        .collect();
 }
 
 pub(crate) fn mesh_policy_has_header_rules(policy: &crate::config::mesh::MeshPolicy) -> bool {
@@ -442,5 +463,33 @@ mod tests {
         assert!(mesh_policy_has_header_rules(&policy));
         assert!(policy.rules[0].to[0].headers.contains_key("x-tenant"));
         assert!(!policy.rules[0].to[0].headers.contains_key("X-Tenant"));
+    }
+
+    #[test]
+    fn normalize_mesh_policy_header_names_preserves_case_collisions() {
+        let mut policy = MeshPolicy {
+            name: "headers".to_string(),
+            namespace: "default".to_string(),
+            scope: PolicyScope::MeshWide,
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: vec![RequestMatch {
+                    headers: BTreeMap::from([
+                        ("X-Tenant".to_string(), "prod".to_string()),
+                        ("x-tenant".to_string(), "dev".to_string()),
+                    ])
+                    .into_iter()
+                    .collect(),
+                    ..RequestMatch::default()
+                }],
+                when: Vec::new(),
+                action: PolicyAction::Allow,
+            }],
+        };
+
+        normalize_mesh_policy_header_names(&mut policy);
+
+        assert!(policy.rules[0].to[0].headers.contains_key("X-Tenant"));
+        assert!(policy.rules[0].to[0].headers.contains_key("x-tenant"));
     }
 }

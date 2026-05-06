@@ -850,19 +850,30 @@ fn normalize_mesh_policy_headers(policies: &mut [MeshPolicy]) {
     for policy in policies {
         for rule in &mut policy.rules {
             for request in &mut rule.to {
-                if request
-                    .headers
-                    .keys()
-                    .all(|key| key.bytes().all(|byte| !byte.is_ascii_uppercase()))
-                {
-                    continue;
-                }
-                request.headers = request
-                    .headers
-                    .drain()
-                    .map(|(key, value)| (key.to_ascii_lowercase(), value))
-                    .collect();
+                normalize_mesh_policy_header_map(&mut request.headers);
             }
         }
     }
+}
+
+fn normalize_mesh_policy_header_map(headers: &mut HashMap<String, String>) {
+    if headers
+        .keys()
+        .all(|key| key.bytes().all(|byte| !byte.is_ascii_uppercase()))
+    {
+        return;
+    }
+
+    let mut lowered = HashSet::with_capacity(headers.len());
+    if headers
+        .keys()
+        .any(|key| !lowered.insert(key.to_ascii_lowercase()))
+    {
+        return;
+    }
+
+    *headers = headers
+        .drain()
+        .map(|(key, value)| (key.to_ascii_lowercase(), value))
+        .collect();
 }

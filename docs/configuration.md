@@ -162,7 +162,7 @@ Mesh mode consumes Layer 2 mesh slices from the control protocols and prepares t
 
 Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Prometheus plugin when mesh metadata is present. The added series are `ferrum_mesh_requests_total` and `ferrum_mesh_request_duration_ms`, labelled with source/destination workload, namespace, principal, app, service, request protocol, response code, response flags, and connection security policy.
 
-Mesh authorization normalizes policy header match names to lowercase at admission/plugin construction, so request-time checks use the already-lowercase header map without per-request key allocation. Wildcard matches support `*` anywhere in the policy pattern while preserving anchored-prefix and anchored-suffix semantics.
+Mesh authorization normalizes policy header match names to lowercase at admission/plugin construction when doing so is unambiguous, so request-time checks use the already-lowercase header map without per-request key allocation. Case-variant duplicate header rules are preserved and evaluated together to avoid nondeterministic policy outcomes. Wildcard matches support `*` anywhere in the policy pattern while preserving anchored-prefix and anchored-suffix semantics.
 
 Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the canonical config. Remote clusters carry trust domains and federation endpoints, VM `WorkloadEntry` resources populate workload addresses/network/cluster metadata, and east-west gateway entries are materialized as SNI-routed passthrough stream proxies only in `east_west_gateway` topology.
 
