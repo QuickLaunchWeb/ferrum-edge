@@ -391,7 +391,10 @@ pub(crate) fn upstream_for_route(
     backends: Vec<RouteBackend>,
 ) -> Upstream {
     let now = Utc::now();
-    let has_weighted_target = backends.iter().any(|backend| backend.weight != 1);
+    let first_weight = backends.first().map(|backend| backend.weight).unwrap_or(1);
+    let has_weighted_target = backends
+        .iter()
+        .any(|backend| backend.weight != first_weight);
     Upstream {
         id: id.clone(),
         name: Some(id),

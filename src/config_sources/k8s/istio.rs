@@ -344,7 +344,9 @@ fn virtual_service_routes(
         };
 
         let (backend_host, backend_port, upstream_id) = if backends.len() == 1 {
-            let backend = backends.into_iter().next().expect("one backend");
+            let Some(backend) = backends.into_iter().next() else {
+                continue;
+            };
             (backend.host, backend.port, None)
         } else {
             let upstream_id = resource_id(
@@ -418,6 +420,8 @@ fn route_backends(
         .flatten()
         .collect();
     let preserve_single_destination = routes.len() == 1;
+    let all_weights_omitted =
+        !preserve_single_destination && routes.iter().all(|route| route.get("weight").is_none());
     for route in routes {
         let Some(destination) = route.get("destination") else {
             continue;
@@ -433,7 +437,11 @@ fn route_backends(
             .and_then(|p| p.get("number"))
             .and_then(Value::as_u64)
             .unwrap_or(80) as u16;
-        let weight = route_weight(object, route)?;
+        let weight = if all_weights_omitted {
+            1
+        } else {
+            route_weight(object, route)?
+        };
         if weight == 0 && !preserve_single_destination {
             continue;
         }
@@ -637,6 +645,26 @@ mod tests {
     }
 
     #[test]
+    fn virtual_service_without_match_defaults_to_catch_all() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/"));
+    }
+
+    #[test]
     fn virtual_service_preserves_weighted_destinations() {
         let result = translate_k8s_objects(
             &[object(
@@ -667,6 +695,41 @@ mod tests {
         assert_eq!(
             result.config.upstreams[0].targets[1].host,
             "api-v2.default.svc.cluster.local"
+        );
+    }
+
+    #[test]
+    fn virtual_service_evenly_splits_all_omitted_weights() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [
+                            {"destination": {"host": "api-v1.default.svc.cluster.local", "port": {"number": 8080}}},
+                            {"destination": {"host": "api-v2.default.svc.cluster.local", "port": {"number": 8081}}}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.upstreams.len(), 1);
+        assert_eq!(
+            result.config.upstreams[0].algorithm,
+            crate::config::types::LoadBalancerAlgorithm::RoundRobin
+        );
+        assert_eq!(result.config.upstreams[0].targets.len(), 2);
+        assert!(
+            result.config.upstreams[0]
+                .targets
+                .iter()
+                .all(|target| target.weight == 1)
         );
     }
 

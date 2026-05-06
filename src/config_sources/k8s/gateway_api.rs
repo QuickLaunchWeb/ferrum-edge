@@ -144,7 +144,9 @@ fn http_route_proxies(
                 None,
             )
         } else if backends.len() == 1 {
-            let backend = backends.into_iter().next().expect("one backend");
+            let Some(backend) = backends.into_iter().next() else {
+                continue;
+            };
             (backend.host, backend.port, None)
         } else {
             let route_suffix = format!("{route_kind}-{rule_index}");
@@ -591,6 +593,41 @@ mod tests {
         assert_eq!(result.config.proxies[0].hosts, vec!["grpc.example.com"]);
         assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/"));
         assert_eq!(result.config.proxies[0].backend_port, 50051);
+    }
+
+    #[test]
+    fn grpc_route_preserves_weighted_backend_refs() {
+        let result = translate_k8s_objects(
+            &[object(
+                "GRPCRoute",
+                serde_json::json!({
+                    "hostnames": ["grpc.example.com"],
+                    "rules": [{
+                        "matches": [
+                            {"method": {"service": "helloworld.Greeter", "method": "SayHello"}},
+                            {"method": {"service": "helloworld.Greeter", "method": "SayGoodbye"}}
+                        ],
+                        "backendRefs": [
+                            {"name": "grpc-v1", "port": 50051, "weight": 90},
+                            {"name": "grpc-v2", "port": 50052, "weight": 10}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/"));
+        assert_eq!(result.config.upstreams.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].upstream_id.as_deref(),
+            Some(result.config.upstreams[0].id.as_str())
+        );
+        assert_eq!(result.config.upstreams[0].targets.len(), 2);
+        assert_eq!(result.config.upstreams[0].targets[0].weight, 90);
+        assert_eq!(result.config.upstreams[0].targets[1].port, 50052);
     }
 
     #[test]
