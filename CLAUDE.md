@@ -154,6 +154,8 @@ Frontend TLS/DTLS handshakes are bounded by `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEO
 
 `passthrough: true` on stream proxies forwards encrypted bytes to backend without TLS/DTLS termination. Peeks at ClientHello for SNI (`src/proxy/sni.rs`). TCP: `TcpStream::peek()` then `bidirectional_copy`. UDP: parse first DTLS ClientHello for SNI; backend is plain UDP. Validation: stream proxies only, mutually exclusive with `frontend_tls`, backend TLS fields rejected. `StreamConnectionContext.sni_hostname` + `consumer_username` (from `effective_identity()`) flow to stream lifecycle plugins.
 
+**TCP+TLS connection ordering**: For TLS-terminating TCP (`frontend_tls: true`, not passthrough), complete the downstream TLS handshake before opening the backend TCP/TLS connection. Then run `on_stream_connect` with client certificate context before any backend socket is consumed. Frontend TLS failures and plugin rejects are frontend setup failures: do not dial backend and do not trip backend circuit breakers. Plain TCP server-first protocols and passthrough may require different upstream timing; do not move backend connect ahead of frontend TLS without preserving these invariants and tests.
+
 ### TCP Bidirectional-Relay Modes (`src/proxy/tcp_proxy.rs`)
 
 Splice/kTLS-splice/io_uring paths use the syscall fast path; userspace runs only when splice unavailable (non-Linux, TLS w/o kTLS, backend TLS-terminated).

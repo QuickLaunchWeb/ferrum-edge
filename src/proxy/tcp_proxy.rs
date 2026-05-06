@@ -1446,9 +1446,10 @@ async fn handle_tcp_connection_inner(
     };
 
     // Terminating TCP-TLS should complete the downstream TLS handshake before
-    // opening an upstream connection. This mirrors Envoy's order and avoids
-    // spending backend sockets/handshakes on clients that fail frontend TLS or
-    // are rejected by stream-connect plugins.
+    // opening an upstream connection. This avoids spending backend sockets or
+    // handshakes on clients that fail frontend TLS or are rejected by
+    // stream-connect plugins, matching the conservative enterprise proxy
+    // ordering for TLS-terminating TCP listeners.
     let client_stream = if let Some(tls_config) = frontend_tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
         // Frontend TLS failures are client-side — do not penalise the backend CB.

@@ -91,7 +91,7 @@ Connection/Session In
 
 Body-aware `before_proxy` plugins such as `graphql`, request-side `body_validator`, `ai_request_guard`, and `ai_prompt_shield` now pre-buffer only matching request bodies (for example JSON `POST` requests). Non-matching requests can continue on the faster streaming path.
 
-**Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). For TCP+TLS listeners it runs after the frontend TLS handshake, so plugins can inspect the client certificate. Plugins can reject to close the connection immediately. Plugins can also insert metadata (e.g., correlation ID, trace ID) into `ctx.metadata`, which is carried through to `on_stream_disconnect`.
+**Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). For TCP+TLS listeners it runs after the frontend TLS handshake and before the backend connection is opened, so plugins can inspect the client certificate without spending an upstream socket first. Frontend TLS handshake failures do not fire stream plugins; plugin rejects close the frontend connection immediately and do not dial the backend. Plugins can also insert metadata (e.g., correlation ID, trace ID) into `ctx.metadata`, which is carried through to `on_stream_disconnect`.
 
 **Phase 2 — `on_stream_disconnect`**: Runs after the stream completes (TCP connection closed, or a UDP/DTLS session expires, is cleaned up, or otherwise ends). Receives a `StreamTransactionSummary` with bytes transferred, duration, error info, and metadata from the connect phase. Fire-and-forget — does not block cleanup.
 
