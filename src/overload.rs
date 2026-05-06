@@ -611,8 +611,8 @@ pub fn raise_fd_limit() -> RaiseFdLimitResult {
 /// (queried via `Handle::current().metrics().num_workers()`), let tokio's
 /// scheduler distribute them across workers, and report the **maximum**
 /// scheduling delay observed across all probes. The timer starts before each
-/// probe is spawned so a starved worker surfaces both first-poll queueing delay
-/// and post-`yield_now()` re-poll delay in the aggregate reading.
+/// probe is spawned, so a starved worker surfaces both first-poll queueing
+/// delay and post-`yield_now()` re-poll delay in the aggregate reading.
 ///
 /// Each probe is a single `yield_now().await` (a few microseconds in the
 /// healthy case), so the overall cost scales linearly with worker count and
