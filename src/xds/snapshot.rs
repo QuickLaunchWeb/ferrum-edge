@@ -4,20 +4,12 @@ use std::sync::Arc;
 
 use super::proto;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct XdsConfigFingerprint {
-    loaded_at_seconds: i64,
-    loaded_at_nanos: u32,
-    config_addr: usize,
-}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct XdsConfigFingerprint(Arc<str>);
 
 impl XdsConfigFingerprint {
-    pub(crate) fn new(loaded_at_seconds: i64, loaded_at_nanos: u32, config_addr: usize) -> Self {
-        Self {
-            loaded_at_seconds,
-            loaded_at_nanos,
-            config_addr,
-        }
+    pub(crate) fn new(value: String) -> Self {
+        Self(Arc::from(value))
     }
 }
 
@@ -159,10 +151,10 @@ impl XdsSnapshotCache {
     pub(crate) fn get_if_fingerprint(
         &self,
         node_id: &str,
-        fingerprint: XdsConfigFingerprint,
+        fingerprint: &XdsConfigFingerprint,
     ) -> Option<Arc<XdsSnapshot>> {
         self.snapshots.get(node_id).and_then(|cached| {
-            (cached.fingerprint == Some(fingerprint)).then(|| Arc::clone(&cached.snapshot))
+            (cached.fingerprint.as_ref() == Some(fingerprint)).then(|| Arc::clone(&cached.snapshot))
         })
     }
 

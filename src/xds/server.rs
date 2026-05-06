@@ -1,6 +1,7 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -34,6 +35,34 @@ struct XdsSubscription {
     resource_names: Vec<String>,
     wildcard: bool,
     legacy_wildcard: bool,
+}
+
+#[derive(Clone)]
+struct XdsStreamConfig {
+    config: GatewayConfig,
+    fingerprint: XdsConfigFingerprint,
+}
+
+impl XdsStreamConfig {
+    fn new(config: GatewayConfig) -> Self {
+        let fingerprint = config_fingerprint(&config);
+        Self {
+            config,
+            fingerprint,
+        }
+    }
+
+    fn replace(&mut self, config: GatewayConfig) {
+        *self = Self::new(config);
+    }
+
+    fn apply_update(&mut self, update: &ConfigUpdate) -> bool {
+        if !XdsAdsServer::apply_update_to_stream_config(&mut self.config, update) {
+            return false;
+        }
+        self.fingerprint = config_fingerprint(&self.config);
+        true
+    }
 }
 
 /// Envoy ADS implementation for Phase B.
@@ -187,14 +216,37 @@ impl XdsAdsServer {
     }
 
     fn snapshot_for_config(&self, node_id: &str, config: &GatewayConfig) -> Arc<XdsSnapshot> {
+        // Non-stream helper for tests and one-off callers. ADS streams carry
+        // XdsStreamConfig so request/ACK cache hits do not rehash config.
         let fingerprint = config_fingerprint(config);
+        self.snapshot_for_config_with_fingerprint(node_id, config, &fingerprint)
+    }
+
+    fn snapshot_for_stream_config(
+        &self,
+        node_id: &str,
+        stream_config: &XdsStreamConfig,
+    ) -> Arc<XdsSnapshot> {
+        self.snapshot_for_config_with_fingerprint(
+            node_id,
+            &stream_config.config,
+            &stream_config.fingerprint,
+        )
+    }
+
+    fn snapshot_for_config_with_fingerprint(
+        &self,
+        node_id: &str,
+        config: &GatewayConfig,
+        fingerprint: &XdsConfigFingerprint,
+    ) -> Arc<XdsSnapshot> {
         if let Some(snapshot) = self.snapshot_cache.get_if_fingerprint(node_id, fingerprint) {
             return snapshot;
         }
 
         let next = self.rebuild_snapshot_from_config(node_id, config);
         self.snapshot_cache
-            .insert_with_fingerprint(next, fingerprint)
+            .insert_with_fingerprint(next, fingerprint.clone())
     }
 
     fn invalidate_snapshot_for_config_update(&self, node_id: &str) {
@@ -348,7 +400,41 @@ impl XdsAdsServer {
         config: &GatewayConfig,
         previous: Option<&XdsSnapshot>,
     ) -> (Arc<XdsSnapshot>, Vec<DiscoveryResponse>) {
-        let snapshot = self.snapshot_for_config(node_id, config);
+        let fingerprint = config_fingerprint(config);
+        self.sotw_responses_for_subscriptions_from_config_with_fingerprint(
+            node_id,
+            subscriptions,
+            config,
+            &fingerprint,
+            previous,
+        )
+    }
+
+    fn sotw_responses_for_stream_config_with_previous(
+        &self,
+        node_id: &str,
+        subscriptions: &HashMap<String, XdsSubscription>,
+        stream_config: &XdsStreamConfig,
+        previous: Option<&XdsSnapshot>,
+    ) -> (Arc<XdsSnapshot>, Vec<DiscoveryResponse>) {
+        self.sotw_responses_for_subscriptions_from_config_with_fingerprint(
+            node_id,
+            subscriptions,
+            &stream_config.config,
+            &stream_config.fingerprint,
+            previous,
+        )
+    }
+
+    fn sotw_responses_for_subscriptions_from_config_with_fingerprint(
+        &self,
+        node_id: &str,
+        subscriptions: &HashMap<String, XdsSubscription>,
+        config: &GatewayConfig,
+        fingerprint: &XdsConfigFingerprint,
+        previous: Option<&XdsSnapshot>,
+    ) -> (Arc<XdsSnapshot>, Vec<DiscoveryResponse>) {
+        let snapshot = self.snapshot_for_config_with_fingerprint(node_id, config, fingerprint);
         let responses = subscriptions
             .values()
             .filter(|subscription| {
@@ -363,6 +449,40 @@ impl XdsAdsServer {
         &self,
         node_id: &str,
         config: &GatewayConfig,
+        subscriptions: &mut HashMap<String, XdsSubscription>,
+        request: &DiscoveryRequest,
+    ) -> Option<(Arc<XdsSnapshot>, DiscoveryResponse)> {
+        let fingerprint = config_fingerprint(config);
+        self.sotw_response_for_request_with_fingerprint(
+            node_id,
+            config,
+            &fingerprint,
+            subscriptions,
+            request,
+        )
+    }
+
+    fn sotw_response_for_stream_request(
+        &self,
+        node_id: &str,
+        stream_config: &XdsStreamConfig,
+        subscriptions: &mut HashMap<String, XdsSubscription>,
+        request: &DiscoveryRequest,
+    ) -> Option<(Arc<XdsSnapshot>, DiscoveryResponse)> {
+        self.sotw_response_for_request_with_fingerprint(
+            node_id,
+            &stream_config.config,
+            &stream_config.fingerprint,
+            subscriptions,
+            request,
+        )
+    }
+
+    fn sotw_response_for_request_with_fingerprint(
+        &self,
+        node_id: &str,
+        config: &GatewayConfig,
+        fingerprint: &XdsConfigFingerprint,
         subscriptions: &mut HashMap<String, XdsSubscription>,
         request: &DiscoveryRequest,
     ) -> Option<(Arc<XdsSnapshot>, DiscoveryResponse)> {
@@ -404,7 +524,7 @@ impl XdsAdsServer {
             .is_none_or(|previous| previous != &subscription);
         subscriptions.insert(request.type_url.clone(), subscription.clone());
         if should_send_sotw_response(request, resource_names_changed) {
-            let snapshot = self.snapshot_for_config(node_id, config);
+            let snapshot = self.snapshot_for_config_with_fingerprint(node_id, config, fingerprint);
             if !request.response_nonce.is_empty()
                 && !subscription_change_affects_resources(
                     &snapshot,
@@ -453,7 +573,41 @@ impl XdsAdsServer {
         config: &GatewayConfig,
         previous: Option<&XdsSnapshot>,
     ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
-        let snapshot = self.snapshot_for_config(node_id, config);
+        let fingerprint = config_fingerprint(config);
+        self.delta_responses_for_subscriptions_from_config_with_fingerprint(
+            node_id,
+            subscriptions,
+            config,
+            &fingerprint,
+            previous,
+        )
+    }
+
+    fn delta_responses_for_stream_config_with_previous(
+        &self,
+        node_id: &str,
+        subscriptions: &HashMap<String, XdsSubscription>,
+        stream_config: &XdsStreamConfig,
+        previous: Option<&XdsSnapshot>,
+    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
+        self.delta_responses_for_subscriptions_from_config_with_fingerprint(
+            node_id,
+            subscriptions,
+            &stream_config.config,
+            &stream_config.fingerprint,
+            previous,
+        )
+    }
+
+    fn delta_responses_for_subscriptions_from_config_with_fingerprint(
+        &self,
+        node_id: &str,
+        subscriptions: &HashMap<String, XdsSubscription>,
+        config: &GatewayConfig,
+        fingerprint: &XdsConfigFingerprint,
+        previous: Option<&XdsSnapshot>,
+    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
+        let snapshot = self.snapshot_for_config_with_fingerprint(node_id, config, fingerprint);
         let responses = subscriptions
             .values()
             .filter(|subscription| {
@@ -535,12 +689,12 @@ impl XdsAdsServer {
     fn catch_up_pending_updates(
         &self,
         updates: &mut broadcast::Receiver<ConfigUpdate>,
-        stream_config: &mut GatewayConfig,
+        stream_config: &mut XdsStreamConfig,
     ) {
         loop {
             match updates.try_recv() {
                 Ok(update) => {
-                    Self::apply_update_to_stream_config(stream_config, &update);
+                    stream_config.apply_update(&update);
                 }
                 Err(broadcast::error::TryRecvError::Empty) => return,
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
@@ -549,7 +703,7 @@ impl XdsAdsServer {
                         n
                     );
                     let current = self.config.load_full();
-                    *stream_config = current.as_ref().clone();
+                    stream_config.replace(current.as_ref().clone());
                 }
                 Err(broadcast::error::TryRecvError::Closed) => return,
             }
@@ -558,13 +712,23 @@ impl XdsAdsServer {
 }
 
 fn config_fingerprint(config: &GatewayConfig) -> XdsConfigFingerprint {
-    // Keep cache-hit checks cheap: published configs are new Arc allocations,
-    // and stream-local mutations evict the node cache at the update boundary.
-    XdsConfigFingerprint::new(
-        config.loaded_at.timestamp(),
-        config.loaded_at.timestamp_subsec_nanos(),
-        config as *const GatewayConfig as usize,
-    )
+    match serde_json::to_vec(config) {
+        Ok(bytes) => fingerprint_bytes([b"full-config".as_slice(), bytes.as_slice()]),
+        Err(error) => {
+            let error = error.to_string();
+            fingerprint_bytes([b"full-config-error".as_slice(), error.as_bytes()])
+        }
+    }
+}
+
+fn fingerprint_bytes<const N: usize>(parts: [&[u8]; N]) -> XdsConfigFingerprint {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+        hasher.update([0xff]);
+    }
+    let digest = hex::encode(hasher.finalize());
+    XdsConfigFingerprint::new(digest[..16].to_string())
 }
 
 #[tonic::async_trait]
@@ -589,7 +753,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             let mut stream_guard = server.stream_guard();
             let mut node_id: Option<String> = None;
             let mut subscriptions: HashMap<String, XdsSubscription> = HashMap::new();
-            let mut stream_config = server.config.load_full().as_ref().clone();
+            let mut stream_config =
+                XdsStreamConfig::new(server.config.load_full().as_ref().clone());
             let mut last_snapshot: Option<Arc<XdsSnapshot>> = None;
             loop {
                 tokio::select! {
@@ -627,7 +792,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             server.catch_up_pending_updates(&mut updates, &mut stream_config);
                         }
 
-                        let send_failed = if let Some((snapshot, response)) = server.sotw_response_for_request(
+                        let send_failed = if let Some((snapshot, response)) = server.sotw_response_for_stream_request(
                             &current_node_id,
                             &stream_config,
                             &mut subscriptions,
@@ -646,7 +811,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                     update = updates.recv() => {
                         match update {
                             Ok(update) => {
-                                if !Self::apply_update_to_stream_config(&mut stream_config, &update) {
+                                if !stream_config.apply_update(&update) {
                                     continue;
                                 }
                                 let Some(current_node_id) = node_id.as_ref() else {
@@ -656,7 +821,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
-                                let (snapshot, responses) = server.sotw_responses_for_subscriptions_from_config_with_previous(
+                                let (snapshot, responses) = server.sotw_responses_for_stream_config_with_previous(
                                     current_node_id,
                                     &subscriptions,
                                     &stream_config,
@@ -672,7 +837,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             Err(broadcast::error::RecvError::Lagged(n)) => {
                                 warn!("xDS ADS stream lagged by {} config updates; sending fresh snapshots", n);
                                 let current = server.config.load_full();
-                                stream_config = current.as_ref().clone();
+                                stream_config.replace(current.as_ref().clone());
                                 let Some(current_node_id) = node_id.as_ref() else {
                                     continue;
                                 };
@@ -680,7 +845,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
-                                let (snapshot, responses) = server.sotw_responses_for_subscriptions_from_config_with_previous(
+                                let (snapshot, responses) = server.sotw_responses_for_stream_config_with_previous(
                                     current_node_id,
                                     &subscriptions,
                                     &stream_config,
@@ -718,7 +883,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             let mut stream_guard = server.stream_guard();
             let mut node_id: Option<String> = None;
             let mut subscriptions: HashMap<String, XdsSubscription> = HashMap::new();
-            let mut stream_config = server.config.load_full().as_ref().clone();
+            let mut stream_config =
+                XdsStreamConfig::new(server.config.load_full().as_ref().clone());
             let mut last_snapshot: Option<Arc<XdsSnapshot>> = None;
             loop {
                 tokio::select! {
@@ -799,7 +965,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                         ) {
                             let previous = last_snapshot.clone();
                             let snapshot =
-                                server.snapshot_for_config(&current_node_id, &stream_config);
+                                server.snapshot_for_stream_config(&current_node_id, &stream_config);
                             let response = server.delta_response(
                                 &snapshot,
                                 previous.as_deref(),
@@ -817,7 +983,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                     update = updates.recv() => {
                         match update {
                             Ok(update) => {
-                                if !Self::apply_update_to_stream_config(&mut stream_config, &update) {
+                                if !stream_config.apply_update(&update) {
                                     continue;
                                 }
                                 let Some(current_node_id) = node_id.as_ref() else {
@@ -827,7 +993,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
-                                let (snapshot, responses) = server.delta_responses_for_subscriptions_from_config_with_previous(
+                                let (snapshot, responses) = server.delta_responses_for_stream_config_with_previous(
                                     current_node_id,
                                     &subscriptions,
                                     &stream_config,
@@ -843,7 +1009,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             Err(broadcast::error::RecvError::Lagged(n)) => {
                                 warn!("xDS delta ADS stream lagged by {} config updates; sending fresh snapshots", n);
                                 let current = server.config.load_full();
-                                stream_config = current.as_ref().clone();
+                                stream_config.replace(current.as_ref().clone());
                                 let Some(current_node_id) = node_id.as_ref() else {
                                     continue;
                                 };
@@ -851,7 +1017,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
-                                let (snapshot, responses) = server.delta_responses_for_subscriptions_from_config_with_previous(
+                                let (snapshot, responses) = server.delta_responses_for_stream_config_with_previous(
                                     current_node_id,
                                     &subscriptions,
                                     &stream_config,
@@ -1331,7 +1497,7 @@ mod tests {
             .update_tx
             .send(full_config_update(&new_config))
             .expect("pending update should send");
-        let mut stream_config = old_config;
+        let mut stream_config = XdsStreamConfig::new(old_config);
         server.catch_up_pending_updates(&mut updates, &mut stream_config);
         let mut subscriptions = HashMap::new();
         let request = DiscoveryRequest {
@@ -1340,7 +1506,12 @@ mod tests {
         };
 
         let (_, response) = server
-            .sotw_response_for_request("node-a", &stream_config, &mut subscriptions, &request)
+            .sotw_response_for_stream_request(
+                "node-a",
+                &stream_config,
+                &mut subscriptions,
+                &request,
+            )
             .expect("first SotW request should receive the caught-up snapshot");
 
         assert_eq!(
@@ -1359,7 +1530,7 @@ mod tests {
             .update_tx
             .send(full_config_update(&new_config))
             .expect("pending update should send");
-        let mut stream_config = old_config;
+        let mut stream_config = XdsStreamConfig::new(old_config);
         server.catch_up_pending_updates(&mut updates, &mut stream_config);
         let request = DeltaDiscoveryRequest {
             type_url: super::super::translator::CDS_TYPE_URL.to_string(),
@@ -1373,7 +1544,7 @@ mod tests {
             &request.resource_names_unsubscribe,
         );
         let previous = server.snapshot_cache.get("node-a");
-        let snapshot = server.snapshot_for_config("node-a", &stream_config);
+        let snapshot = server.snapshot_for_stream_config("node-a", &stream_config);
 
         let response = server.delta_response(
             &snapshot,
@@ -1507,12 +1678,14 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_cache_reuses_same_config_identity() {
+    fn snapshot_cache_reuses_same_config_content_across_streams() {
         let config = gateway_config_with_named_service("api", 0);
         let server = test_server(config.clone());
+        let first_stream = XdsStreamConfig::new(config.clone());
+        let second_stream = XdsStreamConfig::new(config);
 
-        let first = server.snapshot_for_config("node-a", &config);
-        let second = server.snapshot_for_config("node-a", &config);
+        let first = server.snapshot_for_stream_config("node-a", &first_stream);
+        let second = server.snapshot_for_stream_config("node-a", &second_stream);
 
         assert!(std::sync::Arc::ptr_eq(&first, &second));
     }
@@ -1522,15 +1695,12 @@ mod tests {
         let old_config = gateway_config_with_named_service("old", 0);
         let new_config = gateway_config_with_named_service("new", 0);
         let server = test_server(old_config.clone());
-        let mut stream_config = old_config;
+        let mut stream_config = XdsStreamConfig::new(old_config);
 
-        let old_snapshot = server.snapshot_for_config("node-a", &stream_config);
-        assert!(XdsAdsServer::apply_update_to_stream_config(
-            &mut stream_config,
-            &full_config_update(&new_config)
-        ));
+        let old_snapshot = server.snapshot_for_stream_config("node-a", &stream_config);
+        assert!(stream_config.apply_update(&full_config_update(&new_config)));
         server.invalidate_snapshot_for_config_update("node-a");
-        let new_snapshot = server.snapshot_for_config("node-a", &stream_config);
+        let new_snapshot = server.snapshot_for_stream_config("node-a", &stream_config);
 
         assert_eq!(
             new_snapshot.resources(super::super::translator::CDS_TYPE_URL)[0].name,
