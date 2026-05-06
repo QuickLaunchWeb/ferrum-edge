@@ -168,7 +168,7 @@ Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the can
 
 Phase D adds Kubernetes source translation and sidecar-injector scaffolding. Kubernetes resources translate into `GatewayConfig` / `MeshConfig`; no config source talks directly to the proxy runtime or xDS server.
 
-Gateway API `HTTPRoute` path matches preserve Kubernetes semantics: `PathPrefix` stays a prefix route, `Exact` is translated to an escaped regex for whole-path matching, and `RegularExpression` is passed through as a Ferrum regex route. Istio `VirtualService` URI matches follow the same shape for `prefix`, `exact`, and `regex`. Translated mesh routes do not strip the listen path before forwarding.
+Gateway API `HTTPRoute` path matches preserve Kubernetes semantics: `PathPrefix` stays a prefix route, `Exact` is translated to an exact-path route for whole-path matching, and `RegularExpression` is passed through as a Ferrum regex route. Istio `VirtualService` URI matches follow the same shape for `prefix`, `exact`, and `regex`. Translated mesh routes do not strip the listen path before forwarding.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|

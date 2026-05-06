@@ -371,7 +371,7 @@ pub(crate) fn service_dns_name(name: &str, namespace: &str) -> String {
 }
 
 pub(crate) fn exact_path_listen_path(path: &str) -> String {
-    format!("~(?P<__ferrum_k8s_exact_path>{})", regex::escape(path))
+    format!("={path}")
 }
 
 pub(crate) fn resource_id(prefix: &str, namespace: &str, name: &str, suffix: &str) -> String {

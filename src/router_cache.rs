@@ -35,7 +35,7 @@ pub struct RouteMatch {
     /// Extracted named path parameters from regex routes. Empty for prefix routes.
     pub path_params: Vec<(String, String)>,
     /// Length of the path prefix consumed by the match (for `strip_listen_path`).
-    /// For prefix routes: `listen_path.len()`. For regex routes: regex match length.
+    /// For prefix routes: `listen_path.len()`. For exact/regex routes: matched path length.
     pub matched_prefix_len: usize,
 }
 
@@ -492,9 +492,11 @@ impl RouterCache {
         // Increment sketch on insert so the new entry starts with a frequency of 1.
         match &result {
             Some(route_match)
-                if !route_match.path_params.is_empty() || is_regex_proxy(&route_match.proxy) =>
+                if !route_match.path_params.is_empty()
+                    || is_regex_proxy(&route_match.proxy)
+                    || is_exact_path_proxy(&route_match.proxy) =>
             {
-                // Regex match → regex cache
+                // Regex/exact match → regex cache (stores matched length).
                 if self.regex_cache.len() >= self.max_cache_entries
                     && !self.regex_cache.contains_key(&cache_key)
                 {
@@ -809,38 +811,6 @@ impl RouterCache {
             };
 
             if let Some(pattern_str) = listen_path.strip_prefix('~') {
-                if let Some(exact_path) = exact_path_from_k8s_regex_marker(pattern_str) {
-                    let add_exact_path = |target: &mut Vec<RouteEntry>, proxy: &Arc<Proxy>| {
-                        target.push(RouteEntry {
-                            listen_path: exact_path.clone(),
-                            proxy: Arc::clone(proxy),
-                        });
-                    };
-
-                    if proxy.hosts.is_empty() {
-                        add_exact_path(&mut catch_all_exact_paths, &arc_proxy);
-                    } else {
-                        for host in &proxy.hosts {
-                            let entry = RouteEntry {
-                                listen_path: exact_path.clone(),
-                                proxy: Arc::clone(&arc_proxy),
-                            };
-                            if host.starts_with("*.") {
-                                wildcard_hosts_exact_paths
-                                    .entry(host.clone())
-                                    .or_default()
-                                    .push(entry);
-                            } else {
-                                exact_hosts_exact_paths
-                                    .entry(host.clone())
-                                    .or_default()
-                                    .push(entry);
-                            }
-                        }
-                    }
-                    continue;
-                }
-
                 // Regex route: compile the pattern
                 // Auto-anchor for full-path matching (^pattern$)
                 let anchored = crate::config::types::anchor_regex_pattern(pattern_str);
@@ -890,6 +860,35 @@ impl RouterCache {
                                     proxy: Arc::clone(&arc_proxy),
                                 },
                             );
+                        }
+                    }
+                }
+            } else if let Some(exact_path) = listen_path.strip_prefix('=') {
+                let add_exact_path = |target: &mut Vec<RouteEntry>, proxy: &Arc<Proxy>| {
+                    target.push(RouteEntry {
+                        listen_path: exact_path.to_string(),
+                        proxy: Arc::clone(proxy),
+                    });
+                };
+
+                if proxy.hosts.is_empty() {
+                    add_exact_path(&mut catch_all_exact_paths, &arc_proxy);
+                } else {
+                    for host in &proxy.hosts {
+                        let entry = RouteEntry {
+                            listen_path: exact_path.to_string(),
+                            proxy: Arc::clone(&arc_proxy),
+                        };
+                        if host.starts_with("*.") {
+                            wildcard_hosts_exact_paths
+                                .entry(host.clone())
+                                .or_default()
+                                .push(entry);
+                        } else {
+                            exact_hosts_exact_paths
+                                .entry(host.clone())
+                                .or_default()
+                                .push(entry);
                         }
                     }
                 }
@@ -1194,29 +1193,11 @@ fn is_regex_proxy(proxy: &Proxy) -> bool {
         .is_some_and(|p| p.starts_with('~'))
 }
 
-fn exact_path_from_k8s_regex_marker(pattern: &str) -> Option<String> {
-    let escaped = pattern
-        .strip_prefix("(?P<__ferrum_k8s_exact_path>")?
-        .strip_suffix(')')?;
-    let literal = unescape_regex_literal(escaped)?;
-    if regex::escape(&literal) == escaped {
-        Some(literal)
-    } else {
-        None
-    }
-}
-
-fn unescape_regex_literal(escaped: &str) -> Option<String> {
-    let mut literal = String::with_capacity(escaped.len());
-    let mut chars = escaped.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            literal.push(chars.next()?);
-        } else {
-            literal.push(ch);
-        }
-    }
-    Some(literal)
+fn is_exact_path_proxy(proxy: &Proxy) -> bool {
+    proxy
+        .listen_path
+        .as_deref()
+        .is_some_and(|p| p.starts_with('='))
 }
 
 fn resolve_auto_router_cache_entries(proxy_count: usize) -> usize {
@@ -1568,7 +1549,7 @@ mod tests {
         let config = GatewayConfig {
             proxies: vec![
                 minimal_proxy_for_routing("root-prefix", "/"),
-                minimal_proxy_for_routing("exact", "~(?P<__ferrum_k8s_exact_path>/api\\.v1)"),
+                minimal_proxy_for_routing("exact", "=/api.v1"),
             ],
             ..GatewayConfig::default()
         };
