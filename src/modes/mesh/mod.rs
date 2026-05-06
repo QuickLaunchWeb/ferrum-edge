@@ -314,13 +314,38 @@ fn gateway_config_from_mesh_slice(
     prepare_gateway_config_for_native_slice(config, runtime, slice)
 }
 
-async fn wait_for_initial_mesh_slice(
+async fn wait_for_initial_mesh_config(
     mesh_state: &MeshRuntimeState,
+    runtime: &MeshRuntimeConfig,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<(), anyhow::Error> {
-    tokio::select! {
-        _ = mesh_state.wait_for_first_slice() => Ok(()),
-        _ = wait_for_mesh_shutdown(&mut shutdown_rx) => Err(anyhow::anyhow!("shutdown requested")),
+) -> Result<(GatewayConfig, String), anyhow::Error> {
+    let mut updates = mesh_state.subscribe();
+    loop {
+        if let Some(slice) = mesh_state.snapshot().as_ref().as_ref().cloned() {
+            match gateway_config_from_mesh_slice(&slice, runtime) {
+                Ok(config) => return Ok((config, slice.version)),
+                Err(e) => {
+                    warn!(
+                        mesh_slice_version = %slice.version,
+                        error = %e,
+                        "Ignoring invalid initial mesh slice"
+                    );
+                }
+            }
+        }
+
+        tokio::select! {
+            changed = updates.changed() => {
+                if changed.is_err() {
+                    return Err(anyhow::anyhow!(
+                        "mesh slice update channel closed before a valid initial slice arrived"
+                    ));
+                }
+            }
+            _ = wait_for_mesh_shutdown(&mut shutdown_rx) => {
+                return Err(anyhow::anyhow!("shutdown requested"));
+            }
+        }
     }
 }
 
@@ -563,20 +588,13 @@ pub async fn run(
                 has_first_slice = mesh_state.has_first_slice(),
                 "Mesh mode initialized native MeshSubscribe consumer"
             );
-            wait_for_initial_mesh_slice(&mesh_state, shutdown_tx.subscribe())
-                .await
-                .context("mesh runtime stopped before receiving initial mesh slice")?;
-            let initial_slice = mesh_state
-                .snapshot()
-                .as_ref()
-                .as_ref()
-                .cloned()
-                .context("mesh state signaled ready without an installed slice")?;
-            let config = gateway_config_from_mesh_slice(&initial_slice, &runtime)
-                .context("failed to prepare mesh plugin bootstrap config")?;
+            let (config, mesh_slice_version) =
+                wait_for_initial_mesh_config(&mesh_state, &runtime, shutdown_tx.subscribe())
+                    .await
+                    .context("mesh runtime stopped before receiving a valid initial mesh slice")?;
             info!(
                 mesh_global_plugins = config.plugin_configs.len(),
-                mesh_slice_version = %initial_slice.version,
+                mesh_slice_version = %mesh_slice_version,
                 "Mesh global plugin chain prepared from initial native slice"
             );
             config
@@ -1013,8 +1031,9 @@ mod tests {
     use super::*;
     use crate::config::EnvConfig;
     use crate::config::mesh::{
-        AppProtocol, EastWestGateway, MeshConfig, MeshPolicy, MeshRule, MultiClusterConfig,
-        PolicyAction, PolicyScope, PrincipalMatch, Workload, WorkloadPort, WorkloadSelector,
+        AppProtocol, EastWestGateway, MeshConfig, MeshPolicy, MeshRule, MeshService,
+        MultiClusterConfig, PolicyAction, PolicyScope, PrincipalMatch, Workload, WorkloadPort,
+        WorkloadSelector,
     };
     use crate::config::types::PluginScope;
     use crate::identity::{SpiffeId, TrustDomain};
@@ -1578,6 +1597,56 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mesh_runtime_waits_for_valid_initial_native_slice() {
+        let runtime = MeshRuntimeConfig {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            cp_urls: vec!["http://127.0.0.1:1".to_string()],
+            config_protocol: MeshConfigProtocol::Native,
+            topology: MeshTopology::Sidecar,
+            inbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            outbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            hbone_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            east_west_listen_port: DEFAULT_EAST_WEST_LISTEN_PORT,
+            workload_spiffe_id: None,
+        };
+        let mesh_state = MeshRuntimeState::new();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let state = mesh_state.clone();
+
+        let wait = tokio::spawn(async move {
+            wait_for_initial_mesh_config(&state, &runtime, shutdown_rx).await
+        });
+
+        mesh_state.install_slice(MeshSlice {
+            version: "bad-slice".to_string(),
+            services: vec![MeshService {
+                name: String::new(),
+                namespace: "default".to_string(),
+                ports: Vec::new(),
+                workloads: Vec::new(),
+                protocol_overrides: HashMap::new(),
+            }],
+            ..MeshSlice::default()
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!wait.is_finished());
+
+        mesh_state.install_slice(MeshSlice {
+            version: "good-slice".to_string(),
+            ..MeshSlice::default()
+        });
+
+        let (config, version) = wait
+            .await
+            .expect("wait task joins")
+            .expect("valid slice is accepted");
+        assert_eq!(version, "good-slice");
+        assert!(!config.plugin_configs.is_empty());
     }
 
     #[test]
