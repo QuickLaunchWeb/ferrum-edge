@@ -284,8 +284,8 @@ fn snapshot_cache_is_keyed_by_node_id() {
     cache.insert(translate_mesh_slice_to_snapshot(&slice_b));
 
     assert_eq!(cache.len(), 2);
-    assert_eq!(cache.get("node-a").unwrap().version, "v1");
-    assert_eq!(cache.get("node-b").unwrap().version, "v2");
+    assert!(cache.get("node-a").unwrap().version.starts_with("v1:"));
+    assert!(cache.get("node-b").unwrap().version.starts_with("v2:"));
 }
 
 #[test]

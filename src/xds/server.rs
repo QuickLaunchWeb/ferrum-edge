@@ -187,15 +187,14 @@ impl XdsAdsServer {
     }
 
     fn snapshot_for_config(&self, node_id: &str, config: &GatewayConfig) -> Arc<XdsSnapshot> {
-        let version = config.loaded_at.to_rfc3339();
+        let next = self.rebuild_snapshot_from_config(node_id, config);
         if let Some(snapshot) = self.snapshot_cache.get(node_id)
-            && snapshot.version == version
+            && snapshot.version == next.version
         {
             return snapshot;
         }
 
-        self.snapshot_cache
-            .insert(self.rebuild_snapshot_from_config(node_id, config))
+        self.snapshot_cache.insert(next)
     }
 
     fn stream_guard(&self) -> XdsStreamGuard {
@@ -1449,7 +1448,11 @@ mod tests {
 
         let next_config = gateway_config_with_named_service("new", 1);
         let shared_snapshot = server.snapshot_for_config("node-a", &next_config);
-        assert_eq!(shared_snapshot.version, next_config.loaded_at.to_rfc3339());
+        assert!(
+            shared_snapshot
+                .version
+                .starts_with(&format!("{}:", next_config.loaded_at.to_rfc3339()))
+        );
 
         let (_, responses) = server.sotw_responses_for_subscriptions_from_config_with_previous(
             "node-a",
@@ -1463,6 +1466,26 @@ mod tests {
             cluster_names(&responses[0]),
             vec!["cluster/default/new/8080".to_string()]
         );
+    }
+
+    #[test]
+    fn snapshot_cache_rebuilds_when_same_timestamp_content_changes() {
+        let old_config = gateway_config_with_named_service("old", 0);
+        let server = test_server(old_config.clone());
+        let old_snapshot = server.snapshot_for_config("node-a", &old_config);
+        assert_eq!(
+            old_snapshot.resources(super::super::translator::CDS_TYPE_URL)[0].name,
+            "cluster/default/old/8080"
+        );
+
+        let new_config = gateway_config_with_named_service("new", 0);
+        let new_snapshot = server.snapshot_for_config("node-a", &new_config);
+
+        assert_eq!(
+            new_snapshot.resources(super::super::translator::CDS_TYPE_URL)[0].name,
+            "cluster/default/new/8080"
+        );
+        assert_ne!(old_snapshot.version, new_snapshot.version);
     }
 
     #[test]

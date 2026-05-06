@@ -1,4 +1,5 @@
 use prost::Message;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 use super::proto;
@@ -27,7 +28,11 @@ pub fn translate_mesh_slice_to_snapshot(slice: &MeshSlice) -> XdsSnapshot {
     resources.extend(translate_cds(slice));
     resources.extend(translate_eds(slice));
     resources.extend(translate_sds(slice));
-    XdsSnapshot::new(slice.node_id.clone(), slice.version.clone(), resources)
+    let version = content_version(&slice.version, &resources);
+    for resource in &mut resources {
+        resource.version = version.clone();
+    }
+    XdsSnapshot::new(slice.node_id.clone(), version, resources)
 }
 
 pub fn translate_lds(slice: &MeshSlice) -> Vec<XdsResource> {
@@ -193,4 +198,24 @@ where
         version: version.to_string(),
         value: message.encode_to_vec(),
     }
+}
+
+fn content_version(base_version: &str, resources: &[XdsResource]) -> String {
+    let mut hasher = Sha256::new();
+    let mut resources: Vec<&XdsResource> = resources.iter().collect();
+    resources.sort_by(|left, right| {
+        left.type_url
+            .cmp(&right.type_url)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    for resource in resources {
+        hasher.update(resource.type_url.as_bytes());
+        hasher.update([0]);
+        hasher.update(resource.name.as_bytes());
+        hasher.update([0]);
+        hasher.update(&resource.value);
+        hasher.update([0xff]);
+    }
+    let digest = hex::encode(hasher.finalize());
+    format!("{base_version}:{}", &digest[..16])
 }
