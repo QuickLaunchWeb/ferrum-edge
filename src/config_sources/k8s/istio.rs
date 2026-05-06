@@ -448,7 +448,7 @@ fn route_backends(
 
 fn route_weight(object: &K8sObject, route: &Value) -> Result<u32, K8sTranslateError> {
     let Some(weight) = route.get("weight").and_then(Value::as_u64) else {
-        return Ok(1);
+        return Ok(0);
     };
     if weight > u64::from(MAX_TARGET_WEIGHT) {
         return Err(invalid_resource(
@@ -667,6 +667,35 @@ mod tests {
             result.config.upstreams[0].targets[1].host,
             "api-v2.default.svc.cluster.local"
         );
+    }
+
+    #[test]
+    fn virtual_service_skips_omitted_weight_in_multi_destination_split() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [
+                            {"destination": {"host": "api-v1.default.svc.cluster.local", "port": {"number": 8080}}, "weight": 100},
+                            {"destination": {"host": "api-v2.default.svc.cluster.local", "port": {"number": 8081}}}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "api-v1.default.svc.cluster.local"
+        );
+        assert_eq!(result.config.proxies[0].backend_port, 8080);
+        assert!(result.config.upstreams.is_empty());
     }
 
     #[test]
