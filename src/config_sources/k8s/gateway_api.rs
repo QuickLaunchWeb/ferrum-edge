@@ -124,6 +124,11 @@ fn http_route_proxies(
         .flatten()
         .enumerate()
     {
+        let match_paths = match_paths(rule);
+        if match_paths.is_empty() {
+            continue;
+        }
+
         let backends = route_backends(object, rule, acc)?;
         if backends.is_empty() {
             continue;
@@ -146,26 +151,6 @@ fn http_route_proxies(
             ));
             (String::new(), 0, Some(upstream_id))
         };
-
-        let mut seen_paths = HashSet::new();
-        let match_paths = rule
-            .get("matches")
-            .and_then(Value::as_array)
-            .map(|matches| {
-                matches
-                    .iter()
-                    .map(|m| {
-                        m.get("path")
-                            .and_then(http_path_match)
-                            .or_else(|| Some("/".to_string()))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .filter(|matches| !matches.is_empty())
-            .unwrap_or_else(|| vec![Some("/".to_string())])
-            .into_iter()
-            .filter(|listen_path| seen_paths.insert(listen_path.clone()))
-            .collect::<Vec<_>>();
 
         let match_count = match_paths.len();
         for (match_index, listen_path) in match_paths.into_iter().enumerate() {
@@ -194,6 +179,22 @@ fn http_route_proxies(
     }
 
     Ok(proxies)
+}
+
+fn match_paths(rule: &Value) -> Vec<Option<String>> {
+    let Some(matches) = rule.get("matches").and_then(Value::as_array) else {
+        return vec![Some("/".to_string())];
+    };
+    if matches.is_empty() {
+        return vec![Some("/".to_string())];
+    }
+
+    let mut seen_paths = HashSet::new();
+    matches
+        .iter()
+        .filter_map(|m| m.get("path").and_then(http_path_match).map(Some))
+        .filter(|listen_path| seen_paths.insert(listen_path.clone()))
+        .collect()
 }
 
 fn route_backends(
@@ -481,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn http_route_dedupes_pathless_matches_to_one_catch_all_proxy() {
+    fn http_route_skips_explicit_pathless_matches() {
         let result = translate_k8s_objects(
             &[object(
                 "HTTPRoute",
@@ -492,6 +493,33 @@ mod tests {
                             {"headers": [{"name": "x-tenant", "value": "a"}]},
                             {"method": "GET"}
                         ],
+                        "backendRefs": [
+                            {"name": "api-a", "port": 8080},
+                            {"name": "api-b", "port": 8081}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.proxies.is_empty());
+        assert!(result.config.upstreams.is_empty());
+    }
+
+    #[test]
+    fn http_route_ignores_pathless_match_in_mixed_rule() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "hostnames": ["api.example.com"],
+                    "rules": [{
+                        "matches": [
+                            {"path": {"type": "PathPrefix", "value": "/v1"}},
+                            {"headers": [{"name": "x-tenant", "value": "a"}]}
+                        ],
                         "backendRefs": [{"name": "api", "port": 8080}]
                     }]
                 }),
@@ -501,7 +529,7 @@ mod tests {
         .expect("translation succeeds");
 
         assert_eq!(result.config.proxies.len(), 1);
-        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/"));
+        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/v1"));
     }
 
     #[test]

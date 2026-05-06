@@ -333,6 +333,11 @@ fn virtual_service_routes(
         .flatten()
         .enumerate()
     {
+        let match_paths = match_paths(http);
+        if match_paths.is_empty() {
+            continue;
+        }
+
         let backends = route_backends(object, http)?;
         if backends.is_empty() {
             continue;
@@ -355,26 +360,6 @@ fn virtual_service_routes(
             ));
             (String::new(), 0, Some(upstream_id))
         };
-
-        let mut seen_paths = HashSet::new();
-        let match_paths = http
-            .get("match")
-            .and_then(Value::as_array)
-            .map(|matches| {
-                matches
-                    .iter()
-                    .map(|m| {
-                        m.get("uri")
-                            .and_then(path_match)
-                            .or_else(|| Some("/".to_string()))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .filter(|matches| !matches.is_empty())
-            .unwrap_or_else(|| vec![Some("/".to_string())])
-            .into_iter()
-            .filter(|listen_path| seen_paths.insert(listen_path.clone()))
-            .collect::<Vec<_>>();
 
         let match_count = match_paths.len();
         for (match_index, listen_path) in match_paths.into_iter().enumerate() {
@@ -403,6 +388,22 @@ fn virtual_service_routes(
     }
 
     Ok((proxies, upstreams))
+}
+
+fn match_paths(http: &Value) -> Vec<Option<String>> {
+    let Some(matches) = http.get("match").and_then(Value::as_array) else {
+        return vec![Some("/".to_string())];
+    };
+    if matches.is_empty() {
+        return vec![Some("/".to_string())];
+    }
+
+    let mut seen_paths = HashSet::new();
+    matches
+        .iter()
+        .filter_map(|m| m.get("uri").and_then(path_match).map(Some))
+        .filter(|listen_path| seen_paths.insert(listen_path.clone()))
+        .collect()
 }
 
 fn route_backends(
@@ -733,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_service_dedupes_pathless_matches_to_one_catch_all_proxy() {
+    fn virtual_service_skips_explicit_pathless_matches() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -752,8 +753,32 @@ mod tests {
         )
         .expect("translation succeeds");
 
+        assert!(result.config.proxies.is_empty());
+        assert!(result.config.upstreams.is_empty());
+    }
+
+    #[test]
+    fn virtual_service_ignores_pathless_match_in_mixed_rule() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/v1"}},
+                            {"headers": {"x-tenant": {"exact": "a"}}}
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
         assert_eq!(result.config.proxies.len(), 1);
-        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/"));
+        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/v1"));
     }
 
     #[test]
