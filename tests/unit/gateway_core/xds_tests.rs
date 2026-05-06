@@ -128,7 +128,7 @@ fn translators_emit_all_phase_b_type_urls() {
     assert_eq!(snapshot.resources(EDS_TYPE_URL).len(), 1);
     assert!(snapshot.resources(SDS_TYPE_URL).is_empty());
 
-    let listener_resource = snapshot.resources(LDS_TYPE_URL).remove(0);
+    let listener_resource = snapshot.resources(LDS_TYPE_URL)[0].clone();
     let listener = proto::Listener::decode(listener_resource.value.as_slice())
         .expect("minimal listener should decode");
     assert_eq!(listener.name, "listener/default/api/8080");

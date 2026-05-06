@@ -27,6 +27,11 @@ use crate::config::types::GatewayConfig;
 use crate::grpc::auth::verify_grpc_jwt_metadata;
 use crate::grpc::proto::ConfigUpdate;
 
+// One bounded queue sits between each ADS request reader and response stream.
+// Phase B keeps this fixed while xDS is opt-in; make it an EnvConfig knob
+// before high-churn Phase C/D sidecar fleets depend on ADS.
+const ADS_STREAM_CHANNEL_CAPACITY: usize = 32;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct XdsSubscription {
     node_id: String,
@@ -254,8 +259,8 @@ impl XdsAdsServer {
         );
         let current_names: HashSet<String> = snapshot
             .resources(&subscription.type_url)
-            .into_iter()
-            .map(|r| r.name)
+            .iter()
+            .map(|r| r.name.clone())
             .collect();
         let mut removed_resources = if initial_resource_versions.is_empty() {
             previous
@@ -567,7 +572,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         let mut requests = request.into_inner();
         let server = self.clone();
         let mut updates = server.update_tx.subscribe();
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::channel(ADS_STREAM_CHANNEL_CAPACITY);
 
         tokio::spawn(async move {
             let mut stream_guard = server.stream_guard();
@@ -694,7 +699,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         let mut requests = request.into_inner();
         let server = self.clone();
         let mut updates = server.update_tx.subscribe();
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::channel(ADS_STREAM_CHANNEL_CAPACITY);
 
         tokio::spawn(async move {
             let mut stream_guard = server.stream_guard();

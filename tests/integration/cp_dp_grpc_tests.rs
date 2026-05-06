@@ -755,7 +755,7 @@ async fn test_cp_accepts_token_with_matching_issuer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cp_rejects_token_with_wrong_issuer() {
     let cp_config = create_test_config(1);
-    let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+    let (addr, _update_tx, server_handle) = start_test_cp_server(cp_config).await;
 
     // Mint a token signed with the correct secret but bearing a foreign issuer.
     let token =
@@ -781,6 +781,48 @@ async fn test_cp_rejects_token_with_wrong_issuer() {
         "Expected Unauthenticated, got: {}",
         status
     );
+
+    server_handle.abort();
+}
+
+/// `MeshSubscribe` shares the same CP/DP JWT security boundary as the
+/// classic DP Subscribe stream. Cover it explicitly so mesh config cannot
+/// accidentally drift into a weaker auth path.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mesh_subscribe_rejects_token_with_wrong_issuer() {
+    let cp_config = create_test_mesh_config();
+    let (addr, _update_tx, server_handle) = start_test_cp_server(cp_config).await;
+
+    let token = dp_client::generate_dp_jwt_with_issuer(
+        TEST_JWT_SECRET,
+        "mesh-iss-bad",
+        "some-other-service",
+    )
+    .unwrap();
+    let mut client = connect_client_with_token!(addr, token);
+
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
+        node_id: "mesh-iss-bad".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+        workload_spiffe_id: "spiffe://cluster.local/ns/ferrum/sa/api".to_string(),
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+    });
+
+    let result = client.mesh_subscribe(request).await;
+    assert!(
+        result.is_err(),
+        "CP should reject MeshSubscribe token with wrong issuer"
+    );
+    let status = result.unwrap_err();
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unauthenticated,
+        "Expected Unauthenticated, got: {}",
+        status
+    );
+
+    server_handle.abort();
 }
 
 /// Verify that the CP rejects a DP token that has no `iss` claim at all.
@@ -2769,6 +2811,46 @@ async fn test_cp_rejects_dp_with_mismatched_namespace_subscribe() {
     assert!(
         status.message().contains("staging"),
         "Error should mention DP namespace 'staging', got: {}",
+        status.message()
+    );
+    assert!(
+        status.message().contains("production"),
+        "Error should mention CP namespace 'production', got: {}",
+        status.message()
+    );
+
+    server_handle.abort();
+}
+
+/// `MeshSubscribe` enforces the same namespace boundary as classic Subscribe:
+/// a mesh node in `staging` must not receive a CP's `production` mesh slice.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_rejects_mesh_subscribe_with_mismatched_namespace() {
+    let cp_config = create_test_mesh_config();
+    let (addr, _update_tx, server_handle) =
+        start_test_cp_server_with_namespace(cp_config, "production").await;
+
+    let generated_token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "test-mesh-dp").unwrap();
+    let mut client = connect_client_with_token!(addr, generated_token);
+
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
+        node_id: "test-mesh-dp".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "staging".to_string(),
+        workload_spiffe_id: "spiffe://cluster.local/ns/staging/sa/api".to_string(),
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+    });
+
+    let result = client.mesh_subscribe(request).await;
+    assert!(
+        result.is_err(),
+        "CP should reject MeshSubscribe with mismatched namespace"
+    );
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("staging"),
+        "Error should mention mesh node namespace 'staging', got: {}",
         status.message()
     );
     assert!(
