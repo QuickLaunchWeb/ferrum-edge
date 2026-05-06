@@ -39,6 +39,7 @@ use crate::scaffolding::ports::reserve_port;
 
 const PROXY_ID: &str = "frontend-tls-order-proxy";
 const DENY_LOCALHOST_PLUGIN_ID: &str = "deny-localhost";
+const ALLOW_LOCALHOST_PLUGIN_ID: &str = "allow-localhost";
 const STDOUT_LOGGING_PLUGIN_ID: &str = "stdout-logging";
 const MAX_GATEWAY_ATTEMPTS: u32 = 3;
 const PER_ATTEMPT_STARTED_TIMEOUT: Duration = Duration::from_secs(2);
@@ -158,6 +159,24 @@ fn deny_localhost_plugin_config() -> PluginConfig {
     }
 }
 
+fn allow_localhost_plugin_config() -> PluginConfig {
+    PluginConfig {
+        id: ALLOW_LOCALHOST_PLUGIN_ID.to_string(),
+        plugin_name: "ip_restriction".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        config: json!({
+            "allow": ["127.0.0.1"],
+            "mode": "allow_first"
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some(PROXY_ID.to_string()),
+        enabled: true,
+        priority_override: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
 fn stdout_logging_plugin_config() -> PluginConfig {
     PluginConfig {
         id: STDOUT_LOGGING_PLUGIN_ID.to_string(),
@@ -220,6 +239,33 @@ fn spawn_counting_backend(
             tokio::spawn(async move {
                 let mut buf = [0u8; 64];
                 let _ = stream.read(&mut buf).await;
+            });
+        }
+    })
+}
+
+fn spawn_echo_backend(
+    listener: TcpListener,
+    accepted: Arc<AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _addr)) = listener.accept().await else {
+                return;
+            };
+            accepted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
             });
         }
     })
@@ -398,6 +444,17 @@ async fn assert_backend_never_dialed(accepted: &AtomicUsize) {
     );
 }
 
+async fn assert_backend_was_dialed(accepted: &AtomicUsize) {
+    for _ in 0..100 {
+        if accepted.load(Ordering::SeqCst) > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    panic!("successful TCP/TLS setup should open a backend connection");
+}
+
 fn extract_access_log_summaries(logs: &str) -> Vec<Value> {
     logs.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -428,6 +485,45 @@ async fn wait_for_access_log_summary(writer: &SharedWriter) -> Value {
         TEST_TIMEOUT,
         writer.contents()
     );
+}
+
+#[tokio::test]
+async fn tcp_tls_successful_plugin_pass_dials_backend_and_relays_data() {
+    let backend = reserve_port().await.expect("reserve backend port");
+    let backend_port = backend.local_addr().expect("backend addr").port();
+    let backend_accepts = Arc::new(AtomicUsize::new(0));
+    let backend_task = spawn_echo_backend(backend.into_listener(), backend_accepts.clone());
+
+    let (listen_port, shutdown_tx, join) =
+        spawn_tcp_tls_gateway_with_retry(backend_port, vec![allow_localhost_plugin_config()]).await;
+    let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
+
+    let tcp = TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect to frontend TLS listener");
+    let server_name =
+        rustls::pki_types::ServerName::try_from("localhost").expect("valid test server name");
+    let mut tls = insecure_tls_connector()
+        .connect(server_name, tcp)
+        .await
+        .expect("frontend TLS handshake should complete");
+
+    let payload = b"frontend-tls-happy-path";
+    tls.write_all(payload)
+        .await
+        .expect("write payload through gateway");
+    let mut echoed = vec![0u8; payload.len()];
+    tokio::time::timeout(TEST_TIMEOUT, tls.read_exact(&mut echoed))
+        .await
+        .expect("timed out waiting for backend echo through gateway")
+        .expect("read backend echo through gateway");
+    assert_eq!(echoed, payload);
+    assert_backend_was_dialed(&backend_accepts).await;
+
+    let _ = tls.shutdown().await;
+    backend_task.abort();
+    let _ = backend_task.await;
+    shutdown_gateway_or_panic(shutdown_tx, join).await;
 }
 
 #[tokio::test]
