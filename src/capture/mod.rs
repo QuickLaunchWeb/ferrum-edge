@@ -1,0 +1,223 @@
+//! Mesh traffic-capture planning (Layer 7).
+//!
+//! The proxy hot path never shells out to iptables or eBPF. This module builds
+//! declarative plans that init containers / node agents can apply outside the
+//! request path.
+
+use std::net::IpAddr;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureMode {
+    Explicit,
+    Iptables,
+    Ebpf,
+}
+
+impl CaptureMode {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.to_ascii_lowercase().as_str() {
+            "explicit" => Ok(Self::Explicit),
+            "iptables" => Ok(Self::Iptables),
+            "ebpf" => Ok(Self::Ebpf),
+            other => Err(format!(
+                "Invalid FERRUM_MESH_CAPTURE_MODE '{other}'. Expected: explicit, iptables, or ebpf"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureConfig {
+    pub mode: CaptureMode,
+    pub proxy_uid: Option<u32>,
+    pub inbound_port: u16,
+    pub outbound_port: u16,
+    pub include_cidrs: Vec<String>,
+    pub exclude_cidrs: Vec<String>,
+    pub exclude_ports: Vec<u16>,
+}
+
+impl CaptureConfig {
+    pub fn explicit(inbound_port: u16, outbound_port: u16) -> Self {
+        Self {
+            mode: CaptureMode::Explicit,
+            proxy_uid: None,
+            inbound_port,
+            outbound_port,
+            include_cidrs: vec!["0.0.0.0/0".to_string()],
+            exclude_cidrs: Vec::new(),
+            exclude_ports: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IptablesPlan {
+    pub commands: Vec<String>,
+}
+
+impl IptablesPlan {
+    pub fn for_config(config: &CaptureConfig) -> Self {
+        let mut commands = Vec::new();
+        commands.push(idempotent_new_chain("nat", "FERRUM_MESH_INBOUND"));
+        commands.push(idempotent_new_chain("nat", "FERRUM_MESH_OUTBOUND"));
+
+        for cidr in &config.exclude_cidrs {
+            commands.push(idempotent_append(
+                "nat",
+                "FERRUM_MESH_OUTBOUND",
+                &format!("-d {cidr} -j RETURN"),
+            ));
+        }
+        for port in &config.exclude_ports {
+            commands.push(idempotent_append(
+                "nat",
+                "FERRUM_MESH_OUTBOUND",
+                &format!("-p tcp --dport {port} -j RETURN"),
+            ));
+        }
+        if let Some(uid) = config.proxy_uid {
+            commands.push(idempotent_append(
+                "nat",
+                "FERRUM_MESH_OUTBOUND",
+                &format!("-m owner --uid-owner {uid} -j RETURN"),
+            ));
+        }
+        for cidr in &config.include_cidrs {
+            commands.push(idempotent_append(
+                "nat",
+                "FERRUM_MESH_OUTBOUND",
+                &format!(
+                    "-p tcp -d {cidr} -j REDIRECT --to-ports {}",
+                    config.outbound_port
+                ),
+            ));
+        }
+        commands.push(idempotent_append(
+            "nat",
+            "FERRUM_MESH_INBOUND",
+            &format!("-p tcp -j REDIRECT --to-ports {}", config.inbound_port),
+        ));
+        commands.push(idempotent_append(
+            "nat",
+            "PREROUTING",
+            "-p tcp -j FERRUM_MESH_INBOUND",
+        ));
+        commands.push(idempotent_append(
+            "nat",
+            "OUTPUT",
+            "-p tcp -j FERRUM_MESH_OUTBOUND",
+        ));
+
+        Self { commands }
+    }
+}
+
+// Phase D keeps the eBPF planner available for the ambient DaemonSet/node-agent
+// integration while the injector path consumes the iptables fallback first.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EbpfPlan {
+    pub enabled: bool,
+    pub fallback: IptablesPlan,
+    pub required_kernel: &'static str,
+}
+
+// The sidecar injector only needs the iptables fallback in this slice.
+#[allow(dead_code)]
+impl EbpfPlan {
+    pub fn for_config(config: &CaptureConfig) -> Self {
+        Self {
+            enabled: config.mode == CaptureMode::Ebpf,
+            fallback: IptablesPlan::for_config(config),
+            required_kernel: "5.7",
+        }
+    }
+}
+
+// Used by the eBPF node-agent path once it is wired to runtime kernel probing.
+#[allow(dead_code)]
+pub fn should_fallback_to_iptables(kernel_release: &str) -> bool {
+    let mut parts = kernel_release.split('.');
+    let major = parts.next().and_then(|p| p.parse::<u32>().ok());
+    let minor = parts.next().and_then(|p| p.parse::<u32>().ok());
+    match (major, minor) {
+        (Some(major), Some(minor)) => major < 5 || (major == 5 && minor < 7),
+        _ => true,
+    }
+}
+
+// Validates operator-provided include/exclude CIDRs before emitting capture
+// rules; the env-facing CIDR knobs land with the node-agent integration.
+#[allow(dead_code)]
+pub fn validate_cidr_list(cidrs: &[String]) -> Result<(), String> {
+    for cidr in cidrs {
+        let Some((addr, prefix)) = cidr.split_once('/') else {
+            return Err(format!("CIDR '{cidr}' must include a prefix length"));
+        };
+        let ip: IpAddr = addr
+            .parse()
+            .map_err(|_| format!("CIDR '{cidr}' has invalid IP address"))?;
+        let prefix: u8 = prefix
+            .parse()
+            .map_err(|_| format!("CIDR '{cidr}' has invalid prefix length"))?;
+        let max = if ip.is_ipv4() { 32 } else { 128 };
+        if prefix > max {
+            return Err(format!(
+                "CIDR '{cidr}' prefix length {prefix} exceeds max {max}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn idempotent_new_chain(table: &str, chain: &str) -> String {
+    format!("iptables -t {table} -N {chain} 2>/dev/null || true")
+}
+
+fn idempotent_append(table: &str, chain: &str, rule: &str) -> String {
+    format!(
+        "iptables -t {table} -C {chain} {rule} 2>/dev/null || iptables -t {table} -A {chain} {rule}"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iptables_plan_is_idempotent() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.proxy_uid = Some(1337);
+        config.exclude_cidrs.push("10.0.0.0/8".to_string());
+        config.exclude_ports.push(15020);
+
+        let plan = IptablesPlan::for_config(&config);
+
+        assert!(plan.commands.iter().any(|cmd| cmd.contains("-C OUTPUT")));
+        assert!(
+            plan.commands
+                .iter()
+                .any(|cmd| cmd.contains("--uid-owner 1337"))
+        );
+        assert!(
+            plan.commands
+                .iter()
+                .any(|cmd| cmd.contains("--to-ports 15001"))
+        );
+    }
+
+    #[test]
+    fn ebpf_falls_back_on_old_kernel() {
+        assert!(should_fallback_to_iptables("5.4.0"));
+        assert!(!should_fallback_to_iptables("5.7.0"));
+        assert!(!should_fallback_to_iptables("6.6.12"));
+    }
+
+    #[test]
+    fn cidr_validation_checks_prefix_range() {
+        assert!(validate_cidr_list(&["10.0.0.0/8".to_string()]).is_ok());
+        assert!(validate_cidr_list(&["10.0.0.0/64".to_string()]).is_err());
+    }
+}
