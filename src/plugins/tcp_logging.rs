@@ -254,7 +254,7 @@ async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
         // / frontend mTLS surfaces. The verifier uses
         // `allow_unknown_revocation_status() + only_check_end_entity_revocation()`
         // (set inside `build_server_verifier_with_crls`).
-        let verifier = crate::tls::build_server_verifier_with_crls(root_store, &cfg.tls_crls, None)
+        let verifier = crate::tls::build_server_verifier_with_crls(root_store, &cfg.tls_crls)
             .map_err(|error| format!("TCP logging: failed to build TLS verifier: {error}"))?;
         rustls::ClientConfig::builder()
             .with_webpki_verifier(verifier)

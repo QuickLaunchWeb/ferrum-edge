@@ -123,18 +123,16 @@ pub async fn start_http3_listener_with_signal(
 
     // If user didn't configure any TLS 1.3 suites, use defaults
     let h3_suites = if tls13_suites.is_empty() {
-        tls_policy
-            .crypto_provider_kind
-            .default_provider()
-            .cipher_suites
-            .into_iter()
-            .filter(|s| s.tls13().is_some())
-            .collect()
+        vec![
+            rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
+            rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256,
+            rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+        ]
     } else {
         tls13_suites
     };
 
-    let base_provider = tls_policy.crypto_provider_kind.default_provider();
+    let base_provider = rustls::crypto::ring::default_provider();
     let h3_provider = rustls::crypto::CryptoProvider {
         cipher_suites: h3_suites,
         kx_groups: tls_policy.crypto_provider.kx_groups.clone(),

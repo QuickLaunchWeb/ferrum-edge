@@ -5,9 +5,8 @@
 
 use ferrum_edge::config::EnvConfig;
 use ferrum_edge::tls::{
-    self, TlsCryptoProviderKind, TlsPolicy, backend_client_config_builder,
-    build_server_verifier_with_crls, check_cert_expiry, check_cert_expiry_for_validation,
-    load_crls,
+    self, TlsPolicy, backend_client_config_builder, build_server_verifier_with_crls,
+    check_cert_expiry, check_cert_expiry_for_validation, load_crls,
 };
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use std::sync::Once;
@@ -330,22 +329,6 @@ fn test_tls_policy_custom_cipher_suites() {
 }
 
 #[test]
-fn test_tls_policy_aws_lc_rs_provider() {
-    let mut env = default_env_config();
-    env.tls_crypto_provider = "aws-lc-rs".to_string();
-
-    let policy = TlsPolicy::from_env_config(&env).unwrap();
-    assert_eq!(policy.crypto_provider_kind, TlsCryptoProviderKind::AwsLcRs);
-    assert!(
-        policy
-            .crypto_provider
-            .cipher_suites
-            .iter()
-            .any(|suite| suite.suite() == rustls::CipherSuite::TLS13_AES_128_GCM_SHA256)
-    );
-}
-
-#[test]
 fn test_tls_policy_unknown_cipher_suite_fails() {
     let mut env = default_env_config();
     env.tls_cipher_suites = Some("INVALID_SUITE".to_string());
@@ -449,7 +432,7 @@ fn test_build_server_verifier_empty_crls_with_roots() {
         .collect();
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add_parsable_certificates(der_certs);
-    let result = build_server_verifier_with_crls(root_store, &[], None);
+    let result = build_server_verifier_with_crls(root_store, &[]);
     assert!(result.is_ok());
 }
 
@@ -457,7 +440,7 @@ fn test_build_server_verifier_empty_crls_with_roots() {
 fn test_build_server_verifier_empty_root_store_fails() {
     ensure_crypto_provider();
     let root_store = rustls::RootCertStore::empty();
-    let result = build_server_verifier_with_crls(root_store, &[], None);
+    let result = build_server_verifier_with_crls(root_store, &[]);
     // Empty root store should fail - WebPki requires at least one trust anchor
     assert!(result.is_err());
 }

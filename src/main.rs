@@ -100,7 +100,7 @@ impl<'a> MakeWriter<'a> for SeverityWriter {
 ///
 /// Startup sequence:
 /// 1. Parse CLI arguments (if any — no args falls through to legacy env-var mode)
-/// 2. Install rustls crypto provider (default: ring backend)
+/// 2. Install rustls crypto provider (ring backend)
 /// 3. Resolve external secrets (Vault, AWS, Azure, GCP, env, file) using a
 ///    temporary runtime that is dropped before env mutation
 /// 4. Initialize structured JSON logging
@@ -154,11 +154,11 @@ fn main() {
     }
 
     // ── Crypto provider ─────────────────────────────────────────────────
-    // Initialize rustls crypto provider (needed by validate for TLS cert checks).
-    // The provider can be selected by env var before full config parsing so
-    // benchmark runs can A/B ring vs aws-lc-rs without changing code.
-    if let Err(e) = tls::install_default_crypto_provider_from_env() {
-        eprintln!("{e}");
+    // Initialize rustls crypto provider (needed by validate for TLS cert checks)
+    if rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+        .is_err()
+    {
+        eprintln!("Failed to install crypto provider");
         std::process::exit(1);
     }
 

@@ -153,7 +153,7 @@ pub fn build_backend_dtls_config(
                     backend_host
                 )
             })?;
-        let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls, None)?;
+        let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)?;
         (Some(server_name), Some(verifier as _))
     };
 
