@@ -28,9 +28,7 @@ use super::utils::ai_providers::{
     AiProvider, AiTokenUsage, detect_response_provider, detect_sse_provider,
     extract_response_usage, parse_ai_provider,
 };
-use super::utils::body_transform::{
-    is_ai_request_content_type, is_event_stream_content_type, is_json_content_type,
-};
+use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::{Plugin, PluginResult, RequestContext};
 
 pub struct AiTokenMetrics {
@@ -284,13 +282,6 @@ impl AiTokenMetrics {
     }
 }
 
-fn request_content_type(ctx: &RequestContext) -> Option<&str> {
-    ctx.headers
-        .get("content-type")
-        .map(String::as_str)
-        .or_else(|| ctx.raw_header_get("content-type"))
-}
-
 fn metadata_key(prefix: &str, suffix: &str) -> String {
     let mut key = String::with_capacity(prefix.len() + 1 + suffix.len());
     key.push_str(prefix);
@@ -351,7 +342,7 @@ impl Plugin for AiTokenMetrics {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        ctx.method == "POST" && request_content_type(ctx).is_some_and(is_ai_request_content_type)
+        ctx.method == "POST"
     }
 
     async fn on_response_body(

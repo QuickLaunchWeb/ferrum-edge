@@ -9,9 +9,7 @@ use tracing::{debug, warn};
 use super::utils::ai_providers::{
     AiProvider, detect_response_provider, extract_response_usage, parse_ai_provider,
 };
-use super::utils::body_transform::{
-    is_ai_request_content_type, is_event_stream_content_type, is_json_content_type,
-};
+use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::rate_limit::{
     AiRateLimitOp, AiTokenRateAlgorithm, RateLimitBackend, RateLimitOutcome,
 };
@@ -275,13 +273,6 @@ impl AiRateLimiter {
     }
 }
 
-fn request_content_type(ctx: &RequestContext) -> Option<&str> {
-    ctx.headers
-        .get("content-type")
-        .map(String::as_str)
-        .or_else(|| ctx.raw_header_get("content-type"))
-}
-
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
     let Some(value) = config.get(field) else {
         return Ok(None);
@@ -354,7 +345,7 @@ impl Plugin for AiRateLimiter {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        ctx.method == "POST" && request_content_type(ctx).is_some_and(is_ai_request_content_type)
+        ctx.method == "POST"
     }
 
     fn applies_after_proxy_on_reject(&self) -> bool {

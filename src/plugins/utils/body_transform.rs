@@ -696,19 +696,6 @@ pub fn is_event_stream_content_type(content_type: &str) -> bool {
         || ascii_contains_ignore_case(content_type, "event-stream")
 }
 
-/// Check if a request Content-Type is a plausible AI/LLM API request body.
-///
-/// Response-body AI plugins can only decide buffering before response headers
-/// arrive, so they use the request Content-Type as the best cheap upper bound.
-/// JSON covers normal chat/completion APIs, multipart covers multimodal uploads
-/// that still return token metadata, and application/grpc covers gRPC-flavored
-/// AI backends.
-pub fn is_ai_request_content_type(content_type: &str) -> bool {
-    is_json_content_type(content_type)
-        || ascii_contains_ignore_case(content_type, "multipart/form-data")
-        || ascii_contains_ignore_case(content_type, "application/grpc")
-}
-
 /// ASCII-insensitive substring check. Zero allocation.
 fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
     let hb = haystack.as_bytes();

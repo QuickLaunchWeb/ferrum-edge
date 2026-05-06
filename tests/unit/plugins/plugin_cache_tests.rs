@@ -958,6 +958,75 @@ fn test_apply_delta_preserves_proxy_group_instance_for_unchanged_group_config() 
     );
 }
 
+#[test]
+fn test_apply_delta_prunes_proxy_group_instance_after_last_association_removed() {
+    let config1 = make_config(
+        vec![make_proxy("p1", "/api", vec!["group1"])],
+        vec![make_plugin_config(
+            "group1",
+            "rate_limiting",
+            PluginScope::ProxyGroup,
+            None,
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+
+    let p1_before = cache.get_plugins("p1");
+    let held_group_plugin = Arc::clone(
+        p1_before
+            .iter()
+            .find(|plugin| plugin.name() == "rate_limiting")
+            .unwrap_or_else(|| panic!("expected initial proxy-group rate limiter")),
+    );
+
+    let config2 = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config(
+            "group1",
+            "rate_limiting",
+            PluginScope::ProxyGroup,
+            None,
+            true,
+        )],
+    );
+    let mut proxy_ids = std::collections::HashSet::new();
+    proxy_ids.insert("p1".to_string());
+
+    cache.apply_delta(&config2, &proxy_ids, &[], false).unwrap();
+
+    let p1_after_removal = cache.get_plugins("p1");
+    assert!(
+        p1_after_removal
+            .iter()
+            .all(|plugin| plugin.name() != "rate_limiting"),
+        "last association removal should remove the proxy-group plugin from the proxy"
+    );
+
+    let config3 = make_config(
+        vec![make_proxy("p1", "/api", vec!["group1"])],
+        vec![make_plugin_config(
+            "group1",
+            "rate_limiting",
+            PluginScope::ProxyGroup,
+            None,
+            true,
+        )],
+    );
+    cache.apply_delta(&config3, &proxy_ids, &[], false).unwrap();
+
+    let p1_after_reattach = cache.get_plugins("p1");
+    let reattached_group_plugin = p1_after_reattach
+        .iter()
+        .find(|plugin| plugin.name() == "rate_limiting")
+        .unwrap_or_else(|| panic!("expected reattached proxy-group rate limiter"));
+
+    assert!(
+        !Arc::ptr_eq(&held_group_plugin, reattached_group_plugin),
+        "reattaching a previously unused proxy-group config should create fresh state"
+    );
+}
+
 // ---- Protocol-filtered plugin lookup tests ----
 
 fn make_plugin_config_with_json(

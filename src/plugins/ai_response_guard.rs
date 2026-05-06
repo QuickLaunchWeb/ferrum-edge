@@ -17,7 +17,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{debug, warn};
 
-use super::utils::body_transform::{is_ai_request_content_type, is_json_content_type};
+use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -562,9 +562,7 @@ impl Plugin for AiResponseGuard {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        self.has_validation_rules
-            && ctx.method == "POST"
-            && request_content_type(ctx).is_some_and(is_ai_request_content_type)
+        self.has_validation_rules && ctx.method == "POST"
     }
 
     async fn on_response_body(
@@ -763,13 +761,6 @@ impl Plugin for AiResponseGuard {
 
         serde_json::to_vec(&json).ok()
     }
-}
-
-fn request_content_type(ctx: &RequestContext) -> Option<&str> {
-    ctx.headers
-        .get("content-type")
-        .map(String::as_str)
-        .or_else(|| ctx.raw_header_get("content-type"))
 }
 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {

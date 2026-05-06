@@ -817,13 +817,25 @@ impl PluginCache {
             }
         }
 
+        let active_proxy_group_ids: HashSet<&str> = config
+            .proxies
+            .iter()
+            .flat_map(|proxy| proxy.plugins.iter())
+            .map(|assoc| assoc.plugin_config_id.as_str())
+            .filter(|id| proxy_group_configs.contains_key(*id))
+            .collect();
+
         // Shared ProxyGroup plugin instances. Start with unchanged current
-        // instances so a partial proxy rebuild keeps state shared with proxies
-        // whose plugin lists are preserved from the previous generation.
+        // instances that are still referenced in the post-delta config. This
+        // keeps state shared with unchanged proxies but drops cascade-deleted
+        // group state once the last proxy association is removed.
         let mut group_plugin_instances: ProxyGroupInstanceMap = current
             .proxy_group_plugins
             .iter()
             .filter_map(|(id, existing)| {
+                if !active_proxy_group_ids.contains(id.as_str()) {
+                    return None;
+                }
                 let pc = proxy_group_configs.get(id.as_str())?;
                 if same_proxy_group_plugin_config(&existing.config, pc) {
                     Some((id.clone(), existing.clone()))

@@ -25,6 +25,14 @@ fn ctx_with_content_type(method: &str, content_type: &str) -> RequestContext {
     ctx
 }
 
+fn ctx_without_content_type(method: &str) -> RequestContext {
+    RequestContext::new(
+        "127.0.0.1".to_string(),
+        method.to_string(),
+        "/chat".to_string(),
+    )
+}
+
 fn assert_continue(result: PluginResult) {
     assert!(
         matches!(result, PluginResult::Continue),
@@ -50,7 +58,8 @@ async fn test_plugin_name_and_priority() {
         "POST",
         "multipart/form-data; boundary=abc"
     )));
-    assert!(!plugin.should_buffer_response_body(&ctx_with_content_type("POST", "text/plain")));
+    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "text/plain")));
+    assert!(plugin.should_buffer_response_body(&ctx_without_content_type("POST")));
     assert!(!plugin.should_buffer_response_body(&ctx_with_content_type("GET", "application/json")));
 }
 
