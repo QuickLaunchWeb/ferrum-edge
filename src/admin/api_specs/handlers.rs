@@ -75,6 +75,14 @@ struct ValidationFailure {
 // ---------------------------------------------------------------------------
 
 fn classify_db_error(e: anyhow::Error) -> ApiSpecError {
+    if e.chain().any(|cause| {
+        cause
+            .downcast_ref::<sqlx::Error>()
+            .is_some_and(|err| matches!(err, sqlx::Error::RowNotFound))
+    }) {
+        return ApiSpecError::NotFound;
+    }
+
     let msg = e.to_string();
     classify_db_error_str(&msg)
 }
@@ -93,14 +101,20 @@ fn classify_db_error_str(msg: &str) -> ApiSpecError {
         || lower.contains("references a")
     {
         ApiSpecError::Unprocessable(msg.to_string())
-    } else if lower.contains("not found")
-        || lower.contains("no rows")
-        || lower.contains("does not exist")
-    {
+    } else if is_row_missing_error_message(&lower) {
         ApiSpecError::NotFound
     } else {
         ApiSpecError::Internal(msg.to_string())
     }
+}
+
+fn is_row_missing_error_message(lower: &str) -> bool {
+    lower.contains("rownotfound")
+        || lower.contains("row not found")
+        || lower.contains("record not found")
+        || lower.contains("document not found")
+        || lower.contains("no rows returned")
+        || lower.contains("no row returned")
 }
 
 // ---------------------------------------------------------------------------
@@ -2581,10 +2595,30 @@ mod tests {
     }
 
     #[test]
-    fn classify_not_found_does_not_exist() {
+    fn classify_typed_sqlx_row_not_found() {
         assert!(matches!(
-            classify_db_error_str("resource does not exist"),
+            classify_db_error(anyhow::Error::new(sqlx::Error::RowNotFound)),
             ApiSpecError::NotFound
+        ));
+    }
+
+    #[test]
+    fn classify_schema_does_not_exist_as_internal() {
+        assert!(matches!(
+            classify_db_error_str(
+                r#"error returned from database: relation "api_specs" does not exist"#
+            ),
+            ApiSpecError::Internal(_)
+        ));
+    }
+
+    #[test]
+    fn classify_column_does_not_exist_as_internal() {
+        assert!(matches!(
+            classify_db_error_str(
+                r#"error returned from database: column "resource_hash" does not exist"#
+            ),
+            ApiSpecError::Internal(_)
         ));
     }
 
