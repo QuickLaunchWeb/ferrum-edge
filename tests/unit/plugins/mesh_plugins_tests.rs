@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ferrum_edge::config::mesh::{
-    MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, WorkloadSelector,
+    MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch, WorkloadSelector,
 };
 use ferrum_edge::config::types::Proxy;
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
@@ -116,6 +116,44 @@ async fn mesh_authz_reads_hbone_baggage_source_identity() {
     let result = plugin.authorize(&mut ctx).await;
 
     assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn mesh_authz_normalizes_header_policy_keys_at_construction() {
+    let mut policy = allow_client_policy(PolicyAction::Allow);
+    policy.rules[0].to = vec![RequestMatch {
+        headers: HashMap::from([("X-Tenant".to_string(), "prod".to_string())]),
+        ..RequestMatch::default()
+    }];
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-tenant", "prod".parse().expect("header value"));
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn mesh_authz_skips_header_materialization_without_header_rules() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-unused", "still-raw".parse().expect("header value"));
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx.headers.is_empty());
 }
 
 #[tokio::test]

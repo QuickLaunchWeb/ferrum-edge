@@ -14,16 +14,18 @@ use crate::identity::SpiffeId;
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
     MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
+    mesh_policies_have_header_rules, normalize_mesh_policy_header_names,
 };
 use crate::xds::slice::MeshSlice;
 
 pub struct MeshAuthz {
     slice: MeshSlice,
+    has_header_rules: bool,
 }
 
 impl MeshAuthz {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let slice = if let Some(value) = config.get("mesh_slice") {
+        let mut slice = if let Some(value) = config.get("mesh_slice") {
             serde_json::from_value::<MeshSlice>(value.clone())
                 .map_err(|e| format!("mesh_authz: invalid mesh_slice: {e}"))?
         } else if let Some(value) = config.get("mesh_policies") {
@@ -36,7 +38,14 @@ impl MeshAuthz {
         } else {
             MeshSlice::default()
         };
-        Ok(Self { slice })
+        for policy in &mut slice.mesh_policies {
+            normalize_mesh_policy_header_names(policy);
+        }
+        let has_header_rules = mesh_policies_have_header_rules(&slice.mesh_policies);
+        Ok(Self {
+            slice,
+            has_header_rules,
+        })
     }
 
     fn decision_to_result(
@@ -82,12 +91,15 @@ impl Plugin for MeshAuthz {
             .raw_header_get("host")
             .or_else(|| ctx.raw_header_get(":authority"))
             .map(str::to_string);
-        ctx.materialize_headers();
-        let headers: BTreeMap<String, String> = ctx
-            .headers
-            .iter()
-            .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
-            .collect();
+        let headers = if self.has_header_rules {
+            ctx.materialize_headers();
+            ctx.headers
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
         let request = MeshAuthzRequest {
             source_principal,
             method: Some(ctx.method.clone()),
