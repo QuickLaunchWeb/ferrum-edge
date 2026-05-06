@@ -47,6 +47,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http3_connections_per_backend: None,
         pool_tcp_keepalive_seconds: None,
         upstream_id: None,
+        api_spec_id: None,
         circuit_breaker: None,
         retry: None,
         response_body_mode: Default::default(),
@@ -99,6 +100,7 @@ fn make_upstream(id: &str) -> Upstream {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -162,6 +164,7 @@ fn test_unique_listen_paths_valid() {
                 pool_http3_connections_per_backend: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
+                api_spec_id: None,
                 circuit_breaker: None,
                 retry: None,
                 response_body_mode: Default::default(),
@@ -215,6 +218,7 @@ fn test_unique_listen_paths_valid() {
                 pool_http3_connections_per_backend: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
+                api_spec_id: None,
                 circuit_breaker: None,
                 retry: None,
                 response_body_mode: Default::default(),
@@ -284,6 +288,7 @@ fn test_unique_listen_paths_duplicate() {
                 pool_http3_connections_per_backend: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
+                api_spec_id: None,
                 circuit_breaker: None,
                 retry: None,
                 response_body_mode: Default::default(),
@@ -337,6 +342,7 @@ fn test_unique_listen_paths_duplicate() {
                 pool_http3_connections_per_backend: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
+                api_spec_id: None,
                 circuit_breaker: None,
                 retry: None,
                 response_body_mode: Default::default(),
@@ -858,6 +864,7 @@ fn test_plugin_config_priority_override_valid() {
         proxy_id: None,
         enabled: true,
         priority_override: Some(5000),
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -875,6 +882,7 @@ fn test_plugin_config_priority_override_none_valid() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -892,6 +900,7 @@ fn test_plugin_config_priority_override_too_high() {
         proxy_id: None,
         enabled: true,
         priority_override: Some(10001),
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -910,6 +919,7 @@ fn test_plugin_config_priority_override_boundary() {
         proxy_id: None,
         enabled: true,
         priority_override: Some(10000),
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -927,6 +937,7 @@ fn test_plugin_config_priority_override_zero() {
         proxy_id: None,
         enabled: true,
         priority_override: Some(0),
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -944,6 +955,7 @@ fn test_plugin_config_priority_override_serde_roundtrip() {
         proxy_id: None,
         enabled: true,
         priority_override: Some(42),
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -994,6 +1006,7 @@ fn test_validate_plugin_references_rejects_global_plugin_association() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }];
@@ -1022,6 +1035,7 @@ fn test_validate_plugin_references_rejects_wrong_proxy_target() {
         proxy_id: Some("other-proxy".into()),
         enabled: true,
         priority_override: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }];
@@ -1052,6 +1066,7 @@ fn test_validate_plugin_references_accepts_proxy_group_association() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }];
@@ -1077,6 +1092,7 @@ fn test_validate_plugin_references_proxy_group_shared_across_proxies() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }];
@@ -1106,6 +1122,7 @@ fn test_validate_plugin_references_rejects_proxy_group_with_proxy_id() {
         proxy_id: Some("p1".into()), // Invalid: proxy_group must not have proxy_id
         enabled: true,
         priority_override: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }];
@@ -1129,6 +1146,7 @@ fn test_plugin_scope_proxy_group_serde_round_trip() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };

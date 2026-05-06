@@ -350,6 +350,7 @@ async fn test_plugin_scope_configuration() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -367,6 +368,7 @@ async fn test_plugin_scope_configuration() {
         proxy_id: Some("test-proxy".to_string()),
         enabled: true,
         priority_override: None,
+        api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };

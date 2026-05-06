@@ -1,8 +1,10 @@
 //! Admin API for Ferrum Edge.
 
+pub mod api_specs;
 mod backup;
 pub(crate) mod crud;
 pub mod jwt_auth;
+pub mod spec_codec;
 
 use bytes::Bytes;
 use chrono::Utc;
@@ -96,6 +98,8 @@ pub struct AdminState {
     pub db_available: Option<Arc<AtomicBool>>,
     /// Max request body size in MiB for POST /restore.
     pub admin_restore_max_body_size_mib: usize,
+    /// Max request body size in MiB for POST/PUT /api-specs.
+    pub admin_spec_max_body_size_mib: usize,
     /// Ports reserved by the gateway's own listeners (proxy, admin, gRPC).
     /// Stream proxy `listen_port` values must not collide with these.
     pub reserved_ports: std::collections::HashSet<u16>,
@@ -643,6 +647,54 @@ pub async fn handle_admin_request(
         Ok(ns) => ns,
         Err(resp) => return Ok(resp),
     };
+
+    // api-specs routes manage their own body reading (configurable limit,
+    // content-type inspection, binary blob).  Dispatch them BEFORE the
+    // shared body-read below so we don't consume `req` prematurely.
+    let segments_peek: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    match (method.clone(), segments_peek.as_slice()) {
+        (Method::POST, ["api-specs"]) => {
+            return api_specs::handlers::handle_post_api_spec(req, &state, &namespace).await;
+        }
+        (Method::PUT, ["api-specs", id]) => {
+            if let Err(e) = crate::config::types::validate_resource_id(id) {
+                return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
+            }
+            let id = id.to_string();
+            return api_specs::handlers::handle_put_api_spec(req, &state, &namespace, &id).await;
+        }
+        (Method::GET, ["api-specs"]) => {
+            return api_specs::handlers::handle_list_api_specs(req, &state, &namespace).await;
+        }
+        (Method::GET, ["api-specs", "by-proxy", proxy_id]) => {
+            if let Err(e) = crate::config::types::validate_resource_id(proxy_id) {
+                return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
+            }
+            let proxy_id = proxy_id.to_string();
+            return api_specs::handlers::handle_get_api_spec_by_proxy(
+                req, &state, &namespace, &proxy_id,
+            )
+            .await;
+        }
+        (Method::GET, ["api-specs", id]) => {
+            if let Err(e) = crate::config::types::validate_resource_id(id) {
+                return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
+            }
+            let id = id.to_string();
+            return api_specs::handlers::handle_get_api_spec(req, &state, &namespace, &id).await;
+        }
+        (Method::DELETE, ["api-specs", id]) => {
+            if let Err(e) = crate::config::types::validate_resource_id(id) {
+                return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
+            }
+            let id = id.to_string();
+            // DELETE should have no body. Drop the receiver so hyper discards
+            // any remaining bytes via Drop without buffering them in userspace.
+            drop(req.into_body());
+            return api_specs::handlers::handle_delete_api_spec(&state, &namespace, &id).await;
+        }
+        _ => {}
+    }
 
     // Read body with size limit.
     // /restore gets a configurable limit (default 100 MiB) for large-scale
