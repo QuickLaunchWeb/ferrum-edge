@@ -103,7 +103,9 @@ async fn mesh_authz_reads_hbone_baggage_source_identity() {
         "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
     }))
     .expect("plugin config");
-    let mut ctx = request_context(None);
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
     let mut headers = http::HeaderMap::new();
     headers.insert(
         "baggage",
@@ -116,6 +118,32 @@ async fn mesh_authz_reads_hbone_baggage_source_identity() {
     let result = plugin.authorize(&mut ctx).await;
 
     assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn mesh_authz_ignores_hbone_baggage_without_authenticated_peer() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(None);
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected reject, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -184,7 +212,9 @@ async fn workload_metrics_adds_identity_metadata_without_header_changes() {
 #[tokio::test]
 async fn workload_metrics_reads_hbone_baggage_source_identity() {
     let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
-    let mut ctx = request_context(None);
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
     let mut raw_headers = http::HeaderMap::new();
     raw_headers.insert(
         "baggage",
@@ -210,6 +240,35 @@ async fn workload_metrics_reads_hbone_baggage_source_identity() {
             .map(String::as_str),
         Some("mutual_tls")
     );
+}
+
+#[tokio::test]
+async fn workload_metrics_does_not_trust_hbone_baggage_without_authenticated_peer() {
+    let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
+    let mut ctx = request_context(None);
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut raw_headers = http::HeaderMap::new();
+    raw_headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(raw_headers);
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.connection_security_policy")
+            .map(String::as_str),
+        Some("none")
+    );
+    assert!(!ctx.metadata.contains_key("mesh.source.principal"));
+    assert!(!ctx.metadata.contains_key("mesh.source.service_account"));
 }
 
 #[tokio::test]
