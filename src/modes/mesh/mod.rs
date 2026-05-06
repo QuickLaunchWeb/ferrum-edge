@@ -29,7 +29,6 @@ use crate::config::types::{
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
-use crate::modes::mesh::config_consumer::xds_client::{XdsClientConfig, XdsConfigConsumer};
 use crate::modes::mesh::runtime::MeshRuntimeState;
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
@@ -205,14 +204,6 @@ impl MeshRuntimeConfig {
             namespace: self.namespace.clone(),
             workload_spiffe_id: self.workload_spiffe_id.clone(),
             labels: Default::default(),
-        }
-    }
-
-    fn xds_client_config(&self) -> XdsClientConfig {
-        XdsClientConfig {
-            cp_url: self.cp_urls[0].clone(),
-            node_id: self.node_id.clone(),
-            namespace: self.namespace.clone(),
         }
     }
 
@@ -468,6 +459,8 @@ pub async fn run(
         "Mesh mode starting"
     );
 
+    ensure_runtime_config_protocol_supported(&runtime)?;
+
     let mesh_state = MeshRuntimeState::new();
     let bootstrap_config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime)
         .context("failed to prepare mesh plugin bootstrap config")?;
@@ -512,14 +505,7 @@ pub async fn run(
             );
         }
         MeshConfigProtocol::Xds => {
-            let consumer = XdsConfigConsumer::new(runtime.xds_client_config(), mesh_state.clone());
-            info!(
-                node_id = %consumer.config().node_id,
-                namespace = %consumer.config().namespace,
-                cp_url = %consumer.config().cp_url,
-                has_first_slice = consumer.state().has_first_slice(),
-                "Mesh mode initialized xDS config consumer"
-            );
+            unreachable!("xDS mesh runtime is rejected by ensure_runtime_config_protocol_supported")
         }
     }
 
@@ -531,6 +517,19 @@ pub async fn run(
         background_handles,
     )
     .await
+}
+
+fn ensure_runtime_config_protocol_supported(
+    runtime: &MeshRuntimeConfig,
+) -> Result<(), anyhow::Error> {
+    match runtime.config_protocol {
+        MeshConfigProtocol::Native => Ok(()),
+        MeshConfigProtocol::Xds => Err(anyhow::anyhow!(
+            "FERRUM_MESH_CONFIG_PROTOCOL=xds is not supported by mesh runtime yet; \
+             use FERRUM_MESH_CONFIG_PROTOCOL=native for Ferrum MeshSubscribe. \
+             FERRUM_XDS_ENABLED only exposes CP ADS for Envoy-compatible clients."
+        )),
+    }
 }
 
 async fn serve_mesh_runtime(
@@ -1001,6 +1000,30 @@ mod tests {
                     "127.0.0.1:16008".parse::<SocketAddr>().unwrap()
                 );
                 assert_eq!(runtime.east_west_listen_port, 16443);
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_rejects_xds_protocol_until_client_is_wired() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_CONFIG_PROTOCOL", "xds"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let err = ensure_runtime_config_protocol_supported(&runtime)
+                    .expect_err("xDS mesh runtime should fail fast");
+
+                assert!(err.to_string().contains("FERRUM_MESH_CONFIG_PROTOCOL=xds"));
             },
         );
     }
