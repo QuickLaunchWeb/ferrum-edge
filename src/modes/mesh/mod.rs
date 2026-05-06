@@ -11,17 +11,24 @@ pub mod policy;
 pub mod runtime;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
-use tracing::{info, warn};
+use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
 
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::config::types::{GatewayConfig, PluginConfig, PluginScope};
+use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::{XdsClientConfig, XdsConfigConsumer};
 use crate::modes::mesh::runtime::MeshRuntimeState;
+use crate::proxy::{self, ProxyState};
+use crate::startup::wait_for_start_signals;
+use crate::tls::{self, TlsPolicy};
 use crate::xds::slice::{MeshSlice, MeshSliceRequest};
 
 const DEFAULT_INBOUND_LISTEN_ADDR: &str = "0.0.0.0:15006";
@@ -387,23 +394,322 @@ pub async fn run(
         }
     }
 
-    let listener_plan = runtime.listener_plan();
-    info!(
-        listeners = listener_plan.len(),
-        "Mesh listener plan prepared; accept loops attach in the serving slice"
-    );
+    serve_mesh_runtime(
+        env_config,
+        runtime,
+        bootstrap_config,
+        shutdown_tx,
+        background_handles,
+    )
+    .await
+}
 
-    let mut shutdown_rx = shutdown_tx.subscribe();
-    if *shutdown_rx.borrow() {
-        return Ok(());
-    }
-    let _ = shutdown_rx.changed().await;
-    for handle in background_handles {
-        if let Err(e) = handle.await {
-            warn!("Mesh background task exited with join error: {}", e);
+async fn serve_mesh_runtime(
+    env_config: EnvConfig,
+    runtime: MeshRuntimeConfig,
+    config: GatewayConfig,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    mesh_background_handles: Vec<JoinHandle<()>>,
+) -> Result<(), anyhow::Error> {
+    let dns_cache = DnsCache::new(DnsConfig {
+        global_overrides: env_config.dns_overrides.clone(),
+        resolver_addresses: env_config.dns_resolver_address.clone(),
+        hosts_file_path: env_config.dns_resolver_hosts_file.clone(),
+        dns_order: env_config.dns_order.clone(),
+        ttl_override_seconds: env_config.dns_ttl_override,
+        min_ttl_seconds: env_config.dns_min_ttl,
+        stale_ttl_seconds: env_config.dns_stale_ttl,
+        error_ttl_seconds: env_config.dns_error_ttl,
+        max_cache_size: env_config.dns_cache_max_size,
+        warmup_concurrency: env_config.dns_warmup_concurrency,
+        slow_threshold_ms: env_config.dns_slow_threshold_ms,
+        refresh_threshold_percent: env_config.dns_refresh_threshold_percent,
+        failed_retry_interval_seconds: env_config.dns_failed_retry_interval,
+        try_tcp_on_error: env_config.dns_try_tcp_on_error,
+        num_concurrent_reqs: env_config.dns_num_concurrent_reqs,
+        max_active_requests: env_config.dns_max_active_requests,
+        max_concurrent_refreshes: env_config.dns_max_concurrent_refreshes,
+        backend_allow_ips: env_config.backend_allow_ips.clone(),
+        shard_amount: env_config.pool_shard_amount,
+    });
+
+    let mut hostnames: Vec<_> = config
+        .proxies
+        .iter()
+        .map(|proxy| {
+            (
+                proxy.backend_host.clone(),
+                proxy.dns_override.clone(),
+                proxy.dns_cache_ttl_seconds,
+            )
+        })
+        .collect();
+    for upstream in &config.upstreams {
+        for target in &upstream.targets {
+            hostnames.push((target.host.clone(), None, None));
         }
     }
+
+    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
+    let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
+    let (proxy_state, health_check_handles) = ProxyState::new(
+        config,
+        dns_cache.clone(),
+        env_config.clone(),
+        Some(tls_policy.clone()),
+        Some(shutdown_tx.subscribe()),
+    )?;
+    proxy_state
+        .stream_listener_manager
+        .set_global_shutdown_rx(shutdown_tx.subscribe());
+
+    for host in proxy_state.plugin_cache.collect_warmup_hostnames() {
+        hostnames.push((host, None, None));
+    }
+    dns_cache.warmup(hostnames).await;
+
+    if env_config.pool_warmup_enabled {
+        proxy_state.warmup_connection_pools().await;
+    }
+    proxy_state.start_backend_capability_refresh_task(
+        !env_config.pool_warmup_enabled,
+        Some(shutdown_tx.subscribe()),
+    );
+    proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
+
+    let dns_handle =
+        dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
+    let dns_retry_handle = dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe()));
+    let per_ip_cleanup_handle =
+        proxy_state.start_per_ip_cleanup_task(Some(shutdown_tx.subscribe()));
+    let overload_handle = crate::overload::start_monitor(
+        proxy_state.overload.clone(),
+        env_config.overload_config(),
+        env_config.max_connections,
+        env_config.max_requests,
+        shutdown_tx.subscribe(),
+    );
+    let metrics_handle = crate::metrics::start_metrics_monitor(
+        proxy_state.request_count.clone(),
+        proxy_state.status_counts.clone(),
+        proxy_state.windowed_metrics.clone(),
+        env_config.status_metrics_window_seconds,
+        shutdown_tx.subscribe(),
+    );
+
+    let frontend_tls = load_frontend_tls(&env_config, &tls_policy, &crls)?;
+    if let Some(ref tls_config) = frontend_tls {
+        proxy_state
+            .stream_listener_manager
+            .set_frontend_tls_config(Some(tls_config.clone()))
+            .await;
+    }
+
+    info!(
+        listeners = runtime.listener_plan().len(),
+        "Mesh listener plan prepared"
+    );
+    let mut listener_handles = Vec::new();
+    let mut startup_signals = Vec::new();
+    for listener in runtime.listener_plan() {
+        let tls_config = listener_tls_config(&listener, frontend_tls.clone());
+        if tls_config.is_none() && listener.kind == MeshListenerKind::MtlsTermination {
+            warn!(
+                direction = ?listener.direction,
+                addr = %listener.addr,
+                "Mesh mTLS listener is running without frontend TLS because no mesh/frontend certificate is configured"
+            );
+        }
+
+        let label = format!("{:?} mesh listener", listener.direction);
+        let state = proxy_state.clone();
+        let shutdown = shutdown_tx.subscribe();
+        let addr = listener.addr;
+        let direction = listener.direction;
+        let kind = listener.kind;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            info!(
+                direction = ?direction,
+                kind = ?kind,
+                addr = %addr,
+                "Starting mesh listener"
+            );
+            if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
+                addr,
+                state,
+                shutdown,
+                tls_config,
+                Some(started_tx),
+            )
+            .await
+            {
+                error!(
+                    direction = ?direction,
+                    kind = ?kind,
+                    addr = %addr,
+                    "Mesh listener error: {}",
+                    e
+                );
+            }
+        });
+        listener_handles.push(handle);
+        startup_signals.push((label, started_rx));
+    }
+
+    let startup_result: Result<(), anyhow::Error> = async {
+        proxy_state.initial_reconcile_stream_listeners().await?;
+        wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
+        proxy_state
+            .stream_listener_manager
+            .wait_until_started(Duration::from_secs(10))
+            .await?;
+        info!("Mesh runtime startup complete");
+        Ok(())
+    }
+    .await;
+    if let Err(e) = startup_result {
+        warn!(
+            "Mesh runtime startup failed after spawning tasks: {}; draining before returning",
+            e
+        );
+        let _ = shutdown_tx.send(true);
+        let _ =
+            await_mesh_listener_handles(listener_handles, shutdown_tx.clone(), "startup failure")
+                .await;
+        shutdown_and_join_mesh(
+            proxy_state,
+            MeshBackgroundTasks {
+                handles: vec![dns_handle, overload_handle, metrics_handle],
+                dns_retry_handle,
+                per_ip_cleanup_handle,
+                health_check_handles,
+                mesh_background_handles,
+            },
+            env_config.shutdown_drain_seconds,
+        )
+        .await;
+        return Err(e);
+    }
+
+    let listener_result =
+        await_mesh_listener_handles(listener_handles, shutdown_tx.clone(), "shutdown").await;
+
+    shutdown_and_join_mesh(
+        proxy_state,
+        MeshBackgroundTasks {
+            handles: vec![dns_handle, overload_handle, metrics_handle],
+            dns_retry_handle,
+            per_ip_cleanup_handle,
+            health_check_handles,
+            mesh_background_handles,
+        },
+        env_config.shutdown_drain_seconds,
+    )
+    .await;
+    info!("Mesh runtime mode shutting down");
+    listener_result?;
     Ok(())
+}
+
+fn load_frontend_tls(
+    env_config: &EnvConfig,
+    tls_policy: &TlsPolicy,
+    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
+    let (Some(cert_path), Some(key_path)) = (
+        env_config.frontend_tls_cert_path.as_ref(),
+        env_config.frontend_tls_key_path.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+
+    let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
+    let mut config = tls::load_tls_config_with_client_auth(
+        cert_path,
+        key_path,
+        client_ca_bundle_path,
+        env_config.tls_no_verify,
+        tls_policy,
+        env_config.tls_cert_expiry_warning_days,
+        crls,
+    )
+    .map_err(|e| anyhow::anyhow!("Invalid mesh frontend TLS configuration: {}", e))?;
+    tls::enable_early_data(&mut config, tls_policy);
+    if env_config.ktls_enabled.could_be_enabled() {
+        tls::enable_secret_extraction_for_ktls(&mut config);
+    }
+    Ok(Some(config))
+}
+
+fn listener_tls_config(
+    listener: &MeshListener,
+    frontend_tls: Option<Arc<rustls::ServerConfig>>,
+) -> Option<Arc<rustls::ServerConfig>> {
+    match listener.kind {
+        MeshListenerKind::PlaintextCapture => None,
+        MeshListenerKind::MtlsTermination => frontend_tls,
+    }
+}
+
+struct MeshBackgroundTasks {
+    handles: Vec<JoinHandle<()>>,
+    dns_retry_handle: Option<JoinHandle<()>>,
+    per_ip_cleanup_handle: Option<JoinHandle<()>>,
+    health_check_handles: Vec<JoinHandle<()>>,
+    mesh_background_handles: Vec<JoinHandle<()>>,
+}
+
+async fn await_mesh_listener_handles(
+    listener_handles: Vec<JoinHandle<()>>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    reason: &str,
+) -> Result<(), tokio::task::JoinError> {
+    if listener_handles.is_empty() {
+        let mut wait_shutdown = shutdown_tx.subscribe();
+        while !*wait_shutdown.borrow() {
+            if wait_shutdown.changed().await.is_err() {
+                break;
+            }
+        }
+        info!(
+            reason,
+            "Mesh runtime observed shutdown with no active listeners"
+        );
+        Ok(())
+    } else {
+        let shutdown_on_panic = move || {
+            let _ = shutdown_tx.send(true);
+        };
+        crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic).await
+    }
+}
+
+async fn shutdown_and_join_mesh(
+    proxy_state: ProxyState,
+    mut tasks: MeshBackgroundTasks,
+    drain_seconds: u64,
+) {
+    proxy_state.stream_listener_manager.shutdown_all().await;
+    crate::overload::begin_drain(&proxy_state.overload);
+    if drain_seconds > 0 {
+        crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))
+            .await;
+    }
+
+    if let Some(handle) = tasks.dns_retry_handle {
+        tasks.handles.push(handle);
+    }
+    if let Some(handle) = tasks.per_ip_cleanup_handle {
+        tasks.handles.push(handle);
+    }
+    tasks
+        .health_check_handles
+        .extend(proxy_state.health_checker.take_active_check_handles());
+    tasks.handles.extend(tasks.health_check_handles);
+    tasks.handles.extend(tasks.mesh_background_handles);
+
+    crate::modes::file::join_background_handles(tasks.handles, Duration::from_secs(5)).await;
 }
 
 fn parse_socket_addr(key: &str, raw: &str) -> Result<SocketAddr, String> {
@@ -440,6 +746,8 @@ mod tests {
             "FERRUM_MESH_INBOUND_LISTEN_ADDR",
             "FERRUM_MESH_OUTBOUND_LISTEN_ADDR",
             "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+            "FERRUM_POOL_WARMUP_ENABLED",
+            "FERRUM_SHUTDOWN_DRAIN_SECONDS",
         ];
 
         for key in keys {
@@ -556,6 +864,46 @@ mod tests {
                 assert!(err.contains("FERRUM_MESH_TOPOLOGY"));
             },
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mesh_runtime_starts_listeners_and_shuts_down() {
+        let env = EnvConfig {
+            mode: crate::config::OperatingMode::Mesh,
+            pool_warmup_enabled: false,
+            shutdown_drain_seconds: 0,
+            accept_threads: 1,
+            ..EnvConfig::default()
+        };
+        let runtime = MeshRuntimeConfig {
+            node_id: "node-a".to_string(),
+            namespace: "ferrum".to_string(),
+            cp_urls: vec!["http://127.0.0.1:1".to_string()],
+            config_protocol: MeshConfigProtocol::Native,
+            topology: MeshTopology::Sidecar,
+            inbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            outbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            workload_spiffe_id: None,
+        };
+        let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let task_shutdown = shutdown_tx.clone();
+        let task = tokio::spawn(async move {
+            serve_mesh_runtime(env, runtime, config, task_shutdown, Vec::new()).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !task.is_finished(),
+            "mesh runtime should keep serving until shutdown"
+        );
+        let _ = shutdown_tx.send(true);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("mesh runtime shut down before timeout")
+            .expect("mesh runtime task joined");
+        assert!(result.is_ok(), "mesh runtime returned error: {result:?}");
     }
 
     fn workload(name: &str, app: &str) -> Workload {
