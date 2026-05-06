@@ -47,7 +47,10 @@ pub fn sha256_hex(data: &[u8]) -> String {
 
 /// HMAC-SHA256 keyed hash.
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
+    let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
+        tracing::error!("HMAC-SHA256 rejected a key length that should be accepted");
+        return Vec::new();
+    };
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }

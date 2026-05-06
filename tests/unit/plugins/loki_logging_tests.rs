@@ -1,9 +1,11 @@
 //! Tests for loki_logging plugin
 
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, loki_logging::LokiLogging};
+use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginHttpClient, loki_logging::LokiLogging};
 use serde_json::json;
 
-use super::plugin_utils::create_test_transaction_summary;
+use super::plugin_utils::{
+    create_test_stream_transaction_summary, create_test_transaction_summary,
+};
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -19,6 +21,9 @@ async fn test_loki_logging_plugin_creation() {
     )
     .unwrap();
     assert_eq!(plugin.name(), "loki_logging");
+    assert_eq!(plugin.priority(), 9155);
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
+    assert_eq!(plugin.warmup_hostnames(), vec!["localhost".to_string()]);
 }
 
 #[tokio::test]
@@ -59,6 +64,39 @@ async fn test_loki_logging_rejects_non_http_scheme() {
     match result {
         Err(e) => assert!(e.contains("http:// or https://")),
         Ok(_) => panic!("Expected non-http endpoint_url to be rejected"),
+    }
+}
+
+#[tokio::test]
+async fn test_loki_logging_rejects_invalid_config_shapes() {
+    let cases = [
+        json!(null),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "gzip": "true"}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "labels": []}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "labels": {"bad-label": "value"}}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "labels": {"env": 1}}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "include_proxy_id_label": "false"}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "include_listen_path_label": []}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "include_status_class_label": 1}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "custom_headers": []}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "custom_headers": {"X-Scope-OrgID": 1}}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "custom_headers": {"Bad Header": "value"}}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "custom_headers": {"X-Bad": "bad\u{0001}value"}}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "authorization_header": ""}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "authorization_header": 123}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "authorization_header": "bad\u{0001}value"}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "batch_size": "100"}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "flush_interval_ms": false}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "buffer_capacity": -1}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "max_retries": []}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "retry_delay_ms": {}}),
+    ];
+
+    for config in cases {
+        assert!(
+            LokiLogging::new(&config, default_client()).is_err(),
+            "expected invalid config to be rejected: {config}"
+        );
     }
 }
 
@@ -264,6 +302,24 @@ async fn test_loki_logging_unreachable_endpoint_graceful() {
     .unwrap();
     let summary = create_test_transaction_summary();
     plugin.log(&summary).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+}
+
+#[tokio::test]
+async fn test_loki_logging_stream_disconnect_does_not_panic() {
+    let plugin = LokiLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:1/unreachable",
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let summary = create_test_stream_transaction_summary();
+
+    plugin.on_stream_disconnect(&summary).await;
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 }
 

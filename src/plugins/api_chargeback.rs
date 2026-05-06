@@ -187,10 +187,14 @@ impl ChargebackRegistry {
         self.currency.store(Arc::new(currency.to_string()));
         self.render_cache_ttl_secs
             .store(render_cache_ttl_secs, Ordering::Relaxed);
-        self.stale_entry_ttl_nanos
-            .store(stale_entry_ttl_secs * 1_000_000_000, Ordering::Relaxed);
-        self.cache_invalidation_min_age_nanos
-            .store(cache_invalidation_min_age_ms * 1_000_000, Ordering::Relaxed);
+        self.stale_entry_ttl_nanos.store(
+            stale_entry_ttl_secs.saturating_mul(1_000_000_000),
+            Ordering::Relaxed,
+        );
+        self.cache_invalidation_min_age_nanos.store(
+            cache_invalidation_min_age_ms.saturating_mul(1_000_000),
+            Ordering::Relaxed,
+        );
         if let Ok(mut ns_label) = self.namespace_label.write() {
             if namespace != crate::config::types::DEFAULT_NAMESPACE {
                 *ns_label = format!(",namespace=\"{}\"", escape_label_value(namespace));
@@ -493,29 +497,54 @@ pub struct ApiChargeback {
     price_by_status: HashMap<u16, f64>,
 }
 
+fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> {
+    match config.get(key) {
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("api_chargeback: '{key}' must be an unsigned integer")),
+        None => Ok(default),
+    }
+}
+
 impl ApiChargeback {
     pub fn new(config: &Value, namespace: &str) -> Result<Self, String> {
+        if !config.is_object() {
+            return Err("api_chargeback: config must be an object".to_string());
+        }
+
         let registry = global_registry();
 
-        let currency = config
-            .get("currency")
-            .and_then(|v| v.as_str())
-            .unwrap_or("USD");
+        let currency = match config.get("currency") {
+            Some(value) => {
+                let currency = value
+                    .as_str()
+                    .ok_or_else(|| "api_chargeback: 'currency' must be a string".to_string())?
+                    .trim();
+                if currency.is_empty() {
+                    return Err("api_chargeback: 'currency' must not be empty".to_string());
+                }
+                currency
+            }
+            None => "USD",
+        };
 
-        let render_cache_ttl_secs = config
-            .get("render_cache_ttl_seconds")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_RENDER_CACHE_TTL_SECS);
+        let render_cache_ttl_secs = optional_u64(
+            config,
+            "render_cache_ttl_seconds",
+            DEFAULT_RENDER_CACHE_TTL_SECS,
+        )?;
 
-        let stale_entry_ttl_secs = config
-            .get("stale_entry_ttl_seconds")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_STALE_TTL_NANOS / 1_000_000_000);
+        let stale_entry_ttl_secs = optional_u64(
+            config,
+            "stale_entry_ttl_seconds",
+            DEFAULT_STALE_TTL_NANOS / 1_000_000_000,
+        )?;
 
-        let cache_invalidation_min_age_ms = config
-            .get("cache_invalidation_min_age_ms")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS / 1_000_000);
+        let cache_invalidation_min_age_ms = optional_u64(
+            config,
+            "cache_invalidation_min_age_ms",
+            DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS / 1_000_000,
+        )?;
 
         // Validate pricing tiers BEFORE mutating the global registry.
         // If validation fails, the singleton must remain unchanged so other
@@ -538,6 +567,12 @@ impl ApiChargeback {
         let mut price_by_status: HashMap<u16, f64> = HashMap::new();
 
         for (i, tier) in tiers.iter().enumerate() {
+            if !tier.is_object() {
+                return Err(format!(
+                    "api_chargeback: pricing_tiers[{i}] must be an object"
+                ));
+            }
+
             let status_codes = tier
                 .get("status_codes")
                 .and_then(|v| v.as_array())
@@ -565,9 +600,9 @@ impl ApiChargeback {
                     )
                 })?;
 
-            if price < 0.0 {
+            if !price.is_finite() || price < 0.0 {
                 return Err(format!(
-                    "api_chargeback: pricing_tiers[{}].price_per_call must be non-negative",
+                    "api_chargeback: pricing_tiers[{}].price_per_call must be finite and non-negative",
                     i
                 ));
             }
@@ -608,10 +643,7 @@ impl ApiChargeback {
             namespace,
         );
 
-        let cleanup_interval_seconds = config
-            .get("cleanup_interval_seconds")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(300);
+        let cleanup_interval_seconds = optional_u64(config, "cleanup_interval_seconds", 300)?;
         registry.start_cleanup_task(cleanup_interval_seconds);
 
         Ok(Self {

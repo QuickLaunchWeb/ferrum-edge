@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use http::{HeaderName, Method};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -44,7 +45,11 @@ fn cache_key_host_part(host: &str) -> String {
     if host.is_empty() {
         String::new()
     } else {
-        format!("h-{}", sha256_hex(&host))
+        let digest = sha256_hex(&host);
+        let mut part = String::with_capacity(2 + digest.len());
+        part.push_str("h-");
+        part.push_str(&digest);
+        part
     }
 }
 
@@ -56,7 +61,11 @@ fn is_sensitive_vary_header(header: &str) -> bool {
 
 fn cache_key_vary_value(header: &str, value: &str) -> String {
     if is_sensitive_vary_header(header) {
-        format!("sha256-{}", sha256_hex(value))
+        let digest = sha256_hex(value);
+        let mut hashed = String::with_capacity(7 + digest.len());
+        hashed.push_str("sha256-");
+        hashed.push_str(&digest);
+        hashed
     } else {
         value.to_string()
     }
@@ -105,25 +114,31 @@ fn parse_cache_control(header_value: &str) -> CacheControlDirectives {
     let mut directives = CacheControlDirectives::default();
 
     for part in header_value.split(',') {
-        let part = part.trim().to_lowercase();
-        if part == "no-store" {
+        let part = part.trim();
+        if part.eq_ignore_ascii_case("no-store") {
             directives.no_store = true;
-        } else if part == "no-cache" {
+        } else if part.eq_ignore_ascii_case("no-cache") {
             directives.no_cache = true;
-        } else if part == "private" {
+        } else if part.eq_ignore_ascii_case("private") {
             directives.private = true;
-        } else if part == "public" {
+        } else if part.eq_ignore_ascii_case("public") {
             directives.public = true;
-        } else if part == "must-revalidate" {
+        } else if part.eq_ignore_ascii_case("must-revalidate") {
             directives.must_revalidate = true;
-        } else if let Some(val) = part.strip_prefix("s-maxage=") {
+        } else if let Some(val) = strip_prefix_ascii_case(part, "s-maxage=") {
             directives.s_maxage = val.trim().parse().ok();
-        } else if let Some(val) = part.strip_prefix("max-age=") {
+        } else if let Some(val) = strip_prefix_ascii_case(part, "max-age=") {
             directives.max_age = val.trim().parse().ok();
         }
     }
 
     directives
+}
+
+fn strip_prefix_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = value.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then_some(&value[prefix.len()..])
 }
 
 /// Plugin configuration.
@@ -145,64 +160,162 @@ struct ResponseCachingConfig {
 }
 
 impl ResponseCachingConfig {
-    fn from_json(config: &Value) -> Self {
-        let cacheable_methods = config["cacheable_methods"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_uppercase()))
-                    .collect()
-            })
+    fn from_json(config: &Value) -> Result<Self, String> {
+        if !config.is_object() {
+            return Err("response_caching: config must be an object".to_string());
+        }
+
+        let cacheable_methods = parse_method_list(config, "cacheable_methods")?
             .unwrap_or_else(|| vec!["GET".to_string(), "HEAD".to_string()]);
-
-        let cacheable_status_codes = config["cacheable_status_codes"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_u64().map(|n| n as u16))
-                    .collect()
-            })
+        let cacheable_status_codes = parse_status_code_list(config, "cacheable_status_codes")?
             .unwrap_or_else(|| vec![200, 301, 404]);
+        let vary_by_headers = parse_header_list(config, "vary_by_headers")?.unwrap_or_default();
 
-        let vary_by_headers = config["vary_by_headers"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Self {
-            ttl_seconds: config["ttl_seconds"]
-                .as_u64()
-                .unwrap_or(DEFAULT_TTL_SECONDS),
-            max_entries: config["max_entries"]
-                .as_u64()
-                .unwrap_or(DEFAULT_MAX_ENTRIES as u64) as usize,
-            max_entry_size_bytes: config["max_entry_size_bytes"]
-                .as_u64()
-                .unwrap_or(DEFAULT_MAX_ENTRY_SIZE_BYTES as u64)
-                as usize,
-            max_total_size_bytes: config["max_total_size_bytes"]
-                .as_u64()
-                .unwrap_or(DEFAULT_MAX_TOTAL_SIZE_BYTES as u64)
-                as usize,
+        Ok(Self {
+            ttl_seconds: optional_u64(config, "ttl_seconds")?.unwrap_or(DEFAULT_TTL_SECONDS),
+            max_entries: optional_positive_usize(config, "max_entries")?
+                .unwrap_or(DEFAULT_MAX_ENTRIES),
+            max_entry_size_bytes: optional_positive_usize(config, "max_entry_size_bytes")?
+                .unwrap_or(DEFAULT_MAX_ENTRY_SIZE_BYTES),
+            max_total_size_bytes: optional_positive_usize(config, "max_total_size_bytes")?
+                .unwrap_or(DEFAULT_MAX_TOTAL_SIZE_BYTES),
             cacheable_methods,
             cacheable_status_codes,
-            respect_cache_control: config["respect_cache_control"].as_bool().unwrap_or(true),
-            respect_no_cache: config["respect_no_cache"].as_bool().unwrap_or(true),
+            respect_cache_control: optional_bool(config, "respect_cache_control")?.unwrap_or(true),
+            respect_no_cache: optional_bool(config, "respect_no_cache")?.unwrap_or(true),
             vary_by_headers,
-            cache_key_include_query: config["cache_key_include_query"].as_bool().unwrap_or(true),
-            cache_key_include_consumer: config["cache_key_include_consumer"]
-                .as_bool()
-                .unwrap_or(false),
-            add_cache_status_header: config["add_cache_status_header"].as_bool().unwrap_or(true),
-            invalidate_on_unsafe_methods: config["invalidate_on_unsafe_methods"]
-                .as_bool()
+            cache_key_include_query: optional_bool(config, "cache_key_include_query")?
                 .unwrap_or(true),
-        }
+            cache_key_include_consumer: optional_bool(config, "cache_key_include_consumer")?
+                .unwrap_or(false),
+            add_cache_status_header: optional_bool(config, "add_cache_status_header")?
+                .unwrap_or(true),
+            invalidate_on_unsafe_methods: optional_bool(config, "invalidate_on_unsafe_methods")?
+                .unwrap_or(true),
+        })
     }
+}
+
+fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
+    match config.get(field) {
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("response_caching: '{field}' must be a boolean")),
+    }
+}
+
+fn optional_u64(config: &Value, field: &'static str) -> Result<Option<u64>, String> {
+    match config.get(field) {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .ok_or_else(|| format!("response_caching: '{field}' must be an unsigned integer"))
+            .map(Some),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!(
+            "response_caching: '{field}' must be an unsigned integer"
+        )),
+    }
+}
+
+fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option<usize>, String> {
+    let Some(value) = optional_u64(config, field)? else {
+        return Ok(None);
+    };
+    let value =
+        usize::try_from(value).map_err(|_| format!("response_caching: '{field}' is too large"))?;
+    if value == 0 {
+        return Err(format!(
+            "response_caching: '{field}' must be greater than zero"
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn parse_method_list(config: &Value, field: &'static str) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!("response_caching: '{field}' must be an array"));
+    };
+    if values.is_empty() {
+        return Err(format!("response_caching: '{field}' must not be empty"));
+    }
+
+    let mut methods = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let Some(method) = value.as_str() else {
+            return Err(format!(
+                "response_caching: '{field}[{index}]' must be a string"
+            ));
+        };
+        if method.is_empty() {
+            return Err(format!(
+                "response_caching: '{field}[{index}]' must not be empty"
+            ));
+        }
+        Method::from_bytes(method.as_bytes()).map_err(|_| {
+            format!("response_caching: '{field}[{index}]' is not a valid HTTP method")
+        })?;
+        methods.push(method.to_ascii_uppercase());
+    }
+    Ok(Some(methods))
+}
+
+fn parse_status_code_list(config: &Value, field: &'static str) -> Result<Option<Vec<u16>>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!("response_caching: '{field}' must be an array"));
+    };
+    if values.is_empty() {
+        return Err(format!("response_caching: '{field}' must not be empty"));
+    }
+
+    let mut status_codes = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let Some(code) = value.as_u64() else {
+            return Err(format!(
+                "response_caching: '{field}[{index}]' must be an unsigned integer"
+            ));
+        };
+        if !(100..=599).contains(&code) {
+            return Err(format!(
+                "response_caching: '{field}[{index}]' must be an HTTP status code"
+            ));
+        }
+        status_codes.push(code as u16);
+    }
+    Ok(Some(status_codes))
+}
+
+fn parse_header_list(config: &Value, field: &'static str) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!("response_caching: '{field}' must be an array"));
+    };
+
+    let mut headers = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let Some(header) = value.as_str() else {
+            return Err(format!(
+                "response_caching: '{field}[{index}]' must be a string"
+            ));
+        };
+        if header.is_empty() {
+            return Err(format!(
+                "response_caching: '{field}[{index}]' must not be empty"
+            ));
+        }
+        let header_name = HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
+            format!("response_caching: '{field}[{index}]' is not a valid HTTP header name")
+        })?;
+        headers.push(header_name.to_string());
+    }
+    Ok(Some(headers))
 }
 
 /// Bounded LRU tracker of keys known to be uncacheable.
@@ -265,7 +378,7 @@ pub struct ResponseCaching {
 
 impl ResponseCaching {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let config = ResponseCachingConfig::from_json(config);
+        let config = ResponseCachingConfig::from_json(config)?;
 
         if config.cacheable_methods.is_empty() {
             return Err(
@@ -313,17 +426,19 @@ impl ResponseCaching {
             .map(|h| cache_key_host_part(h))
             .unwrap_or_default();
 
-        let query_part = if self.config.cache_key_include_query {
+        let mut query_part = String::new();
+        if self.config.cache_key_include_query && !ctx.query_params.is_empty() {
             let mut params: Vec<(&String, &String)> = ctx.query_params.iter().collect();
             params.sort_by_key(|(k, _)| k.as_str());
-            params
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect::<Vec<_>>()
-                .join("&")
-        } else {
-            String::new()
-        };
+            for (index, (key, value)) in params.iter().enumerate() {
+                if index > 0 {
+                    query_part.push('&');
+                }
+                query_part.push_str(key);
+                query_part.push('=');
+                query_part.push_str(value);
+            }
+        }
 
         let consumer_part = if self.config.cache_key_include_consumer {
             ctx.effective_identity().unwrap_or("_anon")
@@ -331,10 +446,27 @@ impl ResponseCaching {
             ""
         };
 
-        format!(
-            "{}:{}:{}:{}:{}:{}",
-            proxy_id, host_part, ctx.method, ctx.path, query_part, consumer_part
-        )
+        let mut key = String::with_capacity(
+            proxy_id.len()
+                + host_part.len()
+                + ctx.method.len()
+                + ctx.path.len()
+                + query_part.len()
+                + consumer_part.len()
+                + 5,
+        );
+        key.push_str(proxy_id);
+        key.push(':');
+        key.push_str(&host_part);
+        key.push(':');
+        key.push_str(&ctx.method);
+        key.push(':');
+        key.push_str(&ctx.path);
+        key.push(':');
+        key.push_str(&query_part);
+        key.push(':');
+        key.push_str(consumer_part);
+        key
     }
 
     fn build_cache_key(
@@ -348,20 +480,23 @@ impl ResponseCaching {
             return base_key;
         }
 
-        let vary_part = vary_headers
-            .iter()
-            .map(|header| {
-                let value = request_headers
-                    .get(header.as_str())
-                    .map(String::as_str)
-                    .unwrap_or("");
-                let value = cache_key_vary_value(header, value);
-                format!("{}={}", header, value)
-            })
-            .collect::<Vec<_>>()
-            .join("|");
+        let mut cache_key = base_key;
+        cache_key.push(':');
+        for (index, header) in vary_headers.iter().enumerate() {
+            if index > 0 {
+                cache_key.push('|');
+            }
+            let value = request_headers
+                .get(header.as_str())
+                .map(String::as_str)
+                .unwrap_or("");
+            let value = cache_key_vary_value(header, value);
+            cache_key.push_str(header);
+            cache_key.push('=');
+            cache_key.push_str(&value);
+        }
 
-        format!("{}:{}", base_key, vary_part)
+        cache_key
     }
 
     /// Check if the request method is cacheable.
@@ -384,7 +519,7 @@ impl ResponseCaching {
 
         if let Some(vary) = response_headers.get("vary") {
             for header in vary.split(',') {
-                let header = header.trim().to_lowercase();
+                let header = header.trim().to_ascii_lowercase();
                 if header.is_empty() {
                     continue;
                 }
@@ -451,7 +586,9 @@ impl ResponseCaching {
     }
 
     fn invalidate_base_key(&self, base_key: &str) {
-        let variant_prefix = format!("{}:", base_key);
+        let mut variant_prefix = String::with_capacity(base_key.len() + 1);
+        variant_prefix.push_str(base_key);
+        variant_prefix.push(':');
         let mut removed_size = 0usize;
         self.cache.retain(|key, entry| {
             if key == base_key || key.starts_with(&variant_prefix) {
@@ -511,7 +648,9 @@ impl ResponseCaching {
             .as_ref()
             .map(|p| p.id.as_str())
             .unwrap_or("_");
-        let prefix = format!("{}:", proxy_id);
+        let mut prefix = String::with_capacity(proxy_id.len() + 1);
+        prefix.push_str(proxy_id);
+        prefix.push(':');
         let path = &ctx.path;
         let mut removed_size = 0usize;
 
@@ -920,7 +1059,10 @@ mod tests {
     use serde_json::json;
 
     fn plugin_with_config(config: serde_json::Value) -> ResponseCaching {
-        ResponseCaching::new(&config).expect("response_caching config should be valid")
+        match ResponseCaching::new(&config) {
+            Ok(plugin) => plugin,
+            Err(error) => panic!("response_caching config should be valid: {error}"),
+        }
     }
 
     fn make_ctx(method: &str, path: &str) -> RequestContext {
@@ -947,10 +1089,9 @@ mod tests {
         let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
         assert!(matches!(result, PluginResult::Continue));
 
-        let predict_key = ctx
-            .metadata
-            .get(CACHE_PREDICT_KEY)
-            .expect("before_proxy should store variant predict key");
+        let Some(predict_key) = ctx.metadata.get(CACHE_PREDICT_KEY) else {
+            panic!("before_proxy should store variant predict key");
+        };
         assert!(!predict_key.contains(bearer));
         assert!(!predict_key.contains("reviewer-secret-token"));
         assert!(predict_key.contains("authorization=sha256-"));

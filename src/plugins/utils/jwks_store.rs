@@ -122,6 +122,7 @@ impl JwksKeyStore {
             .await
             .map_err(|e| format!("JWKS parse failed: {}", e))?;
 
+        let total_keys = jwks.keys.len();
         let mut new_keys = HashMap::new();
 
         for (idx, jwk) in jwks.keys.iter().enumerate() {
@@ -147,6 +148,12 @@ impl JwksKeyStore {
         }
 
         let count = new_keys.len();
+        if count == 0 && total_keys > 0 {
+            return Err(
+                "JWKS response contained keys but no usable signing keys were parsed".to_string(),
+            );
+        }
+
         self.keys.store(Arc::new(new_keys));
         debug!("JWKS key store updated: {} keys cached", count);
         Ok(count)
@@ -158,9 +165,19 @@ impl JwksKeyStore {
     /// or the process exits.
     pub fn start_background_refresh(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
         let store = self.clone();
+        let interval = if interval.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            interval
+        };
         tokio::spawn(async move {
+            if let Err(e) = store.fetch_keys().await {
+                warn!("JWKS initial fetch failed: {}", e);
+            }
+
             let mut timer = tokio::time::interval(interval);
-            // Skip the first tick (keys are fetched eagerly at startup)
+            // Skip tokio's immediate first tick; the explicit initial fetch
+            // above already covered startup.
             timer.tick().await;
             loop {
                 timer.tick().await;

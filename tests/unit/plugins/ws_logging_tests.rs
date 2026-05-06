@@ -1,12 +1,39 @@
 //! Tests for ws_logging plugin
 
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult, ws_logging::WsLogging};
+use std::collections::HashMap;
+
+use ferrum_edge::plugins::{
+    Direction, Plugin, PluginHttpClient, PluginResult, WS_ONLY_PROTOCOLS, WsDisconnectContext,
+    ws_logging::WsLogging,
+};
 use serde_json::json;
 
 use super::plugin_utils::{create_test_context, create_test_transaction_summary};
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
+}
+
+fn test_ws_disconnect_context() -> WsDisconnectContext {
+    let mut metadata = HashMap::new();
+    metadata.insert("correlation_id".to_string(), "cid-123".to_string());
+    metadata.insert("authorization".to_string(), "Bearer secret".to_string());
+
+    WsDisconnectContext {
+        namespace: "ferrum".to_string(),
+        proxy_id: "proxy-ws".to_string(),
+        proxy_name: Some("websocket-proxy".to_string()),
+        client_ip: "127.0.0.1".to_string(),
+        backend_target: "ws://backend.local/chat".to_string(),
+        listen_port: 8080,
+        duration_ms: 250.0,
+        frames_client_to_backend: 3,
+        frames_backend_to_client: 4,
+        direction: Some(Direction::ClientToBackend),
+        error_class: None,
+        consumer_username: Some("alice".to_string()),
+        metadata,
+    }
 }
 
 #[tokio::test]
@@ -19,6 +46,10 @@ async fn test_ws_logging_plugin_creation() {
     )
     .unwrap();
     assert_eq!(plugin.name(), "ws_logging");
+    assert_eq!(plugin.priority(), 9175);
+    assert_eq!(plugin.supported_protocols(), WS_ONLY_PROTOCOLS);
+    assert!(plugin.requires_ws_disconnect_hooks());
+    assert_eq!(plugin.warmup_hostnames(), vec!["localhost".to_string()]);
 }
 
 #[tokio::test]
@@ -47,6 +78,25 @@ async fn test_ws_logging_plugin_creation_empty_config() {
             e
         ),
         Ok(_) => panic!("Expected Err when creating ws_logging without endpoint_url"),
+    }
+}
+
+#[tokio::test]
+async fn test_ws_logging_rejects_invalid_config_shapes() {
+    for config in [
+        json!("not-an-object"),
+        json!({"endpoint_url": 42}),
+        json!({"endpoint_url": "ws://localhost:9300/logs", "batch_size": "many"}),
+        json!({"endpoint_url": "ws://localhost:9300/logs", "flush_interval_ms": false}),
+        json!({"endpoint_url": "ws://localhost:9300/logs", "buffer_capacity": -1}),
+        json!({"endpoint_url": "ws://localhost:9300/logs", "max_retries": "3"}),
+        json!({"endpoint_url": "ws://localhost:9300/logs", "retry_delay_ms": {}}),
+        json!({"endpoint_url": "ws://localhost:9300/logs", "reconnect_delay_ms": "soon"}),
+    ] {
+        assert!(
+            WsLogging::new(&config, default_client()).is_err(),
+            "expected invalid config to be rejected: {config}"
+        );
     }
 }
 
@@ -119,6 +169,25 @@ async fn test_ws_logging_log_does_not_panic() {
 
     // Should not panic — entry goes into channel and is drained
     plugin.log(&summary).await;
+}
+
+#[tokio::test]
+async fn test_ws_logging_ws_disconnect_does_not_panic() {
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://127.0.0.1:1/unreachable",
+            "batch_size": 1000,
+            "flush_interval_ms": 60000,
+            "max_retries": 0,
+            "buffer_capacity": 1
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let ctx = test_ws_disconnect_context();
+
+    plugin.on_ws_disconnect(&ctx).await;
+    plugin.on_ws_disconnect(&ctx).await;
 }
 
 #[tokio::test]

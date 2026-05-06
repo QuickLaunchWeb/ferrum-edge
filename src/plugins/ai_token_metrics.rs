@@ -28,33 +28,63 @@ use super::utils::ai_providers::{
     AiProvider, AiTokenUsage, detect_response_provider, detect_sse_provider,
     extract_response_usage, parse_ai_provider,
 };
+use super::utils::body_transform::{
+    is_ai_request_content_type, is_event_stream_content_type, is_json_content_type,
+};
 use super::{Plugin, PluginResult, RequestContext};
 
 pub struct AiTokenMetrics {
     provider: String,
     include_model: bool,
     include_token_details: bool,
-    metadata_prefix: String,
+    provider_key: String,
+    total_tokens_key: String,
+    prompt_tokens_key: String,
+    completion_tokens_key: String,
+    model_key: String,
+    estimated_cost_key: String,
+    streaming_key: String,
     cost_per_prompt_token: Option<f64>,
     cost_per_completion_token: Option<f64>,
 }
 
 impl AiTokenMetrics {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let provider = config["provider"]
-            .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("auto")
-            .to_ascii_lowercase();
-        let include_model = config["include_model"].as_bool().unwrap_or(true);
-        let include_token_details = config["include_token_details"].as_bool().unwrap_or(true);
-        let metadata_prefix = config["metadata_prefix"]
-            .as_str()
-            .unwrap_or("ai")
-            .to_string();
-        let cost_per_prompt_token = config["cost_per_prompt_token"].as_f64();
-        let cost_per_completion_token = config["cost_per_completion_token"].as_f64();
+        if !config.is_object() {
+            return Err("ai_token_metrics: config must be an object".to_string());
+        }
+
+        let provider = match optional_string(config, "provider")? {
+            Some(raw) => {
+                let provider = raw.trim();
+                if provider.is_empty() {
+                    return Err("ai_token_metrics: 'provider' must not be empty".to_string());
+                }
+                provider.to_ascii_lowercase()
+            }
+            None => "auto".to_string(),
+        };
+        if provider != "auto" && parse_ai_provider(&provider).is_none() {
+            return Err(format!(
+                "ai_token_metrics: unknown 'provider' value '{}' (expected auto, openai, anthropic, google, cohere, mistral, or bedrock)",
+                provider
+            ));
+        }
+
+        let include_model = optional_bool(config, "include_model")?.unwrap_or(true);
+        let include_token_details = optional_bool(config, "include_token_details")?.unwrap_or(true);
+        let metadata_prefix = match optional_string(config, "metadata_prefix")? {
+            Some(raw) => {
+                let prefix = raw.trim();
+                if prefix.is_empty() {
+                    return Err("ai_token_metrics: 'metadata_prefix' must not be empty".to_string());
+                }
+                prefix.to_string()
+            }
+            None => "ai".to_string(),
+        };
+        let cost_per_prompt_token = optional_f64(config, "cost_per_prompt_token")?;
+        let cost_per_completion_token = optional_f64(config, "cost_per_completion_token")?;
 
         // Reject negative or non-finite cost rates — they would produce
         // nonsensical (negative or NaN/Inf) cost metrics that pollute
@@ -74,11 +104,25 @@ impl AiTokenMetrics {
             ));
         }
 
+        let provider_key = metadata_key(&metadata_prefix, "provider");
+        let total_tokens_key = metadata_key(&metadata_prefix, "total_tokens");
+        let prompt_tokens_key = metadata_key(&metadata_prefix, "prompt_tokens");
+        let completion_tokens_key = metadata_key(&metadata_prefix, "completion_tokens");
+        let model_key = metadata_key(&metadata_prefix, "model");
+        let estimated_cost_key = metadata_key(&metadata_prefix, "estimated_cost");
+        let streaming_key = metadata_key(&metadata_prefix, "streaming");
+
         Ok(Self {
             provider,
             include_model,
             include_token_details,
-            metadata_prefix,
+            provider_key,
+            total_tokens_key,
+            prompt_tokens_key,
+            completion_tokens_key,
+            model_key,
+            estimated_cost_key,
+            streaming_key,
             cost_per_prompt_token,
             cost_per_completion_token,
         })
@@ -203,35 +247,27 @@ impl AiTokenMetrics {
     }
     /// Write extracted token usage into the request context metadata.
     fn write_metadata(&self, metadata: &mut HashMap<String, String>, usage: &AiTokenUsage) {
-        let prefix = &self.metadata_prefix;
-
         if let Some(provider) = usage.provider {
-            metadata.insert(
-                format!("{}_provider", prefix),
-                provider.as_str().to_string(),
-            );
+            metadata.insert(self.provider_key.clone(), provider.as_str().to_string());
         }
 
         if let Some(total) = usage.total_tokens {
-            metadata.insert(format!("{}_total_tokens", prefix), total.to_string());
+            metadata.insert(self.total_tokens_key.clone(), total.to_string());
         }
 
         if self.include_token_details {
             if let Some(prompt) = usage.prompt_tokens {
-                metadata.insert(format!("{}_prompt_tokens", prefix), prompt.to_string());
+                metadata.insert(self.prompt_tokens_key.clone(), prompt.to_string());
             }
             if let Some(completion) = usage.completion_tokens {
-                metadata.insert(
-                    format!("{}_completion_tokens", prefix),
-                    completion.to_string(),
-                );
+                metadata.insert(self.completion_tokens_key.clone(), completion.to_string());
             }
         }
 
         if self.include_model
             && let Some(ref model) = usage.model
         {
-            metadata.insert(format!("{}_model", prefix), model.clone());
+            metadata.insert(self.model_key.clone(), model.clone());
         }
 
         // Calculate estimated cost if at least one cost rate is configured
@@ -241,11 +277,59 @@ impl AiTokenMetrics {
             let total_cost = prompt_tokens * self.cost_per_prompt_token.unwrap_or(0.0)
                 + completion_tokens * self.cost_per_completion_token.unwrap_or(0.0);
             metadata.insert(
-                format!("{}_estimated_cost", prefix),
+                self.estimated_cost_key.clone(),
                 format!("{:.6}", total_cost),
             );
         }
     }
+}
+
+fn request_content_type(ctx: &RequestContext) -> Option<&str> {
+    ctx.headers
+        .get("content-type")
+        .map(String::as_str)
+        .or_else(|| ctx.raw_header_get("content-type"))
+}
+
+fn metadata_key(prefix: &str, suffix: &str) -> String {
+    let mut key = String::with_capacity(prefix.len() + 1 + suffix.len());
+    key.push_str(prefix);
+    key.push('_');
+    key.push_str(suffix);
+    key
+}
+
+fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(Some)
+        .ok_or_else(|| format!("ai_token_metrics: '{field}' must be a string"))
+}
+
+fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| format!("ai_token_metrics: '{field}' must be a boolean"))
+}
+
+fn optional_f64(config: &Value, field: &'static str) -> Result<Option<f64>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_f64()
+        .map(Some)
+        .ok_or_else(|| format!("ai_token_metrics: '{field}' must be a number"))
 }
 
 #[async_trait]
@@ -267,11 +351,7 @@ impl Plugin for AiTokenMetrics {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        // Only buffer for POST requests — AI/LLM API calls that contain token
-        // usage data in the response body. We check method only, not request
-        // Content-Type, because multipart/form-data uploads (e.g., file inputs
-        // to vision models) also return JSON responses with token counts.
-        ctx.method == "POST"
+        ctx.method == "POST" && request_content_type(ctx).is_some_and(is_ai_request_content_type)
     }
 
     async fn on_response_body(
@@ -303,14 +383,12 @@ impl Plugin for AiTokenMetrics {
         }
 
         // Handle SSE streaming responses
-        if content_type.contains("text/event-stream") || content_type.contains("event-stream") {
+        if is_event_stream_content_type(content_type) {
             debug!("ai_token_metrics: parsing SSE streaming response");
             if let Some(usage) = self.extract_from_sse(body) {
                 self.write_metadata(&mut ctx.metadata, &usage);
-                ctx.metadata.insert(
-                    format!("{}_streaming", self.metadata_prefix),
-                    "true".to_string(),
-                );
+                ctx.metadata
+                    .insert(self.streaming_key.clone(), "true".to_string());
             } else {
                 debug!("ai_token_metrics: no usage data found in SSE stream");
             }
@@ -318,7 +396,7 @@ impl Plugin for AiTokenMetrics {
         }
 
         // Handle regular JSON responses
-        if !content_type.contains("json") {
+        if !is_json_content_type(content_type) {
             debug!(
                 "ai_token_metrics: skipping non-JSON response (content-type: {})",
                 content_type

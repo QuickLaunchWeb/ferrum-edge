@@ -1,9 +1,11 @@
 //! Tests for http_logging plugin
 
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, http_logging::HttpLogging};
+use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginHttpClient, http_logging::HttpLogging};
 use serde_json::json;
 
-use super::plugin_utils::create_test_transaction_summary;
+use super::plugin_utils::{
+    create_test_stream_transaction_summary, create_test_transaction_summary,
+};
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -22,6 +24,8 @@ async fn test_http_logging_plugin_creation() {
     )
     .unwrap();
     assert_eq!(plugin.name(), "http_logging");
+    assert_eq!(plugin.priority(), 9100);
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
 }
 
 #[tokio::test]
@@ -130,9 +134,8 @@ async fn test_http_logging_with_custom_headers() {
 }
 
 #[tokio::test]
-async fn test_http_logging_custom_headers_skips_non_string_values() {
-    // Non-string values in custom_headers are skipped with a warning log
-    let plugin = HttpLogging::new(
+async fn test_http_logging_custom_headers_rejects_non_string_values() {
+    let result = HttpLogging::new(
         &json!({
             "endpoint_url": "http://127.0.0.1:1/unreachable",
             "custom_headers": {
@@ -145,9 +148,31 @@ async fn test_http_logging_custom_headers_skips_non_string_values() {
             "max_retries": 0
         }),
         default_client(),
-    )
-    .unwrap();
-    assert_eq!(plugin.name(), "http_logging");
+    );
+    match result {
+        Err(e) => assert!(e.contains("custom_headers['bad_")),
+        Ok(_) => panic!("Expected non-string custom header values to be rejected"),
+    }
+}
+
+#[tokio::test]
+async fn test_http_logging_rejects_invalid_config_shapes() {
+    let cases = [
+        json!(null),
+        json!({"endpoint_url": "http://127.0.0.1:1/logs", "custom_headers": []}),
+        json!({"endpoint_url": "http://127.0.0.1:1/logs", "batch_size": "10"}),
+        json!({"endpoint_url": "http://127.0.0.1:1/logs", "flush_interval_ms": false}),
+        json!({"endpoint_url": "http://127.0.0.1:1/logs", "buffer_capacity": -1}),
+        json!({"endpoint_url": "http://127.0.0.1:1/logs", "max_retries": []}),
+        json!({"endpoint_url": "http://127.0.0.1:1/logs", "retry_delay_ms": {}}),
+    ];
+
+    for config in cases {
+        assert!(
+            HttpLogging::new(&config, default_client()).is_err(),
+            "expected invalid config to be rejected: {config}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -334,4 +359,22 @@ async fn test_http_logging_buffer_full_drops_gracefully() {
         plugin.log(&summary).await;
     }
     // Should not panic — overflow entries are dropped with a warning
+}
+
+#[tokio::test]
+async fn test_http_logging_stream_disconnect_does_not_panic() {
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:1/unreachable",
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let summary = create_test_stream_transaction_summary();
+
+    plugin.on_stream_disconnect(&summary).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 }

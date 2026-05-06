@@ -3,7 +3,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ferrum_edge::plugins::utils::{BatchConfig, BatchingLogger, RetryPolicy};
+use ferrum_edge::plugins::utils::{
+    BatchConfig, BatchConfigDefaults, BatchingLogger, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY,
+    RetryPolicy, build_batch_config, validate_batch_config,
+};
+use serde_json::json;
 use tokio::sync::Notify;
 use tokio::time::timeout;
 use tracing_subscriber::fmt::MakeWriter;
@@ -61,10 +65,55 @@ fn test_logger_config(
     }
 }
 
+fn batch_defaults() -> BatchConfigDefaults {
+    BatchConfigDefaults {
+        batch_size_key: "batch_size",
+        batch_size: 50,
+        flush_interval_ms: 1000,
+        min_flush_interval_ms: 100,
+        buffer_capacity: 10_000,
+        max_retries: 3,
+        retry_delay_ms: 1000,
+    }
+}
+
 async fn wait_for_flush(notify: &Notify) {
     timeout(Duration::from_millis(250), notify.notified())
         .await
         .expect("flush did not occur in time");
+}
+
+#[test]
+fn build_batch_config_caps_unbounded_values() {
+    let cfg = build_batch_config(
+        &json!({
+            "batch_size": u64::MAX,
+            "buffer_capacity": u64::MAX,
+            "max_retries": u64::MAX
+        }),
+        "batching_logger_bounds",
+        batch_defaults(),
+    );
+
+    assert_eq!(cfg.batch_size, MAX_BATCH_SIZE);
+    assert_eq!(cfg.buffer_capacity, MAX_BUFFER_CAPACITY);
+    assert_eq!(cfg.retry.max_attempts, u32::MAX);
+}
+
+#[test]
+fn validate_batch_config_rejects_malformed_numeric_values() {
+    for config in [
+        json!({"batch_size": "many"}),
+        json!({"flush_interval_ms": false}),
+        json!({"buffer_capacity": -1}),
+        json!({"max_retries": {}}),
+        json!({"retry_delay_ms": []}),
+    ] {
+        assert!(
+            validate_batch_config(&config, "batching_logger_bounds", batch_defaults()).is_err(),
+            "expected invalid config to be rejected: {config}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -92,6 +141,45 @@ async fn try_send_batch_threshold_triggers_flush() {
 
     wait_for_flush(&notify).await;
     assert_eq!(*flushed.lock().unwrap(), vec![vec![1, 2]]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn oversized_batch_size_is_capped_before_flush_loop() {
+    let flushed_len = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(Notify::new());
+    let notify_clone = Arc::clone(&notify);
+    let flushed_len_clone = Arc::clone(&flushed_len);
+
+    let logger = BatchingLogger::spawn(
+        BatchConfig {
+            batch_size: MAX_BATCH_SIZE + 1024,
+            flush_interval: Duration::from_secs(60),
+            buffer_capacity: MAX_BATCH_SIZE + 16,
+            retry: RetryPolicy {
+                max_attempts: 1,
+                delay: Duration::from_millis(0),
+            },
+            plugin_name: "batching_logger_capped",
+        },
+        move |batch: Vec<usize>| {
+            let notify = Arc::clone(&notify_clone);
+            let flushed_len = Arc::clone(&flushed_len_clone);
+            async move {
+                flushed_len.store(batch.len(), Ordering::Relaxed);
+                notify.notify_one();
+                Ok(())
+            }
+        },
+    );
+
+    for value in 0..MAX_BATCH_SIZE {
+        logger.try_send(value);
+    }
+
+    timeout(Duration::from_secs(1), notify.notified())
+        .await
+        .expect("capped batch did not flush");
+    assert_eq!(flushed_len.load(Ordering::Relaxed), MAX_BATCH_SIZE);
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -5348,6 +5348,11 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
     status_code: u16,
     response_headers: &mut HashMap<String, String>,
 ) {
+    let rejection_marker_key = "ferrum:rejection_response".to_string();
+    let previous_marker = ctx
+        .metadata
+        .insert(rejection_marker_key.clone(), "true".to_string());
+
     for plugin in plugins.iter().filter(|p| p.applies_after_proxy_on_reject()) {
         match plugin.after_proxy(ctx, status_code, response_headers).await {
             PluginResult::Reject {
@@ -5366,6 +5371,12 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
             }
             PluginResult::Continue => {}
         }
+    }
+
+    if let Some(previous_marker) = previous_marker {
+        ctx.metadata.insert(rejection_marker_key, previous_marker);
+    } else {
+        ctx.metadata.remove(&rejection_marker_key);
     }
 }
 

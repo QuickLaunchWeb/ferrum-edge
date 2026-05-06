@@ -7,6 +7,8 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 const DROP_WARN_EVERY: u64 = 100;
+pub const MAX_BATCH_SIZE: usize = 10_000;
+pub const MAX_BUFFER_CAPACITY: usize = 1_000_000;
 
 /// Strategy for retrying a failed flush. The flush closure owns its own
 /// status-code-aware logic (e.g. "don't retry 401/403, do retry 408/429") —
@@ -47,13 +49,21 @@ impl<T: Send + 'static> BatchingLogger<T> {
         F: Fn(Vec<T>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
-        let batch_size = cfg.batch_size.max(1);
-        let (sender, receiver) = mpsc::channel(cfg.buffer_capacity.max(1));
-        tokio::spawn(run_flush_loop(
-            BatchConfig { batch_size, ..cfg },
-            receiver,
-            flush,
-        ));
+        let batch_size = cfg.batch_size.clamp(1, MAX_BATCH_SIZE);
+        let buffer_capacity = cfg.buffer_capacity.clamp(1, MAX_BUFFER_CAPACITY);
+        let flush_interval = if cfg.flush_interval.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            cfg.flush_interval
+        };
+        let cfg = BatchConfig {
+            batch_size,
+            buffer_capacity,
+            flush_interval,
+            ..cfg
+        };
+        let (sender, receiver) = mpsc::channel(cfg.buffer_capacity);
+        tokio::spawn(run_flush_loop(cfg, receiver, flush));
 
         Self {
             sender,

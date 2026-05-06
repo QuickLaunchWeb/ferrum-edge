@@ -45,6 +45,23 @@ impl<'a> Iterator for PathSegments<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CompiledPath {
+    segments: Vec<String>,
+    has_numeric_segment: bool,
+}
+
+impl CompiledPath {
+    fn parse(path: &str) -> Self {
+        let segments: Vec<String> = path_segments(path).map(Cow::into_owned).collect();
+        let has_numeric_segment = segments.iter().any(|seg| seg.parse::<usize>().is_ok());
+        Self {
+            segments,
+            has_numeric_segment,
+        }
+    }
+}
+
 /// Build a path-segment iterator. Picks the zero-alloc fast path when the
 /// path contains no `\`.
 ///
@@ -85,13 +102,6 @@ fn path_segments(path: &str) -> PathSegments<'_> {
     PathSegments::Escaped(segments.into_iter())
 }
 
-/// Returns true if any dot-notation segment of `path` parses as a `usize`
-/// (i.e. looks like an array index). Uses `path_segments` so escaped dots
-/// (`\.`) are honored — a segment like `foo\.0` is one key, not an index.
-fn path_has_numeric_segment(path: &str) -> bool {
-    path_segments(path).any(|seg| seg.as_ref().parse::<usize>().is_ok())
-}
-
 /// Immutable child lookup: works on both objects and arrays (numeric index).
 fn child<'a>(parent: &'a Value, segment: &str) -> Option<&'a Value> {
     match parent {
@@ -121,10 +131,16 @@ fn child_mut<'a>(parent: &'a mut Value, segment: &str) -> Option<&'a mut Value> 
 /// segments are object keys. `\\.` is treated as a literal `.` in a key.
 /// Returns `None` if any segment along the path is missing or the parent node
 /// is not an object/array (or index is out of bounds).
+#[allow(dead_code)]
 pub fn get_nested_value<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    let path = CompiledPath::parse(path);
+    get_nested_value_compiled(root, &path)
+}
+
+fn get_nested_value_compiled<'a>(root: &'a Value, path: &CompiledPath) -> Option<&'a Value> {
     let mut current = root;
-    for segment in path_segments(path) {
-        current = child(current, segment.as_ref())?;
+    for segment in &path.segments {
+        current = child(current, segment)?;
     }
     Some(current)
 }
@@ -135,14 +151,20 @@ pub fn get_nested_value<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
 /// Returns `true` if the value was successfully set, `false` if an
 /// unreachable node was encountered (non-object intermediate, out-of-bounds
 /// array index, or array index that can't be parsed).
+#[allow(dead_code)]
 pub fn set_nested_value(root: &mut Value, path: &str, value: Value) -> bool {
-    set_nested_value_inner(root, path, value).is_ok()
+    let path = CompiledPath::parse(path);
+    set_nested_value_inner(root, &path, value).is_ok()
 }
 
 /// Internal: set_nested_value that returns the value back on failure so the
 /// caller can recover it without an upfront clone.
-fn set_nested_value_inner(root: &mut Value, path: &str, value: Value) -> Result<(), Value> {
-    let mut iter = path_segments(path).peekable();
+fn set_nested_value_inner(
+    root: &mut Value,
+    path: &CompiledPath,
+    value: Value,
+) -> Result<(), Value> {
+    let mut iter = path.segments.iter().peekable();
     if iter.peek().is_none() {
         return Err(value);
     }
@@ -150,11 +172,10 @@ fn set_nested_value_inner(root: &mut Value, path: &str, value: Value) -> Result<
     loop {
         // `peek` above confirmed at least one segment; subsequent iterations
         // only reach this line after `peek().is_some()` on the prior check.
-        let segment = match iter.next() {
+        let seg = match iter.next() {
             Some(s) => s,
             None => return Err(value),
         };
-        let seg = segment.as_ref();
         let is_last = iter.peek().is_none();
         if is_last {
             return match current {
@@ -193,18 +214,23 @@ fn set_nested_value_inner(root: &mut Value, path: &str, value: Value) -> Result<
 ///
 /// Returns the removed value if it existed, `None` otherwise. For arrays,
 /// uses `Vec::remove` which shifts subsequent elements.
+#[allow(dead_code)]
 pub fn remove_nested_value(root: &mut Value, path: &str) -> Option<Value> {
-    let mut iter = path_segments(path).peekable();
+    let path = CompiledPath::parse(path);
+    remove_nested_value_compiled(root, &path)
+}
+
+fn remove_nested_value_compiled(root: &mut Value, path: &CompiledPath) -> Option<Value> {
+    let mut iter = path.segments.iter().peekable();
     iter.peek()?;
     let mut current = root;
     loop {
         let segment = iter.next()?;
-        let seg = segment.as_ref();
         if iter.peek().is_none() {
             // Terminal: remove at current.
             return match current {
-                Value::Object(map) => map.remove(seg),
-                Value::Array(arr) => seg.parse::<usize>().ok().and_then(|i| {
+                Value::Object(map) => map.remove(segment),
+                Value::Array(arr) => segment.parse::<usize>().ok().and_then(|i| {
                     if i < arr.len() {
                         Some(arr.remove(i))
                     } else {
@@ -214,7 +240,7 @@ pub fn remove_nested_value(root: &mut Value, path: &str) -> Option<Value> {
                 _ => None,
             };
         }
-        current = child_mut(current, seg)?;
+        current = child_mut(current, segment)?;
     }
 }
 
@@ -232,10 +258,13 @@ enum RemovalContext {
     /// Removed from an object. `old_path` suffices for restoration via
     /// `set_nested_value_inner`, which performs `map.insert(last_segment, v)`.
     Object,
-    /// Removed from an array at `parent_path` index `idx`. Restoration must
-    /// call `Vec::insert(idx, v)` on the array at `parent_path` to restore the
+    /// Removed from an array at `parent_segments` index `idx`. Restoration must
+    /// call `Vec::insert(idx, v)` on the array at those segments to restore the
     /// pre-removal ordering.
-    Array { parent_path: String, idx: usize },
+    Array {
+        parent_segments: Vec<String>,
+        idx: usize,
+    },
 }
 
 /// Remove a value at `path` and return both the removed value AND the parent
@@ -246,85 +275,62 @@ enum RemovalContext {
 /// reverse the latter.
 fn remove_nested_value_with_context(
     root: &mut Value,
-    path: &str,
+    path: &CompiledPath,
 ) -> Option<(Value, RemovalContext)> {
     // We need to know the parent path (everything up to the final segment) so
     // that Array rollback can navigate to the same Vec and call insert.
-    // Re-walk using the segment iterator so we correctly handle escaped dots.
-    let segments: Vec<Cow<'_, str>> = path_segments(path).collect();
-    if segments.is_empty() {
+    if path.segments.is_empty() {
         return None;
     }
-    let (last_seg, parent_segs) = segments.split_last()?;
+    let (last_seg, parent_segs) = path.segments.split_last()?;
 
     // Navigate to the parent node.
     let mut current: &mut Value = root;
     for seg in parent_segs {
-        current = child_mut(current, seg.as_ref())?;
+        current = child_mut(current, seg)?;
     }
 
     // Remove at the terminal, recording the context.
     match current {
         Value::Object(map) => {
-            let removed = map.remove(last_seg.as_ref())?;
+            let removed = map.remove(last_seg)?;
             Some((removed, RemovalContext::Object))
         }
         Value::Array(arr) => {
-            let idx = last_seg.as_ref().parse::<usize>().ok()?;
+            let idx = last_seg.parse::<usize>().ok()?;
             if idx >= arr.len() {
                 return None;
             }
             let removed = arr.remove(idx);
-            // Reconstruct the parent path. For the simple (no-escape) case
-            // this is the common path; escaped segments already have the
-            // backslashes stripped so we rebuild with escape-safe joining.
-            let parent_path = join_segments(parent_segs);
-            Some((removed, RemovalContext::Array { parent_path, idx }))
+            Some((
+                removed,
+                RemovalContext::Array {
+                    parent_segments: parent_segs.to_vec(),
+                    idx,
+                },
+            ))
         }
         _ => None,
     }
 }
 
-/// Re-escape and join segments back into a dot-notation path.
-///
-/// Any literal dots or backslashes inside a segment are escaped so that
-/// subsequent `path_segments()` parses them as a single segment. This is
-/// required for rollback fidelity when a segment contains unusual characters.
-fn join_segments(segments: &[Cow<'_, str>]) -> String {
-    let mut out = String::new();
-    for (i, seg) in segments.iter().enumerate() {
-        if i > 0 {
-            out.push('.');
-        }
-        for c in seg.chars() {
-            if c == '\\' || c == '.' {
-                out.push('\\');
-            }
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// Insert a value at an array index inside the `Vec` located at `parent_path`.
+/// Insert a value at an array index inside the `Vec` located at `parent_segments`.
 ///
 /// Returns `Err(value)` if the parent cannot be reached or is not an array, so
 /// the caller can still recover the value. Used only by the rollback path.
 fn insert_into_array_at(
     root: &mut Value,
-    parent_path: &str,
+    parent_segments: &[String],
     idx: usize,
     value: Value,
 ) -> Result<(), Value> {
-    // Navigate to parent. An empty parent_path means the array IS the root.
+    // Navigate to parent. Empty segments mean the array IS the root.
     let mut current: &mut Value = root;
-    if !parent_path.is_empty() {
-        for seg in path_segments(parent_path) {
-            current = match child_mut(current, seg.as_ref()) {
-                Some(c) => c,
-                None => return Err(value),
-            };
-        }
+    for seg in parent_segments {
+        current = match child_mut(current, seg) {
+            Some(c) => c,
+            None => return Err(value),
+        };
     }
     match current {
         Value::Array(arr) => {
@@ -355,7 +361,26 @@ fn insert_into_array_at(
 /// container (only possible when `new_path` is a strict prefix of `old_path`
 /// and the intermediate we depended on was replaced mid-operation — an
 /// API-misuse edge case). We log a warning and return `false`.
+#[allow(dead_code)]
 pub fn rename_nested_field(root: &mut Value, old_path: &str, new_path: &str) -> bool {
+    let old_path_compiled = CompiledPath::parse(old_path);
+    let new_path_compiled = CompiledPath::parse(new_path);
+    rename_nested_field_compiled(
+        root,
+        &old_path_compiled,
+        &new_path_compiled,
+        old_path,
+        new_path,
+    )
+}
+
+fn rename_nested_field_compiled(
+    root: &mut Value,
+    old_path: &CompiledPath,
+    new_path: &CompiledPath,
+    old_path_label: &str,
+    new_path_label: &str,
+) -> bool {
     let Some((value, ctx)) = remove_nested_value_with_context(root, old_path) else {
         return false;
     };
@@ -366,9 +391,10 @@ pub fn rename_nested_field(root: &mut Value, old_path: &str, new_path: &str) -> 
             // restored with insert (preserving ordering) rather than overwrite.
             let restore_result = match &ctx {
                 RemovalContext::Object => set_nested_value_inner(root, old_path, recovered),
-                RemovalContext::Array { parent_path, idx } => {
-                    insert_into_array_at(root, parent_path, *idx, recovered)
-                }
+                RemovalContext::Array {
+                    parent_segments,
+                    idx,
+                } => insert_into_array_at(root, parent_segments, *idx, recovered),
             };
             // The rollback path reaches this branch only when the failing
             // `set_nested_value_inner(new_path)` was a no-op: it returns `Err`
@@ -383,11 +409,11 @@ pub fn rename_nested_field(root: &mut Value, old_path: &str, new_path: &str) -> 
             if restore_result.is_err() {
                 debug_assert!(
                     false,
-                    "body_transform: rename rollback invariant violated for {old_path} -> {new_path}"
+                    "body_transform: rename rollback invariant violated for {old_path_label} -> {new_path_label}"
                 );
                 warn!(
                     "body_transform: rename rollback failed for {} -> {}; data lost at {}",
-                    old_path, new_path, old_path
+                    old_path_label, new_path_label, old_path_label
                 );
             }
             false
@@ -404,11 +430,13 @@ pub struct BodyRule {
     /// Dot-notation path to the field (e.g., `"user.address.city"`,
     /// `"items.0.id"`, `"weird\\.key"`).
     pub key: String,
+    key_path: CompiledPath,
     /// Value for add/update operations (JSON string that will be parsed,
     /// or a raw string that becomes a JSON string value).
     pub value: Option<Value>,
     /// New dot-notation path for rename operations.
     pub new_key: Option<String>,
+    new_key_path: Option<CompiledPath>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -431,12 +459,18 @@ pub enum BodyOperation {
 /// Rules whose `target` is not `"body"` are silently skipped (they are
 /// validated by the caller — the request/response transformer plugins).
 pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
-    let Some(arr) = config["rules"].as_array() else {
+    let Some(rules_value) = config.get("rules") else {
         return Ok(Vec::new());
+    };
+    let Some(arr) = rules_value.as_array() else {
+        return Err("'rules' must be an array".to_string());
     };
 
     let mut rules = Vec::new();
     for (idx, r) in arr.iter().enumerate() {
+        if !r.is_object() {
+            return Err(format!("rule[{idx}]: rule must be an object"));
+        }
         // `target` is optional — callers (request_transformer) default missing
         // target to "header", so `None` means "not a body rule, skip". But if
         // `target` is PRESENT and not a string (including explicit null), it
@@ -515,6 +549,8 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
                 ));
             }
         };
+        let key_path = CompiledPath::parse(&key);
+        let new_key_path = new_key.as_deref().map(CompiledPath::parse);
 
         // Operation-specific required-field validation.
         match operation {
@@ -537,7 +573,10 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
                 // silently drops data when both paths target the same array.
                 // Users who need array mutation can compose `remove` + `add`.
                 let new_key_ref = new_key.as_deref().unwrap_or("");
-                if path_has_numeric_segment(&key) || path_has_numeric_segment(new_key_ref) {
+                let new_has_numeric_segment = new_key_path
+                    .as_ref()
+                    .is_some_and(|path| path.has_numeric_segment);
+                if key_path.has_numeric_segment || new_has_numeric_segment {
                     return Err(format!(
                         "rule[{idx}]: body 'rename' does not support array indices in 'key' or 'new_key' (got key='{key}', new_key='{new_key_ref}'); use 'remove' + 'add' instead"
                     ));
@@ -549,8 +588,10 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
         rules.push(BodyRule {
             operation,
             key,
+            key_path,
             value,
             new_key,
+            new_key_path,
         });
     }
 
@@ -584,8 +625,8 @@ pub fn apply_body_rules(body: &[u8], rules: &[BodyRule]) -> Option<Vec<u8>> {
             BodyOperation::Add => {
                 // Only add if the field doesn't already exist.
                 if let Some(ref value) = rule.value
-                    && get_nested_value(&json, &rule.key).is_none()
-                    && set_nested_value(&mut json, &rule.key, value.clone())
+                    && get_nested_value_compiled(&json, &rule.key_path).is_none()
+                    && set_nested_value_inner(&mut json, &rule.key_path, value.clone()).is_ok()
                 {
                     debug!("body_transform: added field {}", rule.key);
                     modified = true;
@@ -593,21 +634,27 @@ pub fn apply_body_rules(body: &[u8], rules: &[BodyRule]) -> Option<Vec<u8>> {
             }
             BodyOperation::Update => {
                 if let Some(ref value) = rule.value
-                    && set_nested_value(&mut json, &rule.key, value.clone())
+                    && set_nested_value_inner(&mut json, &rule.key_path, value.clone()).is_ok()
                 {
                     debug!("body_transform: updated field {}", rule.key);
                     modified = true;
                 }
             }
             BodyOperation::Remove => {
-                if remove_nested_value(&mut json, &rule.key).is_some() {
+                if remove_nested_value_compiled(&mut json, &rule.key_path).is_some() {
                     debug!("body_transform: removed field {}", rule.key);
                     modified = true;
                 }
             }
             BodyOperation::Rename => {
-                if let Some(ref new_key) = rule.new_key
-                    && rename_nested_field(&mut json, &rule.key, new_key)
+                if let (Some(new_key), Some(new_key_path)) = (&rule.new_key, &rule.new_key_path)
+                    && rename_nested_field_compiled(
+                        &mut json,
+                        &rule.key_path,
+                        new_key_path,
+                        &rule.key,
+                        new_key,
+                    )
                 {
                     debug!("body_transform: renamed field {} -> {}", rule.key, new_key);
                     modified = true;
@@ -639,6 +686,27 @@ pub fn apply_body_rules(body: &[u8], rules: &[BodyRule]) -> Option<Vec<u8>> {
 pub fn is_json_content_type(content_type: &str) -> bool {
     ascii_contains_ignore_case(content_type, "application/json")
         || ascii_contains_ignore_case(content_type, "+json")
+}
+
+/// Check if a response Content-Type is Server-Sent Events.
+///
+/// ASCII case-insensitive and allocation-free.
+pub fn is_event_stream_content_type(content_type: &str) -> bool {
+    ascii_contains_ignore_case(content_type, "text/event-stream")
+        || ascii_contains_ignore_case(content_type, "event-stream")
+}
+
+/// Check if a request Content-Type is a plausible AI/LLM API request body.
+///
+/// Response-body AI plugins can only decide buffering before response headers
+/// arrive, so they use the request Content-Type as the best cheap upper bound.
+/// JSON covers normal chat/completion APIs, multipart covers multimodal uploads
+/// that still return token metadata, and application/grpc covers gRPC-flavored
+/// AI backends.
+pub fn is_ai_request_content_type(content_type: &str) -> bool {
+    is_json_content_type(content_type)
+        || ascii_contains_ignore_case(content_type, "multipart/form-data")
+        || ascii_contains_ignore_case(content_type, "application/grpc")
 }
 
 /// ASCII-insensitive substring check. Zero allocation.

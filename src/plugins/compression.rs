@@ -56,6 +56,8 @@ const DEFAULT_CONTENT_TYPES: &[&str] = &[
 /// HTTP status codes that should never be compressed (no body or cache-only).
 const UNCOMPRESSIBLE_STATUS_CODES: &[u16] = &[204, 304];
 
+const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+
 struct CompressionConfig {
     /// Enabled algorithms in server-preference order (used to break q-value ties).
     algorithms: Vec<Algorithm>,
@@ -84,6 +86,10 @@ pub struct CompressionPlugin {
 
 impl CompressionPlugin {
     pub fn new(config: &Value) -> Result<Self, String> {
+        if !config.is_object() {
+            return Err("compression: config must be an object".to_string());
+        }
+
         // Parse `algorithms` strictly. Unknown values are rejected (no silent
         // skip) so configuration typos surface immediately at load time
         // instead of producing a partially-functional plugin.
@@ -112,40 +118,41 @@ impl CompressionPlugin {
             }
         };
 
-        let content_types = config["content_types"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                    .collect()
+        let content_types = parse_content_types(config)?;
+
+        let min_content_length = optional_usize(config, "min_content_length")?.unwrap_or(256);
+
+        let disable_on_etag = optional_bool(config, "disable_on_etag")?.unwrap_or(false);
+
+        let remove_accept_encoding =
+            optional_bool(config, "remove_accept_encoding")?.unwrap_or(true);
+
+        let decompress_request = optional_bool(config, "decompress_request")?.unwrap_or(false);
+
+        let max_decompressed_request_size =
+            optional_positive_usize(config, "max_decompressed_request_size")?
+                .unwrap_or(10 * 1024 * 1024);
+
+        let gzip_level = optional_u64(config, "gzip_level")?
+            .map(|value| {
+                if value > 9 {
+                    Err("compression: 'gzip_level' must be between 0 and 9".to_string())
+                } else {
+                    Ok(value as u32)
+                }
             })
-            .unwrap_or_else(|| {
-                DEFAULT_CONTENT_TYPES
-                    .iter()
-                    .map(|s| (*s).to_string())
-                    .collect()
-            });
-
-        let min_content_length = config["min_content_length"].as_u64().unwrap_or(256) as usize;
-
-        let disable_on_etag = config["disable_on_etag"].as_bool().unwrap_or(false);
-
-        let remove_accept_encoding = config["remove_accept_encoding"].as_bool().unwrap_or(true);
-
-        let decompress_request = config["decompress_request"].as_bool().unwrap_or(false);
-
-        let max_decompressed_request_size = config["max_decompressed_request_size"]
-            .as_u64()
-            .unwrap_or(10 * 1024 * 1024) as usize;
-
-        let gzip_level = config["gzip_level"]
-            .as_u64()
-            .map(|v| v.min(9) as u32)
+            .transpose()?
             .unwrap_or(6);
 
-        let brotli_quality = config["brotli_quality"]
-            .as_u64()
-            .map(|v| v.min(11) as u32)
+        let brotli_quality = optional_u64(config, "brotli_quality")?
+            .map(|value| {
+                if value > 11 {
+                    Err("compression: 'brotli_quality' must be between 0 and 11".to_string())
+                } else {
+                    Ok(value as u32)
+                }
+            })
+            .transpose()?
             .unwrap_or(4);
 
         if algorithms.is_empty() {
@@ -212,11 +219,9 @@ impl CompressionPlugin {
 
     /// Check if the content type is eligible for compression.
     fn is_compressible_content_type(&self, content_type: &str) -> bool {
-        let ct_lower = content_type.to_lowercase();
-        self.config
-            .content_types
-            .iter()
-            .any(|t| ct_lower.contains(t.as_str()))
+        self.config.content_types.iter().any(|content_type_rule| {
+            contains_ascii_case_insensitive(content_type, content_type_rule)
+        })
     }
 
     fn compress(&self, algo: Algorithm, data: &[u8]) -> Result<Vec<u8>, String> {
@@ -272,6 +277,108 @@ impl CompressionPlugin {
         let mut reader = brotli::Decompressor::new(data, 4096);
         read_with_limit(&mut reader, max_size, "brotli")
     }
+}
+
+fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
+    match config.get(field) {
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("compression: '{field}' must be a boolean")),
+    }
+}
+
+fn optional_u64(config: &Value, field: &'static str) -> Result<Option<u64>, String> {
+    match config.get(field) {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .ok_or_else(|| format!("compression: '{field}' must be an unsigned integer"))
+            .map(Some),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!(
+            "compression: '{field}' must be an unsigned integer"
+        )),
+    }
+}
+
+fn optional_usize(config: &Value, field: &'static str) -> Result<Option<usize>, String> {
+    let Some(value) = optional_u64(config, field)? else {
+        return Ok(None);
+    };
+    usize::try_from(value)
+        .map(Some)
+        .map_err(|_| format!("compression: '{field}' is too large"))
+}
+
+fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option<usize>, String> {
+    let Some(value) = optional_usize(config, field)? else {
+        return Ok(None);
+    };
+    if value == 0 {
+        return Err(format!("compression: '{field}' must be greater than zero"));
+    }
+    Ok(Some(value))
+}
+
+fn parse_content_types(config: &Value) -> Result<Vec<String>, String> {
+    let Some(value) = config.get("content_types") else {
+        return Ok(DEFAULT_CONTENT_TYPES
+            .iter()
+            .map(|content_type| (*content_type).to_string())
+            .collect());
+    };
+    let Some(values) = value.as_array() else {
+        return Err("compression: 'content_types' must be an array".to_string());
+    };
+    if values.is_empty() {
+        return Err("compression: 'content_types' must not be empty".to_string());
+    }
+
+    let mut content_types = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let Some(content_type) = value.as_str() else {
+            return Err(format!(
+                "compression: 'content_types[{index}]' must be a string"
+            ));
+        };
+        if content_type.is_empty() {
+            return Err(format!(
+                "compression: 'content_types[{index}]' must not be empty"
+            ));
+        }
+        if !content_type.is_ascii() {
+            return Err(format!(
+                "compression: 'content_types[{index}]' must contain only ASCII"
+            ));
+        }
+        content_types.push(content_type.to_ascii_lowercase());
+    }
+
+    Ok(content_types)
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    !needle.is_empty()
+        && haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn supported_request_encoding(value: &str) -> Option<&'static str> {
+    if value.eq_ignore_ascii_case("gzip") {
+        Some("gzip")
+    } else if value.eq_ignore_ascii_case("br") {
+        Some("br")
+    } else {
+        None
+    }
+}
+
+fn comma_header_contains_token(value: &str, token: &str) -> bool {
+    value
+        .split(',')
+        .any(|part| part.trim().eq_ignore_ascii_case(token))
 }
 
 /// Read from `reader` into a `Vec`, enforcing a maximum decompressed size.
@@ -358,6 +465,10 @@ impl Plugin for CompressionPlugin {
         !self.config.algorithms.is_empty() && ctx.headers.contains_key("accept-encoding")
     }
 
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -390,17 +501,20 @@ impl Plugin for CompressionPlugin {
         // receives the same headers map (with content-encoding already removed).
         if self.config.decompress_request
             && let Some(ce) = headers.get("content-encoding")
+            && let Some(encoding) = supported_request_encoding(ce)
         {
-            let ce_lower = ce.to_lowercase();
-            if ce_lower == "gzip" || ce_lower == "br" {
-                ctx.metadata
-                    .insert("compression:request_encoding".to_string(), ce_lower.clone());
-                headers.remove("content-encoding");
-                headers.insert("x-ferrum-original-content-encoding".to_string(), ce_lower);
-                // Content-Length will be wrong after decompression; remove it
-                // so the backend uses chunked transfer or recalculates.
-                headers.remove("content-length");
-            }
+            ctx.metadata.insert(
+                "compression:request_encoding".to_string(),
+                encoding.to_string(),
+            );
+            headers.remove("content-encoding");
+            headers.insert(
+                "x-ferrum-original-content-encoding".to_string(),
+                encoding.to_string(),
+            );
+            // Content-Length will be wrong after decompression; remove it
+            // so the backend uses chunked transfer or recalculates.
+            headers.remove("content-length");
         }
 
         PluginResult::Continue
@@ -412,6 +526,13 @@ impl Plugin for CompressionPlugin {
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // Rejection handling currently re-runs only `after_proxy` header hooks,
+        // not response-body transforms. Do not commit a Content-Encoding there
+        // unless/until the rejection path can also compress the reject body.
+        if ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY) {
+            return PluginResult::Continue;
+        }
+
         // Skip uncompressible status codes.
         if UNCOMPRESSIBLE_STATUS_CODES.contains(&response_status) {
             return PluginResult::Continue;
@@ -471,8 +592,10 @@ impl Plugin for CompressionPlugin {
         match response_headers.get("vary") {
             Some(existing) => {
                 // Don't duplicate if already present.
-                if !existing.to_lowercase().contains("accept-encoding") {
-                    let updated = format!("{existing}, Accept-Encoding");
+                if !comma_header_contains_token(existing, "accept-encoding") {
+                    let mut updated = String::with_capacity(existing.len() + 17);
+                    updated.push_str(existing);
+                    updated.push_str(", Accept-Encoding");
                     response_headers.insert("vary".to_string(), updated);
                 }
             }
@@ -500,9 +623,9 @@ impl Plugin for CompressionPlugin {
         let encoding = request_headers
             .get("x-ferrum-original-content-encoding")
             .or_else(|| request_headers.get("content-encoding"))
-            .map(|v| v.to_lowercase())?;
+            .and_then(|v| supported_request_encoding(v))?;
 
-        match self.decompress(&encoding, body, self.config.max_decompressed_request_size) {
+        match self.decompress(encoding, body, self.config.max_decompressed_request_size) {
             Ok(decompressed) => {
                 debug!(
                     "compression: decompressed request body from {} to {} bytes ({})",

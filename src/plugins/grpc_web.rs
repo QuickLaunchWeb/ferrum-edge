@@ -43,11 +43,12 @@
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use http::header::HeaderName;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
-use super::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext};
+use super::{GRPC_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext};
 
 /// Metadata key storing the original gRPC-Web mode ("text" or "binary").
 const META_GRPC_WEB_MODE: &str = "grpc_web_mode";
@@ -59,6 +60,9 @@ const META_GRPC_WEB_ORIGINAL_CT: &str = "grpc_web_original_ct";
 /// gRPC-Web encoding mode. Stripped before reaching the backend by the gateway's
 /// hop-by-hop header removal.
 const HEADER_GRPC_WEB_MODE: &str = "x-grpc-web-mode";
+const APPLICATION_GRPC_WEB: &str = "application/grpc-web";
+const APPLICATION_GRPC_WEB_TEXT: &str = "application/grpc-web-text";
+const BASE_EXPOSE_HEADERS: [&str; 3] = ["grpc-status", "grpc-message", "grpc-status-details-bin"];
 
 /// gRPC frame flag: data frame.
 pub(crate) const GRPC_FRAME_DATA: u8 = 0x00;
@@ -74,33 +78,95 @@ fn grpc_content_type_header() -> HashMap<String, String> {
 
 pub struct GrpcWebPlugin {
     expose_headers: Vec<String>,
+    expose_headers_value: String,
 }
 
 impl GrpcWebPlugin {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let expose_headers = config["expose_headers"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut expose_headers = BASE_EXPOSE_HEADERS
+            .iter()
+            .map(|header| (*header).to_string())
+            .collect::<Vec<_>>();
+        expose_headers.extend(parse_expose_headers(config)?);
+        let expose_headers_value = expose_headers.join(", ");
 
-        Ok(Self { expose_headers })
+        Ok(Self {
+            expose_headers,
+            expose_headers_value,
+        })
     }
+}
+
+fn parse_expose_headers(config: &Value) -> Result<Vec<String>, String> {
+    let Some(value) = config.get("expose_headers") else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let headers = value
+        .as_array()
+        .ok_or_else(|| format!("grpc_web: 'expose_headers' must be an array, got: {value}"))?;
+
+    let mut seen = HashSet::with_capacity(headers.len());
+    let mut parsed = Vec::with_capacity(headers.len());
+    for (idx, raw) in headers.iter().enumerate() {
+        let header = raw.as_str().ok_or_else(|| {
+            format!("grpc_web: 'expose_headers[{idx}]' must be a string, got: {raw}")
+        })?;
+        let header = header.trim();
+        if header.is_empty() {
+            return Err(format!(
+                "grpc_web: 'expose_headers[{idx}]' must not be empty"
+            ));
+        }
+        let header_name = HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
+            format!("grpc_web: 'expose_headers[{idx}]' is not a valid HTTP header name")
+        })?;
+        let normalized = header_name.as_str().to_string();
+        if seen.insert(normalized.clone()) {
+            parsed.push(normalized);
+        }
+    }
+    Ok(parsed)
+}
+
+fn has_ascii_case_insensitive_prefix(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn contains_proto_suffix(value: &str) -> bool {
+    value
+        .as_bytes()
+        .windows("+proto".len())
+        .any(|window| window.eq_ignore_ascii_case(b"+proto"))
 }
 
 /// Check if a content-type indicates a gRPC-Web request.
 pub(crate) fn is_grpc_web_content_type(ct: &str) -> bool {
-    let ct_lower = ct.trim().to_lowercase();
-    ct_lower.starts_with("application/grpc-web")
+    has_ascii_case_insensitive_prefix(ct.trim(), APPLICATION_GRPC_WEB)
 }
 
 /// Check if a gRPC-Web content-type uses text (base64) encoding.
 pub(crate) fn is_grpc_web_text(ct: &str) -> bool {
-    let ct_lower = ct.trim().to_lowercase();
-    ct_lower.starts_with("application/grpc-web-text")
+    has_ascii_case_insensitive_prefix(ct.trim(), APPLICATION_GRPC_WEB_TEXT)
+}
+
+fn is_valid_trailer_header(key: &str) -> Option<HeaderName> {
+    let header = HeaderName::from_bytes(key.trim().as_bytes()).ok()?;
+    let normalized = header.as_str();
+    if normalized.starts_with("grpc-") || normalized.ends_with("-bin") {
+        Some(header)
+    } else {
+        None
+    }
+}
+
+fn is_valid_trailer_value(value: &str) -> bool {
+    !value.bytes().any(|b| b == b'\r' || b == b'\n')
 }
 
 /// Build a gRPC-Web trailer frame from response headers.
@@ -113,8 +179,10 @@ pub(crate) fn build_trailer_frame(response_headers: &HashMap<String, String>) ->
     let mut trailer_payload = Vec::new();
     for (key, value) in response_headers {
         // Include grpc-* trailers and any custom trailing metadata
-        if key.starts_with("grpc-") || key.ends_with("-bin") {
-            trailer_payload.extend_from_slice(key.as_bytes());
+        if let Some(header_name) = is_valid_trailer_header(key)
+            && is_valid_trailer_value(value)
+        {
+            trailer_payload.extend_from_slice(header_name.as_str().as_bytes());
             trailer_payload.extend_from_slice(b": ");
             trailer_payload.extend_from_slice(value.as_bytes());
             trailer_payload.extend_from_slice(b"\r\n");
@@ -160,14 +228,14 @@ pub(crate) fn parse_grpc_frames(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
 ///
 /// Preserves the +proto suffix if present.
 pub(crate) fn response_content_type(original_ct: &str) -> &'static str {
-    let ct_lower = original_ct.trim().to_lowercase();
-    if ct_lower.starts_with("application/grpc-web-text") {
-        if ct_lower.contains("+proto") {
+    let original_ct = original_ct.trim();
+    if has_ascii_case_insensitive_prefix(original_ct, APPLICATION_GRPC_WEB_TEXT) {
+        if contains_proto_suffix(original_ct) {
             "application/grpc-web-text+proto"
         } else {
             "application/grpc-web-text"
         }
-    } else if ct_lower.contains("+proto") {
+    } else if contains_proto_suffix(original_ct) {
         "application/grpc-web+proto"
     } else {
         "application/grpc-web"
@@ -185,7 +253,7 @@ impl Plugin for GrpcWebPlugin {
     }
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
-        HTTP_GRPC_PROTOCOLS
+        GRPC_ONLY_PROTOCOLS
     }
 
     fn modifies_request_headers(&self) -> bool {
@@ -389,19 +457,11 @@ impl Plugin for GrpcWebPlugin {
         // (Previously this branch was a no-op when the backend didn't emit
         // access-control-expose-headers, which broke browser clients on backends
         // that didn't already configure CORS.)
-        let mut expose = vec![
-            "grpc-status".to_string(),
-            "grpc-message".to_string(),
-            "grpc-status-details-bin".to_string(),
-        ];
-        expose.extend(self.expose_headers.iter().cloned());
-
         let combined = match response_headers.get("access-control-expose-headers") {
             Some(existing) => {
-                let existing_lower = existing.to_lowercase();
                 let mut out = existing.clone();
-                for h in &expose {
-                    if !existing_lower
+                for h in &self.expose_headers {
+                    if !existing
                         .split(',')
                         .any(|tok| tok.trim().eq_ignore_ascii_case(h))
                     {
@@ -411,7 +471,7 @@ impl Plugin for GrpcWebPlugin {
                 }
                 out
             }
-            None => expose.join(", "),
+            None => self.expose_headers_value.clone(),
         };
         response_headers.insert("access-control-expose-headers".to_string(), combined);
 

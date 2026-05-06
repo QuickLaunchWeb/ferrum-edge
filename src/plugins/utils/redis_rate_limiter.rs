@@ -87,38 +87,78 @@ pub struct RedisConfig {
 impl RedisConfig {
     /// Parse Redis configuration from a plugin's JSON config.
     ///
-    /// Returns `None` if `sync_mode` is not `"redis"` or if `redis_url` is missing.
-    pub fn from_plugin_config(config: &serde_json::Value, default_prefix: &str) -> Option<Self> {
-        let sync_mode = config["sync_mode"].as_str().unwrap_or("local");
-        if sync_mode != "redis" {
-            return None;
+    /// Returns `Ok(None)` if `sync_mode` is absent or `"local"`.
+    pub fn from_plugin_config(
+        config: &serde_json::Value,
+        default_prefix: &str,
+    ) -> Result<Option<Self>, String> {
+        let object = config
+            .as_object()
+            .ok_or_else(|| format!("redis rate limiter config must be an object, got: {config}"))?;
+
+        let sync_mode = parse_optional_string(object, "sync_mode")?
+            .unwrap_or("local")
+            .to_ascii_lowercase();
+        match sync_mode.as_str() {
+            "local" => return Ok(None),
+            "redis" => {}
+            other => {
+                return Err(format!(
+                    "redis rate limiter: 'sync_mode' must be 'local' or 'redis', got: {other:?}"
+                ));
+            }
         }
 
-        let url = config["redis_url"].as_str().map(|s| s.to_string())?;
+        let url = parse_optional_string(object, "redis_url")?.ok_or_else(|| {
+            "redis rate limiter: 'redis_url' is required when sync_mode='redis'".to_string()
+        })?;
         if url.is_empty() {
-            warn!(
-                "sync_mode is 'redis' but redis_url is empty — falling back to local rate limiting"
+            return Err(
+                "redis rate limiter: 'redis_url' must be non-empty when sync_mode='redis'"
+                    .to_string(),
             );
-            return None;
         }
 
-        let tls = config["redis_tls"].as_bool().unwrap_or(false);
-        let key_prefix = config["redis_key_prefix"]
-            .as_str()
+        let tls = parse_optional_bool(object, "redis_tls")?.unwrap_or(false);
+        let key_prefix = parse_optional_string(object, "redis_key_prefix")?
             .unwrap_or(default_prefix)
             .to_string();
-        let pool_size = config["redis_pool_size"].as_u64().unwrap_or(4) as usize;
-        let connect_timeout_seconds = config["redis_connect_timeout_seconds"]
-            .as_u64()
-            .unwrap_or(5);
-        let health_check_interval_seconds = config["redis_health_check_interval_seconds"]
-            .as_u64()
-            .unwrap_or(5);
-        let username = config["redis_username"].as_str().map(|s| s.to_string());
-        let password = config["redis_password"].as_str().map(|s| s.to_string());
+        if key_prefix.is_empty() {
+            return Err("redis rate limiter: 'redis_key_prefix' must be non-empty".to_string());
+        }
 
-        Some(RedisConfig {
-            url,
+        let pool_size = parse_optional_u64(object, "redis_pool_size")?.unwrap_or(4);
+        if pool_size == 0 {
+            return Err(
+                "redis rate limiter: 'redis_pool_size' must be greater than zero".to_string(),
+            );
+        }
+        let pool_size = usize::try_from(pool_size)
+            .map_err(|_| "redis rate limiter: 'redis_pool_size' is too large".to_string())?;
+
+        let connect_timeout_seconds =
+            parse_optional_u64(object, "redis_connect_timeout_seconds")?.unwrap_or(5);
+        if connect_timeout_seconds == 0 {
+            return Err(
+                "redis rate limiter: 'redis_connect_timeout_seconds' must be greater than zero"
+                    .to_string(),
+            );
+        }
+
+        let health_check_interval_seconds =
+            parse_optional_u64(object, "redis_health_check_interval_seconds")?.unwrap_or(5);
+        if health_check_interval_seconds == 0 {
+            return Err(
+                "redis rate limiter: 'redis_health_check_interval_seconds' must be greater than zero"
+                    .to_string(),
+            );
+        }
+
+        let username = parse_optional_string(object, "redis_username")?.map(ToString::to_string);
+        let password = parse_optional_string(object, "redis_password")?.map(ToString::to_string);
+
+        Ok(Some(RedisConfig {
+            url: url.to_string(),
             tls,
             key_prefix,
             pool_size,
@@ -126,7 +166,7 @@ impl RedisConfig {
             health_check_interval_seconds,
             username,
             password,
-        })
+        }))
     }
 
     /// Build the effective Redis URL, upgrading to TLS scheme if needed.
@@ -185,6 +225,48 @@ impl RedisConfig {
 
         parsed.to_string()
     }
+}
+
+fn parse_optional_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<&'a str>, String> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| format!("redis rate limiter: '{field}' must be a string"))
+        })
+        .transpose()
+}
+
+fn parse_optional_bool(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<bool>, String> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| format!("redis rate limiter: '{field}' must be a boolean"))
+        })
+        .transpose()
+}
+
+fn parse_optional_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<u64>, String> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| format!("redis rate limiter: '{field}' must be an integer"))
+        })
+        .transpose()
 }
 
 /// A Redis-backed rate limiter client shared across plugin instances.

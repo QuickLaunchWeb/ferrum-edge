@@ -3,7 +3,7 @@
 use ferrum_edge::plugins::prometheus_metrics::{
     CounterKey, MetricsRegistry, PrometheusMetrics, global_registry,
 };
-use ferrum_edge::plugins::{Plugin, StreamTransactionSummary, TransactionSummary};
+use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, StreamTransactionSummary, TransactionSummary};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -80,6 +80,24 @@ async fn test_prometheus_plugin_creation() {
     let plugin = PrometheusMetrics::new(&config, "ferrum").unwrap();
     assert_eq!(plugin.name(), "prometheus_metrics");
     assert_eq!(plugin.priority(), 9300);
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
+}
+
+#[tokio::test]
+async fn test_prometheus_plugin_rejects_invalid_config_shapes() {
+    let cases = [
+        json!(null),
+        json!({"render_cache_ttl_seconds": "5"}),
+        json!({"stale_entry_ttl_seconds": -1}),
+        json!({"cache_invalidation_min_age_ms": true}),
+    ];
+
+    for config in cases {
+        assert!(
+            PrometheusMetrics::new(&config, "ferrum").is_err(),
+            "expected invalid config to be rejected: {config}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -524,6 +542,18 @@ async fn test_plugin_config_sets_registry_tunables() {
     // Can't read atomics directly from outside, but we can verify the plugin
     // didn't error on valid config
     assert_eq!(_plugin.name(), "prometheus_metrics");
+}
+
+#[tokio::test]
+async fn test_plugin_config_saturates_extreme_tunables() {
+    let config = serde_json::json!({
+        "render_cache_ttl_seconds": u64::MAX,
+        "stale_entry_ttl_seconds": u64::MAX,
+        "cache_invalidation_min_age_ms": u64::MAX
+    });
+
+    let plugin = PrometheusMetrics::new(&config, "ferrum").unwrap();
+    assert_eq!(plugin.name(), "prometheus_metrics");
 }
 
 #[tokio::test]

@@ -30,6 +30,7 @@
 //! Since `RejectBinary` bypasses `on_response_body`, this plugin writes token
 //! metadata directly into `ctx.metadata` using the same keys as `ai_token_metrics`.
 
+use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
@@ -37,10 +38,11 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::utils::aws_sigv4;
+use super::utils::body_transform::is_json_content_type;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 // ---------------------------------------------------------------------------
@@ -160,34 +162,33 @@ struct CachedToken {
 /// Thread-safe OAuth2 token cache for Google Vertex AI.
 #[derive(Debug)]
 struct OAuth2Cache {
-    cache: RwLock<Option<CachedToken>>,
+    cache: ArcSwapOption<CachedToken>,
+    refresh_lock: Mutex<()>,
     service_account_json: String,
 }
 
 impl OAuth2Cache {
     fn new(service_account_json: String) -> Self {
         Self {
-            cache: RwLock::new(None),
+            cache: ArcSwapOption::empty(),
+            refresh_lock: Mutex::new(()),
             service_account_json,
         }
     }
 
     async fn get_token(&self, http_client: &PluginHttpClient) -> Result<String, String> {
-        // Check cache first (read lock)
+        // Hot path: lock-free cache read. Refresh coordination only happens
+        // when the cached token is absent or close to expiry.
+        if let Some(token) = self.cache.load_full()
+            && token.expires_at > std::time::Instant::now() + Duration::from_secs(60)
         {
-            let cached = self.cache.read().await;
-            if let Some(ref token) = *cached
-                && token.expires_at > std::time::Instant::now() + Duration::from_secs(60)
-            {
-                return Ok(token.token.clone());
-            }
+            return Ok(token.token.clone());
         }
 
-        // Refresh token (write lock)
-        let mut cached = self.cache.write().await;
+        let _refresh = self.refresh_lock.lock().await;
 
-        // Double-check after acquiring write lock
-        if let Some(ref token) = *cached
+        // Double-check after acquiring the refresh lock.
+        if let Some(token) = self.cache.load_full()
             && token.expires_at > std::time::Instant::now() + Duration::from_secs(60)
         {
             return Ok(token.token.clone());
@@ -195,7 +196,7 @@ impl OAuth2Cache {
 
         let token = self.refresh_token(http_client).await?;
         let result = token.token.clone();
-        *cached = Some(token);
+        self.cache.store(Some(Arc::new(token)));
         Ok(result)
     }
 
@@ -483,6 +484,10 @@ pub struct AiFederation {
 
 impl AiFederation {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        if !config.is_object() {
+            return Err("ai_federation: config must be an object".to_string());
+        }
+
         let providers_val = config
             .get("providers")
             .and_then(|v| v.as_array())
@@ -509,34 +514,20 @@ impl AiFederation {
             ))?;
             let provider_type = ProviderType::from_str(provider_type_str)?;
 
-            let priority = pv["priority"].as_u64().unwrap_or((i as u64) + 1) as u32;
+            let priority_u64 = optional_u64(pv, "priority")?.unwrap_or((i as u64) + 1);
+            let priority = u32::try_from(priority_u64)
+                .map_err(|_| format!("ai_federation: provider '{name}' priority is too large"))?;
 
-            let model_patterns: Vec<String> = pv
-                .get("model_patterns")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let model_patterns = optional_string_vec(pv, "model_patterns")?.unwrap_or_default();
 
-            let model_mapping: HashMap<String, String> = pv
-                .get("model_mapping")
-                .and_then(|v| v.as_object())
-                .map(|obj| {
-                    obj.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let model_mapping = optional_string_map(pv, "model_mapping")?.unwrap_or_default();
 
             let default_model = pv["default_model"].as_str().map(String::from);
 
             let connect_timeout =
-                Duration::from_secs(pv["connect_timeout_seconds"].as_u64().unwrap_or(5));
+                Duration::from_secs(optional_u64(pv, "connect_timeout_seconds")?.unwrap_or(5));
             let read_timeout =
-                Duration::from_secs(pv["read_timeout_seconds"].as_u64().unwrap_or(60));
+                Duration::from_secs(optional_u64(pv, "read_timeout_seconds")?.unwrap_or(60));
 
             let base_url = pv["base_url"].as_str().map(String::from);
             let allow_plaintext = pv["allow_plaintext"].as_bool().unwrap_or(false);
@@ -602,21 +593,13 @@ impl AiFederation {
         // Sort by priority (ascending — lower = tried first)
         providers.sort_by_key(|p| p.priority);
 
-        let fallback_enabled = config["fallback_enabled"].as_bool().unwrap_or(true);
+        let fallback_enabled = optional_bool(config, "fallback_enabled")?.unwrap_or(true);
 
-        let fallback_status_codes: HashSet<u16> = config
-            .get("fallback_on_status_codes")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_u64().map(|n| n as u16))
-                    .collect()
-            })
+        let fallback_status_codes = optional_status_code_set(config, "fallback_on_status_codes")?
             .unwrap_or_else(|| [429, 500, 502, 503].into_iter().collect());
 
-        let fallback_on_network_errors = config["fallback_on_network_errors"]
-            .as_bool()
-            .unwrap_or(true);
+        let fallback_on_network_errors =
+            optional_bool(config, "fallback_on_network_errors")?.unwrap_or(true);
 
         Ok(Self {
             providers,
@@ -626,6 +609,89 @@ impl AiFederation {
             http_client,
         })
     }
+}
+
+fn optional_u64(config: &Value, field: &'static str) -> Result<Option<u64>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .map(Some)
+        .ok_or_else(|| format!("ai_federation: '{field}' must be an unsigned integer"))
+}
+
+fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| format!("ai_federation: '{field}' must be a boolean"))
+}
+
+fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!("ai_federation: '{field}' must be an array"));
+    };
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(value) = value.as_str() else {
+            return Err(format!(
+                "ai_federation: '{field}' must contain only strings"
+            ));
+        };
+        out.push(value.to_string());
+    }
+    Ok(Some(out))
+}
+
+fn optional_string_map(
+    config: &Value,
+    field: &'static str,
+) -> Result<Option<HashMap<String, String>>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(values) = value.as_object() else {
+        return Err(format!("ai_federation: '{field}' must be an object"));
+    };
+    let mut out = HashMap::with_capacity(values.len());
+    for (key, value) in values {
+        let Some(value) = value.as_str() else {
+            return Err(format!("ai_federation: '{field}' values must be strings"));
+        };
+        out.insert(key.clone(), value.to_string());
+    }
+    Ok(Some(out))
+}
+
+fn optional_status_code_set(
+    config: &Value,
+    field: &'static str,
+) -> Result<Option<HashSet<u16>>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!("ai_federation: '{field}' must be an array"));
+    };
+    let mut out = HashSet::with_capacity(values.len());
+    for value in values {
+        let Some(value) = value.as_u64() else {
+            return Err(format!(
+                "ai_federation: '{field}' must contain integer status codes"
+            ));
+        };
+        let status = u16::try_from(value)
+            .map_err(|_| format!("ai_federation: '{field}' status code {value} is too large"))?;
+        out.insert(status);
+    }
+    Ok(Some(out))
 }
 
 /// Build the authentication method for a provider.
@@ -1651,7 +1717,7 @@ impl Plugin for AiFederation {
             && ctx
                 .headers
                 .get("content-type")
-                .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
+                .is_some_and(|ct| is_json_content_type(ct))
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -1680,22 +1746,22 @@ impl Plugin for AiFederation {
         }
         let content_type = headers
             .get("content-type")
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_default();
-        if !content_type.contains("json") {
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if !is_json_content_type(content_type) {
             return PluginResult::Continue;
         }
 
         // Read request body
         let body_str = match ctx.metadata.get("request_body") {
-            Some(b) => b.clone(),
+            Some(b) => b.as_str(),
             None => {
                 debug!("ai_federation: no request_body in metadata, skipping");
                 return PluginResult::Continue;
             }
         };
 
-        let openai_body: Value = match serde_json::from_str(&body_str) {
+        let openai_body: Value = match serde_json::from_str(body_str) {
             Ok(v) => v,
             Err(e) => {
                 debug!("ai_federation: request body is not valid JSON: {e}");

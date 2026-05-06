@@ -610,9 +610,9 @@ pub fn raise_fd_limit() -> RaiseFdLimitResult {
 /// To surface per-worker starvation, we spawn one tiny probe task per worker
 /// (queried via `Handle::current().metrics().num_workers()`), let tokio's
 /// scheduler distribute them across workers, and report the **maximum**
-/// scheduling delay observed across all probes. A starved worker will have at
-/// least one queued probe task that takes much longer than `yield_now()` to
-/// re-poll, surfacing the starvation in the aggregate reading.
+/// scheduling delay observed across all probes. The timer starts before each
+/// probe is spawned so a starved worker surfaces both first-poll queueing delay
+/// and post-`yield_now()` re-poll delay in the aggregate reading.
 ///
 /// Each probe is a single `yield_now().await` (a few microseconds in the
 /// healthy case), so the overall cost scales linearly with worker count and
@@ -633,8 +633,8 @@ async fn measure_event_loop_latency() -> Duration {
 
     let mut probes = tokio::task::JoinSet::new();
     for _ in 0..num_workers {
-        probes.spawn(async {
-            let start = std::time::Instant::now();
+        let start = std::time::Instant::now();
+        probes.spawn(async move {
             tokio::task::yield_now().await;
             start.elapsed()
         });
@@ -1038,6 +1038,7 @@ pub async fn wait_for_drain(state: &Arc<OverloadState>, timeout: Duration) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[cfg(unix)]
     #[test]
@@ -1362,13 +1363,11 @@ mod tests {
     /// Saturate every worker with a synchronous CPU-bound sleep, then verify
     /// the probe surfaces the resulting scheduling delay.
     ///
-    /// Strategy: spawn `2 * num_workers` synchronous-sleep tasks. The work
-    /// stealing scheduler distributes them, fully oversubscribing every
-    /// worker. The driver task immediately calls `measure_event_loop_latency`,
-    /// which in turn spawns one yield-now probe per worker. Each probe must
-    /// queue behind in-progress sleep work on its assigned worker, so the
-    /// MAX observed reschedule latency is bounded below by the sleep duration
-    /// minus the time the driver took to spin up the probes.
+    /// Strategy: spawn one synchronous-sleep task per worker and have a
+    /// separate OS thread wait until every blocker has entered its sleep before
+    /// starting the latency probe. Each per-worker probe must then queue behind
+    /// in-progress sleep work, so the MAX observed reschedule latency is
+    /// bounded below by the sleep duration minus minor scheduling overhead.
     ///
     /// The OLD single-task implementation would also detect this scenario
     /// (because the driver itself can't make forward progress with every
@@ -1378,26 +1377,37 @@ mod tests {
     /// worker, not just the driver's worker.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn measure_event_loop_latency_detects_saturated_workers() {
-        let num_workers = tokio::runtime::Handle::current().metrics().num_workers();
+        let handle = tokio::runtime::Handle::current();
+        let num_workers = handle.metrics().num_workers();
         const SLEEP_MS: u64 = 150;
-        // Spawn 2× workers worth of CPU-bound sleeps so every worker has a
-        // queued blocker behind whatever else lands on it.
-        let mut blockers = Vec::with_capacity(num_workers * 2);
-        for _ in 0..(num_workers * 2) {
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let probe_started = Arc::clone(&started);
+        let probe_thread = std::thread::spawn(move || {
+            while probe_started.load(Ordering::Acquire) < num_workers {
+                std::thread::yield_now();
+            }
+            handle.block_on(measure_event_loop_latency())
+        });
+
+        // Spawn one CPU-bound sleep per worker. The probe thread waits until
+        // all of them have started, avoiding a race where the probe runs before
+        // the runtime is actually saturated.
+        let mut blockers = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let started = Arc::clone(&started);
             blockers.push(tokio::spawn(async move {
+                started.fetch_add(1, Ordering::Release);
                 std::thread::sleep(Duration::from_millis(SLEEP_MS));
             }));
         }
 
-        // Probe immediately. Each per-worker probe will queue behind the
-        // sleeping blocker(s) on whichever worker it lands on, so the MAX
-        // latency is at least the time it takes for one blocker to finish
-        // and release a worker (minus minor overhead).
-        let latency = measure_event_loop_latency().await;
-
         for b in blockers {
             let _ = b.await;
         }
+        let latency = probe_thread
+            .join()
+            .expect("latency probe thread should not panic");
 
         // Conservative lower bound: 25ms is well above µs-scale healthy
         // readings, well below the SLEEP_MS budget, and tolerant of CI jitter.

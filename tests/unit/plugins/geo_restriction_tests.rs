@@ -2,8 +2,8 @@ use chrono::Utc;
 use ferrum_edge::config::types::{
     GatewayConfig, PluginConfig, PluginScope, default_namespace, validate_mmdb_file,
 };
-use ferrum_edge::plugins::Plugin;
 use ferrum_edge::plugins::geo_restriction::GeoRestriction;
+use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use serde_json::json;
 
 // Note: geo_restriction tests that require actual .mmdb files are limited to
@@ -50,6 +50,22 @@ fn test_new_invalid_db_path_succeeds_with_none_reader() {
 }
 
 #[test]
+fn test_plugin_metadata_and_protocol_flags() {
+    let config = json!({
+        "db_path": "/nonexistent/path/to/GeoLite2-Country.mmdb",
+        "allow_countries": ["US"]
+    });
+    let plugin = GeoRestriction::new(&config).unwrap();
+    assert_eq!(plugin.name(), "geo_restriction");
+    assert_eq!(plugin.priority(), priority::GEO_RESTRICTION);
+    assert_eq!(plugin.priority(), 175);
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.applies_after_proxy_on_reject());
+    assert!(!plugin.is_auth_plugin());
+}
+
+#[test]
 fn test_new_no_countries_fails() {
     // With reader now optional, this properly tests the no-countries validation.
     let config = json!({
@@ -76,6 +92,87 @@ fn test_new_both_allow_and_deny_fails() {
         result.err().unwrap().contains("mutually exclusive"),
         "Should fail due to both allow and deny lists"
     );
+}
+
+#[test]
+fn test_new_rejects_invalid_country_code() {
+    let config = json!({
+        "db_path": "/nonexistent/path/to/test.mmdb",
+        "allow_countries": ["USA"]
+    });
+    let result = GeoRestriction::new(&config);
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("country code"));
+}
+
+#[test]
+fn test_new_rejects_non_string_country_code() {
+    let config = json!({
+        "db_path": "/nonexistent/path/to/test.mmdb",
+        "deny_countries": [42]
+    });
+    let result = GeoRestriction::new(&config);
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("entries must be strings"));
+}
+
+#[test]
+fn test_new_rejects_non_array_country_list() {
+    let config = json!({
+        "db_path": "/nonexistent/path/to/test.mmdb",
+        "allow_countries": "US"
+    });
+    let result = GeoRestriction::new(&config);
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("allow_countries"));
+}
+
+#[test]
+fn test_new_rejects_invalid_on_lookup_failure() {
+    let config = json!({
+        "db_path": "/nonexistent/path/to/test.mmdb",
+        "allow_countries": ["US"],
+        "on_lookup_failure": "block"
+    });
+    let result = GeoRestriction::new(&config);
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("on_lookup_failure"));
+}
+
+#[test]
+fn test_new_rejects_non_bool_inject_headers() {
+    let config = json!({
+        "db_path": "/nonexistent/path/to/test.mmdb",
+        "allow_countries": ["US"],
+        "inject_headers": "yes"
+    });
+    let result = GeoRestriction::new(&config);
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("inject_headers"));
+}
+
+#[tokio::test]
+async fn test_missing_reader_uses_deny_lookup_failure_policy() {
+    let config = json!({
+        "db_path": "/nonexistent/path/to/test.mmdb",
+        "allow_countries": ["US"],
+        "on_lookup_failure": "deny"
+    });
+    let plugin = GeoRestriction::new(&config).unwrap();
+    let mut ctx = RequestContext::new(
+        "203.0.113.1".to_string(),
+        "GET".to_string(),
+        "/test".to_string(),
+    );
+
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
 }
 
 // --- validate_mmdb_file tests ---

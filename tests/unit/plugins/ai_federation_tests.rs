@@ -1,5 +1,6 @@
 use ferrum_edge::plugins::ai_federation;
 use ferrum_edge::plugins::ai_federation::test_helpers;
+use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, priority};
 use ferrum_edge::{
     config::{BackendAllowIps, PoolConfig},
     dns::{DnsCache, DnsConfig},
@@ -29,6 +30,69 @@ fn test_valid_config_openai_provider() {
         "valid config should parse: {:?}",
         result.err()
     );
+}
+
+#[test]
+fn test_plugin_metadata_and_warmup_hostnames() {
+    let config = json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test-key",
+            "model_patterns": ["gpt-*"]
+        }]
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+    assert_eq!(plugin.name(), "ai_federation");
+    assert_eq!(plugin.priority(), priority::AI_FEDERATION);
+    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
+    assert!(plugin.requires_request_body_before_before_proxy());
+    assert!(plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.is_auth_plugin());
+    assert_eq!(
+        plugin.warmup_hostnames(),
+        vec!["api.openai.com".to_string()]
+    );
+}
+
+#[test]
+fn test_invalid_config_shapes_rejected() {
+    let valid_provider = json!({
+        "name": "openai",
+        "provider_type": "openai",
+        "api_key": "sk-test-key"
+    });
+    for config in [
+        json!("bad"),
+        json!({"providers": [json!({
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test-key",
+            "priority": "1"
+        })]}),
+        json!({"providers": [json!({
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test-key",
+            "model_patterns": ["gpt-*", 123]
+        })]}),
+        json!({"providers": [json!({
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test-key",
+            "model_mapping": {"gpt-4": 123}
+        })]}),
+        json!({"providers": [valid_provider.clone()], "fallback_enabled": "true"}),
+        json!({"providers": [valid_provider.clone()], "fallback_on_network_errors": "false"}),
+        json!({"providers": [valid_provider.clone()], "fallback_on_status_codes": "429"}),
+        json!({"providers": [valid_provider.clone()], "fallback_on_status_codes": [429, "500"]}),
+    ] {
+        let result = ai_federation::AiFederation::new(&config, create_test_http_client());
+        assert!(result.is_err(), "config should be rejected: {config:?}");
+    }
 }
 
 #[test]

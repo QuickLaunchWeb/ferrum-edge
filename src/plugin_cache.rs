@@ -107,6 +107,9 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_response_body_buffering(&self) -> bool {
         self.inner.requires_response_body_buffering()
     }
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        self.inner.should_buffer_response_body(ctx)
+    }
     async fn on_response_body(
         &self,
         ctx: &mut RequestContext,
@@ -268,6 +271,25 @@ type BufferingMap = HashMap<String, bool>;
 type RequestBufferingMap = HashMap<String, bool>;
 /// Map from proxy_id to whether any plugin requires per-frame WebSocket hooks.
 type WsFrameMap = HashMap<String, bool>;
+/// Map from proxy_group plugin_config_id to its shared plugin instance.
+type ProxyGroupInstanceMap = HashMap<String, ProxyGroupPluginInstance>;
+
+#[derive(Clone)]
+struct ProxyGroupPluginInstance {
+    plugin: Arc<dyn Plugin>,
+    config: PluginConfig,
+}
+
+fn same_proxy_group_plugin_config(left: &PluginConfig, right: &PluginConfig) -> bool {
+    left.id == right.id
+        && left.namespace == right.namespace
+        && left.plugin_name == right.plugin_name
+        && left.config == right.config
+        && left.scope == right.scope
+        && left.proxy_id == right.proxy_id
+        && left.enabled == right.enabled
+        && left.priority_override == right.priority_override
+}
 
 // ---------------------------------------------------------------------------
 // Per-protocol phase data — precomputed at config reload time
@@ -449,6 +471,10 @@ pub(crate) struct PluginCacheInner {
     requires_ws_frame: WsFrameMap,
     /// Whether global-only plugins require per-frame WebSocket hooks (fallback).
     global_requires_ws_frame: bool,
+    /// Shared proxy-group plugin instances, keyed by plugin_config_id. Kept
+    /// across incremental updates so rebuilt proxies can keep sharing state
+    /// with unchanged proxies when the proxy-group config itself did not change.
+    proxy_group_plugins: ProxyGroupInstanceMap,
 }
 
 impl PluginCacheInner {
@@ -463,6 +489,7 @@ impl PluginCacheInner {
         protocol_snapshot: ProtocolSnapshot,
         requires_ws_frame: WsFrameMap,
         global_requires_ws_frame: bool,
+        proxy_group_plugins: ProxyGroupInstanceMap,
     ) -> Self {
         Self {
             proxy_plugins,
@@ -474,6 +501,7 @@ impl PluginCacheInner {
             protocol_snapshot,
             requires_ws_frame,
             global_requires_ws_frame,
+            proxy_group_plugins,
         }
     }
 
@@ -659,6 +687,7 @@ impl PluginCache {
             global_needs_req_buffering,
             ws_frame_map,
             global_needs_ws_frame,
+            proxy_group_plugins,
         ) = Self::build_cache(config, http_client)?;
         let snapshot = build_protocol_snapshot(&proxy_map, &globals);
 
@@ -672,6 +701,7 @@ impl PluginCache {
             snapshot,
             ws_frame_map,
             global_needs_ws_frame,
+            proxy_group_plugins,
         )))
     }
 
@@ -787,8 +817,21 @@ impl PluginCache {
             }
         }
 
-        // Shared ProxyGroup plugin instances (created on first reference, reused)
-        let mut group_plugin_instances: HashMap<&str, Arc<dyn Plugin>> = HashMap::new();
+        // Shared ProxyGroup plugin instances. Start with unchanged current
+        // instances so a partial proxy rebuild keeps state shared with proxies
+        // whose plugin lists are preserved from the previous generation.
+        let mut group_plugin_instances: ProxyGroupInstanceMap = current
+            .proxy_group_plugins
+            .iter()
+            .filter_map(|(id, existing)| {
+                let pc = proxy_group_configs.get(id.as_str())?;
+                if same_proxy_group_plugin_config(&existing.config, pc) {
+                    Some((id.clone(), existing.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         // Clone the current map and patch it
         let mut new_map: HashMap<String, Arc<Vec<Arc<dyn Plugin>>>> = current.proxy_plugins.clone();
@@ -843,7 +886,7 @@ impl PluginCache {
             for assoc in &proxy.plugins {
                 if let Some(pc) = proxy_group_configs.get(assoc.plugin_config_id.as_str()) {
                     if let Some(existing) = group_plugin_instances.get(pc.id.as_str()) {
-                        let plugin = Arc::clone(existing);
+                        let plugin = Arc::clone(&existing.plugin);
                         merged.retain(|p| {
                             p.name() != plugin.name()
                                 || !global_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize))
@@ -852,7 +895,13 @@ impl PluginCache {
                     } else {
                         match try_create_plugin(pc, &self.http_client) {
                             Ok(Some(plugin)) => {
-                                group_plugin_instances.insert(pc.id.as_str(), Arc::clone(&plugin));
+                                group_plugin_instances.insert(
+                                    pc.id.clone(),
+                                    ProxyGroupPluginInstance {
+                                        plugin: Arc::clone(&plugin),
+                                        config: (*pc).clone(),
+                                    },
+                                );
                                 merged.retain(|p| {
                                     p.name() != plugin.name()
                                         || !global_ptrs
@@ -970,6 +1019,7 @@ impl PluginCache {
             },
             new_ws_frame,
             new_global_requires_ws_frame,
+            group_plugin_instances,
         )))
     }
 
@@ -1169,6 +1219,7 @@ impl PluginCache {
             bool,
             WsFrameMap,
             bool,
+            ProxyGroupInstanceMap,
         ),
         String,
     > {
@@ -1214,7 +1265,7 @@ impl PluginCache {
 
         // Lazily create shared ProxyGroup plugin instances (created on first
         // reference, then Arc-cloned for subsequent proxies in the group).
-        let mut group_plugin_instances: HashMap<&str, Arc<dyn Plugin>> = HashMap::new();
+        let mut group_plugin_instances: ProxyGroupInstanceMap = HashMap::new();
 
         // Step 2: For each proxy, resolve its full plugin list
         // (global + proxy-scoped, with proxy overriding global of same name)
@@ -1272,7 +1323,7 @@ impl PluginCache {
                 if let Some(pc) = proxy_group_configs.get(assoc.plugin_config_id.as_str()) {
                     if let Some(existing) = group_plugin_instances.get(pc.id.as_str()) {
                         // Reuse the shared instance (Arc::clone is ~5ns)
-                        let plugin = Arc::clone(existing);
+                        let plugin = Arc::clone(&existing.plugin);
                         merged.retain(|p| {
                             p.name() != plugin.name()
                                 || !global_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize))
@@ -1282,7 +1333,13 @@ impl PluginCache {
                         // First proxy to reference this group plugin — create the instance
                         match try_create_plugin(pc, http_client) {
                             Ok(Some(plugin)) => {
-                                group_plugin_instances.insert(pc.id.as_str(), Arc::clone(&plugin));
+                                group_plugin_instances.insert(
+                                    pc.id.clone(),
+                                    ProxyGroupPluginInstance {
+                                        plugin: Arc::clone(&plugin),
+                                        config: (*pc).clone(),
+                                    },
+                                );
                                 merged.retain(|p| {
                                     p.name() != plugin.name()
                                         || !global_ptrs
@@ -1345,6 +1402,7 @@ impl PluginCache {
             global_needs_req_buffering,
             ws_frame_map,
             global_needs_ws_frame,
+            group_plugin_instances,
         ))
     }
 }

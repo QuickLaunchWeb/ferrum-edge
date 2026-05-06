@@ -1,5 +1,5 @@
 use ferrum_edge::plugins::serverless_function::ServerlessFunction;
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult};
+use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, priority};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -37,7 +37,7 @@ fn test_plugin_name_and_priority() {
     .unwrap();
 
     assert_eq!(plugin.name(), "serverless_function");
-    assert_eq!(plugin.priority(), 3025);
+    assert_eq!(plugin.priority(), priority::SERVERLESS_FUNCTION);
 }
 
 #[test]
@@ -51,8 +51,7 @@ fn test_supported_protocols() {
     )
     .unwrap();
 
-    let protocols = plugin.supported_protocols();
-    assert_eq!(protocols.len(), 2);
+    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
 }
 
 #[test]
@@ -94,6 +93,12 @@ fn test_warmup_hostnames_aws() {
 // ---------------------------------------------------------------------------
 // Config validation
 // ---------------------------------------------------------------------------
+
+#[test]
+fn test_non_object_config_rejects() {
+    let err = expect_err(ServerlessFunction::new(&json!("bad"), default_client()));
+    assert!(err.contains("config must be an object"), "got: {}", err);
+}
 
 #[test]
 fn test_missing_provider_rejects() {
@@ -317,6 +322,87 @@ fn test_non_string_mode_rejects() {
         default_client(),
     ));
     assert!(err.contains("'mode' must be a string"), "got: {}", err);
+}
+
+#[test]
+fn test_non_bool_forward_body_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "forward_body": "yes"
+        }),
+        default_client(),
+    ));
+    assert!(
+        err.contains("'forward_body' must be a boolean"),
+        "got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_non_bool_forward_query_params_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "forward_query_params": 1
+        }),
+        default_client(),
+    ));
+    assert!(
+        err.contains("'forward_query_params' must be a boolean"),
+        "got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_invalid_forward_headers_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "forward_headers": ["X-Request-ID", "bad header"]
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("valid HTTP header name"), "got: {}", err);
+}
+
+#[test]
+fn test_non_array_forward_headers_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "forward_headers": "X-Request-ID"
+        }),
+        default_client(),
+    ));
+    assert!(
+        err.contains("'forward_headers' must be an array"),
+        "got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_non_integer_timeout_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "timeout_ms": "5000"
+        }),
+        default_client(),
+    ));
+    assert!(
+        err.contains("'timeout_ms' must be an unsigned integer"),
+        "got: {}",
+        err
+    );
 }
 
 #[test]
@@ -586,6 +672,52 @@ async fn test_terminate_mode_rejects_grpc_requests() {
             assert!(body.contains("not supported for gRPC"));
         }
         other => panic!("Expected Reject for gRPC terminate, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_terminate_mode_returns_function_response_as_reject_binary() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .set_body_bytes(br#"{"ok":true}"#.to_vec())
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 202);
+            assert_eq!(&body[..], br#"{"ok":true}"#);
+            assert_eq!(
+                headers.get("content-type").map(|v| v.as_str()),
+                Some("application/json")
+            );
+        }
+        other => panic!("Expected RejectBinary, got {:?}", other),
     }
 }
 

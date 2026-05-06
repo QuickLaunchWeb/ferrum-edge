@@ -1,10 +1,21 @@
 use ferrum_edge::plugins::ai_response_guard::AiResponseGuard;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
 use serde_json::json;
 use std::collections::HashMap;
 
 fn make_plugin(config: serde_json::Value) -> AiResponseGuard {
     AiResponseGuard::new(&config).unwrap()
+}
+
+fn ctx_with_content_type(method: &str, content_type: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        method.to_string(),
+        "/chat".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), content_type.to_string());
+    ctx
 }
 
 #[test]
@@ -442,7 +453,19 @@ fn test_requires_response_body_buffering() {
         "action": "reject"
     });
     let plugin = make_plugin(config);
+    assert_eq!(plugin.priority(), 4075);
+    assert_eq!(
+        plugin.supported_protocols(),
+        &[ProxyProtocol::Http, ProxyProtocol::Grpc]
+    );
     assert!(plugin.requires_response_body_buffering());
+    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "application/json")));
+    assert!(plugin.should_buffer_response_body(&ctx_with_content_type(
+        "POST",
+        "multipart/form-data; boundary=abc"
+    )));
+    assert!(!plugin.should_buffer_response_body(&ctx_with_content_type("POST", "text/plain")));
+    assert!(!plugin.should_buffer_response_body(&ctx_with_content_type("GET", "application/json")));
 }
 
 #[test]
@@ -457,6 +480,39 @@ fn test_unknown_builtin_pii_pattern_is_fatal() {
     .err()
     .unwrap();
     assert!(err.contains("unknown built-in PII pattern"), "got: {err}");
+}
+
+#[test]
+fn test_invalid_config_shapes_rejected() {
+    for (config, needle) in [
+        (json!(null), "config must be an object"),
+        (json!({"pii_patterns": ["ssn"], "action": "drop"}), "action"),
+        (
+            json!({"pii_patterns": ["ssn"], "scan_fields": "everything"}),
+            "scan_fields",
+        ),
+        (
+            json!({"pii_patterns": ["ssn"], "max_scan_bytes": 0}),
+            "max_scan_bytes",
+        ),
+        (
+            json!({"pii_patterns": ["ssn"], "require_json": "yes"}),
+            "require_json",
+        ),
+        (
+            json!({"required_fields": ["choices", 42]}),
+            "required_fields[1]",
+        ),
+        (json!({"blocked_phrases": [""]}), "blocked_phrases[0]"),
+        (
+            json!({"custom_pii_patterns": [{"name": "secret"}]}),
+            "custom_pii_patterns[0].regex",
+        ),
+        (json!({"blocked_patterns": [42]}), "blocked_patterns[0]"),
+    ] {
+        let err = AiResponseGuard::new(&config).err().unwrap();
+        assert!(err.contains(needle), "needle={needle}, got: {err}");
+    }
 }
 
 // ─── ScanMode::All — structural keys are protected from redaction ─────
