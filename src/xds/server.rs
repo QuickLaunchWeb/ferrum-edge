@@ -24,8 +24,8 @@ use super::slice::{MeshSlice, MeshSliceRequest};
 use super::snapshot::{XdsSnapshot, XdsSnapshotCache};
 use super::translator::translate_mesh_slice_to_snapshot;
 use crate::FERRUM_VERSION;
+use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::GatewayConfig;
-use crate::grpc::cp_server::CpGrpcServer;
 use crate::grpc::proto::ConfigUpdate;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +59,10 @@ struct XdsStreamRegistry {
 
 impl XdsStreamRegistry {
     fn register(&self, node_id: &str) {
+        // TODO(Phase C): enforce a per-node ADS stream ceiling once mesh
+        // listeners can create large fleets of authenticated xDS clients.
+        // Phase B keeps xDS opt-in/off by default and only tracks counts so
+        // final stream teardown can drop per-node cache/nonce state.
         match self.counts.entry(node_id.to_string()) {
             Entry::Occupied(mut entry) => {
                 *entry.get_mut() += 1;
@@ -527,7 +531,7 @@ impl XdsAdsServer {
                 &update.config_json,
             ) {
                 Ok(delta) => {
-                    CpGrpcServer::apply_incremental_to_config_snapshot(stream_config, delta);
+                    apply_incremental_to_config_snapshot(stream_config, delta);
                     stream_config.normalize_fields();
                     true
                 }

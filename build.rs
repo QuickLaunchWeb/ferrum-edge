@@ -11,6 +11,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        // The vendored xDS proto intentionally declares minimal `Any` and
+        // `Status` shims in the Envoy package instead of importing
+        // google.protobuf.Any / google.rpc.Status. They are wire-compatible
+        // for the Phase B fields Ferrum consumes; avoid "fixing" this unless
+        // the translator layer also switches to the full upstream protos.
         .compile_protos(
             &["proto/envoy/service/discovery/v3/discovery.proto"],
             &["proto/"],

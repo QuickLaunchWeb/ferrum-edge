@@ -30,7 +30,6 @@ use dashmap::DashMap;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -46,6 +45,7 @@ use super::proto::{
     SubscribeRequest,
 };
 use crate::FERRUM_VERSION;
+use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::{GatewayConfig, default_namespace};
 use crate::xds::{MeshSlice, MeshSliceRequest};
 
@@ -120,13 +120,17 @@ struct TrackedStream<S> {
     registry: Arc<DpNodeRegistry>,
     node_id: String,
     connected_at: DateTime<Utc>,
+    stream_label: &'static str,
 }
 
 impl<S> Drop for TrackedStream<S> {
     fn drop(&mut self) {
         self.registry
             .remove_if_stale(&self.node_id, self.connected_at);
-        info!("DP node '{}' disconnected (stream dropped)", self.node_id);
+        info!(
+            "{} node '{}' disconnected (stream dropped)",
+            self.stream_label, self.node_id
+        );
     }
 }
 
@@ -330,95 +334,47 @@ impl CpGrpcServer {
     }
 
     #[allow(clippy::result_large_err)]
-    fn build_mesh_config_update(
-        config: &GatewayConfig,
-        slice_request: MeshSliceRequest,
-    ) -> Result<MeshConfigUpdate, Status> {
-        let slice = MeshSlice::from_gateway_config(config, slice_request);
+    fn build_mesh_config_update_from_slice(slice: MeshSlice) -> Result<MeshConfigUpdate, Status> {
+        let version = slice.version.clone();
         let mesh_slice_json = serde_json::to_string(&slice).map_err(|e| {
             error!("Failed to serialize mesh slice: {}", e);
             Status::internal("Failed to serialize mesh slice")
         })?;
         Ok(MeshConfigUpdate {
-            version: slice.version,
+            version,
             timestamp: chrono::Utc::now().timestamp(),
             mesh_slice_json,
             ferrum_version: FERRUM_VERSION.to_string(),
         })
     }
 
+    #[allow(clippy::result_large_err)]
+    fn build_mesh_config_update_if_changed(
+        config: &GatewayConfig,
+        slice_request: MeshSliceRequest,
+        previous_slice: &MeshSlice,
+    ) -> Result<(MeshSlice, Option<MeshConfigUpdate>), Status> {
+        let next_slice = MeshSlice::from_gateway_config(config, slice_request);
+        if mesh_slice_content_equal(previous_slice, &next_slice) {
+            return Ok((next_slice, None));
+        }
+        let update = Self::build_mesh_config_update_from_slice(next_slice.clone())?;
+        Ok((next_slice, Some(update)))
+    }
+
     fn apply_mesh_delta_to_stream_config(
         stream_config: &mut GatewayConfig,
         delta: crate::config::db_loader::IncrementalResult,
         slice_request: MeshSliceRequest,
-    ) -> Result<MeshConfigUpdate, Status> {
+        previous_slice: &MeshSlice,
+    ) -> Result<(MeshSlice, Option<MeshConfigUpdate>), Status> {
         let mut candidate = stream_config.clone();
-        Self::apply_incremental_to_config_snapshot(&mut candidate, delta);
+        apply_incremental_to_config_snapshot(&mut candidate, delta);
         candidate.normalize_fields();
-        let update = Self::build_mesh_config_update(&candidate, slice_request)?;
+        let result =
+            Self::build_mesh_config_update_if_changed(&candidate, slice_request, previous_slice)?;
         *stream_config = candidate;
-        Ok(update)
-    }
-
-    pub(crate) fn apply_incremental_to_config_snapshot(
-        config: &mut GatewayConfig,
-        result: crate::config::db_loader::IncrementalResult,
-    ) {
-        let removed_proxies: HashSet<&str> = result
-            .removed_proxy_ids
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let removed_consumers: HashSet<&str> = result
-            .removed_consumer_ids
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let removed_plugins: HashSet<&str> = result
-            .removed_plugin_config_ids
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let removed_upstreams: HashSet<&str> = result
-            .removed_upstream_ids
-            .iter()
-            .map(String::as_str)
-            .collect();
-
-        config
-            .proxies
-            .retain(|proxy| !removed_proxies.contains(proxy.id.as_str()));
-        config
-            .consumers
-            .retain(|consumer| !removed_consumers.contains(consumer.id.as_str()));
-        config
-            .plugin_configs
-            .retain(|plugin| !removed_plugins.contains(plugin.id.as_str()));
-        config
-            .upstreams
-            .retain(|upstream| !removed_upstreams.contains(upstream.id.as_str()));
-
-        upsert_by_id(
-            &mut config.proxies,
-            result.added_or_modified_proxies,
-            |proxy| proxy.id.as_str(),
-        );
-        upsert_by_id(
-            &mut config.consumers,
-            result.added_or_modified_consumers,
-            |consumer| consumer.id.as_str(),
-        );
-        upsert_by_id(
-            &mut config.plugin_configs,
-            result.added_or_modified_plugin_configs,
-            |plugin| plugin.id.as_str(),
-        );
-        upsert_by_id(
-            &mut config.upstreams,
-            result.added_or_modified_upstreams,
-            |upstream| upstream.id.as_str(),
-        );
-        config.loaded_at = result.poll_timestamp;
+        Ok(result)
     }
 
     /// Check whether the DP's reported version is compatible with this CP.
@@ -624,6 +580,7 @@ impl ConfigSync for CpGrpcServer {
             registry: self.registry.clone(),
             node_id,
             connected_at: now,
+            stream_label: "DP",
         };
 
         Ok(Response::new(Box::pin(tracked)))
@@ -680,16 +637,31 @@ impl ConfigSync for CpGrpcServer {
             inner.node_id, inner.ferrum_version, inner.namespace
         );
 
+        let node_id = inner.node_id;
+        let node_version = inner.ferrum_version;
+        let node_namespace = inner.namespace;
+
         let slice_request = MeshSliceRequest::from_native(
-            inner.node_id,
-            inner.namespace,
+            node_id.clone(),
+            node_namespace.clone(),
             inner.workload_spiffe_id,
             inner.labels,
         );
         let config = self.config.load_full();
-        let initial = Self::build_mesh_config_update(config.as_ref(), slice_request.clone())?;
+        let initial_slice = MeshSlice::from_gateway_config(config.as_ref(), slice_request.clone());
+        let initial = Self::build_mesh_config_update_from_slice(initial_slice.clone())?;
+
+        let now = Utc::now();
+        self.registry.insert(DpNodeInfo {
+            node_id: node_id.clone(),
+            version: node_version,
+            namespace: node_namespace,
+            connected_at: now,
+            last_update_at: now,
+        });
 
         let mut stream_config = config.as_ref().clone();
+        let mut previous_slice = initial_slice;
         let rx = self.update_tx.subscribe();
         let config_for_recovery = self.config.clone();
         let stream = BroadcastStream::new(rx).filter_map(move |result| {
@@ -699,10 +671,19 @@ impl ConfigSync for CpGrpcServer {
                     match serde_json::from_str::<GatewayConfig>(&update.config_json) {
                         Ok(mut config) => {
                             config.normalize_fields();
-                            match Self::build_mesh_config_update(&config, slice_request) {
-                                Ok(mesh_update) => {
+                            match Self::build_mesh_config_update_if_changed(
+                                &config,
+                                slice_request,
+                                &previous_slice,
+                            ) {
+                                Ok((next_slice, Some(mesh_update))) => {
                                     stream_config = config;
+                                    previous_slice = next_slice;
                                     Some(Ok(mesh_update))
+                                }
+                                Ok((_, None)) => {
+                                    stream_config = config;
+                                    None
                                 }
                                 Err(e) => Some(Err(e)),
                             }
@@ -722,9 +703,15 @@ impl ConfigSync for CpGrpcServer {
                                 &mut stream_config,
                                 delta,
                                 slice_request,
+                                &previous_slice,
                             )
                             .ok()
-                            .map(Ok)
+                            .and_then(|(next_slice, maybe_update)| {
+                                if maybe_update.is_some() {
+                                    previous_slice = next_slice;
+                                }
+                                maybe_update.map(Ok)
+                            })
                         }
                         Err(e) => {
                             warn!("Failed to deserialize delta config for mesh stream: {}", e);
@@ -745,10 +732,19 @@ impl ConfigSync for CpGrpcServer {
                         n
                     );
                     let current = config_for_recovery.load_full();
-                    match Self::build_mesh_config_update(current.as_ref(), slice_request) {
-                        Ok(update) => {
+                    match Self::build_mesh_config_update_if_changed(
+                        current.as_ref(),
+                        slice_request,
+                        &previous_slice,
+                    ) {
+                        Ok((next_slice, Some(update))) => {
                             stream_config = current.as_ref().clone();
+                            previous_slice = next_slice;
                             Some(Ok(update))
+                        }
+                        Ok((_, None)) => {
+                            stream_config = current.as_ref().clone();
+                            None
                         }
                         Err(e) => Some(Err(e)),
                     }
@@ -757,30 +753,29 @@ impl ConfigSync for CpGrpcServer {
         });
 
         let initial_stream = tokio_stream::once(Ok(initial));
-        Ok(Response::new(Box::pin(initial_stream.chain(stream))))
+        let combined = initial_stream.chain(stream);
+        let tracked = TrackedStream {
+            inner: Box::pin(combined),
+            registry: self.registry.clone(),
+            node_id,
+            connected_at: now,
+            stream_label: "Mesh",
+        };
+        Ok(Response::new(Box::pin(tracked)))
     }
 }
 
-fn upsert_by_id<T, F>(existing: &mut Vec<T>, updates: Vec<T>, get_id: F)
-where
-    F: Fn(&T) -> &str,
-{
-    let mut index: std::collections::HashMap<String, usize> = existing
-        .iter()
-        .enumerate()
-        .map(|(i, item)| (get_id(item).to_string(), i))
-        .collect();
-
-    for item in updates {
-        let id = get_id(&item).to_string();
-        if let Some(&pos) = index.get(id.as_str()) {
-            existing[pos] = item;
-        } else {
-            let pos = existing.len();
-            existing.push(item);
-            index.insert(id, pos);
-        }
-    }
+fn mesh_slice_content_equal(previous: &MeshSlice, next: &MeshSlice) -> bool {
+    previous.node_id == next.node_id
+        && previous.namespace == next.namespace
+        && previous.workload_spiffe_id == next.workload_spiffe_id
+        && previous.labels == next.labels
+        && previous.workloads == next.workloads
+        && previous.services == next.services
+        && previous.mesh_policies == next.mesh_policies
+        && previous.peer_authentications == next.peer_authentications
+        && previous.service_entries == next.service_entries
+        && previous.trust_bundles == next.trust_bundles
 }
 
 // Version compatibility is tested inline because `check_version_compatibility` is private.
@@ -820,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn mesh_delta_update_uses_broadcast_payload_version() {
+    fn mesh_delta_update_skips_unchanged_mesh_slice_content() {
         let mut stream_config = mesh_config_with_service(0);
         let poll_timestamp = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 42).unwrap();
         let delta = IncrementalResult {
@@ -834,55 +829,54 @@ mod tests {
             removed_upstream_ids: vec!["stale-upstream".to_string()],
             poll_timestamp,
         };
-        let update = CpGrpcServer::apply_mesh_delta_to_stream_config(
+        let slice_request = MeshSliceRequest::from_native(
+            "node-a".to_string(),
+            "ferrum".to_string(),
+            String::new(),
+            std::collections::HashMap::new(),
+        );
+        let previous_slice = MeshSlice::from_gateway_config(&stream_config, slice_request.clone());
+        let (next_slice, update) = CpGrpcServer::apply_mesh_delta_to_stream_config(
             &mut stream_config,
             delta,
-            MeshSliceRequest::from_native(
-                "node-a".to_string(),
-                "ferrum".to_string(),
-                String::new(),
-                std::collections::HashMap::new(),
-            ),
+            slice_request,
+            &previous_slice,
         )
         .expect("mesh delta should build");
-        let slice: MeshSlice =
-            serde_json::from_str(&update.mesh_slice_json).expect("mesh slice should deserialize");
 
-        assert_eq!(slice.version, poll_timestamp.to_rfc3339());
-        assert_eq!(slice.services.len(), 1);
+        assert!(update.is_none());
+        assert_eq!(stream_config.loaded_at, poll_timestamp);
+        assert_eq!(next_slice.version, poll_timestamp.to_rfc3339());
+        assert_eq!(next_slice.services.len(), 1);
     }
 
     #[test]
-    fn mesh_delta_update_preserves_stream_local_snapshot() {
-        let mut stream_config = mesh_config_with_named_service("stream-local", 0);
-        let poll_timestamp = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 43).unwrap();
-        let delta = IncrementalResult {
-            added_or_modified_proxies: Vec::new(),
-            removed_proxy_ids: Vec::new(),
-            added_or_modified_consumers: Vec::new(),
-            removed_consumer_ids: Vec::new(),
-            added_or_modified_plugin_configs: Vec::new(),
-            removed_plugin_config_ids: Vec::new(),
-            added_or_modified_upstreams: Vec::new(),
-            removed_upstream_ids: Vec::new(),
-            poll_timestamp,
-        };
-        let update = CpGrpcServer::apply_mesh_delta_to_stream_config(
-            &mut stream_config,
-            delta,
-            MeshSliceRequest::from_native(
-                "node-a".to_string(),
-                "ferrum".to_string(),
-                String::new(),
-                std::collections::HashMap::new(),
-            ),
+    fn mesh_full_update_emits_when_mesh_slice_content_changes() {
+        let stream_config = mesh_config_with_named_service("stream-local", 0);
+        let next_config = mesh_config_with_named_service("new-service", 43);
+        let slice_request = MeshSliceRequest::from_native(
+            "node-a".to_string(),
+            "ferrum".to_string(),
+            String::new(),
+            std::collections::HashMap::new(),
+        );
+        let previous_slice = MeshSlice::from_gateway_config(&stream_config, slice_request.clone());
+        let (_next_slice, update) = CpGrpcServer::build_mesh_config_update_if_changed(
+            &next_config,
+            slice_request,
+            &previous_slice,
         )
-        .expect("mesh delta should build");
+        .expect("mesh full update should build");
+        let update = update.expect("changed mesh content should emit an update");
         let slice: MeshSlice =
             serde_json::from_str(&update.mesh_slice_json).expect("mesh slice should deserialize");
 
-        assert_eq!(slice.version, poll_timestamp.to_rfc3339());
-        assert_eq!(slice.services[0].name, "stream-local");
+        assert_eq!(slice.version, next_config.loaded_at.to_rfc3339());
+        assert_eq!(slice.services[0].name, "new-service");
+        assert_eq!(
+            stream_config.mesh.as_ref().unwrap().services[0].name,
+            "stream-local"
+        );
     }
 
     #[test]

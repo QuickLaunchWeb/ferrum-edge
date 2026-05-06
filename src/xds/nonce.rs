@@ -124,6 +124,10 @@ impl XdsNonceTracker {
     }
 
     pub fn remove_node(&self, node_id: &str) {
+        // Phase B cardinality is tiny: one entry per active `(node, type_url)`
+        // and xDS is gated off by default. Before large-fleet deployment,
+        // replace this O(n) retain with a per-node key index or hierarchical
+        // map so stream teardown does not scan unrelated nodes.
         self.states.retain(|key, _| key.node_id != node_id);
     }
 
