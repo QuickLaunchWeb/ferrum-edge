@@ -163,6 +163,7 @@ pub async fn run(
             grpc_secret,
             env_config.cp_dp_grpc_jwt_issuer.clone(),
             env_config.namespace.clone(),
+            env_config.xds_stream_channel_capacity,
         ))
     } else {
         None

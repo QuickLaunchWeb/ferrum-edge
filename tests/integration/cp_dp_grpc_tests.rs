@@ -26,6 +26,10 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::grpc::cp_server::CpGrpcServer;
 use ferrum_edge::grpc::dp_client::{self, DpGrpcTlsConfig, GrpcJwtSecret};
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
+use ferrum_edge::modes::mesh::config_consumer::native_client::{
+    NativeMeshClientConfig, start_native_mesh_client_with_shutdown,
+};
+use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::xds::{LDS_TYPE_URL, XdsAdsServer};
 
@@ -409,6 +413,43 @@ async fn test_mesh_subscribe_receives_initial_mesh_slice() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_native_mesh_client_installs_mesh_slice_from_cp() {
+    let cp_config = create_test_mesh_config();
+    let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+    let state = MeshRuntimeState::new();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let client_config = NativeMeshClientConfig {
+        node_id: "mesh-node".to_string(),
+        namespace: "ferrum".to_string(),
+        workload_spiffe_id: Some("spiffe://cluster.local/ns/ferrum/sa/api".to_string()),
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+    };
+    let handle = tokio::spawn(start_native_mesh_client_with_shutdown(
+        vec![format!("http://127.0.0.1:{}", addr.port())],
+        test_secret(),
+        client_config,
+        state.clone(),
+        shutdown_rx,
+        None,
+    ));
+
+    timeout(Duration::from_secs(5), state.wait_for_first_slice())
+        .await
+        .expect("native mesh client should install first slice");
+    let snapshot = state.snapshot();
+    let slice = snapshot.as_ref().as_ref().expect("slice installed");
+    assert_eq!(slice.node_id, "mesh-node");
+    assert_eq!(slice.services.len(), 1);
+    assert_eq!(slice.workloads.len(), 1);
+
+    shutdown_tx.send(true).expect("shutdown signal sent");
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("native mesh client should exit on shutdown")
+        .expect("native mesh client task should not panic");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_xds_ads_stream_returns_lds_snapshot() {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(create_test_mesh_config())));
     let (_cp_server, update_tx) =
@@ -419,6 +460,7 @@ async fn test_xds_ads_stream_returns_lds_snapshot() {
         TEST_JWT_SECRET.to_string(),
         ferrum_edge::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER.to_string(),
         "ferrum".to_string(),
+        32,
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -716,7 +758,7 @@ async fn test_cp_accepts_token_with_matching_issuer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cp_rejects_token_with_wrong_issuer() {
     let cp_config = create_test_config(1);
-    let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+    let (addr, _update_tx, server_handle) = start_test_cp_server(cp_config).await;
 
     // Mint a token signed with the correct secret but bearing a foreign issuer.
     let token =
@@ -742,6 +784,48 @@ async fn test_cp_rejects_token_with_wrong_issuer() {
         "Expected Unauthenticated, got: {}",
         status
     );
+
+    server_handle.abort();
+}
+
+/// `MeshSubscribe` shares the same CP/DP JWT security boundary as the
+/// classic DP Subscribe stream. Cover it explicitly so mesh config cannot
+/// accidentally drift into a weaker auth path.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mesh_subscribe_rejects_token_with_wrong_issuer() {
+    let cp_config = create_test_mesh_config();
+    let (addr, _update_tx, server_handle) = start_test_cp_server(cp_config).await;
+
+    let token = dp_client::generate_dp_jwt_with_issuer(
+        TEST_JWT_SECRET,
+        "mesh-iss-bad",
+        "some-other-service",
+    )
+    .unwrap();
+    let mut client = connect_client_with_token!(addr, token);
+
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
+        node_id: "mesh-iss-bad".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+        workload_spiffe_id: "spiffe://cluster.local/ns/ferrum/sa/api".to_string(),
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+    });
+
+    let result = client.mesh_subscribe(request).await;
+    assert!(
+        result.is_err(),
+        "CP should reject MeshSubscribe token with wrong issuer"
+    );
+    let status = result.unwrap_err();
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unauthenticated,
+        "Expected Unauthenticated, got: {}",
+        status
+    );
+
+    server_handle.abort();
 }
 
 /// Verify that the CP rejects a DP token that has no `iss` claim at all.
@@ -2731,6 +2815,46 @@ async fn test_cp_rejects_dp_with_mismatched_namespace_subscribe() {
     assert!(
         status.message().contains("staging"),
         "Error should mention DP namespace 'staging', got: {}",
+        status.message()
+    );
+    assert!(
+        status.message().contains("production"),
+        "Error should mention CP namespace 'production', got: {}",
+        status.message()
+    );
+
+    server_handle.abort();
+}
+
+/// `MeshSubscribe` enforces the same namespace boundary as classic Subscribe:
+/// a mesh node in `staging` must not receive a CP's `production` mesh slice.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_rejects_mesh_subscribe_with_mismatched_namespace() {
+    let cp_config = create_test_mesh_config();
+    let (addr, _update_tx, server_handle) =
+        start_test_cp_server_with_namespace(cp_config, "production").await;
+
+    let generated_token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "test-mesh-dp").unwrap();
+    let mut client = connect_client_with_token!(addr, generated_token);
+
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
+        node_id: "test-mesh-dp".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "staging".to_string(),
+        workload_spiffe_id: "spiffe://cluster.local/ns/staging/sa/api".to_string(),
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+    });
+
+    let result = client.mesh_subscribe(request).await;
+    assert!(
+        result.is_err(),
+        "CP should reject MeshSubscribe with mismatched namespace"
+    );
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("staging"),
+        "Error should mention mesh node namespace 'staging', got: {}",
         status.message()
     );
     assert!(

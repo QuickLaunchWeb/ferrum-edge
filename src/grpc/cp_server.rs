@@ -27,9 +27,7 @@
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::Serialize;
-use serde_json::Value;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -39,6 +37,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
+use super::auth::verify_grpc_jwt_metadata;
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{
     ConfigUpdate, FullConfigRequest, FullConfigResponse, MeshConfigUpdate, MeshSubscribeRequest,
@@ -401,34 +400,7 @@ impl CpGrpcServer {
 
     #[allow(clippy::result_large_err)]
     fn verify_jwt_metadata(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), Status> {
-        let token = metadata
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.strip_prefix("Bearer ").unwrap_or(s))
-            .ok_or_else(|| Status::unauthenticated("Missing authorization token"))?;
-
-        let key = DecodingKey::from_secret(self.jwt_secret.as_bytes());
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.validate_exp = true;
-        // Require standard claims to prevent minimal/forged tokens from authenticating.
-        // `iss` is required AND constrained to the expected issuer below: a token
-        // signed with the same shared secret but bearing a different `iss` (e.g.
-        // a leaked admin-API token if the secret was reused, or a token minted
-        // for an unrelated audience) is rejected here.
-        validation.required_spec_claims = {
-            let mut claims = std::collections::HashSet::new();
-            claims.insert("exp".to_string());
-            claims.insert("iat".to_string());
-            claims.insert("sub".to_string());
-            claims.insert("iss".to_string());
-            claims
-        };
-        validation.set_issuer(&[self.expected_issuer.as_str()]);
-
-        decode::<Value>(token, &key, &validation)
-            .map_err(|e| Status::unauthenticated(format!("Invalid token: {}", e)))?;
-
-        Ok(())
+        verify_grpc_jwt_metadata(metadata, &self.jwt_secret, &self.expected_issuer)
     }
 
     pub fn into_service(self) -> ConfigSyncServer<Self> {
@@ -457,7 +429,7 @@ impl CpGrpcServer {
         previous_slice: &MeshSlice,
     ) -> Result<(MeshSlice, Option<MeshConfigUpdate>), Status> {
         let next_slice = MeshSlice::from_gateway_config(config, slice_request);
-        if mesh_slice_content_equal(previous_slice, &next_slice) {
+        if previous_slice.content_eq(&next_slice) {
             return Ok((next_slice, None));
         }
         let update = Self::build_mesh_config_update_from_slice(next_slice.clone())?;
@@ -801,19 +773,23 @@ impl ConfigSync for CpGrpcServer {
                         &update.config_json,
                     ) {
                         Ok(delta) => {
-                            Self::apply_mesh_delta_to_stream_config(
+                            match Self::apply_mesh_delta_to_stream_config(
                                 &mut stream_config,
                                 delta,
                                 slice_request,
                                 &previous_slice,
-                            )
-                            .ok()
-                            .and_then(|(next_slice, maybe_update)| {
-                                if maybe_update.is_some() {
-                                    previous_slice = next_slice;
+                            ) {
+                                Ok((next_slice, maybe_update)) => {
+                                    if maybe_update.is_some() {
+                                        previous_slice = next_slice;
+                                    }
+                                    maybe_update.map(Ok)
                                 }
-                                maybe_update.map(Ok)
-                            })
+                                Err(e) => {
+                                    warn!("Failed to build mesh delta update: {}", e);
+                                    None
+                                }
+                            }
                         }
                         Err(e) => {
                             warn!("Failed to deserialize delta config for mesh stream: {}", e);
@@ -865,19 +841,6 @@ impl ConfigSync for CpGrpcServer {
         };
         Ok(Response::new(Box::pin(tracked)))
     }
-}
-
-fn mesh_slice_content_equal(previous: &MeshSlice, next: &MeshSlice) -> bool {
-    previous.node_id == next.node_id
-        && previous.namespace == next.namespace
-        && previous.workload_spiffe_id == next.workload_spiffe_id
-        && previous.labels == next.labels
-        && previous.workloads == next.workloads
-        && previous.services == next.services
-        && previous.mesh_policies == next.mesh_policies
-        && previous.peer_authentications == next.peer_authentications
-        && previous.service_entries == next.service_entries
-        && previous.trust_bundles == next.trust_bundles
 }
 
 // Version compatibility is tested inline because `check_version_compatibility` is private.

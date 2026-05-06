@@ -5,7 +5,9 @@
 //! the canonical Layer 2 mesh model instead of reading any config source
 //! directly.
 
-#![allow(dead_code, unused_imports)]
+// Phase B exposes xDS pieces before every runtime path consumes them. Keep the
+// allowance scoped to dead code only; unused imports should still be caught.
+#![allow(dead_code)]
 
 pub mod conformance;
 pub mod nonce;
@@ -20,10 +22,15 @@ pub mod proto {
     tonic::include_proto!("envoy.service.discovery.v3");
 }
 
+// Public re-exports are used by library consumers/tests even when the binary
+// target only reaches xDS through narrower module paths.
+#[allow(unused_imports)]
 pub use nonce::{AckOutcome, XdsNonceTracker};
 pub use server::XdsAdsServer;
 pub use slice::{MeshSlice, MeshSliceRequest};
+#[allow(unused_imports)]
 pub use snapshot::{XdsResource, XdsSnapshot, XdsSnapshotCache};
+#[allow(unused_imports)]
 pub use translator::{
     CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL, SDS_TYPE_URL, XDS_TYPE_URLS,
     translate_mesh_slice_to_snapshot,

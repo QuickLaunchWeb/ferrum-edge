@@ -6,7 +6,7 @@ use prost::Message;
 use ferrum_edge::config::mesh::{
     AppProtocol, MeshConfig, MeshPolicy, MeshRule, MeshService, MtlsMode, PeerAuthentication,
     PolicyAction, PolicyScope, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
-    Workload, WorkloadPort, WorkloadSelector,
+    TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadSelector,
 };
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
@@ -128,7 +128,7 @@ fn translators_emit_all_phase_b_type_urls() {
     assert_eq!(snapshot.resources(EDS_TYPE_URL).len(), 1);
     assert!(snapshot.resources(SDS_TYPE_URL).is_empty());
 
-    let listener_resource = snapshot.resources(LDS_TYPE_URL).remove(0);
+    let listener_resource = snapshot.resources(LDS_TYPE_URL)[0].clone();
     let listener = proto::Listener::decode(listener_resource.value.as_slice())
         .expect("minimal listener should decode");
     assert_eq!(listener.name, "listener/default/api/8080");
@@ -188,6 +188,73 @@ fn translators_deduplicate_colliding_listener_and_route_resources() {
     let rds = snapshot.resources(RDS_TYPE_URL);
     assert_eq!(rds.len(), 1);
     assert_eq!(rds[0].name, "route/default/api");
+}
+
+#[test]
+fn translator_deduplicates_colliding_sds_resources() {
+    let mut mesh = mesh_config();
+    let cluster_local = TrustDomain::new("cluster.local").expect("valid trust domain");
+    let partner = TrustDomain::new("partner.local").expect("valid trust domain");
+    mesh.trust_bundles = Some(TrustBundleSet {
+        local: TrustBundle {
+            trust_domain: cluster_local.clone(),
+            x509_authorities: vec!["local-ca".to_string()],
+            jwt_authorities: Vec::new(),
+            refresh_hint_seconds: None,
+        },
+        federated: vec![
+            TrustBundle {
+                trust_domain: partner.clone(),
+                x509_authorities: vec!["partner-ca".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            TrustBundle {
+                trust_domain: partner,
+                x509_authorities: vec!["partner-ca-duplicate".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            TrustBundle {
+                trust_domain: cluster_local,
+                x509_authorities: vec!["local-ca-duplicate".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+        ],
+    });
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    let request = MeshSliceRequest::from_xds_node("node-a".to_string(), "default".to_string());
+    let slice = MeshSlice::from_gateway_config(&config, request);
+    let snapshot = translate_mesh_slice_to_snapshot(&slice);
+
+    let secrets = snapshot.resources(SDS_TYPE_URL);
+    let secret_names: std::collections::HashSet<_> = secrets
+        .iter()
+        .map(|resource| resource.name.as_str())
+        .collect();
+
+    assert_eq!(secrets.len(), 2);
+    assert!(secret_names.contains("secret/spiffe-bundle/cluster.local"));
+    assert!(secret_names.contains("secret/spiffe-bundle/partner.local"));
+}
+
+#[test]
+fn mesh_slice_content_eq_ignores_only_version() {
+    let config = gateway_config();
+    let request = MeshSliceRequest::from_xds_node("node-a".to_string(), "default".to_string());
+    let mut left = MeshSlice::from_gateway_config(&config, request.clone());
+    let mut right = MeshSlice::from_gateway_config(&config, request);
+
+    right.version = "different-version".to_string();
+    assert!(left.content_eq(&right));
+
+    left.namespace = "other".to_string();
+    assert!(!left.content_eq(&right));
 }
 
 #[test]
