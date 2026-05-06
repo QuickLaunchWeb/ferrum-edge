@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
 use crate::config::mesh::{AppProtocol, MeshService, ServicePort};
-use crate::config::types::BackendScheme;
+use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT};
 
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, RouteBackend, RouteProxySpec, SourceKind,
@@ -147,6 +147,7 @@ fn http_route_proxies(
             (String::new(), 0, Some(upstream_id))
         };
 
+        let mut seen_paths = HashSet::new();
         let match_paths = rule
             .get("matches")
             .and_then(Value::as_array)
@@ -161,7 +162,10 @@ fn http_route_proxies(
                     .collect::<Vec<_>>()
             })
             .filter(|matches| !matches.is_empty())
-            .unwrap_or_else(|| vec![Some("/".to_string())]);
+            .unwrap_or_else(|| vec![Some("/".to_string())])
+            .into_iter()
+            .filter(|listen_path| seen_paths.insert(listen_path.clone()))
+            .collect::<Vec<_>>();
 
         let match_count = match_paths.len();
         for (match_index, listen_path) in match_paths.into_iter().enumerate() {
@@ -232,12 +236,15 @@ fn backend_weight(object: &K8sObject, backend_ref: &Value) -> Result<u32, K8sTra
     let Some(weight) = backend_ref.get("weight").and_then(Value::as_u64) else {
         return Ok(1);
     };
-    u32::try_from(weight).map_err(|_| {
-        invalid_resource(
+    if weight > u64::from(MAX_TARGET_WEIGHT) {
+        return Err(invalid_resource(
             object,
-            format!("backendRefs[].weight {weight} exceeds u32::MAX"),
-        )
-    })
+            format!(
+                "backendRefs[].weight must be between 0 and {MAX_TARGET_WEIGHT} (got {weight})"
+            ),
+        ));
+    }
+    Ok(weight as u32)
 }
 
 fn l4_route_proxies(
@@ -470,6 +477,51 @@ mod tests {
                 .proxies
                 .iter()
                 .all(|proxy| proxy.backend_port == 8080)
+        );
+    }
+
+    #[test]
+    fn http_route_dedupes_pathless_matches_to_one_catch_all_proxy() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "hostnames": ["api.example.com"],
+                    "rules": [{
+                        "matches": [
+                            {"headers": [{"name": "x-tenant", "value": "a"}]},
+                            {"method": "GET"}
+                        ],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn http_route_rejects_backend_weight_above_ferrum_limit() {
+        let err = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [{"name": "api", "port": 8080, "weight": 65536}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("oversized backend weight should fail translation");
+
+        assert!(
+            err.to_string()
+                .contains("weight must be between 0 and 65535")
         );
     }
 

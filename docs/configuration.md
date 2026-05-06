@@ -168,6 +168,8 @@ Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the can
 
 Phase D adds Kubernetes source translation and sidecar-injector scaffolding. Kubernetes resources translate into `GatewayConfig` / `MeshConfig`; no config source talks directly to the proxy runtime or xDS server.
 
+Gateway API `HTTPRoute.backendRefs` and Istio `VirtualService.http[].route` splits are preserved during translation. A single backend becomes a direct Ferrum proxy backend; multiple non-zero backends create a generated `Upstream` and the proxy references it through `upstream_id`. Generated upstreams use `weighted_round_robin` when any backend weight is not `1`, otherwise `round_robin`. Each HTTPRoute `matches[]` path and each VirtualService `match[]` URI becomes its own proxy, so path alternatives are not collapsed into the first match. Gateway API `weight: 0` backendRefs are skipped; Istio `weight: 0` destinations are skipped only in multi-destination splits because a lone Istio destination still receives all traffic.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_INJECTOR_LISTEN_ADDR` | Injector mode | `0.0.0.0:9443` | Admission webhook bind address for `POST /mutate` |
