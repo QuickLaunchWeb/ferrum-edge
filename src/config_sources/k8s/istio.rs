@@ -10,8 +10,9 @@ use crate::config::mesh::{
 use crate::identity::spiffe::SpiffeId;
 
 use super::{
-    K8sAccumulator, K8sObject, K8sTranslateError, RouteProxySpec, SourceKind, invalid_resource,
-    proxy_for_route, resource_id, selector_from_istio, string_array, string_field, string_map,
+    K8sAccumulator, K8sObject, K8sTranslateError, RouteBackend, RouteProxySpec, SourceKind,
+    invalid_resource, proxy_for_route, resource_id, selector_from_istio, string_array,
+    string_field, string_map, upstream_for_route,
 };
 use crate::config::types::BackendScheme;
 
@@ -39,7 +40,11 @@ pub(super) fn translate(
             Ok(true)
         }
         "VirtualService" => {
-            for proxy in virtual_service_routes(object)? {
+            let (proxies, upstreams) = virtual_service_routes(object)?;
+            for upstream in upstreams {
+                acc.upsert_upstream(upstream);
+            }
+            for proxy in proxies {
                 acc.upsert_proxy(proxy, SourceKind::Istio);
             }
             Ok(true)
@@ -309,9 +314,16 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
 
 fn virtual_service_routes(
     object: &K8sObject,
-) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
+) -> Result<
+    (
+        Vec<crate::config::types::Proxy>,
+        Vec<crate::config::types::Upstream>,
+    ),
+    K8sTranslateError,
+> {
     let hosts = string_array(&object.spec, "hosts");
     let mut proxies = Vec::new();
+    let mut upstreams = Vec::new();
 
     for (index, http) in object
         .spec
@@ -321,13 +333,85 @@ fn virtual_service_routes(
         .flatten()
         .enumerate()
     {
-        let Some(route) = http
-            .get("route")
-            .and_then(Value::as_array)
-            .and_then(|routes| routes.first())
-        else {
+        let backends = route_backends(object, http)?;
+        if backends.is_empty() {
             continue;
         };
+
+        let (backend_host, backend_port, upstream_id) = if backends.len() == 1 {
+            let backend = backends.into_iter().next().expect("one backend");
+            (backend.host, backend.port, None)
+        } else {
+            let upstream_id = resource_id(
+                "istio-vs-upstream",
+                &object.metadata.namespace,
+                &object.metadata.name,
+                &index.to_string(),
+            );
+            upstreams.push(upstream_for_route(
+                upstream_id.clone(),
+                object.metadata.namespace.clone(),
+                backends,
+            ));
+            (String::new(), 0, Some(upstream_id))
+        };
+
+        let match_paths = http
+            .get("match")
+            .and_then(Value::as_array)
+            .map(|matches| {
+                matches
+                    .iter()
+                    .map(|m| {
+                        m.get("uri")
+                            .and_then(path_match)
+                            .or_else(|| Some("/".to_string()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|matches| !matches.is_empty())
+            .unwrap_or_else(|| vec![Some("/".to_string())]);
+
+        let match_count = match_paths.len();
+        for (match_index, listen_path) in match_paths.into_iter().enumerate() {
+            let suffix = if match_count == 1 {
+                index.to_string()
+            } else {
+                format!("{index}-{match_index}")
+            };
+            proxies.push(proxy_for_route(RouteProxySpec {
+                id: resource_id(
+                    "istio-vs",
+                    &object.metadata.namespace,
+                    &object.metadata.name,
+                    &suffix,
+                ),
+                namespace: object.metadata.namespace.clone(),
+                hosts: hosts.clone(),
+                listen_path,
+                backend_host: backend_host.clone(),
+                backend_port,
+                upstream_id: upstream_id.clone(),
+                backend_scheme: BackendScheme::Http,
+                listen_port: None,
+            }));
+        }
+    }
+
+    Ok((proxies, upstreams))
+}
+
+fn route_backends(
+    object: &K8sObject,
+    http: &Value,
+) -> Result<Vec<RouteBackend>, K8sTranslateError> {
+    let mut backends = Vec::new();
+    for route in http
+        .get("route")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         let Some(destination) = route.get("destination") else {
             continue;
         };
@@ -342,32 +426,29 @@ fn virtual_service_routes(
             .and_then(|p| p.get("number"))
             .and_then(Value::as_u64)
             .unwrap_or(80) as u16;
-
-        let listen_path = http
-            .get("match")
-            .and_then(Value::as_array)
-            .and_then(|matches| matches.first())
-            .and_then(|m| m.get("uri"))
-            .and_then(path_match);
-
-        proxies.push(proxy_for_route(RouteProxySpec {
-            id: resource_id(
-                "istio-vs",
-                &object.metadata.namespace,
-                &object.metadata.name,
-                &index.to_string(),
-            ),
-            namespace: object.metadata.namespace.clone(),
-            hosts: hosts.clone(),
-            listen_path: listen_path.or_else(|| Some("/".to_string())),
-            backend_host: host.to_string(),
-            backend_port: port,
-            backend_scheme: BackendScheme::Http,
-            listen_port: None,
-        }));
+        let weight = route_weight(object, route)?;
+        if weight == 0 {
+            continue;
+        }
+        backends.push(RouteBackend {
+            host: host.to_string(),
+            port,
+            weight,
+        });
     }
+    Ok(backends)
+}
 
-    Ok(proxies)
+fn route_weight(object: &K8sObject, route: &Value) -> Result<u32, K8sTranslateError> {
+    let Some(weight) = route.get("weight").and_then(Value::as_u64) else {
+        return Ok(1);
+    };
+    u32::try_from(weight).map_err(|_| {
+        invalid_resource(
+            object,
+            format!("VirtualService route.weight {weight} exceeds u32::MAX"),
+        )
+    })
 }
 
 fn path_match(uri: &Value) -> Option<String> {
@@ -542,5 +623,75 @@ mod tests {
         assert_eq!(result.config.proxies.len(), 1);
         assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/v1"));
         assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn virtual_service_preserves_weighted_destinations() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [
+                            {"destination": {"host": "api-v1.default.svc.cluster.local", "port": {"number": 8080}}, "weight": 80},
+                            {"destination": {"host": "api-v2.default.svc.cluster.local", "port": {"number": 8081}}, "weight": 20}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.upstreams.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].upstream_id.as_deref(),
+            Some(result.config.upstreams[0].id.as_str())
+        );
+        assert_eq!(result.config.upstreams[0].targets.len(), 2);
+        assert_eq!(result.config.upstreams[0].targets[0].weight, 80);
+        assert_eq!(
+            result.config.upstreams[0].targets[1].host,
+            "api-v2.default.svc.cluster.local"
+        );
+    }
+
+    #[test]
+    fn virtual_service_creates_proxy_per_uri_match() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/v1"}},
+                            {"uri": {"prefix": "/v2"}}
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let paths: Vec<_> = result
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.listen_path.as_deref())
+            .collect();
+        assert_eq!(paths, vec![Some("/v1"), Some("/v2")]);
+        assert!(
+            result
+                .config
+                .proxies
+                .iter()
+                .all(|proxy| proxy.backend_port == 8080)
+        );
     }
 }

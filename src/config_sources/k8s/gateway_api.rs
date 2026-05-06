@@ -6,8 +6,9 @@ use crate::config::mesh::{AppProtocol, MeshService, ServicePort};
 use crate::config::types::BackendScheme;
 
 use super::{
-    K8sAccumulator, K8sObject, K8sTranslateError, RouteProxySpec, SourceKind, invalid_resource,
-    proxy_for_route, resource_id, service_dns_name, string_array, string_field,
+    K8sAccumulator, K8sObject, K8sTranslateError, RouteBackend, RouteProxySpec, SourceKind,
+    invalid_resource, proxy_for_route, resource_id, service_dns_name, string_array, string_field,
+    upstream_for_route,
 };
 
 pub(super) fn translate(
@@ -110,7 +111,7 @@ fn mesh_services_from_gateway(object: &K8sObject) -> Vec<MeshService> {
 
 fn http_route_proxies(
     object: &K8sObject,
-    acc: &K8sAccumulator,
+    acc: &mut K8sAccumulator,
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
     let hostnames = string_array(&object.spec, "hostnames");
     let mut proxies = Vec::new();
@@ -123,9 +124,86 @@ fn http_route_proxies(
         .flatten()
         .enumerate()
     {
-        let Some(backend_ref) = first_backend_ref(rule) else {
+        let backends = route_backends(object, rule, acc)?;
+        if backends.is_empty() {
             continue;
         };
+
+        let (backend_host, backend_port, upstream_id) = if backends.len() == 1 {
+            let backend = backends.into_iter().next().expect("one backend");
+            (backend.host, backend.port, None)
+        } else {
+            let upstream_id = resource_id(
+                "gwapi-route-upstream",
+                &object.metadata.namespace,
+                &object.metadata.name,
+                &rule_index.to_string(),
+            );
+            acc.upsert_upstream(upstream_for_route(
+                upstream_id.clone(),
+                object.metadata.namespace.clone(),
+                backends,
+            ));
+            (String::new(), 0, Some(upstream_id))
+        };
+
+        let match_paths = rule
+            .get("matches")
+            .and_then(Value::as_array)
+            .map(|matches| {
+                matches
+                    .iter()
+                    .map(|m| {
+                        m.get("path")
+                            .and_then(http_path_match)
+                            .or_else(|| Some("/".to_string()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|matches| !matches.is_empty())
+            .unwrap_or_else(|| vec![Some("/".to_string())]);
+
+        let match_count = match_paths.len();
+        for (match_index, listen_path) in match_paths.into_iter().enumerate() {
+            let suffix = if match_count == 1 {
+                rule_index.to_string()
+            } else {
+                format!("{rule_index}-{match_index}")
+            };
+            proxies.push(proxy_for_route(RouteProxySpec {
+                id: resource_id(
+                    "gwapi-route",
+                    &object.metadata.namespace,
+                    &object.metadata.name,
+                    &suffix,
+                ),
+                namespace: object.metadata.namespace.clone(),
+                hosts: hostnames.clone(),
+                listen_path,
+                backend_host: backend_host.clone(),
+                backend_port,
+                upstream_id: upstream_id.clone(),
+                backend_scheme: BackendScheme::Http,
+                listen_port: None,
+            }));
+        }
+    }
+
+    Ok(proxies)
+}
+
+fn route_backends(
+    object: &K8sObject,
+    rule: &Value,
+    acc: &K8sAccumulator,
+) -> Result<Vec<RouteBackend>, K8sTranslateError> {
+    let mut backends = Vec::new();
+    for backend_ref in rule
+        .get("backendRefs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         let backend_name = string_field(backend_ref, "name")
             .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
         let backend_namespace =
@@ -137,34 +215,29 @@ fn http_route_proxies(
                 80
             },
         ) as u16;
-
-        let listen_path = rule
-            .get("matches")
-            .and_then(Value::as_array)
-            .and_then(|matches| matches.first())
-            .and_then(|m| m.get("path"))
-            .and_then(http_path_match)
-            .or_else(|| Some("/".to_string()));
-
-        let backend_host = service_dns_name(backend_name, &backend_namespace);
-        proxies.push(proxy_for_route(RouteProxySpec {
-            id: resource_id(
-                "gwapi-route",
-                &object.metadata.namespace,
-                &object.metadata.name,
-                &rule_index.to_string(),
-            ),
-            namespace: object.metadata.namespace.clone(),
-            hosts: hostnames.clone(),
-            listen_path,
-            backend_host: backend_host.clone(),
-            backend_port,
-            backend_scheme: BackendScheme::Http,
-            listen_port: None,
-        }));
+        let weight = backend_weight(object, backend_ref)?;
+        if weight == 0 {
+            continue;
+        }
+        backends.push(RouteBackend {
+            host: service_dns_name(backend_name, &backend_namespace),
+            port: backend_port,
+            weight,
+        });
     }
+    Ok(backends)
+}
 
-    Ok(proxies)
+fn backend_weight(object: &K8sObject, backend_ref: &Value) -> Result<u32, K8sTranslateError> {
+    let Some(weight) = backend_ref.get("weight").and_then(Value::as_u64) else {
+        return Ok(1);
+    };
+    u32::try_from(weight).map_err(|_| {
+        invalid_resource(
+            object,
+            format!("backendRefs[].weight {weight} exceeds u32::MAX"),
+        )
+    })
 }
 
 fn l4_route_proxies(
@@ -207,6 +280,7 @@ fn l4_route_proxies(
             listen_path: None,
             backend_host: service_dns_name(backend_name, &backend_namespace),
             backend_port,
+            upstream_id: None,
             backend_scheme: scheme,
             listen_port: Some(backend_port),
         }));
@@ -330,6 +404,73 @@ mod tests {
             Some("/api")
         );
         assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn http_route_preserves_weighted_backend_refs() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "hostnames": ["api.example.com"],
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                        "backendRefs": [
+                            {"name": "api-v1", "port": 8080, "weight": 90},
+                            {"name": "api-v2", "port": 8081, "weight": 10}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.upstreams.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].upstream_id.as_deref(),
+            Some(result.config.upstreams[0].id.as_str())
+        );
+        assert_eq!(result.config.upstreams[0].targets.len(), 2);
+        assert_eq!(result.config.upstreams[0].targets[0].weight, 90);
+        assert_eq!(result.config.upstreams[0].targets[1].port, 8081);
+    }
+
+    #[test]
+    fn http_route_creates_proxy_per_match() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "hostnames": ["api.example.com"],
+                    "rules": [{
+                        "matches": [
+                            {"path": {"type": "PathPrefix", "value": "/v1"}},
+                            {"path": {"type": "PathPrefix", "value": "/v2"}}
+                        ],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let paths: Vec<_> = result
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.listen_path.as_deref())
+            .collect();
+        assert_eq!(paths, vec![Some("/v1"), Some("/v2")]);
+        assert!(
+            result
+                .config
+                .proxies
+                .iter()
+                .all(|proxy| proxy.backend_port == 8080)
+        );
     }
 
     #[test]
