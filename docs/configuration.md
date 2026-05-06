@@ -174,10 +174,12 @@ Phase D adds Kubernetes source translation and sidecar-injector scaffolding. Kub
 | `FERRUM_INJECTOR_SIDECAR_IMAGE` | No | `ferrum-edge:latest` | Image injected into workload pods as the Ferrum mesh sidecar |
 | `FERRUM_INJECTOR_REQUIRE_ANNOTATION` | No | `true` | Require pod label `ferrum.io/mesh=enabled` or annotation `ferrum.io/inject=true` before injecting |
 | `FERRUM_INJECTOR_TRUST_DOMAIN` | No | `cluster.local` | Trust domain used to derive injected sidecar `FERRUM_MESH_WORKLOAD_SPIFFE_ID` from pod namespace and service account |
+| `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` | No | — | Kubernetes Secret name used as the injected sidecar `FERRUM_CP_DP_GRPC_JWT_SECRET` source |
+| `FERRUM_INJECTOR_JWT_SECRET_REF_KEY` | No | — | Key inside `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` used as the injected sidecar `FERRUM_CP_DP_GRPC_JWT_SECRET` source |
 | `FERRUM_INJECTOR_TLS_CERT_PATH` | Kubernetes webhook deployments | — | TLS certificate presented by the injector webhook server |
 | `FERRUM_INJECTOR_TLS_KEY_PATH` | Kubernetes webhook deployments | — | TLS private key for `FERRUM_INJECTOR_TLS_CERT_PATH` |
 
-The injector copies mesh sidecar control-plane env vars from its own environment into injected containers when set: `FERRUM_DP_CP_GRPC_URL`, `FERRUM_DP_CP_GRPC_URLS`, `FERRUM_CP_DP_GRPC_JWT_SECRET`, `FERRUM_CP_DP_GRPC_JWT_ISSUER`, DP gRPC TLS vars, and `FERRUM_MESH_CONFIG_PROTOCOL`.
+The injector copies non-secret mesh sidecar control-plane env vars from its own environment into injected containers when set: `FERRUM_DP_CP_GRPC_URL`, `FERRUM_DP_CP_GRPC_URLS`, `FERRUM_CP_DP_GRPC_JWT_ISSUER`, DP gRPC TLS vars, and `FERRUM_MESH_CONFIG_PROTOCOL`. It does not copy plaintext `FERRUM_CP_DP_GRPC_JWT_SECRET`; set `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` and `FERRUM_INJECTOR_JWT_SECRET_REF_KEY` to inject that variable via `valueFrom.secretKeyRef`.
 
 ### Migration
 
