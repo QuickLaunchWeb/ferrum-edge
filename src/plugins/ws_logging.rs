@@ -1,16 +1,11 @@
 //! WebSocket access logging plugin — batched async log shipping over ws/wss.
 //!
-//! Serializes WebSocket upgrade `TransactionSummary` entries and WebSocket
-//! disconnect summaries, then sends them to a remote WebSocket endpoint in
-//! batches. Uses an mpsc channel to decouple the proxy hot path from network
-//! I/O: hooks enqueue entries non-blocking, and a background task drains the
-//! channel in configurable batch sizes with a flush interval timer. The
-//! WebSocket connection is maintained persistently with automatic reconnection
-//! on failure.
-//!
-//! This plugin is scoped to the gateway's WebSocket protocol path. Other
-//! remote logging sinks (`http_logging`, `tcp_logging`, `udp_logging`, Kafka,
-//! Loki, StatsD) cover non-WebSocket HTTP and stream traffic.
+//! Serializes `TransactionSummary`, `StreamTransactionSummary`, and WebSocket
+//! disconnect entries, then sends them to a remote WebSocket endpoint in batches.
+//! Uses an mpsc channel to decouple the proxy hot path from network I/O: hooks
+//! enqueue entries non-blocking, and a background task drains the channel in
+//! configurable batch sizes with a flush interval timer. The WebSocket
+//! connection is maintained persistently with automatic reconnection on failure.
 //!
 //! **TLS**: For `wss://` endpoints, the plugin builds a `rustls::ClientConfig`
 //! that follows the gateway's CA trust chain:
@@ -34,7 +29,8 @@ use url::Url;
 
 use super::utils::{BatchConfigDefaults, PluginHttpClient, validate_batch_config};
 use super::{
-    Direction, Plugin, ProxyProtocol, TransactionSummary, WS_ONLY_PROTOCOLS, WsDisconnectContext,
+    ALL_PROTOCOLS, Direction, Plugin, ProxyProtocol, StreamTransactionSummary, TransactionSummary,
+    WsDisconnectContext,
 };
 
 /// Union type for log entries sent through the batched channel.
@@ -42,6 +38,7 @@ use super::{
 #[serde(untagged)]
 enum LogEntry {
     Http(TransactionSummary),
+    Stream(StreamTransactionSummary),
     WebSocket(WsDisconnectLogEntry),
 }
 
@@ -283,11 +280,21 @@ impl Plugin for WsLogging {
     }
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
-        WS_ONLY_PROTOCOLS
+        ALL_PROTOCOLS
     }
 
     fn requires_ws_disconnect_hooks(&self) -> bool {
         true
+    }
+
+    async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
+        if self
+            .sender
+            .try_send(LogEntry::Stream(summary.clone()))
+            .is_err()
+        {
+            warn!("WebSocket logging buffer full — dropping stream log entry");
+        }
     }
 
     async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {

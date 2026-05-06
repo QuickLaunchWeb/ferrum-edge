@@ -3,12 +3,14 @@
 use std::collections::HashMap;
 
 use ferrum_edge::plugins::{
-    Direction, Plugin, PluginHttpClient, PluginResult, WS_ONLY_PROTOCOLS, WsDisconnectContext,
+    ALL_PROTOCOLS, Direction, Plugin, PluginHttpClient, PluginResult, WsDisconnectContext,
     ws_logging::WsLogging,
 };
 use serde_json::json;
 
-use super::plugin_utils::{create_test_context, create_test_transaction_summary};
+use super::plugin_utils::{
+    create_test_context, create_test_stream_transaction_summary, create_test_transaction_summary,
+};
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -47,7 +49,7 @@ async fn test_ws_logging_plugin_creation() {
     .unwrap();
     assert_eq!(plugin.name(), "ws_logging");
     assert_eq!(plugin.priority(), 9175);
-    assert_eq!(plugin.supported_protocols(), WS_ONLY_PROTOCOLS);
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
     assert!(plugin.requires_ws_disconnect_hooks());
     assert_eq!(plugin.warmup_hostnames(), vec!["localhost".to_string()]);
 }
@@ -188,6 +190,25 @@ async fn test_ws_logging_ws_disconnect_does_not_panic() {
 
     plugin.on_ws_disconnect(&ctx).await;
     plugin.on_ws_disconnect(&ctx).await;
+}
+
+#[tokio::test]
+async fn test_ws_logging_stream_disconnect_does_not_panic() {
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://127.0.0.1:1/unreachable",
+            "batch_size": 1000,
+            "flush_interval_ms": 60000,
+            "max_retries": 0,
+            "buffer_capacity": 1
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let summary = create_test_stream_transaction_summary();
+
+    plugin.on_stream_disconnect(&summary).await;
+    plugin.on_stream_disconnect(&summary).await;
 }
 
 #[tokio::test]

@@ -16,6 +16,8 @@ use tracing::{debug, warn};
 
 use super::PluginHttpClient;
 
+const EMPTY_STORE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
 /// A cached JWKS key with its algorithm and decoding key.
 #[derive(Clone)]
 pub struct CachedJwk {
@@ -171,19 +173,12 @@ impl JwksKeyStore {
             interval
         };
         tokio::spawn(async move {
-            if let Err(e) = store.fetch_keys().await {
-                warn!("JWKS initial fetch failed: {}", e);
-            }
-
-            let mut timer = tokio::time::interval(interval);
-            // Skip tokio's immediate first tick; the explicit initial fetch
-            // above already covered startup.
-            timer.tick().await;
             loop {
-                timer.tick().await;
                 if let Err(e) = store.fetch_keys().await {
                     warn!("JWKS background refresh failed: {}", e);
                 }
+
+                tokio::time::sleep(refresh_delay_after_attempt(store.has_keys(), interval)).await;
             }
         })
     }
@@ -249,5 +244,39 @@ impl JwksKeyStore {
             algorithm,
             decoding_key,
         })
+    }
+}
+
+fn refresh_delay_after_attempt(store_has_keys: bool, interval: Duration) -> Duration {
+    if store_has_keys {
+        interval
+    } else {
+        std::cmp::min(interval, EMPTY_STORE_RETRY_INTERVAL)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EMPTY_STORE_RETRY_INTERVAL, refresh_delay_after_attempt};
+    use std::time::Duration;
+
+    #[test]
+    fn populated_store_uses_configured_refresh_interval() {
+        let interval = Duration::from_secs(900);
+        assert_eq!(refresh_delay_after_attempt(true, interval), interval);
+    }
+
+    #[test]
+    fn empty_store_uses_short_retry_when_interval_is_longer() {
+        assert_eq!(
+            refresh_delay_after_attempt(false, Duration::from_secs(900)),
+            EMPTY_STORE_RETRY_INTERVAL
+        );
+    }
+
+    #[test]
+    fn empty_store_keeps_shorter_configured_interval() {
+        let interval = Duration::from_secs(2);
+        assert_eq!(refresh_delay_after_attempt(false, interval), interval);
     }
 }

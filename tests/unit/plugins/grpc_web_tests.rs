@@ -1,4 +1,4 @@
-use ferrum_edge::plugins::{GRPC_ONLY_PROTOCOLS, Plugin, PluginResult, create_plugin, priority};
+use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, create_plugin, priority};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -746,7 +746,7 @@ async fn test_transform_response_body_no_content_type() {
 #[test]
 fn test_supported_protocols() {
     let plugin = create_plugin_default();
-    assert_eq!(plugin.supported_protocols(), GRPC_ONLY_PROTOCOLS);
+    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
 }
 
 // ── Trait flags ──

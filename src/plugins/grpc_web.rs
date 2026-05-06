@@ -48,7 +48,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
-use super::{GRPC_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext};
+use super::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext};
 
 /// Metadata key storing the original gRPC-Web mode ("text" or "binary").
 const META_GRPC_WEB_MODE: &str = "grpc_web_mode";
@@ -253,7 +253,7 @@ impl Plugin for GrpcWebPlugin {
     }
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
-        GRPC_ONLY_PROTOCOLS
+        HTTP_GRPC_PROTOCOLS
     }
 
     fn modifies_request_headers(&self) -> bool {
