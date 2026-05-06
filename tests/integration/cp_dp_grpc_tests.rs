@@ -26,6 +26,10 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::grpc::cp_server::CpGrpcServer;
 use ferrum_edge::grpc::dp_client::{self, DpGrpcTlsConfig, GrpcJwtSecret};
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
+use ferrum_edge::modes::mesh::config_consumer::native_client::{
+    NativeMeshClientConfig, start_native_mesh_client_with_shutdown,
+};
+use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::xds::{LDS_TYPE_URL, XdsAdsServer};
 
@@ -404,6 +408,43 @@ async fn test_mesh_subscribe_receives_initial_mesh_slice() {
     assert_eq!(slice.services.len(), 1);
     assert_eq!(slice.services[0].name, "api");
     assert_eq!(slice.workloads.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_native_mesh_client_installs_mesh_slice_from_cp() {
+    let cp_config = create_test_mesh_config();
+    let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+    let state = MeshRuntimeState::new();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let client_config = NativeMeshClientConfig {
+        node_id: "mesh-node".to_string(),
+        namespace: "ferrum".to_string(),
+        workload_spiffe_id: Some("spiffe://cluster.local/ns/ferrum/sa/api".to_string()),
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+    };
+    let handle = tokio::spawn(start_native_mesh_client_with_shutdown(
+        vec![format!("http://127.0.0.1:{}", addr.port())],
+        test_secret(),
+        client_config,
+        state.clone(),
+        shutdown_rx,
+        None,
+    ));
+
+    timeout(Duration::from_secs(5), state.wait_for_first_slice())
+        .await
+        .expect("native mesh client should install first slice");
+    let snapshot = state.snapshot();
+    let slice = snapshot.as_ref().as_ref().expect("slice installed");
+    assert_eq!(slice.node_id, "mesh-node");
+    assert_eq!(slice.services.len(), 1);
+    assert_eq!(slice.workloads.len(), 1);
+
+    shutdown_tx.send(true).expect("shutdown signal sent");
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("native mesh client should exit on shutdown")
+        .expect("native mesh client task should not panic");
 }
 
 #[tokio::test(flavor = "multi_thread")]

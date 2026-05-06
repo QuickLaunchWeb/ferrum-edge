@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
+use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::{XdsClientConfig, XdsConfigConsumer};
 use crate::modes::mesh::runtime::MeshRuntimeState;
@@ -141,7 +142,6 @@ impl MeshRuntimeConfig {
 
     fn native_client_config(&self) -> NativeMeshClientConfig {
         NativeMeshClientConfig {
-            cp_url: self.cp_urls[0].clone(),
             node_id: self.node_id.clone(),
             namespace: self.namespace.clone(),
             workload_spiffe_id: self.workload_spiffe_id.clone(),
@@ -178,18 +178,38 @@ pub async fn run(
     );
 
     let mesh_state = MeshRuntimeState::new();
+    let jwt_secret = GrpcJwtSecret::with_issuer(
+        env_config.cp_dp_grpc_jwt_secret.clone().ok_or_else(|| {
+            anyhow::anyhow!("FERRUM_CP_DP_GRPC_JWT_SECRET is required in mesh mode")
+        })?,
+        env_config.cp_dp_grpc_jwt_issuer.clone(),
+    );
+    let grpc_tls = build_dp_grpc_tls_config(&env_config, &runtime.cp_urls, "Mesh")?;
+    let mut background_handles = Vec::new();
 
     match runtime.config_protocol {
         MeshConfigProtocol::Native => {
             let client_config = runtime.native_client_config();
             let request = client_config.subscribe_request(crate::FERRUM_VERSION);
-            let consumer =
-                config_consumer::native_client::NativeMeshConfigConsumer::new(mesh_state.clone());
+            let cp_urls = runtime.cp_urls.clone();
+            let state = mesh_state.clone();
+            let shutdown_rx = shutdown_tx.subscribe();
+            let handle = tokio::spawn(
+                config_consumer::native_client::start_native_mesh_client_with_shutdown(
+                    cp_urls,
+                    jwt_secret.clone(),
+                    client_config,
+                    state,
+                    shutdown_rx,
+                    grpc_tls.clone(),
+                ),
+            );
+            background_handles.push(handle);
             info!(
                 node_id = %request.node_id,
                 namespace = %request.namespace,
-                cp_url = %client_config.cp_url,
-                has_first_slice = consumer.state().has_first_slice(),
+                cp_urls = runtime.cp_urls.len(),
+                has_first_slice = mesh_state.has_first_slice(),
                 "Mesh mode initialized native MeshSubscribe consumer"
             );
         }
@@ -214,6 +234,11 @@ pub async fn run(
         return Ok(());
     }
     let _ = shutdown_rx.changed().await;
+    for handle in background_handles {
+        if let Err(e) = handle.await {
+            warn!("Mesh background task exited with join error: {}", e);
+        }
+    }
     Ok(())
 }
 
