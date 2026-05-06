@@ -804,6 +804,7 @@ fn parse_root_document(
             Ok(v) => (v, false, SpecFormat::Json),
             Err(e) if declared_format.is_none() => {
                 // Autodetected as JSON but failed — try YAML (covers flow-style).
+                reject_yaml_alias_or_anchor_syntax(body)?;
                 let yv: serde_yaml::Value = serde_yaml::from_slice(body)
                     .map_err(|_| ExtractError::InvalidJson(e.to_string()))?;
                 let val = serde_json::to_value(yv)
@@ -813,6 +814,7 @@ fn parse_root_document(
             Err(e) => return Err(ExtractError::InvalidJson(e.to_string())),
         },
         SpecFormat::Yaml => {
+            reject_yaml_alias_or_anchor_syntax(body)?;
             let yv: serde_yaml::Value = serde_yaml::from_slice(body)
                 .map_err(|e| ExtractError::InvalidYaml(e.to_string()))?;
             let val =
@@ -821,15 +823,14 @@ fn parse_root_document(
         }
     };
 
-    // serde_yaml 0.9 does not cap alias/anchor expansion.  A small YAML doc
-    // using nested aliases can expand to billions of Value nodes despite the
-    // HTTP body-size limit.  Walk the tree with a budget to reject bombs.
-    // Applied to both the explicit YAML path and the JSON→YAML fallback.
+    // Defence-in-depth for very large literal YAML trees.  Anchor/alias syntax
+    // is rejected before serde_yaml materializes the Value, so this post-parse
+    // walk does not serve as the primary alias-bomb memory cap.
     if parsed_via_yaml {
         let mut budget = MAX_YAML_EXPANDED_NODES;
         if !count_value_nodes(&root, &mut budget) {
             return Err(ExtractError::InvalidYaml(
-                "YAML alias expansion exceeds node limit; reduce anchor nesting".to_string(),
+                "YAML document exceeds expanded node limit; reduce nesting".to_string(),
             ));
         }
     }
@@ -841,12 +842,117 @@ fn parse_root_document(
 // YAML alias-bomb defence
 // ---------------------------------------------------------------------------
 
+const YAML_ANCHORS_UNSUPPORTED_MESSAGE: &str =
+    "YAML anchors and aliases are not supported in API specs; inline repeated content instead";
+
 /// Maximum number of `serde_json::Value` nodes allowed after YAML → JSON
 /// conversion.  500k nodes is generous for any real OpenAPI spec (the largest
-/// public specs top out around 50k nodes). serde_yaml expands aliases while
-/// parsing, so this is a post-parse guard rather than a hard pre-parse memory
-/// cap; the HTTP body-size limit remains the outer bound for parser input.
+/// public specs top out around 50k nodes). Anchors and aliases are rejected
+/// before parsing; this guard caps large literal YAML documents.
 pub(crate) const MAX_YAML_EXPANDED_NODES: usize = 500_000;
+
+fn reject_yaml_alias_or_anchor_syntax(body: &[u8]) -> Result<(), ExtractError> {
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_comment = false;
+    let mut escaped = false;
+    let mut previous_plain_byte: Option<u8> = None;
+    let mut i = 0;
+
+    while i < body.len() {
+        let byte = body[i];
+
+        if in_comment {
+            if byte == b'\n' || byte == b'\r' {
+                in_comment = false;
+                previous_plain_byte = Some(byte);
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_single_quote {
+            if byte == b'\'' {
+                if body.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_single_quote = false;
+                previous_plain_byte = Some(byte);
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_double_quote {
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => {
+                    in_double_quote = false;
+                    previous_plain_byte = Some(byte);
+                }
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+
+        match byte {
+            b'#' => {
+                in_comment = true;
+            }
+            b'\'' => {
+                in_single_quote = true;
+                previous_plain_byte = Some(byte);
+            }
+            b'"' => {
+                in_double_quote = true;
+                previous_plain_byte = Some(byte);
+            }
+            b'&' | b'*'
+                if yaml_indicator_can_start_after(previous_plain_byte)
+                    && body
+                        .get(i + 1)
+                        .copied()
+                        .is_some_and(is_yaml_anchor_name_byte) =>
+            {
+                return Err(ExtractError::InvalidYaml(format!(
+                    "{YAML_ANCHORS_UNSUPPORTED_MESSAGE} (found '{}' at byte {i})",
+                    char::from(byte)
+                )));
+            }
+            _ => {
+                previous_plain_byte = Some(byte);
+            }
+        }
+
+        i += 1;
+    }
+
+    Ok(())
+}
+
+fn yaml_indicator_can_start_after(previous: Option<u8>) -> bool {
+    match previous {
+        None => true,
+        Some(byte) if byte.is_ascii_whitespace() => true,
+        Some(b'[' | b'{' | b',' | b':' | b'-' | b'?') => true,
+        _ => false,
+    }
+}
+
+fn is_yaml_anchor_name_byte(byte: u8) -> bool {
+    !byte.is_ascii_whitespace()
+        && !matches!(
+            byte,
+            b',' | b'[' | b']' | b'{' | b'}' | b':' | b'#' | b'\'' | b'"'
+        )
+}
 
 /// Walk a `serde_json::Value` tree, decrementing `budget` for each node
 /// visited.  Returns `false` (reject) when the budget hits zero.
@@ -2217,10 +2323,60 @@ x-ferrum-proxy:
     }
 
     #[test]
+    fn yaml_anchor_syntax_rejected_before_parse() {
+        let yaml = b"openapi: '3.1.0'\n\
+                     info: &info\n\
+                       title: Anchored\n\
+                       version: '1.0'\n\
+                     x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}";
+        let err = extract(yaml, Some(SpecFormat::Yaml), "default").unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("anchors and aliases")),
+            "expected YAML anchor preflight rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn yaml_alias_syntax_rejected_before_parse() {
+        let yaml = b"openapi: '3.1.0'\n\
+                     info: *common_info\n\
+                     x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}";
+        let err = extract(yaml, Some(SpecFormat::Yaml), "default").unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("anchors and aliases")),
+            "expected YAML alias preflight rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn flow_style_yaml_anchor_rejected_on_json_fallback() {
+        let yaml = b"{openapi: '3.1.0', info: &info {title: flow, version: '1.0'}, \
+                     x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}}";
+        let err = extract(yaml, None, "default").unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("anchors and aliases")),
+            "expected YAML fallback preflight rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn yaml_anchor_like_text_in_quotes_and_comments_allowed() {
+        let yaml = b"openapi: '3.1.0'\n\
+                     info:\n\
+                       title: \"R&D *literal*\"\n\
+                       version: '1.0'\n\
+                       description: 'quoted &anchor and *alias text'\n\
+                     # comment mentions &anchor and *alias\n\
+                     x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}";
+        let (bundle, _meta) = extract(yaml, Some(SpecFormat::Yaml), "default").unwrap();
+        assert_eq!(bundle.proxy.id, "test");
+    }
+
+    #[test]
     fn yaml_alias_bomb_rejected() {
         // Build a YAML doc with deeply nested anchors that expands
-        // exponentially.  serde_yaml 0.9 may catch this at its own
-        // repetition limit; our node counter is defence-in-depth.
+        // exponentially.  The preflight rejects anchors and aliases before
+        // serde_yaml can materialize the expanded tree.
         let yaml = b"a: &a [1,2,3,4,5,6,7,8]\n\
                       b: &b [*a,*a,*a,*a,*a,*a,*a,*a]\n\
                       c: &c [*b,*b,*b,*b,*b,*b,*b,*b]\n\
@@ -2231,10 +2387,10 @@ x-ferrum-proxy:
                       openapi: '3.0.0'\n\
                       info: {title: bomb, version: '1.0'}\n\
                       x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}";
-        let result = extract(yaml, Some(SpecFormat::Yaml), "default");
+        let err = extract(yaml, Some(SpecFormat::Yaml), "default").unwrap_err();
         assert!(
-            result.is_err(),
-            "alias bomb must be rejected by serde_yaml repetition limit or node counter"
+            matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("anchors and aliases")),
+            "alias bomb must be rejected before YAML parsing, got {err:?}"
         );
     }
 }
