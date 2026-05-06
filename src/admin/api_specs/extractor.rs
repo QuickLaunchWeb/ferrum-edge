@@ -119,39 +119,9 @@ pub enum ExtractError {
 // OpenAPI 3.x version-string matcher
 // ---------------------------------------------------------------------------
 
-/// Returns `true` iff `s` is `3.MINOR.PATCH` (decimal digits) with an optional
-/// non-empty pre-release suffix like `-rc1`.
-///
-/// Hand-written rather than backed by a `regex::Regex` to avoid `.expect()`
-/// in production code (CLAUDE.md "no expect/unwrap" rule). Equivalent to the
-/// regex `^3\.\d+\.\d+(-.+)?$`.
+/// Returns `true` iff `s` is a valid SemVer string for OpenAPI 3.x.
 fn is_openapi3_version(s: &str) -> bool {
-    // Must start with "3."
-    let Some(rest) = s.strip_prefix("3.") else {
-        return false;
-    };
-    // First component (MINOR): one or more ASCII digits, terminated by '.'
-    let Some(dot_idx) = rest.find('.') else {
-        return false;
-    };
-    let minor = &rest[..dot_idx];
-    if minor.is_empty() || !minor.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    let after_minor = &rest[dot_idx + 1..];
-    // Second component (PATCH): one or more ASCII digits, optionally followed
-    // by '-<suffix>' where <suffix> is non-empty.
-    let patch_end = after_minor.find('-').unwrap_or(after_minor.len());
-    let patch = &after_minor[..patch_end];
-    if patch.is_empty() || !patch.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    if patch_end == after_minor.len() {
-        // No suffix.
-        return true;
-    }
-    // Suffix present (after the '-'): must be non-empty.
-    !after_minor[patch_end + 1..].is_empty()
+    semver::Version::parse(s).is_ok_and(|version| version.major == 3)
 }
 
 /// Plugin config keys that are forbidden inside a plugin's `config` value.
@@ -1161,7 +1131,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // is_openapi3_version — parity with the prior `^3\.\d+\.\d+(-.+)?$` regex
+    // is_openapi3_version — SemVer parser constrained to major version 3
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1192,6 +1162,18 @@ mod tests {
     }
 
     #[test]
+    fn is_openapi3_version_accepts_build_metadata() {
+        for v in [
+            "3.1.0+build.7",
+            "3.1.0-rc.1+build.7",
+            "3.2.0+exp.sha.5114f85",
+            "3.0.0-alpha.1+001",
+        ] {
+            assert!(is_openapi3_version(v), "must accept {v}");
+        }
+    }
+
+    #[test]
     fn is_openapi3_version_rejects_non_threes() {
         for v in ["2.0.0", "4.0.0", "30.0.0", "3", "3.0", "3.", ""] {
             assert!(!is_openapi3_version(v), "must reject {v:?}");
@@ -1207,17 +1189,16 @@ mod tests {
             "3.0.0a",
             "3..0",
             "3.0.",
-            "3.0.0-",      // empty suffix
-            "3.0.0-\u{0}", // suffix with non-empty contents is fine; empty is not
-            "3.-1.0",      // leading dash → minor empty
+            "3.0.0-",
+            "3.0.0+",
+            "3.0.0-rc+",
+            "3.0.0-rc+build+again",
+            "3.0.0-rc..1",
+            "3.0.0+build..1",
+            "3.0.0-\u{0}",
+            "3.-1.0",
         ] {
-            // The "3.0.0-\u{0}" case has a non-empty suffix, so it should be ACCEPTED.
-            // Special-case it.
-            if v == "3.0.0-\u{0}" {
-                assert!(is_openapi3_version(v), "must accept non-empty suffix {v:?}");
-            } else {
-                assert!(!is_openapi3_version(v), "must reject {v:?}");
-            }
+            assert!(!is_openapi3_version(v), "must reject {v:?}");
         }
     }
 
@@ -1278,6 +1259,26 @@ mod tests {
         );
         let (_, meta) = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap();
         assert_eq!(meta.version, "3.2.0-rc1");
+    }
+
+    #[test]
+    fn test_version_openapi_3_1_build_metadata() {
+        let spec = format!(
+            r#"{{"openapi": "3.1.0+build.7", "info": {{"title": "T", "version": "1"}}, "x-ferrum-proxy": {}}}"#,
+            minimal_proxy()
+        );
+        let (_, meta) = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap();
+        assert_eq!(meta.version, "3.1.0+build.7");
+    }
+
+    #[test]
+    fn test_version_openapi_3_1_prerelease_build_metadata() {
+        let spec = format!(
+            r#"{{"openapi": "3.1.0-rc.1+build.7", "info": {{"title": "T", "version": "1"}}, "x-ferrum-proxy": {}}}"#,
+            minimal_proxy()
+        );
+        let (_, meta) = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap();
+        assert_eq!(meta.version, "3.1.0-rc.1+build.7");
     }
 
     #[test]
