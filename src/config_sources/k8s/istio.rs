@@ -369,7 +369,13 @@ fn virtual_service_routes(
 fn first_positive_weighted_route(http: &Value) -> Option<&Value> {
     http.get("route")
         .and_then(Value::as_array)
-        .and_then(|routes| routes.iter().find(|route| route_weight(route) > 0))
+        .and_then(|routes| {
+            if routes.len() == 1 {
+                routes.first()
+            } else {
+                routes.iter().find(|route| route_weight(route) > 0)
+            }
+        })
 }
 
 fn route_weight(route: &Value) -> u64 {
@@ -590,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_service_with_only_zero_weight_destinations_is_not_materialized() {
+    fn virtual_service_keeps_single_zero_weight_destination() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -604,6 +610,45 @@ mod tests {
                             },
                             "weight": 0
                         }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "dark.default.svc.cluster.local"
+        );
+        assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn virtual_service_with_only_zero_weight_split_destinations_is_not_materialized() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "route": [
+                            {
+                                "destination": {
+                                    "host": "dark.default.svc.cluster.local",
+                                    "port": {"number": 8080}
+                                },
+                                "weight": 0
+                            },
+                            {
+                                "destination": {
+                                    "host": "canary.default.svc.cluster.local",
+                                    "port": {"number": 9090}
+                                },
+                                "weight": 0
+                            }
+                        ]
                     }]
                 }),
             )],
