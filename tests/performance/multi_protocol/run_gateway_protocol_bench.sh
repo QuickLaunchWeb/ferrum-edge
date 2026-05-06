@@ -257,6 +257,12 @@ start_ferrum() {
                 -e "FERRUM_ENABLE_HTTP3=true"
             )
             ;;
+        tcp-tls)
+            extra_env+=(
+                -e "FERRUM_TLS_MIN_VERSION=1.3"
+                -e "FERRUM_TLS_CIPHER_SUITES=TLS_AES_128_GCM_SHA256"
+            )
+            ;;
     esac
     # Optional extra env var injection for per-experiment tuning. Set
     # FERRUM_EXTRA_ENV to a space-separated list of KEY=VALUE pairs, e.g.:
