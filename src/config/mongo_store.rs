@@ -87,6 +87,29 @@ mod inner {
         "cleanup_orphaned_proxy_group_plugins",
     ];
 
+    /// Step labels for the standalone-mongod (no-replica-set)
+    /// `replace_api_spec_bundle` delete phase, in execution order. The proxy
+    /// document is removed first so any later partial failure leaves no live
+    /// route with missing plugin/upstream dependencies.
+    pub(super) const REPLACE_API_SPEC_STANDALONE_DELETE_ORDER: &[&str] = &[
+        "delete_proxy_document",
+        "delete_spec_owned_plugin_configs",
+        "delete_spec_owned_upstreams",
+        "delete_api_spec_document",
+    ];
+
+    /// Step labels for the standalone-mongod (no-replica-set)
+    /// `delete_api_spec` path, in execution order. The proxy document is removed
+    /// first for the same runtime-safety reason as `delete_proxy`.
+    pub(super) const DELETE_API_SPEC_STANDALONE_ORDER: &[&str] = &[
+        "delete_proxy_document",
+        "delete_spec_owned_plugin_configs",
+        "delete_proxy_scoped_plugin_configs",
+        "cleanup_orphaned_proxy_group_plugins",
+        "delete_spec_owned_upstreams",
+        "delete_api_spec_document",
+    ];
+
     /// Step labels for the standalone-mongod (no-replica-set) `update_proxy`
     /// path, in execution order. Cleanup runs after the replace because the
     /// new proxy.plugins array determines which proxy_group plugin_configs
@@ -677,29 +700,77 @@ mod inner {
             spec_id: &str,
             spec_proxy_id: &str,
         ) -> Result<(), anyhow::Error> {
-            let mut upstream_cursor = self
-                .upstreams()
-                .find(doc! { "api_spec_id": spec_id, "namespace": namespace })
-                .projection(doc! { "_id": 1 })
-                .await?;
-            let mut upstream_ids = Vec::new();
-            while upstream_cursor.advance().await? {
-                let doc = upstream_cursor.deserialize_current()?;
-                if let Ok(id) = doc.get_str("_id") {
-                    upstream_ids.push(id.to_string());
-                }
-            }
-            if upstream_ids.is_empty() {
-                return Ok(());
-            }
+            self.ensure_no_external_spec_upstream_refs_opt_session(
+                None,
+                namespace,
+                spec_id,
+                spec_proxy_id,
+            )
+            .await
+        }
 
-            let external = self
-                .proxies()
-                .find_one(
-                    doc! { "upstream_id": { "$in": upstream_ids }, "_id": { "$ne": spec_proxy_id } },
-                )
-                .projection(doc! { "_id": 1, "upstream_id": 1 })
-                .await?;
+        async fn ensure_no_external_spec_upstream_refs_opt_session(
+            &self,
+            session: Option<&mut ClientSession>,
+            namespace: &str,
+            spec_id: &str,
+            spec_proxy_id: &str,
+        ) -> Result<(), anyhow::Error> {
+            let mut upstream_ids = Vec::new();
+            let external = if let Some(s) = session {
+                let mut upstream_cursor = self
+                    .upstreams()
+                    .find(doc! { "api_spec_id": spec_id, "namespace": namespace })
+                    .projection(doc! { "_id": 1 })
+                    .session(&mut *s)
+                    .await?;
+                while upstream_cursor.advance(&mut *s).await? {
+                    let doc = upstream_cursor.deserialize_current()?;
+                    if let Ok(id) = doc.get_str("_id") {
+                        upstream_ids.push(id.to_string());
+                    }
+                }
+                drop(upstream_cursor);
+
+                if upstream_ids.is_empty() {
+                    return Ok(());
+                }
+
+                let filter = doc! {
+                    "upstream_id": { "$in": upstream_ids },
+                    "_id": { "$ne": spec_proxy_id },
+                };
+                self.proxies()
+                    .find_one(filter)
+                    .projection(doc! { "_id": 1, "upstream_id": 1 })
+                    .session(&mut *s)
+                    .await?
+            } else {
+                let mut upstream_cursor = self
+                    .upstreams()
+                    .find(doc! { "api_spec_id": spec_id, "namespace": namespace })
+                    .projection(doc! { "_id": 1 })
+                    .await?;
+                while upstream_cursor.advance().await? {
+                    let doc = upstream_cursor.deserialize_current()?;
+                    if let Ok(id) = doc.get_str("_id") {
+                        upstream_ids.push(id.to_string());
+                    }
+                }
+
+                if upstream_ids.is_empty() {
+                    return Ok(());
+                }
+
+                let filter = doc! {
+                    "upstream_id": { "$in": upstream_ids },
+                    "_id": { "$ne": spec_proxy_id },
+                };
+                self.proxies()
+                    .find_one(filter)
+                    .projection(doc! { "_id": 1, "upstream_id": 1 })
+                    .await?
+            };
             if let Some(doc) = external {
                 let proxy_id = doc.get_str("_id").unwrap_or("<unknown>");
                 let upstream_id = doc.get_str("upstream_id").unwrap_or("<unknown>");
@@ -1141,12 +1212,10 @@ mod inner {
             // the stored document may carry an ownership tag from a spec
             // import.  SQL is safe because its UPDATE excludes api_spec_id.
             //
-            // We replace_one first (which clears api_spec_id), then
-            // atomically restore it from the api_specs collection (the
-            // source of truth for ownership).  This avoids a TOCTOU race
-            // where a concurrent replace_api_spec_bundle could change
-            // ownership between a find_one read and the replace_one write.
-            let doc = proxy_to_doc(proxy)?;
+            // The api_specs collection is the source of truth for ownership.
+            // Inject that tag into the replacement document before writing so
+            // the method cannot succeed with an untagged spec-owned proxy.
+            let mut doc = proxy_to_doc(proxy)?;
 
             if self.replica_set_configured.load(Ordering::Acquire) {
                 let mut session = self.client.load().start_session().await?;
@@ -1154,31 +1223,25 @@ mod inner {
                     .start_transaction()
                     .and_run((self, &proxy.id, doc), |s, (this, id, doc)| {
                         Box::pin(async move {
-                            this.proxies()
-                                .replace_one(mongodb::bson::doc! { "_id": *id }, doc.clone())
-                                .session(&mut *s)
-                                .await?;
-                            // Restore api_spec_id from the authoritative api_specs row.
-                            if let Ok(Some(spec_doc)) = this
+                            let mut doc = doc.clone();
+                            if let Some(spec_doc) = this
                                 .api_specs()
                                 .find_one(mongodb::bson::doc! { "proxy_id": *id })
                                 .session(&mut *s)
-                                .await
-                                && let Ok(sid) = spec_doc.get_str("_id")
-                                && let Err(e) = this
-                                    .proxies()
-                                    .update_one(
-                                        mongodb::bson::doc! { "_id": *id },
-                                        mongodb::bson::doc! { "$set": { "api_spec_id": sid } },
-                                    )
-                                    .session(&mut *s)
-                                    .await
+                                .await?
                             {
-                                warn!(
-                                    "update_proxy: failed to restore api_spec_id for proxy {}: {}",
-                                    *id, e
-                                );
+                                let sid = spec_doc.get_str("_id").map_err(|e| {
+                                    mongodb::error::Error::custom(format!(
+                                        "api_spec for proxy {} is missing _id: {}",
+                                        *id, e
+                                    ))
+                                })?;
+                                doc.insert("api_spec_id", sid);
                             }
+                            this.proxies()
+                                .replace_one(mongodb::bson::doc! { "_id": *id }, doc)
+                                .session(&mut *s)
+                                .await?;
                             this.cleanup_orphaned_proxy_group_plugins_opt_session(Some(s))
                                 .await
                                 .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
@@ -1188,28 +1251,19 @@ mod inner {
                     .await
                     .map_err(|e| anyhow::anyhow!("update_proxy transaction failed: {}", e))?;
             } else {
+                if let Some(spec_doc) = self
+                    .api_specs()
+                    .find_one(doc! { "proxy_id": &proxy.id })
+                    .await?
+                {
+                    let sid = spec_doc.get_str("_id").map_err(|e| {
+                        anyhow::anyhow!("api_spec for proxy {} is missing _id: {}", proxy.id, e)
+                    })?;
+                    doc.insert("api_spec_id", sid);
+                }
                 self.proxies()
                     .replace_one(doc! { "_id": &proxy.id }, doc)
                     .await?;
-                // Restore api_spec_id from the authoritative api_specs row.
-                if let Ok(Some(spec_doc)) = self
-                    .api_specs()
-                    .find_one(doc! { "proxy_id": &proxy.id })
-                    .await
-                    && let Ok(sid) = spec_doc.get_str("_id")
-                    && let Err(e) = self
-                        .proxies()
-                        .update_one(
-                            doc! { "_id": &proxy.id },
-                            doc! { "$set": { "api_spec_id": sid } },
-                        )
-                        .await
-                {
-                    warn!(
-                        "update_proxy: failed to restore api_spec_id for proxy {}: {}",
-                        proxy.id, e
-                    );
-                }
                 self.cleanup_orphaned_proxy_group_plugins().await?;
             }
 
@@ -1227,14 +1281,51 @@ mod inner {
                     .and_run((self, id.to_string()), |s, (this, id)| {
                         Box::pin(async move {
                             // Capture upstream_id before deleting the proxy.
-                            let upstream_id_to_check: Option<String> = this
+                            let proxy_doc = this
                                 .proxies()
                                 .find_one(mongodb::bson::doc! { "_id": id.as_str() })
                                 .session(&mut *s)
-                                .await?
-                                .and_then(|doc| {
+                                .await?;
+                            let upstream_id_to_check: Option<String> =
+                                proxy_doc.as_ref().and_then(|doc| {
                                     doc.get_str("upstream_id").ok().map(str::to_string)
                                 });
+                            if proxy_doc.is_none() {
+                                return Ok(false);
+                            }
+
+                            let spec_owner: Option<(String, String)> = this
+                                .api_specs()
+                                .find_one(mongodb::bson::doc! { "proxy_id": id.as_str() })
+                                .session(&mut *s)
+                                .await?
+                                .map(|doc| {
+                                    let sid =
+                                        doc.get_str("_id").map(str::to_string).map_err(|e| {
+                                            mongodb::error::Error::custom(format!(
+                                                "api_spec for proxy {} is missing _id: {}",
+                                                id, e
+                                            ))
+                                        })?;
+                                    let namespace = doc
+                                        .get_str("namespace")
+                                        .map(str::to_string)
+                                        .unwrap_or_else(|_| {
+                                            crate::config::types::default_namespace()
+                                        });
+                                    Ok::<_, mongodb::error::Error>((sid, namespace))
+                                })
+                                .transpose()?;
+                            if let Some((ref sid, ref namespace)) = spec_owner {
+                                this.ensure_no_external_spec_upstream_refs_opt_session(
+                                    Some(&mut *s),
+                                    namespace,
+                                    sid,
+                                    id,
+                                )
+                                .await
+                                .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
+                            }
 
                             this.plugin_configs()
                                 .delete_many(mongodb::bson::doc! { "proxy_id": id.as_str() })
@@ -1248,25 +1339,21 @@ mod inner {
 
                             if result.deleted_count > 0 {
                                 // Cascade api_specs + spec-owned upstreams.
-                                let spec_id: Option<String> = this
-                                    .api_specs()
-                                    .find_one(mongodb::bson::doc! { "proxy_id": id.as_str() })
-                                    .session(&mut *s)
-                                    .await?
-                                    .and_then(|doc| doc.get_str("_id").ok().map(str::to_string));
-                                let _ = this
-                                    .api_specs()
-                                    .delete_one(mongodb::bson::doc! { "proxy_id": id.as_str() })
-                                    .session(&mut *s)
-                                    .await;
-                                if let Some(ref sid) = spec_id {
-                                    let _ = this
-                                        .upstreams()
-                                        .delete_many(
-                                            mongodb::bson::doc! { "api_spec_id": sid.as_str() },
-                                        )
+                                if let Some((ref sid, ref namespace)) = spec_owner {
+                                    this.api_specs()
+                                        .delete_one(mongodb::bson::doc! {
+                                            "_id": sid.as_str(),
+                                            "namespace": namespace.as_str(),
+                                        })
                                         .session(&mut *s)
-                                        .await;
+                                        .await?;
+                                    this.upstreams()
+                                        .delete_many(mongodb::bson::doc! {
+                                            "api_spec_id": sid.as_str(),
+                                            "namespace": namespace.as_str(),
+                                        })
+                                        .session(&mut *s)
+                                        .await?;
                                 }
                                 // Cascade-delete orphaned upstream.
                                 if let Some(ref uid) = upstream_id_to_check {
@@ -1305,11 +1392,28 @@ mod inner {
             let upstream_id_to_check: Option<String> = proxy_doc
                 .as_ref()
                 .and_then(|doc| doc.get_str("upstream_id").ok().map(str::to_string));
-            let spec_id: Option<String> =
-                match self.api_specs().find_one(doc! { "proxy_id": id }).await {
-                    Ok(Some(doc)) => doc.get_str("_id").ok().map(str::to_string),
-                    _ => None,
+            if proxy_doc.is_none() {
+                self.check_slow_query("delete_proxy", start);
+                return Ok(false);
+            }
+            let spec_owner: Option<(String, String)> =
+                match self.api_specs().find_one(doc! { "proxy_id": id }).await? {
+                    Some(doc) => {
+                        let sid = doc.get_str("_id").map(str::to_string).map_err(|e| {
+                            anyhow::anyhow!("api_spec for proxy {} is missing _id: {}", id, e)
+                        })?;
+                        let namespace = doc
+                            .get_str("namespace")
+                            .map(str::to_string)
+                            .unwrap_or_else(|_| crate::config::types::default_namespace());
+                        Some((sid, namespace))
+                    }
+                    None => None,
                 };
+            if let Some((ref sid, ref namespace)) = spec_owner {
+                self.ensure_no_external_spec_upstream_refs(namespace, sid, id)
+                    .await?;
+            }
 
             let result = self.proxies().delete_one(doc! { "_id": id }).await?;
             if result.deleted_count > 0 {
@@ -1317,10 +1421,10 @@ mod inner {
                     .delete_many(doc! { "proxy_id": id })
                     .await?;
                 let _ = self.api_specs().delete_one(doc! { "proxy_id": id }).await;
-                if let Some(ref sid) = spec_id {
+                if let Some((ref sid, ref namespace)) = spec_owner {
                     let _ = self
                         .upstreams()
-                        .delete_many(doc! { "api_spec_id": sid })
+                        .delete_many(doc! { "api_spec_id": sid, "namespace": namespace })
                         .await;
                 }
                 if let Some(ref uid) = upstream_id_to_check {
@@ -1470,31 +1574,30 @@ mod inner {
 
         async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
-            // Preserve api_spec_id (same rationale as update_proxy).
-            // Replace first, then restore from the authoritative source.
-            let doc = plugin_config_to_doc(pc)?;
-            let existing_spec_id: Option<String> = self
+            // Preserve api_spec_id by carrying it into the replacement document.
+            // Returning an error is safer than silently detaching spec ownership.
+            let mut doc = plugin_config_to_doc(pc)?;
+            let existing_doc = self
                 .plugin_configs()
                 .find_one(doc! { "_id": &pc.id })
-                .await?
-                .and_then(|d| d.get_str("api_spec_id").ok().map(str::to_string));
+                .await?;
+            let existing_spec_id = match existing_doc.as_ref().and_then(|d| d.get("api_spec_id")) {
+                Some(Bson::String(s)) if !s.is_empty() => Some(s.clone()),
+                Some(Bson::Null) | None => None,
+                Some(other) => {
+                    anyhow::bail!(
+                        "plugin_config {} has non-string api_spec_id ownership tag: {:?}",
+                        pc.id,
+                        other
+                    );
+                }
+            };
+            if let Some(sid) = existing_spec_id {
+                doc.insert("api_spec_id", sid);
+            }
             self.plugin_configs()
                 .replace_one(doc! { "_id": &pc.id }, doc)
                 .await?;
-            if let Some(sid) = existing_spec_id
-                && let Err(e) = self
-                    .plugin_configs()
-                    .update_one(
-                        doc! { "_id": &pc.id },
-                        doc! { "$set": { "api_spec_id": &sid } },
-                    )
-                    .await
-            {
-                warn!(
-                    "update_plugin_config: failed to restore api_spec_id for plugin_config {}: {}",
-                    pc.id, e
-                );
-            }
             self.check_slow_query("update_plugin_config", start);
             Ok(())
         }
@@ -1561,30 +1664,30 @@ mod inner {
 
         async fn update_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
-            // Preserve api_spec_id (same rationale as update_proxy).
-            let doc = upstream_to_doc(upstream)?;
-            let existing_spec_id: Option<String> = self
+            // Preserve api_spec_id by carrying it into the replacement document.
+            // Returning an error is safer than silently detaching spec ownership.
+            let mut doc = upstream_to_doc(upstream)?;
+            let existing_doc = self
                 .upstreams()
                 .find_one(doc! { "_id": &upstream.id })
-                .await?
-                .and_then(|d| d.get_str("api_spec_id").ok().map(str::to_string));
+                .await?;
+            let existing_spec_id = match existing_doc.as_ref().and_then(|d| d.get("api_spec_id")) {
+                Some(Bson::String(s)) if !s.is_empty() => Some(s.clone()),
+                Some(Bson::Null) | None => None,
+                Some(other) => {
+                    anyhow::bail!(
+                        "upstream {} has non-string api_spec_id ownership tag: {:?}",
+                        upstream.id,
+                        other
+                    );
+                }
+            };
+            if let Some(sid) = existing_spec_id {
+                doc.insert("api_spec_id", sid);
+            }
             self.upstreams()
                 .replace_one(doc! { "_id": &upstream.id }, doc)
                 .await?;
-            if let Some(sid) = existing_spec_id
-                && let Err(e) = self
-                    .upstreams()
-                    .update_one(
-                        doc! { "_id": &upstream.id },
-                        doc! { "$set": { "api_spec_id": &sid } },
-                    )
-                    .await
-            {
-                warn!(
-                    "update_upstream: failed to restore api_spec_id for upstream {}: {}",
-                    upstream.id, e
-                );
-            }
             self.check_slow_query("update_upstream", start);
             Ok(())
         }
@@ -2611,7 +2714,7 @@ mod inner {
                     .session(&mut session)
                     .await?;
                 self.proxies()
-                    .delete_many(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
+                    .delete_one(doc! { "_id": &spec.proxy_id, "namespace": &spec.namespace })
                     .session(&mut session)
                     .await?;
                 self.upstreams()
@@ -2674,7 +2777,23 @@ mod inner {
                 // least leave the spec empty rather than half-populated.
                 // Operators should re-submit the spec to recover.
 
-                // Delete leaf-first, log any failure but proceed.
+                // Delete the live proxy first and fail closed if that cannot
+                // happen. Later cleanup failures may leave orphans, but no live
+                // route will point at missing dependencies.
+                if let Err(e) = self
+                    .proxies()
+                    .delete_one(doc! { "_id": &spec.proxy_id, "namespace": &spec.namespace })
+                    .await
+                {
+                    return Err(anyhow::anyhow!(
+                        "replace_api_spec_bundle: failed to delete proxy {} for spec {} before \
+                         dependency cleanup: {}",
+                        spec.proxy_id,
+                        spec.id,
+                        e
+                    ));
+                }
+
                 if let Err(e) = self
                     .plugin_configs()
                     .delete_many(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
@@ -2682,17 +2801,6 @@ mod inner {
                 {
                     warn!(
                         "replace_api_spec_bundle: failed to delete spec-owned plugin_configs for \
-                         spec {}: {}",
-                        spec.id, e
-                    );
-                }
-                if let Err(e) = self
-                    .proxies()
-                    .delete_many(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
-                    .await
-                {
-                    warn!(
-                        "replace_api_spec_bundle: failed to delete spec-owned proxies for \
                          spec {}: {}",
                         spec.id, e
                     );
@@ -3022,6 +3130,20 @@ mod inner {
                 // returns Ok(true) so the caller knows the spec was found and the
                 // attempt was made.  Production MongoDB deployments should use a
                 // replica set (see FERRUM_MONGO_REPLICA_SET).
+                if let Some(ref pid) = proxy_id {
+                    self.proxies()
+                        .delete_one(doc! { "_id": pid, "namespace": namespace })
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "delete_api_spec: failed to delete proxy {} for spec {} before \
+                                 dependency cleanup: {}",
+                                pid,
+                                id,
+                                e
+                            )
+                        })?;
+                }
                 if let Err(e) = self
                     .plugin_configs()
                     .delete_many(doc! { "api_spec_id": id, "namespace": namespace })
@@ -3034,25 +3156,15 @@ mod inner {
                     );
                 }
                 if let Some(ref pid) = proxy_id {
-                    if let Err(e) = self
+                    let cleanup_result = self
                         .plugin_configs()
                         .delete_many(doc! { "proxy_id": pid, "namespace": namespace })
-                        .await
-                    {
+                        .await;
+                    if let Err(e) = cleanup_result {
                         warn!(
                             "delete_api_spec: failed to delete proxy-scoped plugin_configs for \
                              proxy {}: {}",
                             pid, e
-                        );
-                    }
-                    if let Err(e) = self
-                        .proxies()
-                        .delete_one(doc! { "_id": pid, "namespace": namespace })
-                        .await
-                    {
-                        warn!(
-                            "delete_api_spec: failed to delete proxy {} for spec {}: {}",
-                            pid, id, e
                         );
                     }
                 }
@@ -3975,7 +4087,7 @@ mod inner {
         }
 
         // -------------------------------------------------------------------
-        // delete_proxy / update_proxy step-order regression guards
+        // delete_proxy / update_proxy / api-spec step-order regression guards
         // -------------------------------------------------------------------
 
         #[test]
@@ -4033,6 +4145,148 @@ mod inner {
                 "update_proxy must replace the proxy document BEFORE cleaning up \
                  orphan proxy_group plugin_configs so the cleanup observes the new \
                  plugins.plugin_config_id references"
+            );
+        }
+
+        #[test]
+        fn replace_api_spec_standalone_delete_order_proxy_first() {
+            assert_eq!(
+                REPLACE_API_SPEC_STANDALONE_DELETE_ORDER,
+                &[
+                    "delete_proxy_document",
+                    "delete_spec_owned_plugin_configs",
+                    "delete_spec_owned_upstreams",
+                    "delete_api_spec_document",
+                ],
+                "standalone replace_api_spec_bundle must delete the proxy before \
+                 dependencies so partial failures leave no live dangling route"
+            );
+        }
+
+        #[test]
+        fn replace_api_spec_standalone_implementation_deletes_proxy_before_plugins() {
+            let source = include_str!("mongo_store.rs");
+            let standalone_start = source
+                .find("// Delete the live proxy first and fail closed if that cannot")
+                .expect("standalone replace_api_spec delete marker");
+            let standalone_path = &source[standalone_start..];
+            let proxy_delete = standalone_path
+                .find("self\n                    .proxies()\n                    .delete_one")
+                .expect("standalone replace proxy delete call");
+            let plugin_cleanup = standalone_path
+                .find(
+                    "self\n                    .plugin_configs()\n                    .delete_many",
+                )
+                .expect("standalone replace plugin cleanup call");
+            assert!(
+                proxy_delete < plugin_cleanup,
+                "standalone replace_api_spec_bundle must remove the proxy before \
+                 deleting plugin_configs"
+            );
+        }
+
+        #[test]
+        fn delete_api_spec_standalone_order_proxy_first() {
+            assert_eq!(
+                DELETE_API_SPEC_STANDALONE_ORDER,
+                &[
+                    "delete_proxy_document",
+                    "delete_spec_owned_plugin_configs",
+                    "delete_proxy_scoped_plugin_configs",
+                    "cleanup_orphaned_proxy_group_plugins",
+                    "delete_spec_owned_upstreams",
+                    "delete_api_spec_document",
+                ],
+                "standalone delete_api_spec must delete the proxy before \
+                 plugin cleanup so partial failures stay runtime-safe"
+            );
+        }
+
+        #[test]
+        fn delete_api_spec_standalone_implementation_deletes_proxy_before_plugins() {
+            let source = include_str!("mongo_store.rs");
+            let delete_api_spec_start = source
+                .find("async fn delete_api_spec(&self, namespace: &str, id: &str)")
+                .expect("delete_api_spec function");
+            let standalone_start = source[delete_api_spec_start..]
+                .find("// No replica set: best-effort deletes.")
+                .map(|idx| delete_api_spec_start + idx)
+                .expect("standalone delete_api_spec marker");
+            let standalone_path = &source[standalone_start..];
+            let proxy_delete = standalone_path
+                .find("self.proxies()\n                        .delete_one")
+                .expect("standalone delete_api_spec proxy delete call");
+            let plugin_cleanup = standalone_path
+                .find(
+                    "self\n                    .plugin_configs()\n                    .delete_many",
+                )
+                .expect("standalone delete_api_spec plugin cleanup call");
+            assert!(
+                proxy_delete < plugin_cleanup,
+                "standalone delete_api_spec must remove the proxy before \
+                 deleting plugin_configs"
+            );
+        }
+
+        #[test]
+        fn delete_proxy_guards_external_spec_upstream_refs_before_spec_upstream_delete() {
+            let source = include_str!("mongo_store.rs");
+            let delete_proxy_start = source
+                .find("async fn delete_proxy(&self, id: &str)")
+                .expect("delete_proxy function");
+            let delete_proxy_body = &source[delete_proxy_start..];
+            let guard = delete_proxy_body
+                .find("ensure_no_external_spec_upstream_refs")
+                .expect("delete_proxy guard call");
+            let upstream_delete = delete_proxy_body
+                .find("\"api_spec_id\": sid")
+                .expect("delete_proxy spec-owned upstream delete");
+            assert!(
+                guard < upstream_delete,
+                "delete_proxy must guard external references before deleting \
+                 upstreams tagged with the spec id"
+            );
+        }
+
+        #[test]
+        fn update_paths_preserve_api_spec_id_in_replacement_doc() {
+            let source = include_str!("mongo_store.rs");
+            let update_proxy_start = source
+                .find("async fn update_proxy(&self, proxy: &Proxy)")
+                .expect("update_proxy function");
+            let update_proxy_body = &source[update_proxy_start..];
+            let insert_tag = update_proxy_body
+                .find("doc.insert(\"api_spec_id\", sid);")
+                .expect("update_proxy must insert api_spec_id into replacement doc");
+            let replace = update_proxy_body
+                .find(".replace_one")
+                .expect("update_proxy replace_one call");
+            assert!(
+                insert_tag < replace,
+                "update_proxy must carry api_spec_id into the replacement document \
+                 before replace_one, not restore it afterward"
+            );
+
+            let update_plugin_start = source
+                .find("async fn update_plugin_config(&self, pc: &PluginConfig)")
+                .expect("update_plugin_config function");
+            let update_plugin_body = &source[update_plugin_start..];
+            assert!(
+                update_plugin_body
+                    .find("doc.insert(\"api_spec_id\", sid);")
+                    .is_some(),
+                "update_plugin_config must preserve api_spec_id in the replacement doc"
+            );
+
+            let update_upstream_start = source
+                .find("async fn update_upstream(&self, upstream: &Upstream)")
+                .expect("update_upstream function");
+            let update_upstream_body = &source[update_upstream_start..];
+            assert!(
+                update_upstream_body
+                    .find("doc.insert(\"api_spec_id\", sid);")
+                    .is_some(),
+                "update_upstream must preserve api_spec_id in the replacement doc"
             );
         }
     }
