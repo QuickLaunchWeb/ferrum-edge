@@ -279,10 +279,10 @@ pub struct RequestContext {
     /// Contains all certificates after the peer cert (index 1+) sent during the handshake.
     /// Used by the mtls_auth plugin for per-proxy CA fingerprint verification.
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
-    /// Peer SPIFFE identity, populated by the `mtls_auth` plugin when the
+    /// Peer SPIFFE identity, populated by the `spiffe_identity` plugin when the
     /// client certificate carries a `spiffe://` URI SAN. `None` for non-mesh
     /// deployments and for clients that present a non-SPIFFE certificate.
-    /// Plugins downstream of `mtls_auth` may read this for identity-aware
+    /// Plugins downstream of `spiffe_identity` may read this for identity-aware
     /// authorization (e.g. mesh policy evaluation in Phase C).
     pub peer_spiffe_id: Option<crate::identity::SpiffeId>,
     /// Cumulative nanoseconds spent by plugins making external HTTP calls
@@ -964,7 +964,7 @@ pub struct StreamTransactionSummary {
 ///
 /// | Band      | Range       | Purpose                                   | Plugins |
 /// |-----------|-------------|-------------------------------------------|---------|
-/// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275) |
+/// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975), ai_federation (2985) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
