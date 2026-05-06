@@ -6,6 +6,9 @@
 //! chain unchanged so existing plugins work in mesh context.
 
 pub mod config_consumer;
+pub mod hbone;
+pub mod policy;
+pub mod runtime;
 
 use std::net::SocketAddr;
 
@@ -16,6 +19,7 @@ use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::{XdsClientConfig, XdsConfigConsumer};
+use crate::modes::mesh::runtime::MeshRuntimeState;
 
 const DEFAULT_INBOUND_LISTEN_ADDR: &str = "0.0.0.0:15006";
 const DEFAULT_OUTBOUND_LISTEN_ADDR: &str = "127.0.0.1:15001";
@@ -173,23 +177,29 @@ pub async fn run(
         "Mesh mode starting"
     );
 
+    let mesh_state = MeshRuntimeState::new();
+
     match runtime.config_protocol {
         MeshConfigProtocol::Native => {
             let client_config = runtime.native_client_config();
             let request = client_config.subscribe_request(crate::FERRUM_VERSION);
+            let consumer =
+                config_consumer::native_client::NativeMeshConfigConsumer::new(mesh_state.clone());
             info!(
                 node_id = %request.node_id,
                 namespace = %request.namespace,
                 cp_url = %client_config.cp_url,
+                has_first_slice = consumer.state().has_first_slice(),
                 "Mesh mode initialized native MeshSubscribe consumer"
             );
         }
         MeshConfigProtocol::Xds => {
-            let consumer = XdsConfigConsumer::new(runtime.xds_client_config());
+            let consumer = XdsConfigConsumer::new(runtime.xds_client_config(), mesh_state.clone());
             info!(
                 node_id = %consumer.config().node_id,
                 namespace = %consumer.config().namespace,
                 cp_url = %consumer.config().cp_url,
+                has_first_slice = consumer.state().has_first_slice(),
                 "Mesh mode initialized xDS config consumer"
             );
         }
