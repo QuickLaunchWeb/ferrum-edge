@@ -194,6 +194,8 @@ Backend TLS settings are controlled by the proxy's `backend_tls_*` fields:
 
 Set `frontend_tls: true` on a UDP proxy to accept DTLS-encrypted connections from clients. The gateway uses ECDSA P-256 or P-384 certificates (configured via env vars) to terminate DTLS, then forwards decrypted datagrams to the backend.
 
+Like TCP+TLS, frontend DTLS handshakes complete before backend session creation. `on_stream_connect` plugins run after DTLS accept with client certificate context available when DTLS mTLS is enabled; handshake failures and plugin rejections do not create backend UDP or DTLS sessions.
+
 ```yaml
 proxies:
   - id: "secure-iot-frontend"

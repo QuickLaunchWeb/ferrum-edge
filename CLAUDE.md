@@ -150,11 +150,13 @@ CONNECT: H2 Extended CONNECT (RFC 8441) with `:protocol=websocket` is the only a
 
 Frontend TLS/DTLS handshakes are bounded by `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` (default 10s, 0 disables) before HTTP header timers can start. Backend TLS/H2/gRPC/H3 handshakes are bounded by the per-proxy `backend_connect_timeout_ms` budget; this is an end-to-end connect budget, not only the TCP SYN phase. Frontend DTLS demux state is capped before allocating per-peer channels/tasks and released on handshake timeout; `/overload.stream_listeners.dtls_demux_sessions` exposes an eventually consistent pre-handshake diagnostic count for triage.
 
+**Frontend TLS-before-backend invariant**: Every TLS/DTLS-terminating client-facing protocol completes frontend crypto/admission before backend dispatch: HTTPS/H2/gRPC/WSS complete TLS before request routing; normal H3 completes QUIC/TLS before request routing; TCP+TLS completes TLS and `on_stream_connect` before backend connect; UDP+DTLS completes DTLS and `on_stream_connect` before backend session creation. Frontend handshake failures and plugin rejects are frontend setup failures: do not dial backend and do not trip backend circuit breakers. The only deliberate exception is operator-enabled HTTP/3 0-RTT early data (`FERRUM_TLS_EARLY_DATA_METHODS`), which is disabled by default, method-gated, and forwarded with `Early-Data: 1` for backend replay policy.
+
 ### TLS/DTLS Passthrough
 
 `passthrough: true` on stream proxies forwards encrypted bytes to backend without TLS/DTLS termination. Peeks at ClientHello for SNI (`src/proxy/sni.rs`). TCP: `TcpStream::peek()` then `bidirectional_copy`. UDP: parse first DTLS ClientHello for SNI; backend is plain UDP. Validation: stream proxies only, mutually exclusive with `frontend_tls`, backend TLS fields rejected. `StreamConnectionContext.sni_hostname` + `consumer_username` (from `effective_identity()`) flow to stream lifecycle plugins.
 
-**TCP+TLS connection ordering**: For TLS-terminating TCP (`frontend_tls: true`, not passthrough), complete the downstream TLS handshake before opening the backend TCP/TLS connection. Then run `on_stream_connect` with client certificate context before any backend socket is consumed. Frontend TLS failures and plugin rejects are frontend setup failures: do not dial backend and do not trip backend circuit breakers. Plain TCP server-first protocols and passthrough may require different upstream timing; do not move backend connect ahead of frontend TLS without preserving these invariants and tests.
+Plain TCP server-first protocols and passthrough may require different upstream timing; do not move terminating TLS/DTLS frontend paths to backend-first ordering without preserving the frontend-before-backend invariant and tests.
 
 ### TCP Bidirectional-Relay Modes (`src/proxy/tcp_proxy.rs`)
 
