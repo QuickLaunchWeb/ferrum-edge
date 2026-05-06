@@ -59,6 +59,7 @@ fn mode_matches_any(mode: &OperatingMode, candidates: &[&str]) -> bool {
         OperatingMode::File => "file",
         OperatingMode::ControlPlane => "cp",
         OperatingMode::DataPlane => "dp",
+        OperatingMode::Mesh => "mesh",
         OperatingMode::Migrate => "migrate",
     };
 

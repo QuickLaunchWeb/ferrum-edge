@@ -68,6 +68,14 @@ fn test_operating_mode_dp() {
 }
 
 #[test]
+fn test_operating_mode_mesh() {
+    with_env_vars(&[("FERRUM_MODE", "mesh")], || {
+        let mode = OperatingMode::from_env().unwrap();
+        assert_eq!(mode, OperatingMode::Mesh);
+    });
+}
+
+#[test]
 fn test_operating_mode_invalid() {
     with_env_vars(&[("FERRUM_MODE", "invalid")], || {
         let result = OperatingMode::from_env();
@@ -223,6 +231,68 @@ fn test_env_config_dp_mode_missing_jwt_secret() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+        ],
+        || {
+            remove_var("FERRUM_CP_DP_GRPC_JWT_SECRET");
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("FERRUM_CP_DP_GRPC_JWT_SECRET"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_valid() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.mode, OperatingMode::Mesh);
+            assert_eq!(
+                config.resolved_dp_cp_grpc_urls(),
+                vec!["http://cp:50051".to_string()]
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_missing_grpc_url() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+        ],
+        || {
+            remove_var("FERRUM_DP_CP_GRPC_URL");
+            remove_var("FERRUM_DP_CP_GRPC_URLS");
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS")
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_missing_jwt_secret() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
             ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
         ],
         || {

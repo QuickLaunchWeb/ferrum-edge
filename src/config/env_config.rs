@@ -25,6 +25,7 @@ pub enum OperatingMode {
     File,
     ControlPlane,
     DataPlane,
+    Mesh,
     Migrate,
 }
 
@@ -41,9 +42,10 @@ impl OperatingMode {
             "file" => Ok(Self::File),
             "cp" => Ok(Self::ControlPlane),
             "dp" => Ok(Self::DataPlane),
+            "mesh" => Ok(Self::Mesh),
             "migrate" => Ok(Self::Migrate),
             other => Err(format!(
-                "Invalid FERRUM_MODE '{}'. Expected: database, file, cp, dp, migrate",
+                "Invalid FERRUM_MODE '{}'. Expected: database, file, cp, dp, mesh, migrate",
                 other
             )),
         }
@@ -1425,7 +1427,7 @@ impl EnvConfig {
             conf = conf, mode = &mode;
             [cp_dp]
             cp_dp_grpc_jwt_secret: Option<String> = "FERRUM_CP_DP_GRPC_JWT_SECRET"
-                => required_for(["cp", "dp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
+                => required_for(["cp", "dp", "mesh"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
             cp_dp_grpc_jwt_issuer: String = "FERRUM_CP_DP_GRPC_JWT_ISSUER" => "ferrum-edge-cp-dp".to_string();
             dp_cp_grpc_url: Option<String> = "FERRUM_DP_CP_GRPC_URL";
             dp_cp_grpc_urls: Vec<String> = "FERRUM_DP_CP_GRPC_URLS" => Vec::new();
@@ -2282,6 +2284,14 @@ impl EnvConfig {
                 if self.dp_cp_grpc_url.is_none() && self.dp_cp_grpc_urls.is_empty() {
                     return Err(
                         "FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS is required in dp mode"
+                            .into(),
+                    );
+                }
+            }
+            OperatingMode::Mesh => {
+                if self.dp_cp_grpc_url.is_none() && self.dp_cp_grpc_urls.is_empty() {
+                    return Err(
+                        "FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS is required in mesh mode"
                             .into(),
                     );
                 }

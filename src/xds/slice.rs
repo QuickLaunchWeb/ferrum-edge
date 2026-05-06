@@ -72,6 +72,23 @@ pub struct MeshSlice {
 }
 
 impl MeshSlice {
+    /// Compare mesh-slice content while ignoring the transport version stamp.
+    ///
+    /// MeshSubscribe uses this to suppress no-op updates. Keep the comparison
+    /// beside the struct so future fields are considered when the model grows.
+    pub fn content_eq(&self, other: &Self) -> bool {
+        self.node_id == other.node_id
+            && self.namespace == other.namespace
+            && self.workload_spiffe_id == other.workload_spiffe_id
+            && self.labels == other.labels
+            && self.workloads == other.workloads
+            && self.services == other.services
+            && self.mesh_policies == other.mesh_policies
+            && self.peer_authentications == other.peer_authentications
+            && self.service_entries == other.service_entries
+            && self.trust_bundles == other.trust_bundles
+    }
+
     pub fn from_gateway_config(config: &GatewayConfig, request: MeshSliceRequest) -> Self {
         let version = config.loaded_at.to_rfc3339();
         let Some(mesh) = config.mesh.as_ref() else {
