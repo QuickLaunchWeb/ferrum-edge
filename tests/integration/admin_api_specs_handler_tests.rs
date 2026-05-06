@@ -4248,3 +4248,215 @@ async fn loaded_gateway_config_excludes_api_specs_after_submission() {
         "GatewayConfig JSON must not contain an api_specs key — this would leak to DPs via gRPC"
     );
 }
+
+// ============================================================================
+// Follow-up coverage from PR #526 review
+// ============================================================================
+
+/// Empty body (0 bytes) must return a parse error, not panic.
+#[tokio::test]
+async fn post_empty_body_returns_400() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let (status, body) = client
+        .post_raw("/api-specs", vec![], "application/json")
+        .await;
+    assert!(
+        status == reqwest::StatusCode::BAD_REQUEST
+            || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "empty body must be rejected (400 or 422); got: {status}, body: {body}"
+    );
+}
+
+/// Unsupported Accept header (text/html) must still return a response
+/// (RFC 7231 permits serving any representation when no Accept rules match
+/// our supported formats).
+#[tokio::test]
+async fn get_with_unsupported_accept_returns_stored_format() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let (status, body) = client
+        .post_json("/api-specs", &minimal_json_spec(&proxy_id))
+        .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    let spec_id = body["id"].as_str().unwrap();
+
+    // text/html is not a known format — server should default to stored.
+    let (status, _bytes, headers) = client
+        .get_raw(&format!("/api-specs/{spec_id}"), Some("text/html"), None)
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "unsupported Accept must not return 406; server should default to stored format"
+    );
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.contains("json"),
+        "stored format is JSON, so Content-Type must be JSON; got: {ct}"
+    );
+}
+
+/// YAML with anchor/alias syntax must be rejected at parse time.
+#[tokio::test]
+async fn post_yaml_with_anchor_alias_returns_400() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let yaml_with_anchor = r#"openapi: "3.1.0"
+info:
+  title: &title Bomb Test
+  version: "1.0.0"
+x-ferrum-proxy:
+  id: anchor-test
+  backend_host: backend.internal
+  backend_port: 443
+  listen_path: /anchor-test
+alias_ref: *title
+"#;
+
+    let (status, body) = client.post_yaml("/api-specs", yaml_with_anchor).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "YAML with anchor/alias must be rejected; body: {body}"
+    );
+    let details = body["details"].as_str().unwrap_or("");
+    assert!(
+        details.contains("anchor") || details.contains("alias"),
+        "error must mention anchor/alias; got: {details}"
+    );
+}
+
+/// Combined list filters must work together (regression for multi-clause SQL).
+#[tokio::test]
+async fn list_with_combined_filters() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    // Submit two specs with different titles and tags.
+    let proxy_id_a = uid("proxy");
+    let spec_a = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Orders Service", "version": "1.0.0"},
+        "tags": [{"name": "public"}],
+        "x-ferrum-proxy": {
+            "id": &proxy_id_a,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id_a}")
+        }
+    });
+    let (s1, _) = client.post_json("/api-specs", &spec_a).await;
+    assert_eq!(s1, reqwest::StatusCode::CREATED);
+
+    let proxy_id_b = uid("proxy");
+    let spec_b = json!({
+        "openapi": "3.0.3",
+        "info": {"title": "Users Service", "version": "2.0.0"},
+        "tags": [{"name": "internal"}],
+        "x-ferrum-proxy": {
+            "id": &proxy_id_b,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id_b}")
+        }
+    });
+    let (s2, _) = client.post_json("/api-specs", &spec_b).await;
+    assert_eq!(s2, reqwest::StatusCode::CREATED);
+
+    // Combined: title_contains=Orders AND spec_version=3.1 → only spec_a
+    let (status, body) = client
+        .get_json("/api-specs?title_contains=Orders&spec_version=3.1")
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let items = body["items"].as_array().expect("items must be array");
+    assert_eq!(
+        items.len(),
+        1,
+        "combined filter must return exactly one match; got: {items:?}"
+    );
+    assert_eq!(items[0]["title"].as_str(), Some("Orders Service"));
+}
+
+/// Case-insensitive Content-Type must work end-to-end.
+#[tokio::test]
+async fn post_with_uppercase_content_type_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let spec = minimal_json_spec(&proxy_id);
+    let body_bytes = serde_json::to_vec(&spec).unwrap();
+
+    // Send with mixed-case Content-Type.
+    let (status, _body) = client
+        .post_raw("/api-specs", body_bytes, "Application/JSON")
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "mixed-case Content-Type must be accepted per RFC 7231"
+    );
+}
+
+/// Duplicate plugin IDs in a spec must be rejected at extraction time.
+#[tokio::test]
+async fn post_with_duplicate_plugin_ids_returns_error() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Dup Plugin Test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": &proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-plugins": [
+            {
+                "id": "same-id",
+                "plugin_name": "cors",
+                "config": {}
+            },
+            {
+                "id": "same-id",
+                "plugin_name": "compression",
+                "config": {}
+            }
+        ]
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert!(
+        status == reqwest::StatusCode::BAD_REQUEST
+            || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "duplicate plugin IDs must be rejected; got: {status}, body: {body}"
+    );
+    let details = body["details"].as_str().unwrap_or("");
+    assert!(
+        details.contains("duplicate plugin id"),
+        "error must mention duplicate plugin id; got: {details}"
+    );
+}

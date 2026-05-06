@@ -93,6 +93,11 @@ fn classify_db_error_str(msg: &str) -> ApiSpecError {
         || lower.contains("references a")
     {
         ApiSpecError::Unprocessable(msg.to_string())
+    } else if lower.contains("not found")
+        || lower.contains("no rows")
+        || lower.contains("does not exist")
+    {
+        ApiSpecError::NotFound
     } else {
         ApiSpecError::Internal(msg.to_string())
     }
@@ -247,7 +252,9 @@ pub(super) fn parse_content_type(headers: &hyper::HeaderMap) -> Option<SpecForma
         .unwrap_or("");
     // Strip parameters (e.g. `application/json; charset=utf-8`)
     let mime = ct.split(';').next().unwrap_or("").trim();
-    match mime {
+    // RFC 7231 §3.1.1.1: media type tokens are case-insensitive.
+    let mime_lower = mime.to_ascii_lowercase();
+    match mime_lower.as_str() {
         "application/json" => Some(SpecFormat::Json),
         "application/yaml" | "application/x-yaml" | "text/yaml" | "text/x-yaml" => {
             Some(SpecFormat::Yaml)
@@ -1668,7 +1675,7 @@ fn spec_content_response(
         match convert_format(&raw, spec.spec_format, target_fmt) {
             Ok(converted) => (converted, content_type_for_format(target_fmt)),
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     "format conversion ({:?} → {:?}) failed for spec {}: {}",
                     spec.spec_format,
                     target_fmt,
@@ -1678,12 +1685,13 @@ fn spec_content_response(
                 let stored_fmt_str = content_type_for_format(spec.spec_format);
                 let accepted_fmt_str = content_type_for_format(target_fmt);
                 return json_resp(
-                    StatusCode::NOT_ACCEPTABLE,
+                    StatusCode::INTERNAL_SERVER_ERROR,
                     &json!({
                         "error": format!(
                             "Cannot convert stored {} to requested {}; \
-                             accept the stored format or request raw bytes via Accept: */*",
-                            stored_fmt_str, accepted_fmt_str
+                             the stored document may be malformed — \
+                             try retrieving in the original format ({}) instead",
+                            stored_fmt_str, accepted_fmt_str, stored_fmt_str
                         )
                     }),
                 );
@@ -2349,6 +2357,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_content_type_case_insensitive_json() {
+        let h = headers_with_ct("Application/JSON");
+        assert_eq!(
+            parse_content_type(&h),
+            Some(SpecFormat::Json),
+            "Content-Type matching must be case-insensitive per RFC 7231"
+        );
+    }
+
+    #[test]
+    fn parse_content_type_case_insensitive_yaml() {
+        let h = headers_with_ct("APPLICATION/YAML");
+        assert_eq!(
+            parse_content_type(&h),
+            Some(SpecFormat::Yaml),
+            "Content-Type matching must be case-insensitive per RFC 7231"
+        );
+    }
+
+    #[test]
+    fn parse_content_type_case_insensitive_text_yaml() {
+        let h = headers_with_ct("Text/X-Yaml");
+        assert_eq!(
+            parse_content_type(&h),
+            Some(SpecFormat::Yaml),
+            "Content-Type matching must be case-insensitive per RFC 7231"
+        );
+    }
+
+    #[test]
     fn parse_content_type_unknown_returns_none() {
         let h = headers_with_ct("text/plain");
         assert_eq!(parse_content_type(&h), None);
@@ -2531,6 +2569,22 @@ mod tests {
         assert!(matches!(
             classify_db_error_str("MongoDB document limit exceeded for collection"),
             ApiSpecError::MongoDocTooLarge
+        ));
+    }
+
+    #[test]
+    fn classify_not_found_row_missing() {
+        assert!(matches!(
+            classify_db_error_str("RowNotFound: no rows returned"),
+            ApiSpecError::NotFound
+        ));
+    }
+
+    #[test]
+    fn classify_not_found_does_not_exist() {
+        assert!(matches!(
+            classify_db_error_str("resource does not exist"),
+            ApiSpecError::NotFound
         ));
     }
 

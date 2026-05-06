@@ -374,6 +374,18 @@ pub fn extract(
                 });
             }
 
+            // Reject duplicate non-empty plugin IDs within the same spec.
+            if !pc.id.is_empty()
+                && out
+                    .iter()
+                    .any(|existing: &PluginConfig| existing.id == pc.id)
+            {
+                return Err(ExtractError::MalformedExtension {
+                    which: "x-ferrum-plugins",
+                    error: format!("duplicate plugin id '{}'", pc.id),
+                });
+            }
+
             // Stamp namespace and link to proxy.
             pc.namespace = namespace.to_string();
             pc.proxy_id = Some(proxy.id.clone());
@@ -1631,6 +1643,41 @@ x-ferrum-proxy:
                     && spec_proxy_id == "my-proxy"
             ),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reject_duplicate_plugin_ids() {
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "1"}},
+                "x-ferrum-proxy": {},
+                "x-ferrum-plugins": [
+                    {{
+                        "id": "dup-id",
+                        "plugin_name": "rate_limiting",
+                        "scope": "proxy",
+                        "config": {{"per_second": 10}}
+                    }},
+                    {{
+                        "id": "dup-id",
+                        "plugin_name": "cors",
+                        "scope": "proxy",
+                        "config": {{}}
+                    }}
+                ]
+            }}"#,
+            minimal_proxy()
+        );
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ExtractError::MalformedExtension { which, error }
+                if *which == "x-ferrum-plugins" && error.contains("duplicate plugin id")
+            ),
+            "duplicate plugin IDs must be rejected; got: {err}"
         );
     }
 
