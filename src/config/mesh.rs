@@ -856,7 +856,7 @@ fn normalize_mesh_policy_headers(policies: &mut [MeshPolicy]) {
     }
 }
 
-fn normalize_mesh_policy_header_map(headers: &mut HashMap<String, String>) {
+pub(crate) fn normalize_mesh_policy_header_map(headers: &mut HashMap<String, String>) {
     if headers
         .keys()
         .all(|key| key.bytes().all(|byte| !byte.is_ascii_uppercase()))

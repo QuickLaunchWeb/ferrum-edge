@@ -5,9 +5,12 @@
 //! trait or proxy hot path.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
-use crate::config::mesh::{ConditionMatch, MeshRule, PolicyAction, PrincipalMatch, RequestMatch};
+use crate::config::mesh::{
+    ConditionMatch, MeshRule, PolicyAction, PrincipalMatch, RequestMatch,
+    normalize_mesh_policy_header_map,
+};
 use crate::identity::SpiffeId;
 use crate::xds::slice::MeshSlice;
 
@@ -230,7 +233,9 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
     let mut value_limit = value.len();
 
     if anchored_start {
-        let first = parts.next().expect("non-empty wildcard part");
+        let Some(first) = parts.next() else {
+            return true;
+        };
         if !value.starts_with(first) {
             return false;
         }
@@ -238,10 +243,9 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
     }
 
     if anchored_end {
-        let last = pattern
-            .rsplit('*')
-            .find(|part| !part.is_empty())
-            .expect("non-empty wildcard part");
+        let Some(last) = pattern.rsplit('*').find(|part| !part.is_empty()) else {
+            return true;
+        };
         if !value.ends_with(last) {
             return false;
         }
@@ -271,28 +275,6 @@ pub(crate) fn normalize_mesh_policy_header_names(policy: &mut crate::config::mes
             normalize_mesh_policy_header_map(&mut request.headers);
         }
     }
-}
-
-fn normalize_mesh_policy_header_map(headers: &mut std::collections::HashMap<String, String>) {
-    if headers
-        .keys()
-        .all(|key| key.bytes().all(|byte| !byte.is_ascii_uppercase()))
-    {
-        return;
-    }
-
-    let mut lowered = HashSet::with_capacity(headers.len());
-    if headers
-        .keys()
-        .any(|key| !lowered.insert(key.to_ascii_lowercase()))
-    {
-        return;
-    }
-
-    *headers = headers
-        .drain()
-        .map(|(key, value)| (key.to_ascii_lowercase(), value))
-        .collect();
 }
 
 pub(crate) fn mesh_policy_has_header_rules(policy: &crate::config::mesh::MeshPolicy) -> bool {
@@ -437,6 +419,19 @@ mod tests {
         ));
         assert!(!wildcard_match("*foo", "barfoobar"));
         assert!(!wildcard_match("foo*foo", "foo"));
+    }
+
+    #[test]
+    fn wildcard_match_handles_degenerate_patterns_without_panics() {
+        assert!(wildcard_match("*", ""));
+        assert!(wildcard_match("**", ""));
+        assert!(wildcard_match("***", "anything"));
+        assert!(wildcard_match("a**b", "ab"));
+        assert!(wildcard_match("a**b", "axxb"));
+        assert!(!wildcard_match("a**b", "ac"));
+        assert!(wildcard_match("", ""));
+        assert!(!wildcard_match("", "anything"));
+        assert!(!wildcard_match("*suffix", ""));
     }
 
     #[test]
