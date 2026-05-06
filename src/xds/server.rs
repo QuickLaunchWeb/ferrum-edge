@@ -344,14 +344,31 @@ impl XdsAdsServer {
         config: &GatewayConfig,
     ) -> Vec<DiscoveryResponse> {
         let previous = self.snapshot_cache.get(node_id);
+        self.sotw_responses_for_subscriptions_from_config_with_previous(
+            node_id,
+            subscriptions,
+            config,
+            previous.as_deref(),
+        )
+        .1
+    }
+
+    fn sotw_responses_for_subscriptions_from_config_with_previous(
+        &self,
+        node_id: &str,
+        subscriptions: &HashMap<String, XdsSubscription>,
+        config: &GatewayConfig,
+        previous: Option<&XdsSnapshot>,
+    ) -> (Arc<XdsSnapshot>, Vec<DiscoveryResponse>) {
         let snapshot = self.snapshot_for_config(node_id, config);
-        subscriptions
+        let responses = subscriptions
             .values()
             .filter(|subscription| {
-                subscription_resources_changed(previous.as_deref(), &snapshot, subscription)
+                subscription_resources_changed(previous, &snapshot, subscription)
             })
             .map(|subscription| self.sotw_response(&snapshot, subscription))
-            .collect()
+            .collect();
+        (snapshot, responses)
     }
 
     fn sotw_response_for_request(
@@ -431,23 +448,33 @@ impl XdsAdsServer {
         config: &GatewayConfig,
     ) -> Vec<DeltaDiscoveryResponse> {
         let previous = self.snapshot_cache.get(node_id);
+        self.delta_responses_for_subscriptions_from_config_with_previous(
+            node_id,
+            subscriptions,
+            config,
+            previous.as_deref(),
+        )
+        .1
+    }
+
+    fn delta_responses_for_subscriptions_from_config_with_previous(
+        &self,
+        node_id: &str,
+        subscriptions: &HashMap<String, XdsSubscription>,
+        config: &GatewayConfig,
+        previous: Option<&XdsSnapshot>,
+    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
         let snapshot = self.snapshot_for_config(node_id, config);
-        subscriptions
+        let responses = subscriptions
             .values()
             .filter(|subscription| {
-                subscription_resources_changed(previous.as_deref(), &snapshot, subscription)
+                subscription_resources_changed(previous, &snapshot, subscription)
             })
             .map(|subscription| {
-                self.delta_response(
-                    &snapshot,
-                    previous.as_deref(),
-                    subscription,
-                    &HashMap::new(),
-                    &[],
-                    &[],
-                )
+                self.delta_response(&snapshot, previous, subscription, &HashMap::new(), &[], &[])
             })
-            .collect()
+            .collect();
+        (snapshot, responses)
     }
 
     fn record_sotw_ack(&self, node_id: &str, request: &DiscoveryRequest) -> AckOutcome {
@@ -564,6 +591,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             let mut node_id: Option<String> = None;
             let mut subscriptions: HashMap<String, XdsSubscription> = HashMap::new();
             let mut stream_config = server.config.load_full().as_ref().clone();
+            let mut last_snapshot: Option<Arc<XdsSnapshot>> = None;
             loop {
                 tokio::select! {
                     maybe_request = requests.next() => {
@@ -607,6 +635,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             &request,
                         )
                         {
+                            last_snapshot = server.snapshot_cache.get(&current_node_id);
                             tx.send(Ok(response)).await.is_err()
                         } else {
                             false
@@ -627,11 +656,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
-                                for response in server.sotw_responses_for_subscriptions_from_config(
+                                let (snapshot, responses) = server.sotw_responses_for_subscriptions_from_config_with_previous(
                                     current_node_id,
                                     &subscriptions,
                                     &stream_config,
-                                ) {
+                                    last_snapshot.as_deref(),
+                                );
+                                last_snapshot = Some(snapshot);
+                                for response in responses {
                                     if tx.send(Ok(response)).await.is_err() {
                                         return;
                                     }
@@ -647,11 +679,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
-                                for response in server.sotw_responses_for_subscriptions_from_config(
+                                let (snapshot, responses) = server.sotw_responses_for_subscriptions_from_config_with_previous(
                                     current_node_id,
                                     &subscriptions,
                                     &stream_config,
-                                ) {
+                                    last_snapshot.as_deref(),
+                                );
+                                last_snapshot = Some(snapshot);
+                                for response in responses {
                                     if tx.send(Ok(response)).await.is_err() {
                                         return;
                                     }
@@ -683,6 +718,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             let mut node_id: Option<String> = None;
             let mut subscriptions: HashMap<String, XdsSubscription> = HashMap::new();
             let mut stream_config = server.config.load_full().as_ref().clone();
+            let mut last_snapshot: Option<Arc<XdsSnapshot>> = None;
             loop {
                 tokio::select! {
                     maybe_request = requests.next() => {
@@ -760,7 +796,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             resource_names_changed,
                             explicit_subscription_request,
                         ) {
-                            let previous = server.snapshot_cache.get(&current_node_id);
+                            let previous = last_snapshot.clone();
                             let snapshot =
                                 server.snapshot_for_config(&current_node_id, &stream_config);
                             let response = server.delta_response(
@@ -771,6 +807,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 &request.resource_names_subscribe,
                                 &request.resource_names_unsubscribe,
                             );
+                            last_snapshot = Some(snapshot);
                             if tx.send(Ok(response)).await.is_err() {
                                 return;
                             }
@@ -788,11 +825,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
-                                for response in server.delta_responses_for_subscriptions_from_config(
+                                let (snapshot, responses) = server.delta_responses_for_subscriptions_from_config_with_previous(
                                     current_node_id,
                                     &subscriptions,
                                     &stream_config,
-                                ) {
+                                    last_snapshot.as_deref(),
+                                );
+                                last_snapshot = Some(snapshot);
+                                for response in responses {
                                     if tx.send(Ok(response)).await.is_err() {
                                         return;
                                     }
@@ -808,11 +848,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
-                                for response in server.delta_responses_for_subscriptions_from_config(
+                                let (snapshot, responses) = server.delta_responses_for_subscriptions_from_config_with_previous(
                                     current_node_id,
                                     &subscriptions,
                                     &stream_config,
-                                ) {
+                                    last_snapshot.as_deref(),
+                                );
+                                last_snapshot = Some(snapshot);
+                                for response in responses {
                                     if tx.send(Ok(response)).await.is_err() {
                                         return;
                                     }
@@ -1231,6 +1274,36 @@ mod tests {
     }
 
     #[test]
+    fn sotw_stream_previous_snapshot_is_not_shared_between_streams() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let subscriptions = cds_subscription();
+        let previous = server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
+        let first_previous = Some(previous.clone());
+        let second_previous = Some(previous);
+        let next_config = gateway_config_with_service(false, 1);
+
+        let (_, first_responses) = server
+            .sotw_responses_for_subscriptions_from_config_with_previous(
+                "node-a",
+                &subscriptions,
+                &next_config,
+                first_previous.as_deref(),
+            );
+        let (_, second_responses) = server
+            .sotw_responses_for_subscriptions_from_config_with_previous(
+                "node-a",
+                &subscriptions,
+                &next_config,
+                second_previous.as_deref(),
+            );
+
+        assert_eq!(first_responses.len(), 1);
+        assert_eq!(second_responses.len(), 1);
+        assert!(first_responses[0].resources.is_empty());
+        assert!(second_responses[0].resources.is_empty());
+    }
+
+    #[test]
     fn stream_config_delta_update_uses_broadcast_payload_version() {
         let mut stream_config = gateway_config_with_service(true, 0);
         let delta = empty_delta(42);
@@ -1406,6 +1479,44 @@ mod tests {
         let unchanged = server.delta_responses_for_subscriptions("node-a", &subscriptions);
 
         assert!(unchanged.is_empty());
+    }
+
+    #[test]
+    fn delta_stream_previous_snapshot_is_not_shared_between_streams() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let subscriptions = cds_subscription();
+        let previous = server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
+        let first_previous = Some(previous.clone());
+        let second_previous = Some(previous);
+        let next_config = gateway_config_with_service(false, 1);
+
+        let (_, first_responses) = server
+            .delta_responses_for_subscriptions_from_config_with_previous(
+                "node-a",
+                &subscriptions,
+                &next_config,
+                first_previous.as_deref(),
+            );
+        let (_, second_responses) = server
+            .delta_responses_for_subscriptions_from_config_with_previous(
+                "node-a",
+                &subscriptions,
+                &next_config,
+                second_previous.as_deref(),
+            );
+
+        assert_eq!(first_responses.len(), 1);
+        assert_eq!(second_responses.len(), 1);
+        assert!(first_responses[0].resources.is_empty());
+        assert_eq!(
+            first_responses[0].removed_resources,
+            vec!["cluster/default/api/8080".to_string()]
+        );
+        assert!(second_responses[0].resources.is_empty());
+        assert_eq!(
+            second_responses[0].removed_resources,
+            vec!["cluster/default/api/8080".to_string()]
+        );
     }
 
     #[test]

@@ -15,6 +15,8 @@ pub mod snapshot;
 pub mod translator;
 
 pub mod proto {
+    // Not google.protobuf.Any/Status: these are the minimal wire-compatible
+    // xDS shims Ferrum needs for Phase B.
     tonic::include_proto!("envoy.service.discovery.v3");
 }
 
