@@ -15,7 +15,7 @@ pub struct StdoutLogging;
 
 impl StdoutLogging {
     pub fn new(config: &Value) -> Result<Self, String> {
-        if !config.is_object() {
+        if !(config.is_object() || config.is_null()) {
             return Err("stdout_logging: config must be an object".to_string());
         }
         Ok(Self)

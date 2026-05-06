@@ -86,7 +86,7 @@ async fn test_prometheus_plugin_creation() {
 #[tokio::test]
 async fn test_prometheus_plugin_rejects_invalid_config_shapes() {
     let cases = [
-        json!(null),
+        json!("bad"),
         json!({"render_cache_ttl_seconds": "5"}),
         json!({"stale_entry_ttl_seconds": -1}),
         json!({"cache_invalidation_min_age_ms": true}),
@@ -98,6 +98,15 @@ async fn test_prometheus_plugin_rejects_invalid_config_shapes() {
             "expected invalid config to be rejected: {config}"
         );
     }
+}
+
+#[tokio::test]
+async fn test_prometheus_plugin_accepts_null_config_as_defaults() {
+    let plugin = PrometheusMetrics::new(&serde_json::Value::Null, "ferrum")
+        .expect("null config should use defaults");
+    assert_eq!(plugin.name(), "prometheus_metrics");
+    assert_eq!(plugin.priority(), 9300);
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
 }
 
 #[tokio::test]

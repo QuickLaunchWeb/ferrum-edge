@@ -80,8 +80,16 @@ async fn test_stdout_logging_plugin_with_config() {
 }
 
 #[test]
+fn test_stdout_logging_accepts_null_config_as_defaults() {
+    let plugin =
+        StdoutLogging::new(&serde_json::Value::Null).expect("null config should use defaults");
+    assert_eq!(plugin.name(), "stdout_logging");
+    assert_eq!(plugin.priority(), 9000);
+}
+
+#[test]
 fn test_stdout_logging_rejects_non_object_config() {
-    let err = StdoutLogging::new(&json!(null)).err().unwrap();
+    let err = StdoutLogging::new(&json!("bad")).err().unwrap();
     assert!(err.contains("config must be an object"), "got: {err}");
 }
 

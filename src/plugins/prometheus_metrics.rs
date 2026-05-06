@@ -728,7 +728,7 @@ fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> 
 
 impl PrometheusMetrics {
     pub fn new(config: &Value, namespace: &str) -> Result<Self, String> {
-        if !config.is_object() {
+        if !(config.is_object() || config.is_null()) {
             return Err("prometheus_metrics: config must be an object".to_string());
         }
 
