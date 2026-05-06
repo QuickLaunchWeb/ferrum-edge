@@ -611,8 +611,9 @@ pub fn raise_fd_limit() -> RaiseFdLimitResult {
 /// (queried via `Handle::current().metrics().num_workers()`), let tokio's
 /// scheduler distribute them across workers, and report the **maximum**
 /// scheduling delay observed across all probes. A starved worker will have at
-/// least one queued probe task that takes much longer than `yield_now()` to
-/// re-poll, surfacing the starvation in the aggregate reading.
+/// least one queued probe task that takes much longer to get its first poll
+/// and then re-poll after `yield_now()`, surfacing the starvation in the
+/// aggregate reading.
 ///
 /// Each probe is a single `yield_now().await` (a few microseconds in the
 /// healthy case), so the overall cost scales linearly with worker count and
@@ -633,8 +634,8 @@ async fn measure_event_loop_latency() -> Duration {
 
     let mut probes = tokio::task::JoinSet::new();
     for _ in 0..num_workers {
-        probes.spawn(async {
-            let start = std::time::Instant::now();
+        let start = std::time::Instant::now();
+        probes.spawn(async move {
             tokio::task::yield_now().await;
             start.elapsed()
         });

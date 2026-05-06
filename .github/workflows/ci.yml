@@ -303,11 +303,11 @@ jobs:
             echo "Performance tests did not produce results." >> $GITHUB_STEP_SUMMARY
           fi
 
-  # ── Cross-platform builds, release & Docker (main push only) ──────────
+  # ── Cross-platform builds (PR + main), release & Docker (main push only) ──
 
   build-binaries:
     name: Build (${{ matrix.asset_name }})
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     environment: ci-build
     runs-on: ${{ matrix.os }}
     strategy:
@@ -605,4 +605,3 @@ jobs:
             -t ghcr.io/${{ github.repository }}:latest \
             -t ghcr.io/${{ github.repository }}:main-${{ github.sha }} \
             $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
-
