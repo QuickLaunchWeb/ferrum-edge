@@ -1,0 +1,53 @@
+{{- if .Values.eastWest.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferrum-mesh-east-west
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-east-west
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.eastWest.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-mesh-east-west
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-mesh-east-west
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: ferrum-mesh
+      containers:
+        - name: ferrum-edge
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: tls-passthru
+              containerPort: {{ .Values.eastWest.listenPort }}
+          env:
+            - name: FERRUM_MESH_EAST_WEST_LISTEN_PORT
+              value: {{ .Values.eastWest.listenPort | quote }}
+            {{- range $name, $value := .Values.eastWest.env }}
+            {{- if ne $name "FERRUM_MESH_EAST_WEST_LISTEN_PORT" }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferrum-mesh-east-west
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    app.kubernetes.io/name: ferrum-mesh-east-west
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: tls-passthru
+      port: {{ .Values.eastWest.listenPort }}
+      targetPort: tls-passthru
+{{- end }}

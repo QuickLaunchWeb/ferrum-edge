@@ -19,6 +19,7 @@
 //! in Phase C — Phase A keeps everything additive.
 
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -52,6 +53,8 @@ pub struct WorkloadApiService {
     /// Long-lived Workload API streams subscribe to this channel and push
     /// fresh responses on each epoch change.
     rotation_signal: Arc<watch::Sender<u64>>,
+    /// Federated trust domains to include in X.509 Workload API responses.
+    federated_trust_domains: Vec<TrustDomain>,
 }
 
 impl WorkloadApiService {
@@ -68,6 +71,7 @@ impl WorkloadApiService {
             trust_domain,
             svid_ttl_secs,
             rotation_signal: Arc::new(tx),
+            federated_trust_domains: Vec::new(),
         }
     }
 
@@ -84,7 +88,13 @@ impl WorkloadApiService {
             trust_domain,
             svid_ttl_secs,
             rotation_signal,
+            federated_trust_domains: Vec::new(),
         }
+    }
+
+    pub fn with_federated_trust_domains(mut self, trust_domains: Vec<TrustDomain>) -> Self {
+        self.federated_trust_domains = trust_domains;
+        self
     }
 
     pub fn rotation_signal(&self) -> &Arc<watch::Sender<u64>> {
@@ -175,6 +185,10 @@ impl WorkloadApiService {
 
         let chain_concat: Vec<u8> = svid.cert_chain_der.iter().flatten().copied().collect();
         let bundle_concat: Vec<u8> = bundle.roots_der.iter().flatten().copied().collect();
+        let federated_bundles =
+            Self::build_federated_x509_bundle_map(&self.ca, &self.federated_trust_domains)
+                .await
+                .map_err(|e| Status::internal(format!("CA federated bundle fetch failed: {e}")))?;
 
         let proto_svid = X509svid {
             spiffe_id: svid.spiffe_id.to_string(),
@@ -191,7 +205,7 @@ impl WorkloadApiService {
         Ok(X509svidResponse {
             svids: vec![proto_svid],
             crl: Vec::new(),
-            federated_bundles: Default::default(),
+            federated_bundles,
         })
     }
 
@@ -200,6 +214,7 @@ impl WorkloadApiService {
         trust_domain: &TrustDomain,
         spiffe_id: &crate::identity::spiffe::SpiffeId,
         ttl_secs: u64,
+        federated_trust_domains: &[TrustDomain],
     ) -> Result<X509svidResponse, Status> {
         let svid = ca
             .issue_svid(IssuanceRequest::Generate {
@@ -219,6 +234,9 @@ impl WorkloadApiService {
 
         let chain_concat: Vec<u8> = svid.cert_chain_der.iter().flatten().copied().collect();
         let bundle_concat: Vec<u8> = bundle.roots_der.iter().flatten().copied().collect();
+        let federated_bundles = Self::build_federated_x509_bundle_map(ca, federated_trust_domains)
+            .await
+            .map_err(|e| Status::internal(format!("CA federated bundle fetch failed: {e}")))?;
 
         let proto_svid = X509svid {
             spiffe_id: svid.spiffe_id.to_string(),
@@ -231,22 +249,44 @@ impl WorkloadApiService {
         Ok(X509svidResponse {
             svids: vec![proto_svid],
             crl: Vec::new(),
-            federated_bundles: Default::default(),
+            federated_bundles,
         })
     }
 
     async fn build_x509_bundles_response_static(
         ca: &Arc<dyn CertificateAuthority>,
         trust_domain: &TrustDomain,
+        federated_trust_domains: &[TrustDomain],
     ) -> Result<X509BundlesResponse, crate::identity::ca::CaError> {
         let bundle = ca.trust_bundle(trust_domain).await?;
-        let mut bundles = std::collections::HashMap::new();
+        let mut bundles = HashMap::new();
         let bundle_concat: Vec<u8> = bundle.roots_der.iter().flatten().copied().collect();
         bundles.insert(trust_domain.to_string(), bundle_concat);
+        for td in federated_trust_domains {
+            if td == trust_domain {
+                continue;
+            }
+            let bundle = ca.trust_bundle(td).await?;
+            let bundle_concat: Vec<u8> = bundle.roots_der.iter().flatten().copied().collect();
+            bundles.insert(td.to_string(), bundle_concat);
+        }
         Ok(X509BundlesResponse {
             crl: Vec::new(),
             bundles,
         })
+    }
+
+    async fn build_federated_x509_bundle_map(
+        ca: &Arc<dyn CertificateAuthority>,
+        federated_trust_domains: &[TrustDomain],
+    ) -> Result<HashMap<String, Vec<u8>>, crate::identity::ca::CaError> {
+        let mut bundles = HashMap::new();
+        for td in federated_trust_domains {
+            let bundle = ca.trust_bundle(td).await?;
+            let bundle_concat: Vec<u8> = bundle.roots_der.iter().flatten().copied().collect();
+            bundles.insert(td.to_string(), bundle_concat);
+        }
+        Ok(bundles)
     }
 }
 
@@ -296,6 +336,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         let td = self.trust_domain.clone();
         let ttl = self.svid_ttl_secs;
         let id = identity.spiffe_id.clone();
+        let federated_trust_domains = self.federated_trust_domains.clone();
         let mut rx = self.rotation_signal.subscribe();
 
         let (tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -306,7 +347,15 @@ impl SpiffeWorkloadApi for WorkloadApiService {
                 if !Self::wait_for_rotation_or_stream_close(&mut rx, &tx).await {
                     return;
                 }
-                match Self::build_x509_svid_response_static(&ca, &td, &id, ttl).await {
+                match Self::build_x509_svid_response_static(
+                    &ca,
+                    &td,
+                    &id,
+                    ttl,
+                    &federated_trust_domains,
+                )
+                .await
+                {
                     Ok(resp) => {
                         if tx.send(Ok(resp)).is_err() {
                             return;
@@ -332,12 +381,17 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         request: Request<X509BundlesRequest>,
     ) -> Result<Response<Self::FetchX509BundlesStream>, Status> {
         Self::validate_workload_metadata(&request)?;
-        let initial = Self::build_x509_bundles_response_static(&self.ca, &self.trust_domain)
-            .await
-            .map_err(|e| Status::internal(format!("CA bundle fetch failed: {e}")))?;
+        let initial = Self::build_x509_bundles_response_static(
+            &self.ca,
+            &self.trust_domain,
+            &self.federated_trust_domains,
+        )
+        .await
+        .map_err(|e| Status::internal(format!("CA bundle fetch failed: {e}")))?;
 
         let ca = Arc::clone(&self.ca);
         let td = self.trust_domain.clone();
+        let federated_trust_domains = self.federated_trust_domains.clone();
         let mut rx = self.rotation_signal.subscribe();
 
         let (tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -348,7 +402,9 @@ impl SpiffeWorkloadApi for WorkloadApiService {
                 if !Self::wait_for_rotation_or_stream_close(&mut rx, &tx).await {
                     return;
                 }
-                match Self::build_x509_bundles_response_static(&ca, &td).await {
+                match Self::build_x509_bundles_response_static(&ca, &td, &federated_trust_domains)
+                    .await
+                {
                     Ok(resp) => {
                         if tx.send(Ok(resp)).is_err() {
                             return;

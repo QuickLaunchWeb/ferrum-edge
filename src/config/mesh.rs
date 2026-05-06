@@ -12,7 +12,7 @@
 //! single gateway instance only loads its own namespace's mesh resources.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::identity::spiffe::{SpiffeId, TrustDomain};
 use crate::identity::{JwtAuthority as IdentityJwtAuthority, TrustBundle as IdentityTrustBundle};
@@ -51,10 +51,20 @@ pub struct Workload {
     pub spiffe_id: SpiffeId,
     pub selector: WorkloadSelector,
     pub service_name: String,
+    /// Workload IPs or DNS names. Istio `WorkloadEntry.address` maps here;
+    /// K8s pod IPs land here once the reconciler wires pod watching.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<WorkloadPort>,
     pub trust_domain: TrustDomain,
     pub namespace: String,
+    /// Istio network label for multi-network routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// Cluster name for CP-to-CP exchange and VM workloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<String>,
 }
 
 /// A port advertised by a workload.
@@ -338,6 +348,60 @@ impl TrustBundleSet {
     }
 }
 
+// ── Multi-cluster ────────────────────────────────────────────────────────
+
+/// Layer-10 multi-cluster mesh settings.
+///
+/// This is intentionally control-plane neutral. Istio CRDs, Gateway API,
+/// native ConfigSync, xDS, file mode, and future CP-to-CP exchange all carry
+/// the same canonical shape instead of talking past Layer 2.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MultiClusterConfig {
+    /// Operator-facing name for the local cluster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_cluster: Option<String>,
+    /// SPIFFE federation endpoint served by this control plane, when Ferrum
+    /// is publishing bundles to remote clusters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_endpoint: Option<String>,
+    /// Remote clusters whose services/workloads/bundles may be exchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_clusters: Vec<RemoteCluster>,
+    /// SNI-routed east-west gateway backends. Mesh mode materializes these as
+    /// passthrough TCP proxies only when topology is `east_west_gateway`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub east_west_gateways: Vec<EastWestGateway>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteCluster {
+    pub name: String,
+    pub trust_domain: TrustDomain,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_plane_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EastWestGateway {
+    pub name: String,
+    pub namespace: String,
+    /// Backend host to which the east-west gateway forwards matched SNI.
+    pub host: String,
+    /// Backend port on `host`.
+    pub port: u16,
+    /// TLS SNI hosts routed through this gateway.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sni_hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_domain: Option<TrustDomain>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+}
+
 // ── Top-level mesh config container ───────────────────────────────────────
 
 /// All mesh-specific configuration, kept in a single container so the
@@ -358,22 +422,29 @@ pub struct MeshConfig {
     pub service_entries: Vec<ServiceEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<TrustBundleSet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_cluster: Option<MultiClusterConfig>,
 }
 
 impl MeshConfig {
     pub fn validate(&self) -> Vec<String> {
-        validate_mesh_config(
+        validate_mesh_config_internal(
             &self.workloads,
             &self.services,
             &self.mesh_policies,
             &self.peer_authentications,
             &self.service_entries,
             self.trust_bundles.as_ref(),
+            self.multi_cluster.as_ref(),
         )
     }
 
     pub fn normalize(&mut self) {
-        normalize_mesh_fields(&mut self.service_entries, &mut self.workloads);
+        normalize_mesh_fields_internal(
+            &mut self.service_entries,
+            &mut self.workloads,
+            self.multi_cluster.as_mut(),
+        );
     }
 }
 
@@ -391,6 +462,26 @@ pub fn validate_mesh_config(
     peer_auths: &[PeerAuthentication],
     service_entries: &[ServiceEntry],
     trust_bundles: Option<&TrustBundleSet>,
+) -> Vec<String> {
+    validate_mesh_config_internal(
+        workloads,
+        services,
+        policies,
+        peer_auths,
+        service_entries,
+        trust_bundles,
+        None,
+    )
+}
+
+fn validate_mesh_config_internal(
+    workloads: &[Workload],
+    services: &[MeshService],
+    policies: &[MeshPolicy],
+    peer_auths: &[PeerAuthentication],
+    service_entries: &[ServiceEntry],
+    trust_bundles: Option<&TrustBundleSet>,
+    multi_cluster: Option<&MultiClusterConfig>,
 ) -> Vec<String> {
     let mut errors = Vec::new();
 
@@ -414,6 +505,34 @@ pub fn validate_mesh_config(
         if wl.service_name.is_empty() {
             errors.push(format!(
                 "Workload '{}': service_name must not be empty",
+                wl.spiffe_id
+            ));
+        }
+        for (i, address) in wl.addresses.iter().enumerate() {
+            if address.trim().is_empty() {
+                errors.push(format!(
+                    "Workload '{}'.addresses[{}]: address must not be empty",
+                    wl.spiffe_id, i
+                ));
+            }
+        }
+        if wl
+            .network
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            errors.push(format!(
+                "Workload '{}': network must not be empty when set",
+                wl.spiffe_id
+            ));
+        }
+        if wl
+            .cluster
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            errors.push(format!(
+                "Workload '{}': cluster must not be empty when set",
                 wl.spiffe_id
             ));
         }
@@ -529,7 +648,20 @@ pub fn validate_mesh_config(
         if let Err(e) = tb_set.local.decode_x509_authorities() {
             errors.push(format!("TrustBundleSet.local: {e}"));
         }
+        let mut seen_trust_domains = HashSet::from([tb_set.local.trust_domain.clone()]);
         for fed in &tb_set.federated {
+            if !seen_trust_domains.insert(fed.trust_domain.clone()) {
+                errors.push(format!(
+                    "TrustBundleSet.federated[{}]: duplicate trust domain",
+                    fed.trust_domain
+                ));
+            }
+            if fed.x509_authorities.is_empty() && fed.jwt_authorities.is_empty() {
+                errors.push(format!(
+                    "TrustBundleSet.federated[{}]: no authorities",
+                    fed.trust_domain
+                ));
+            }
             if let Err(e) = fed.decode_x509_authorities() {
                 errors.push(format!(
                     "TrustBundleSet.federated[{}]: {e}",
@@ -539,13 +671,155 @@ pub fn validate_mesh_config(
         }
     }
 
+    if let Some(multi_cluster) = multi_cluster {
+        validate_multi_cluster(multi_cluster, trust_bundles, &mut errors);
+    }
+
     errors
+}
+
+fn validate_multi_cluster(
+    multi_cluster: &MultiClusterConfig,
+    trust_bundles: Option<&TrustBundleSet>,
+    errors: &mut Vec<String>,
+) {
+    if multi_cluster
+        .local_cluster
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        errors.push("MultiClusterConfig.local_cluster must not be empty when set".to_string());
+    }
+    if multi_cluster
+        .federation_endpoint
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        errors
+            .push("MultiClusterConfig.federation_endpoint must not be empty when set".to_string());
+    }
+
+    let mut seen_cluster_names = HashSet::new();
+    for remote in &multi_cluster.remote_clusters {
+        if remote.name.trim().is_empty() {
+            errors.push("RemoteCluster: name must not be empty".to_string());
+        } else if !seen_cluster_names.insert(remote.name.as_str()) {
+            errors.push(format!("RemoteCluster '{}': duplicate name", remote.name));
+        }
+        if remote
+            .network
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            errors.push(format!(
+                "RemoteCluster '{}': network must not be empty when set",
+                remote.name
+            ));
+        }
+        if remote
+            .control_plane_url
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            errors.push(format!(
+                "RemoteCluster '{}': control_plane_url must not be empty when set",
+                remote.name
+            ));
+        }
+        if remote
+            .federation_endpoint
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            errors.push(format!(
+                "RemoteCluster '{}': federation_endpoint must not be empty when set",
+                remote.name
+            ));
+        }
+
+        if let Some(tb_set) = trust_bundles
+            && remote.trust_domain != tb_set.local.trust_domain
+            && !tb_set
+                .federated
+                .iter()
+                .any(|bundle| bundle.trust_domain == remote.trust_domain)
+        {
+            errors.push(format!(
+                "RemoteCluster '{}': trust domain '{}' has no matching federated trust bundle",
+                remote.name, remote.trust_domain
+            ));
+        }
+    }
+
+    let mut seen_sni_routes: HashSet<String> = HashSet::new();
+    for gateway in &multi_cluster.east_west_gateways {
+        if gateway.name.trim().is_empty() {
+            errors.push("EastWestGateway: name must not be empty".to_string());
+        }
+        if gateway.namespace.trim().is_empty() {
+            errors.push(format!(
+                "EastWestGateway '{}': namespace must not be empty",
+                gateway.name
+            ));
+        }
+        if gateway.host.trim().is_empty() {
+            errors.push(format!(
+                "EastWestGateway '{}': host must not be empty",
+                gateway.name
+            ));
+        }
+        if gateway.port == 0 {
+            errors.push(format!(
+                "EastWestGateway '{}': port must be between 1 and 65535",
+                gateway.name
+            ));
+        }
+        if gateway.sni_hosts.is_empty() {
+            errors.push(format!(
+                "EastWestGateway '{}': sni_hosts must not be empty",
+                gateway.name
+            ));
+        }
+        if gateway
+            .network
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            errors.push(format!(
+                "EastWestGateway '{}': network must not be empty when set",
+                gateway.name
+            ));
+        }
+        for sni in &gateway.sni_hosts {
+            if sni.trim().is_empty() {
+                errors.push(format!(
+                    "EastWestGateway '{}': sni_hosts must not contain empty entries",
+                    gateway.name
+                ));
+                continue;
+            }
+            if !seen_sni_routes.insert(sni.to_ascii_lowercase()) {
+                errors.push(format!(
+                    "EastWestGateway '{}': duplicate SNI host '{}'",
+                    gateway.name, sni
+                ));
+            }
+        }
+    }
 }
 
 /// Lower-case in-place hostname normalisation for mesh entries — matches
 /// the existing `normalize_fields()` pattern used elsewhere in
 /// [`crate::config::types`]. Idempotent.
 pub fn normalize_mesh_fields(service_entries: &mut [ServiceEntry], workloads: &mut [Workload]) {
+    normalize_mesh_fields_internal(service_entries, workloads, None);
+}
+
+fn normalize_mesh_fields_internal(
+    service_entries: &mut [ServiceEntry],
+    workloads: &mut [Workload],
+    multi_cluster: Option<&mut MultiClusterConfig>,
+) {
     for se in service_entries {
         for host in &mut se.hosts {
             host.make_ascii_lowercase();
@@ -554,9 +828,17 @@ pub fn normalize_mesh_fields(service_entries: &mut [ServiceEntry], workloads: &m
             ep.address.make_ascii_lowercase();
         }
     }
-    // Workloads carry a service_name (logical) — case kept as-is per Istio
-    // semantics; namespaces stay case-sensitive too. Nothing to lower-case
-    // here today; placeholder for Phase B when we may add hostname-bearing
-    // workload fields.
-    let _ = workloads;
+    for workload in workloads {
+        for address in &mut workload.addresses {
+            address.make_ascii_lowercase();
+        }
+    }
+    if let Some(multi_cluster) = multi_cluster {
+        for gateway in &mut multi_cluster.east_west_gateways {
+            gateway.host.make_ascii_lowercase();
+            for sni in &mut gateway.sni_hosts {
+                sni.make_ascii_lowercase();
+            }
+        }
+    }
 }

@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::config::mesh::{
-    MeshPolicy, MeshService, PeerAuthentication, PolicyScope, ServiceEntry, TrustBundleSet,
-    Workload, WorkloadSelector,
+    MeshPolicy, MeshService, MultiClusterConfig, PeerAuthentication, PolicyScope, ServiceEntry,
+    TrustBundleSet, Workload, WorkloadSelector,
 };
 use crate::config::types::GatewayConfig;
 
@@ -69,6 +69,8 @@ pub struct MeshSlice {
     pub service_entries: Vec<ServiceEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<TrustBundleSet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_cluster: Option<MultiClusterConfig>,
 }
 
 impl MeshSlice {
@@ -87,6 +89,7 @@ impl MeshSlice {
             && self.peer_authentications == other.peer_authentications
             && self.service_entries == other.service_entries
             && self.trust_bundles == other.trust_bundles
+            && self.multi_cluster == other.multi_cluster
     }
 
     pub fn from_gateway_config(config: &GatewayConfig, request: MeshSliceRequest) -> Self {
@@ -170,6 +173,7 @@ impl MeshSlice {
             peer_authentications,
             service_entries,
             trust_bundles: mesh.trust_bundles.clone(),
+            multi_cluster: mesh.multi_cluster.clone(),
         }
     }
 }

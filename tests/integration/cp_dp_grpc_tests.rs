@@ -129,6 +129,7 @@ fn create_test_mesh_config() -> GatewayConfig {
                 namespace: Some("ferrum".to_string()),
             },
             service_name: "api".to_string(),
+            addresses: Vec::new(),
             ports: vec![WorkloadPort {
                 port: 8080,
                 protocol: AppProtocol::Http,
@@ -136,6 +137,8 @@ fn create_test_mesh_config() -> GatewayConfig {
             }],
             trust_domain,
             namespace: "ferrum".to_string(),
+            network: None,
+            cluster: None,
         }],
         services: vec![MeshService {
             name: "api".to_string(),
