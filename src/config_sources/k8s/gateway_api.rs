@@ -114,6 +114,7 @@ fn http_route_proxies(
     acc: &mut K8sAccumulator,
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
     let hostnames = string_array(&object.spec, "hostnames");
+    let route_kind = object.kind.to_ascii_lowercase();
     let mut proxies = Vec::new();
 
     for (rule_index, rule) in object
@@ -138,11 +139,12 @@ fn http_route_proxies(
             let backend = backends.into_iter().next().expect("one backend");
             (backend.host, backend.port, None)
         } else {
+            let route_suffix = format!("{route_kind}-{rule_index}");
             let upstream_id = resource_id(
                 "gwapi-route-upstream",
                 &object.metadata.namespace,
                 &object.metadata.name,
-                &rule_index.to_string(),
+                &route_suffix,
             );
             acc.upsert_upstream(upstream_for_route(
                 upstream_id.clone(),
@@ -155,9 +157,9 @@ fn http_route_proxies(
         let match_count = match_paths.len();
         for (match_index, listen_path) in match_paths.into_iter().enumerate() {
             let suffix = if match_count == 1 {
-                rule_index.to_string()
+                format!("{route_kind}-{rule_index}")
             } else {
-                format!("{rule_index}-{match_index}")
+                format!("{route_kind}-{rule_index}-{match_index}")
             };
             proxies.push(proxy_for_route(RouteProxySpec {
                 id: resource_id(
@@ -568,6 +570,72 @@ mod tests {
         assert_eq!(result.config.proxies[0].hosts, vec!["grpc.example.com"]);
         assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/"));
         assert_eq!(result.config.proxies[0].backend_port, 50051);
+    }
+
+    #[test]
+    fn gateway_api_weighted_upstream_ids_include_route_kind() {
+        let result = translate_k8s_objects(
+            &[
+                object(
+                    "HTTPRoute",
+                    serde_json::json!({
+                        "hostnames": ["api.example.com"],
+                        "rules": [{
+                            "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                            "backendRefs": [
+                                {"name": "api-v1", "port": 8080, "weight": 90},
+                                {"name": "api-v2", "port": 8081, "weight": 10}
+                            ]
+                        }]
+                    }),
+                ),
+                object(
+                    "GRPCRoute",
+                    serde_json::json!({
+                        "hostnames": ["grpc.example.com"],
+                        "rules": [{
+                            "matches": [
+                                {"method": {"service": "helloworld.Greeter", "method": "SayHello"}}
+                            ],
+                            "backendRefs": [
+                                {"name": "grpc-v1", "port": 50051, "weight": 90},
+                                {"name": "grpc-v2", "port": 50052, "weight": 10}
+                            ]
+                        }]
+                    }),
+                ),
+            ],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 2);
+        assert_eq!(result.config.upstreams.len(), 2);
+        assert_ne!(result.config.upstreams[0].id, result.config.upstreams[1].id);
+        assert!(
+            result
+                .config
+                .upstreams
+                .iter()
+                .any(|upstream| upstream.id.contains("httproute"))
+        );
+        assert!(
+            result
+                .config
+                .upstreams
+                .iter()
+                .any(|upstream| upstream.id.contains("grpcroute"))
+        );
+        assert_eq!(
+            result
+                .config
+                .proxies
+                .iter()
+                .filter_map(|proxy| proxy.upstream_id.as_deref())
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
     }
 
     #[test]
