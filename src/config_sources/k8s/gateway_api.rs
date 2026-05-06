@@ -124,7 +124,7 @@ fn http_route_proxies(
         .flatten()
         .enumerate()
     {
-        let match_paths = match_paths(rule);
+        let match_paths = match_paths(object, rule);
         if match_paths.is_empty() {
             continue;
         }
@@ -181,7 +181,7 @@ fn http_route_proxies(
     Ok(proxies)
 }
 
-fn match_paths(rule: &Value) -> Vec<Option<String>> {
+fn match_paths(object: &K8sObject, rule: &Value) -> Vec<Option<String>> {
     let Some(matches) = rule.get("matches").and_then(Value::as_array) else {
         return vec![Some("/".to_string())];
     };
@@ -190,6 +190,18 @@ fn match_paths(rule: &Value) -> Vec<Option<String>> {
     }
 
     let mut seen_paths = HashSet::new();
+    if object.kind == "GRPCRoute" {
+        return matches
+            .iter()
+            .map(|m| {
+                m.get("path")
+                    .and_then(http_path_match)
+                    .or_else(|| Some("/".to_string()))
+            })
+            .filter(|listen_path| seen_paths.insert(listen_path.clone()))
+            .collect();
+    }
+
     matches
         .iter()
         .filter_map(|m| m.get("path").and_then(http_path_match).map(Some))
@@ -530,6 +542,32 @@ mod tests {
 
         assert_eq!(result.config.proxies.len(), 1);
         assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/v1"));
+    }
+
+    #[test]
+    fn grpc_route_keeps_pathless_matches_as_catch_all() {
+        let result = translate_k8s_objects(
+            &[object(
+                "GRPCRoute",
+                serde_json::json!({
+                    "hostnames": ["grpc.example.com"],
+                    "rules": [{
+                        "matches": [
+                            {"method": {"service": "helloworld.Greeter", "method": "SayHello"}},
+                            {"method": {"service": "helloworld.Greeter", "method": "SayGoodbye"}}
+                        ],
+                        "backendRefs": [{"name": "grpc-api"}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].hosts, vec!["grpc.example.com"]);
+        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/"));
+        assert_eq!(result.config.proxies[0].backend_port, 50051);
     }
 
     #[test]
