@@ -318,12 +318,12 @@ async fn wait_for_initial_mesh_config(
     mesh_state: &MeshRuntimeState,
     runtime: &MeshRuntimeConfig,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<(GatewayConfig, String), anyhow::Error> {
+) -> Result<(GatewayConfig, MeshSlice), anyhow::Error> {
     let mut updates = mesh_state.subscribe();
     loop {
         if let Some(slice) = mesh_state.snapshot().as_ref().as_ref().cloned() {
             match gateway_config_from_mesh_slice(&slice, runtime) {
-                Ok(config) => return Ok((config, slice.version)),
+                Ok(config) => return Ok((config, slice)),
                 Err(e) => {
                     warn!(
                         mesh_slice_version = %slice.version,
@@ -563,7 +563,7 @@ pub async fn run(
     let grpc_tls = build_dp_grpc_tls_config(&env_config, &runtime.cp_urls, "Mesh")?;
     let mut background_handles = Vec::new();
 
-    let bootstrap_config = match runtime.config_protocol {
+    let (bootstrap_config, initial_applied_mesh_slice) = match runtime.config_protocol {
         MeshConfigProtocol::Native => {
             let client_config = runtime.native_client_config();
             let request = client_config.subscribe_request(crate::FERRUM_VERSION);
@@ -588,16 +588,16 @@ pub async fn run(
                 has_first_slice = mesh_state.has_first_slice(),
                 "Mesh mode initialized native MeshSubscribe consumer"
             );
-            let (config, mesh_slice_version) =
+            let (config, initial_slice) =
                 wait_for_initial_mesh_config(&mesh_state, &runtime, shutdown_tx.subscribe())
                     .await
                     .context("mesh runtime stopped before receiving a valid initial mesh slice")?;
             info!(
                 mesh_global_plugins = config.plugin_configs.len(),
-                mesh_slice_version = %mesh_slice_version,
+                mesh_slice_version = %initial_slice.version,
                 "Mesh global plugin chain prepared from initial native slice"
             );
-            config
+            (config, Some(initial_slice))
         }
         MeshConfigProtocol::Xds => {
             let consumer = XdsConfigConsumer::new(runtime.xds_client_config(), mesh_state.clone());
@@ -614,7 +614,7 @@ pub async fn run(
                 mesh_global_plugins = config.plugin_configs.len(),
                 "Mesh global plugin chain prepared for xDS bootstrap"
             );
-            config
+            (config, None)
         }
     };
 
@@ -624,6 +624,7 @@ pub async fn run(
         bootstrap_config,
         shutdown_tx,
         mesh_state,
+        initial_applied_mesh_slice,
         background_handles,
     )
     .await
@@ -635,6 +636,7 @@ async fn serve_mesh_runtime(
     config: GatewayConfig,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     mesh_state: MeshRuntimeState,
+    initial_applied_mesh_slice: Option<MeshSlice>,
     mesh_background_handles: Vec<JoinHandle<()>>,
 ) -> Result<(), anyhow::Error> {
     let dns_cache = DnsCache::new(DnsConfig {
@@ -726,6 +728,7 @@ async fn serve_mesh_runtime(
         mesh_state,
         proxy_state.clone(),
         runtime.clone(),
+        initial_applied_mesh_slice,
         shutdown_tx.subscribe(),
     );
 
@@ -903,37 +906,50 @@ fn start_mesh_slice_apply_task(
     mesh_state: MeshRuntimeState,
     proxy_state: ProxyState,
     runtime: MeshRuntimeConfig,
+    initial_applied_mesh_slice: Option<MeshSlice>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut updates = mesh_state.subscribe();
+        let mut last_applied_slice = initial_applied_mesh_slice;
         loop {
             if *shutdown_rx.borrow() {
                 return;
             }
 
             if let Some(slice) = mesh_state.snapshot().as_ref().as_ref().cloned() {
-                match gateway_config_from_mesh_slice(&slice, &runtime) {
-                    Ok(config) => {
-                        let applied = proxy_state.update_config(config);
-                        if applied {
-                            info!(
+                if last_applied_slice
+                    .as_ref()
+                    .is_some_and(|applied| applied.content_eq(&slice))
+                {
+                    debug!(
+                        mesh_slice_version = %slice.version,
+                        "Skipping no-op mesh slice update"
+                    );
+                } else {
+                    match gateway_config_from_mesh_slice(&slice, &runtime) {
+                        Ok(config) => {
+                            let applied = proxy_state.update_config(config);
+                            last_applied_slice = Some(slice.clone());
+                            if applied {
+                                info!(
+                                    mesh_slice_version = %slice.version,
+                                    "Applied mesh slice to proxy runtime"
+                                );
+                            } else {
+                                debug!(
+                                    mesh_slice_version = %slice.version,
+                                    "Mesh slice produced no proxy runtime changes"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
                                 mesh_slice_version = %slice.version,
-                                "Applied mesh slice to proxy runtime"
-                            );
-                        } else {
-                            debug!(
-                                mesh_slice_version = %slice.version,
-                                "Mesh slice produced no proxy runtime changes"
+                                error = %e,
+                                "Ignoring invalid mesh slice update"
                             );
                         }
-                    }
-                    Err(e) => {
-                        warn!(
-                            mesh_slice_version = %slice.version,
-                            error = %e,
-                            "Ignoring invalid mesh slice update"
-                        );
                     }
                 }
             }
@@ -1245,7 +1261,16 @@ mod tests {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let task_shutdown = shutdown_tx.clone();
         let task = tokio::spawn(async move {
-            serve_mesh_runtime(env, runtime, config, task_shutdown, mesh_state, Vec::new()).await
+            serve_mesh_runtime(
+                env,
+                runtime,
+                config,
+                task_shutdown,
+                mesh_state,
+                None,
+                Vec::new(),
+            )
+            .await
         });
 
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1641,11 +1666,11 @@ mod tests {
             ..MeshSlice::default()
         });
 
-        let (config, version) = wait
+        let (config, slice) = wait
             .await
             .expect("wait task joins")
             .expect("valid slice is accepted");
-        assert_eq!(version, "good-slice");
+        assert_eq!(slice.version, "good-slice");
         assert!(!config.plugin_configs.is_empty());
     }
 
