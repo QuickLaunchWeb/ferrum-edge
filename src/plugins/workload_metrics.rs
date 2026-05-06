@@ -249,9 +249,9 @@ fn authenticated_hbone_identity(
         return None;
     }
 
-    ctx.raw_header_get(BAGGAGE_HEADER)
-        .or_else(|| headers.get(BAGGAGE_HEADER).map(String::as_str))
-        .or_else(|| ctx.headers.get(BAGGAGE_HEADER).map(String::as_str))
+    headers
+        .get(BAGGAGE_HEADER)
+        .map(String::as_str)
         .map(HboneIdentity::from_baggage_header)
 }
 

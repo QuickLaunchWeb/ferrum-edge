@@ -239,15 +239,10 @@ async fn workload_metrics_reads_hbone_baggage_source_identity() {
     let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/ztunnel"));
     ctx.metadata
         .insert("request_protocol".to_string(), "hbone".to_string());
-    let mut raw_headers = http::HeaderMap::new();
-    raw_headers.insert(
-        "baggage",
-        "source.principal=spiffe://cluster.local/ns/default/sa/client"
-            .parse()
-            .expect("header value"),
-    );
-    ctx.set_raw_headers(raw_headers);
-    let mut headers = HashMap::new();
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/default/sa/client".to_string(),
+    )]);
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
 
@@ -295,20 +290,38 @@ async fn workload_metrics_reads_forwarded_materialized_hbone_baggage() {
 }
 
 #[tokio::test]
+async fn workload_metrics_ignores_stale_materialized_hbone_baggage() {
+    let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    ctx.headers.insert(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/default/sa/client".to_string(),
+    );
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.service_account")
+            .map(String::as_str),
+        Some("ztunnel")
+    );
+}
+
+#[tokio::test]
 async fn workload_metrics_does_not_trust_hbone_baggage_without_authenticated_peer() {
     let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
     let mut ctx = request_context(None);
     ctx.metadata
         .insert("request_protocol".to_string(), "hbone".to_string());
-    let mut raw_headers = http::HeaderMap::new();
-    raw_headers.insert(
-        "baggage",
-        "source.principal=spiffe://cluster.local/ns/default/sa/client"
-            .parse()
-            .expect("header value"),
-    );
-    ctx.set_raw_headers(raw_headers);
-    let mut headers = HashMap::new();
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/default/sa/client".to_string(),
+    )]);
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
 
