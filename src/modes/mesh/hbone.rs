@@ -34,6 +34,10 @@ impl HboneIdentity {
         Self::from_baggage(parse_baggage_header(raw))
     }
 
+    pub fn from_baggage_values<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
+        Self::from_baggage(parse_baggage_values(values))
+    }
+
     fn from_baggage(baggage: BTreeMap<String, String>) -> Self {
         let source_principal = first_baggage_value(
             &baggage,
@@ -85,19 +89,27 @@ pub fn is_hbone_connect(method: &Method, version: Version, headers: &HeaderMap) 
 }
 
 pub fn parse_baggage(headers: &HeaderMap) -> BTreeMap<String, String> {
-    let mut baggage = BTreeMap::new();
-    for value in headers.get_all(BAGGAGE_HEADER) {
-        let Ok(raw) = value.to_str() else {
-            continue;
-        };
-        parse_baggage_header_into(raw, &mut baggage);
-    }
-    baggage
+    parse_baggage_values(
+        headers
+            .get_all(BAGGAGE_HEADER)
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+    )
 }
 
 pub fn parse_baggage_header(raw: &str) -> BTreeMap<String, String> {
     let mut baggage = BTreeMap::new();
     parse_baggage_header_into(raw, &mut baggage);
+    baggage
+}
+
+pub fn parse_baggage_values<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> BTreeMap<String, String> {
+    let mut baggage = BTreeMap::new();
+    for raw in values {
+        parse_baggage_header_into(raw, &mut baggage);
+    }
     baggage
 }
 

@@ -380,6 +380,17 @@ impl RequestContext {
             .and_then(|v| v.to_str().ok())
     }
 
+    /// Iterate all values for a raw header without materializing the full
+    /// header map. Returns an empty iterator if raw headers were already
+    /// consumed.
+    #[inline]
+    pub fn raw_header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.raw_headers
+            .iter()
+            .flat_map(move |headers| headers.get_all(name).iter())
+            .filter_map(|value| value.to_str().ok())
+    }
+
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
     /// String>`). This is a one-time operation — subsequent calls are no-ops.
     /// Non-UTF-8 header values are silently skipped (same as the previous eager

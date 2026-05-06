@@ -119,6 +119,33 @@ async fn mesh_authz_reads_hbone_baggage_source_identity() {
 }
 
 #[tokio::test]
+async fn mesh_authz_reads_split_hbone_baggage_headers() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(None);
+    let mut headers = http::HeaderMap::new();
+    headers.append(
+        "baggage",
+        "destination.principal=spiffe://cluster.local/ns/default/sa/server"
+            .parse()
+            .expect("header value"),
+    );
+    headers.append(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
 async fn workload_metrics_adds_identity_metadata_without_header_changes() {
     let plugin = WorkloadMetrics::new(&json!({
         "node_id": "node-a",
@@ -209,6 +236,37 @@ async fn workload_metrics_reads_hbone_baggage_source_identity() {
             .get("mesh.connection_security_policy")
             .map(String::as_str),
         Some("mutual_tls")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_reads_split_hbone_baggage_headers() {
+    let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
+    let mut ctx = request_context(None);
+    let mut raw_headers = http::HeaderMap::new();
+    raw_headers.append(
+        "baggage",
+        "destination.principal=spiffe://cluster.local/ns/default/sa/server"
+            .parse()
+            .expect("header value"),
+    );
+    raw_headers.append(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(raw_headers);
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.service_account")
+            .map(String::as_str),
+        Some("client")
     );
 }
 
