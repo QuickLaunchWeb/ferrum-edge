@@ -1714,6 +1714,42 @@ fn test_priority_override_delegates_response_buffering_refinement() {
 }
 
 #[test]
+fn test_priority_override_delegates_request_buffering_refinement() {
+    let mut plugin_config = make_plugin_config_with_json(
+        "ps1",
+        "graphql",
+        json!({"max_depth": 4}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin_config.priority_override = Some(100);
+
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![plugin_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].priority(), 100);
+    assert!(plugins[0].requires_request_body_buffering());
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/graphql".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+
+    assert!(
+        !plugins[0].should_buffer_request_body(&ctx),
+        "priority override wrapper must preserve plugin-specific GET buffering skip"
+    );
+}
+
+#[test]
 fn test_multiple_same_type_with_different_plugins_mixed() {
     // Two stdout_logging + one cors on the same proxy — all three should be present
     let config = make_config(

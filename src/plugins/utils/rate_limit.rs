@@ -139,6 +139,9 @@ where
         }
 
         let remove_count = len.saturating_sub(max_entries);
+        // DashMap iteration order is intentionally arbitrary here. Rate-limit
+        // state is already window-bounded, so after stale entries are retained
+        // away any remaining key can be evicted to enforce the hard cap.
         let keys: Vec<K> = self
             .state
             .iter()

@@ -775,7 +775,8 @@ fn test_aws_sigv4_includes_security_token_when_present() {
         url,
         b"{}",
         &now,
-    );
+    )
+    .expect("SigV4 signing should succeed");
 
     // Should produce 4 headers (including x-amz-security-token)
     assert_eq!(headers.len(), 4);
@@ -804,7 +805,8 @@ fn test_aws_sigv4_omits_security_token_when_absent() {
         url,
         b"{}",
         &now,
-    );
+    )
+    .expect("SigV4 signing should succeed");
 
     // Should produce 3 headers (no x-amz-security-token)
     assert_eq!(headers.len(), 3);
@@ -813,6 +815,23 @@ fn test_aws_sigv4_omits_security_token_when_absent() {
     // Authorization header should NOT include x-amz-security-token in SignedHeaders
     let auth_header = headers.iter().find(|(k, _)| k == "authorization").unwrap();
     assert!(!auth_header.1.contains("x-amz-security-token"));
+}
+
+#[test]
+fn test_aws_sigv4_rejects_invalid_url() {
+    let aws_config = create_test_aws_config();
+    let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    let result = ferrum_edge::plugins::serverless_function::test_helpers::sign_aws_request_test(
+        &aws_config,
+        "not a url",
+        b"{}",
+        &now,
+    );
+
+    assert!(result.is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,7 +1021,8 @@ fn test_aws_sigv4_produces_valid_authorization_header() {
         url,
         payload,
         &now,
-    );
+    )
+    .expect("SigV4 signing should succeed");
 
     assert_eq!(headers.len(), 3);
 
@@ -1038,13 +1058,15 @@ fn test_aws_sigv4_different_payloads_produce_different_signatures() {
         url,
         b"{}",
         &now,
-    );
+    )
+    .expect("SigV4 signing should succeed");
     let headers2 = ferrum_edge::plugins::serverless_function::test_helpers::sign_aws_request_test(
         &aws_config,
         url,
         b"{\"key\":\"value\"}",
         &now,
-    );
+    )
+    .expect("SigV4 signing should succeed");
 
     let sig1 = &headers1
         .iter()

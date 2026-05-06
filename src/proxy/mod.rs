@@ -106,6 +106,8 @@ use self::http2_pool::Http2ConnectionPool;
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
+const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+
 /// Capability probes run during startup and background refresh, so they should
 /// not inherit long per-request connect timeouts that could hold readiness.
 const BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP: u64 = 5_000;
@@ -5348,10 +5350,10 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
     status_code: u16,
     response_headers: &mut HashMap<String, String>,
 ) {
-    let rejection_marker_key = "ferrum:rejection_response".to_string();
-    let previous_marker = ctx
-        .metadata
-        .insert(rejection_marker_key.clone(), "true".to_string());
+    let previous_marker = ctx.metadata.insert(
+        REJECTION_RESPONSE_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
 
     for plugin in plugins.iter().filter(|p| p.applies_after_proxy_on_reject()) {
         match plugin.after_proxy(ctx, status_code, response_headers).await {
@@ -5374,9 +5376,10 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
     }
 
     if let Some(previous_marker) = previous_marker {
-        ctx.metadata.insert(rejection_marker_key, previous_marker);
+        ctx.metadata
+            .insert(REJECTION_RESPONSE_METADATA_KEY.to_string(), previous_marker);
     } else {
-        ctx.metadata.remove(&rejection_marker_key);
+        ctx.metadata.remove(REJECTION_RESPONSE_METADATA_KEY);
     }
 }
 

@@ -476,7 +476,7 @@ impl ServerlessFunction {
                 if let Some(ref aws) = self.aws_config {
                     let now = Utc::now();
                     let auth_headers =
-                        sign_aws_request(aws, &self.function_url, &payload_bytes, &now);
+                        sign_aws_request(aws, &self.function_url, &payload_bytes, &now)?;
                     for (k, v) in &auth_headers {
                         req_builder = req_builder.header(k.as_str(), v.as_str());
                     }
@@ -655,7 +655,7 @@ fn sign_aws_request(
     url_str: &str,
     payload: &[u8],
     now: &chrono::DateTime<Utc>,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, String> {
     let config = aws_sigv4::AwsSigV4Config {
         region: aws.region.clone(),
         access_key_id: aws.access_key_id.clone(),
@@ -687,7 +687,7 @@ pub mod test_helpers {
         url: &str,
         payload: &[u8],
         now: &chrono::DateTime<Utc>,
-    ) -> Vec<(String, String)> {
+    ) -> Result<Vec<(String, String)>, String> {
         let config = aws_sigv4::AwsSigV4Config {
             region: aws_config["region"]
                 .as_str()

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 const DROP_WARN_EVERY: u64 = 100;
 pub const MAX_BATCH_SIZE: usize = 10_000;
@@ -52,6 +52,10 @@ impl<T: Send + 'static> BatchingLogger<T> {
         let batch_size = cfg.batch_size.clamp(1, MAX_BATCH_SIZE);
         let buffer_capacity = cfg.buffer_capacity.clamp(1, MAX_BUFFER_CAPACITY);
         let flush_interval = if cfg.flush_interval.is_zero() {
+            debug!(
+                plugin = cfg.plugin_name,
+                "{}: zero batch flush interval requested; clamping to 1ms", cfg.plugin_name,
+            );
             Duration::from_millis(1)
         } else {
             cfg.flush_interval

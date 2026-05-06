@@ -21,6 +21,7 @@ pub struct AwsSigV4Config {
 /// URI-encode a string per AWS SigV4 rules.
 /// When `encode_slash` is false, forward slashes are preserved (for URI paths).
 pub fn uri_encode(input: &str, encode_slash: bool) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut result = String::with_capacity(input.len() * 2);
     for byte in input.bytes() {
         match byte {
@@ -31,7 +32,9 @@ pub fn uri_encode(input: &str, encode_slash: bool) -> String {
                 result.push('/');
             }
             _ => {
-                result.push_str(&format!("%{:02X}", byte));
+                result.push('%');
+                result.push(HEX[(byte >> 4) as usize] as char);
+                result.push(HEX[(byte & 0x0f) as usize] as char);
             }
         }
     }
@@ -46,21 +49,24 @@ pub fn sha256_hex(data: &[u8]) -> String {
 }
 
 /// HMAC-SHA256 keyed hash.
-pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
-        tracing::error!("HMAC-SHA256 rejected a key length that should be accepted");
-        return Vec::new();
-    };
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut mac = HmacSha256::new_from_slice(key)
+        .map_err(|_| "HMAC-SHA256 rejected a key length that should be accepted".to_string())?;
     mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+    Ok(mac.finalize().into_bytes().to_vec())
 }
 
 /// Derive the SigV4 signing key:
 /// `HMAC(HMAC(HMAC(HMAC("AWS4"+secret, date), region), service), "aws4_request")`
-pub fn derive_signing_key(secret: &str, date_stamp: &str, region: &str, service: &str) -> Vec<u8> {
-    let k_date = hmac_sha256(format!("AWS4{}", secret).as_bytes(), date_stamp.as_bytes());
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, service.as_bytes());
+pub fn derive_signing_key(
+    secret: &str,
+    date_stamp: &str,
+    region: &str,
+    service: &str,
+) -> Result<Vec<u8>, String> {
+    let k_date = hmac_sha256(format!("AWS4{}", secret).as_bytes(), date_stamp.as_bytes())?;
+    let k_region = hmac_sha256(&k_date, region.as_bytes())?;
+    let k_service = hmac_sha256(&k_region, service.as_bytes())?;
     hmac_sha256(&k_service, b"aws4_request")
 }
 
@@ -85,19 +91,17 @@ pub fn sign_request(
     content_type: &str,
     payload: &[u8],
     now: &chrono::DateTime<chrono::Utc>,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, String> {
     let date_stamp = now.format("%Y%m%d").to_string();
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
 
-    let parsed_url = match Url::parse(url_str) {
-        Ok(u) => u,
-        Err(_) => return Vec::new(),
-    };
+    let parsed_url =
+        Url::parse(url_str).map_err(|e| format!("AWS SigV4 invalid request URL: {e}"))?;
 
-    let host = match parsed_url.host_str() {
-        Some(h) => h.to_string(),
-        None => return Vec::new(),
-    };
+    let host = parsed_url
+        .host_str()
+        .ok_or_else(|| "AWS SigV4 request URL must include a host".to_string())?
+        .to_string();
 
     let canonical_uri = uri_encode(parsed_url.path(), false);
     let canonical_querystring = parsed_url.query().unwrap_or("");
@@ -151,8 +155,8 @@ pub fn sign_request(
         &date_stamp,
         &config.region,
         service,
-    );
-    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+    )?;
+    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes())?);
 
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
@@ -169,5 +173,5 @@ pub fn sign_request(
         headers.push(("x-amz-security-token".to_string(), token.clone()));
     }
 
-    headers
+    Ok(headers)
 }

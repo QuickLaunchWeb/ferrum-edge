@@ -1657,7 +1657,7 @@ impl AiFederation {
 
             AuthMethod::AwsSigV4 { config } => {
                 let now = Utc::now();
-                Ok(aws_sigv4::sign_request(
+                aws_sigv4::sign_request(
                     config,
                     "bedrock",
                     "POST",
@@ -1665,7 +1665,7 @@ impl AiFederation {
                     "application/json",
                     payload,
                     &now,
-                ))
+                )
             }
 
             AuthMethod::GoogleOAuth2 { cache } => {
