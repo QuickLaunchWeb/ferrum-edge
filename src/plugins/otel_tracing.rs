@@ -60,6 +60,7 @@ struct SpanData {
     error_class: Option<String>,
     response_streamed: bool,
     client_disconnected: bool,
+    mesh_attributes: Vec<(String, String)>,
 }
 
 impl OtelTracing {
@@ -387,6 +388,7 @@ impl Plugin for OtelTracing {
                 error_class: summary.error_class.as_ref().map(|e| format!("{e:?}")),
                 response_streamed: summary.response_streamed,
                 client_disconnected: summary.client_disconnected,
+                mesh_attributes: mesh_trace_attributes(&summary.metadata),
             };
 
             if sender.try_send(span_data).is_err() {
@@ -611,6 +613,9 @@ fn build_otlp_payload(
             if s.client_disconnected {
                 attributes.push(otlp_attribute_bool("gateway.client.disconnected", true));
             }
+            for (key, value) in &s.mesh_attributes {
+                attributes.push(otlp_attribute(key, value));
+            }
 
             // Build span events for error conditions
             let mut events = Vec::new();
@@ -718,6 +723,16 @@ fn otlp_attribute_bool(key: &str, value: bool) -> Value {
     })
 }
 
+fn mesh_trace_attributes(metadata: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut attributes: Vec<_> = metadata
+        .iter()
+        .filter(|(key, _)| key.starts_with("mesh."))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    attributes.sort_by(|left, right| left.0.cmp(&right.0));
+    attributes
+}
+
 /// Convert a hex string to base64-encoded bytes (OTLP/HTTP JSON encoding).
 ///
 /// Per the OpenTelemetry spec, `traceId` (16 bytes / 32 hex chars) and
@@ -784,5 +799,60 @@ mod tests {
         // Non-hex chars are filtered out via from_str_radix Err.
         let encoded = hex_to_base64("XX");
         assert_eq!(encoded, ""); // no valid bytes decoded
+    }
+
+    #[test]
+    fn otlp_payload_includes_mesh_identity_attributes() {
+        let span = SpanData {
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+            span_id: "00f067aa0ba902b7".to_string(),
+            parent_span_id: String::new(),
+            service_name: "ferrum-edge".to_string(),
+            http_method: "GET".to_string(),
+            http_url: "/".to_string(),
+            http_status_code: 200,
+            client_ip: "127.0.0.1".to_string(),
+            duration_ms: 10.0,
+            gateway_processing_ms: 1.0,
+            backend_ttfb_ms: 2.0,
+            backend_ms: 3.0,
+            plugin_execution_ms: 1.0,
+            gateway_overhead_ms: 1.0,
+            consumer: None,
+            timestamp_received: "2025-01-01T00:00:00Z".to_string(),
+            user_agent: None,
+            proxy_id: Some("proxy-a".to_string()),
+            matched_route: Some("payments".to_string()),
+            backend_target_url: None,
+            backend_resolved_ip: None,
+            error_class: None,
+            response_streamed: false,
+            client_disconnected: false,
+            mesh_attributes: vec![
+                (
+                    "mesh.source.principal".to_string(),
+                    "spiffe://cluster.local/ns/default/sa/frontend".to_string(),
+                ),
+                (
+                    "mesh.destination.service".to_string(),
+                    "payments".to_string(),
+                ),
+            ],
+        };
+
+        let payload = build_otlp_payload("ferrum-edge", None, &[span]);
+        let attributes = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap();
+
+        assert!(attributes.iter().any(|attribute| {
+            attribute["key"] == "mesh.source.principal"
+                && attribute["value"]["stringValue"]
+                    == "spiffe://cluster.local/ns/default/sa/frontend"
+        }));
+        assert!(attributes.iter().any(|attribute| {
+            attribute["key"] == "mesh.destination.service"
+                && attribute["value"]["stringValue"] == "payments"
+        }));
     }
 }

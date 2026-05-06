@@ -34,6 +34,8 @@ spec:
               containerPort: {{ .Values.ambient.outboundPort }}
             - name: inbound
               containerPort: {{ .Values.ambient.inboundPort }}
+            - name: hbone
+              containerPort: {{ .Values.ambient.hbonePort }}
           env:
             - name: FERRUM_MESH_CAPTURE_MODE
               value: {{ .Values.ambient.captureMode | quote }}
