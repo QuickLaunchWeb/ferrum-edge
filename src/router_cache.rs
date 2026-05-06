@@ -1195,8 +1195,15 @@ fn is_regex_proxy(proxy: &Proxy) -> bool {
 }
 
 fn exact_path_from_k8s_regex_marker(pattern: &str) -> Option<String> {
-    let escaped = pattern.strip_prefix("(?:")?.strip_suffix(')')?;
-    unescape_regex_literal(escaped)
+    let escaped = pattern
+        .strip_prefix("(?P<__ferrum_k8s_exact_path>")?
+        .strip_suffix(')')?;
+    let literal = unescape_regex_literal(escaped)?;
+    if regex::escape(&literal) == escaped {
+        Some(literal)
+    } else {
+        None
+    }
 }
 
 fn unescape_regex_literal(escaped: &str) -> Option<String> {
@@ -1561,7 +1568,7 @@ mod tests {
         let config = GatewayConfig {
             proxies: vec![
                 minimal_proxy_for_routing("root-prefix", "/"),
-                minimal_proxy_for_routing("exact", "~(?:/api\\.v1)"),
+                minimal_proxy_for_routing("exact", "~(?P<__ferrum_k8s_exact_path>/api\\.v1)"),
             ],
             ..GatewayConfig::default()
         };
@@ -1581,6 +1588,25 @@ mod tests {
             .find_proxy(None, "/api.v1/users")
             .expect("child path should fall back to prefix");
         assert_eq!(child.proxy.id, "root-prefix");
+    }
+
+    #[test]
+    fn noncapturing_group_regex_routes_stay_in_regex_tier() {
+        let config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("regex", "~(?:/api|/admin)")],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+
+        let api = cache
+            .find_proxy(None, "/api")
+            .expect("non-capturing group regex should match /api");
+        assert_eq!(api.proxy.id, "regex");
+
+        let admin = cache
+            .find_proxy(None, "/admin")
+            .expect("non-capturing group regex should match /admin");
+        assert_eq!(admin.proxy.id, "regex");
     }
 
     #[test]

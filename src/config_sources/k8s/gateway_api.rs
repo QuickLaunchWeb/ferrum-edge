@@ -355,7 +355,7 @@ mod tests {
 
         assert_eq!(
             result.config.proxies[0].listen_path.as_deref(),
-            Some("~(?:/api\\.v1)")
+            Some("~(?P<__ferrum_k8s_exact_path>/api\\.v1)")
         );
         assert!(!result.config.proxies[0].strip_listen_path);
     }
