@@ -160,6 +160,8 @@ Mesh mode consumes Layer 2 mesh slices from the control protocols and prepares t
 | `FERRUM_MESH_CAPTURE_MODE` | No | `explicit` | Traffic capture mode used by injector/capture planning: `explicit`, `iptables`, or `ebpf`. eBPF always falls back to iptables when unsupported |
 | `FERRUM_MESH_PROXY_UID` | No | `1337` in injector patches | UID used to exempt Ferrum's own outbound traffic from iptables capture |
 
+Capture plans reserve proxy UID `1337` by default so Ferrum's own outbound traffic is excluded from redirect rules even when the operator does not set `FERRUM_MESH_PROXY_UID`. The eBPF capture plan carries an iptables fallback with the same UID exclusion and redirect ports.
+
 Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Prometheus plugin when mesh metadata is present. The added series are `ferrum_mesh_requests_total` and `ferrum_mesh_request_duration_ms`, labelled with source/destination workload, namespace, principal, app, service, request protocol, response code, response flags, and connection security policy.
 
 Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the canonical config. Remote clusters carry trust domains and federation endpoints, VM `WorkloadEntry` resources populate workload addresses/network/cluster metadata, and east-west gateway entries are materialized as SNI-routed passthrough stream proxies only in `east_west_gateway` topology.
