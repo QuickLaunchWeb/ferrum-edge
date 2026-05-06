@@ -147,6 +147,8 @@ See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_
 
 Mesh mode consumes Layer 2 mesh slices from the control protocols and prepares the shared sidecar/ambient data-plane listeners. Non-mesh modes do not instantiate this runtime.
 
+xDS snapshots are versioned from both the upstream slice/config version and a hash of translated resource content. This lets the xDS server rebuild and publish a new snapshot when resources change under the same source timestamp or base version.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_MESH_CONFIG_PROTOCOL` | No | `native` | Mesh config source: `native` for Ferrum `MeshSubscribe`, `xds` for ADS |
