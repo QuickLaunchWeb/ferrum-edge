@@ -11,7 +11,8 @@ use crate::identity::spiffe::SpiffeId;
 
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, RouteProxySpec, SourceKind, invalid_resource,
-    proxy_for_route, resource_id, selector_from_istio, string_array, string_field, string_map,
+    optional_port_field, port_from_u64, proxy_for_route, resource_id, selector_from_istio,
+    string_array, string_field, string_map,
 };
 use crate::config::types::BackendScheme;
 
@@ -234,27 +235,38 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
         return Err(invalid_resource(object, "ServiceEntry requires spec.hosts"));
     }
 
-    let endpoints = object
+    let mut endpoints = Vec::new();
+    for endpoint in object
         .spec
         .get("endpoints")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|endpoint| {
-            Some(MeshEndpoint {
-                address: string_field(endpoint, "address")?.to_string(),
-                ports: endpoint
-                    .get("ports")
-                    .and_then(Value::as_object)
-                    .into_iter()
-                    .flat_map(|ports| ports.iter())
-                    .filter_map(|(name, port)| port.as_u64().map(|p| (name.clone(), p as u16)))
-                    .collect(),
-                labels: endpoint.get("labels").map(string_map).unwrap_or_default(),
-                network: string_field(endpoint, "network").map(ToOwned::to_owned),
-            })
-        })
-        .collect();
+    {
+        let Some(address) = string_field(endpoint, "address") else {
+            continue;
+        };
+        let mut ports = HashMap::new();
+        for (name, port) in endpoint
+            .get("ports")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|ports| ports.iter())
+        {
+            if let Some(raw_port) = port.as_u64() {
+                ports.insert(
+                    name.clone(),
+                    port_from_u64(object, raw_port, "endpoints[].ports")?,
+                );
+            }
+        }
+        endpoints.push(MeshEndpoint {
+            address: address.to_string(),
+            ports,
+            labels: endpoint.get("labels").map(string_map).unwrap_or_default(),
+            network: string_field(endpoint, "network").map(ToOwned::to_owned),
+        });
+    }
 
     Ok(ServiceEntry {
         name: object.metadata.name.clone(),
@@ -270,7 +282,7 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
             "MESH_INTERNAL" => ServiceEntryLocation::MeshInternal,
             _ => ServiceEntryLocation::MeshExternal,
         },
-        ports: service_ports(&object.spec),
+        ports: service_ports(object)?,
     })
 }
 
@@ -299,7 +311,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         addresses: string_field(&object.spec, "address")
             .map(|address| vec![address.to_string()])
             .unwrap_or_default(),
-        ports: workload_ports(&object.spec),
+        ports: workload_ports(object)?,
         trust_domain: acc.options.trust_domain.clone(),
         namespace: object.metadata.namespace.clone(),
         network: string_field(&object.spec, "network").map(ToOwned::to_owned),
@@ -337,11 +349,12 @@ fn virtual_service_routes(
                 "VirtualService route.destination.host is required",
             ));
         };
-        let port = destination
-            .get("port")
-            .and_then(|p| p.get("number"))
-            .and_then(Value::as_u64)
-            .unwrap_or(80) as u16;
+        let port = optional_port_field(
+            object,
+            destination.get("port").and_then(|p| p.get("number")),
+            "route.destination.port.number",
+        )?
+        .unwrap_or(80);
 
         let listen_path = http
             .get("match")
@@ -376,34 +389,48 @@ fn path_match(uri: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn service_ports(spec: &Value) -> Vec<ServicePort> {
-    spec.get("ports")
+fn service_ports(object: &K8sObject) -> Result<Vec<ServicePort>, K8sTranslateError> {
+    let mut ports = Vec::new();
+    object
+        .spec
+        .get("ports")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|port| {
-            Some(ServicePort {
-                port: port.get("number").and_then(Value::as_u64)? as u16,
+        .try_for_each(|port| {
+            let Some(raw_port) = port.get("number").and_then(Value::as_u64) else {
+                return Ok(());
+            };
+            ports.push(ServicePort {
+                port: port_from_u64(object, raw_port, "ports[].number")?,
                 protocol: app_protocol(string_field(port, "protocol")),
                 name: string_field(port, "name").map(ToOwned::to_owned),
-            })
-        })
-        .collect()
+            });
+            Ok::<(), K8sTranslateError>(())
+        })?;
+    Ok(ports)
 }
 
-fn workload_ports(spec: &Value) -> Vec<WorkloadPort> {
-    spec.get("ports")
+fn workload_ports(object: &K8sObject) -> Result<Vec<WorkloadPort>, K8sTranslateError> {
+    let mut workload_ports = Vec::new();
+    object
+        .spec
+        .get("ports")
         .and_then(Value::as_object)
         .into_iter()
         .flat_map(|ports| ports.iter())
-        .filter_map(|(name, port)| {
-            Some(WorkloadPort {
-                port: port.as_u64()? as u16,
+        .try_for_each(|(name, port)| {
+            let Some(raw_port) = port.as_u64() else {
+                return Ok(());
+            };
+            workload_ports.push(WorkloadPort {
+                port: port_from_u64(object, raw_port, "ports")?,
                 protocol: AppProtocol::Unknown,
                 name: Some(name.clone()),
-            })
-        })
-        .collect()
+            });
+            Ok::<(), K8sTranslateError>(())
+        })?;
+    Ok(workload_ports)
 }
 
 fn app_protocol(value: Option<&str>) -> AppProtocol {
@@ -490,6 +517,24 @@ mod tests {
         let mesh = result.config.mesh.expect("mesh config");
         assert_eq!(mesh.service_entries[0].hosts, vec!["api.example.com"]);
         assert_eq!(mesh.service_entries[0].ports[0].protocol, AppProtocol::Tls);
+    }
+
+    #[test]
+    fn rejects_istio_ports_outside_kubernetes_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "ServiceEntry",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "ports": [{"number": 70000, "name": "http", "protocol": "HTTP"}]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid port must fail closed");
+
+        assert!(err.to_string().contains("ports[].number"));
+        assert!(err.to_string().contains("70000"));
     }
 
     #[test]
