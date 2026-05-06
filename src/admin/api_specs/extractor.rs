@@ -825,7 +825,8 @@ fn reject_yaml_alias_or_anchor_syntax(body: &[u8]) -> Result<(), ExtractError> {
     let mut in_single_quote = false;
     let mut in_double_quote = false;
     let mut escaped = false;
-    let mut previous_plain_byte: Option<u8> = None;
+    let mut flow_depth: usize = 0;
+    let mut expect_node_start = true;
     let mut i = 0;
     let mut block_scalar_min_indent: Option<usize> = None;
 
@@ -853,7 +854,6 @@ fn reject_yaml_alias_or_anchor_syntax(body: &[u8]) -> Result<(), ExtractError> {
 
         if let Some(min_indent) = block_scalar_min_indent {
             if line_blank || indent >= min_indent {
-                previous_plain_byte = Some(b'\n');
                 i = next_line_start;
                 continue;
             }
@@ -861,6 +861,9 @@ fn reject_yaml_alias_or_anchor_syntax(body: &[u8]) -> Result<(), ExtractError> {
         }
 
         let mut j = line_start;
+        if flow_depth == 0 {
+            expect_node_start = true;
+        }
         while j < line_end {
             let byte = body[j];
 
@@ -871,7 +874,7 @@ fn reject_yaml_alias_or_anchor_syntax(body: &[u8]) -> Result<(), ExtractError> {
                         continue;
                     }
                     in_single_quote = false;
-                    previous_plain_byte = Some(byte);
+                    expect_node_start = false;
                 }
                 j += 1;
                 continue;
@@ -887,7 +890,7 @@ fn reject_yaml_alias_or_anchor_syntax(body: &[u8]) -> Result<(), ExtractError> {
                     b'\\' => escaped = true,
                     b'"' => {
                         in_double_quote = false;
-                        previous_plain_byte = Some(byte);
+                        expect_node_start = false;
                     }
                     _ => {}
                 }
@@ -901,11 +904,11 @@ fn reject_yaml_alias_or_anchor_syntax(body: &[u8]) -> Result<(), ExtractError> {
                 }
                 b'\'' => {
                     in_single_quote = true;
-                    previous_plain_byte = Some(byte);
+                    expect_node_start = false;
                 }
                 b'"' => {
                     in_double_quote = true;
-                    previous_plain_byte = Some(byte);
+                    expect_node_start = false;
                 }
                 b'|' | b'>'
                     if yaml_block_scalar_header_min_indent(line, j - line_start, indent)
@@ -916,7 +919,7 @@ fn reject_yaml_alias_or_anchor_syntax(body: &[u8]) -> Result<(), ExtractError> {
                     break;
                 }
                 b'&' | b'*'
-                    if yaml_indicator_can_start_after(previous_plain_byte)
+                    if expect_node_start
                         && body
                             .get(j + 1)
                             .copied()
@@ -927,17 +930,37 @@ fn reject_yaml_alias_or_anchor_syntax(body: &[u8]) -> Result<(), ExtractError> {
                         char::from(byte)
                     )));
                 }
+                b'[' | b'{' if expect_node_start => {
+                    flow_depth += 1;
+                    expect_node_start = true;
+                }
+                b']' | b'}' if flow_depth > 0 => {
+                    flow_depth -= 1;
+                    expect_node_start = false;
+                }
+                b',' if flow_depth > 0 => {
+                    expect_node_start = true;
+                }
+                b':' if yaml_colon_is_mapping_separator(line, j - line_start) => {
+                    expect_node_start = true;
+                }
+                b'-' if expect_node_start
+                    && line
+                        .get(j - line_start + 1)
+                        .copied()
+                        .is_none_or(|next| next.is_ascii_whitespace()) =>
+                {
+                    expect_node_start = true;
+                }
+                byte if byte.is_ascii_whitespace() => {}
                 _ => {
-                    previous_plain_byte = Some(byte);
+                    expect_node_start = false;
                 }
             }
 
             j += 1;
         }
 
-        if next_line_start > line_end {
-            previous_plain_byte = Some(b'\n');
-        }
         i = next_line_start;
     }
 
@@ -994,13 +1017,10 @@ fn yaml_block_scalar_header_min_indent(
     Some(line_indent + explicit_indent.unwrap_or(1))
 }
 
-fn yaml_indicator_can_start_after(previous: Option<u8>) -> bool {
-    match previous {
-        None => true,
-        Some(byte) if byte.is_ascii_whitespace() => true,
-        Some(b'[' | b'{' | b',' | b':' | b'-' | b'?') => true,
-        _ => false,
-    }
+fn yaml_colon_is_mapping_separator(line: &[u8], colon_idx: usize) -> bool {
+    line.get(colon_idx + 1)
+        .copied()
+        .is_none_or(|next| next.is_ascii_whitespace() || matches!(next, b'#' | b',' | b']' | b'}'))
 }
 
 fn is_yaml_anchor_name_byte(byte: u8) -> bool {
@@ -2461,6 +2481,36 @@ x-ferrum-proxy:
         .as_bytes();
         let (bundle, _meta) = extract(yaml, Some(SpecFormat::Yaml), "default").unwrap();
         assert_eq!(bundle.proxy.id, "test");
+    }
+
+    #[test]
+    fn yaml_anchor_like_text_in_plain_scalars_allowed() {
+        let yaml = concat!(
+            "openapi: 3.1.0\n",
+            "info:\n",
+            "  title: Terms & Conditions\n",
+            "  version: 1.0\n",
+            "  description: Use *bold* text and https://example.com?a=1&b=2 literally.\n",
+            "servers:\n",
+            "  - url: https://example.com?a=1&b=2\n",
+            "x-ferrum-proxy:\n",
+            "  id: test\n",
+            "  backend_host: x.com\n",
+            "  backend_port: 443",
+        )
+        .as_bytes();
+        let (bundle, meta) = extract(yaml, Some(SpecFormat::Yaml), "default").unwrap();
+        assert_eq!(bundle.proxy.id, "test");
+        assert_eq!(meta.title.as_deref(), Some("Terms & Conditions"));
+        assert!(
+            meta.description
+                .as_deref()
+                .is_some_and(|desc| desc.contains("*bold*"))
+        );
+        assert_eq!(
+            meta.server_urls,
+            vec!["https://example.com?a=1&b=2".to_string()]
+        );
     }
 
     #[test]

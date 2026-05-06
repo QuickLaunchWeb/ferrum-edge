@@ -3340,16 +3340,15 @@ mod inner {
             Ok(namespaces)
         }
 
-        /// Returns `true` when a MongoDB replica set is configured, enabling
-        /// multi-document transactions. Without a replica set, MongoDB does not
-        /// support transactions (server-side error on `start_transaction`).
         /// Returns `true` when a MongoDB replica set was configured at `connect()` time.
         ///
         /// The official `mongodb` Rust driver does not expose `repl_set_name` as a
-        /// `Client` method. Instead, the `MongoStore` constructor encodes the presence
-        /// of a replica set in `db_type_str` by using the suffix `"+rs"` whenever
-        /// the caller passes a non-`None` `replica_set` argument. This avoids an
-        /// extra server round-trip on every method call.
+        /// `Client` method. Instead, the `MongoStore` constructor and reconnect
+        /// path update this atomic from the effective `ClientOptions::repl_set_name`.
+        /// API-spec writes use this helper to decide whether multi-document
+        /// transactions are available. Without a replica set, MongoDB does not
+        /// support transactions (server-side error on `start_transaction`).
+        ///
         /// Detection is env-var-based only (`FERRUM_MONGO_REPLICA_SET`).  A
         /// user pointing at an actual replica set without setting the env var
         /// silently falls into the compensating-delete path.  A startup
@@ -3357,7 +3356,7 @@ mod inner {
         /// is the documented contract and false-negative is safe (just slower
         /// and less atomic).
         fn replica_set_configured(&self) -> bool {
-            self.db_type_str.ends_with("+rs")
+            self.replica_set_configured.load(Ordering::Acquire)
         }
 
         async fn ensure_api_spec_standalone_replace_ids_available(
@@ -4299,6 +4298,29 @@ mod inner {
         fn resolve_replica_set_configured_named_replica_set_enables_transactions() {
             assert!(resolve_replica_set_configured(Some("rs0")));
             assert!(resolve_replica_set_configured(Some("ferrum-cluster")));
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn api_spec_replica_set_helper_uses_atomic_state() {
+            let store = make_test_store(vec![]);
+
+            assert!(
+                !store.replica_set_configured(),
+                "fresh test store should default to standalone MongoDB semantics"
+            );
+
+            store.replica_set_configured.store(true, Ordering::Release);
+
+            assert!(
+                store.replica_set_configured(),
+                "API-spec transaction branch detection must follow the atomic \
+                 replica-set state updated by connect/reconnect, not db_type_str"
+            );
+            assert_eq!(
+                store.db_type_str, "mongodb",
+                "db_type_str intentionally remains the backend name and must not \
+                 be the replica-set source of truth"
+            );
         }
 
         // -------------------------------------------------------------------
