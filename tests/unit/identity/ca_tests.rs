@@ -27,6 +27,14 @@ fn dev_root(td: &str) -> bootstrap::BootstrappedRoot {
     dev_root_inside_guard(td, &guard)
 }
 
+fn leaf_not_after(cert_der: &[u8]) -> chrono::DateTime<chrono::Utc> {
+    use x509_parser::prelude::*;
+
+    let (_, parsed) = X509Certificate::from_der(cert_der).expect("issued cert parses");
+    chrono::DateTime::<chrono::Utc>::from_timestamp(parsed.validity().not_after.timestamp(), 0)
+        .expect("issued cert validity is representable")
+}
+
 #[test]
 fn bootstrap_emits_pem_root() {
     let root = dev_root("td.test");
@@ -96,6 +104,41 @@ async fn internal_ca_signs_generate_request() {
         ferrum_edge::identity::spiffe::extract_spiffe_id_from_cert(&svid.cert_chain_der[0])
             .expect("issued cert has SPIFFE URI SAN");
     assert_eq!(extracted.as_str(), id.as_str());
+    assert_eq!(svid.not_after, leaf_not_after(&svid.cert_chain_der[0]));
+}
+
+#[tokio::test]
+async fn internal_ca_csr_svid_not_after_matches_leaf_cert() {
+    let root = dev_root("td.internal-ca-csr-test");
+    let trust_domain = TrustDomain::new("td.internal-ca-csr-test").unwrap();
+    let cfg = internal::InternalCaConfig {
+        root_cert_pem: root.root_cert_pem,
+        root_key_pem: root.root_key_pem,
+        trust_domain: trust_domain.clone(),
+        bundle_refresh_hint_secs: Some(60),
+        default_svid_ttl_secs: 600,
+        max_svid_ttl_secs: 3600,
+    };
+    let ca = internal::InternalCa::new(cfg).expect("CA initialised");
+
+    let csr_key =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("CSR key generated");
+    let csr = rcgen::CertificateParams::default()
+        .serialize_request(&csr_key)
+        .expect("CSR generated");
+    let id = SpiffeId::from_parts(&trust_domain, "ns/test/sa/csr").unwrap();
+    let svid = ca
+        .issue_svid(IssuanceRequest::Csr {
+            csr_der: csr.der().as_ref().to_vec(),
+            spiffe_id: id.clone(),
+            ttl_secs: 600,
+        })
+        .await
+        .expect("CSR issuance succeeds");
+
+    assert_eq!(svid.spiffe_id, id);
+    assert!(svid.private_key_pkcs8_der.is_empty());
+    assert_eq!(svid.not_after, leaf_not_after(&svid.cert_chain_der[0]));
 }
 
 #[tokio::test]
