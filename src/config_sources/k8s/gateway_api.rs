@@ -58,6 +58,7 @@ pub(super) fn collect_reference_grant(
         let from_namespace = string_field(from, "namespace").ok_or_else(|| {
             invalid_resource(object, "ReferenceGrant spec.from[].namespace is required")
         })?;
+        let from_group = string_field(from, "group").unwrap_or_default();
         let from_kind = string_field(from, "kind").ok_or_else(|| {
             invalid_resource(object, "ReferenceGrant spec.from[].kind is required")
         })?;
@@ -72,10 +73,13 @@ pub(super) fn collect_reference_grant(
             let to_kind = string_field(to, "kind").ok_or_else(|| {
                 invalid_resource(object, "ReferenceGrant spec.to[].kind is required")
             })?;
+            let to_group = string_field(to, "group").unwrap_or_default();
             acc.add_reference_grant(
                 from_namespace.to_string(),
+                from_group.to_string(),
                 from_kind.to_string(),
                 object.metadata.namespace.clone(),
+                to_group.to_string(),
                 to_kind.to_string(),
             );
         }
@@ -222,15 +226,20 @@ fn checked_backend_namespace(
 ) -> Result<String, K8sTranslateError> {
     let backend_namespace =
         string_field(backend_ref, "namespace").unwrap_or(&object.metadata.namespace);
+    let to_group = string_field(backend_ref, "group").unwrap_or_default();
+    let to_kind = string_field(backend_ref, "kind").unwrap_or("Service");
+    validate_supported_backend_ref(object, to_group, to_kind)?;
+
     if backend_namespace == object.metadata.namespace {
         return Ok(backend_namespace.to_string());
     }
 
-    let to_kind = string_field(backend_ref, "kind").unwrap_or("Service");
     if acc.reference_grant_allows(
         &object.metadata.namespace,
+        api_group(&object.api_version),
         from_kind,
         backend_namespace,
+        to_group,
         to_kind,
     ) {
         Ok(backend_namespace.to_string())
@@ -243,6 +252,31 @@ fn checked_backend_namespace(
             ),
         ))
     }
+}
+
+fn validate_supported_backend_ref(
+    object: &K8sObject,
+    to_group: &str,
+    to_kind: &str,
+) -> Result<(), K8sTranslateError> {
+    if to_group.is_empty() && to_kind == "Service" {
+        return Ok(());
+    }
+
+    Err(invalid_resource(
+        object,
+        format!(
+            "unsupported backendRef target group '{}' kind '{}'; only core Service backendRefs are supported",
+            to_group, to_kind
+        ),
+    ))
+}
+
+fn api_group(api_version: &str) -> &str {
+    api_version
+        .split_once('/')
+        .map(|(group, _version)| group)
+        .unwrap_or_default()
 }
 
 fn first_backend_ref(rule: &Value) -> Option<&Value> {
@@ -376,6 +410,111 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("requires a matching ReferenceGrant")
+        );
+    }
+
+    #[test]
+    fn rejects_cross_namespace_backend_ref_when_reference_grant_from_group_mismatches() {
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "backendRefs": [{
+                        "name": "api",
+                        "namespace": "backend",
+                        "port": 8080
+                    }]
+                }]
+            }),
+        );
+        let grant = object_in_namespace(
+            "ReferenceGrant",
+            "backend",
+            serde_json::json!({
+                "from": [{
+                    "group": "",
+                    "kind": "HTTPRoute",
+                    "namespace": "default"
+                }],
+                "to": [{
+                    "group": "",
+                    "kind": "Service"
+                }]
+            }),
+        );
+
+        let err = translate_k8s_objects(&[route, grant], options())
+            .expect_err("ReferenceGrant group must match route API group");
+
+        assert!(
+            err.to_string()
+                .contains("requires a matching ReferenceGrant")
+        );
+    }
+
+    #[test]
+    fn rejects_cross_namespace_backend_ref_when_reference_grant_to_group_mismatches() {
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "backendRefs": [{
+                        "name": "api",
+                        "namespace": "backend",
+                        "port": 8080
+                    }]
+                }]
+            }),
+        );
+        let grant = object_in_namespace(
+            "ReferenceGrant",
+            "backend",
+            serde_json::json!({
+                "from": [{
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "HTTPRoute",
+                    "namespace": "default"
+                }],
+                "to": [{
+                    "group": "example.com",
+                    "kind": "Service"
+                }]
+            }),
+        );
+
+        let err = translate_k8s_objects(&[route, grant], options())
+            .expect_err("ReferenceGrant target group must match backendRef group");
+
+        assert!(
+            err.to_string()
+                .contains("requires a matching ReferenceGrant")
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_backend_ref_kind() {
+        let err = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [{
+                            "group": "example.com",
+                            "kind": "Backend",
+                            "name": "api",
+                            "namespace": "default",
+                            "port": 8080
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("non-Service backendRefs must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("only core Service backendRefs are supported")
         );
     }
 
