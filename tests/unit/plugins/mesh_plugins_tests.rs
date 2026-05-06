@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ferrum_edge::config::mesh::{
-    MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, WorkloadSelector,
+    MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch, WorkloadSelector,
 };
 use ferrum_edge::config::types::Proxy;
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
@@ -31,6 +31,25 @@ fn allow_client_policy(action: PolicyAction) -> MeshPolicy {
             to: Vec::new(),
             when: Vec::new(),
             action,
+        }],
+    }
+}
+
+fn allow_host_policy(host: &str) -> MeshPolicy {
+    MeshPolicy {
+        name: "host-policy".to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector::default(),
+        },
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: vec![RequestMatch {
+                hosts: vec![host.to_string()],
+                ..RequestMatch::default()
+            }],
+            when: Vec::new(),
+            action: PolicyAction::Allow,
         }],
     }
 }
@@ -112,6 +131,21 @@ async fn mesh_authz_reads_hbone_baggage_source_identity() {
             .expect("header value"),
     );
     ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn mesh_authz_uses_materialized_host_backfilled_from_authority() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_host_policy("api.example.com")]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(None);
+    ctx.headers
+        .insert("host".to_string(), "api.example.com".to_string());
 
     let result = plugin.authorize(&mut ctx).await;
 

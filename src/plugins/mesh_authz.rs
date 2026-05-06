@@ -78,11 +78,10 @@ impl Plugin for MeshAuthz {
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         let source_principal = source_principal_from_request(ctx);
-        let host = ctx
-            .raw_header_get("host")
-            .or_else(|| ctx.raw_header_get(":authority"))
-            .map(str::to_string);
         ctx.materialize_headers();
+        let host = header_value(&ctx.headers, "host")
+            .or_else(|| ctx.raw_header_get("host"))
+            .map(str::to_string);
         let headers: BTreeMap<String, String> = ctx
             .headers
             .iter()
@@ -134,5 +133,14 @@ fn source_principal_from_request(ctx: &RequestContext) -> Option<SpiffeId> {
         ctx.raw_header_get(BAGGAGE_HEADER)
             .map(HboneIdentity::from_baggage_header)
             .and_then(|identity| identity.source_principal)
+    })
+}
+
+fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    headers.get(name).map(String::as_str).or_else(|| {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
     })
 }
