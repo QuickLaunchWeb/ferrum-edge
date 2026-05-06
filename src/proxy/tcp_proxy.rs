@@ -27,7 +27,8 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
 use crate::plugins::{
-    Direction, PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary,
+    Direction, Plugin, PluginResult, ProxyProtocol, StreamConnectionContext,
+    StreamTransactionSummary,
 };
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
@@ -1143,6 +1144,30 @@ async fn handle_tcp_connection(
     }
 }
 
+async fn run_tcp_stream_connect_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    stream_ctx: &mut StreamConnectionContext,
+    proxy_id: &str,
+    client_ip: IpAddr,
+    connection_label: &'static str,
+    rejection_detail: &'static str,
+) -> Result<(), anyhow::Error> {
+    for plugin in plugins {
+        if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
+            debug!(
+                proxy_id = %proxy_id,
+                client = %client_ip,
+                connection = connection_label,
+                "TCP stream connection rejected by plugin"
+            );
+            return Err(
+                StreamSetupError::new(StreamSetupKind::RejectedByPlugin, rejection_detail).into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Inner implementation of TCP connection handling that can use `?` for early returns
 /// while the caller always receives backend info for logging.
 #[allow(clippy::too_many_arguments, unused_variables)]
@@ -1452,7 +1477,8 @@ async fn handle_tcp_connection_inner(
     // ordering for TLS-terminating TCP listeners.
     let client_stream = if let Some(tls_config) = frontend_tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
-        // Frontend TLS failures are client-side — do not penalise the backend CB.
+        // Frontend TLS failures return before any backend dispatch — no backend
+        // circuit-breaker, pool, or socket interaction.
         // The typed `StreamSetupError` carries the kind so
         // `pre_copy_disconnect_cause` reads `Frontend` directly from
         // `StreamSetupKind::FrontendTlsHandshake`, no string match. The accept
@@ -1498,37 +1524,29 @@ async fn handle_tcp_connection_inner(
 
         // Run on_stream_connect plugins after TLS handshake so client cert is available.
         if !plugins.is_empty() {
-            for plugin in plugins.iter() {
-                if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
-                    debug!(
-                        proxy_id = %proxy_id,
-                        client = %remote_addr.ip(),
-                        "TCP/TLS connection rejected by plugin"
-                    );
-                    return Err(StreamSetupError::new(
-                        StreamSetupKind::RejectedByPlugin,
-                        "(TCP/TLS)",
-                    )
-                    .into());
-                }
-            }
+            run_tcp_stream_connect_plugins(
+                plugins.as_ref(),
+                stream_ctx,
+                proxy_id,
+                remote_addr.ip(),
+                "TCP/TLS",
+                "(TCP/TLS)",
+            )
+            .await?;
         }
 
         ClientRelayStream::Tls(Box::new(tls_stream))
     } else {
         if !plugins.is_empty() {
-            for plugin in plugins.iter() {
-                if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
-                    debug!(
-                        proxy_id = %proxy_id,
-                        client = %remote_addr.ip(),
-                        "TCP connection rejected by plugin"
-                    );
-                    return Err(
-                        StreamSetupError::new(StreamSetupKind::RejectedByPlugin, "(TCP)").into(),
-                    );
-                }
-            }
+            run_tcp_stream_connect_plugins(
+                plugins.as_ref(),
+                stream_ctx,
+                proxy_id,
+                remote_addr.ip(),
+                "TCP",
+                "(TCP)",
+            )
+            .await?;
         }
         ClientRelayStream::Plain(client_stream)
     };

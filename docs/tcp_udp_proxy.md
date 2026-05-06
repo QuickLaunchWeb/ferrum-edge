@@ -179,6 +179,8 @@ Set `frontend_tls: true` to accept TLS connections from clients. The gateway use
 
 For TLS-terminating TCP proxies, Ferrum completes the client-to-gateway TLS handshake before opening the backend connection. Stream lifecycle plugins then run with frontend TLS context, including client certificate material when mTLS is enabled, before any backend socket is consumed. Clients that fail the frontend TLS handshake, or are rejected by `on_stream_connect` plugins, are closed on the frontend side without dialing the backend or recording a backend circuit-breaker failure.
 
+Latency trade-off: backend connect now starts after frontend TLS instead of overlapping with it, so legitimate TCP+TLS sessions may add roughly one backend RTT to first-byte latency compared with backend-first setup. The benefit is that failed frontend handshakes, plugin rejects, and already-open backend circuit breakers do not spend backend sockets or handshakes on unadmitted clients. If a backend circuit breaker is already open, Ferrum still completes frontend TLS before refusing the stream, so the cost shifts to bounded frontend TLS CPU instead of backend capacity.
+
 `passthrough: true` is different: Ferrum does not terminate TLS, so it peeks at ClientHello SNI and forwards the encrypted stream to the backend.
 
 ### Backend TLS Origination (TCP)

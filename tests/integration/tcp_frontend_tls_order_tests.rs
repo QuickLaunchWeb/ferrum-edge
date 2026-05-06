@@ -5,17 +5,19 @@
 //! That keeps frontend TLS failures and plugin rejects from consuming upstream
 //! capacity or being misclassified as backend failures.
 
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
+use tracing_subscriber::fmt::MakeWriter;
 
 use ferrum_edge::adaptive_buffer::AdaptiveBufferTracker;
 use ferrum_edge::circuit_breaker::CircuitBreakerCache;
@@ -36,12 +38,49 @@ use ferrum_edge::tls::NoVerifier;
 use crate::scaffolding::ports::reserve_port;
 
 const PROXY_ID: &str = "frontend-tls-order-proxy";
-const PLUGIN_CONFIG_ID: &str = "deny-localhost";
+const DENY_LOCALHOST_PLUGIN_ID: &str = "deny-localhost";
+const STDOUT_LOGGING_PLUGIN_ID: &str = "stdout-logging";
 const MAX_GATEWAY_ATTEMPTS: u32 = 3;
 const PER_ATTEMPT_STARTED_TIMEOUT: Duration = Duration::from_secs(2);
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn tcp_tls_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &[&str]) -> Proxy {
+#[derive(Clone, Default)]
+struct SharedWriter {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedWriter {
+    fn contents(&self) -> String {
+        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
+    }
+}
+
+struct SharedGuard {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl io::Write for SharedGuard {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for SharedWriter {
+    type Writer = SharedGuard;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedGuard {
+            buffer: Arc::clone(&self.buffer),
+        }
+    }
+}
+
+fn tcp_tls_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &[String]) -> Proxy {
     Proxy {
         id: PROXY_ID.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -69,7 +108,7 @@ fn tcp_tls_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &[&str]
         plugins: plugin_config_ids
             .iter()
             .map(|id| PluginAssociation {
-                plugin_config_id: (*id).to_string(),
+                plugin_config_id: id.clone(),
             })
             .collect(),
         pool_idle_timeout_seconds: None,
@@ -103,13 +142,28 @@ fn tcp_tls_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &[&str]
 
 fn deny_localhost_plugin_config() -> PluginConfig {
     PluginConfig {
-        id: PLUGIN_CONFIG_ID.to_string(),
+        id: DENY_LOCALHOST_PLUGIN_ID.to_string(),
         plugin_name: "ip_restriction".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         config: json!({
             "deny": ["127.0.0.1"],
             "mode": "deny_first"
         }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some(PROXY_ID.to_string()),
+        enabled: true,
+        priority_override: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn stdout_logging_plugin_config() -> PluginConfig {
+    PluginConfig {
+        id: STDOUT_LOGGING_PLUGIN_ID.to_string(),
+        plugin_name: "stdout_logging".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        config: json!({}),
         scope: PluginScope::Proxy,
         proxy_id: Some(PROXY_ID.to_string()),
         enabled: true,
@@ -173,7 +227,7 @@ fn spawn_counting_backend(
 
 async fn spawn_tcp_tls_gateway_with_retry(
     backend_port: u16,
-    plugin_config: Option<PluginConfig>,
+    plugin_configs: Vec<PluginConfig>,
 ) -> (u16, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
     let mut last_port = 0;
     for attempt in 1..=MAX_GATEWAY_ATTEMPTS {
@@ -181,7 +235,7 @@ async fn spawn_tcp_tls_gateway_with_retry(
         let listen_port = frontend.drop_and_take_port();
         last_port = listen_port;
         if let Some(handles) =
-            try_spawn_tcp_tls_gateway(backend_port, listen_port, plugin_config.clone()).await
+            try_spawn_tcp_tls_gateway(backend_port, listen_port, plugin_configs.clone()).await
         {
             return handles;
         }
@@ -203,18 +257,18 @@ async fn spawn_tcp_tls_gateway_with_retry(
 async fn try_spawn_tcp_tls_gateway(
     backend_port: u16,
     listen_port: u16,
-    plugin_config: Option<PluginConfig>,
+    plugin_configs: Vec<PluginConfig>,
 ) -> Option<(u16, watch::Sender<bool>, tokio::task::JoinHandle<()>)> {
-    let plugin_config_ids: Vec<&str> = plugin_config
-        .as_ref()
-        .map(|_| vec![PLUGIN_CONFIG_ID])
-        .unwrap_or_default();
+    let plugin_config_ids: Vec<String> = plugin_configs
+        .iter()
+        .map(|plugin_config| plugin_config.id.clone())
+        .collect();
     let proxy = tcp_tls_proxy(listen_port, backend_port, &plugin_config_ids);
     let gateway_config = GatewayConfig {
         version: "1".to_string(),
         proxies: vec![proxy],
         consumers: vec![],
-        plugin_configs: plugin_config.into_iter().collect(),
+        plugin_configs,
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
@@ -223,11 +277,15 @@ async fn try_spawn_tcp_tls_gateway(
     let plugin_cache = Arc::new(PluginCache::new(&gateway_config).expect("build plugin cache"));
     if !gateway_config.plugin_configs.is_empty() {
         let attached = plugin_cache.get_plugins_for_protocol(PROXY_ID, ProxyProtocol::Tcp);
-        assert!(
-            attached.iter().any(|p| p.name() == "ip_restriction"),
-            "ip_restriction should attach to TCP/TLS proxy; got {:?}",
-            attached.iter().map(|p| p.name()).collect::<Vec<_>>()
-        );
+        let attached_names: Vec<&str> = attached.iter().map(|p| p.name()).collect();
+        for plugin_config in &gateway_config.plugin_configs {
+            assert!(
+                attached_names.contains(&plugin_config.plugin_name.as_str()),
+                "{} should attach to TCP/TLS proxy; got {:?}",
+                plugin_config.plugin_name,
+                attached_names
+            );
+        }
     }
 
     let consumer_index = Arc::new(ConsumerIndex::new(&gateway_config.consumers));
@@ -340,6 +398,38 @@ async fn assert_backend_never_dialed(accepted: &AtomicUsize) {
     );
 }
 
+fn extract_access_log_summaries(logs: &str) -> Vec<Value> {
+    logs.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|line| line.get("target").and_then(Value::as_str) == Some("access_log"))
+        .filter_map(|line| {
+            line.get("fields")
+                .and_then(|fields| fields.get("message"))
+                .and_then(Value::as_str)
+                .and_then(|message| serde_json::from_str::<Value>(message).ok())
+        })
+        .collect()
+}
+
+async fn wait_for_access_log_summary(writer: &SharedWriter) -> Value {
+    for _ in 0..100 {
+        let logs = writer.contents();
+        if let Some(summary) = extract_access_log_summaries(&logs)
+            .into_iter()
+            .find(|summary| summary.get("proxy_id").and_then(Value::as_str) == Some(PROXY_ID))
+        {
+            return summary;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    panic!(
+        "stdout_logging did not emit a stream summary within {:?}; logs:\n{}",
+        TEST_TIMEOUT,
+        writer.contents()
+    );
+}
+
 #[tokio::test]
 async fn tcp_tls_frontend_handshake_failure_does_not_connect_backend() {
     let backend = reserve_port().await.expect("reserve backend port");
@@ -348,7 +438,7 @@ async fn tcp_tls_frontend_handshake_failure_does_not_connect_backend() {
     let backend_task = spawn_counting_backend(backend.into_listener(), backend_accepts.clone());
 
     let (listen_port, shutdown_tx, join) =
-        spawn_tcp_tls_gateway_with_retry(backend_port, None).await;
+        spawn_tcp_tls_gateway_with_retry(backend_port, Vec::new()).await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
     let mut client = TcpStream::connect(gateway_addr)
@@ -371,6 +461,69 @@ async fn tcp_tls_frontend_handshake_failure_does_not_connect_backend() {
     shutdown_gateway_or_panic(shutdown_tx, join).await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn tcp_tls_frontend_handshake_failure_logs_client_side_disconnect_summary() {
+    let writer = SharedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let backend = reserve_port().await.expect("reserve backend port");
+    let backend_port = backend.local_addr().expect("backend addr").port();
+    let backend_accepts = Arc::new(AtomicUsize::new(0));
+    let backend_task = spawn_counting_backend(backend.into_listener(), backend_accepts.clone());
+
+    let (listen_port, shutdown_tx, join) =
+        spawn_tcp_tls_gateway_with_retry(backend_port, vec![stdout_logging_plugin_config()]).await;
+    let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
+
+    let mut client = TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect to frontend TLS listener");
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("write invalid TLS bytes");
+    let _ = client.shutdown().await;
+    assert!(
+        is_closed_by_peer(&mut client).await,
+        "gateway should close clients that fail frontend TLS"
+    );
+    assert_backend_never_dialed(&backend_accepts).await;
+
+    let summary = wait_for_access_log_summary(&writer).await;
+    assert_eq!(
+        summary.get("disconnect_direction").and_then(Value::as_str),
+        Some("client_to_backend"),
+        "frontend TLS failure should log as client-side direction: {summary}"
+    );
+    assert_eq!(
+        summary.get("disconnect_cause").and_then(Value::as_str),
+        Some("recv_error"),
+        "frontend TLS failure should log as recv_error: {summary}"
+    );
+    assert_eq!(summary.get("bytes_sent").and_then(Value::as_u64), Some(0));
+    assert_eq!(
+        summary.get("bytes_received").and_then(Value::as_u64),
+        Some(0)
+    );
+    assert!(
+        summary
+            .get("connection_error")
+            .and_then(Value::as_str)
+            .is_some_and(|err| err.contains("Frontend TLS handshake failed")),
+        "stream summary should preserve frontend TLS setup error: {summary}"
+    );
+
+    backend_task.abort();
+    let _ = backend_task.await;
+    shutdown_gateway_or_panic(shutdown_tx, join).await;
+}
+
 #[tokio::test]
 async fn tcp_tls_stream_plugin_rejection_does_not_connect_backend() {
     let backend = reserve_port().await.expect("reserve backend port");
@@ -379,7 +532,7 @@ async fn tcp_tls_stream_plugin_rejection_does_not_connect_backend() {
     let backend_task = spawn_counting_backend(backend.into_listener(), backend_accepts.clone());
 
     let (listen_port, shutdown_tx, join) =
-        spawn_tcp_tls_gateway_with_retry(backend_port, Some(deny_localhost_plugin_config())).await;
+        spawn_tcp_tls_gateway_with_retry(backend_port, vec![deny_localhost_plugin_config()]).await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
     let tcp = TcpStream::connect(gateway_addr)
