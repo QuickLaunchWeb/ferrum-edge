@@ -59,11 +59,18 @@ pub struct DpNodeInfo {
     pub last_update_at: DateTime<Utc>,
 }
 
-/// Registry of connected DP nodes. Shared between the gRPC server and the
-/// admin API so that `GET /cluster` can report live connection state.
+/// Registry of connected DP and mesh config-stream nodes. Shared between the
+/// gRPC server and the admin API so that `GET /cluster` can report live
+/// connection state.
 #[derive(Default)]
 pub struct DpNodeRegistry {
-    nodes: DashMap<String, DpNodeInfo>,
+    nodes: DashMap<String, DpNodeRegistryEntry>,
+}
+
+#[derive(Clone, Default)]
+struct DpNodeRegistryEntry {
+    dp: Option<DpNodeInfo>,
+    mesh: Option<DpNodeInfo>,
 }
 
 impl DpNodeRegistry {
@@ -74,40 +81,128 @@ impl DpNodeRegistry {
     }
 
     pub fn insert(&self, info: DpNodeInfo) {
-        self.nodes.insert(info.node_id.clone(), info);
+        self.insert_for_stream(info, RegistryStreamKind::Dp);
+    }
+
+    pub fn insert_mesh(&self, info: DpNodeInfo) {
+        self.insert_for_stream(info, RegistryStreamKind::Mesh);
     }
 
     /// Remove a node only if its `connected_at` matches the expected timestamp.
     /// This prevents a stale stream drop from removing a newer reconnection's entry.
     pub fn remove_if_stale(&self, node_id: &str, expected_connected_at: DateTime<Utc>) {
-        self.nodes.remove_if(node_id, |_, info| {
-            info.connected_at == expected_connected_at
-        });
+        self.remove_if_stale_for_stream(node_id, expected_connected_at, RegistryStreamKind::Dp);
     }
 
     /// Update `last_update_at` for all connected nodes (called after broadcast).
     pub fn touch_all(&self) {
         let now = Utc::now();
         for mut entry in self.nodes.iter_mut() {
-            entry.last_update_at = now;
+            if let Some(dp) = entry.dp.as_mut() {
+                dp.last_update_at = now;
+            }
+            if let Some(mesh) = entry.mesh.as_mut() {
+                mesh.last_update_at = now;
+            }
         }
     }
 
     /// Return a snapshot of all connected nodes.
     pub fn snapshot(&self) -> Vec<DpNodeInfo> {
-        self.nodes.iter().map(|e| e.value().clone()).collect()
+        self.nodes
+            .iter()
+            .filter_map(|entry| entry.value().snapshot_info())
+            .collect()
     }
 
-    /// Number of connected DPs.
+    /// Number of connected node IDs.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.snapshot().len()
     }
 
-    /// Whether the registry has no connected DPs.
+    /// Whether the registry has no connected node IDs.
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.len() == 0
+    }
+
+    fn remove_mesh_if_stale(&self, node_id: &str, expected_connected_at: DateTime<Utc>) {
+        self.remove_if_stale_for_stream(node_id, expected_connected_at, RegistryStreamKind::Mesh);
+    }
+
+    fn insert_for_stream(&self, info: DpNodeInfo, kind: RegistryStreamKind) {
+        let node_id = info.node_id.clone();
+        self.nodes
+            .entry(node_id)
+            .and_modify(|entry| entry.set(kind, info.clone()))
+            .or_insert_with(|| {
+                let mut entry = DpNodeRegistryEntry::default();
+                entry.set(kind, info);
+                entry
+            });
+    }
+
+    fn remove_if_stale_for_stream(
+        &self,
+        node_id: &str,
+        expected_connected_at: DateTime<Utc>,
+        kind: RegistryStreamKind,
+    ) {
+        let should_remove_entry = if let Some(mut entry) = self.nodes.get_mut(node_id) {
+            entry.remove_if_stale(kind, expected_connected_at);
+            entry.is_empty()
+        } else {
+            false
+        };
+        if should_remove_entry {
+            self.nodes.remove_if(node_id, |_, entry| entry.is_empty());
+        }
+    }
+}
+
+impl DpNodeRegistryEntry {
+    fn set(&mut self, kind: RegistryStreamKind, info: DpNodeInfo) {
+        match kind {
+            RegistryStreamKind::Dp => self.dp = Some(info),
+            RegistryStreamKind::Mesh => self.mesh = Some(info),
+        }
+    }
+
+    fn remove_if_stale(&mut self, kind: RegistryStreamKind, expected_connected_at: DateTime<Utc>) {
+        let slot = match kind {
+            RegistryStreamKind::Dp => &mut self.dp,
+            RegistryStreamKind::Mesh => &mut self.mesh,
+        };
+        if slot
+            .as_ref()
+            .is_some_and(|info| info.connected_at == expected_connected_at)
+        {
+            *slot = None;
+        }
+    }
+
+    fn snapshot_info(&self) -> Option<DpNodeInfo> {
+        self.dp.clone().or_else(|| self.mesh.clone())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.dp.is_none() && self.mesh.is_none()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RegistryStreamKind {
+    Dp,
+    Mesh,
+}
+
+impl RegistryStreamKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Dp => "DP",
+            Self::Mesh => "Mesh",
+        }
     }
 }
 
@@ -120,16 +215,23 @@ struct TrackedStream<S> {
     registry: Arc<DpNodeRegistry>,
     node_id: String,
     connected_at: DateTime<Utc>,
-    stream_label: &'static str,
+    stream_kind: RegistryStreamKind,
 }
 
 impl<S> Drop for TrackedStream<S> {
     fn drop(&mut self) {
-        self.registry
-            .remove_if_stale(&self.node_id, self.connected_at);
+        match self.stream_kind {
+            RegistryStreamKind::Dp => self
+                .registry
+                .remove_if_stale(&self.node_id, self.connected_at),
+            RegistryStreamKind::Mesh => self
+                .registry
+                .remove_mesh_if_stale(&self.node_id, self.connected_at),
+        }
         info!(
             "{} node '{}' disconnected (stream dropped)",
-            self.stream_label, self.node_id
+            self.stream_kind.label(),
+            self.node_id
         );
     }
 }
@@ -580,7 +682,7 @@ impl ConfigSync for CpGrpcServer {
             registry: self.registry.clone(),
             node_id,
             connected_at: now,
-            stream_label: "DP",
+            stream_kind: RegistryStreamKind::Dp,
         };
 
         Ok(Response::new(Box::pin(tracked)))
@@ -652,7 +754,7 @@ impl ConfigSync for CpGrpcServer {
         let initial = Self::build_mesh_config_update_from_slice(initial_slice.clone())?;
 
         let now = Utc::now();
-        self.registry.insert(DpNodeInfo {
+        self.registry.insert_mesh(DpNodeInfo {
             node_id: node_id.clone(),
             version: node_version,
             namespace: node_namespace,
@@ -759,7 +861,7 @@ impl ConfigSync for CpGrpcServer {
             registry: self.registry.clone(),
             node_id,
             connected_at: now,
-            stream_label: "Mesh",
+            stream_kind: RegistryStreamKind::Mesh,
         };
         Ok(Response::new(Box::pin(tracked)))
     }
@@ -812,6 +914,77 @@ mod tests {
                 .unwrap(),
             ..GatewayConfig::default()
         }
+    }
+
+    fn registry_info(node_id: &str, version: &str, connected_at: DateTime<Utc>) -> DpNodeInfo {
+        DpNodeInfo {
+            node_id: node_id.to_string(),
+            version: version.to_string(),
+            namespace: "ferrum".to_string(),
+            connected_at,
+            last_update_at: connected_at,
+        }
+    }
+
+    #[test]
+    fn registry_mesh_insert_does_not_clobber_dp_snapshot() {
+        let registry = DpNodeRegistry::new();
+        let dp_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 1).unwrap();
+        let mesh_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 2).unwrap();
+
+        registry.insert(registry_info("node-a", "dp-version", dp_connected_at));
+        registry.insert_mesh(registry_info("node-a", "mesh-version", mesh_connected_at));
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].node_id, "node-a");
+        assert_eq!(snapshot[0].version, "dp-version");
+        assert_eq!(snapshot[0].connected_at, dp_connected_at);
+    }
+
+    #[test]
+    fn registry_mesh_drop_does_not_remove_active_dp_entry() {
+        let registry = DpNodeRegistry::new();
+        let dp_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 1).unwrap();
+        let mesh_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 2).unwrap();
+
+        registry.insert(registry_info("node-a", "dp-version", dp_connected_at));
+        registry.insert_mesh(registry_info("node-a", "mesh-version", mesh_connected_at));
+        registry.remove_mesh_if_stale("node-a", mesh_connected_at);
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].version, "dp-version");
+        assert_eq!(snapshot[0].connected_at, dp_connected_at);
+    }
+
+    #[test]
+    fn registry_dp_drop_keeps_active_mesh_entry_visible() {
+        let registry = DpNodeRegistry::new();
+        let dp_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 1).unwrap();
+        let mesh_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 2).unwrap();
+
+        registry.insert(registry_info("node-a", "dp-version", dp_connected_at));
+        registry.insert_mesh(registry_info("node-a", "mesh-version", mesh_connected_at));
+        registry.remove_if_stale("node-a", dp_connected_at);
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].version, "mesh-version");
+        assert_eq!(snapshot[0].connected_at, mesh_connected_at);
+    }
+
+    #[test]
+    fn registry_mesh_only_entry_is_visible_and_removable() {
+        let registry = DpNodeRegistry::new();
+        let mesh_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 2).unwrap();
+
+        registry.insert_mesh(registry_info("node-a", "mesh-version", mesh_connected_at));
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.snapshot()[0].version, "mesh-version");
+
+        registry.remove_mesh_if_stale("node-a", mesh_connected_at);
+        assert!(registry.is_empty());
     }
 
     #[test]
