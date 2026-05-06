@@ -16,7 +16,9 @@ use tracing::{debug, warn};
 
 use super::PluginHttpClient;
 
-const EMPTY_STORE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const EMPTY_STORE_RETRY_1: Duration = Duration::from_secs(5);
+const EMPTY_STORE_RETRY_2: Duration = Duration::from_secs(15);
+const EMPTY_STORE_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// A cached JWKS key with its algorithm and decoding key.
 #[derive(Clone)]
@@ -173,12 +175,25 @@ impl JwksKeyStore {
             interval
         };
         tokio::spawn(async move {
+            let mut empty_store_retry_attempt = 0;
             loop {
                 if let Err(e) = store.fetch_keys().await {
                     warn!("JWKS background refresh failed: {}", e);
                 }
 
-                tokio::time::sleep(refresh_delay_after_attempt(store.has_keys(), interval)).await;
+                let has_keys = store.has_keys();
+                tokio::time::sleep(refresh_delay_after_attempt(
+                    has_keys,
+                    interval,
+                    empty_store_retry_attempt,
+                ))
+                .await;
+
+                if has_keys {
+                    empty_store_retry_attempt = 0;
+                } else {
+                    empty_store_retry_attempt = empty_store_retry_attempt.saturating_add(1);
+                }
             }
         })
     }
@@ -247,36 +262,76 @@ impl JwksKeyStore {
     }
 }
 
-fn refresh_delay_after_attempt(store_has_keys: bool, interval: Duration) -> Duration {
+fn refresh_delay_after_attempt(
+    store_has_keys: bool,
+    interval: Duration,
+    empty_store_retry_attempt: u32,
+) -> Duration {
     if store_has_keys {
         interval
     } else {
-        std::cmp::min(interval, EMPTY_STORE_RETRY_INTERVAL)
+        std::cmp::min(
+            interval,
+            empty_store_retry_interval(empty_store_retry_attempt),
+        )
+    }
+}
+
+fn empty_store_retry_interval(empty_store_retry_attempt: u32) -> Duration {
+    match empty_store_retry_attempt {
+        0 => EMPTY_STORE_RETRY_1,
+        1 => EMPTY_STORE_RETRY_2,
+        _ => EMPTY_STORE_RETRY_MAX,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{EMPTY_STORE_RETRY_INTERVAL, refresh_delay_after_attempt};
+    use super::{
+        EMPTY_STORE_RETRY_1, EMPTY_STORE_RETRY_2, EMPTY_STORE_RETRY_MAX,
+        empty_store_retry_interval, refresh_delay_after_attempt,
+    };
     use std::time::Duration;
 
     #[test]
     fn populated_store_uses_configured_refresh_interval() {
         let interval = Duration::from_secs(900);
-        assert_eq!(refresh_delay_after_attempt(true, interval), interval);
+        assert_eq!(refresh_delay_after_attempt(true, interval, 2), interval);
     }
 
     #[test]
-    fn empty_store_uses_short_retry_when_interval_is_longer() {
+    fn empty_store_backs_off_until_capped_when_interval_is_longer() {
         assert_eq!(
-            refresh_delay_after_attempt(false, Duration::from_secs(900)),
-            EMPTY_STORE_RETRY_INTERVAL
+            refresh_delay_after_attempt(false, Duration::from_secs(900), 0),
+            EMPTY_STORE_RETRY_1
+        );
+        assert_eq!(
+            refresh_delay_after_attempt(false, Duration::from_secs(900), 1),
+            EMPTY_STORE_RETRY_2
+        );
+        assert_eq!(
+            refresh_delay_after_attempt(false, Duration::from_secs(900), 2),
+            EMPTY_STORE_RETRY_MAX
+        );
+        assert_eq!(
+            refresh_delay_after_attempt(false, Duration::from_secs(900), 12),
+            EMPTY_STORE_RETRY_MAX
         );
     }
 
     #[test]
     fn empty_store_keeps_shorter_configured_interval() {
         let interval = Duration::from_secs(2);
-        assert_eq!(refresh_delay_after_attempt(false, interval), interval);
+        assert_eq!(refresh_delay_after_attempt(false, interval, 0), interval);
+        assert_eq!(refresh_delay_after_attempt(false, interval, 1), interval);
+        assert_eq!(refresh_delay_after_attempt(false, interval, 2), interval);
+    }
+
+    #[test]
+    fn empty_store_retry_interval_uses_five_fifteen_thirty_sequence() {
+        assert_eq!(empty_store_retry_interval(0), EMPTY_STORE_RETRY_1);
+        assert_eq!(empty_store_retry_interval(1), EMPTY_STORE_RETRY_2);
+        assert_eq!(empty_store_retry_interval(2), EMPTY_STORE_RETRY_MAX);
+        assert_eq!(empty_store_retry_interval(u32::MAX), EMPTY_STORE_RETRY_MAX);
     }
 }
