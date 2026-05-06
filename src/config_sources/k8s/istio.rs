@@ -465,6 +465,7 @@ fn path_match(uri: &Value) -> Option<String> {
     string_field(uri, "prefix")
         .or_else(|| string_field(uri, "exact"))
         .map(ToOwned::to_owned)
+        .or_else(|| string_field(uri, "regex").map(|value| format!("~{value}")))
 }
 
 fn service_ports(spec: &Value) -> Vec<ServicePort> {
@@ -759,6 +760,30 @@ mod tests {
                 .proxies
                 .iter()
                 .all(|proxy| proxy.backend_port == 8080)
+        );
+    }
+
+    #[test]
+    fn virtual_service_preserves_regex_uri_match() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"regex": "/v[0-9]+/items"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("~/v[0-9]+/items")
         );
     }
 
