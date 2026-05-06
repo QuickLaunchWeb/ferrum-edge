@@ -39,6 +39,14 @@ ambient:
     FERRUM_MESH_TOPOLOGY: ambient
     FERRUM_MESH_HBONE_LISTEN_ADDR: 0.0.0.0:15008
 
+eastWest:
+  enabled: false
+  replicas: 1
+  listenPort: 15443
+  env:
+    FERRUM_MODE: mesh
+    FERRUM_MESH_TOPOLOGY: east_west_gateway
+
 ca:
   enabled: true
   env:

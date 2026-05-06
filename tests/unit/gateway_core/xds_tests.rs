@@ -29,6 +29,7 @@ fn workload(name: &str, app: &str) -> Workload {
             namespace: Some("default".to_string()),
         },
         service_name: name.to_string(),
+        addresses: Vec::new(),
         ports: vec![WorkloadPort {
             port: 8080,
             protocol: AppProtocol::Http,
@@ -36,6 +37,8 @@ fn workload(name: &str, app: &str) -> Workload {
         }],
         trust_domain,
         namespace: "default".to_string(),
+        network: None,
+        cluster: None,
     }
 }
 
@@ -86,6 +89,7 @@ fn mesh_config() -> MeshConfig {
         }],
         service_entries: Vec::new(),
         trust_bundles: None,
+        multi_cluster: None,
     }
 }
 
@@ -254,6 +258,13 @@ fn mesh_slice_content_eq_ignores_only_version() {
     assert!(left.content_eq(&right));
 
     left.namespace = "other".to_string();
+    assert!(!left.content_eq(&right));
+
+    left.namespace = right.namespace.clone();
+    right.multi_cluster = Some(ferrum_edge::config::mesh::MultiClusterConfig {
+        local_cluster: Some("cluster-a".to_string()),
+        ..Default::default()
+    });
     assert!(!left.content_eq(&right));
 }
 

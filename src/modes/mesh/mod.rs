@@ -21,7 +21,11 @@ use tracing::{error, info, warn};
 
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
-use crate::config::types::{GatewayConfig, PluginConfig, PluginScope};
+use crate::config::mesh::EastWestGateway;
+use crate::config::types::{
+    BackendScheme, BackendTlsConfig, GatewayConfig, PluginAssociation, PluginConfig, PluginScope,
+    Proxy, ResponseBodyMode,
+};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
@@ -35,6 +39,7 @@ use crate::xds::slice::{MeshSlice, MeshSliceRequest};
 const DEFAULT_INBOUND_LISTEN_ADDR: &str = "0.0.0.0:15006";
 const DEFAULT_OUTBOUND_LISTEN_ADDR: &str = "127.0.0.1:15001";
 const DEFAULT_HBONE_LISTEN_ADDR: &str = "0.0.0.0:15008";
+const DEFAULT_EAST_WEST_LISTEN_PORT: u16 = 15443;
 
 pub const MESH_SPIFFE_IDENTITY_PLUGIN_ID: &str = "__mesh_spiffe_identity";
 pub const MESH_AUTHZ_PLUGIN_ID: &str = "__mesh_authz";
@@ -62,11 +67,13 @@ pub struct MeshListener {
 }
 
 /// Mesh data-plane topology. Sidecar and ambient share the same runtime path;
-/// ambient selects HBONE termination instead of sidecar inbound mTLS.
+/// ambient selects HBONE termination instead of sidecar inbound mTLS, and
+/// east-west gateway delegates SNI passthrough to the stream listener manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshTopology {
     Sidecar,
     Ambient,
+    EastWestGateway,
 }
 
 impl MeshTopology {
@@ -74,8 +81,9 @@ impl MeshTopology {
         match raw.trim().to_ascii_lowercase().as_str() {
             "sidecar" => Ok(Self::Sidecar),
             "ambient" => Ok(Self::Ambient),
+            "east_west_gateway" | "east-west-gateway" => Ok(Self::EastWestGateway),
             other => Err(format!(
-                "Invalid FERRUM_MESH_TOPOLOGY '{other}'. Expected: sidecar or ambient"
+                "Invalid FERRUM_MESH_TOPOLOGY '{other}'. Expected: sidecar, ambient, or east_west_gateway"
             )),
         }
     }
@@ -84,6 +92,7 @@ impl MeshTopology {
         match self {
             Self::Sidecar => "sidecar",
             Self::Ambient => "ambient",
+            Self::EastWestGateway => "east_west_gateway",
         }
     }
 }
@@ -126,6 +135,7 @@ pub struct MeshRuntimeConfig {
     pub inbound_listen_addr: SocketAddr,
     pub outbound_listen_addr: SocketAddr,
     pub hbone_listen_addr: SocketAddr,
+    pub east_west_listen_port: u16,
     pub workload_spiffe_id: Option<String>,
 }
 
@@ -168,6 +178,10 @@ impl MeshRuntimeConfig {
                 .as_deref()
                 .unwrap_or(DEFAULT_HBONE_LISTEN_ADDR),
         )?;
+        let east_west_port_raw = resolve_ferrum_var("FERRUM_MESH_EAST_WEST_LISTEN_PORT")
+            .unwrap_or_else(|| DEFAULT_EAST_WEST_LISTEN_PORT.to_string());
+        let east_west_listen_port =
+            parse_port("FERRUM_MESH_EAST_WEST_LISTEN_PORT", &east_west_port_raw)?;
         let workload_spiffe_id = resolve_ferrum_var("FERRUM_MESH_WORKLOAD_SPIFFE_ID")
             .filter(|value| !value.trim().is_empty());
 
@@ -180,6 +194,7 @@ impl MeshRuntimeConfig {
             inbound_listen_addr,
             outbound_listen_addr,
             hbone_listen_addr,
+            east_west_listen_port,
             workload_spiffe_id,
         })
     }
@@ -202,6 +217,12 @@ impl MeshRuntimeConfig {
     }
 
     pub fn listener_plan(&self) -> Vec<MeshListener> {
+        let (inbound_kind, inbound_addr) = match self.topology {
+            MeshTopology::Sidecar => (MeshListenerKind::MtlsTermination, self.inbound_listen_addr),
+            MeshTopology::Ambient => (MeshListenerKind::HboneTermination, self.hbone_listen_addr),
+            MeshTopology::EastWestGateway => return Vec::new(),
+        };
+
         vec![
             MeshListener {
                 direction: MeshTrafficDirection::Outbound,
@@ -210,14 +231,8 @@ impl MeshRuntimeConfig {
             },
             MeshListener {
                 direction: MeshTrafficDirection::Inbound,
-                kind: match self.topology {
-                    MeshTopology::Sidecar => MeshListenerKind::MtlsTermination,
-                    MeshTopology::Ambient => MeshListenerKind::HboneTermination,
-                },
-                addr: match self.topology {
-                    MeshTopology::Sidecar => self.inbound_listen_addr,
-                    MeshTopology::Ambient => self.hbone_listen_addr,
-                },
+                kind: inbound_kind,
+                addr: inbound_addr,
             },
         ]
     }
@@ -242,6 +257,7 @@ pub fn prepare_gateway_config_for_mesh(
     runtime: &MeshRuntimeConfig,
 ) -> Result<GatewayConfig, anyhow::Error> {
     config.normalize_fields();
+    config.normalize_mesh_fields();
     let mesh_errors = config.validate_mesh_fields();
     if !mesh_errors.is_empty() {
         return Err(anyhow::anyhow!(
@@ -252,7 +268,103 @@ pub fn prepare_gateway_config_for_mesh(
 
     let mesh_slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
     inject_mesh_global_plugins(&mut config, runtime, &mesh_slice);
+    materialize_east_west_gateway_proxies(&mut config, runtime);
+    config.normalize_fields();
     Ok(config)
+}
+
+fn materialize_east_west_gateway_proxies(config: &mut GatewayConfig, runtime: &MeshRuntimeConfig) {
+    if runtime.topology != MeshTopology::EastWestGateway {
+        return;
+    }
+
+    let Some(mesh) = config.mesh.as_ref() else {
+        warn!("east-west gateway topology has no mesh.multi_cluster configuration");
+        return;
+    };
+    let Some(multi_cluster) = mesh.multi_cluster.as_ref() else {
+        warn!("east-west gateway topology has no mesh.multi_cluster configuration");
+        return;
+    };
+
+    for gateway in &multi_cluster.east_west_gateways {
+        if gateway.namespace != runtime.namespace {
+            continue;
+        }
+
+        let proxy = east_west_gateway_proxy(gateway, runtime.east_west_listen_port);
+
+        if let Some(existing) = config
+            .proxies
+            .iter_mut()
+            .find(|candidate| candidate.id == proxy.id)
+        {
+            *existing = proxy;
+        } else {
+            config.proxies.push(proxy);
+        }
+    }
+}
+
+fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy {
+    let now = chrono::Utc::now();
+    Proxy {
+        id: mesh_east_west_proxy_id(&gateway.namespace, &gateway.name),
+        name: Some(format!("mesh east-west {}", gateway.name)),
+        namespace: gateway.namespace.clone(),
+        hosts: gateway.sni_hosts.clone(),
+        listen_path: None,
+        backend_scheme: Some(BackendScheme::Tcp),
+        dispatch_kind: Default::default(),
+        backend_host: gateway.host.clone(),
+        backend_port: gateway.port,
+        backend_path: None,
+        strip_listen_path: false,
+        preserve_host_header: false,
+        backend_connect_timeout_ms: 30_000,
+        backend_read_timeout_ms: 30_000,
+        backend_write_timeout_ms: 30_000,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        resolved_tls: BackendTlsConfig::default(),
+        dns_override: None,
+        dns_cache_ttl_seconds: None,
+        auth_mode: Default::default(),
+        plugins: Vec::<PluginAssociation>::new(),
+        pool_idle_timeout_seconds: None,
+        pool_enable_http_keep_alive: None,
+        pool_enable_http2: None,
+        pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
+        pool_http2_initial_stream_window_size: None,
+        pool_http2_initial_connection_window_size: None,
+        pool_http2_adaptive_window: None,
+        pool_http2_max_frame_size: None,
+        pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
+        upstream_id: None,
+        api_spec_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: ResponseBodyMode::Stream,
+        listen_port: Some(listen_port),
+        frontend_tls: false,
+        passthrough: true,
+        udp_idle_timeout_seconds: 60,
+        udp_max_response_amplification_factor: None,
+        tcp_idle_timeout_seconds: None,
+        allowed_methods: None,
+        allowed_ws_origins: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn mesh_east_west_proxy_id(namespace: &str, name: &str) -> String {
+    format!("__mesh-east-west-{namespace}-{name}").replace(['/', '.'], "-")
 }
 
 fn inject_mesh_global_plugins(
@@ -350,6 +462,8 @@ pub async fn run(
         config_protocol = runtime.config_protocol.as_str(),
         inbound = %runtime.inbound_listen_addr,
         outbound = %runtime.outbound_listen_addr,
+        hbone = %runtime.hbone_listen_addr,
+        east_west_listen_port = runtime.east_west_listen_port,
         cp_urls = runtime.cp_urls.len(),
         "Mesh mode starting"
     );
@@ -737,13 +851,24 @@ fn parse_socket_addr(key: &str, raw: &str) -> Result<SocketAddr, String> {
         .map_err(|e| format!("{key} must be a socket address (got '{raw}'): {e}"))
 }
 
+fn parse_port(key: &str, raw: &str) -> Result<u16, String> {
+    let port = raw
+        .parse::<u16>()
+        .map_err(|e| format!("{key} must be a TCP port (got '{raw}'): {e}"))?;
+    if port == 0 {
+        Err(format!("{key} must be between 1 and 65535 (got 0)"))
+    } else {
+        Ok(port)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::EnvConfig;
     use crate::config::mesh::{
-        AppProtocol, MeshConfig, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch,
-        Workload, WorkloadPort, WorkloadSelector,
+        AppProtocol, EastWestGateway, MeshConfig, MeshPolicy, MeshRule, MultiClusterConfig,
+        PolicyAction, PolicyScope, PrincipalMatch, Workload, WorkloadPort, WorkloadSelector,
     };
     use crate::config::types::PluginScope;
     use crate::identity::{SpiffeId, TrustDomain};
@@ -766,6 +891,7 @@ mod tests {
             "FERRUM_MESH_INBOUND_LISTEN_ADDR",
             "FERRUM_MESH_OUTBOUND_LISTEN_ADDR",
             "FERRUM_MESH_HBONE_LISTEN_ADDR",
+            "FERRUM_MESH_EAST_WEST_LISTEN_PORT",
             "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
             "FERRUM_POOL_WARMUP_ENABLED",
             "FERRUM_SHUTDOWN_DRAIN_SECONDS",
@@ -819,6 +945,7 @@ mod tests {
                     runtime.hbone_listen_addr,
                     DEFAULT_HBONE_LISTEN_ADDR.parse::<SocketAddr>().unwrap()
                 );
+                assert_eq!(runtime.east_west_listen_port, DEFAULT_EAST_WEST_LISTEN_PORT);
             },
         );
     }
@@ -842,6 +969,7 @@ mod tests {
                 ("FERRUM_MESH_INBOUND_LISTEN_ADDR", "127.0.0.1:16006"),
                 ("FERRUM_MESH_OUTBOUND_LISTEN_ADDR", "127.0.0.1:16001"),
                 ("FERRUM_MESH_HBONE_LISTEN_ADDR", "127.0.0.1:16008"),
+                ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "16443"),
                 (
                     "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
                     "spiffe://cluster.local/ns/default/sa/api",
@@ -872,6 +1000,32 @@ mod tests {
                     runtime.hbone_listen_addr,
                     "127.0.0.1:16008".parse::<SocketAddr>().unwrap()
                 );
+                assert_eq!(runtime.east_west_listen_port, 16443);
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_config_parses_east_west_gateway_topology() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
+                ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "15444"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                assert_eq!(runtime.topology, MeshTopology::EastWestGateway);
+                assert_eq!(runtime.east_west_listen_port, 15444);
+                assert!(runtime.listener_plan().is_empty());
             },
         );
     }
@@ -914,6 +1068,7 @@ mod tests {
             inbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
             outbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
             hbone_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            east_west_listen_port: DEFAULT_EAST_WEST_LISTEN_PORT,
             workload_spiffe_id: None,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
@@ -947,6 +1102,7 @@ mod tests {
                 namespace: Some("default".to_string()),
             },
             service_name: name.to_string(),
+            addresses: Vec::new(),
             ports: vec![WorkloadPort {
                 port: 8080,
                 protocol: AppProtocol::Http,
@@ -954,6 +1110,8 @@ mod tests {
             }],
             trust_domain,
             namespace: "default".to_string(),
+            network: None,
+            cluster: None,
         }
     }
 
@@ -1018,6 +1176,64 @@ mod tests {
                         && listener.kind == MeshListenerKind::HboneTermination
                         && listener.addr.port() == 15008
                 }));
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_prepares_east_west_passthrough_proxies() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_NAMESPACE", "mesh-system"),
+                ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
+                ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "15443"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let config = GatewayConfig {
+                    mesh: Some(Box::new(MeshConfig {
+                        multi_cluster: Some(MultiClusterConfig {
+                            east_west_gateways: vec![EastWestGateway {
+                                name: "remote-a".to_string(),
+                                namespace: "mesh-system".to_string(),
+                                host: "EastWest.Remote.Example".to_string(),
+                                port: 443,
+                                sni_hosts: vec!["API.Remote.Example".to_string()],
+                                trust_domain: Some(TrustDomain::new("remote.test").unwrap()),
+                                network: Some("network-a".to_string()),
+                            }],
+                            ..MultiClusterConfig::default()
+                        }),
+                        ..MeshConfig::default()
+                    })),
+                    ..GatewayConfig::default()
+                };
+
+                let prepared =
+                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                let proxy = prepared
+                    .proxies
+                    .iter()
+                    .find(|proxy| proxy.id == "__mesh-east-west-mesh-system-remote-a")
+                    .expect("east-west proxy");
+
+                assert_eq!(proxy.listen_port, Some(15443));
+                assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
+                assert_eq!(
+                    proxy.dispatch_kind,
+                    crate::config::types::DispatchKind::TcpRaw
+                );
+                assert!(proxy.passthrough);
+                assert_eq!(proxy.backend_host, "eastwest.remote.example");
+                assert_eq!(proxy.hosts, vec!["api.remote.example"]);
             },
         );
     }

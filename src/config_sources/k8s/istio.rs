@@ -296,9 +296,14 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
             .and_then(Value::as_str)
             .unwrap_or(&object.metadata.name)
             .to_string(),
+        addresses: string_field(&object.spec, "address")
+            .map(|address| vec![address.to_string()])
+            .unwrap_or_default(),
         ports: workload_ports(&object.spec),
         trust_domain: acc.options.trust_domain.clone(),
         namespace: object.metadata.namespace.clone(),
+        network: string_field(&object.spec, "network").map(ToOwned::to_owned),
+        cluster: string_field(&object.spec, "cluster").map(ToOwned::to_owned),
     })
 }
 
@@ -485,6 +490,36 @@ mod tests {
         let mesh = result.config.mesh.expect("mesh config");
         assert_eq!(mesh.service_entries[0].hosts, vec!["api.example.com"]);
         assert_eq!(mesh.service_entries[0].ports[0].protocol, AppProtocol::Tls);
+    }
+
+    #[test]
+    fn translates_workload_entry_vm_metadata() {
+        let result = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "VM-API.Example",
+                    "serviceAccount": "api",
+                    "service": "api",
+                    "network": "network-a",
+                    "cluster": "cluster-a",
+                    "labels": {"app": "api"},
+                    "ports": {"http": 8080}
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let workload = &mesh.workloads[0];
+        assert_eq!(workload.addresses, vec!["vm-api.example"]);
+        assert_eq!(workload.network.as_deref(), Some("network-a"));
+        assert_eq!(workload.cluster.as_deref(), Some("cluster-a"));
+        assert_eq!(
+            workload.spiffe_id.as_str(),
+            "spiffe://cluster.local/ns/default/sa/api"
+        );
     }
 
     #[test]
