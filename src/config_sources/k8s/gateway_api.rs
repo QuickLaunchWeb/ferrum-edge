@@ -11,6 +11,9 @@ use super::{
     upstream_for_route,
 };
 
+const ZERO_WEIGHT_BACKEND_HOST: &str = "ferrum-zero-weight.invalid";
+const ZERO_WEIGHT_BACKEND_PORT: u16 = 65535;
+
 pub(super) fn translate(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -131,11 +134,16 @@ fn http_route_proxies(
         }
 
         let backends = route_backends(object, rule, acc)?;
-        if backends.is_empty() {
-            continue;
-        };
-
-        let (backend_host, backend_port, upstream_id) = if backends.len() == 1 {
+        let (backend_host, backend_port, upstream_id) = if backends.is_empty() {
+            if !has_only_zero_weight_backend_refs(rule) {
+                continue;
+            }
+            (
+                ZERO_WEIGHT_BACKEND_HOST.to_string(),
+                ZERO_WEIGHT_BACKEND_PORT,
+                None,
+            )
+        } else if backends.len() == 1 {
             let backend = backends.into_iter().next().expect("one backend");
             (backend.host, backend.port, None)
         } else {
@@ -181,6 +189,19 @@ fn http_route_proxies(
     }
 
     Ok(proxies)
+}
+
+fn has_only_zero_weight_backend_refs(rule: &Value) -> bool {
+    let Some(backend_refs) = rule.get("backendRefs").and_then(Value::as_array) else {
+        return false;
+    };
+    if backend_refs.is_empty() {
+        return false;
+    }
+
+    backend_refs
+        .iter()
+        .all(|backend_ref| backend_ref.get("weight").and_then(Value::as_u64) == Some(0))
 }
 
 fn match_paths(object: &K8sObject, rule: &Value) -> Vec<Option<String>> {
@@ -636,6 +657,41 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn http_route_keeps_all_zero_weight_rule_as_blackhole() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "hostnames": ["api.example.com"],
+                    "rules": [
+                        {
+                            "matches": [{"path": {"type": "PathPrefix", "value": "/admin"}}],
+                            "backendRefs": [{"name": "admin", "port": 8080, "weight": 0}]
+                        },
+                        {
+                            "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
+                            "backendRefs": [{"name": "api", "port": 8080}]
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 2);
+        let admin_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.listen_path.as_deref() == Some("/admin"))
+            .expect("admin route proxy exists");
+        assert_eq!(admin_proxy.backend_host, ZERO_WEIGHT_BACKEND_HOST);
+        assert_eq!(admin_proxy.backend_port, ZERO_WEIGHT_BACKEND_PORT);
+        assert!(admin_proxy.upstream_id.is_none());
     }
 
     #[test]
