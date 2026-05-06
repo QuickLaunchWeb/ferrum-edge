@@ -27,7 +27,8 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
 use crate::plugins::{
-    Direction, PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary,
+    Direction, Plugin, PluginResult, ProxyProtocol, StreamConnectionContext,
+    StreamTransactionSummary,
 };
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
@@ -1143,6 +1144,30 @@ async fn handle_tcp_connection(
     }
 }
 
+async fn run_tcp_stream_connect_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    stream_ctx: &mut StreamConnectionContext,
+    proxy_id: &str,
+    client_ip: IpAddr,
+    connection_label: &'static str,
+    rejection_detail: &'static str,
+) -> Result<(), anyhow::Error> {
+    for plugin in plugins {
+        if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
+            debug!(
+                proxy_id = %proxy_id,
+                client = %client_ip,
+                connection = connection_label,
+                "TCP stream connection rejected by plugin"
+            );
+            return Err(
+                StreamSetupError::new(StreamSetupKind::RejectedByPlugin, rejection_detail).into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Inner implementation of TCP connection handling that can use `?` for early returns
 /// while the caller always receives backend info for logging.
 #[allow(clippy::too_many_arguments, unused_variables)]
@@ -1445,22 +1470,86 @@ async fn handle_tcp_connection_inner(
         None
     };
 
-    // For non-TLS proxies, run on_stream_connect plugins before backend connection.
-    // TLS proxies defer this until after the TLS handshake so client cert is available.
-    if frontend_tls_config.is_none() && !plugins.is_empty() {
-        for plugin in plugins.iter() {
-            if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
-                debug!(
-                    proxy_id = %proxy_id,
-                    client = %remote_addr.ip(),
-                    "TCP connection rejected by plugin"
-                );
-                return Err(
-                    StreamSetupError::new(StreamSetupKind::RejectedByPlugin, "(TCP)").into(),
-                );
+    // Terminating TCP-TLS should complete the downstream TLS handshake before
+    // opening an upstream connection. This avoids spending backend sockets or
+    // handshakes on clients that fail frontend TLS or are rejected by
+    // stream-connect plugins, matching the conservative enterprise proxy
+    // ordering for TLS-terminating TCP listeners.
+    let client_stream = if let Some(tls_config) = frontend_tls_config {
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
+        // Frontend TLS failures return before any backend dispatch — no backend
+        // circuit-breaker, pool, or socket interaction.
+        // The typed `StreamSetupError` carries the kind so
+        // `pre_copy_disconnect_cause` reads `Frontend` directly from
+        // `StreamSetupKind::FrontendTlsHandshake`, no string match. The accept
+        // helper bounds the handshake under the configured timeout so a stalled
+        // peer cannot wedge a frontend slot indefinitely.
+        let tls_stream = crate::tls::accept_with_optional_timeout(
+            &acceptor,
+            client_stream,
+            frontend_tls_handshake_timeout_seconds,
+            &remote_addr,
+        )
+        .await
+        .map_err(|e| -> anyhow::Error {
+            StreamSetupError::with_source(
+                StreamSetupKind::FrontendTlsHandshake,
+                format!("from {remote_addr}: {e}"),
+                e,
+            )
+            .into()
+        })?;
+
+        // Extract peer certificate DER from TLS handshake for plugin use.
+        let peer_chain_der = tls_stream.get_ref().1.peer_certificates().map(|certs| {
+            certs
+                .iter()
+                .map(|cert| cert.to_vec())
+                .collect::<Vec<Vec<u8>>>()
+        });
+        let peer_cert_der = peer_chain_der
+            .as_ref()
+            .and_then(|certs| certs.first().cloned())
+            .map(Arc::new);
+        let peer_chain_tail_der = peer_chain_der.and_then(|mut certs| {
+            if certs.len() <= 1 {
+                None
+            } else {
+                certs.remove(0);
+                Some(Arc::new(certs))
             }
+        });
+        stream_ctx.tls_client_cert_der = peer_cert_der;
+        stream_ctx.tls_client_cert_chain_der = peer_chain_tail_der;
+
+        // Run on_stream_connect plugins after TLS handshake so client cert is available.
+        if !plugins.is_empty() {
+            run_tcp_stream_connect_plugins(
+                plugins.as_ref(),
+                stream_ctx,
+                proxy_id,
+                remote_addr.ip(),
+                "TCP/TLS",
+                "(TCP/TLS)",
+            )
+            .await?;
         }
-    }
+
+        ClientRelayStream::Tls(Box::new(tls_stream))
+    } else {
+        if !plugins.is_empty() {
+            run_tcp_stream_connect_plugins(
+                plugins.as_ref(),
+                stream_ctx,
+                proxy_id,
+                remote_addr.ip(),
+                "TCP",
+                "(TCP)",
+            )
+            .await?;
+        }
+        ClientRelayStream::Plain(client_stream)
+    };
 
     // Helper: record circuit breaker failure for the current target.
     let record_cb_failure = |cb_cache: &CircuitBreakerCache,
@@ -1657,145 +1746,97 @@ async fn handle_tcp_connection_inner(
     let (_backend_socket_addr, backend_stream) = backend_addr;
     let _ = last_connect_err; // consumed by retry loop logging
 
-    // Apply frontend TLS termination if configured, then start bidirectional copy.
-    // From here, no retries — bytes may be exchanged.
+    // Start bidirectional copy. From here, no retries — bytes may be exchanged.
     let mut used_splice = false;
-    let copy_result = if let Some(tls_config) = frontend_tls_config {
-        let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
-        // Frontend TLS failures are client-side — do not penalise the backend CB.
-        // The typed `StreamSetupError` carries the kind so
-        // `pre_copy_disconnect_cause` reads `Frontend` directly from
-        // `StreamSetupKind::FrontendTlsHandshake`, no string match. The accept
-        // helper bounds the handshake under the configured timeout so a stalled
-        // peer cannot wedge a frontend slot indefinitely.
-        let tls_stream = crate::tls::accept_with_optional_timeout(
-            &acceptor,
-            client_stream,
-            frontend_tls_handshake_timeout_seconds,
-            &remote_addr,
-        )
-        .await
-        .map_err(|e| -> anyhow::Error {
-            StreamSetupError::with_source(
-                StreamSetupKind::FrontendTlsHandshake,
-                format!("from {remote_addr}: {e}"),
-                e,
-            )
-            .into()
-        })?;
-
-        // Extract peer certificate DER from TLS handshake for plugin use.
-        let peer_chain_der = tls_stream.get_ref().1.peer_certificates().map(|certs| {
-            certs
-                .iter()
-                .map(|cert| cert.to_vec())
-                .collect::<Vec<Vec<u8>>>()
-        });
-        let peer_cert_der = peer_chain_der
-            .as_ref()
-            .and_then(|certs| certs.first().cloned())
-            .map(Arc::new);
-        let peer_chain_tail_der = peer_chain_der.and_then(|mut certs| {
-            if certs.len() <= 1 {
-                None
-            } else {
-                certs.remove(0);
-                Some(Arc::new(certs))
-            }
-        });
-        stream_ctx.tls_client_cert_der = peer_cert_der;
-        stream_ctx.tls_client_cert_chain_der = peer_chain_tail_der;
-
-        // Run on_stream_connect plugins after TLS handshake so client cert is available.
-        if !plugins.is_empty() {
-            for plugin in plugins.iter() {
-                if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
-                    debug!(
-                        proxy_id = %proxy_id,
-                        client = %remote_addr.ip(),
-                        "TCP/TLS connection rejected by plugin"
-                    );
-                    return Err(StreamSetupError::new(
-                        StreamSetupKind::RejectedByPlugin,
-                        "(TCP/TLS)",
+    let copy_result = match client_stream {
+        ClientRelayStream::Tls(tls_stream) => {
+            let tls_stream = *tls_stream;
+            let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+            match backend_stream {
+                BackendStream::Tls(bs) => {
+                    bidirectional_copy(
+                        tls_stream,
+                        bs,
+                        idle_timeout,
+                        half_close_cap,
+                        backend_read_timeout,
+                        backend_write_timeout,
+                        buf_size,
                     )
-                    .into());
+                    .await
                 }
-            }
-        }
-
-        let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
-        match backend_stream {
-            BackendStream::Tls(bs) => {
-                bidirectional_copy(
-                    tls_stream,
-                    bs,
-                    idle_timeout,
-                    half_close_cap,
-                    backend_read_timeout,
-                    backend_write_timeout,
-                    buf_size,
-                )
-                .await
-            }
-            BackendStream::Plain(bs) => {
-                // On Linux with kTLS, attempt to install TLS keys into the kernel
-                // so splice(2) can handle encrypted traffic without userspace copies.
-                #[cfg(target_os = "linux")]
-                {
-                    if ktls_enabled {
-                        match try_ktls_splice(
-                            tls_stream,
-                            bs,
-                            idle_timeout,
-                            half_close_cap,
-                            buf_size,
-                        )
-                        .await
-                        {
-                            Ok(result) => {
-                                used_splice = true;
-                                result
-                            }
-                            Err(KtlsError::Unsupported(streams)) => {
-                                // kTLS not available for this cipher/version — fall back
-                                // to userspace copy with the TLS stream intact.
-                                let (tls_stream_back, bs_back) = *streams;
-                                bidirectional_copy(
-                                    tls_stream_back,
-                                    bs_back,
-                                    idle_timeout,
-                                    half_close_cap,
-                                    backend_read_timeout,
-                                    backend_write_timeout,
-                                    buf_size,
-                                )
-                                .await
-                            }
-                            Err(KtlsError::Installed(e)) => {
-                                // Unrecoverable: TLS stream was consumed via into_inner()
-                                // + dangerous_extract_secrets(). The raw TcpStream has no
-                                // TLS layer — bidirectional_copy would forward plaintext.
-                                // This path only triggers if SOL_TLS key install fails
-                                // AFTER the pre-flight TCP_ULP probe succeeded (e.g.,
-                                // kernel cipher mismatch or ENOMEM). In practice this is
-                                // extremely rare since we validate cipher/version before
-                                // extracting secrets. Attribute the failure at the
-                                // bidirectional-copy boundary — no bytes were exchanged
-                                // through the proxy path, so per-direction counts are 0.
-                                StreamCopyResult {
-                                    bytes_client_to_backend: 0,
-                                    bytes_backend_to_client: 0,
-                                    first_failure: Some((
-                                        Direction::Unknown,
-                                        classify_stream_error(&e),
-                                        None,
-                                        e.to_string(),
-                                    )),
+                BackendStream::Plain(bs) => {
+                    // On Linux with kTLS, attempt to install TLS keys into the kernel
+                    // so splice(2) can handle encrypted traffic without userspace copies.
+                    #[cfg(target_os = "linux")]
+                    {
+                        if ktls_enabled {
+                            match try_ktls_splice(
+                                tls_stream,
+                                bs,
+                                idle_timeout,
+                                half_close_cap,
+                                buf_size,
+                            )
+                            .await
+                            {
+                                Ok(result) => {
+                                    used_splice = true;
+                                    result
+                                }
+                                Err(KtlsError::Unsupported(streams)) => {
+                                    // kTLS not available for this cipher/version — fall back
+                                    // to userspace copy with the TLS stream intact.
+                                    let (tls_stream_back, bs_back) = *streams;
+                                    bidirectional_copy(
+                                        tls_stream_back,
+                                        bs_back,
+                                        idle_timeout,
+                                        half_close_cap,
+                                        backend_read_timeout,
+                                        backend_write_timeout,
+                                        buf_size,
+                                    )
+                                    .await
+                                }
+                                Err(KtlsError::Installed(e)) => {
+                                    // Unrecoverable: TLS stream was consumed via into_inner()
+                                    // + dangerous_extract_secrets(). The raw TcpStream has no
+                                    // TLS layer — bidirectional_copy would forward plaintext.
+                                    // This path only triggers if SOL_TLS key install fails
+                                    // AFTER the pre-flight TCP_ULP probe succeeded (e.g.,
+                                    // kernel cipher mismatch or ENOMEM). In practice this is
+                                    // extremely rare since we validate cipher/version before
+                                    // extracting secrets. Attribute the failure at the
+                                    // bidirectional-copy boundary — no bytes were exchanged
+                                    // through the proxy path, so per-direction counts are 0.
+                                    StreamCopyResult {
+                                        bytes_client_to_backend: 0,
+                                        bytes_backend_to_client: 0,
+                                        first_failure: Some((
+                                            Direction::Unknown,
+                                            classify_stream_error(&e),
+                                            None,
+                                            e.to_string(),
+                                        )),
+                                    }
                                 }
                             }
+                        } else {
+                            bidirectional_copy(
+                                tls_stream,
+                                bs,
+                                idle_timeout,
+                                half_close_cap,
+                                backend_read_timeout,
+                                backend_write_timeout,
+                                buf_size,
+                            )
+                            .await
                         }
-                    } else {
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
                         bidirectional_copy(
                             tls_stream,
                             bs,
@@ -1808,66 +1849,12 @@ async fn handle_tcp_connection_inner(
                         .await
                     }
                 }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    bidirectional_copy(
-                        tls_stream,
-                        bs,
-                        idle_timeout,
-                        half_close_cap,
-                        backend_read_timeout,
-                        backend_write_timeout,
-                        buf_size,
-                    )
-                    .await
-                }
             }
         }
-    } else {
-        let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
-        match backend_stream {
-            BackendStream::Tls(bs) => {
-                used_splice = false;
-                bidirectional_copy(
-                    client_stream,
-                    bs,
-                    idle_timeout,
-                    half_close_cap,
-                    backend_read_timeout,
-                    backend_write_timeout,
-                    buf_size,
-                )
-                .await
-            }
-            BackendStream::Plain(bs) => {
-                // On Linux, use splice(2) for zero-copy relay when both sides
-                // are raw TCP (no frontend TLS, no backend TLS).
-                // When io_uring is enabled, use IORING_OP_SPLICE on blocking threads.
-                #[cfg(target_os = "linux")]
-                {
-                    used_splice = true;
-                    if io_uring_splice_enabled {
-                        bidirectional_splice_io_uring(
-                            client_stream,
-                            bs,
-                            idle_timeout,
-                            half_close_cap,
-                            buf_size,
-                        )
-                        .await
-                    } else {
-                        bidirectional_splice(
-                            client_stream,
-                            bs,
-                            idle_timeout,
-                            half_close_cap,
-                            buf_size,
-                        )
-                        .await
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
+        ClientRelayStream::Plain(client_stream) => {
+            let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+            match backend_stream {
+                BackendStream::Tls(bs) => {
                     used_splice = false;
                     bidirectional_copy(
                         client_stream,
@@ -1879,6 +1866,48 @@ async fn handle_tcp_connection_inner(
                         buf_size,
                     )
                     .await
+                }
+                BackendStream::Plain(bs) => {
+                    // On Linux, use splice(2) for zero-copy relay when both sides
+                    // are raw TCP (no frontend TLS, no backend TLS).
+                    // When io_uring is enabled, use IORING_OP_SPLICE on blocking threads.
+                    #[cfg(target_os = "linux")]
+                    {
+                        used_splice = true;
+                        if io_uring_splice_enabled {
+                            bidirectional_splice_io_uring(
+                                client_stream,
+                                bs,
+                                idle_timeout,
+                                half_close_cap,
+                                buf_size,
+                            )
+                            .await
+                        } else {
+                            bidirectional_splice(
+                                client_stream,
+                                bs,
+                                idle_timeout,
+                                half_close_cap,
+                                buf_size,
+                            )
+                            .await
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        used_splice = false;
+                        bidirectional_copy(
+                            client_stream,
+                            bs,
+                            idle_timeout,
+                            half_close_cap,
+                            backend_read_timeout,
+                            backend_write_timeout,
+                            buf_size,
+                        )
+                        .await
+                    }
                 }
             }
         }
@@ -1948,6 +1977,12 @@ fn resolve_backend_target(
 enum BackendStream {
     Plain(TcpStream),
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+/// Client-side stream after optional frontend TLS termination.
+enum ClientRelayStream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
 }
 
 /// Try to select a different upstream target for retry, excluding the current one.

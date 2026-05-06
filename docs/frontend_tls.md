@@ -47,6 +47,28 @@ WSS, gRPC-over-TLS, TCP+TLS stream listeners, and UDP+DTLS listeners from slow
 or stalled handshakes. After TLS completes, HTTP requests are governed by
 `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS`.
 
+### Frontend Before Backend
+
+For TLS/DTLS-terminating client-facing protocols, Ferrum completes frontend
+crypto and admission before backend dispatch:
+
+- HTTPS, HTTP/2-over-TLS, WSS, and gRPC-over-TLS complete the frontend TLS
+  handshake before HTTP request routing or backend connection selection.
+- Normal HTTP/3 completes the QUIC/TLS handshake before request routing.
+- TCP+TLS stream proxies complete the frontend TLS handshake, then run
+  `on_stream_connect`, before opening the backend TCP or TLS connection.
+- UDP+DTLS stream proxies complete the frontend DTLS handshake, then run
+  `on_stream_connect`, before creating the backend UDP or DTLS session.
+
+Frontend handshake failures and stream plugin rejections are frontend setup
+failures. They close the client side without dialing the backend or recording a
+backend circuit-breaker failure.
+
+The deliberate exception is operator-enabled HTTP/3 0-RTT early data
+(`FERRUM_TLS_EARLY_DATA_METHODS`), which is disabled by default. When enabled,
+Ferrum permits only configured replay-safe methods and forwards `Early-Data: 1`
+so backends can apply their own replay policy.
+
 ## Configuration Scenarios
 
 ### 1. HTTP Only (Default)
