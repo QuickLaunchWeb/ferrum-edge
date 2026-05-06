@@ -5937,6 +5937,11 @@ async fn handle_proxy_request_inner(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    ctx.frontend_listen_port = Some(if is_tls {
+        state.env_config.proxy_https_port
+    } else {
+        state.env_config.proxy_http_port
+    });
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     // Store raw query string on ctx for lazy parsing. The local `query_string`

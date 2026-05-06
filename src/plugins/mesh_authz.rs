@@ -79,9 +79,10 @@ impl Plugin for MeshAuthz {
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         let source_principal = source_principal_from_request(ctx);
         ctx.materialize_headers();
-        let host = header_value(&ctx.headers, "host")
-            .or_else(|| ctx.raw_header_get("host"))
-            .map(str::to_string);
+        // The proxy handler backfills HTTP/2/3 `:authority` into materialized
+        // `host` before plugin phases run, so the materialized map is the
+        // single source of truth here.
+        let host = ctx.headers.get("host").cloned();
         let headers: BTreeMap<String, String> = ctx
             .headers
             .iter()
@@ -92,10 +93,11 @@ impl Plugin for MeshAuthz {
             method: Some(ctx.method.clone()),
             path: Some(ctx.path.clone()),
             host,
-            port: ctx
-                .matched_proxy
-                .as_ref()
-                .and_then(|proxy| proxy.listen_port),
+            port: ctx.frontend_listen_port.or_else(|| {
+                ctx.matched_proxy
+                    .as_ref()
+                    .and_then(|proxy| proxy.listen_port)
+            }),
             headers,
             attributes: BTreeMap::new(),
         };
@@ -133,14 +135,5 @@ fn source_principal_from_request(ctx: &RequestContext) -> Option<SpiffeId> {
         ctx.raw_header_get(BAGGAGE_HEADER)
             .map(HboneIdentity::from_baggage_header)
             .and_then(|identity| identity.source_principal)
-    })
-}
-
-fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
-    headers.get(name).map(String::as_str).or_else(|| {
-        headers
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
     })
 }
