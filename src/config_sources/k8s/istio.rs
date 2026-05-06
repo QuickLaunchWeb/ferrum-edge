@@ -570,7 +570,7 @@ mod tests {
 
         assert_eq!(
             result.config.proxies[0].listen_path.as_deref(),
-            Some("~/v1\\.items")
+            Some("~(?:/v1\\.items)")
         );
         assert!(!result.config.proxies[0].strip_listen_path);
     }

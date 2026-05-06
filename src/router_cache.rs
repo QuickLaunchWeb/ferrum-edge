@@ -2,7 +2,8 @@
 //!
 //! Pre-sorts routes by listen_path length (longest first) at config load time,
 //! with two-tier host+path matching: exact host → wildcard host → catch-all.
-//! Within each host tier, prefix routes are checked first, then regex routes.
+//! Within each host tier, literal exact-path routes are checked first, then
+//! prefix routes, then regex routes.
 //!
 //! Caches (host, path) → proxy lookups in a bounded DashMap for O(1) repeated hits.
 //! Regex route matches use a separate cache partition to prevent high-cardinality
@@ -42,6 +43,11 @@ pub struct RouteMatch {
 struct RouteEntry {
     listen_path: String,
     proxy: Arc<Proxy>,
+}
+
+/// Literal exact-path routes with O(1) lookup.
+struct IndexedExactPathRoutes {
+    path_index: HashMap<String, Arc<Proxy>>,
 }
 
 /// A collection of prefix routes with both sorted Vec (for fallback) and
@@ -106,18 +112,25 @@ impl IndexedRegexRoutes {
 /// 3. Catch-all (proxies with empty `hosts`)
 ///
 /// Within each tier the order is:
-/// a. Prefix listen_path routes (longest-prefix matching)
-/// b. Regex listen_path routes (first match in config order)
-/// c. Host-only routes (`listen_path.is_none()`) — fallback catch-all for the host
+/// a. Literal exact-path routes (`Exact` Kubernetes translations)
+/// b. Prefix listen_path routes (longest-prefix matching)
+/// c. Regex listen_path routes (first match in config order)
+/// d. Host-only routes (`listen_path.is_none()`) — fallback catch-all for the host
 ///
 /// Host-only routes never exist in the catch-all tier: a proxy with both
 /// `hosts.is_empty()` and `listen_path.is_none()` is rejected at config validation.
 pub(crate) struct HostRouteTable {
+    /// Exact host → literal exact-path route entries.
+    exact_hosts_exact_paths: HashMap<String, IndexedExactPathRoutes>,
     /// Exact host → indexed prefix route entries (longest listen_path first + HashMap index).
     exact_hosts: HashMap<String, IndexedPrefixRoutes>,
+    /// Wildcard host → literal exact-path route entries.
+    wildcard_hosts_exact_paths: Vec<(String, IndexedExactPathRoutes)>,
     /// Wildcard suffix entries, e.g., ("*.example.com", routes).
     /// Sorted by pattern length descending so more-specific wildcards match first.
     wildcard_hosts: Vec<(String, IndexedPrefixRoutes)>,
+    /// Catch-all literal exact-path routes (proxies with empty `hosts`).
+    catch_all_exact_paths: IndexedExactPathRoutes,
     /// Catch-all prefix routes (proxies with empty `hosts`) with HashMap index.
     catch_all: IndexedPrefixRoutes,
     /// Exact host → indexed regex route entries (RegexSet + individual patterns).
@@ -131,6 +144,8 @@ pub(crate) struct HostRouteTable {
     exact_hosts_host_only: HashMap<String, Arc<Proxy>>,
     /// Wildcard host → host-only proxy. Sorted by pattern length descending.
     wildcard_hosts_host_only: Vec<(String, Arc<Proxy>)>,
+    /// Pre-computed flag: true if any exact-path routes exist.
+    has_exact_path_routes: bool,
     /// Pre-computed flag: true if any regex routes exist (skip regex path entirely when false).
     has_regex_routes: bool,
     /// Pre-computed flag: true if any host-only routes exist (skip host-only path entirely when false).
@@ -402,8 +417,9 @@ impl RouterCache {
     /// Find the matching proxy for a request host and path.
     ///
     /// Priority order (within each host tier):
-    /// 1. Prefix route: longest path prefix match
-    /// 2. Regex route: first pattern match (in config order)
+    /// 1. Literal exact-path route
+    /// 2. Prefix route: longest path prefix match
+    /// 3. Regex route: first pattern match (in config order)
     ///
     /// Host tiers are searched: exact host → wildcard host → catch-all.
     ///
@@ -535,7 +551,7 @@ impl RouterCache {
     /// Search the route table for a matching proxy.
     ///
     /// Within each host tier, matching order is:
-    ///   prefix routes → regex routes → host-only fallback.
+    ///   exact-path routes → prefix routes → regex routes → host-only fallback.
     /// Host tiers are searched exact → wildcard → catch-all. Catch-all has no
     /// host-only tier (validation forbids empty-hosts + no-listen-path).
     fn search_route_table(
@@ -544,7 +560,13 @@ impl RouterCache {
         path: &str,
     ) -> Option<RouteMatch> {
         if let Some(host) = host {
-            // 1. Exact host match — prefix, regex, then host-only
+            // 1. Exact host match — exact path, prefix, regex, then host-only
+            if table.has_exact_path_routes
+                && let Some(routes) = table.exact_hosts_exact_paths.get(host)
+                && let Some(route_match) = find_exact_path_match_indexed(routes, path)
+            {
+                return Some(route_match);
+            }
             if let Some(routes) = table.exact_hosts.get(host)
                 && let Some(route_match) = find_prefix_match_indexed(routes, path)
             {
@@ -566,7 +588,16 @@ impl RouterCache {
                 });
             }
 
-            // 2. Wildcard host match — prefix, regex, then host-only
+            // 2. Wildcard host match — exact path, prefix, regex, then host-only
+            if table.has_exact_path_routes {
+                for (pattern, routes) in &table.wildcard_hosts_exact_paths {
+                    if wildcard_matches(pattern, host)
+                        && let Some(route_match) = find_exact_path_match_indexed(routes, path)
+                    {
+                        return Some(route_match);
+                    }
+                }
+            }
             for (pattern, routes) in &table.wildcard_hosts {
                 if wildcard_matches(pattern, host)
                     && let Some(route_match) = find_prefix_match_indexed(routes, path)
@@ -596,8 +627,14 @@ impl RouterCache {
             }
         }
 
-        // 3. Catch-all — prefix then regex (no host-only tier: validation
+        // 3. Catch-all — exact path, prefix, then regex (no host-only tier: validation
         //    forbids empty-hosts + no-listen-path).
+        if table.has_exact_path_routes
+            && let Some(route_match) =
+                find_exact_path_match_indexed(&table.catch_all_exact_paths, path)
+        {
+            return Some(route_match);
+        }
         if let Some(route_match) = find_prefix_match_indexed(&table.catch_all, path) {
             return Some(route_match);
         }
@@ -644,8 +681,18 @@ impl RouterCache {
     pub fn route_count(&self) -> usize {
         let table = self.route_table.load();
         let exact_count: usize = table.exact_hosts.values().map(|v| v.path_index.len()).sum();
+        let exact_path_count: usize = table
+            .exact_hosts_exact_paths
+            .values()
+            .map(|v| v.path_index.len())
+            .sum();
         let wildcard_count: usize = table
             .wildcard_hosts
+            .iter()
+            .map(|(_, v)| v.path_index.len())
+            .sum();
+        let wildcard_exact_path_count: usize = table
+            .wildcard_hosts_exact_paths
             .iter()
             .map(|(_, v)| v.path_index.len())
             .sum();
@@ -660,7 +707,10 @@ impl RouterCache {
             .map(|(_, v)| v.entries.len())
             .sum();
         exact_count
+            + exact_path_count
             + wildcard_count
+            + wildcard_exact_path_count
+            + table.catch_all_exact_paths.path_index.len()
             + table.catch_all.path_index.len()
             + exact_regex
             + wildcard_regex
@@ -712,8 +762,11 @@ impl RouterCache {
     /// Regex patterns are pre-compiled at build time. Host-only routes (no
     /// listen_path) are stored as the fallback tier per host.
     fn build_route_table(config: &GatewayConfig) -> HostRouteTable {
+        let mut exact_hosts_exact_paths: HashMap<String, Vec<RouteEntry>> = HashMap::new();
         let mut exact_hosts: HashMap<String, Vec<RouteEntry>> = HashMap::new();
+        let mut wildcard_hosts_exact_paths: HashMap<String, Vec<RouteEntry>> = HashMap::new();
         let mut wildcard_hosts: HashMap<String, Vec<RouteEntry>> = HashMap::new();
+        let mut catch_all_exact_paths: Vec<RouteEntry> = Vec::new();
         let mut catch_all: Vec<RouteEntry> = Vec::new();
         let mut exact_hosts_regex: HashMap<String, Vec<RegexRouteEntry>> = HashMap::new();
         let mut wildcard_hosts_regex: HashMap<String, Vec<RegexRouteEntry>> = HashMap::new();
@@ -756,6 +809,38 @@ impl RouterCache {
             };
 
             if let Some(pattern_str) = listen_path.strip_prefix('~') {
+                if let Some(exact_path) = exact_path_from_k8s_regex_marker(pattern_str) {
+                    let add_exact_path = |target: &mut Vec<RouteEntry>, proxy: &Arc<Proxy>| {
+                        target.push(RouteEntry {
+                            listen_path: exact_path.clone(),
+                            proxy: Arc::clone(proxy),
+                        });
+                    };
+
+                    if proxy.hosts.is_empty() {
+                        add_exact_path(&mut catch_all_exact_paths, &arc_proxy);
+                    } else {
+                        for host in &proxy.hosts {
+                            let entry = RouteEntry {
+                                listen_path: exact_path.clone(),
+                                proxy: Arc::clone(&arc_proxy),
+                            };
+                            if host.starts_with("*.") {
+                                wildcard_hosts_exact_paths
+                                    .entry(host.clone())
+                                    .or_default()
+                                    .push(entry);
+                            } else {
+                                exact_hosts_exact_paths
+                                    .entry(host.clone())
+                                    .or_default()
+                                    .push(entry);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 // Regex route: compile the pattern
                 // Auto-anchor for full-path matching (^pattern$)
                 let anchored = crate::config::types::anchor_regex_pattern(pattern_str);
@@ -840,6 +925,11 @@ impl RouterCache {
             .into_iter()
             .map(|(host, routes)| (host, IndexedPrefixRoutes::from_sorted(routes)))
             .collect();
+        let exact_hosts_exact_path_indexed: HashMap<String, IndexedExactPathRoutes> =
+            exact_hosts_exact_paths
+                .into_iter()
+                .map(|(host, routes)| (host, IndexedExactPathRoutes::from_entries(routes)))
+                .collect();
 
         let mut wildcard_vec: Vec<(String, Vec<RouteEntry>)> = wildcard_hosts.into_iter().collect();
         for (_, routes) in &mut wildcard_vec {
@@ -851,9 +941,19 @@ impl RouterCache {
             .into_iter()
             .map(|(pattern, routes)| (pattern, IndexedPrefixRoutes::from_sorted(routes)))
             .collect();
+        let mut wildcard_exact_path_vec: Vec<(String, Vec<RouteEntry>)> =
+            wildcard_hosts_exact_paths.into_iter().collect();
+        wildcard_exact_path_vec.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
+        let wildcard_exact_path_indexed: Vec<(String, IndexedExactPathRoutes)> =
+            wildcard_exact_path_vec
+                .into_iter()
+                .map(|(pattern, routes)| (pattern, IndexedExactPathRoutes::from_entries(routes)))
+                .collect();
 
         catch_all.sort_by_key(|b| std::cmp::Reverse(b.listen_path.len()));
         let catch_all_indexed = IndexedPrefixRoutes::from_sorted(catch_all);
+        let catch_all_exact_path_indexed =
+            IndexedExactPathRoutes::from_entries(catch_all_exact_paths);
 
         // Build RegexSet indexes for O(1) multi-pattern matching
         let exact_hosts_regex_indexed: HashMap<String, IndexedRegexRoutes> = exact_hosts_regex
@@ -875,6 +975,9 @@ impl RouterCache {
         let has_regex_routes = !exact_hosts_regex_indexed.is_empty()
             || !wildcard_regex_indexed.is_empty()
             || !catch_all_regex_indexed.is_empty();
+        let has_exact_path_routes = !exact_hosts_exact_path_indexed.is_empty()
+            || !wildcard_exact_path_indexed.is_empty()
+            || !catch_all_exact_path_indexed.is_empty();
 
         // Sort wildcard host-only entries by pattern length descending so
         // more-specific wildcards match first (same ordering as wildcard_hosts).
@@ -886,17 +989,35 @@ impl RouterCache {
             !exact_hosts_host_only.is_empty() || !wildcard_host_only_vec.is_empty();
 
         HostRouteTable {
+            exact_hosts_exact_paths: exact_hosts_exact_path_indexed,
             exact_hosts: exact_hosts_indexed,
+            wildcard_hosts_exact_paths: wildcard_exact_path_indexed,
             wildcard_hosts: wildcard_indexed,
+            catch_all_exact_paths: catch_all_exact_path_indexed,
             catch_all: catch_all_indexed,
             exact_hosts_regex: exact_hosts_regex_indexed,
             wildcard_hosts_regex: wildcard_regex_indexed,
             catch_all_regex: catch_all_regex_indexed,
             exact_hosts_host_only,
             wildcard_hosts_host_only: wildcard_host_only_vec,
+            has_exact_path_routes,
             has_regex_routes,
             has_host_only_routes,
         }
+    }
+}
+
+impl IndexedExactPathRoutes {
+    fn from_entries(entries: Vec<RouteEntry>) -> Self {
+        let path_index = entries
+            .iter()
+            .map(|entry| (entry.listen_path.clone(), Arc::clone(&entry.proxy)))
+            .collect();
+        Self { path_index }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.path_index.is_empty()
     }
 }
 
@@ -909,6 +1030,25 @@ impl IndexedPrefixRoutes {
             .collect();
         Self { path_index }
     }
+}
+
+fn find_exact_path_match_indexed(
+    routes: &IndexedExactPathRoutes,
+    path: &str,
+) -> Option<RouteMatch> {
+    if routes.path_index.is_empty() {
+        return None;
+    }
+
+    let match_path = match path.find('?') {
+        Some(pos) => &path[..pos],
+        None => path,
+    };
+    routes.path_index.get(match_path).map(|proxy| RouteMatch {
+        proxy: Arc::clone(proxy),
+        path_params: Vec::new(),
+        matched_prefix_len: match_path.len(),
+    })
 }
 
 /// Find the longest-prefix-matching route using the HashMap index.
@@ -1052,6 +1192,24 @@ fn is_regex_proxy(proxy: &Proxy) -> bool {
         .listen_path
         .as_deref()
         .is_some_and(|p| p.starts_with('~'))
+}
+
+fn exact_path_from_k8s_regex_marker(pattern: &str) -> Option<String> {
+    let escaped = pattern.strip_prefix("(?:")?.strip_suffix(')')?;
+    unescape_regex_literal(escaped)
+}
+
+fn unescape_regex_literal(escaped: &str) -> Option<String> {
+    let mut literal = String::with_capacity(escaped.len());
+    let mut chars = escaped.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            literal.push(chars.next()?);
+        } else {
+            literal.push(ch);
+        }
+    }
+    Some(literal)
 }
 
 fn resolve_auto_router_cache_entries(proxy_count: usize) -> usize {
@@ -1396,6 +1554,33 @@ mod tests {
             proxies,
             ..GatewayConfig::default()
         }
+    }
+
+    #[test]
+    fn k8s_exact_path_route_precedes_prefix_catch_all() {
+        let config = GatewayConfig {
+            proxies: vec![
+                minimal_proxy_for_routing("root-prefix", "/"),
+                minimal_proxy_for_routing("exact", "~(?:/api\\.v1)"),
+            ],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+
+        let exact = cache
+            .find_proxy(None, "/api.v1")
+            .expect("exact path should match");
+        assert_eq!(exact.proxy.id, "exact");
+
+        let exact_with_query = cache
+            .find_proxy(None, "/api.v1?debug=true")
+            .expect("exact path should ignore query string");
+        assert_eq!(exact_with_query.proxy.id, "exact");
+
+        let child = cache
+            .find_proxy(None, "/api.v1/users")
+            .expect("child path should fall back to prefix");
+        assert_eq!(child.proxy.id, "root-prefix");
     }
 
     #[test]
