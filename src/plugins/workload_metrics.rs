@@ -54,7 +54,7 @@ impl WorkloadMetrics {
 
     fn annotate_http_context(&self, ctx: &mut RequestContext, headers: &HashMap<String, String>) {
         self.insert_common_metadata(&mut ctx.metadata);
-        let hbone_identity = authenticated_hbone_identity(ctx);
+        let hbone_identity = authenticated_hbone_identity(ctx, headers);
         let source_identity = hbone_identity
             .as_ref()
             .and_then(|identity| identity.source_principal.clone())
@@ -236,7 +236,10 @@ fn request_protocol(ctx: &RequestContext, headers: &HashMap<String, String>) -> 
     }
 }
 
-fn authenticated_hbone_identity(ctx: &RequestContext) -> Option<HboneIdentity> {
+fn authenticated_hbone_identity(
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+) -> Option<HboneIdentity> {
     if ctx.peer_spiffe_id.is_none()
         || ctx
             .metadata
@@ -247,6 +250,8 @@ fn authenticated_hbone_identity(ctx: &RequestContext) -> Option<HboneIdentity> {
     }
 
     ctx.raw_header_get(BAGGAGE_HEADER)
+        .or_else(|| headers.get(BAGGAGE_HEADER).map(String::as_str))
+        .or_else(|| ctx.headers.get(BAGGAGE_HEADER).map(String::as_str))
         .map(HboneIdentity::from_baggage_header)
 }
 

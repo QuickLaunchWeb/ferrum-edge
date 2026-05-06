@@ -131,8 +131,7 @@ impl Plugin for MeshAuthz {
 
 fn source_principal_from_request(ctx: &RequestContext) -> Option<SpiffeId> {
     if is_authenticated_hbone_request(ctx) {
-        return ctx
-            .raw_header_get(BAGGAGE_HEADER)
+        return baggage_header_from_request(ctx)
             .map(HboneIdentity::from_baggage_header)
             .and_then(|identity| identity.source_principal)
             .or_else(|| ctx.peer_spiffe_id.clone());
@@ -147,4 +146,9 @@ fn is_authenticated_hbone_request(ctx: &RequestContext) -> bool {
             .metadata
             .get("request_protocol")
             .is_some_and(|value| value == "hbone")
+}
+
+fn baggage_header_from_request(ctx: &RequestContext) -> Option<&str> {
+    ctx.raw_header_get(BAGGAGE_HEADER)
+        .or_else(|| ctx.headers.get(BAGGAGE_HEADER).map(String::as_str))
 }
