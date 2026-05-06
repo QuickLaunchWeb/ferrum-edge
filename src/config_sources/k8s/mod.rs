@@ -452,4 +452,15 @@ mod tests {
 
         assert!(result.config.mesh.is_none());
     }
+
+    #[test]
+    fn port_from_u64_enforces_kubernetes_port_boundaries() {
+        let object = object("HTTPRoute", serde_json::json!({}));
+
+        assert!(port_from_u64(&object, 0, "port").is_err());
+        assert_eq!(port_from_u64(&object, 1, "port").unwrap(), 1);
+        assert_eq!(port_from_u64(&object, 65_535, "port").unwrap(), 65_535);
+        assert!(port_from_u64(&object, 65_536, "port").is_err());
+        assert!(port_from_u64(&object, u64::MAX, "port").is_err());
+    }
 }

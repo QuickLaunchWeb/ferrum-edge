@@ -28,7 +28,7 @@ pub(super) fn translate(
         "PeerAuthentication" => {
             acc.mesh
                 .peer_authentications
-                .push(peer_authentication(object));
+                .push(peer_authentication(object)?);
             Ok(true)
         }
         "ServiceEntry" => {
@@ -108,8 +108,8 @@ fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateEr
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|rule| mesh_rule(rule, action))
-        .collect();
+        .map(|rule| mesh_rule(object, rule, action))
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(MeshPolicy {
         name: object.metadata.name.clone(),
@@ -119,7 +119,11 @@ fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateEr
     })
 }
 
-fn mesh_rule(rule: &Value, action: PolicyAction) -> MeshRule {
+fn mesh_rule(
+    object: &K8sObject,
+    rule: &Value,
+    action: PolicyAction,
+) -> Result<MeshRule, K8sTranslateError> {
     let from = rule
         .get("from")
         .and_then(Value::as_array)
@@ -132,8 +136,8 @@ fn mesh_rule(rule: &Value, action: PolicyAction) -> MeshRule {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|to| request_match(to.get("operation").unwrap_or(&Value::Null)))
-        .collect();
+        .map(|to| request_match(object, to.get("operation").unwrap_or(&Value::Null)))
+        .collect::<Result<Vec<_>, _>>()?;
     let when = rule
         .get("when")
         .and_then(Value::as_array)
@@ -142,12 +146,12 @@ fn mesh_rule(rule: &Value, action: PolicyAction) -> MeshRule {
         .filter_map(condition_match)
         .collect();
 
-    MeshRule {
+    Ok(MeshRule {
         from,
         to,
         when,
         action,
-    }
+    })
 }
 
 fn principal_matches(source: &Value) -> Vec<PrincipalMatch> {
@@ -169,17 +173,19 @@ fn principal_matches(source: &Value) -> Vec<PrincipalMatch> {
     matches
 }
 
-fn request_match(operation: &Value) -> RequestMatch {
-    RequestMatch {
+fn request_match(object: &K8sObject, operation: &Value) -> Result<RequestMatch, K8sTranslateError> {
+    let ports = string_array(operation, "ports")
+        .into_iter()
+        .map(|port| port_from_string(object, &port, "rules[].to[].operation.ports"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(RequestMatch {
         methods: string_array(operation, "methods"),
         paths: string_array(operation, "paths"),
         hosts: string_array(operation, "hosts"),
         headers: HashMap::new(),
-        ports: string_array(operation, "ports")
-            .into_iter()
-            .filter_map(|port| port.parse::<u16>().ok())
-            .collect(),
-    }
+        ports,
+    })
 }
 
 fn condition_match(value: &Value) -> Option<ConditionMatch> {
@@ -190,23 +196,23 @@ fn condition_match(value: &Value) -> Option<ConditionMatch> {
     })
 }
 
-fn peer_authentication(object: &K8sObject) -> PeerAuthentication {
+fn peer_authentication(object: &K8sObject) -> Result<PeerAuthentication, K8sTranslateError> {
     let mtls = object.spec.get("mtls").unwrap_or(&Value::Null);
     let effective_mtls_mode = mtls_mode(string_field(mtls, "mode").unwrap_or("PERMISSIVE"));
-    let port_overrides = object
+    let mut port_overrides = HashMap::new();
+    for (port, value) in object
         .spec
         .get("portLevelMtls")
         .and_then(Value::as_object)
         .into_iter()
         .flat_map(|ports| ports.iter())
-        .filter_map(|(port, value)| {
-            let port = port.parse::<u16>().ok()?;
-            let mode = mtls_mode(string_field(value, "mode").unwrap_or("PERMISSIVE"));
-            Some((port, mode))
-        })
-        .collect();
+    {
+        let port = port_from_string(object, port, "portLevelMtls")?;
+        let mode = mtls_mode(string_field(value, "mode").unwrap_or("PERMISSIVE"));
+        port_overrides.insert(port, mode);
+    }
 
-    PeerAuthentication {
+    Ok(PeerAuthentication {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
         selector: object
@@ -218,7 +224,17 @@ fn peer_authentication(object: &K8sObject) -> PeerAuthentication {
             }),
         mtls_mode: effective_mtls_mode,
         port_overrides,
-    }
+    })
+}
+
+fn port_from_string(object: &K8sObject, raw: &str, field: &str) -> Result<u16, K8sTranslateError> {
+    let parsed = raw.parse::<u64>().map_err(|_| {
+        invalid_resource(
+            object,
+            format!("{field} must be a numeric port between 1 and 65535 (got {raw})"),
+        )
+    })?;
+    port_from_u64(object, parsed, field)
 }
 
 fn mtls_mode(value: &str) -> MtlsMode {
@@ -534,6 +550,66 @@ mod tests {
         .expect_err("invalid port must fail closed");
 
         assert!(err.to_string().contains("ports[].number"));
+        assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn rejects_authorization_policy_ports_outside_kubernetes_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [{"operation": {"ports": ["70000"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid AuthorizationPolicy port must fail closed");
+
+        assert!(err.to_string().contains("rules[].to[].operation.ports"));
+        assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn rejects_peer_authentication_port_level_mtls_outside_kubernetes_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "PeerAuthentication",
+                serde_json::json!({
+                    "mtls": {"mode": "PERMISSIVE"},
+                    "portLevelMtls": {
+                        "70000": {"mode": "STRICT"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid PeerAuthentication port must fail closed");
+
+        assert!(err.to_string().contains("portLevelMtls"));
+        assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn rejects_virtual_service_destination_ports_outside_kubernetes_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 70000}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid VirtualService destination port must fail closed");
+
+        assert!(err.to_string().contains("route.destination.port.number"));
         assert!(err.to_string().contains("70000"));
     }
 

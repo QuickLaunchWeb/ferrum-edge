@@ -387,6 +387,45 @@ mod tests {
     }
 
     #[test]
+    fn rejects_gateway_listener_ports_outside_kubernetes_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Gateway",
+                serde_json::json!({
+                    "listeners": [{"name": "http", "port": 70000, "protocol": "HTTP"}]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid listener port must fail closed");
+
+        assert!(err.to_string().contains("listeners[].port"));
+        assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn rejects_l4_route_ports_outside_kubernetes_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "TCPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [{"name": "db", "port": 70000}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid L4 backend port must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("TCPRoute/TLSRoute backendRefs[].port")
+        );
+        assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
     fn rejects_cross_namespace_backend_ref_without_reference_grant() {
         let err = translate_k8s_objects(
             &[object(
