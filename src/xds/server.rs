@@ -381,7 +381,7 @@ impl XdsAdsServer {
         config: &GatewayConfig,
         subscriptions: &mut HashMap<String, XdsSubscription>,
         request: &DiscoveryRequest,
-    ) -> Option<DiscoveryResponse> {
+    ) -> Option<(Arc<XdsSnapshot>, DiscoveryResponse)> {
         if !request.response_nonce.is_empty() {
             match self.record_sotw_ack(node_id, request) {
                 AckOutcome::Acked => debug!(
@@ -430,7 +430,8 @@ impl XdsAdsServer {
             {
                 return None;
             }
-            Some(self.sotw_response(&snapshot, &subscription))
+            let response = self.sotw_response(&snapshot, &subscription);
+            Some((snapshot, response))
         } else {
             None
         }
@@ -632,14 +633,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             server.catch_up_pending_updates(&mut updates, &mut stream_config);
                         }
 
-                        let send_failed = if let Some(response) = server.sotw_response_for_request(
+                        let send_failed = if let Some((snapshot, response)) = server.sotw_response_for_request(
                             &current_node_id,
                             &stream_config,
                             &mut subscriptions,
                             &request,
                         )
                         {
-                            last_snapshot = server.snapshot_cache.get(&current_node_id);
+                            last_snapshot = Some(snapshot);
                             tx.send(Ok(response)).await.is_err()
                         } else {
                             false
@@ -1339,7 +1340,7 @@ mod tests {
             ..DiscoveryRequest::default()
         };
 
-        let response = server
+        let (_, response) = server
             .sotw_response_for_request("node-a", &stream_config, &mut subscriptions, &request)
             .expect("first SotW request should receive the caught-up snapshot");
 
@@ -1434,7 +1435,7 @@ mod tests {
             ..DiscoveryRequest::default()
         };
 
-        let response = server
+        let (_, response) = server
             .sotw_response_for_request("node-a", &config, &mut subscriptions, &request)
             .expect("subscription update should send the requested resource");
 
@@ -1444,6 +1445,42 @@ mod tests {
         assert!(!subscription.wildcard);
         assert_eq!(subscription.resource_names, vec![name]);
         assert_eq!(response.resources.len(), 1);
+    }
+
+    #[test]
+    fn sotw_request_returns_exact_snapshot_for_stream_state() {
+        let config = gateway_config_with_named_service("old", 0);
+        let server = test_server(config.clone());
+        let mut subscriptions = HashMap::new();
+        let request = DiscoveryRequest {
+            type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+            ..DiscoveryRequest::default()
+        };
+
+        let (last_sent_snapshot, initial_response) = server
+            .sotw_response_for_request("node-a", &config, &mut subscriptions, &request)
+            .expect("initial SotW request should send a snapshot");
+        assert_eq!(
+            cluster_names(&initial_response),
+            vec!["cluster/default/old/8080".to_string()]
+        );
+
+        let next_config = gateway_config_with_named_service("new", 1);
+        let shared_snapshot = server.snapshot_for_config("node-a", &next_config);
+        assert_eq!(shared_snapshot.version, next_config.loaded_at.to_rfc3339());
+
+        let (_, responses) = server.sotw_responses_for_subscriptions_from_config_with_previous(
+            "node-a",
+            &subscriptions,
+            &next_config,
+            Some(last_sent_snapshot.as_ref()),
+        );
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            cluster_names(&responses[0]),
+            vec!["cluster/default/new/8080".to_string()]
+        );
     }
 
     #[test]

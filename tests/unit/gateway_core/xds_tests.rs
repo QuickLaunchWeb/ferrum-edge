@@ -169,6 +169,28 @@ fn translators_deduplicate_colliding_cluster_resources() {
 }
 
 #[test]
+fn translators_deduplicate_colliding_listener_and_route_resources() {
+    let mut mesh = mesh_config();
+    mesh.services.push(mesh.services[0].clone());
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    let request = MeshSliceRequest::from_xds_node("node-a".to_string(), "default".to_string());
+    let slice = MeshSlice::from_gateway_config(&config, request);
+    let snapshot = translate_mesh_slice_to_snapshot(&slice);
+
+    let lds = snapshot.resources(LDS_TYPE_URL);
+    assert_eq!(lds.len(), 1);
+    assert_eq!(lds[0].name, "listener/default/api/8080");
+
+    let rds = snapshot.resources(RDS_TYPE_URL);
+    assert_eq!(rds.len(), 1);
+    assert_eq!(rds[0].name, "route/default/api");
+}
+
+#[test]
 fn snapshot_cache_is_keyed_by_node_id() {
     let cache = XdsSnapshotCache::new();
     let mut slice_a = MeshSlice::from_gateway_config(
