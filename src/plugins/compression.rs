@@ -86,9 +86,14 @@ pub struct CompressionPlugin {
 
 impl CompressionPlugin {
     pub fn new(config: &Value) -> Result<Self, String> {
-        if !config.is_object() {
+        let default_config = Value::Object(serde_json::Map::new());
+        let config = if config.is_null() {
+            &default_config
+        } else if config.is_object() {
+            config
+        } else {
             return Err("compression: config must be an object".to_string());
-        }
+        };
 
         // Parse `algorithms` strictly. Unknown values are rejected (no silent
         // skip) so configuration typos surface immediately at load time

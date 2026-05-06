@@ -35,6 +35,15 @@ fn test_default_config() {
 }
 
 #[test]
+fn test_null_config_uses_defaults() {
+    let plugin =
+        CompressionPlugin::new(&serde_json::Value::Null).expect("null config should use defaults");
+    assert_eq!(plugin.name(), "compression");
+    assert!(plugin.requires_response_body_buffering());
+    assert!(!plugin.modifies_request_body());
+}
+
+#[test]
 fn test_decompress_request_config() {
     let plugin = make_plugin(json!({"decompress_request": true}));
     assert!(plugin.modifies_request_body());
