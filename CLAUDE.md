@@ -174,15 +174,15 @@ Priority order, lower = first. Multiple instances per proxy allowed. Each has `i
 
 1. `on_request_received` — tracing/CORS/termination/IP+geo/bot/spec_expose/spiffe_identity (940)/SSE validate/gRPC-Web/size+rate/tx_debug
 2. `authenticate` — mTLS (950), JWKS (1000), JWT (1100), keyauth (1200), LDAP (1250), basicauth (1300), HMAC (1400)
-3. `authorize` — ACL (2000), rate_limiting (2900)
-4. `before_proxy` — SOAP WS-Security, AI cache/dedup/guards/federation, request_transformer, serverless, response_mock, gRPC deadline, mirror, load_testing, response_caching, compression, ai_rate_limiter
+3. `authorize` — ACL (2000), mesh_authz (2075), rate_limiting (2900)
+4. `before_proxy` — SOAP WS-Security, AI cache/dedup/guards/federation, workload_metrics, request_transformer, serverless, response_mock, gRPC deadline, mirror, load_testing, response_caching, compression, ai_rate_limiter
 5. `on_final_request_body` — body_validator (gRPC protobuf + JSON/XML after transformer), gRPC-Web validation
 6. `after_proxy` — counterpart to before_proxy; rejects enforced on response path across HTTP/H3/gRPC
 7. `on_final_response_body` — dedup + semantic cache store, size limiting, response_caching LRU uncacheable predictor
 8. `on_response_body` — AI response guard, AI token metrics
-9. `log` — stdout, statsd, http, tcp, kafka, loki, udp, ws, tx_debug, prometheus, chargeback
+9. `log` — stdout, statsd, http, tcp, kafka, loki, udp, ws, tx_debug, prometheus, chargeback, access_log
 10. `on_ws_frame` — ws_message_size_limiting, ws_rate_limit, ws_frame_logging
-11. `on_stream_connect`/`on_stream_disconnect` — TCP+TLS runs after handshake (client cert available); UDP+DTLS after DTLS handshake
+11. `on_stream_connect`/`on_stream_disconnect` — TCP+TLS runs after handshake (client cert available); UDP+DTLS after DTLS handshake; mesh_authz and workload_metrics use SPIFFE/HBONE identity metadata here
 12. `on_udp_datagram` — bidirectional hooks; zero overhead unless `requires_udp_datagram_hooks()`
 
 **Multi-auth**: `AuthMode::Multi` accepts `ctx.identified_consumer` OR `ctx.authenticated_identity` (JWKS/OIDC). First-success-wins. Empty chain → reject.

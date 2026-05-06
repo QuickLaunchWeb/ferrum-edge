@@ -26,6 +26,14 @@ pub struct HboneIdentity {
 impl HboneIdentity {
     pub fn from_headers(headers: &HeaderMap) -> Self {
         let baggage = parse_baggage(headers);
+        Self::from_baggage(baggage)
+    }
+
+    pub fn from_baggage_header(raw: &str) -> Self {
+        Self::from_baggage(parse_baggage_header(raw))
+    }
+
+    fn from_baggage(baggage: BTreeMap<String, String>) -> Self {
         let source_principal = first_baggage_value(
             &baggage,
             &[
@@ -83,7 +91,17 @@ pub fn parse_baggage(headers: &HeaderMap) -> BTreeMap<String, String> {
     else {
         return baggage;
     };
+    parse_baggage_header_into(raw, &mut baggage);
+    baggage
+}
 
+pub fn parse_baggage_header(raw: &str) -> BTreeMap<String, String> {
+    let mut baggage = BTreeMap::new();
+    parse_baggage_header_into(raw, &mut baggage);
+    baggage
+}
+
+fn parse_baggage_header_into(raw: &str, baggage: &mut BTreeMap<String, String>) {
     for member in raw.split(',') {
         let Some((key, value_and_params)) = member.trim().split_once('=') else {
             continue;
@@ -103,7 +121,6 @@ pub fn parse_baggage(headers: &HeaderMap) -> BTreeMap<String, String> {
         }
         baggage.insert(key.to_string(), value.to_string());
     }
-    baggage
 }
 
 fn first_baggage_value<'a>(
