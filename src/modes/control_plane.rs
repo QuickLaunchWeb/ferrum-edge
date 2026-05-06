@@ -26,11 +26,15 @@ use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::db_backend::{self, DatabaseBackend};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
+use crate::config::incremental_apply::apply_incremental_to_config_snapshot as apply_incremental_to_config;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::cp_server::CpGrpcServer;
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
 use crate::xds::XdsAdsServer;
+
+#[cfg(test)]
+use crate::config::incremental_apply::upsert_by_id;
 
 pub async fn run(
     env_config: EnvConfig,
@@ -599,7 +603,6 @@ pub async fn run(
                                 let mut new_config = (*config_poll.load_full()).clone();
                                 apply_incremental_to_config(&mut new_config, result);
                                 new_config.normalize_fields();
-                                new_config.loaded_at = poll_ts;
                                 config_poll.store(Arc::new(new_config));
 
                                 info!("Incremental config update pushed to DPs");
@@ -734,95 +737,6 @@ pub async fn run(
     crate::modes::file::join_background_handles(vec![db_poll_handle], Duration::from_secs(5)).await;
 
     Ok(())
-}
-
-/// Apply an incremental result to a config snapshot in-place.
-///
-/// Removes deleted resources by ID, then upserts added/modified resources.
-/// This keeps the CP's in-memory config in sync without a full DB reload.
-fn apply_incremental_to_config(
-    config: &mut crate::config::types::GatewayConfig,
-    result: crate::config::db_loader::IncrementalResult,
-) {
-    use std::collections::HashSet;
-
-    // Remove deleted resources
-    let removed_proxies: HashSet<&str> = result
-        .removed_proxy_ids
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-    let removed_consumers: HashSet<&str> = result
-        .removed_consumer_ids
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-    let removed_plugins: HashSet<&str> = result
-        .removed_plugin_config_ids
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-    let removed_upstreams: HashSet<&str> = result
-        .removed_upstream_ids
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-
-    config
-        .proxies
-        .retain(|p| !removed_proxies.contains(p.id.as_str()));
-    config
-        .consumers
-        .retain(|c| !removed_consumers.contains(c.id.as_str()));
-    config
-        .plugin_configs
-        .retain(|pc| !removed_plugins.contains(pc.id.as_str()));
-    config
-        .upstreams
-        .retain(|u| !removed_upstreams.contains(u.id.as_str()));
-
-    // Upsert added/modified resources using index for O(1) lookups
-    upsert_by_id(&mut config.proxies, result.added_or_modified_proxies, |p| {
-        p.id.as_str()
-    });
-    upsert_by_id(
-        &mut config.consumers,
-        result.added_or_modified_consumers,
-        |c| c.id.as_str(),
-    );
-    upsert_by_id(
-        &mut config.plugin_configs,
-        result.added_or_modified_plugin_configs,
-        |pc| pc.id.as_str(),
-    );
-    upsert_by_id(
-        &mut config.upstreams,
-        result.added_or_modified_upstreams,
-        |u| u.id.as_str(),
-    );
-}
-
-/// Upsert items into a vec by ID: replace existing entries, append new ones.
-fn upsert_by_id<T, F>(existing: &mut Vec<T>, updates: Vec<T>, get_id: F)
-where
-    F: Fn(&T) -> &str,
-{
-    let mut index: std::collections::HashMap<String, usize> = existing
-        .iter()
-        .enumerate()
-        .map(|(i, item)| (get_id(item).to_string(), i))
-        .collect();
-
-    for item in updates {
-        let id = get_id(&item).to_string();
-        if let Some(&pos) = index.get(id.as_str()) {
-            existing[pos] = item;
-        } else {
-            let pos = existing.len();
-            existing.push(item);
-            index.insert(id, pos);
-        }
-    }
 }
 
 /// Update a known ID set by adding new IDs and removing deleted ones.

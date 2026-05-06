@@ -15,7 +15,6 @@ mod health_check_tests;
 mod http3_config_tests;
 mod lazy_timeout_tests;
 mod load_balancer_tests;
-mod mesh_runtime_tests;
 mod metrics_tests;
 mod overload_tests;
 mod pool_key_tests;

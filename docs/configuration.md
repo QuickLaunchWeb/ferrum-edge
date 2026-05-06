@@ -11,10 +11,11 @@ This page is the canonical human-readable reference for `FERRUM_*` variables and
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_CONF_PATH` | No | `./ferrum.conf` | Path to optional conf file (provides defaults; env vars override) |
-| `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp`, `migrate` |
+| `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp`, `mesh`, `migrate` |
 | `FERRUM_NAMESPACE` | No | `ferrum` | Namespace this gateway loads and manages |
 | `FERRUM_LOG_LEVEL` | No | `error` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace` |
 | `FERRUM_LOG_BUFFER_CAPACITY` | No | `128000` | Max buffered log lines in the non-blocking writer channel. When full, new events are dropped to avoid backpressure on request threads |
+| `FERRUM_LOG_REDACT_METADATA_KEYS` | No | — | Comma-separated additional metadata-key substrings to redact from `TransactionSummary.metadata` and `StreamTransactionSummary.metadata` before log serialization. Built-in sensitive substrings such as `authorization`, `cookie`, `password`, `secret`, and `token` are always redacted |
 | `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` | No | `30` | Timeout for each external secret fetch during startup |
 
 ### Proxy Listener
@@ -122,14 +123,14 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_CP_GRPC_LISTEN_ADDR` | No | `0.0.0.0:50051` in CP mode | gRPC listen address. Port `0` disables plaintext gRPC |
-| `FERRUM_CP_DP_GRPC_JWT_SECRET` | CP & DP modes | — | Shared JWT secret for CP/DP gRPC auth (DP generates short-lived JWTs, CP validates). Must be at least 32 characters |
+| `FERRUM_CP_DP_GRPC_JWT_SECRET` | CP, DP & mesh modes | — | Shared JWT secret for CP/DP/mesh gRPC auth (DP/mesh clients generate short-lived JWTs, CP validates). Must be at least 32 characters |
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | If CP gRPC TLS | — | CP gRPC server TLS certificate |
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | If CP gRPC TLS | — | CP gRPC server TLS private key |
 | `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | No | — | CA bundle for verifying DP client certificates (mTLS) |
 | `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` | No | `128` | CP broadcast channel capacity before lagging DPs receive a full snapshot |
 | `FERRUM_XDS_ENABLED` | No | `false` | Enable Phase B xDS ADS (`StreamAggregatedResources` and `DeltaAggregatedResources`) on the CP gRPC listener |
-| `FERRUM_DP_CP_GRPC_URL` | DP mode (unless `_URLS` set) | — | Control Plane gRPC URL |
-| `FERRUM_DP_CP_GRPC_URLS` | No | — | Comma-separated priority-ordered CP URLs for DP failover. Takes precedence over single URL |
+| `FERRUM_DP_CP_GRPC_URL` | DP/mesh mode (unless `_URLS` set) | — | Control Plane gRPC URL |
+| `FERRUM_DP_CP_GRPC_URLS` | No | — | Comma-separated priority-ordered CP URLs for DP/mesh failover. Takes precedence over single URL |
 | `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` | No | `300` | Retry primary CP interval (seconds) when connected to a fallback. `0` = disabled |
 | `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | No | — | CA certificate for verifying the CP server |
 | `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` | No | — | DP client certificate for CP mTLS |
@@ -137,6 +138,19 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 | `FERRUM_DP_GRPC_TLS_NO_VERIFY` | No | `false` | Skip DP gRPC TLS verification (testing only) |
 
 See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_CP_GRPC_TLS_*`, `FERRUM_DP_GRPC_TLS_*`) and [multi_region_ha.md](multi_region_ha.md) for multi-region deployment patterns.
+
+### Mesh Runtime
+
+Phase C mesh mode consumes Layer 2 mesh slices from the Phase B control protocols and prepares the inbound/outbound data-plane listeners. Non-mesh modes do not instantiate this runtime.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FERRUM_MESH_CONFIG_PROTOCOL` | No | `native` | Mesh config source: `native` for Ferrum `MeshSubscribe`, `xds` for ADS |
+| `FERRUM_MESH_NODE_ID` | No | `$HOSTNAME` or `ferrum-mesh-node` | Stable mesh data-plane node ID used for xDS/MeshSubscribe |
+| `FERRUM_MESH_TOPOLOGY` | No | `sidecar` | Mesh topology flag: `sidecar` or `ambient`. Both share the same data-plane path |
+| `FERRUM_MESH_INBOUND_LISTEN_ADDR` | No | `0.0.0.0:15006` | Mesh inbound listener address for mTLS or HBONE termination |
+| `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` | No | `127.0.0.1:15001` | Mesh outbound capture listener address for plaintext-in to mTLS-out or HBONE encapsulation |
+| `FERRUM_MESH_WORKLOAD_SPIFFE_ID` | No | — | Optional workload SPIFFE ID hint sent to native MeshSubscribe |
 
 ### Migration
 

@@ -17,6 +17,7 @@ pub mod db_backend;
 pub mod db_loader;
 pub mod env_config;
 pub mod file_loader;
+pub(crate) mod incremental_apply;
 // Mesh model (Layer 2 — Phase A scaffolding). Functions are unused from the
 // binary's perspective until Phase B/C; `dead_code` is intentionally allowed.
 #[allow(dead_code)]
@@ -33,7 +34,6 @@ pub use env_config::AutoBool;
 pub use env_config::is_private_ip;
 #[allow(unused_imports)] // DbTlsMode is used by unit tests and public config consumers
 pub use env_config::{
-    BackendAllowIps, DbTlsMode, EnvConfig, MeshConfigSource, MeshTopology, OperatingMode,
-    check_backend_ip_allowed,
+    BackendAllowIps, DbTlsMode, EnvConfig, OperatingMode, check_backend_ip_allowed,
 };
 pub use pool_config::PoolConfig;

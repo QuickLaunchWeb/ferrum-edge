@@ -352,6 +352,34 @@ fn pre_copy_disconnect_direction(error: &anyhow::Error, class: &ErrorClass) -> D
     }
 }
 
+/// Crate-visible bounded bidirectional relay used by TCP-family paths that
+/// need the same idle and half-close watchdogs as the dedicated TCP proxy.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn bidirectional_copy_for_relay<C, B>(
+    client: C,
+    backend: B,
+    idle_timeout: Option<Duration>,
+    half_close_cap: Option<Duration>,
+    backend_read_timeout: Option<Duration>,
+    backend_write_timeout: Option<Duration>,
+    buf_size: usize,
+) -> StreamCopyResult
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    bidirectional_copy(
+        client,
+        backend,
+        idle_timeout,
+        half_close_cap,
+        backend_read_timeout,
+        backend_write_timeout,
+        buf_size,
+    )
+    .await
+}
+
 /// Crate-visible entry point to `bidirectional_copy` for the `_test_support`
 /// module. Exposed only so external integration/unit tests can exercise the
 /// direction-tracking behavior without the private function being made `pub`.
@@ -372,7 +400,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    bidirectional_copy(
+    bidirectional_copy_for_relay(
         client,
         backend,
         idle_timeout,

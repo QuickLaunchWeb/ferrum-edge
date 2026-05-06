@@ -32,37 +32,41 @@ pub fn translate_mesh_slice_to_snapshot(slice: &MeshSlice) -> XdsSnapshot {
 
 pub fn translate_lds(slice: &MeshSlice) -> Vec<XdsResource> {
     let mut resources = Vec::new();
+    let mut seen_names = HashSet::new();
     for service in &slice.services {
         for port in &service.ports {
             let name = format!(
                 "listener/{}/{}/{}",
                 service.namespace, service.name, port.port
             );
-            resources.push(resource(
+            push_unique_resource(
+                &mut resources,
+                &mut seen_names,
                 name.clone(),
                 LDS_TYPE_URL,
                 &slice.version,
                 proto::Listener { name },
-            ));
+            );
         }
     }
     resources
 }
 
 pub fn translate_rds(slice: &MeshSlice) -> Vec<XdsResource> {
-    slice
-        .services
-        .iter()
-        .map(|service| {
-            let name = format!("route/{}/{}", service.namespace, service.name);
-            resource(
-                name.clone(),
-                RDS_TYPE_URL,
-                &slice.version,
-                proto::RouteConfiguration { name },
-            )
-        })
-        .collect()
+    let mut resources = Vec::new();
+    let mut seen_names = HashSet::new();
+    for service in &slice.services {
+        let name = format!("route/{}/{}", service.namespace, service.name);
+        push_unique_resource(
+            &mut resources,
+            &mut seen_names,
+            name.clone(),
+            RDS_TYPE_URL,
+            &slice.version,
+            proto::RouteConfiguration { name },
+        );
+    }
+    resources
 }
 
 pub fn translate_cds(slice: &MeshSlice) -> Vec<XdsResource> {
@@ -134,23 +138,28 @@ pub fn translate_sds(slice: &MeshSlice) -> Vec<XdsResource> {
         return Vec::new();
     };
     let mut resources = Vec::new();
+    let mut seen_names = HashSet::new();
     let local = bundle_set.local.trust_domain.as_str();
     let local_name = format!("secret/spiffe-bundle/{local}");
-    resources.push(resource(
+    push_unique_resource(
+        &mut resources,
+        &mut seen_names,
         local_name.clone(),
         SDS_TYPE_URL,
         &slice.version,
         proto::Secret { name: local_name },
-    ));
+    );
     for bundle in &bundle_set.federated {
         let trust_domain = bundle.trust_domain.as_str();
         let name = format!("secret/spiffe-bundle/{trust_domain}");
-        resources.push(resource(
+        push_unique_resource(
+            &mut resources,
+            &mut seen_names,
             name.clone(),
             SDS_TYPE_URL,
             &slice.version,
             proto::Secret { name },
-        ));
+        );
     }
     resources
 }

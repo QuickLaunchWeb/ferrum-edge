@@ -1,230 +1,118 @@
-//! Mesh runtime planning.
+//! Shared mesh runtime state.
 //!
-//! The listener plan is a cold-start artifact for `FERRUM_MODE=mesh`. It keeps
-//! topology decisions out of the proxy hot path and gives Phase C a small,
-//! testable boundary before the capture/HBONE accept loops grow more capable.
+//! Phase C keeps the live per-node [`MeshSlice`] in an `ArcSwap` slot so
+//! listener and plugin paths can read the latest mesh view without locks.
+#![allow(dead_code)]
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::config::types::{GatewayConfig, PluginConfig, PluginScope};
-use crate::config::{EnvConfig, MeshConfigSource, MeshTopology};
-use crate::xds::{MeshSlice, MeshSliceRequest};
+use arc_swap::ArcSwap;
+use tokio::sync::Notify;
 
-use super::config_consumer::native_client::NativeMeshClientConfig;
-use super::config_consumer::xds_client::XdsClientConfig;
+use crate::xds::slice::MeshSlice;
 
-pub const MESH_SPIFFE_IDENTITY_PLUGIN_ID: &str = "__mesh_spiffe_identity";
-pub const MESH_AUTHZ_PLUGIN_ID: &str = "__mesh_authz";
-pub const MESH_WORKLOAD_METRICS_PLUGIN_ID: &str = "__mesh_workload_metrics";
-pub const MESH_ACCESS_LOG_PLUGIN_ID: &str = "__mesh_access_log";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MeshTrafficDirection {
-    Inbound,
-    Outbound,
-    Hbone,
+/// Lock-free holder for the current Layer 2 mesh slice.
+#[derive(Clone)]
+pub struct MeshRuntimeState {
+    current: Arc<ArcSwap<Option<MeshSlice>>>,
+    first_ready: Arc<Notify>,
+    has_first: Arc<AtomicBool>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MeshListenerKind {
-    PlaintextCapture,
-    MtlsTermination,
-    HboneTunnel,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MeshListener {
-    pub direction: MeshTrafficDirection,
-    pub kind: MeshListenerKind,
-    pub addr: SocketAddr,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MeshRuntimeConfig {
-    pub topology: MeshTopology,
-    pub config_source: MeshConfigSource,
-    pub node_id: String,
-    pub namespace: String,
-    pub workload_spiffe_id: Option<String>,
-    pub labels: HashMap<String, String>,
-    pub inbound_addr: SocketAddr,
-    pub outbound_addr: SocketAddr,
-    pub hbone_addr: Option<SocketAddr>,
-}
-
-impl MeshRuntimeConfig {
-    pub fn from_env(env: &EnvConfig) -> Self {
+impl MeshRuntimeState {
+    pub fn new() -> Self {
         Self {
-            topology: env.mesh_topology,
-            config_source: env.mesh_config_source,
-            node_id: env.mesh_node_id.clone(),
-            namespace: env.namespace.clone(),
-            workload_spiffe_id: env.mesh_workload_spiffe_id.clone(),
-            labels: env.mesh_labels.clone(),
-            inbound_addr: env.mesh_socket_addr(env.mesh_inbound_port),
-            outbound_addr: env.mesh_socket_addr(env.mesh_outbound_port),
-            hbone_addr: env
-                .mesh_hbone_enabled
-                .then(|| env.mesh_socket_addr(env.mesh_hbone_port)),
+            current: Arc::new(ArcSwap::new(Arc::new(None))),
+            first_ready: Arc::new(Notify::new()),
+            has_first: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    pub fn listener_plan(&self) -> Vec<MeshListener> {
-        let mut listeners = Vec::with_capacity(3);
-        listeners.push(MeshListener {
-            direction: MeshTrafficDirection::Outbound,
-            kind: MeshListenerKind::PlaintextCapture,
-            addr: self.outbound_addr,
+    /// Return the latest mesh slice snapshot.
+    pub fn snapshot(&self) -> Arc<Option<MeshSlice>> {
+        self.current.load_full()
+    }
+
+    /// True once at least one mesh slice has been installed.
+    pub fn has_first_slice(&self) -> bool {
+        self.has_first.load(Ordering::Acquire)
+    }
+
+    /// Hot-swap the live mesh slice and notify waiters on the first install.
+    pub fn install_slice(&self, slice: MeshSlice) {
+        self.current.store(Arc::new(Some(slice)));
+        let was_first = self.has_first.swap(true, Ordering::AcqRel);
+        if !was_first {
+            self.first_ready.notify_waiters();
+        }
+    }
+
+    /// Resolve once the initial mesh slice is available.
+    ///
+    /// Race-free against concurrent installs: the waiter is registered before
+    /// checking the flag, so a first install cannot be missed between load and
+    /// await.
+    pub async fn wait_for_first_slice(&self) {
+        let notified = self.first_ready.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        if self.has_first.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+impl Default for MeshRuntimeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wait_for_first_slice_resolves_after_install() {
+        let state = MeshRuntimeState::new();
+        let waiter = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state.wait_for_first_slice().await;
+                state
+                    .snapshot()
+                    .as_ref()
+                    .as_ref()
+                    .map(|slice| slice.version.clone())
+            })
+        };
+
+        tokio::task::yield_now().await;
+        state.install_slice(MeshSlice {
+            version: "v1".to_string(),
+            ..MeshSlice::default()
         });
-        listeners.push(MeshListener {
-            direction: MeshTrafficDirection::Inbound,
-            kind: match self.topology {
-                MeshTopology::Sidecar => MeshListenerKind::MtlsTermination,
-                MeshTopology::Ambient => MeshListenerKind::PlaintextCapture,
-            },
-            addr: self.inbound_addr,
+
+        let observed = waiter.await.expect("waiter task should complete");
+        assert_eq!(observed.as_deref(), Some("v1"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_first_slice_returns_immediately_when_already_installed() {
+        let state = MeshRuntimeState::new();
+        state.install_slice(MeshSlice {
+            version: "v1".to_string(),
+            ..MeshSlice::default()
         });
-        if let Some(addr) = self.hbone_addr {
-            listeners.push(MeshListener {
-                direction: MeshTrafficDirection::Hbone,
-                kind: MeshListenerKind::HboneTunnel,
-                addr,
-            });
-        }
-        listeners
-    }
 
-    pub fn native_client_config(&self, cp_url: String) -> NativeMeshClientConfig {
-        NativeMeshClientConfig {
-            cp_url,
-            node_id: self.node_id.clone(),
-            namespace: self.namespace.clone(),
-            workload_spiffe_id: self.workload_spiffe_id.clone(),
-            labels: self.labels.clone(),
-        }
-    }
-
-    pub fn xds_client_config(&self, cp_url: String) -> XdsClientConfig {
-        XdsClientConfig {
-            cp_url,
-            node_id: self.node_id.clone(),
-            namespace: self.namespace.clone(),
-        }
-    }
-
-    pub fn mesh_slice_request(&self) -> MeshSliceRequest {
-        MeshSliceRequest {
-            node_id: self.node_id.clone(),
-            namespace: self.namespace.clone(),
-            workload_spiffe_id: self.workload_spiffe_id.clone(),
-            labels: self.labels.clone().into_iter().collect(),
-        }
-    }
-}
-
-/// Prepare a gateway snapshot for mesh-mode serving.
-///
-/// Mesh mode is the only caller. The mutation is intentionally cold-path:
-/// it happens once before [`crate::proxy::ProxyState`] builds the router and
-/// plugin caches, so ordinary gateway modes and non-mesh requests pay no cost.
-pub fn prepare_gateway_config_for_mesh(
-    mut config: GatewayConfig,
-    runtime: &MeshRuntimeConfig,
-) -> Result<GatewayConfig, anyhow::Error> {
-    config.normalize_fields();
-    let mesh_errors = config.validate_mesh_fields();
-    if !mesh_errors.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Mesh configuration validation failed: {}",
-            mesh_errors.join("; ")
-        ));
-    }
-
-    let mesh_slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
-    inject_mesh_global_plugins(&mut config, runtime, &mesh_slice);
-    Ok(config)
-}
-
-fn inject_mesh_global_plugins(
-    config: &mut GatewayConfig,
-    runtime: &MeshRuntimeConfig,
-    mesh_slice: &MeshSlice,
-) {
-    ensure_global_plugin(
-        config,
-        MESH_SPIFFE_IDENTITY_PLUGIN_ID,
-        "spiffe_identity",
-        serde_json::json!({}),
-        &runtime.namespace,
-    );
-
-    ensure_global_plugin(
-        config,
-        MESH_AUTHZ_PLUGIN_ID,
-        "mesh_authz",
-        serde_json::json!({
-            "policies": mesh_slice.mesh_policies.clone(),
-            "peer_authentications": mesh_slice.peer_authentications.clone(),
-        }),
-        &runtime.namespace,
-    );
-
-    ensure_global_plugin(
-        config,
-        MESH_WORKLOAD_METRICS_PLUGIN_ID,
-        "workload_metrics",
-        serde_json::json!({
-            "node_id": runtime.node_id.clone(),
-            "topology": runtime.topology.to_string(),
-            "namespace": mesh_slice.namespace.clone(),
-            "workload_spiffe_id": mesh_slice.workload_spiffe_id.clone(),
-            "labels": mesh_slice.labels.clone(),
-        }),
-        &runtime.namespace,
-    );
-
-    ensure_global_plugin(
-        config,
-        MESH_ACCESS_LOG_PLUGIN_ID,
-        "access_log",
-        serde_json::json!({}),
-        &runtime.namespace,
-    );
-}
-
-fn ensure_global_plugin(
-    config: &mut GatewayConfig,
-    id: &str,
-    plugin_name: &str,
-    plugin_config: serde_json::Value,
-    namespace: &str,
-) {
-    if config
-        .plugin_configs
-        .iter()
-        .any(|pc| pc.enabled && pc.scope == PluginScope::Global && pc.plugin_name == plugin_name)
-    {
-        return;
-    }
-
-    let now = chrono::Utc::now();
-    let mesh_plugin = PluginConfig {
-        id: id.to_string(),
-        plugin_name: plugin_name.to_string(),
-        namespace: namespace.to_string(),
-        config: plugin_config,
-        scope: PluginScope::Global,
-        proxy_id: None,
-        enabled: true,
-        priority_override: None,
-        created_at: now,
-        updated_at: now,
-    };
-
-    if let Some(existing) = config.plugin_configs.iter_mut().find(|pc| pc.id == id) {
-        *existing = mesh_plugin;
-    } else {
-        config.plugin_configs.push(mesh_plugin);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            state.wait_for_first_slice(),
+        )
+        .await
+        .expect("already-installed slice should not block");
     }
 }

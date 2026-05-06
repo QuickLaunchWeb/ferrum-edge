@@ -8,7 +8,7 @@
 //! | `file`     | Yes   | Read-only   | YAML/JSON file, SIGHUP reload    |
 //! | `cp`       | No    | Read/Write  | DB polling + gRPC broadcast to DPs |
 //! | `dp`       | Yes   | Read-only   | gRPC stream from CP              |
-//! | `mesh`     | Yes   | No          | Canonical mesh config            |
+//! | `mesh`     | Yes   | Read-only   | xDS or native MeshSubscribe      |
 //! | `migrate`  | No    | No          | Runs DB migrations then exits    |
 //!
 //! All modes share the same `ProxyState` and atomic config swap mechanism.

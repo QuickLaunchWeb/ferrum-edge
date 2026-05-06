@@ -36,6 +36,9 @@ message Status {
 message Node {
   string id = 1;
   string cluster = 2;
+  // Phase B records metadata as uninterpreted bytes in this minimal shim.
+  // Real Envoy uses google.protobuf.Struct here; switch to the upstream proto
+  // surface before Ferrum consumes workload labels from Envoy Node metadata.
   bytes metadata = 3;
 }
 

@@ -85,80 +85,6 @@ fn test_operating_mode_invalid() {
 }
 
 #[test]
-fn test_env_config_mesh_mode_file_defaults() {
-    with_env_vars(
-        &[
-            ("FERRUM_MODE", "mesh"),
-            ("FERRUM_FILE_CONFIG_PATH", "/path/to/mesh.yaml"),
-        ],
-        || {
-            let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.mode, OperatingMode::Mesh);
-            assert_eq!(config.mesh_topology.to_string(), "sidecar");
-            assert_eq!(config.mesh_config_source.to_string(), "file");
-            assert_eq!(config.mesh_inbound_port, 15006);
-            assert_eq!(config.mesh_outbound_port, 15001);
-            assert_eq!(config.mesh_hbone_port, 15008);
-            assert!(config.mesh_hbone_enabled);
-        },
-    );
-}
-
-#[test]
-fn test_env_config_mesh_mode_custom_values() {
-    with_env_vars(
-        &[
-            ("FERRUM_MODE", "mesh"),
-            ("FERRUM_FILE_CONFIG_PATH", "/path/to/mesh.yaml"),
-            ("FERRUM_MESH_TOPOLOGY", "ambient"),
-            ("FERRUM_MESH_NODE_ID", "node-a"),
-            (
-                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
-                "spiffe://cluster.local/ns/default/sa/app",
-            ),
-            ("FERRUM_MESH_LABELS", r#"{"app":"api","version":"v1"}"#),
-            ("FERRUM_MESH_BIND_ADDRESS", "127.0.0.1"),
-            ("FERRUM_MESH_INBOUND_PORT", "16006"),
-            ("FERRUM_MESH_OUTBOUND_PORT", "16001"),
-            ("FERRUM_MESH_HBONE_PORT", "16008"),
-        ],
-        || {
-            let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.mesh_topology.to_string(), "ambient");
-            assert_eq!(config.mesh_node_id, "node-a");
-            assert_eq!(
-                config.mesh_workload_spiffe_id.as_deref(),
-                Some("spiffe://cluster.local/ns/default/sa/app")
-            );
-            assert_eq!(
-                config.mesh_labels.get("app").map(String::as_str),
-                Some("api")
-            );
-            assert_eq!(config.mesh_bind_address, "127.0.0.1");
-            assert_eq!(config.mesh_inbound_port, 16006);
-            assert_eq!(config.mesh_outbound_port, 16001);
-            assert_eq!(config.mesh_hbone_port, 16008);
-        },
-    );
-}
-
-#[test]
-fn test_env_config_non_mesh_ignores_mesh_bind_address() {
-    with_env_vars(
-        &[
-            ("FERRUM_MODE", "file"),
-            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
-            ("FERRUM_MESH_BIND_ADDRESS", "not-an-ip"),
-        ],
-        || {
-            let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.mode, OperatingMode::File);
-            assert_eq!(config.mesh_bind_address, "not-an-ip");
-        },
-    );
-}
-
-#[test]
 fn test_operating_mode_case_insensitive() {
     with_env_vars(&[("FERRUM_MODE", "DATABASE")], || {
         let mode = OperatingMode::from_env().unwrap();
@@ -305,6 +231,68 @@ fn test_env_config_dp_mode_missing_jwt_secret() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+        ],
+        || {
+            remove_var("FERRUM_CP_DP_GRPC_JWT_SECRET");
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("FERRUM_CP_DP_GRPC_JWT_SECRET"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_valid() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.mode, OperatingMode::Mesh);
+            assert_eq!(
+                config.resolved_dp_cp_grpc_urls(),
+                vec!["http://cp:50051".to_string()]
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_missing_grpc_url() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+        ],
+        || {
+            remove_var("FERRUM_DP_CP_GRPC_URL");
+            remove_var("FERRUM_DP_CP_GRPC_URLS");
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS")
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_missing_jwt_secret() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
             ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
         ],
         || {

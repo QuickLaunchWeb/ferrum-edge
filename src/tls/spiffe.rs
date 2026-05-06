@@ -29,11 +29,12 @@ use rustls::client::WantsClientCert;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::{WantsServerCert, WebPkiClientVerifier};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::identity::spiffe::{SpiffeId, extract_spiffe_id_from_parsed};
-use crate::identity::{SvidBundle, TrustBundleSet};
+use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet, TrustDomain};
 
 /// Errors raised by the SPIFFE TLS builders.
 #[derive(Debug, thiserror::Error)]
@@ -202,6 +203,7 @@ struct SpiffeClientCertVerifier {
     slot: SharedBundleSlot,
     peer_required: bool,
     schemes: Vec<rustls::SignatureScheme>,
+    peer_verifier_cache: ArcSwap<Option<SpiffePeerVerifierCache>>,
 }
 
 impl SpiffeClientCertVerifier {
@@ -212,6 +214,7 @@ impl SpiffeClientCertVerifier {
             schemes: rustls::crypto::ring::default_provider()
                 .signature_verification_algorithms
                 .supported_schemes(),
+            peer_verifier_cache: ArcSwap::new(Arc::new(None)),
         }
     }
 }
@@ -237,9 +240,16 @@ impl rustls::server::danger::ClientCertVerifier for SpiffeClientCertVerifier {
         let bundle = snapshot.as_ref().as_ref().ok_or_else(|| {
             rustls::Error::General("SPIFFE inbound verifier: no SVID bundle yet".into())
         })?;
-        verify_peer_against_bundle(&bundle.trust_bundles, end_entity, intermediates, None)
-            .map(|_| rustls::server::danger::ClientCertVerified::assertion())
-            .map_err(|e| rustls::Error::General(format!("SPIFFE inbound verify: {e}")))
+        verify_peer_against_cached_snapshot(
+            &self.peer_verifier_cache,
+            snapshot.clone(),
+            &bundle.trust_bundles,
+            end_entity,
+            intermediates,
+            None,
+        )
+        .map(|_| rustls::server::danger::ClientCertVerified::assertion())
+        .map_err(|e| rustls::Error::General(format!("SPIFFE inbound verify: {e}")))
     }
 
     fn verify_tls12_signature(
@@ -288,6 +298,7 @@ struct SpiffeServerCertVerifier {
     slot: SharedBundleSlot,
     expected_peer: Option<SpiffeId>,
     schemes: Vec<rustls::SignatureScheme>,
+    peer_verifier_cache: ArcSwap<Option<SpiffePeerVerifierCache>>,
 }
 
 impl SpiffeServerCertVerifier {
@@ -298,6 +309,7 @@ impl SpiffeServerCertVerifier {
             schemes: rustls::crypto::ring::default_provider()
                 .signature_verification_algorithms
                 .supported_schemes(),
+            peer_verifier_cache: ArcSwap::new(Arc::new(None)),
         }
     }
 }
@@ -321,7 +333,9 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
         let bundle = snapshot.as_ref().as_ref().ok_or_else(|| {
             rustls::Error::General("SPIFFE outbound verifier: no SVID bundle yet".into())
         })?;
-        verify_peer_against_bundle(
+        verify_peer_against_cached_snapshot(
+            &self.peer_verifier_cache,
+            snapshot.clone(),
             &bundle.trust_bundles,
             end_entity,
             intermediates,
@@ -384,17 +398,124 @@ fn certified_key_from_bundle(bundle: &SvidBundle) -> Result<rustls::sign::Certif
     Ok(rustls::sign::CertifiedKey::new(chain, signing_key))
 }
 
-/// Validate `end_entity + intermediates` against `bundle.trust_bundles`,
-/// extract the SPIFFE ID, and (optionally) match it against `expected_peer`.
-///
-/// Phase A keeps the chain verification simple: build a webpki verifier
-/// from the bundle's roots and let it do the work. Future phases tie this
-/// into the existing `build_server_verifier_with_crls` helper for CRL
-/// support.
-fn verify_peer_against_bundle(
+struct SpiffePeerVerifierCache {
+    source: Arc<Option<SvidBundle>>,
+    verifiers: PeerVerifierMap,
+}
+
+type PeerChainVerifier = Arc<dyn rustls::server::danger::ClientCertVerifier>;
+type PeerVerifierMap = HashMap<TrustDomain, PeerChainVerifier>;
+
+fn verify_peer_against_cached_snapshot(
+    cache_slot: &ArcSwap<Option<SpiffePeerVerifierCache>>,
+    source: Arc<Option<SvidBundle>>,
     trust_bundles: &TrustBundleSet,
     end_entity: &CertificateDer<'_>,
     intermediates: &[CertificateDer<'_>],
+    expected_peer: Option<&SpiffeId>,
+) -> Result<SpiffeId, String> {
+    let peer_id = extract_and_check_peer_spiffe_id(end_entity, expected_peer)?;
+    if trust_bundles.get(peer_id.trust_domain()).is_none() {
+        return Err(format!(
+            "no trust bundle for peer's trust domain '{}'",
+            peer_id.trust_domain()
+        ));
+    }
+
+    let cache_snapshot = peer_verifier_cache(cache_slot, source)?;
+    let cache = cache_snapshot
+        .as_ref()
+        .as_ref()
+        .ok_or_else(|| "SPIFFE verifier cache unexpectedly empty".to_string())?;
+    let verifier = cache
+        .verifiers
+        .get(peer_id.trust_domain())
+        .ok_or_else(|| "trust bundle for peer's domain has no usable roots".to_string())?;
+
+    verify_peer_chain(verifier.as_ref(), end_entity, intermediates)?;
+    debug!(
+        peer_id = %peer_id,
+        "SPIFFE peer verified against cached trust bundle"
+    );
+    Ok(peer_id)
+}
+
+fn peer_verifier_cache(
+    cache_slot: &ArcSwap<Option<SpiffePeerVerifierCache>>,
+    source: Arc<Option<SvidBundle>>,
+) -> Result<Arc<Option<SpiffePeerVerifierCache>>, String> {
+    let cached = cache_slot.load_full();
+    if let Some(cache) = cached.as_ref()
+        && Arc::ptr_eq(&cache.source, &source)
+    {
+        return Ok(cached);
+    }
+
+    let next = Arc::new(Some(SpiffePeerVerifierCache::build(source)?));
+    cache_slot.store(next.clone());
+    Ok(next)
+}
+
+impl SpiffePeerVerifierCache {
+    fn build(source: Arc<Option<SvidBundle>>) -> Result<Self, String> {
+        let bundle = source
+            .as_ref()
+            .as_ref()
+            .ok_or_else(|| "SPIFFE verifier cache: no SVID bundle yet".to_string())?;
+        let mut verifiers = HashMap::new();
+
+        insert_trust_bundle_verifier(&mut verifiers, &bundle.trust_bundles.local);
+        for trust_bundle in bundle.trust_bundles.federated.values() {
+            insert_trust_bundle_verifier(&mut verifiers, trust_bundle);
+        }
+
+        Ok(Self { source, verifiers })
+    }
+}
+
+fn insert_trust_bundle_verifier(verifiers: &mut PeerVerifierMap, trust_bundle: &TrustBundle) {
+    if verifiers.contains_key(&trust_bundle.trust_domain) {
+        return;
+    }
+
+    match build_peer_chain_verifier(trust_bundle) {
+        Ok(verifier) => {
+            verifiers.insert(trust_bundle.trust_domain.clone(), verifier);
+        }
+        Err(e) => warn!(
+            trust_domain = %trust_bundle.trust_domain,
+            error = %e,
+            "SPIFFE verifier cache: skipping unusable trust bundle"
+        ),
+    }
+}
+
+fn build_peer_chain_verifier(trust_bundle: &TrustBundle) -> Result<PeerChainVerifier, String> {
+    let mut roots = RootCertStore::empty();
+    let added = roots.add_parsable_certificates(
+        trust_bundle
+            .x509_authorities
+            .iter()
+            .map(|d| CertificateDer::from(d.clone())),
+    );
+    if added.0 == 0 {
+        return Err("trust bundle for peer's domain has no usable roots".to_string());
+    }
+
+    // SPIFFE peer verification is chain-only: the peer's identity is its
+    // SPIFFE URI SAN, not a DNS / IP name. `WebPkiClientVerifier` performs
+    // the chain-up-to-trust-anchor check without server-name matching, which
+    // is the desired behavior for both inbound and outbound mesh peers.
+    WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .build()
+    .map_err(|e| format!("webpki verifier build failed: {e}"))
+}
+
+fn extract_and_check_peer_spiffe_id(
+    end_entity: &CertificateDer<'_>,
     expected_peer: Option<&SpiffeId>,
 ) -> Result<SpiffeId, String> {
     use x509_parser::prelude::*;
@@ -414,6 +535,37 @@ fn verify_peer_against_bundle(
         ));
     }
 
+    Ok(peer_id)
+}
+
+fn verify_peer_chain(
+    verifier: &dyn rustls::server::danger::ClientCertVerifier,
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+) -> Result<(), String> {
+    rustls::server::danger::ClientCertVerifier::verify_client_cert(
+        verifier,
+        end_entity,
+        intermediates,
+        UnixTime::now(),
+    )
+    .map(|_| ())
+    .map_err(|e| format!("chain verify failed: {e}"))
+}
+
+/// Validate `end_entity + intermediates` against `bundle.trust_bundles`,
+/// extract the SPIFFE ID, and (optionally) match it against `expected_peer`.
+///
+/// This uncached helper is retained for direct validation tests. Runtime
+/// verifiers use [`verify_peer_against_cached_snapshot`] so live handshakes
+/// rebuild chain verifiers only when the bundle slot rotates.
+fn verify_peer_against_bundle(
+    trust_bundles: &TrustBundleSet,
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+    expected_peer: Option<&SpiffeId>,
+) -> Result<SpiffeId, String> {
+    let peer_id = extract_and_check_peer_spiffe_id(end_entity, expected_peer)?;
     let bundle = trust_bundles.get(peer_id.trust_domain()).ok_or_else(|| {
         format!(
             "no trust bundle for peer's trust domain '{}'",
@@ -421,44 +573,8 @@ fn verify_peer_against_bundle(
         )
     })?;
 
-    let mut roots = RootCertStore::empty();
-    let added = roots.add_parsable_certificates(
-        bundle
-            .x509_authorities
-            .iter()
-            .map(|d| CertificateDer::from(d.clone())),
-    );
-    if added.0 == 0 {
-        return Err("trust bundle for peer's domain has no usable roots".to_string());
-    }
-
-    // SPIFFE peer verification is chain-only: the peer's identity is its
-    // SPIFFE URI SAN (extracted above), not a DNS / IP name. We deliberately
-    // do NOT use `WebPkiServerVerifier` here — that path is server-name aware
-    // and would reject any SVID whose DNS SANs don't match a placeholder
-    // (some CAs emit SPIFFE SVIDs with extra DNS SANs alongside the URI SAN).
-    //
-    // `WebPkiClientVerifier` does the equivalent chain-up-to-trust-anchor
-    // check without server-name matching, which is exactly the semantics we
-    // want for both directions (inbound peer-cert and outbound peer-cert
-    // share the same chain validation; the only direction-specific bit is
-    // the optional `expected_peer` pin, handled above).
-    let verifier = WebPkiClientVerifier::builder_with_provider(
-        Arc::new(roots),
-        Arc::new(rustls::crypto::ring::default_provider()),
-    )
-    .build()
-    .map_err(|e| format!("webpki verifier build failed: {e}"))?;
-
-    let now = UnixTime::now();
-    rustls::server::danger::ClientCertVerifier::verify_client_cert(
-        verifier.as_ref(),
-        end_entity,
-        intermediates,
-        now,
-    )
-    .map_err(|e| format!("chain verify failed: {e}"))?;
-
+    let verifier = build_peer_chain_verifier(bundle)?;
+    verify_peer_chain(verifier.as_ref(), end_entity, intermediates)?;
     debug!(
         peer_id = %peer_id,
         "SPIFFE peer verified against trust bundle"
@@ -559,6 +675,15 @@ mod tests {
         })
     }
 
+    fn svid_bundle_for(id: SpiffeId, trust_bundles: TrustBundleSet, leaf: Vec<u8>) -> SvidBundle {
+        SvidBundle {
+            spiffe_id: id,
+            cert_chain_der: vec![leaf],
+            private_key_pkcs8_der: Vec::new(),
+            trust_bundles,
+        }
+    }
+
     #[test]
     fn verifies_uri_san_only_svid() {
         let td = TrustDomain::new("td.verify-test").unwrap();
@@ -633,5 +758,70 @@ mod tests {
 
         let result = verify_peer_against_bundle(&bundles, &CertificateDer::from(leaf), &[], None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn peer_verifier_cache_reuses_snapshot_and_rebuilds_after_rotation() {
+        let td = TrustDomain::new("td.cache-rotation").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+        let (root_der_a, root_pem_a, key_pem_a) = synthetic_root(&td);
+        let leaf_a = issue_leaf(&id, &root_pem_a, &key_pem_a, None);
+        let initial = Arc::new(Some(svid_bundle_for(
+            id.clone(),
+            bundle_for(td.clone(), root_der_a),
+            leaf_a.clone(),
+        )));
+        let slot = Arc::new(ArcSwap::new(initial.clone()));
+        let verifier = SpiffeClientCertVerifier::new(slot.clone(), true);
+
+        rustls::server::danger::ClientCertVerifier::verify_client_cert(
+            &verifier,
+            &CertificateDer::from(leaf_a.clone()),
+            &[],
+            UnixTime::now(),
+        )
+        .expect("initial leaf verifies");
+        let cache_a = verifier.peer_verifier_cache.load_full();
+        let cache_a_inner = cache_a
+            .as_ref()
+            .as_ref()
+            .expect("initial verification should build cache");
+        assert!(Arc::ptr_eq(&cache_a_inner.source, &initial));
+        assert_eq!(cache_a_inner.verifiers.len(), 1);
+
+        rustls::server::danger::ClientCertVerifier::verify_client_cert(
+            &verifier,
+            &CertificateDer::from(leaf_a),
+            &[],
+            UnixTime::now(),
+        )
+        .expect("same snapshot still verifies");
+        let cache_a_again = verifier.peer_verifier_cache.load_full();
+        assert!(Arc::ptr_eq(&cache_a, &cache_a_again));
+
+        let (root_der_b, root_pem_b, key_pem_b) = synthetic_root(&td);
+        let leaf_b = issue_leaf(&id, &root_pem_b, &key_pem_b, None);
+        let rotated = Arc::new(Some(svid_bundle_for(
+            id,
+            bundle_for(td, root_der_b),
+            leaf_b.clone(),
+        )));
+        slot.store(rotated.clone());
+
+        rustls::server::danger::ClientCertVerifier::verify_client_cert(
+            &verifier,
+            &CertificateDer::from(leaf_b),
+            &[],
+            UnixTime::now(),
+        )
+        .expect("rotated bundle verifies");
+        let cache_b = verifier.peer_verifier_cache.load_full();
+        let cache_b_inner = cache_b
+            .as_ref()
+            .as_ref()
+            .expect("rotated verification should rebuild cache");
+        assert!(!Arc::ptr_eq(&cache_a, &cache_b));
+        assert!(Arc::ptr_eq(&cache_b_inner.source, &rotated));
+        assert_eq!(cache_b_inner.verifiers.len(), 1);
     }
 }

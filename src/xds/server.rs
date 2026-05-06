@@ -1,8 +1,6 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -24,9 +22,15 @@ use super::slice::{MeshSlice, MeshSliceRequest};
 use super::snapshot::{XdsSnapshot, XdsSnapshotCache};
 use super::translator::translate_mesh_slice_to_snapshot;
 use crate::FERRUM_VERSION;
+use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::GatewayConfig;
-use crate::grpc::cp_server::CpGrpcServer;
+use crate::grpc::auth::verify_grpc_jwt_metadata;
 use crate::grpc::proto::ConfigUpdate;
+
+// One bounded queue sits between each ADS request reader and response stream.
+// Phase B keeps this fixed while xDS is opt-in; make it an EnvConfig knob
+// before high-churn Phase C/D sidecar fleets depend on ADS.
+const ADS_STREAM_CHANNEL_CAPACITY: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct XdsSubscription {
@@ -59,6 +63,10 @@ struct XdsStreamRegistry {
 
 impl XdsStreamRegistry {
     fn register(&self, node_id: &str) {
+        // TODO(Phase C): enforce a per-node ADS stream ceiling once mesh
+        // listeners can create large fleets of authenticated xDS clients.
+        // Phase B keeps xDS opt-in/off by default and only tracks counts so
+        // final stream teardown can drop per-node cache/nonce state.
         match self.counts.entry(node_id.to_string()) {
             Entry::Occupied(mut entry) => {
                 *entry.get_mut() += 1;
@@ -166,28 +174,7 @@ impl XdsAdsServer {
 
     #[allow(clippy::result_large_err)]
     fn verify_jwt_metadata(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), Status> {
-        let token = metadata
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.strip_prefix("Bearer ").unwrap_or(value))
-            .ok_or_else(|| Status::unauthenticated("Missing authorization token"))?;
-
-        let key = DecodingKey::from_secret(self.jwt_secret.as_bytes());
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.validate_exp = true;
-        validation.required_spec_claims = {
-            let mut claims = std::collections::HashSet::new();
-            claims.insert("exp".to_string());
-            claims.insert("iat".to_string());
-            claims.insert("sub".to_string());
-            claims.insert("iss".to_string());
-            claims
-        };
-        validation.set_issuer(&[self.expected_issuer.as_str()]);
-
-        decode::<Value>(token, &key, &validation)
-            .map_err(|err| Status::unauthenticated(format!("Invalid token: {err}")))?;
-        Ok(())
+        verify_grpc_jwt_metadata(metadata, &self.jwt_secret, &self.expected_issuer)
     }
 
     fn rebuild_snapshot(&self, node_id: &str) -> XdsSnapshot {
@@ -272,8 +259,8 @@ impl XdsAdsServer {
         );
         let current_names: HashSet<String> = snapshot
             .resources(&subscription.type_url)
-            .into_iter()
-            .map(|r| r.name)
+            .iter()
+            .map(|r| r.name.clone())
             .collect();
         let mut removed_resources = if initial_resource_versions.is_empty() {
             previous
@@ -377,7 +364,7 @@ impl XdsAdsServer {
         config: &GatewayConfig,
         subscriptions: &mut HashMap<String, XdsSubscription>,
         request: &DiscoveryRequest,
-    ) -> Option<DiscoveryResponse> {
+    ) -> Option<(Arc<XdsSnapshot>, DiscoveryResponse)> {
         if !request.response_nonce.is_empty() {
             match self.record_sotw_ack(node_id, request) {
                 AckOutcome::Acked => debug!(
@@ -426,7 +413,8 @@ impl XdsAdsServer {
             {
                 return None;
             }
-            Some(self.sotw_response(&snapshot, &subscription))
+            let response = self.sotw_response(&snapshot, &subscription);
+            Some((snapshot, response))
         } else {
             None
         }
@@ -527,7 +515,7 @@ impl XdsAdsServer {
                 &update.config_json,
             ) {
                 Ok(delta) => {
-                    CpGrpcServer::apply_incremental_to_config_snapshot(stream_config, delta);
+                    apply_incremental_to_config_snapshot(stream_config, delta);
                     stream_config.normalize_fields();
                     true
                 }
@@ -584,7 +572,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         let mut requests = request.into_inner();
         let server = self.clone();
         let mut updates = server.update_tx.subscribe();
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::channel(ADS_STREAM_CHANNEL_CAPACITY);
 
         tokio::spawn(async move {
             let mut stream_guard = server.stream_guard();
@@ -628,14 +616,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             server.catch_up_pending_updates(&mut updates, &mut stream_config);
                         }
 
-                        let send_failed = if let Some(response) = server.sotw_response_for_request(
+                        let send_failed = if let Some((snapshot, response)) = server.sotw_response_for_request(
                             &current_node_id,
                             &stream_config,
                             &mut subscriptions,
                             &request,
                         )
                         {
-                            last_snapshot = server.snapshot_cache.get(&current_node_id);
+                            last_snapshot = Some(snapshot);
                             tx.send(Ok(response)).await.is_err()
                         } else {
                             false
@@ -711,7 +699,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         let mut requests = request.into_inner();
         let server = self.clone();
         let mut updates = server.update_tx.subscribe();
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::channel(ADS_STREAM_CHANNEL_CAPACITY);
 
         tokio::spawn(async move {
             let mut stream_guard = server.stream_guard();
@@ -1335,7 +1323,7 @@ mod tests {
             ..DiscoveryRequest::default()
         };
 
-        let response = server
+        let (_, response) = server
             .sotw_response_for_request("node-a", &stream_config, &mut subscriptions, &request)
             .expect("first SotW request should receive the caught-up snapshot");
 
@@ -1430,7 +1418,7 @@ mod tests {
             ..DiscoveryRequest::default()
         };
 
-        let response = server
+        let (_, response) = server
             .sotw_response_for_request("node-a", &config, &mut subscriptions, &request)
             .expect("subscription update should send the requested resource");
 
@@ -1440,6 +1428,42 @@ mod tests {
         assert!(!subscription.wildcard);
         assert_eq!(subscription.resource_names, vec![name]);
         assert_eq!(response.resources.len(), 1);
+    }
+
+    #[test]
+    fn sotw_request_returns_exact_snapshot_for_stream_state() {
+        let config = gateway_config_with_named_service("old", 0);
+        let server = test_server(config.clone());
+        let mut subscriptions = HashMap::new();
+        let request = DiscoveryRequest {
+            type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+            ..DiscoveryRequest::default()
+        };
+
+        let (last_sent_snapshot, initial_response) = server
+            .sotw_response_for_request("node-a", &config, &mut subscriptions, &request)
+            .expect("initial SotW request should send a snapshot");
+        assert_eq!(
+            cluster_names(&initial_response),
+            vec!["cluster/default/old/8080".to_string()]
+        );
+
+        let next_config = gateway_config_with_named_service("new", 1);
+        let shared_snapshot = server.snapshot_for_config("node-a", &next_config);
+        assert_eq!(shared_snapshot.version, next_config.loaded_at.to_rfc3339());
+
+        let (_, responses) = server.sotw_responses_for_subscriptions_from_config_with_previous(
+            "node-a",
+            &subscriptions,
+            &next_config,
+            Some(last_sent_snapshot.as_ref()),
+        );
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            cluster_names(&responses[0]),
+            vec!["cluster/default/new/8080".to_string()]
+        );
     }
 
     #[test]

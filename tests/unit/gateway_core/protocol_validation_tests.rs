@@ -912,7 +912,6 @@ fn h2_connect_without_protocol_is_hbone_only_in_mesh_mode() {
         .unwrap();
     let mesh_env = ferrum_edge::config::EnvConfig {
         mode: ferrum_edge::config::OperatingMode::Mesh,
-        mesh_hbone_enabled: true,
         ..Default::default()
     };
     let non_mesh_env = ferrum_edge::config::EnvConfig::default();
@@ -922,26 +921,19 @@ fn h2_connect_without_protocol_is_hbone_only_in_mesh_mode() {
 }
 
 #[test]
-fn hbone_detection_requires_http2_and_enabled_listener() {
+fn hbone_detection_requires_http2_mesh_mode() {
     let h1_connect = hyper::Request::builder()
         .method(hyper::Method::CONNECT)
         .version(hyper::Version::HTTP_11)
         .uri("orders.default.svc.cluster.local:8080")
         .body(())
         .unwrap();
-    let disabled_env = ferrum_edge::config::EnvConfig {
+    let mesh_env = ferrum_edge::config::EnvConfig {
         mode: ferrum_edge::config::OperatingMode::Mesh,
-        mesh_hbone_enabled: false,
-        ..Default::default()
-    };
-    let enabled_env = ferrum_edge::config::EnvConfig {
-        mode: ferrum_edge::config::OperatingMode::Mesh,
-        mesh_hbone_enabled: true,
         ..Default::default()
     };
 
-    assert!(!is_hbone_connect_request(&h1_connect, &enabled_env));
-    assert!(!is_hbone_connect_request(&h1_connect, &disabled_env));
+    assert!(!is_hbone_connect_request(&h1_connect, &mesh_env));
 }
 
 #[test]
@@ -966,7 +958,6 @@ fn extended_connect_protocols_are_not_hbone() {
         .insert(hyper::ext::Protocol::from_static("connect-udp"));
     let env = ferrum_edge::config::EnvConfig {
         mode: ferrum_edge::config::OperatingMode::Mesh,
-        mesh_hbone_enabled: true,
         ..Default::default()
     };
 

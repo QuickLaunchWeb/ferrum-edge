@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -48,7 +49,7 @@ impl XdsNonceTracker {
 
     pub fn issue_nonce(&self, node_id: &str, type_url: &str, version: &str) -> String {
         let sequence = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let nonce = format!("{node_id}|{type_url}|{version}|{sequence}");
+        let nonce = opaque_nonce(node_id, type_url, version, sequence);
         let key = NonceKey {
             node_id: node_id.to_string(),
             type_url: type_url.to_string(),
@@ -124,6 +125,10 @@ impl XdsNonceTracker {
     }
 
     pub fn remove_node(&self, node_id: &str) {
+        // Phase B cardinality is tiny: one entry per active `(node, type_url)`
+        // and xDS is gated off by default. Before large-fleet deployment,
+        // replace this O(n) retain with a per-node key index or hierarchical
+        // map so stream teardown does not scan unrelated nodes.
         self.states.retain(|key, _| key.node_id != node_id);
     }
 
@@ -133,5 +138,56 @@ impl XdsNonceTracker {
 
     pub fn is_empty(&self) -> bool {
         self.states.is_empty()
+    }
+}
+
+fn opaque_nonce(node_id: &str, type_url: &str, version: &str, sequence: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(node_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(type_url.as_bytes());
+    hasher.update([0]);
+    hasher.update(version.as_bytes());
+    hasher.update([0]);
+    hasher.update(sequence.to_be_bytes());
+    format!("n1:{}", hex::encode(hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issued_nonce_is_opaque_and_unique() {
+        let tracker = XdsNonceTracker::new();
+
+        let first = tracker.issue_nonce(
+            "spiffe://cluster.local/ns/prod/sa/api",
+            "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+            "2026-05-06T00:00:00Z",
+        );
+        let second = tracker.issue_nonce(
+            "spiffe://cluster.local/ns/prod/sa/api",
+            "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+            "2026-05-06T00:00:00Z",
+        );
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("n1:"));
+        assert!(!first.contains("spiffe://"));
+        assert!(!first.contains("envoy.config.cluster"));
+        assert!(!first.contains("2026-05-06"));
+    }
+
+    #[test]
+    fn opaque_nonce_still_drives_ack_state_machine() {
+        let tracker = XdsNonceTracker::new();
+        let nonce = tracker.issue_nonce("node-a", "type-a", "v1");
+
+        assert_eq!(
+            tracker.record_response("node-a", "type-a", &nonce, "v1", None),
+            AckOutcome::Acked
+        );
+        assert_eq!(tracker.last_error("node-a", "type-a"), None);
     }
 }

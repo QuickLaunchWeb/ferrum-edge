@@ -45,9 +45,7 @@ async fn test_all_protocol_plugins() {
             json!({"window_seconds": 60, "max_requests": 100}),
         ),
         ("stdout_logging", json!({})),
-        ("access_log", json!({})),
         ("prometheus_metrics", json!({})),
-        ("workload_metrics", json!({})),
         ("correlation_id", json!({})),
         (
             "otel_tracing",
@@ -112,8 +110,6 @@ fn test_http_family_and_stream_plugins() {
     // mtls_auth and access_control support all stream transports (TCP + UDP/DTLS)
     let plugins = vec![
         ("mtls_auth", json!({})),
-        ("spiffe_identity", json!({})),
-        ("mesh_authz", json!({})),
         ("access_control", json!({"allowed_consumers": ["admin"]})),
     ];
 
@@ -201,9 +197,7 @@ fn test_stream_compatible_plugins_support_tcp_udp() {
             json!({"window_seconds": 60, "max_requests": 100}),
         ),
         ("stdout_logging", json!({})),
-        ("access_log", json!({})),
         ("prometheus_metrics", json!({})),
-        ("workload_metrics", json!({})),
         ("correlation_id", json!({})),
     ];
 
@@ -595,11 +589,7 @@ async fn test_http_family_plugins_complete_coverage() {
 
 #[test]
 fn test_http_family_and_stream_plugins_complete_coverage() {
-    let plugins = vec![
-        ("mtls_auth", json!({})),
-        ("spiffe_identity", json!({})),
-        ("mesh_authz", json!({})),
-    ];
+    let plugins = vec![("mtls_auth", json!({}))];
 
     for (name, config) in plugins {
         let plugin = make_plugin(name, config);

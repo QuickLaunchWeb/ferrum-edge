@@ -78,7 +78,6 @@ fn create_mesh_proxy_state(proxy: Proxy) -> ProxyState {
     };
     let env_config = EnvConfig {
         mode: OperatingMode::Mesh,
-        mesh_hbone_enabled: true,
         log_level: "error".to_string(),
         proxy_http_port: 0,
         proxy_https_port: 0,
@@ -132,6 +131,22 @@ async fn start_echo_backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<
     (addr, handle)
 }
 
+async fn start_idle_backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind idle backend");
+    let addr = listener.local_addr().expect("idle backend local addr");
+    let handle = tokio::spawn(async move {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(_) => return,
+        };
+        let mut buf = [0_u8; 16];
+        let _ = stream.read(&mut buf).await;
+    });
+    (addr, handle)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn hbone_connect_relays_data_frames_to_tcp_backend() {
     let (backend_addr, backend_handle) = start_echo_backend().await;
@@ -170,6 +185,48 @@ async fn hbone_connect_relays_data_frames_to_tcp_backend() {
     .await
     .expect("collect CONNECT response");
     assert_eq!(&body[..], b"echo:mesh-bytes");
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    backend_handle.await.expect("backend task");
+    conn_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hbone_connect_closes_idle_tunnel() {
+    let (backend_addr, backend_handle) = start_idle_backend().await;
+    let mut proxy = create_mesh_proxy(backend_addr.port());
+    proxy.tcp_idle_timeout_seconds = Some(1);
+    proxy.backend_read_timeout_ms = 0;
+    proxy.backend_write_timeout_ms = 0;
+    let state = create_mesh_proxy_state(proxy);
+    let (gateway_addr, shutdown_tx) = start_gateway(state).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect gateway");
+    let _ = stream.set_nodelay(true);
+    let (mut sender, conn) = h2::client::handshake(stream).await.expect("h2 handshake");
+    let conn_task = tokio::spawn(conn);
+
+    let req = Request::builder()
+        .method(Method::CONNECT)
+        .uri("orders.default.svc.cluster.local:8080")
+        .body(())
+        .expect("connect request");
+    let (response_fut, _request_body) = sender.send_request(req, false).expect("send CONNECT");
+    let resp = response_fut.await.expect("CONNECT response");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut response_body = resp.into_body();
+    let idle_close = tokio::time::timeout(std::time::Duration::from_secs(4), response_body.data())
+        .await
+        .expect("idle tunnel should close");
+    match idle_close {
+        None => {}
+        Some(Err(_)) => {}
+        Some(Ok(chunk)) if chunk.is_empty() => {}
+        Some(Ok(chunk)) => panic!("idle tunnel returned unexpected data: {chunk:?}"),
+    }
 
     shutdown_tx.send(true).expect("shutdown gateway");
     backend_handle.await.expect("backend task");

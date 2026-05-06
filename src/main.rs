@@ -107,7 +107,7 @@ impl<'a> MakeWriter<'a> for SeverityWriter {
 /// 4. Initialize structured JSON logging
 /// 5. Parse environment configuration (`EnvConfig::from_env()`)
 /// 6. Build the multi-threaded tokio runtime with configured worker/blocking threads
-/// 7. Dispatch to the appropriate operating mode (database, file, cp, dp, migrate)
+/// 7. Dispatch to the appropriate operating mode (database, file, cp, dp, mesh, migrate)
 ///    — each mode then loads TLS certs (frontend, admin, DTLS, gRPC) and validates
 ///    per-proxy backend TLS paths before starting listeners
 /// 8. Wait for SIGINT/SIGTERM for graceful shutdown

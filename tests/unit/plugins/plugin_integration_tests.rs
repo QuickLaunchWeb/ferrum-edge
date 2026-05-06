@@ -184,7 +184,6 @@ async fn test_all_plugins_available() {
 
     let expected_builtins: BTreeSet<_> = [
         "stdout_logging",
-        "access_log",
         "http_logging",
         "tcp_logging",
         "transaction_debugger",
@@ -242,8 +241,9 @@ async fn test_all_plugins_available() {
         "spec_expose",
         "spiffe_identity",
         "mesh_authz",
-        "ai_federation",
         "workload_metrics",
+        "access_log",
+        "ai_federation",
         "api_chargeback",
     ]
     .into_iter()
@@ -324,9 +324,6 @@ async fn test_plugin_creation_all_plugins() {
             "response_caching" => json!({"ttl_seconds": 60}),
             "spec_expose" => json!({"spec_url": "https://example.com/openapi.yaml"}),
             "spiffe_identity" => json!({}),
-            "mesh_authz" => json!({}),
-            "access_log" => json!({}),
-            "workload_metrics" => json!({}),
             "api_chargeback" => {
                 json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}]})
             }

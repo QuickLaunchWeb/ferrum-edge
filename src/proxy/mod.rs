@@ -594,10 +594,36 @@ pub fn is_h2_websocket_connect<B>(req: &Request<B>) -> bool {
 /// (for example `connect-udp`) on the existing fail-closed path.
 pub fn is_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> bool {
     env_config.mode == OperatingMode::Mesh
-        && env_config.mesh_hbone_enabled
-        && req.method() == hyper::Method::CONNECT
-        && req.version() == hyper::Version::HTTP_2
         && req.extensions().get::<hyper::ext::Protocol>().is_none()
+        && crate::modes::mesh::hbone::is_hbone_connect(req.method(), req.version(), req.headers())
+}
+
+fn hbone_relay_timeout(seconds: u64) -> Option<Duration> {
+    (seconds > 0).then(|| Duration::from_secs(seconds))
+}
+
+fn hbone_relay_timeout_millis(milliseconds: u64) -> Option<Duration> {
+    (milliseconds > 0).then(|| Duration::from_millis(milliseconds))
+}
+
+fn hbone_proxy_idle_timeout(proxy: &Proxy, env_config: &EnvConfig) -> Option<Duration> {
+    hbone_relay_timeout(
+        proxy
+            .tcp_idle_timeout_seconds
+            .unwrap_or(env_config.tcp_idle_timeout_seconds),
+    )
+}
+
+fn hbone_proxy_half_close_cap(env_config: &EnvConfig) -> Option<Duration> {
+    hbone_relay_timeout(env_config.tcp_half_close_max_wait_seconds)
+}
+
+fn hbone_backend_read_timeout(proxy: &Proxy) -> Option<Duration> {
+    hbone_relay_timeout_millis(proxy.backend_read_timeout_ms)
+}
+
+fn hbone_backend_write_timeout(proxy: &Proxy) -> Option<Duration> {
+    hbone_relay_timeout_millis(proxy.backend_write_timeout_ms)
 }
 
 #[allow(dead_code)]
@@ -6679,31 +6705,51 @@ async fn handle_proxy_request_inner(
         let backend_resolved_ip = backend.resolved_ip.clone();
         let request_bytes_observed = Arc::clone(&ctx.request_bytes_observed);
         let relay_proxy_id = proxy.id.clone();
+        let relay_buffer_proxy_id = proxy.id.clone();
+        let adaptive_buffer = Arc::clone(&state.adaptive_buffer);
+        let relay_buffer_size = adaptive_buffer.get_buffer_size(&relay_buffer_proxy_id);
+        let relay_idle_timeout = hbone_proxy_idle_timeout(&proxy, &state.env_config);
+        let relay_half_close_cap = hbone_proxy_half_close_cap(&state.env_config);
+        let relay_read_timeout = hbone_backend_read_timeout(&proxy);
+        let relay_write_timeout = hbone_backend_write_timeout(&proxy);
         let lb_guard =
             LoadBalancerConnectionGuard::new(upstream_target.clone(), upstream_balancer.clone());
-        let mut backend_stream = backend.stream;
+        let backend_stream = backend.stream;
         tokio::spawn(async move {
             let _lb_guard = lb_guard;
             match hbone_on_upgrade.await {
                 Ok(upgraded) => {
-                    let mut client_stream = TokioIo::new(upgraded);
-                    match tokio::io::copy_bidirectional(&mut client_stream, &mut backend_stream)
-                        .await
-                    {
-                        Ok((client_to_backend, _backend_to_client)) => {
-                            request_bytes_observed
-                                .fetch_add(client_to_backend, std::sync::atomic::Ordering::Release);
-                        }
-                        Err(err) => {
-                            let class = classify_hbone_io_error(&err);
-                            warn!(
-                                proxy_id = %relay_proxy_id,
-                                error_kind = retry::error_class_log_kind(class),
-                                error_class = %class,
-                                error = %err,
-                                "HBONE tunnel relay failed"
-                            );
-                        }
+                    let client_stream = TokioIo::new(upgraded);
+                    let result = crate::proxy::tcp_proxy::bidirectional_copy_for_relay(
+                        client_stream,
+                        backend_stream,
+                        relay_idle_timeout,
+                        relay_half_close_cap,
+                        relay_read_timeout,
+                        relay_write_timeout,
+                        relay_buffer_size,
+                    )
+                    .await;
+                    request_bytes_observed.fetch_add(
+                        result.bytes_client_to_backend,
+                        std::sync::atomic::Ordering::Release,
+                    );
+                    adaptive_buffer.record_connection(
+                        &relay_buffer_proxy_id,
+                        result
+                            .bytes_client_to_backend
+                            .saturating_add(result.bytes_backend_to_client),
+                    );
+                    if let Some((direction, class, side, message)) = result.first_failure {
+                        warn!(
+                            proxy_id = %relay_proxy_id,
+                            direction = ?direction,
+                            io_side = ?side,
+                            error_kind = retry::error_class_log_kind(class),
+                            error_class = %class,
+                            error = %message,
+                            "HBONE tunnel relay failed"
+                        );
                     }
                 }
                 Err(err) => {

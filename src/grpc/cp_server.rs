@@ -27,10 +27,7 @@
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::Serialize;
-use serde_json::Value;
-use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -40,12 +37,14 @@ use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
+use super::auth::verify_grpc_jwt_metadata;
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{
     ConfigUpdate, FullConfigRequest, FullConfigResponse, MeshConfigUpdate, MeshSubscribeRequest,
     SubscribeRequest,
 };
 use crate::FERRUM_VERSION;
+use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::{GatewayConfig, default_namespace};
 use crate::xds::{MeshSlice, MeshSliceRequest};
 
@@ -59,11 +58,18 @@ pub struct DpNodeInfo {
     pub last_update_at: DateTime<Utc>,
 }
 
-/// Registry of connected DP nodes. Shared between the gRPC server and the
-/// admin API so that `GET /cluster` can report live connection state.
+/// Registry of connected DP and mesh config-stream nodes. Shared between the
+/// gRPC server and the admin API so that `GET /cluster` can report live
+/// connection state.
 #[derive(Default)]
 pub struct DpNodeRegistry {
-    nodes: DashMap<String, DpNodeInfo>,
+    nodes: DashMap<String, DpNodeRegistryEntry>,
+}
+
+#[derive(Clone, Default)]
+struct DpNodeRegistryEntry {
+    dp: Option<DpNodeInfo>,
+    mesh: Option<DpNodeInfo>,
 }
 
 impl DpNodeRegistry {
@@ -74,40 +80,128 @@ impl DpNodeRegistry {
     }
 
     pub fn insert(&self, info: DpNodeInfo) {
-        self.nodes.insert(info.node_id.clone(), info);
+        self.insert_for_stream(info, RegistryStreamKind::Dp);
+    }
+
+    pub fn insert_mesh(&self, info: DpNodeInfo) {
+        self.insert_for_stream(info, RegistryStreamKind::Mesh);
     }
 
     /// Remove a node only if its `connected_at` matches the expected timestamp.
     /// This prevents a stale stream drop from removing a newer reconnection's entry.
     pub fn remove_if_stale(&self, node_id: &str, expected_connected_at: DateTime<Utc>) {
-        self.nodes.remove_if(node_id, |_, info| {
-            info.connected_at == expected_connected_at
-        });
+        self.remove_if_stale_for_stream(node_id, expected_connected_at, RegistryStreamKind::Dp);
     }
 
     /// Update `last_update_at` for all connected nodes (called after broadcast).
     pub fn touch_all(&self) {
         let now = Utc::now();
         for mut entry in self.nodes.iter_mut() {
-            entry.last_update_at = now;
+            if let Some(dp) = entry.dp.as_mut() {
+                dp.last_update_at = now;
+            }
+            if let Some(mesh) = entry.mesh.as_mut() {
+                mesh.last_update_at = now;
+            }
         }
     }
 
     /// Return a snapshot of all connected nodes.
     pub fn snapshot(&self) -> Vec<DpNodeInfo> {
-        self.nodes.iter().map(|e| e.value().clone()).collect()
+        self.nodes
+            .iter()
+            .filter_map(|entry| entry.value().snapshot_info())
+            .collect()
     }
 
-    /// Number of connected DPs.
+    /// Number of connected node IDs.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.snapshot().len()
     }
 
-    /// Whether the registry has no connected DPs.
+    /// Whether the registry has no connected node IDs.
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.len() == 0
+    }
+
+    fn remove_mesh_if_stale(&self, node_id: &str, expected_connected_at: DateTime<Utc>) {
+        self.remove_if_stale_for_stream(node_id, expected_connected_at, RegistryStreamKind::Mesh);
+    }
+
+    fn insert_for_stream(&self, info: DpNodeInfo, kind: RegistryStreamKind) {
+        let node_id = info.node_id.clone();
+        self.nodes
+            .entry(node_id)
+            .and_modify(|entry| entry.set(kind, info.clone()))
+            .or_insert_with(|| {
+                let mut entry = DpNodeRegistryEntry::default();
+                entry.set(kind, info);
+                entry
+            });
+    }
+
+    fn remove_if_stale_for_stream(
+        &self,
+        node_id: &str,
+        expected_connected_at: DateTime<Utc>,
+        kind: RegistryStreamKind,
+    ) {
+        let should_remove_entry = if let Some(mut entry) = self.nodes.get_mut(node_id) {
+            entry.remove_if_stale(kind, expected_connected_at);
+            entry.is_empty()
+        } else {
+            false
+        };
+        if should_remove_entry {
+            self.nodes.remove_if(node_id, |_, entry| entry.is_empty());
+        }
+    }
+}
+
+impl DpNodeRegistryEntry {
+    fn set(&mut self, kind: RegistryStreamKind, info: DpNodeInfo) {
+        match kind {
+            RegistryStreamKind::Dp => self.dp = Some(info),
+            RegistryStreamKind::Mesh => self.mesh = Some(info),
+        }
+    }
+
+    fn remove_if_stale(&mut self, kind: RegistryStreamKind, expected_connected_at: DateTime<Utc>) {
+        let slot = match kind {
+            RegistryStreamKind::Dp => &mut self.dp,
+            RegistryStreamKind::Mesh => &mut self.mesh,
+        };
+        if slot
+            .as_ref()
+            .is_some_and(|info| info.connected_at == expected_connected_at)
+        {
+            *slot = None;
+        }
+    }
+
+    fn snapshot_info(&self) -> Option<DpNodeInfo> {
+        self.dp.clone().or_else(|| self.mesh.clone())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.dp.is_none() && self.mesh.is_none()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RegistryStreamKind {
+    Dp,
+    Mesh,
+}
+
+impl RegistryStreamKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Dp => "DP",
+            Self::Mesh => "Mesh",
+        }
     }
 }
 
@@ -120,13 +214,24 @@ struct TrackedStream<S> {
     registry: Arc<DpNodeRegistry>,
     node_id: String,
     connected_at: DateTime<Utc>,
+    stream_kind: RegistryStreamKind,
 }
 
 impl<S> Drop for TrackedStream<S> {
     fn drop(&mut self) {
-        self.registry
-            .remove_if_stale(&self.node_id, self.connected_at);
-        info!("DP node '{}' disconnected (stream dropped)", self.node_id);
+        match self.stream_kind {
+            RegistryStreamKind::Dp => self
+                .registry
+                .remove_if_stale(&self.node_id, self.connected_at),
+            RegistryStreamKind::Mesh => self
+                .registry
+                .remove_mesh_if_stale(&self.node_id, self.connected_at),
+        }
+        info!(
+            "{} node '{}' disconnected (stream dropped)",
+            self.stream_kind.label(),
+            self.node_id
+        );
     }
 }
 
@@ -295,34 +400,7 @@ impl CpGrpcServer {
 
     #[allow(clippy::result_large_err)]
     fn verify_jwt_metadata(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), Status> {
-        let token = metadata
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.strip_prefix("Bearer ").unwrap_or(s))
-            .ok_or_else(|| Status::unauthenticated("Missing authorization token"))?;
-
-        let key = DecodingKey::from_secret(self.jwt_secret.as_bytes());
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.validate_exp = true;
-        // Require standard claims to prevent minimal/forged tokens from authenticating.
-        // `iss` is required AND constrained to the expected issuer below: a token
-        // signed with the same shared secret but bearing a different `iss` (e.g.
-        // a leaked admin-API token if the secret was reused, or a token minted
-        // for an unrelated audience) is rejected here.
-        validation.required_spec_claims = {
-            let mut claims = std::collections::HashSet::new();
-            claims.insert("exp".to_string());
-            claims.insert("iat".to_string());
-            claims.insert("sub".to_string());
-            claims.insert("iss".to_string());
-            claims
-        };
-        validation.set_issuer(&[self.expected_issuer.as_str()]);
-
-        decode::<Value>(token, &key, &validation)
-            .map_err(|e| Status::unauthenticated(format!("Invalid token: {}", e)))?;
-
-        Ok(())
+        verify_grpc_jwt_metadata(metadata, &self.jwt_secret, &self.expected_issuer)
     }
 
     pub fn into_service(self) -> ConfigSyncServer<Self> {
@@ -330,95 +408,47 @@ impl CpGrpcServer {
     }
 
     #[allow(clippy::result_large_err)]
-    fn build_mesh_config_update(
-        config: &GatewayConfig,
-        slice_request: MeshSliceRequest,
-    ) -> Result<MeshConfigUpdate, Status> {
-        let slice = MeshSlice::from_gateway_config(config, slice_request);
+    fn build_mesh_config_update_from_slice(slice: MeshSlice) -> Result<MeshConfigUpdate, Status> {
+        let version = slice.version.clone();
         let mesh_slice_json = serde_json::to_string(&slice).map_err(|e| {
             error!("Failed to serialize mesh slice: {}", e);
             Status::internal("Failed to serialize mesh slice")
         })?;
         Ok(MeshConfigUpdate {
-            version: slice.version,
+            version,
             timestamp: chrono::Utc::now().timestamp(),
             mesh_slice_json,
             ferrum_version: FERRUM_VERSION.to_string(),
         })
     }
 
+    #[allow(clippy::result_large_err)]
+    fn build_mesh_config_update_if_changed(
+        config: &GatewayConfig,
+        slice_request: MeshSliceRequest,
+        previous_slice: &MeshSlice,
+    ) -> Result<(MeshSlice, Option<MeshConfigUpdate>), Status> {
+        let next_slice = MeshSlice::from_gateway_config(config, slice_request);
+        if previous_slice.content_eq(&next_slice) {
+            return Ok((next_slice, None));
+        }
+        let update = Self::build_mesh_config_update_from_slice(next_slice.clone())?;
+        Ok((next_slice, Some(update)))
+    }
+
     fn apply_mesh_delta_to_stream_config(
         stream_config: &mut GatewayConfig,
         delta: crate::config::db_loader::IncrementalResult,
         slice_request: MeshSliceRequest,
-    ) -> Result<MeshConfigUpdate, Status> {
+        previous_slice: &MeshSlice,
+    ) -> Result<(MeshSlice, Option<MeshConfigUpdate>), Status> {
         let mut candidate = stream_config.clone();
-        Self::apply_incremental_to_config_snapshot(&mut candidate, delta);
+        apply_incremental_to_config_snapshot(&mut candidate, delta);
         candidate.normalize_fields();
-        let update = Self::build_mesh_config_update(&candidate, slice_request)?;
+        let result =
+            Self::build_mesh_config_update_if_changed(&candidate, slice_request, previous_slice)?;
         *stream_config = candidate;
-        Ok(update)
-    }
-
-    pub(crate) fn apply_incremental_to_config_snapshot(
-        config: &mut GatewayConfig,
-        result: crate::config::db_loader::IncrementalResult,
-    ) {
-        let removed_proxies: HashSet<&str> = result
-            .removed_proxy_ids
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let removed_consumers: HashSet<&str> = result
-            .removed_consumer_ids
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let removed_plugins: HashSet<&str> = result
-            .removed_plugin_config_ids
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let removed_upstreams: HashSet<&str> = result
-            .removed_upstream_ids
-            .iter()
-            .map(String::as_str)
-            .collect();
-
-        config
-            .proxies
-            .retain(|proxy| !removed_proxies.contains(proxy.id.as_str()));
-        config
-            .consumers
-            .retain(|consumer| !removed_consumers.contains(consumer.id.as_str()));
-        config
-            .plugin_configs
-            .retain(|plugin| !removed_plugins.contains(plugin.id.as_str()));
-        config
-            .upstreams
-            .retain(|upstream| !removed_upstreams.contains(upstream.id.as_str()));
-
-        upsert_by_id(
-            &mut config.proxies,
-            result.added_or_modified_proxies,
-            |proxy| proxy.id.as_str(),
-        );
-        upsert_by_id(
-            &mut config.consumers,
-            result.added_or_modified_consumers,
-            |consumer| consumer.id.as_str(),
-        );
-        upsert_by_id(
-            &mut config.plugin_configs,
-            result.added_or_modified_plugin_configs,
-            |plugin| plugin.id.as_str(),
-        );
-        upsert_by_id(
-            &mut config.upstreams,
-            result.added_or_modified_upstreams,
-            |upstream| upstream.id.as_str(),
-        );
-        config.loaded_at = result.poll_timestamp;
+        Ok(result)
     }
 
     /// Check whether the DP's reported version is compatible with this CP.
@@ -624,6 +654,7 @@ impl ConfigSync for CpGrpcServer {
             registry: self.registry.clone(),
             node_id,
             connected_at: now,
+            stream_kind: RegistryStreamKind::Dp,
         };
 
         Ok(Response::new(Box::pin(tracked)))
@@ -680,16 +711,31 @@ impl ConfigSync for CpGrpcServer {
             inner.node_id, inner.ferrum_version, inner.namespace
         );
 
+        let node_id = inner.node_id;
+        let node_version = inner.ferrum_version;
+        let node_namespace = inner.namespace;
+
         let slice_request = MeshSliceRequest::from_native(
-            inner.node_id,
-            inner.namespace,
+            node_id.clone(),
+            node_namespace.clone(),
             inner.workload_spiffe_id,
             inner.labels,
         );
         let config = self.config.load_full();
-        let initial = Self::build_mesh_config_update(config.as_ref(), slice_request.clone())?;
+        let initial_slice = MeshSlice::from_gateway_config(config.as_ref(), slice_request.clone());
+        let initial = Self::build_mesh_config_update_from_slice(initial_slice.clone())?;
+
+        let now = Utc::now();
+        self.registry.insert_mesh(DpNodeInfo {
+            node_id: node_id.clone(),
+            version: node_version,
+            namespace: node_namespace,
+            connected_at: now,
+            last_update_at: now,
+        });
 
         let mut stream_config = config.as_ref().clone();
+        let mut previous_slice = initial_slice;
         let rx = self.update_tx.subscribe();
         let config_for_recovery = self.config.clone();
         let stream = BroadcastStream::new(rx).filter_map(move |result| {
@@ -699,10 +745,19 @@ impl ConfigSync for CpGrpcServer {
                     match serde_json::from_str::<GatewayConfig>(&update.config_json) {
                         Ok(mut config) => {
                             config.normalize_fields();
-                            match Self::build_mesh_config_update(&config, slice_request) {
-                                Ok(mesh_update) => {
+                            match Self::build_mesh_config_update_if_changed(
+                                &config,
+                                slice_request,
+                                &previous_slice,
+                            ) {
+                                Ok((next_slice, Some(mesh_update))) => {
                                     stream_config = config;
+                                    previous_slice = next_slice;
                                     Some(Ok(mesh_update))
+                                }
+                                Ok((_, None)) => {
+                                    stream_config = config;
+                                    None
                                 }
                                 Err(e) => Some(Err(e)),
                             }
@@ -718,13 +773,23 @@ impl ConfigSync for CpGrpcServer {
                         &update.config_json,
                     ) {
                         Ok(delta) => {
-                            Self::apply_mesh_delta_to_stream_config(
+                            match Self::apply_mesh_delta_to_stream_config(
                                 &mut stream_config,
                                 delta,
                                 slice_request,
-                            )
-                            .ok()
-                            .map(Ok)
+                                &previous_slice,
+                            ) {
+                                Ok((next_slice, maybe_update)) => {
+                                    if maybe_update.is_some() {
+                                        previous_slice = next_slice;
+                                    }
+                                    maybe_update.map(Ok)
+                                }
+                                Err(e) => {
+                                    warn!("Failed to build mesh delta update: {}", e);
+                                    None
+                                }
+                            }
                         }
                         Err(e) => {
                             warn!("Failed to deserialize delta config for mesh stream: {}", e);
@@ -745,10 +810,19 @@ impl ConfigSync for CpGrpcServer {
                         n
                     );
                     let current = config_for_recovery.load_full();
-                    match Self::build_mesh_config_update(current.as_ref(), slice_request) {
-                        Ok(update) => {
+                    match Self::build_mesh_config_update_if_changed(
+                        current.as_ref(),
+                        slice_request,
+                        &previous_slice,
+                    ) {
+                        Ok((next_slice, Some(update))) => {
                             stream_config = current.as_ref().clone();
+                            previous_slice = next_slice;
                             Some(Ok(update))
+                        }
+                        Ok((_, None)) => {
+                            stream_config = current.as_ref().clone();
+                            None
                         }
                         Err(e) => Some(Err(e)),
                     }
@@ -757,29 +831,15 @@ impl ConfigSync for CpGrpcServer {
         });
 
         let initial_stream = tokio_stream::once(Ok(initial));
-        Ok(Response::new(Box::pin(initial_stream.chain(stream))))
-    }
-}
-
-fn upsert_by_id<T, F>(existing: &mut Vec<T>, updates: Vec<T>, get_id: F)
-where
-    F: Fn(&T) -> &str,
-{
-    let mut index: std::collections::HashMap<String, usize> = existing
-        .iter()
-        .enumerate()
-        .map(|(i, item)| (get_id(item).to_string(), i))
-        .collect();
-
-    for item in updates {
-        let id = get_id(&item).to_string();
-        if let Some(&pos) = index.get(id.as_str()) {
-            existing[pos] = item;
-        } else {
-            let pos = existing.len();
-            existing.push(item);
-            index.insert(id, pos);
-        }
+        let combined = initial_stream.chain(stream);
+        let tracked = TrackedStream {
+            inner: Box::pin(combined),
+            registry: self.registry.clone(),
+            node_id,
+            connected_at: now,
+            stream_kind: RegistryStreamKind::Mesh,
+        };
+        Ok(Response::new(Box::pin(tracked)))
     }
 }
 
@@ -819,8 +879,79 @@ mod tests {
         }
     }
 
+    fn registry_info(node_id: &str, version: &str, connected_at: DateTime<Utc>) -> DpNodeInfo {
+        DpNodeInfo {
+            node_id: node_id.to_string(),
+            version: version.to_string(),
+            namespace: "ferrum".to_string(),
+            connected_at,
+            last_update_at: connected_at,
+        }
+    }
+
     #[test]
-    fn mesh_delta_update_uses_broadcast_payload_version() {
+    fn registry_mesh_insert_does_not_clobber_dp_snapshot() {
+        let registry = DpNodeRegistry::new();
+        let dp_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 1).unwrap();
+        let mesh_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 2).unwrap();
+
+        registry.insert(registry_info("node-a", "dp-version", dp_connected_at));
+        registry.insert_mesh(registry_info("node-a", "mesh-version", mesh_connected_at));
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].node_id, "node-a");
+        assert_eq!(snapshot[0].version, "dp-version");
+        assert_eq!(snapshot[0].connected_at, dp_connected_at);
+    }
+
+    #[test]
+    fn registry_mesh_drop_does_not_remove_active_dp_entry() {
+        let registry = DpNodeRegistry::new();
+        let dp_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 1).unwrap();
+        let mesh_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 2).unwrap();
+
+        registry.insert(registry_info("node-a", "dp-version", dp_connected_at));
+        registry.insert_mesh(registry_info("node-a", "mesh-version", mesh_connected_at));
+        registry.remove_mesh_if_stale("node-a", mesh_connected_at);
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].version, "dp-version");
+        assert_eq!(snapshot[0].connected_at, dp_connected_at);
+    }
+
+    #[test]
+    fn registry_dp_drop_keeps_active_mesh_entry_visible() {
+        let registry = DpNodeRegistry::new();
+        let dp_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 1).unwrap();
+        let mesh_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 2).unwrap();
+
+        registry.insert(registry_info("node-a", "dp-version", dp_connected_at));
+        registry.insert_mesh(registry_info("node-a", "mesh-version", mesh_connected_at));
+        registry.remove_if_stale("node-a", dp_connected_at);
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].version, "mesh-version");
+        assert_eq!(snapshot[0].connected_at, mesh_connected_at);
+    }
+
+    #[test]
+    fn registry_mesh_only_entry_is_visible_and_removable() {
+        let registry = DpNodeRegistry::new();
+        let mesh_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 2).unwrap();
+
+        registry.insert_mesh(registry_info("node-a", "mesh-version", mesh_connected_at));
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.snapshot()[0].version, "mesh-version");
+
+        registry.remove_mesh_if_stale("node-a", mesh_connected_at);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn mesh_delta_update_skips_unchanged_mesh_slice_content() {
         let mut stream_config = mesh_config_with_service(0);
         let poll_timestamp = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 42).unwrap();
         let delta = IncrementalResult {
@@ -834,55 +965,54 @@ mod tests {
             removed_upstream_ids: vec!["stale-upstream".to_string()],
             poll_timestamp,
         };
-        let update = CpGrpcServer::apply_mesh_delta_to_stream_config(
+        let slice_request = MeshSliceRequest::from_native(
+            "node-a".to_string(),
+            "ferrum".to_string(),
+            String::new(),
+            std::collections::HashMap::new(),
+        );
+        let previous_slice = MeshSlice::from_gateway_config(&stream_config, slice_request.clone());
+        let (next_slice, update) = CpGrpcServer::apply_mesh_delta_to_stream_config(
             &mut stream_config,
             delta,
-            MeshSliceRequest::from_native(
-                "node-a".to_string(),
-                "ferrum".to_string(),
-                String::new(),
-                std::collections::HashMap::new(),
-            ),
+            slice_request,
+            &previous_slice,
         )
         .expect("mesh delta should build");
-        let slice: MeshSlice =
-            serde_json::from_str(&update.mesh_slice_json).expect("mesh slice should deserialize");
 
-        assert_eq!(slice.version, poll_timestamp.to_rfc3339());
-        assert_eq!(slice.services.len(), 1);
+        assert!(update.is_none());
+        assert_eq!(stream_config.loaded_at, poll_timestamp);
+        assert_eq!(next_slice.version, poll_timestamp.to_rfc3339());
+        assert_eq!(next_slice.services.len(), 1);
     }
 
     #[test]
-    fn mesh_delta_update_preserves_stream_local_snapshot() {
-        let mut stream_config = mesh_config_with_named_service("stream-local", 0);
-        let poll_timestamp = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 43).unwrap();
-        let delta = IncrementalResult {
-            added_or_modified_proxies: Vec::new(),
-            removed_proxy_ids: Vec::new(),
-            added_or_modified_consumers: Vec::new(),
-            removed_consumer_ids: Vec::new(),
-            added_or_modified_plugin_configs: Vec::new(),
-            removed_plugin_config_ids: Vec::new(),
-            added_or_modified_upstreams: Vec::new(),
-            removed_upstream_ids: Vec::new(),
-            poll_timestamp,
-        };
-        let update = CpGrpcServer::apply_mesh_delta_to_stream_config(
-            &mut stream_config,
-            delta,
-            MeshSliceRequest::from_native(
-                "node-a".to_string(),
-                "ferrum".to_string(),
-                String::new(),
-                std::collections::HashMap::new(),
-            ),
+    fn mesh_full_update_emits_when_mesh_slice_content_changes() {
+        let stream_config = mesh_config_with_named_service("stream-local", 0);
+        let next_config = mesh_config_with_named_service("new-service", 43);
+        let slice_request = MeshSliceRequest::from_native(
+            "node-a".to_string(),
+            "ferrum".to_string(),
+            String::new(),
+            std::collections::HashMap::new(),
+        );
+        let previous_slice = MeshSlice::from_gateway_config(&stream_config, slice_request.clone());
+        let (_next_slice, update) = CpGrpcServer::build_mesh_config_update_if_changed(
+            &next_config,
+            slice_request,
+            &previous_slice,
         )
-        .expect("mesh delta should build");
+        .expect("mesh full update should build");
+        let update = update.expect("changed mesh content should emit an update");
         let slice: MeshSlice =
             serde_json::from_str(&update.mesh_slice_json).expect("mesh slice should deserialize");
 
-        assert_eq!(slice.version, poll_timestamp.to_rfc3339());
-        assert_eq!(slice.services[0].name, "stream-local");
+        assert_eq!(slice.version, next_config.loaded_at.to_rfc3339());
+        assert_eq!(slice.services[0].name, "new-service");
+        assert_eq!(
+            stream_config.mesh.as_ref().unwrap().services[0].name,
+            "stream-local"
+        );
     }
 
     #[test]
