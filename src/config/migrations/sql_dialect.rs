@@ -86,6 +86,13 @@ impl V001SqlBuilder {
             self.create_proxies_sql(),
             self.create_plugin_configs_sql(),
             self.create_proxy_plugins_sql(),
+            // api_specs must come AFTER proxies (api_specs.proxy_id FKs
+            // proxies(id) ON DELETE CASCADE, so the proxies table must exist
+            // first).  The api_spec_id back-links on proxies/upstreams/
+            // plugin_configs are application-managed (no FK constraint) — see
+            // the comment block in create_api_specs_sql().  api_specs is
+            // admin-only metadata; the gateway runtime never reads this table.
+            self.create_api_specs_sql(),
         ] {
             sqlx::query(sql).execute(pool).await?;
         }
@@ -112,6 +119,22 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_updated ON upstreams (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_scope ON plugin_configs (namespace, scope)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_plugin_name ON plugin_configs (namespace, plugin_name)",
+            // Note: no standalone namespace index on api_specs — the compound
+            // indexes below (namespace + updated_at / spec_version / etc.) all
+            // have namespace as the leading column and serve namespace-only lookups.
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_namespace_updated_at ON api_specs (namespace, updated_at)",
+            // Wave 5 indexes — for spec_version filter, title sort, operation_count sort, created_at sort
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_spec_version ON api_specs (namespace, spec_version)",
+            self.api_specs_title_index_sql(),
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_operation_count ON api_specs (namespace, operation_count)",
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_created_at ON api_specs (namespace, created_at)",
+            // Back-link indexes: replace_api_spec_bundle and delete_api_spec
+            // run WHERE api_spec_id = ? against these tables. Without indexes,
+            // those queries are full-table scans that grow with overall config
+            // volume, not spec count.
+            "CREATE INDEX IF NOT EXISTS idx_proxies_api_spec_id ON proxies (api_spec_id)",
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_api_spec_id ON plugin_configs (api_spec_id)",
+            "CREATE INDEX IF NOT EXISTS idx_upstreams_api_spec_id ON upstreams (api_spec_id)",
         ];
 
         for idx_sql in indexes {
@@ -163,6 +186,18 @@ impl V001SqlBuilder {
         matches!(self.dialect, SqlDialect::Sqlite)
     }
 
+    fn api_specs_title_index_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            // MySQL cannot index a TEXT column without a key length. The
+            // extractor caps title at 1024 bytes; a 255-character prefix keeps
+            // the namespace+title index comfortably inside InnoDB's common
+            // utf8mb4 key length limits while preserving useful title sorting.
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_title ON api_specs (namespace, title(255))"
+        } else {
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_title ON api_specs (namespace, title)"
+        }
+    }
+
     fn create_upstreams_sql(&self) -> &'static str {
         if self.is_mysql() {
             r#"
@@ -180,6 +215,7 @@ impl V001SqlBuilder {
                 backend_tls_client_key_path VARCHAR(2048),
                 backend_tls_verify_server_cert TINYINT NOT NULL DEFAULT 1,
                 backend_tls_server_ca_cert_path VARCHAR(2048),
+                api_spec_id VARCHAR(255),
                 created_at VARCHAR(64) NOT NULL,
                 updated_at VARCHAR(64) NOT NULL
             )
@@ -200,6 +236,7 @@ impl V001SqlBuilder {
                 backend_tls_client_key_path TEXT,
                 backend_tls_verify_server_cert INTEGER NOT NULL DEFAULT 1,
                 backend_tls_server_ca_cert_path TEXT,
+                api_spec_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
@@ -287,6 +324,7 @@ impl V001SqlBuilder {
                 allowed_methods TEXT,
                 allowed_ws_origins TEXT,
                 udp_max_response_amplification_factor REAL,
+                api_spec_id VARCHAR(255),
                 created_at VARCHAR(64) NOT NULL,
                 updated_at VARCHAR(64) NOT NULL,
                 CONSTRAINT fk_proxies_upstream FOREIGN KEY (upstream_id) REFERENCES upstreams(id) ON DELETE RESTRICT,
@@ -346,6 +384,7 @@ impl V001SqlBuilder {
                 allowed_methods TEXT,
                 allowed_ws_origins TEXT,
                 udp_max_response_amplification_factor REAL,
+                api_spec_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 CHECK (backend_port >= 0 AND backend_port <= 65535),
@@ -370,6 +409,7 @@ impl V001SqlBuilder {
                 proxy_id VARCHAR(255),
                 enabled INTEGER NOT NULL DEFAULT 1,
                 priority_override INTEGER DEFAULT NULL,
+                api_spec_id VARCHAR(255),
                 created_at VARCHAR(64) NOT NULL,
                 updated_at VARCHAR(64) NOT NULL,
                 CONSTRAINT fk_plugin_configs_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
@@ -386,6 +426,7 @@ impl V001SqlBuilder {
                 proxy_id TEXT REFERENCES proxies(id) ON DELETE CASCADE,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 priority_override INTEGER DEFAULT NULL,
+                api_spec_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
@@ -415,6 +456,110 @@ impl V001SqlBuilder {
         }
     }
 
+    fn create_api_specs_sql(&self) -> &'static str {
+        // api_specs is admin-only metadata. The gateway runtime never reads
+        // this table; it is excluded from db_loader.rs, GatewayConfig, and
+        // all gRPC/CP distribution paths.
+        //
+        // FK: proxy_id → proxies(id) ON DELETE CASCADE so deleting the proxy
+        //     (e.g., when a spec is purged) automatically removes the spec row.
+        //
+        // The api_spec_id columns on proxies, upstreams, and plugin_configs are
+        // deliberately UNCONSTRAINED (no FK, no ON DELETE SET NULL).  Application
+        // code in `delete_api_spec` (db_loader.rs and mongo_store.rs) handles
+        // cleanup of spec-owned resources.  FK constraints were intentionally
+        // omitted to:
+        //   1. Keep MongoDB and SQL semantics identical without a Mongo FK concept.
+        //   2. Avoid cross-table creation-ordering complexity on MySQL (which would
+        //      require api_specs to exist before inserting proxies that reference it).
+        // Manual DB operations that delete from api_specs directly must also clean
+        // dependent rows by hand (WHERE api_spec_id = '<deleted-spec-id>').
+        if self.is_mysql() {
+            r#"
+            CREATE TABLE IF NOT EXISTS api_specs (
+                id VARCHAR(255) PRIMARY KEY,
+                namespace VARCHAR(255) NOT NULL DEFAULT 'ferrum',
+                proxy_id VARCHAR(255) NOT NULL,
+                spec_version VARCHAR(50) NOT NULL,
+                spec_format VARCHAR(10) NOT NULL,
+                spec_content LONGBLOB NOT NULL,
+                content_encoding VARCHAR(50) NOT NULL DEFAULT 'gzip',
+                uncompressed_size BIGINT NOT NULL,
+                content_hash VARCHAR(64) NOT NULL,
+                title TEXT,
+                info_version VARCHAR(255),
+                description LONGTEXT,
+                contact_name TEXT,
+                contact_email TEXT,
+                license_name TEXT,
+                license_identifier TEXT,
+                tags LONGTEXT NOT NULL,
+                server_urls LONGTEXT NOT NULL,
+                operation_count INTEGER NOT NULL DEFAULT 0,
+                resource_hash VARCHAR(64) NOT NULL DEFAULT '',
+                created_at VARCHAR(50) NOT NULL,
+                updated_at VARCHAR(50) NOT NULL,
+                CONSTRAINT fk_api_specs_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
+            )
+            "#
+        } else if self.is_sqlite() {
+            r#"
+            CREATE TABLE IF NOT EXISTS api_specs (
+                id TEXT PRIMARY KEY,
+                namespace TEXT NOT NULL DEFAULT 'ferrum',
+                proxy_id TEXT NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+                spec_version TEXT NOT NULL,
+                spec_format TEXT NOT NULL,
+                spec_content BLOB NOT NULL,
+                content_encoding TEXT NOT NULL DEFAULT 'gzip',
+                uncompressed_size BIGINT NOT NULL,
+                content_hash TEXT NOT NULL,
+                title TEXT,
+                info_version TEXT,
+                description TEXT,
+                contact_name TEXT,
+                contact_email TEXT,
+                license_name TEXT,
+                license_identifier TEXT,
+                tags TEXT NOT NULL DEFAULT '[]',
+                server_urls TEXT NOT NULL DEFAULT '[]',
+                operation_count INTEGER NOT NULL DEFAULT 0,
+                resource_hash TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#
+        } else {
+            // PostgreSQL: BYTEA for binary data (BLOB is not a native PG type).
+            r#"
+            CREATE TABLE IF NOT EXISTS api_specs (
+                id TEXT PRIMARY KEY,
+                namespace TEXT NOT NULL DEFAULT 'ferrum',
+                proxy_id TEXT NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+                spec_version TEXT NOT NULL,
+                spec_format TEXT NOT NULL,
+                spec_content BYTEA NOT NULL,
+                content_encoding TEXT NOT NULL DEFAULT 'gzip',
+                uncompressed_size BIGINT NOT NULL,
+                content_hash TEXT NOT NULL,
+                title TEXT,
+                info_version TEXT,
+                description TEXT,
+                contact_name TEXT,
+                contact_email TEXT,
+                license_name TEXT,
+                license_identifier TEXT,
+                tags TEXT NOT NULL DEFAULT '[]',
+                server_urls TEXT NOT NULL DEFAULT '[]',
+                operation_count INTEGER NOT NULL DEFAULT 0,
+                resource_hash TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#
+        }
+    }
+
     fn unique_listen_port_sql(&self) -> &'static str {
         if self.is_mysql() {
             "CREATE UNIQUE INDEX idx_proxies_unique_listen_port ON proxies (namespace, listen_port)"
@@ -430,6 +575,7 @@ impl V001SqlBuilder {
                 "CREATE UNIQUE INDEX idx_consumers_namespace_username ON consumers (namespace, username)",
                 "CREATE UNIQUE INDEX idx_consumers_namespace_custom_id ON consumers (namespace, custom_id)",
                 "CREATE UNIQUE INDEX idx_upstreams_namespace_name ON upstreams (namespace, name)",
+                "CREATE UNIQUE INDEX idx_api_specs_namespace_proxy_id ON api_specs (namespace, proxy_id)",
             ]
         } else {
             &[
@@ -437,6 +583,7 @@ impl V001SqlBuilder {
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_consumers_namespace_username ON consumers (namespace, username)",
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_consumers_namespace_custom_id ON consumers (namespace, custom_id) WHERE custom_id IS NOT NULL",
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_upstreams_namespace_name ON upstreams (namespace, name) WHERE name IS NOT NULL",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_api_specs_namespace_proxy_id ON api_specs (namespace, proxy_id)",
             ]
         }
     }
@@ -459,6 +606,29 @@ mod tests {
             builder
                 .unique_listen_port_sql()
                 .contains("CREATE UNIQUE INDEX idx_proxies_unique_listen_port")
+        );
+    }
+
+    #[test]
+    fn test_mysql_api_specs_title_index_uses_prefix_length() {
+        let builder = V001SqlBuilder::new("mysql");
+        assert!(
+            builder.api_specs_title_index_sql().contains("title(255)"),
+            "MySQL must use a prefix length when indexing api_specs.title TEXT"
+        );
+    }
+
+    #[test]
+    fn test_mysql_api_specs_metadata_columns_hold_extractor_caps() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_api_specs_sql();
+        assert!(
+            sql.contains("tags LONGTEXT NOT NULL"),
+            "tags must not be capped at VARCHAR(8192); extractor caps can exceed that"
+        );
+        assert!(
+            sql.contains("server_urls LONGTEXT NOT NULL"),
+            "server_urls must not be capped at VARCHAR(8192); extractor caps can exceed that"
         );
     }
 

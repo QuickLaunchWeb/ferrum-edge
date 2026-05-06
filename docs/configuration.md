@@ -46,6 +46,7 @@ This page is the canonical human-readable reference for `FERRUM_*` variables and
 | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | PEM CA bundle for Admin API client certificate verification |
 | `FERRUM_ADMIN_TLS_NO_VERIFY` | No | `false` | Skip Admin API TLS certificate verification (testing only) |
 | `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` | No | `100` | Max request body size in MiB for `POST /restore` |
+| `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` | No | `25` | Max request body size in MiB for `POST/PUT /api-specs`. Specs are stored gzip-compressed; large API definitions (e.g. AWS combined services) can approach 30–50 MiB uncompressed. MongoDB backends are additionally bounded by the BSON 16 MB document limit, enforced at write time |
 
 ### Database
 
@@ -129,6 +130,7 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 | `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | No | — | CA bundle for verifying DP client certificates (mTLS) |
 | `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` | No | `128` | CP broadcast channel capacity before lagging DPs receive a full snapshot |
 | `FERRUM_XDS_ENABLED` | No | `false` | Enable Phase B xDS ADS (`StreamAggregatedResources` and `DeltaAggregatedResources`) on the CP gRPC listener |
+| `FERRUM_XDS_STREAM_CHANNEL_CAPACITY` | No | `32` | Per-ADS-stream response queue capacity before slow xDS readers apply backpressure to their own stream task |
 | `FERRUM_DP_CP_GRPC_URL` | DP/mesh mode (unless `_URLS` set) | — | Control Plane gRPC URL |
 | `FERRUM_DP_CP_GRPC_URLS` | No | — | Comma-separated priority-ordered CP URLs for DP/mesh failover. Takes precedence over single URL |
 | `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` | No | `300` | Retry primary CP interval (seconds) when connected to a fallback. `0` = disabled |

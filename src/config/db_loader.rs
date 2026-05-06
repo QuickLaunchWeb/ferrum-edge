@@ -39,14 +39,71 @@ use tracing::{debug, error, info, warn};
 // Re-export trait types so existing `use crate::config::db_loader::{IncrementalResult, ...}` works.
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
-    DatabaseBackend, IncrementalResult, PaginatedResult, extract_db_hostname, extract_known_ids,
-    redact_url,
+    ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult, PaginatedResult,
+    SortOrder, extract_db_hostname, extract_known_ids, redact_url,
 };
 
 struct PluginConfigRef {
     id: String,
     scope: PluginScope,
     proxy_id: Option<String>,
+}
+
+fn declared_proxy_plugin_association_ids_from_spec(
+    spec: &crate::config::types::ApiSpec,
+) -> Result<HashSet<String>, anyhow::Error> {
+    if spec.content_encoding != "gzip" {
+        warn!(
+            "api_spec '{}' uses unsupported content_encoding '{}'",
+            spec.id, spec.content_encoding
+        );
+        return Ok(HashSet::new());
+    }
+    let cap = usize::try_from(spec.uncompressed_size).unwrap_or(usize::MAX);
+    let body = match crate::admin::spec_codec::decompress_gzip_capped(&spec.spec_content, cap) {
+        Ok(body) => body,
+        Err(e) => {
+            warn!(
+                "failed to decompress stored api_spec '{}' proxy plugin associations: {}",
+                spec.id, e
+            );
+            return Ok(HashSet::new());
+        }
+    };
+    let ids = match crate::admin::api_specs::extract_declared_proxy_plugin_association_ids(
+        &body,
+        Some(spec.spec_format),
+    ) {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!(
+                "failed to parse stored api_spec '{}' proxy plugin associations: {}",
+                spec.id, e
+            );
+            return Ok(HashSet::new());
+        }
+    };
+    Ok(ids.into_iter().collect())
+}
+
+fn store_canonical_resource_hash(
+    bundle: &crate::admin::api_specs::ExtractedBundle,
+) -> Result<String, anyhow::Error> {
+    let mut proxy = bundle.proxy.clone();
+    proxy.normalize_fields();
+    let upstream = bundle.upstream.clone().map(|mut upstream| {
+        upstream.normalize_fields();
+        upstream
+    });
+    let mut plugins = bundle.plugins.clone();
+    for plugin in &mut plugins {
+        plugin.normalize_fields();
+    }
+    crate::admin::api_specs::hash_resource_bundle(&crate::admin::api_specs::ExtractedBundle {
+        proxy,
+        upstream,
+        plugins,
+    })
 }
 
 /// Identifies a resource table for lightweight `SELECT id` queries.
@@ -504,6 +561,15 @@ impl DatabaseStore {
             .validate_plugin_file_dependencies(ValidationAction::Warn)
             .run()?;
 
+        // Hot-path isolation: strip api_spec_id from runtime config. The row
+        // mappers preserve api_spec_id so admin GET/list paths can serialise
+        // it; here we ensure the gateway's in-memory `GatewayConfig` does
+        // not carry the ownership tag (the runtime never reads it, and CP
+        // gRPC broadcasts must not leak it to DPs). Mirrors the strip done
+        // by Mongo's `load_full_config`. See the cross-backend invariant
+        // test `runtime_load_strips_api_spec_id_from_resources`.
+        strip_api_spec_id_from_runtime_config(&mut config);
+
         self.check_slow_query("load_full_config", start);
         Ok(config)
     }
@@ -639,6 +705,90 @@ impl DatabaseStore {
         Ok(configs)
     }
 
+    // ---- Proxy INSERT SQL helpers ----
+    //
+    // The column list for a proxy INSERT appears in three places:
+    //   1. `create_proxy`           — direct admin POST /proxies
+    //   2. `batch_create_proxies_chunk` — bulk import
+    //   3. `submit_api_spec_bundle` — spec-owned INSERT (adds `api_spec_id` column)
+    //
+    // Sites 1 and 2 share `PROXY_INSERT_SQL` (no api_spec_id).
+    // Site 3 uses `PROXY_INSERT_WITH_SPEC_SQL` (adds api_spec_id before created_at).
+    //
+    // IMPORTANT: when adding a new column to `proxies`, update BOTH constants and
+    // the corresponding `.bind()` chains in all three call sites.  The direct-admin
+    // `update_proxy` (also in this file) and `replace_api_spec_bundle` UPDATE paths
+    // are separate SQL strings and must be updated independently.
+    //
+    // NOTE: `submit_api_spec_bundle` uses a literal multi-line query string with
+    // `\` continuation rather than this const because it adds the `api_spec_id`
+    // column.  The `replace_api_spec_bundle` path uses UPDATE so it is out of scope.
+    // ── Drift-prevention contract for proxy INSERT call sites ────────────────
+    //
+    // The 45-column proxy column list is canonical and shared by THREE INSERT
+    // sites and ONE UPDATE site. When you add a new column to the `proxies`
+    // table, it must be added — in the same position — to ALL of:
+    //
+    //   1. PROXY_INSERT_SQL                         (direct admin path)
+    //   2. create_proxy() bind chain                (this file, ~line 790)
+    //   3. submit_api_spec_bundle() proxy INSERT    (this file, ~line 3387)
+    //   4. update_proxy() SET clause + bind chain   (this file, ~line 919)
+    //   5. PROXY_INSERT_PLACEHOLDER_COUNT below     (drift catcher)
+    //   6. PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT below
+    //
+    // The two `proxy_insert_sql_*_count_matches_bind_count` tests below count
+    // `?` placeholders in the SQL and assert against the constants here. If
+    // you forget to update the placeholder count, the test fails and points
+    // at the exact discrepancy. If you update the constant but forget to
+    // bind, sqlx returns "wrong number of parameters" at execute time.
+    //
+    // We chose this drift-catcher pattern over a fully-generic
+    // `bind_proxy_base_columns` helper because the sqlx::Any generic makes
+    // such helpers verbose without meaningful runtime benefit.
+
+    /// Number of `?` placeholders in `PROXY_INSERT_SQL` (no api_spec_id).
+    /// 45 base columns + `created_at` + `updated_at` = 47.
+    ///
+    /// Used only by the drift-catcher tests in `proxy_insert_sql_drift_tests`;
+    /// kept available outside `#[cfg(test)]` so it remains a visible
+    /// drift-prevention anchor when reading the SQL definition.
+    #[allow(dead_code)]
+    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 47;
+
+    /// Number of `?` placeholders in the `submit_api_spec_bundle` proxy
+    /// INSERT statement (which adds `api_spec_id` between
+    /// `udp_max_response_amplification_factor` and `created_at`).
+    /// 47 base + 1 (api_spec_id) = 48.
+    #[allow(dead_code)]
+    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 48;
+
+    /// Proxy INSERT SQL without `api_spec_id` (direct admin path and bulk import).
+    ///
+    /// Note: the `?` placeholder is rewritten to `$N` for PostgreSQL by `self.q()`.
+    /// Any new column must be appended in the same position in `PROXY_INSERT_SQL`
+    /// and the corresponding `.bind()` chain — see the drift-prevention contract
+    /// block above.
+    const PROXY_INSERT_SQL: &'static str = "\
+        INSERT INTO proxies (id, namespace, name, hosts, listen_path, backend_scheme, \
+         backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, \
+         backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, \
+         backend_tls_client_cert_path, backend_tls_client_key_path, \
+         backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, \
+         dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, \
+         circuit_breaker, retry, response_body_mode, \
+         pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, \
+         pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, \
+         pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, \
+         pool_http2_initial_connection_window_size, pool_http2_adaptive_window, \
+         pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
+         pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, \
+         udp_idle_timeout_seconds, tcp_idle_timeout_seconds, \
+         allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
+         created_at, updated_at) \
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                ?, ?)";
+
     // ---- CRUD for Admin API ----
 
     pub async fn create_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
@@ -662,58 +812,101 @@ impl DatabaseStore {
 
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
-        sqlx::query(
-            &self.q("INSERT INTO proxies (id, namespace, name, hosts, listen_path, backend_scheme, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, udp_idle_timeout_seconds, tcp_idle_timeout_seconds, allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        )
-        .bind(&proxy.id)
-        .bind(&proxy.namespace)
-        .bind(&proxy.name)
-        .bind(&hosts_json)
-        .bind(&proxy.listen_path)
-        .bind(proxy.effective_scheme().to_scheme_str())
-        .bind(&proxy.backend_host)
-        .bind(proxy.backend_port as i32)
-        .bind(&proxy.backend_path)
-        .bind(if proxy.strip_listen_path { 1i32 } else { 0 })
-        .bind(if proxy.preserve_host_header { 1i32 } else { 0 })
-        .bind(proxy.backend_connect_timeout_ms as i64)
-        .bind(proxy.backend_read_timeout_ms as i64)
-        .bind(proxy.backend_write_timeout_ms as i64)
-        .bind(&proxy.backend_tls_client_cert_path)
-        .bind(&proxy.backend_tls_client_key_path)
-        .bind(if proxy.backend_tls_verify_server_cert { 1i32 } else { 0 })
-        .bind(&proxy.backend_tls_server_ca_cert_path)
-        .bind(&proxy.dns_override)
-        .bind(proxy.dns_cache_ttl_seconds.map(|v| v as i64))
-        .bind(match proxy.auth_mode { AuthMode::Multi => "multi", _ => "single" })
-        .bind(&proxy.upstream_id)
-        .bind(&circuit_breaker_json)
-        .bind(&retry_json)
-        .bind(response_body_mode_str)
-        .bind(proxy.pool_idle_timeout_seconds.map(|v| v as i64))
-        .bind(proxy.pool_enable_http_keep_alive.map(|v| if v { 1i32 } else { 0 }))
-        .bind(proxy.pool_enable_http2.map(|v| if v { 1i32 } else { 0 }))
-        .bind(proxy.pool_tcp_keepalive_seconds.map(|v| v as i64))
-        .bind(proxy.pool_http2_keep_alive_interval_seconds.map(|v| v as i64))
-        .bind(proxy.pool_http2_keep_alive_timeout_seconds.map(|v| v as i64))
-        .bind(proxy.pool_http2_initial_stream_window_size.map(|v| v as i64))
-        .bind(proxy.pool_http2_initial_connection_window_size.map(|v| v as i64))
-        .bind(proxy.pool_http2_adaptive_window.map(|v| if v { 1i32 } else { 0 }))
-        .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
-        .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
-        .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
-        .bind(proxy.listen_port.map(|v| v as i32))
-        .bind(if proxy.frontend_tls { 1i32 } else { 0 })
-        .bind(if proxy.passthrough { 1i32 } else { 0 })
-        .bind(proxy.udp_idle_timeout_seconds as i64)
-        .bind(proxy.tcp_idle_timeout_seconds.map(|v| v as i64))
-        .bind(proxy.allowed_methods.as_ref().map(serde_json::to_string).transpose()?)
-        .bind(if proxy.allowed_ws_origins.is_empty() { None } else { Some(serde_json::to_string(&proxy.allowed_ws_origins)?) })
-        .bind(proxy.udp_max_response_amplification_factor.map(|v| v as f64))
-        .bind(proxy.created_at.to_rfc3339())
-        .bind(proxy.updated_at.to_rfc3339())
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query(&self.q(Self::PROXY_INSERT_SQL))
+            .bind(&proxy.id)
+            .bind(&proxy.namespace)
+            .bind(&proxy.name)
+            .bind(&hosts_json)
+            .bind(&proxy.listen_path)
+            .bind(proxy.effective_scheme().to_scheme_str())
+            .bind(&proxy.backend_host)
+            .bind(proxy.backend_port as i32)
+            .bind(&proxy.backend_path)
+            .bind(if proxy.strip_listen_path { 1i32 } else { 0 })
+            .bind(if proxy.preserve_host_header { 1i32 } else { 0 })
+            .bind(proxy.backend_connect_timeout_ms as i64)
+            .bind(proxy.backend_read_timeout_ms as i64)
+            .bind(proxy.backend_write_timeout_ms as i64)
+            .bind(&proxy.backend_tls_client_cert_path)
+            .bind(&proxy.backend_tls_client_key_path)
+            .bind(if proxy.backend_tls_verify_server_cert {
+                1i32
+            } else {
+                0
+            })
+            .bind(&proxy.backend_tls_server_ca_cert_path)
+            .bind(&proxy.dns_override)
+            .bind(proxy.dns_cache_ttl_seconds.map(|v| v as i64))
+            .bind(match proxy.auth_mode {
+                AuthMode::Multi => "multi",
+                _ => "single",
+            })
+            .bind(&proxy.upstream_id)
+            .bind(&circuit_breaker_json)
+            .bind(&retry_json)
+            .bind(response_body_mode_str)
+            .bind(proxy.pool_idle_timeout_seconds.map(|v| v as i64))
+            .bind(
+                proxy
+                    .pool_enable_http_keep_alive
+                    .map(|v| if v { 1i32 } else { 0 }),
+            )
+            .bind(proxy.pool_enable_http2.map(|v| if v { 1i32 } else { 0 }))
+            .bind(proxy.pool_tcp_keepalive_seconds.map(|v| v as i64))
+            .bind(
+                proxy
+                    .pool_http2_keep_alive_interval_seconds
+                    .map(|v| v as i64),
+            )
+            .bind(
+                proxy
+                    .pool_http2_keep_alive_timeout_seconds
+                    .map(|v| v as i64),
+            )
+            .bind(
+                proxy
+                    .pool_http2_initial_stream_window_size
+                    .map(|v| v as i64),
+            )
+            .bind(
+                proxy
+                    .pool_http2_initial_connection_window_size
+                    .map(|v| v as i64),
+            )
+            .bind(
+                proxy
+                    .pool_http2_adaptive_window
+                    .map(|v| if v { 1i32 } else { 0 }),
+            )
+            .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
+            .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
+            .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
+            .bind(proxy.listen_port.map(|v| v as i32))
+            .bind(if proxy.frontend_tls { 1i32 } else { 0 })
+            .bind(if proxy.passthrough { 1i32 } else { 0 })
+            .bind(proxy.udp_idle_timeout_seconds as i64)
+            .bind(proxy.tcp_idle_timeout_seconds.map(|v| v as i64))
+            .bind(
+                proxy
+                    .allowed_methods
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+            )
+            .bind(if proxy.allowed_ws_origins.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&proxy.allowed_ws_origins)?)
+            })
+            .bind(
+                proxy
+                    .udp_max_response_amplification_factor
+                    .map(|v| v as f64),
+            )
+            .bind(proxy.created_at.to_rfc3339())
+            .bind(proxy.updated_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
 
         // Persist plugin associations in the junction table
         for assoc in &proxy.plugins {
@@ -833,14 +1026,34 @@ impl DatabaseStore {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
 
-        // Look up the proxy's upstream_id before deleting so we can cascade-delete
-        // the upstream if it becomes orphaned.
-        let upstream_id: Option<String> =
+        // Look up the proxy's current upstream_id before deleting so we can
+        // cascade-delete that upstream if it becomes orphaned. Also capture the
+        // api_spec row, if this proxy owns one, before the FK cascade removes it.
+        let proxy_row: Option<AnyRow> =
             sqlx::query(&self.q("SELECT upstream_id FROM proxies WHERE id = ?"))
                 .bind(id)
                 .fetch_optional(&mut *tx)
-                .await?
-                .and_then(|row| row.try_get::<String, _>("upstream_id").ok());
+                .await?;
+        let Some(proxy_row) = proxy_row else {
+            tx.rollback().await?;
+            self.check_slow_query("delete_proxy", start);
+            return Ok(false);
+        };
+        let upstream_id: Option<String> = proxy_row.try_get::<String, _>("upstream_id").ok();
+
+        let spec_row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT id, namespace FROM api_specs WHERE proxy_id = ?"))
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let spec_owner: Option<(String, String)> = spec_row
+            .as_ref()
+            .map(|row| Ok::<_, anyhow::Error>((row.try_get("id")?, row.try_get("namespace")?)))
+            .transpose()?;
+        if let Some((ref spec_id, ref namespace)) = spec_owner {
+            self.ensure_no_external_spec_upstream_refs_tx(&mut tx, namespace, spec_id, id)
+                .await?;
+        }
 
         // Clean up junction table (defense in depth alongside ON DELETE CASCADE)
         sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE proxy_id = ?"))
@@ -855,11 +1068,23 @@ impl DatabaseStore {
 
         if result.rows_affected() == 0 {
             tx.rollback().await?;
+            self.check_slow_query("delete_proxy", start);
             return Ok(false);
         }
 
         // Clean up orphaned proxy_group plugin configs (no remaining associations)
         self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
+
+        // If this was a spec-owned proxy, delete every upstream tagged with the
+        // spec id, not only the proxy's current upstream_id. Direct admin CRUD
+        // can drift the pointer away from the original spec-owned upstream.
+        if let Some((ref spec_id, ref namespace)) = spec_owner {
+            sqlx::query(&self.q("DELETE FROM upstreams WHERE api_spec_id = ? AND namespace = ?"))
+                .bind(spec_id)
+                .bind(namespace)
+                .execute(&mut *tx)
+                .await?;
+        }
 
         // If the proxy had an upstream, check if it's now orphaned and delete it
         if let Some(ref uid) = upstream_id {
@@ -2072,7 +2297,7 @@ impl DatabaseStore {
             diff_removed(known_plugin_config_ids, &current_plugin_config_ids);
         let removed_upstream_ids = diff_removed(known_upstream_ids, &current_upstream_ids);
 
-        let result = IncrementalResult {
+        let mut result = IncrementalResult {
             added_or_modified_proxies: changed_proxies,
             removed_proxy_ids,
             added_or_modified_consumers: changed_consumers,
@@ -2083,6 +2308,19 @@ impl DatabaseStore {
             removed_upstream_ids,
             poll_timestamp,
         };
+
+        // Hot-path isolation: strip api_spec_id from every loaded resource
+        // before the polling loop applies the delta. Mirrors the
+        // load_full_config strip and matches the Mongo incremental path.
+        for p in &mut result.added_or_modified_proxies {
+            p.api_spec_id = None;
+        }
+        for u in &mut result.added_or_modified_upstreams {
+            u.api_spec_id = None;
+        }
+        for pc in &mut result.added_or_modified_plugin_configs {
+            pc.api_spec_id = None;
+        }
 
         if result.is_empty() {
             debug!("Incremental poll: no changes detected");
@@ -2413,7 +2651,7 @@ impl DatabaseStore {
         attach_plugins: bool,
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
-        let insert_sql = self.q("INSERT INTO proxies (id, namespace, name, hosts, listen_path, backend_scheme, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, udp_idle_timeout_seconds, tcp_idle_timeout_seconds, allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let insert_sql = self.q(Self::PROXY_INSERT_SQL);
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
 
@@ -2762,6 +3000,14 @@ impl DatabaseStore {
             .bind(namespace)
             .execute(&mut *tx)
             .await?;
+        // Delete api_specs BEFORE proxies: the FK cascade (proxy_id → proxies ON
+        // DELETE CASCADE) would handle it, but explicit deletion is clearer and
+        // matches the Mongo path.  Also ensures cleanup even if FK enforcement is
+        // disabled (e.g. SQLite PRAGMA foreign_keys=OFF in recovery scenarios).
+        sqlx::query(&self.q("DELETE FROM api_specs WHERE namespace = ?"))
+            .bind(namespace)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(&self.q("DELETE FROM proxies WHERE namespace = ?"))
             .bind(namespace)
             .execute(&mut *tx)
@@ -3031,6 +3277,1165 @@ impl DatabaseStore {
         }
         self.check_slow_query("list_namespaces", start);
         Ok(namespaces)
+    }
+
+    // -----------------------------------------------------------------------
+    // ApiSpec operations — admin-only, never called from the hot proxy path.
+    //
+    // IMPORTANT: Do NOT call these from db_loader polling loops, GatewayConfig
+    // loading, or gRPC distribution paths. The api_specs table is pure admin
+    // metadata; the gateway runtime never reads it.
+    // -----------------------------------------------------------------------
+
+    /// Atomically insert all bundle resources + the api_spec row.
+    ///
+    /// Insertion order (respects FK dependencies):
+    ///   1. upstream (optional) — no FK on proxies
+    ///   2. proxy — depends on upstream FK
+    ///   3. plugin_configs — depend on proxy FK
+    ///   4. api_specs — depends on proxy FK (ON DELETE CASCADE)
+    ///
+    /// Each resource is tagged with `api_spec_id = spec.id` so that a later
+    /// `replace_api_spec_bundle` / `delete_api_spec` can identify spec-owned
+    /// rows via `WHERE api_spec_id = ?`.
+    pub async fn submit_api_spec_bundle(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &crate::config::types::ApiSpec,
+    ) -> Result<(), anyhow::Error> {
+        use crate::config::types::{AuthMode, ResponseBodyMode};
+
+        let mut tx = self.pool().begin().await?;
+
+        // 1. INSERT upstream (if present), tagged with api_spec_id.
+        if let Some(u) = &bundle.upstream {
+            let targets_json = serde_json::to_string(&u.targets)?;
+            let algo_json = serde_json::to_string(&u.algorithm)?;
+            let algo_str = algo_json.trim_matches('"');
+            let health_checks_json = u
+                .health_checks
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let service_discovery_json = u
+                .service_discovery
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let hash_on_cookie_config_json = u
+                .hash_on_cookie_config
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+
+            sqlx::query(&self.q("INSERT INTO upstreams \
+                 (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, \
+                  health_checks, service_discovery, backend_tls_client_cert_path, \
+                  backend_tls_client_key_path, backend_tls_verify_server_cert, \
+                  backend_tls_server_ca_cert_path, api_spec_id, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+            .bind(&u.id)
+            .bind(&u.namespace)
+            .bind(&u.name)
+            .bind(&targets_json)
+            .bind(algo_str)
+            .bind(&u.hash_on)
+            .bind(&hash_on_cookie_config_json)
+            .bind(&health_checks_json)
+            .bind(&service_discovery_json)
+            .bind(&u.backend_tls_client_cert_path)
+            .bind(&u.backend_tls_client_key_path)
+            .bind(u.backend_tls_verify_server_cert as i32)
+            .bind(&u.backend_tls_server_ca_cert_path)
+            .bind(&spec.id)
+            .bind(u.created_at.to_rfc3339())
+            .bind(u.updated_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 2. INSERT proxy, tagged with api_spec_id.
+        //
+        // This SQL differs from `Self::PROXY_INSERT_SQL` only by the addition of
+        // the `api_spec_id` column before `created_at`.  When adding a new column
+        // to `proxies`, update BOTH this query AND `Self::PROXY_INSERT_SQL` (and
+        // the corresponding `.bind()` chains in `create_proxy`, `batch_create_proxies_chunk`,
+        // and the `replace_api_spec_bundle` UPDATE path).
+        {
+            let p = &bundle.proxy;
+            let hosts_json = serde_json::to_string(&p.hosts)?;
+            let circuit_breaker_json = p
+                .circuit_breaker
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let retry_json = p.retry.as_ref().map(serde_json::to_string).transpose()?;
+            let response_body_mode_str = match p.response_body_mode {
+                ResponseBodyMode::Buffer => "buffer",
+                ResponseBodyMode::Stream => "stream",
+            };
+
+            sqlx::query(&self.q("INSERT INTO proxies \
+                 (id, namespace, name, hosts, listen_path, backend_scheme, backend_host, \
+                  backend_port, backend_path, strip_listen_path, preserve_host_header, \
+                  backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, \
+                  backend_tls_client_cert_path, backend_tls_client_key_path, \
+                  backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, \
+                  dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, \
+                  circuit_breaker, retry, response_body_mode, \
+                  pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, \
+                  pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, \
+                  pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, \
+                  pool_http2_initial_connection_window_size, pool_http2_adaptive_window, \
+                  pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
+                  pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, \
+                  udp_idle_timeout_seconds, tcp_idle_timeout_seconds, \
+                  allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
+                  api_spec_id, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                         ?, ?, ?)"))
+            .bind(&p.id)
+            .bind(&p.namespace)
+            .bind(&p.name)
+            .bind(&hosts_json)
+            .bind(&p.listen_path)
+            .bind(p.effective_scheme().to_scheme_str())
+            .bind(&p.backend_host)
+            .bind(p.backend_port as i32)
+            .bind(&p.backend_path)
+            .bind(if p.strip_listen_path { 1i32 } else { 0 })
+            .bind(if p.preserve_host_header { 1i32 } else { 0 })
+            .bind(p.backend_connect_timeout_ms as i64)
+            .bind(p.backend_read_timeout_ms as i64)
+            .bind(p.backend_write_timeout_ms as i64)
+            .bind(&p.backend_tls_client_cert_path)
+            .bind(&p.backend_tls_client_key_path)
+            .bind(if p.backend_tls_verify_server_cert {
+                1i32
+            } else {
+                0
+            })
+            .bind(&p.backend_tls_server_ca_cert_path)
+            .bind(&p.dns_override)
+            .bind(p.dns_cache_ttl_seconds.map(|v| v as i64))
+            .bind(match p.auth_mode {
+                AuthMode::Multi => "multi",
+                _ => "single",
+            })
+            .bind(&p.upstream_id)
+            .bind(&circuit_breaker_json)
+            .bind(&retry_json)
+            .bind(response_body_mode_str)
+            .bind(p.pool_idle_timeout_seconds.map(|v| v as i64))
+            .bind(
+                p.pool_enable_http_keep_alive
+                    .map(|v| if v { 1i32 } else { 0 }),
+            )
+            .bind(p.pool_enable_http2.map(|v| if v { 1i32 } else { 0 }))
+            .bind(p.pool_tcp_keepalive_seconds.map(|v| v as i64))
+            .bind(p.pool_http2_keep_alive_interval_seconds.map(|v| v as i64))
+            .bind(p.pool_http2_keep_alive_timeout_seconds.map(|v| v as i64))
+            .bind(p.pool_http2_initial_stream_window_size.map(|v| v as i64))
+            .bind(
+                p.pool_http2_initial_connection_window_size
+                    .map(|v| v as i64),
+            )
+            .bind(
+                p.pool_http2_adaptive_window
+                    .map(|v| if v { 1i32 } else { 0 }),
+            )
+            .bind(p.pool_http2_max_frame_size.map(|v| v as i64))
+            .bind(p.pool_http2_max_concurrent_streams.map(|v| v as i64))
+            .bind(p.pool_http3_connections_per_backend.map(|v| v as i64))
+            .bind(p.listen_port.map(|v| v as i32))
+            .bind(if p.frontend_tls { 1i32 } else { 0 })
+            .bind(if p.passthrough { 1i32 } else { 0 })
+            .bind(p.udp_idle_timeout_seconds as i64)
+            .bind(p.tcp_idle_timeout_seconds.map(|v| v as i64))
+            .bind(
+                p.allowed_methods
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+            )
+            .bind(if p.allowed_ws_origins.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&p.allowed_ws_origins)?)
+            })
+            .bind(p.udp_max_response_amplification_factor.map(|v| v as f64))
+            .bind(&spec.id)
+            .bind(p.created_at.to_rfc3339())
+            .bind(p.updated_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+
+            // NOTE: proxy_plugins junction rows are inserted AFTER plugin_configs
+            // below (step 3) to satisfy the FK: plugin_config_id REFERENCES
+            // plugin_configs(id). Inserting them here would violate that FK because
+            // the plugin_configs rows don't exist yet.
+        }
+
+        // 3. INSERT plugin_configs, tagged with api_spec_id.
+        for pc in &bundle.plugins {
+            let config_json = serde_json::to_string(&pc.config)?;
+            let scope_str = match pc.scope {
+                crate::config::types::PluginScope::Proxy => "proxy",
+                crate::config::types::PluginScope::ProxyGroup => "proxy_group",
+                crate::config::types::PluginScope::Global => "global",
+            };
+            sqlx::query(&self.q("INSERT INTO plugin_configs \
+                 (id, namespace, plugin_name, config, scope, proxy_id, enabled, \
+                  priority_override, api_spec_id, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+            .bind(&pc.id)
+            .bind(&pc.namespace)
+            .bind(&pc.plugin_name)
+            .bind(&config_json)
+            .bind(scope_str)
+            .bind(&pc.proxy_id)
+            .bind(if pc.enabled { 1i32 } else { 0 })
+            .bind(pc.priority_override.map(|v| v as i32))
+            .bind(&spec.id)
+            .bind(pc.created_at.to_rfc3339())
+            .bind(pc.updated_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 3b. INSERT proxy_plugins junction rows — AFTER plugin_configs so the
+        //     plugin_config_id FK is satisfied.
+        {
+            let p = &bundle.proxy;
+            for assoc in &p.plugins {
+                sqlx::query(
+                    &self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)"),
+                )
+                .bind(&p.id)
+                .bind(&assoc.plugin_config_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        // 4. INSERT api_specs row.
+        self.insert_api_spec_tx(&mut tx, spec).await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically replace a spec: delete spec-owned resources, re-insert from
+    /// the new bundle, then update the api_specs row in place.
+    pub async fn replace_api_spec_bundle(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &crate::config::types::ApiSpec,
+    ) -> Result<(), anyhow::Error> {
+        use crate::config::types::{AuthMode, ResponseBodyMode};
+
+        // --- Resource no-op shortcut (Wave 5 Feature A) -----------------------
+        // Compare the current spec-owned resource graph to the incoming bundle
+        // inside the SAME transaction as any subsequent write. If they already
+        // match, only the api_specs metadata row is updated; proxy/upstream/plugin
+        // tables are left untouched. Because this reads the live resources, direct
+        // admin CRUD drift forces the full replace path even when the submitted
+        // spec's resource_hash matches the stored metadata.
+        let mut tx = self.pool().begin().await?;
+
+        let existing_spec: Option<crate::config::types::ApiSpec> =
+            sqlx::query(&self.q("SELECT * FROM api_specs WHERE namespace = ? AND id = ?"))
+                .bind(&spec.namespace)
+                .bind(&spec.id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|row| row_to_api_spec(&row))
+                .transpose()?;
+        let previous_declared_assoc_ids = existing_spec
+            .as_ref()
+            .map(declared_proxy_plugin_association_ids_from_spec)
+            .transpose()?
+            .unwrap_or_default();
+        let desired_resource_hash = store_canonical_resource_hash(bundle)?;
+
+        let current_resource_hash = if !spec.resource_hash.is_empty() {
+            self.current_api_spec_resource_hash_tx(
+                &mut tx,
+                bundle,
+                spec,
+                &previous_declared_assoc_ids,
+            )
+            .await?
+        } else {
+            None
+        };
+        if !spec.resource_hash.is_empty()
+            && current_resource_hash.as_deref() == Some(desired_resource_hash.as_str())
+        {
+            // Bundle is unchanged — only update the api_specs metadata row.
+            let tags_json = serde_json::to_string(&spec.tags).unwrap_or_else(|_| "[]".to_string());
+            let server_urls_json =
+                serde_json::to_string(&spec.server_urls).unwrap_or_else(|_| "[]".to_string());
+            let spec_format_str = match spec.spec_format {
+                crate::config::types::SpecFormat::Json => "json",
+                crate::config::types::SpecFormat::Yaml => "yaml",
+            };
+            sqlx::query(&self.q("UPDATE api_specs SET \
+                 spec_content = ?, content_encoding = ?, content_hash = ?, \
+                 uncompressed_size = ?, resource_hash = ?, \
+                 spec_format = ?, spec_version = ?, title = ?, info_version = ?, \
+                 description = ?, contact_name = ?, contact_email = ?, \
+                 license_name = ?, license_identifier = ?, \
+                 tags = ?, server_urls = ?, operation_count = ?, \
+                 updated_at = ? \
+                 WHERE namespace = ? AND id = ?"))
+            .bind(&spec.spec_content)
+            .bind(&spec.content_encoding)
+            .bind(&spec.content_hash)
+            .bind(spec.uncompressed_size as i64)
+            .bind(&spec.resource_hash)
+            .bind(spec_format_str)
+            .bind(&spec.spec_version)
+            .bind(&spec.title)
+            .bind(&spec.info_version)
+            .bind(&spec.description)
+            .bind(&spec.contact_name)
+            .bind(&spec.contact_email)
+            .bind(&spec.license_name)
+            .bind(&spec.license_identifier)
+            .bind(&tags_json)
+            .bind(&server_urls_json)
+            .bind(spec.operation_count as i64)
+            .bind(spec.updated_at.to_rfc3339())
+            .bind(&spec.namespace)
+            .bind(&spec.id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(());
+        }
+        // Resource graph mismatch — fall through to the full replace path. The
+        // same `tx` wraps the rest of the operation; opening another `begin()`
+        // would double-nest and is redundant.
+
+        self.ensure_no_external_spec_upstream_refs_tx(
+            &mut tx,
+            &spec.namespace,
+            &spec.id,
+            &spec.proxy_id,
+        )
+        .await?;
+
+        // Delete only spec-owned plugin_configs. Hand-added plugins (api_spec_id IS NULL)
+        // are intentionally preserved. The proxy itself is updated in place (not deleted)
+        // so FK cascades do not wipe hand-added plugins.
+        sqlx::query(&self.q("DELETE FROM plugin_configs WHERE api_spec_id = ? AND namespace = ?"))
+            .bind(&spec.id)
+            .bind(&spec.namespace)
+            .execute(&mut *tx)
+            .await?;
+
+        // Fix 3: proxies.upstream_id FK is ON DELETE RESTRICT (not SET NULL).
+        // We must clear proxy.upstream_id BEFORE deleting the old upstream row,
+        // otherwise the DELETE violates the FK and rolls back the transaction.
+        sqlx::query(&self.q("UPDATE proxies SET upstream_id = NULL \
+                 WHERE id = ? AND api_spec_id = ? AND namespace = ?"))
+        .bind(&spec.proxy_id)
+        .bind(&spec.id)
+        .bind(&spec.namespace)
+        .execute(&mut *tx)
+        .await?;
+
+        // Now safe to delete spec-owned upstreams — no proxy references them.
+        sqlx::query(&self.q("DELETE FROM upstreams WHERE api_spec_id = ? AND namespace = ?"))
+            .bind(&spec.id)
+            .bind(&spec.namespace)
+            .execute(&mut *tx)
+            .await?;
+
+        // Insert the new upstream (if present).
+        if let Some(u) = &bundle.upstream {
+            let targets_json = serde_json::to_string(&u.targets)?;
+            let algo_json = serde_json::to_string(&u.algorithm)?;
+            let algo_str = algo_json.trim_matches('"');
+            let health_checks_json = u
+                .health_checks
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let service_discovery_json = u
+                .service_discovery
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let hash_on_cookie_config_json = u
+                .hash_on_cookie_config
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+
+            sqlx::query(&self.q("INSERT INTO upstreams \
+                 (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, \
+                  health_checks, service_discovery, backend_tls_client_cert_path, \
+                  backend_tls_client_key_path, backend_tls_verify_server_cert, \
+                  backend_tls_server_ca_cert_path, api_spec_id, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+            .bind(&u.id)
+            .bind(&u.namespace)
+            .bind(&u.name)
+            .bind(&targets_json)
+            .bind(algo_str)
+            .bind(&u.hash_on)
+            .bind(&hash_on_cookie_config_json)
+            .bind(&health_checks_json)
+            .bind(&service_discovery_json)
+            .bind(&u.backend_tls_client_cert_path)
+            .bind(&u.backend_tls_client_key_path)
+            .bind(u.backend_tls_verify_server_cert as i32)
+            .bind(&u.backend_tls_server_ca_cert_path)
+            .bind(&spec.id)
+            .bind(u.created_at.to_rfc3339())
+            .bind(u.updated_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // UPDATE proxy in place (preserves the primary key and created_at, so
+        // hand-added plugins whose proxy_id FK points at this row are unaffected).
+        {
+            let p = &bundle.proxy;
+            let hosts_json = serde_json::to_string(&p.hosts)?;
+            let circuit_breaker_json = p
+                .circuit_breaker
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let retry_json = p.retry.as_ref().map(serde_json::to_string).transpose()?;
+            let response_body_mode_str = match p.response_body_mode {
+                ResponseBodyMode::Buffer => "buffer",
+                ResponseBodyMode::Stream => "stream",
+            };
+
+            sqlx::query(&self.q("UPDATE proxies SET \
+                 namespace = ?, name = ?, hosts = ?, listen_path = ?, backend_scheme = ?, \
+                 backend_host = ?, backend_port = ?, backend_path = ?, \
+                 strip_listen_path = ?, preserve_host_header = ?, \
+                 backend_connect_timeout_ms = ?, backend_read_timeout_ms = ?, \
+                 backend_write_timeout_ms = ?, \
+                 backend_tls_client_cert_path = ?, backend_tls_client_key_path = ?, \
+                 backend_tls_verify_server_cert = ?, backend_tls_server_ca_cert_path = ?, \
+                 dns_override = ?, dns_cache_ttl_seconds = ?, auth_mode = ?, upstream_id = ?, \
+                 circuit_breaker = ?, retry = ?, response_body_mode = ?, \
+                 pool_idle_timeout_seconds = ?, pool_enable_http_keep_alive = ?, \
+                 pool_enable_http2 = ?, pool_tcp_keepalive_seconds = ?, \
+                 pool_http2_keep_alive_interval_seconds = ?, \
+                 pool_http2_keep_alive_timeout_seconds = ?, \
+                 pool_http2_initial_stream_window_size = ?, \
+                 pool_http2_initial_connection_window_size = ?, \
+                 pool_http2_adaptive_window = ?, pool_http2_max_frame_size = ?, \
+                 pool_http2_max_concurrent_streams = ?, \
+                 pool_http3_connections_per_backend = ?, \
+                 listen_port = ?, frontend_tls = ?, passthrough = ?, \
+                 udp_idle_timeout_seconds = ?, tcp_idle_timeout_seconds = ?, \
+                 allowed_methods = ?, allowed_ws_origins = ?, \
+                 udp_max_response_amplification_factor = ?, \
+                 api_spec_id = ?, updated_at = ? \
+                 WHERE id = ? AND namespace = ?"))
+            .bind(&p.namespace)
+            .bind(&p.name)
+            .bind(&hosts_json)
+            .bind(&p.listen_path)
+            .bind(p.effective_scheme().to_scheme_str())
+            .bind(&p.backend_host)
+            .bind(p.backend_port as i32)
+            .bind(&p.backend_path)
+            .bind(if p.strip_listen_path { 1i32 } else { 0 })
+            .bind(if p.preserve_host_header { 1i32 } else { 0 })
+            .bind(p.backend_connect_timeout_ms as i64)
+            .bind(p.backend_read_timeout_ms as i64)
+            .bind(p.backend_write_timeout_ms as i64)
+            .bind(&p.backend_tls_client_cert_path)
+            .bind(&p.backend_tls_client_key_path)
+            .bind(if p.backend_tls_verify_server_cert {
+                1i32
+            } else {
+                0
+            })
+            .bind(&p.backend_tls_server_ca_cert_path)
+            .bind(&p.dns_override)
+            .bind(p.dns_cache_ttl_seconds.map(|v| v as i64))
+            .bind(match p.auth_mode {
+                AuthMode::Multi => "multi",
+                _ => "single",
+            })
+            .bind(&p.upstream_id)
+            .bind(&circuit_breaker_json)
+            .bind(&retry_json)
+            .bind(response_body_mode_str)
+            .bind(p.pool_idle_timeout_seconds.map(|v| v as i64))
+            .bind(
+                p.pool_enable_http_keep_alive
+                    .map(|v| if v { 1i32 } else { 0 }),
+            )
+            .bind(p.pool_enable_http2.map(|v| if v { 1i32 } else { 0 }))
+            .bind(p.pool_tcp_keepalive_seconds.map(|v| v as i64))
+            .bind(p.pool_http2_keep_alive_interval_seconds.map(|v| v as i64))
+            .bind(p.pool_http2_keep_alive_timeout_seconds.map(|v| v as i64))
+            .bind(p.pool_http2_initial_stream_window_size.map(|v| v as i64))
+            .bind(
+                p.pool_http2_initial_connection_window_size
+                    .map(|v| v as i64),
+            )
+            .bind(
+                p.pool_http2_adaptive_window
+                    .map(|v| if v { 1i32 } else { 0 }),
+            )
+            .bind(p.pool_http2_max_frame_size.map(|v| v as i64))
+            .bind(p.pool_http2_max_concurrent_streams.map(|v| v as i64))
+            .bind(p.pool_http3_connections_per_backend.map(|v| v as i64))
+            .bind(p.listen_port.map(|v| v as i32))
+            .bind(if p.frontend_tls { 1i32 } else { 0 })
+            .bind(if p.passthrough { 1i32 } else { 0 })
+            .bind(p.udp_idle_timeout_seconds as i64)
+            .bind(p.tcp_idle_timeout_seconds.map(|v| v as i64))
+            .bind(
+                p.allowed_methods
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+            )
+            .bind(if p.allowed_ws_origins.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&p.allowed_ws_origins)?)
+            })
+            .bind(p.udp_max_response_amplification_factor.map(|v| v as f64))
+            .bind(&spec.id)
+            .bind(p.updated_at.to_rfc3339())
+            // WHERE clause — match by primary key
+            .bind(&p.id)
+            .bind(&p.namespace)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Insert new spec-owned plugin_configs.
+        for pc in &bundle.plugins {
+            let config_json = serde_json::to_string(&pc.config)?;
+            let scope_str = match pc.scope {
+                crate::config::types::PluginScope::Proxy => "proxy",
+                crate::config::types::PluginScope::ProxyGroup => "proxy_group",
+                crate::config::types::PluginScope::Global => "global",
+            };
+            sqlx::query(&self.q("INSERT INTO plugin_configs \
+                 (id, namespace, plugin_name, config, scope, proxy_id, enabled, \
+                  priority_override, api_spec_id, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+            .bind(&pc.id)
+            .bind(&pc.namespace)
+            .bind(&pc.plugin_name)
+            .bind(&config_json)
+            .bind(scope_str)
+            .bind(&pc.proxy_id)
+            .bind(if pc.enabled { 1i32 } else { 0 })
+            .bind(pc.priority_override.map(|v| v as i32))
+            .bind(&spec.id)
+            .bind(pc.created_at.to_rfc3339())
+            .bind(pc.updated_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Rebuild the proxy_plugins junction table for this proxy. Associations
+        // declared in the previous spec are removed when absent from the new
+        // document; truly hand-added associations remain untouched.
+        let desired_assoc_ids: HashSet<String> = bundle
+            .proxy
+            .plugins
+            .iter()
+            .map(|a| a.plugin_config_id.clone())
+            .collect();
+        for previous_id in &previous_declared_assoc_ids {
+            if !desired_assoc_ids.contains(previous_id) {
+                sqlx::query(
+                    &self
+                        .q("DELETE FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ?"),
+                )
+                .bind(&bundle.proxy.id)
+                .bind(previous_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        for assoc in &bundle.proxy.plugins {
+            sqlx::query(
+                &self.q("DELETE FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ?"),
+            )
+            .bind(&bundle.proxy.id)
+            .bind(&assoc.plugin_config_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // Re-insert — plugin_configs rows now exist (inserted above), so FK is satisfied.
+        for assoc in &bundle.proxy.plugins {
+            sqlx::query(
+                &self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)"),
+            )
+            .bind(&bundle.proxy.id)
+            .bind(&assoc.plugin_config_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
+
+        // Update the api_specs row (no CASCADE delete needed since proxy survives).
+        let tags_json = serde_json::to_string(&spec.tags).unwrap_or_else(|_| "[]".to_string());
+        let server_urls_json =
+            serde_json::to_string(&spec.server_urls).unwrap_or_else(|_| "[]".to_string());
+        let spec_format_str = match spec.spec_format {
+            crate::config::types::SpecFormat::Json => "json",
+            crate::config::types::SpecFormat::Yaml => "yaml",
+        };
+        sqlx::query(&self.q("UPDATE api_specs SET \
+             proxy_id = ?, spec_content = ?, content_encoding = ?, content_hash = ?, \
+             uncompressed_size = ?, \
+             spec_format = ?, spec_version = ?, title = ?, info_version = ?, \
+             description = ?, contact_name = ?, contact_email = ?, \
+             license_name = ?, license_identifier = ?, \
+             tags = ?, server_urls = ?, operation_count = ?, resource_hash = ?, \
+             updated_at = ? \
+             WHERE namespace = ? AND id = ?"))
+        .bind(&spec.proxy_id)
+        .bind(&spec.spec_content)
+        .bind(&spec.content_encoding)
+        .bind(&spec.content_hash)
+        .bind(spec.uncompressed_size as i64)
+        .bind(spec_format_str)
+        .bind(&spec.spec_version)
+        .bind(&spec.title)
+        .bind(&spec.info_version)
+        .bind(&spec.description)
+        .bind(&spec.contact_name)
+        .bind(&spec.contact_email)
+        .bind(&spec.license_name)
+        .bind(&spec.license_identifier)
+        .bind(&tags_json)
+        .bind(&server_urls_json)
+        .bind(spec.operation_count as i64)
+        .bind(&spec.resource_hash)
+        .bind(spec.updated_at.to_rfc3339())
+        .bind(&spec.namespace)
+        .bind(&spec.id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn current_api_spec_resource_hash_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &crate::config::types::ApiSpec,
+        previous_declared_assoc_ids: &HashSet<String>,
+    ) -> Result<Option<String>, anyhow::Error> {
+        let plugin_rows: Vec<AnyRow> = sqlx::query(&self.q(concat!(
+            "SELECT * FROM plugin_configs ",
+            "WHERE namespace = ? AND api_spec_id = ? ",
+            "ORDER BY created_at ASC, id ASC"
+        )))
+        .bind(&spec.namespace)
+        .bind(&spec.id)
+        .fetch_all(&mut **tx)
+        .await?;
+        let mut plugins = Vec::with_capacity(plugin_rows.len());
+        for row in &plugin_rows {
+            let mut plugin = row_to_plugin_config(row)?;
+            plugin.normalize_fields();
+            plugins.push(plugin);
+        }
+
+        let spec_owned_plugin_ids: HashSet<String> =
+            plugins.iter().map(|pc| pc.id.clone()).collect();
+        let desired_assoc_ids: HashSet<String> = bundle
+            .proxy
+            .plugins
+            .iter()
+            .map(|assoc| assoc.plugin_config_id.clone())
+            .collect();
+        let mut relevant_assoc_ids = spec_owned_plugin_ids.clone();
+        relevant_assoc_ids.extend(previous_declared_assoc_ids.iter().cloned());
+        relevant_assoc_ids.extend(desired_assoc_ids.iter().cloned());
+
+        let assoc_rows: Vec<AnyRow> =
+            sqlx::query(&self.q("SELECT plugin_config_id FROM proxy_plugins WHERE proxy_id = ?"))
+                .bind(&spec.proxy_id)
+                .fetch_all(&mut **tx)
+                .await?;
+        let mut current_relevant_assoc_ids = HashSet::new();
+        for row in &assoc_rows {
+            if let Ok(id) = row.try_get::<String, _>("plugin_config_id")
+                && relevant_assoc_ids.contains(&id)
+            {
+                current_relevant_assoc_ids.insert(id);
+            }
+        }
+        if current_relevant_assoc_ids != desired_assoc_ids {
+            return Ok(None);
+        }
+
+        let proxy_row: Option<AnyRow> = sqlx::query(
+            &self.q("SELECT * FROM proxies WHERE id = ? AND namespace = ? AND api_spec_id = ?"),
+        )
+        .bind(&spec.proxy_id)
+        .bind(&spec.namespace)
+        .bind(&spec.id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(proxy_row) = proxy_row else {
+            return Ok(None);
+        };
+        let desired_assocs: Vec<PluginAssociation> = bundle
+            .proxy
+            .plugins
+            .iter()
+            .filter(|assoc| current_relevant_assoc_ids.contains(&assoc.plugin_config_id))
+            .cloned()
+            .collect();
+        let mut proxy = row_to_proxy(&proxy_row, spec.proxy_id.clone(), desired_assocs)?;
+        proxy.normalize_fields();
+
+        let upstream_rows: Vec<AnyRow> =
+            sqlx::query(&self.q("SELECT * FROM upstreams WHERE namespace = ? AND api_spec_id = ?"))
+                .bind(&spec.namespace)
+                .bind(&spec.id)
+                .fetch_all(&mut **tx)
+                .await?;
+        if upstream_rows.len() > 1 {
+            return Ok(None);
+        }
+        let upstream =
+            upstream_rows
+                .first()
+                .map(row_to_upstream)
+                .transpose()?
+                .map(|mut upstream| {
+                    upstream.normalize_fields();
+                    upstream
+                });
+
+        let current = crate::admin::api_specs::ExtractedBundle {
+            proxy,
+            upstream,
+            plugins,
+        };
+        crate::admin::api_specs::hash_resource_bundle(&current).map(Some)
+    }
+
+    async fn ensure_no_external_spec_upstream_refs_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        spec_id: &str,
+        spec_proxy_id: &str,
+    ) -> Result<(), anyhow::Error> {
+        let row: Option<AnyRow> = sqlx::query(&self.q(concat!(
+            "SELECT p.id AS proxy_id, p.upstream_id AS upstream_id ",
+            "FROM proxies p ",
+            "INNER JOIN upstreams u ON p.upstream_id = u.id ",
+            "WHERE u.namespace = ? AND u.api_spec_id = ? AND p.id <> ? ",
+            "LIMIT 1"
+        )))
+        .bind(namespace)
+        .bind(spec_id)
+        .bind(spec_proxy_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        if let Some(row) = row {
+            let proxy_id = row
+                .try_get::<String, _>("proxy_id")
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            let upstream_id = row
+                .try_get::<String, _>("upstream_id")
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            anyhow::bail!(
+                "proxy '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                 detach it before replacing or deleting the API spec",
+                proxy_id,
+                upstream_id,
+                spec_id
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Insert the api_specs row inside an existing transaction.
+    async fn insert_api_spec_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        spec: &crate::config::types::ApiSpec,
+    ) -> Result<(), anyhow::Error> {
+        let spec_format_str = match spec.spec_format {
+            crate::config::types::SpecFormat::Json => "json",
+            crate::config::types::SpecFormat::Yaml => "yaml",
+        };
+        let tags_json = serde_json::to_string(&spec.tags).unwrap_or_else(|_| "[]".to_string());
+        let server_urls_json =
+            serde_json::to_string(&spec.server_urls).unwrap_or_else(|_| "[]".to_string());
+        sqlx::query(&self.q("INSERT INTO api_specs \
+             (id, namespace, proxy_id, spec_version, spec_format, spec_content, \
+              content_encoding, uncompressed_size, content_hash, title, info_version, \
+              description, contact_name, contact_email, license_name, license_identifier, \
+              tags, server_urls, operation_count, resource_hash, \
+              created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+        .bind(&spec.id)
+        .bind(&spec.namespace)
+        .bind(&spec.proxy_id)
+        .bind(&spec.spec_version)
+        .bind(spec_format_str)
+        .bind(&spec.spec_content)
+        .bind(&spec.content_encoding)
+        .bind(spec.uncompressed_size as i64)
+        .bind(&spec.content_hash)
+        .bind(&spec.title)
+        .bind(&spec.info_version)
+        .bind(&spec.description)
+        .bind(&spec.contact_name)
+        .bind(&spec.contact_email)
+        .bind(&spec.license_name)
+        .bind(&spec.license_identifier)
+        .bind(&tags_json)
+        .bind(&server_urls_json)
+        .bind(spec.operation_count as i64)
+        .bind(&spec.resource_hash)
+        .bind(spec.created_at.to_rfc3339())
+        .bind(spec.updated_at.to_rfc3339())
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Fetch a single ApiSpec by namespace + id.
+    pub async fn get_api_spec(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
+        let row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT * FROM api_specs WHERE namespace = ? AND id = ?"))
+                .bind(namespace)
+                .bind(id)
+                .fetch_optional(&self.pool())
+                .await?;
+        match row {
+            Some(r) => Ok(Some(row_to_api_spec(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch the ApiSpec that owns a given proxy_id.
+    pub async fn get_api_spec_by_proxy(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
+        let row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT * FROM api_specs WHERE namespace = ? AND proxy_id = ?"))
+                .bind(namespace)
+                .bind(proxy_id)
+                .fetch_optional(&self.pool())
+                .await?;
+        match row {
+            Some(r) => Ok(Some(row_to_api_spec(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List ApiSpecs in a namespace with optional filtering, sorting, and pagination.
+    ///
+    /// Returns a [`PaginatedResult`] that includes the filtered `total` row count
+    /// (ignoring limit/offset) so callers can build "showing X of Y" UI.
+    /// The count query uses the same WHERE conditions as the data query; both
+    /// are issued against the read pool and run sequentially on a single
+    /// connection from that pool.
+    pub async fn list_api_specs(
+        &self,
+        namespace: &str,
+        filter: &crate::config::db_backend::ApiSpecListFilter,
+    ) -> Result<
+        crate::config::db_backend::PaginatedResult<crate::config::types::ApiSpec>,
+        anyhow::Error,
+    > {
+        use crate::config::db_backend::{ApiSpecSortBy, PaginatedResult, SortOrder};
+
+        // Build WHERE clause dynamically.
+        // We collect bind values as strings/i64 in order to use sqlx's typed bind API.
+        // All column references are whitelisted — no user input goes into the SQL template.
+        //
+        // Note: the COUNT and data queries run sequentially without a shared
+        // transaction, so `total` can be stale relative to `items` if a
+        // concurrent write lands between them.  Standard pagination trade-off;
+        // wrapping both in a transaction would serialize all list calls.
+        let mut conditions: Vec<&'static str> = vec!["namespace = ?"];
+        let mut proxy_id_val: Option<String> = None;
+        let mut spec_version_val: Option<String> = None;
+        let mut title_contains_val: Option<String> = None;
+        let mut updated_since_val: Option<String> = None;
+        let mut has_tag_val: Option<String> = None;
+
+        if filter.proxy_id.is_some() {
+            conditions.push("proxy_id = ?");
+            proxy_id_val = filter.proxy_id.clone();
+        }
+        if let Some(ref prefix) = filter.spec_version_prefix {
+            conditions.push("spec_version LIKE ?");
+            spec_version_val = Some(format!("{prefix}%"));
+        }
+        if let Some(ref substr) = filter.title_contains {
+            // LOWER() + LIKE for case-insensitive substring.
+            conditions.push("LOWER(title) LIKE ?");
+            title_contains_val = Some(format!("%{}%", substr.to_lowercase()));
+        }
+        if let Some(ref since) = filter.updated_since {
+            conditions.push("updated_at >= ?");
+            updated_since_val = Some(since.to_rfc3339());
+        }
+        if let Some(ref tag) = filter.has_tag {
+            // Tags are stored as a JSON text array e.g. `["foo","bar"]`.
+            // We match with LIKE `%"tag_name"%` — this correctly handles the JSON
+            // quote-wrapping without requiring JSON functions (cross-dialect).
+            //
+            // SAFETY-CRITICAL CROSS-FILE INVARIANT:
+            // The bare LIKE pattern here has NO ESCAPE clause.  It is safe ONLY
+            // because tag names containing `"`, `%`, `_`, or `\` are rejected
+            // at extract time via `ExtractError::InvalidTagName` in
+            // src/admin/api_specs/extractor.rs (tag validation section).
+            // Note: `_` is the SQL LIKE single-character wildcard — without
+            // rejecting it, `?has_tag=api_v1` would falsely match `apixv1`.
+            // If you ever relax that extractor whitelist, you MUST switch this
+            // query to use `LIKE ... ESCAPE '\\'` and pre-escape the tag value
+            // before binding it — otherwise `%`, `_`, or `\` in a tag name
+            // would turn into a wildcard or escape token, producing false
+            // positives.
+            //
+            // MongoDB uses native array membership (`filter_doc.insert("tags", tag)`)
+            // with a multikey index and is unaffected by this pattern.
+            conditions.push(r#"tags LIKE ?"#);
+            has_tag_val = Some(format!("%\"{}\"", tag) + "%");
+        }
+
+        let where_clause = conditions.join(" AND ");
+
+        // --- COUNT query (same WHERE, no ORDER BY / LIMIT / OFFSET) ----------
+        let count_sql = self.q(&format!(
+            "SELECT COUNT(*) AS cnt FROM api_specs WHERE {where_clause}"
+        ));
+        let mut count_query = sqlx::query(&count_sql).bind(namespace);
+        if let Some(ref v) = proxy_id_val {
+            count_query = count_query.bind(v);
+        }
+        if let Some(ref v) = spec_version_val {
+            count_query = count_query.bind(v);
+        }
+        if let Some(ref v) = title_contains_val {
+            count_query = count_query.bind(v);
+        }
+        if let Some(ref v) = updated_since_val {
+            count_query = count_query.bind(v);
+        }
+        if let Some(ref v) = has_tag_val {
+            count_query = count_query.bind(v);
+        }
+        let count_row = count_query.fetch_one(&self.rpool()).await?;
+        let total: i64 = count_row.try_get("cnt")?;
+
+        // --- Data query (ORDER BY + LIMIT + OFFSET) --------------------------
+        // Whitelist the ORDER BY column to prevent injection.
+        let order_col = match filter.sort_by {
+            ApiSpecSortBy::UpdatedAt => "updated_at",
+            ApiSpecSortBy::Title => "title",
+            ApiSpecSortBy::OperationCount => "operation_count",
+            ApiSpecSortBy::CreatedAt => "created_at",
+        };
+        let order_dir = match filter.order {
+            SortOrder::Asc => "ASC",
+            SortOrder::Desc => "DESC",
+        };
+
+        let sql = self.q(&format!(
+            "SELECT id, namespace, proxy_id, spec_version, spec_format, \
+             content_encoding, uncompressed_size, content_hash, title, \
+             info_version, description, contact_name, contact_email, \
+             license_name, license_identifier, tags, server_urls, \
+             operation_count, created_at, updated_at \
+             FROM api_specs WHERE {where_clause} \
+             ORDER BY {order_col} {order_dir} LIMIT ? OFFSET ?"
+        ));
+
+        let mut query = sqlx::query(&sql).bind(namespace);
+        if let Some(ref v) = proxy_id_val {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = spec_version_val {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = title_contains_val {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = updated_since_val {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = has_tag_val {
+            query = query.bind(v);
+        }
+        let rows: Vec<AnyRow> = query
+            .bind(filter.limit as i64)
+            .bind(filter.offset as i64)
+            .fetch_all(&self.rpool())
+            .await?;
+        let mut specs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            specs.push(row_to_api_spec_summary(row)?);
+        }
+        Ok(PaginatedResult {
+            items: specs,
+            total,
+        })
+    }
+
+    /// Delete an ApiSpec and all resources it owns.
+    ///
+    /// The api_spec row has FK `proxy_id REFERENCES proxies(id) ON DELETE CASCADE`,
+    /// so deleting the proxy cascades to remove the api_specs row and the
+    /// proxy-scoped plugin_configs (via plugin_configs.proxy_id FK). Upstreams
+    /// have no FK to proxies, so they are cleaned up manually by api_spec_id.
+    pub async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
+        let mut tx = self.pool().begin().await?;
+
+        // Find the proxy_id for this spec.
+        let row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT proxy_id FROM api_specs WHERE namespace = ? AND id = ?"))
+                .bind(namespace)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+
+        let proxy_id: String = row.try_get("proxy_id")?;
+
+        self.ensure_no_external_spec_upstream_refs_tx(&mut tx, namespace, id, &proxy_id)
+            .await?;
+
+        // Delete spec-owned plugin_configs by api_spec_id (belt-and-suspenders;
+        // the proxy FK cascade below would handle proxy-scoped ones, but
+        // being explicit ensures correctness even if FK enforcement is disabled).
+        sqlx::query(&self.q("DELETE FROM plugin_configs WHERE api_spec_id = ? AND namespace = ?"))
+            .bind(id)
+            .bind(namespace)
+            .execute(&mut *tx)
+            .await?;
+
+        // Delete the proxy. FK ON DELETE CASCADE on api_specs.proxy_id removes
+        // the api_specs row. FK ON DELETE CASCADE on plugin_configs.proxy_id
+        // removes any remaining proxy-scoped plugins.
+        sqlx::query(&self.q("DELETE FROM proxies WHERE id = ? AND namespace = ?"))
+            .bind(&proxy_id)
+            .bind(namespace)
+            .execute(&mut *tx)
+            .await?;
+
+        // Deleting the proxy removes proxy_plugins junction rows via FK
+        // cascade. If a spec-associated proxy was the last proxy referencing a
+        // proxy_group plugin, mirror delete_proxy() and remove that now-orphaned
+        // shared plugin config inside the same transaction.
+        self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
+
+        // Delete spec-owned upstream (no FK cascade on this path).
+        sqlx::query(&self.q("DELETE FROM upstreams WHERE api_spec_id = ? AND namespace = ?"))
+            .bind(id)
+            .bind(namespace)
+            .execute(&mut *tx)
+            .await?;
+
+        // Defensive explicit delete of the api_specs row in case the FK
+        // cascade did not fire (e.g. SQLite with foreign_keys OFF).
+        sqlx::query(&self.q("DELETE FROM api_specs WHERE id = ? AND namespace = ?"))
+            .bind(id)
+            .bind(namespace)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// List plugin configs owned by `spec_id` (i.e., tagged with
+    /// `api_spec_id = spec_id`).
+    ///
+    /// Used by the PUT handler to reuse existing plugin IDs rather than
+    /// minting fresh UUIDs on every re-submit of a spec with empty plugin IDs.
+    /// Admin-only — NEVER call from polling loops or GatewayConfig loading.
+    pub async fn list_spec_owned_plugin_configs(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+    ) -> Result<Vec<PluginConfig>, anyhow::Error> {
+        let start = std::time::Instant::now();
+        let rows: Vec<AnyRow> = sqlx::query(&self.q(concat!(
+            "SELECT * FROM plugin_configs ",
+            "WHERE namespace = ? AND api_spec_id = ? ",
+            "ORDER BY created_at ASC, id ASC"
+        )))
+        .bind(namespace)
+        .bind(spec_id)
+        .fetch_all(&self.pool())
+        .await?;
+
+        let mut configs = Vec::with_capacity(rows.len());
+        for row in rows {
+            configs.push(row_to_plugin_config(&row)?);
+        }
+        self.check_slow_query("list_spec_owned_plugin_configs", start);
+        Ok(configs)
+    }
+
+    /// List upstreams owned by `spec_id` (i.e., tagged with
+    /// `api_spec_id = spec_id`).
+    ///
+    /// Used by the PUT handler to reuse the previous spec-owned upstream ID
+    /// even when direct admin CRUD drifted the proxy's upstream pointer.
+    /// Admin-only — NEVER call from polling loops or GatewayConfig loading.
+    pub async fn list_spec_owned_upstreams(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+    ) -> Result<Vec<Upstream>, anyhow::Error> {
+        let start = std::time::Instant::now();
+        let rows: Vec<AnyRow> = sqlx::query(&self.q(concat!(
+            "SELECT * FROM upstreams ",
+            "WHERE namespace = ? AND api_spec_id = ? ",
+            "ORDER BY created_at ASC, id ASC"
+        )))
+        .bind(namespace)
+        .bind(spec_id)
+        .fetch_all(&self.pool())
+        .await?;
+
+        let mut upstreams = Vec::with_capacity(rows.len());
+        for row in rows {
+            upstreams.push(row_to_upstream(&row)?);
+        }
+        self.check_slow_query("list_spec_owned_upstreams", start);
+        Ok(upstreams)
     }
 }
 
@@ -3409,6 +4814,69 @@ impl DatabaseBackend for DatabaseStore {
     async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
         DatabaseStore::list_namespaces(self).await
     }
+
+    async fn submit_api_spec_bundle(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &crate::config::types::ApiSpec,
+    ) -> Result<(), anyhow::Error> {
+        DatabaseStore::submit_api_spec_bundle(self, bundle, spec).await
+    }
+
+    async fn replace_api_spec_bundle(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &crate::config::types::ApiSpec,
+    ) -> Result<(), anyhow::Error> {
+        DatabaseStore::replace_api_spec_bundle(self, bundle, spec).await
+    }
+
+    async fn get_api_spec(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
+        DatabaseStore::get_api_spec(self, namespace, id).await
+    }
+
+    async fn get_api_spec_by_proxy(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
+        DatabaseStore::get_api_spec_by_proxy(self, namespace, proxy_id).await
+    }
+
+    async fn list_api_specs(
+        &self,
+        namespace: &str,
+        filter: &crate::config::db_backend::ApiSpecListFilter,
+    ) -> Result<
+        crate::config::db_backend::PaginatedResult<crate::config::types::ApiSpec>,
+        anyhow::Error,
+    > {
+        DatabaseStore::list_api_specs(self, namespace, filter).await
+    }
+
+    async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
+        DatabaseStore::delete_api_spec(self, namespace, id).await
+    }
+
+    async fn list_spec_owned_plugin_configs(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+    ) -> Result<Vec<PluginConfig>, anyhow::Error> {
+        DatabaseStore::list_spec_owned_plugin_configs(self, namespace, spec_id).await
+    }
+
+    async fn list_spec_owned_upstreams(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+    ) -> Result<Vec<Upstream>, anyhow::Error> {
+        DatabaseStore::list_spec_owned_upstreams(self, namespace, spec_id).await
+    }
 }
 
 /// IDs in `known` that are not in `current` (i.e., deleted resources).
@@ -3645,6 +5113,17 @@ fn row_to_proxy(
             .try_get::<f64, _>("udp_max_response_amplification_factor")
             .ok()
             .map(|v| v as f32),
+        // api_spec_id: PRESERVE here. This row mapper is shared between
+        // admin GET/list paths (which need the real owning spec id to
+        // serialise per the OpenAPI schema) and the runtime config loader
+        // (which must NOT see it). The runtime callers
+        // `load_full_config` / `load_incremental_config` strip it
+        // explicitly via `strip_api_spec_id_from_runtime_config(&mut cfg)`
+        // before returning — see Wave 1A's hot-path isolation invariant.
+        api_spec_id: row
+            .try_get::<Option<String>, _>("api_spec_id")
+            .ok()
+            .flatten(),
         resolved_tls: Default::default(),
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
@@ -3740,6 +5219,13 @@ fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
             .ok()
             .flatten()
             .map(|v| v as u16),
+        // See row_to_proxy for the rationale: preserve here so admin reads
+        // get the real owning spec id; runtime callers strip via
+        // strip_api_spec_id_from_runtime_config.
+        api_spec_id: row
+            .try_get::<Option<String>, _>("api_spec_id")
+            .ok()
+            .flatten(),
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })
@@ -3832,6 +5318,120 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
         backend_tls_verify_server_cert,
         backend_tls_server_ca_cert_path: row.try_get("backend_tls_server_ca_cert_path").ok(),
+        // See row_to_proxy for the rationale: preserve here so admin reads
+        // get the real owning spec id; runtime callers strip via
+        // strip_api_spec_id_from_runtime_config.
+        api_spec_id: row
+            .try_get::<Option<String>, _>("api_spec_id")
+            .ok()
+            .flatten(),
+        created_at: parse_datetime_column(row, "created_at"),
+        updated_at: parse_datetime_column(row, "updated_at"),
+    })
+}
+
+/// Strip `api_spec_id` from every resource in a `GatewayConfig` so the
+/// gateway runtime never observes the ownership tag.
+///
+/// The row mappers (`row_to_proxy`, `row_to_upstream`, `row_to_plugin_config`)
+/// PRESERVE `api_spec_id` so admin GET/list paths can serialise it per the
+/// OpenAPI schema. The runtime callers (`load_full_config`,
+/// `load_incremental_config`) call this helper before returning to enforce
+/// the hot-path isolation invariant: api_specs is admin-only metadata,
+/// CP gRPC broadcasts must not leak ownership tags to DPs, and the
+/// polling delta path keys off resource fields that should not include
+/// admin metadata.
+///
+/// Mirror of the Mongo path's strip in `MongoStore::load_full_config` /
+/// `MongoStore::load_incremental_config`.
+pub(crate) fn strip_api_spec_id_from_runtime_config(config: &mut GatewayConfig) {
+    for p in &mut config.proxies {
+        p.api_spec_id = None;
+    }
+    for u in &mut config.upstreams {
+        u.api_spec_id = None;
+    }
+    for pc in &mut config.plugin_configs {
+        pc.api_spec_id = None;
+    }
+}
+
+/// Parse an api_specs row into an [`ApiSpec`] struct.
+///
+/// This function is used exclusively by the admin-layer api_spec methods.
+/// It must NEVER be called from runtime polling paths.
+fn row_to_api_spec(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
+    // spec_content is stored as BLOB/BYTEA — sqlx returns Vec<u8>.
+    let spec_content: Vec<u8> = row.try_get("spec_content")?;
+    row_to_api_spec_with_content(row, spec_content)
+}
+
+/// Parse an api_specs list row into an [`ApiSpec`] summary.
+///
+/// The list endpoint must not pull the compressed `spec_content` blob for
+/// every row. Keep `spec_content` empty here; full document retrieval goes
+/// through [`row_to_api_spec`].
+fn row_to_api_spec_summary(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
+    row_to_api_spec_with_content(row, Vec::new())
+}
+
+fn row_to_api_spec_with_content(
+    row: &AnyRow,
+    spec_content: Vec<u8>,
+) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
+    use crate::config::types::{ApiSpec, SpecFormat};
+
+    let spec_format_str: String = row.try_get("spec_format")?;
+    let spec_format = match spec_format_str.as_str() {
+        "json" => SpecFormat::Json,
+        _ => SpecFormat::Yaml,
+    };
+    let uncompressed_size: i64 = row.try_get("uncompressed_size")?;
+
+    // Wave 5: parse JSON-text arrays for tags / server_urls.
+    let tags: Vec<String> = row
+        .try_get::<String, _>("tags")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let server_urls: Vec<String> = row
+        .try_get::<String, _>("server_urls")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let operation_count: u32 = row
+        .try_get::<i64, _>("operation_count")
+        .map(|v| v.clamp(0, u32::MAX as i64) as u32)
+        .unwrap_or(0);
+    let resource_hash: String = row
+        .try_get::<String, _>("resource_hash")
+        .unwrap_or_default();
+
+    Ok(ApiSpec {
+        id: row.try_get("id")?,
+        namespace: row
+            .try_get::<String, _>("namespace")
+            .unwrap_or_else(|_| crate::config::types::default_namespace()),
+        proxy_id: row.try_get("proxy_id")?,
+        spec_version: row.try_get("spec_version")?,
+        spec_format,
+        spec_content,
+        content_encoding: row
+            .try_get::<String, _>("content_encoding")
+            .unwrap_or_else(|_| "gzip".to_string()),
+        uncompressed_size: uncompressed_size.max(0) as u64,
+        content_hash: row.try_get("content_hash")?,
+        title: row.try_get("title").ok().flatten(),
+        info_version: row.try_get("info_version").ok().flatten(),
+        description: row.try_get("description").ok().flatten(),
+        contact_name: row.try_get("contact_name").ok().flatten(),
+        contact_email: row.try_get("contact_email").ok().flatten(),
+        license_name: row.try_get("license_name").ok().flatten(),
+        license_identifier: row.try_get("license_identifier").ok().flatten(),
+        tags,
+        server_urls,
+        operation_count,
+        resource_hash,
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })
@@ -3861,4 +5461,58 @@ fn parse_datetime_column(row: &AnyRow, column: &str) -> chrono::DateTime<Utc> {
             );
             Utc::now()
         })
+}
+
+#[cfg(test)]
+mod proxy_insert_sql_drift_tests {
+    //! Drift-catcher tests for the proxy INSERT call sites.
+    //!
+    //! See the "Drift-prevention contract for proxy INSERT call sites"
+    //! comment block in [`DatabaseStore::PROXY_INSERT_PLACEHOLDER_COUNT`]
+    //! for the contract these tests enforce.
+    //!
+    //! When you add a column to `proxies`:
+    //!   1. Bump `PROXY_INSERT_PLACEHOLDER_COUNT` by 1.
+    //!   2. Bump `PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT` by 1.
+    //!   3. Add the column + `?` placeholder + `.bind()` to all four sites
+    //!      listed in the contract block.
+    //!   4. Re-run these tests; they verify the SQL placeholder counts match
+    //!      the constants. If the bind chain is missing a column, sqlx will
+    //!      surface "wrong number of parameters" at execute time (caught by
+    //!      the existing integration tests).
+    use super::DatabaseStore;
+
+    #[test]
+    fn proxy_insert_sql_placeholder_count_matches_const() {
+        let placeholders = DatabaseStore::PROXY_INSERT_SQL.matches('?').count();
+        assert_eq!(
+            placeholders,
+            DatabaseStore::PROXY_INSERT_PLACEHOLDER_COUNT,
+            "PROXY_INSERT_SQL `?` placeholder count drifted from \
+             PROXY_INSERT_PLACEHOLDER_COUNT — see the drift-prevention \
+             contract comment block in db_loader.rs",
+        );
+    }
+
+    /// The `submit_api_spec_bundle` INSERT is built inline (it carries an
+    /// extra `api_spec_id` column), so we mirror its SQL skeleton here and
+    /// assert the same `?` count contract. If the inline SQL in
+    /// `submit_api_spec_bundle` drifts, edit BOTH this fixture and the
+    /// `PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT` constant.
+    #[test]
+    fn submit_api_spec_bundle_proxy_insert_placeholder_count_matches_const() {
+        // VALUES list has one `?` per column; we lifted this row count from
+        // the actual INSERT in submit_api_spec_bundle. Update if columns
+        // change there.
+        let values_clause = "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                                     ?, ?, ?)";
+        let placeholders = values_clause.matches('?').count();
+        assert_eq!(
+            placeholders,
+            DatabaseStore::PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT,
+            "submit_api_spec_bundle proxy INSERT placeholder count must match \
+             PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT — see drift-prevention contract",
+        );
+    }
 }

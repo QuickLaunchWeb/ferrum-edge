@@ -503,6 +503,9 @@ pub struct EnvConfig {
     /// Mount Envoy ADS (`AggregatedDiscoveryService`) on the CP gRPC listener.
     /// Default false so existing CP/DP deployments expose only ConfigSync.
     pub xds_enabled: bool,
+    /// Capacity of the per-ADS-stream response queue between the request
+    /// reader task and tonic response stream. Default: 32.
+    pub xds_stream_channel_capacity: usize,
 
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
@@ -923,6 +926,10 @@ pub struct EnvConfig {
     /// Default: 100 MiB.
     pub admin_restore_max_body_size_mib: usize,
 
+    /// Max request body size in MiB for POST/PUT /api-specs.
+    /// Default: 25 MiB.
+    pub admin_spec_max_body_size_mib: usize,
+
     /// Migration action: up, status, config (migrate mode only).
     /// Default: "up".
     pub migrate_action: String,
@@ -1178,6 +1185,7 @@ impl Default for EnvConfig {
             cp_grpc_tls_client_ca_path: None,
             cp_broadcast_channel_capacity: 128,
             xds_enabled: false,
+            xds_stream_channel_capacity: 32,
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -1282,6 +1290,7 @@ impl Default for EnvConfig {
             tls_crl_file_path: None,
             admin_allowed_cidrs: String::new(),
             admin_restore_max_body_size_mib: 100,
+            admin_spec_max_body_size_mib: 25,
             migrate_action: "up".into(),
             migrate_dry_run: false,
             auto_apply_plugin_migrations: false,
@@ -1437,6 +1446,7 @@ impl EnvConfig {
             cp_grpc_tls_client_ca_path: Option<String> = "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH";
             cp_broadcast_channel_capacity: usize = "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY" => 128usize;
             xds_enabled: bool = "FERRUM_XDS_ENABLED" => false;
+            xds_stream_channel_capacity: usize = "FERRUM_XDS_STREAM_CHANNEL_CAPACITY" => 32usize;
             dp_grpc_tls_ca_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CA_CERT_PATH";
             dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
@@ -1557,6 +1567,7 @@ impl EnvConfig {
             tls_crl_file_path: Option<String> = "FERRUM_TLS_CRL_FILE_PATH";
             admin_allowed_cidrs: String = "FERRUM_ADMIN_ALLOWED_CIDRS" => String::new();
             admin_restore_max_body_size_mib: usize = "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB" => 100usize;
+            admin_spec_max_body_size_mib: usize = "FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB" => 25usize;
             migrate_action: String = "FERRUM_MIGRATE_ACTION" => "up".to_string(), lowercase();
             migrate_dry_run: bool = "FERRUM_MIGRATE_DRY_RUN" => false;
             auto_apply_plugin_migrations: bool = "FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS" => false;
@@ -1775,6 +1786,7 @@ impl EnvConfig {
             cp_grpc_tls_client_ca_path,
             cp_broadcast_channel_capacity,
             xds_enabled,
+            xds_stream_channel_capacity,
             dp_grpc_tls_ca_cert_path,
             dp_grpc_tls_client_cert_path,
             dp_grpc_tls_client_key_path,
@@ -1879,6 +1891,7 @@ impl EnvConfig {
             tls_crl_file_path,
             admin_allowed_cidrs,
             admin_restore_max_body_size_mib,
+            admin_spec_max_body_size_mib,
             migrate_action,
             migrate_dry_run,
             auto_apply_plugin_migrations,

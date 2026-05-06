@@ -163,6 +163,7 @@ pub async fn run(
             grpc_secret,
             env_config.cp_dp_grpc_jwt_issuer.clone(),
             env_config.namespace.clone(),
+            env_config.xds_stream_channel_capacity,
         ))
     } else {
         None
@@ -198,6 +199,7 @@ pub async fn run(
         startup_ready: Some(startup_ready.clone()),
         db_available: Some(db_available.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+        admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
         reserved_ports: reserved_ports.clone(),
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         admin_allowed_cidrs: admin_allowed_cidrs.clone(),
@@ -815,6 +817,7 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             upstream_id: None,
+            api_spec_id: None,
             circuit_breaker: None,
             retry: None,
             response_body_mode: ResponseBodyMode::default(),

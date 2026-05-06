@@ -305,6 +305,7 @@ fn ensure_global_plugin(
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        api_spec_id: None,
         created_at: now,
         updated_at: now,
     };
@@ -1095,6 +1096,7 @@ mod tests {
                     proxy_id: None,
                     enabled: true,
                     priority_override: Some(2005),
+                    api_spec_id: None,
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
                 };

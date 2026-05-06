@@ -1942,6 +1942,7 @@ dependencies = [
  "rstest",
  "rustls 0.23.40",
  "rustls-pemfile",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",

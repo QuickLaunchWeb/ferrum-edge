@@ -15,6 +15,7 @@ fn create_mesh_proxy(backend_port: u16) -> Proxy {
         id: "mesh-hbone".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("Mesh HBONE".to_string()),
+        api_spec_id: None,
         hosts: vec!["orders.default.svc.cluster.local".to_string()],
         listen_path: Some("/".to_string()),
         backend_scheme: Some(BackendScheme::Http),

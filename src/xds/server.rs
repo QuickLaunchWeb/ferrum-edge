@@ -27,11 +27,6 @@ use crate::config::types::GatewayConfig;
 use crate::grpc::auth::verify_grpc_jwt_metadata;
 use crate::grpc::proto::ConfigUpdate;
 
-// One bounded queue sits between each ADS request reader and response stream.
-// Phase B keeps this fixed while xDS is opt-in; make it an EnvConfig knob
-// before high-churn Phase C/D sidecar fleets depend on ADS.
-const ADS_STREAM_CHANNEL_CAPACITY: usize = 32;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct XdsSubscription {
     node_id: String,
@@ -49,6 +44,7 @@ pub struct XdsAdsServer {
     jwt_secret: String,
     expected_issuer: String,
     namespace: String,
+    stream_channel_capacity: usize,
     snapshot_cache: Arc<XdsSnapshotCache>,
     nonce_tracker: Arc<XdsNonceTracker>,
     active_streams: Arc<XdsStreamRegistry>,
@@ -147,6 +143,7 @@ impl XdsAdsServer {
         jwt_secret: String,
         expected_issuer: String,
         namespace: String,
+        stream_channel_capacity: usize,
     ) -> Self {
         Self {
             config,
@@ -154,6 +151,7 @@ impl XdsAdsServer {
             jwt_secret,
             expected_issuer,
             namespace,
+            stream_channel_capacity: stream_channel_capacity.max(1),
             snapshot_cache: Arc::new(XdsSnapshotCache::new()),
             nonce_tracker: Arc::new(XdsNonceTracker::new()),
             active_streams: Arc::new(XdsStreamRegistry::default()),
@@ -572,7 +570,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         let mut requests = request.into_inner();
         let server = self.clone();
         let mut updates = server.update_tx.subscribe();
-        let (tx, rx) = mpsc::channel(ADS_STREAM_CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
 
         tokio::spawn(async move {
             let mut stream_guard = server.stream_guard();
@@ -699,7 +697,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         let mut requests = request.into_inner();
         let server = self.clone();
         let mut updates = server.update_tx.subscribe();
-        let (tx, rx) = mpsc::channel(ADS_STREAM_CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
 
         tokio::spawn(async move {
             let mut stream_guard = server.stream_guard();
@@ -1165,6 +1163,7 @@ mod tests {
             "x".repeat(32),
             "issuer".to_string(),
             "default".to_string(),
+            32,
         )
     }
 
