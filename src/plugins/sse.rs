@@ -57,6 +57,8 @@ use tracing::{debug, warn};
 
 use super::{PluginResult, RequestContext};
 
+const TEXT_EVENT_STREAM: &str = "text/event-stream";
+
 pub struct SsePlugin {
     // ── Request validation ───────────────────────────────────────────────
     /// Require `Accept: text/event-stream` header. Default: true.
@@ -74,9 +76,10 @@ pub struct SsePlugin {
     add_no_buffering_header: bool,
     /// Strip `Content-Length` from SSE responses (streams are indefinite). Default: true.
     strip_content_length: bool,
-    /// Reconnection interval hint (ms). When set, stored in metadata and
-    /// prepended as `retry: <ms>\n` when wrapping responses. Default: none.
-    retry_ms: Option<u64>,
+    /// Reconnection interval hint (ms). When set, stored in metadata.
+    retry_ms_text: Option<String>,
+    /// Pre-built `retry: <ms>\n` field used when wrapping responses.
+    retry_field: Option<Vec<u8>>,
     /// Force `Content-Type: text/event-stream` even if the backend returns
     /// a different content type. Default: false.
     force_sse_content_type: bool,
@@ -87,14 +90,22 @@ pub struct SsePlugin {
 
 impl SsePlugin {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let require_accept_header = config["require_accept_header"].as_bool().unwrap_or(true);
-        let require_get_method = config["require_get_method"].as_bool().unwrap_or(true);
-        let strip_accept_encoding = config["strip_accept_encoding"].as_bool().unwrap_or(true);
-        let add_no_buffering_header = config["add_no_buffering_header"].as_bool().unwrap_or(true);
-        let strip_content_length = config["strip_content_length"].as_bool().unwrap_or(true);
-        let retry_ms = config["retry_ms"].as_u64();
-        let force_sse_content_type = config["force_sse_content_type"].as_bool().unwrap_or(false);
-        let wrap_non_sse_responses = config["wrap_non_sse_responses"].as_bool().unwrap_or(false);
+        let require_accept_header = bool_config(config, "require_accept_header", true)?;
+        let require_get_method = bool_config(config, "require_get_method", true)?;
+        let strip_accept_encoding = bool_config(config, "strip_accept_encoding", true)?;
+        let add_no_buffering_header = bool_config(config, "add_no_buffering_header", true)?;
+        let strip_content_length = bool_config(config, "strip_content_length", true)?;
+        let retry_ms = optional_positive_u64_config(config, "retry_ms")?;
+        let force_sse_content_type = bool_config(config, "force_sse_content_type", false)?;
+        let wrap_non_sse_responses = bool_config(config, "wrap_non_sse_responses", false)?;
+        let retry_ms_text = retry_ms.map(|retry| retry.to_string());
+        let retry_field = retry_ms_text.as_ref().map(|retry| {
+            let mut field = Vec::with_capacity("retry: \n".len() + retry.len());
+            field.extend_from_slice(b"retry: ");
+            field.extend_from_slice(retry.as_bytes());
+            field.push(b'\n');
+            field
+        });
 
         Ok(Self {
             require_accept_header,
@@ -102,7 +113,8 @@ impl SsePlugin {
             strip_accept_encoding,
             add_no_buffering_header,
             strip_content_length,
-            retry_ms,
+            retry_ms_text,
+            retry_field,
             force_sse_content_type,
             wrap_non_sse_responses,
         })
@@ -112,13 +124,43 @@ impl SsePlugin {
     fn accepts_event_stream(accept: &str) -> bool {
         accept
             .split(',')
-            .any(|part| part.trim().to_lowercase().starts_with("text/event-stream"))
+            .any(|part| has_ascii_case_insensitive_prefix(part.trim(), TEXT_EVENT_STREAM))
     }
 
     /// Returns true if the response `Content-Type` is `text/event-stream`.
     fn is_sse_content_type(content_type: &str) -> bool {
-        content_type.to_lowercase().starts_with("text/event-stream")
+        has_ascii_case_insensitive_prefix(content_type.trim(), TEXT_EVENT_STREAM)
     }
+}
+
+fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String> {
+    match config.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(other) => Err(format!("sse: '{key}' must be a boolean, got: {other}")),
+    }
+}
+
+fn optional_positive_u64_config(config: &Value, key: &str) -> Result<Option<u64>, String> {
+    match config.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => match number.as_u64() {
+            Some(value) if value > 0 => Ok(Some(value)),
+            Some(_) => Err(format!("sse: '{key}' must be greater than zero")),
+            None => Err(format!(
+                "sse: '{key}' must be an unsigned integer, got: {number}"
+            )),
+        },
+        Some(other) => Err(format!(
+            "sse: '{key}' must be an unsigned integer, got: {other}"
+        )),
+    }
+}
+
+fn has_ascii_case_insensitive_prefix(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 #[async_trait]
@@ -136,7 +178,7 @@ impl super::Plugin for SsePlugin {
     }
 
     fn modifies_request_headers(&self) -> bool {
-        self.strip_accept_encoding
+        true
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -277,9 +319,9 @@ impl super::Plugin for SsePlugin {
         }
 
         // Store retry hint in metadata for transform_response_body.
-        if let Some(retry) = self.retry_ms {
+        if let Some(retry) = &self.retry_ms_text {
             ctx.metadata
-                .insert("sse:retry_ms".to_string(), retry.to_string());
+                .insert("sse:retry_ms".to_string(), retry.clone());
         }
 
         debug!(plugin = "sse", "SSE response headers applied");
@@ -312,10 +354,8 @@ impl super::Plugin for SsePlugin {
 
         // Prepend `retry:` field if configured — tells the EventSource client
         // how long to wait before reconnecting after a disconnect.
-        if let Some(retry) = self.retry_ms {
-            output.extend_from_slice(b"retry: ");
-            output.extend_from_slice(retry.to_string().as_bytes());
-            output.push(b'\n');
+        if let Some(retry_field) = &self.retry_field {
+            output.extend_from_slice(retry_field);
         }
 
         for line in body_str.lines() {

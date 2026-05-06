@@ -35,11 +35,14 @@ impl WsMessageSizeLimiting {
     const MAX_CLOSE_REASON_BYTES: usize = 123;
 
     pub fn new(config: &Value) -> Result<Self, String> {
+        if !config.is_object() {
+            return Err("ws_message_size_limiting: config must be an object".to_string());
+        }
+
         let max_frame_bytes =
             required_positive_usize(config, "max_frame_bytes", "ws_message_size_limiting")?;
 
-        let mut close_reason = config["close_reason"]
-            .as_str()
+        let mut close_reason = optional_string(config, "close_reason")?
             .unwrap_or("Message too large")
             .to_string();
         if close_reason.len() > Self::MAX_CLOSE_REASON_BYTES {
@@ -76,6 +79,16 @@ impl WsMessageSizeLimiting {
             Message::Close(_) | Message::Frame(_) => 0,
         }
     }
+}
+
+fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(Some)
+        .ok_or_else(|| format!("ws_message_size_limiting: '{field}' must be a string"))
 }
 
 impl SizeLimiter for WsMessageSizeLimiting {

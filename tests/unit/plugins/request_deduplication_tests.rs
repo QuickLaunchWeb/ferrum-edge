@@ -1,7 +1,11 @@
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use ferrum_edge::plugins::{
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
+};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Barrier;
 
 fn make_plugin(config: serde_json::Value) -> RequestDeduplication {
     RequestDeduplication::new(&config, PluginHttpClient::default()).unwrap()
@@ -12,6 +16,13 @@ fn test_new_default_config() {
     let config = json!({});
     let plugin = make_plugin(config);
     assert_eq!(plugin.name(), "request_deduplication");
+    assert_eq!(plugin.priority(), priority::REQUEST_DEDUPLICATION);
+    assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    assert!(plugin.requires_response_body_buffering());
+    assert!(!plugin.is_auth_plugin());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.requires_request_body_buffering());
 }
 
 #[test]
@@ -23,6 +34,51 @@ fn test_new_custom_header() {
     });
     let plugin = make_plugin(config);
     assert_eq!(plugin.name(), "request_deduplication");
+}
+
+#[test]
+fn test_new_rejects_non_object_config() {
+    let result = RequestDeduplication::new(&json!("bad"), PluginHttpClient::default());
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("config must be an object"));
+}
+
+#[test]
+fn test_new_rejects_invalid_header_name() {
+    let config = json!({
+        "header_name": "not a header"
+    });
+    let result = RequestDeduplication::new(&config, PluginHttpClient::default());
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("header_name"));
+}
+
+#[test]
+fn test_new_rejects_invalid_numeric_and_bool_types() {
+    for config in [
+        json!({"ttl_seconds": "300"}),
+        json!({"inflight_ttl_seconds": "300"}),
+        json!({"max_entries": "100"}),
+        json!({"max_entries": 0}),
+        json!({"scope_by_consumer": "true"}),
+        json!({"enforce_required": "false"}),
+    ] {
+        let result = RequestDeduplication::new(&config, PluginHttpClient::default());
+        assert!(result.is_err(), "config should be rejected: {config:?}");
+    }
+}
+
+#[test]
+fn test_new_rejects_invalid_applicable_methods() {
+    for config in [
+        json!({"applicable_methods": "POST"}),
+        json!({"applicable_methods": ["POST", 123]}),
+        json!({"applicable_methods": [""]}),
+        json!({"applicable_methods": ["bad method"]}),
+    ] {
+        let result = RequestDeduplication::new(&config, PluginHttpClient::default());
+        assert!(result.is_err(), "config should be rejected: {config:?}");
+    }
 }
 
 #[test]
@@ -69,11 +125,15 @@ fn test_new_empty_methods_fails() {
 fn test_new_with_redis_config() {
     let config = json!({
         "sync_mode": "redis",
-        "redis_url": "redis://localhost:6379/0",
+        "redis_url": "redis://dedup-redis.internal:6379/0",
         "redis_key_prefix": "dedup"
     });
     let plugin = make_plugin(config);
     assert_eq!(plugin.name(), "request_deduplication");
+    assert_eq!(
+        plugin.warmup_hostnames(),
+        vec!["dedup-redis.internal".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -130,6 +190,11 @@ async fn test_enforce_required_rejects_missing_key() {
         } => {
             assert_eq!(status_code, 400);
             assert!(body.contains("idempotency"));
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                parsed["error"],
+                "Missing required idempotency header: idempotency-key"
+            );
         }
         _ => panic!("Expected Reject"),
     }
@@ -223,6 +288,45 @@ async fn test_concurrent_duplicate_returns_conflict() {
         }
         _ => panic!("Expected 409 Conflict"),
     }
+}
+
+#[tokio::test]
+async fn test_concurrent_first_requests_only_one_reaches_backend() {
+    let plugin = Arc::new(make_plugin(json!({})));
+    let barrier = Arc::new(Barrier::new(16));
+    let mut handles = Vec::new();
+
+    for _ in 0..16 {
+        let plugin = Arc::clone(&plugin);
+        let barrier = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/api".to_string(),
+            );
+            let mut headers = HashMap::new();
+            headers.insert("idempotency-key".to_string(), "race-key".to_string());
+
+            barrier.wait().await;
+            plugin.before_proxy(&mut ctx, &mut headers).await
+        }));
+    }
+
+    let mut continues = 0;
+    let mut conflicts = 0;
+    for handle in handles {
+        match handle.await.unwrap() {
+            PluginResult::Continue => continues += 1,
+            PluginResult::Reject {
+                status_code: 409, ..
+            } => conflicts += 1,
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    assert_eq!(continues, 1);
+    assert_eq!(conflicts, 15);
 }
 
 #[tokio::test]

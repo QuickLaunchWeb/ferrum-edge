@@ -1,6 +1,8 @@
 //! Tests for the Correlation ID plugin
 
-use ferrum_edge::plugins::{Plugin, RequestContext, correlation_id::CorrelationId, priority};
+use ferrum_edge::plugins::{
+    ALL_PROTOCOLS, Plugin, RequestContext, correlation_id::CorrelationId, priority,
+};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -79,6 +81,30 @@ fn test_plugin_priority() {
 fn test_modifies_request_headers() {
     let plugin = CorrelationId::new(&json!({})).unwrap();
     assert!(plugin.modifies_request_headers());
+}
+
+#[test]
+fn test_phase_and_protocol_flags() {
+    let plugin = CorrelationId::new(&json!({})).unwrap();
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
+    assert!(plugin.modifies_request_headers());
+    assert!(plugin.applies_after_proxy_on_reject());
+    assert!(!plugin.is_auth_plugin());
+}
+
+#[test]
+fn test_applies_after_proxy_on_reject_follows_echo_downstream() {
+    let echo_enabled = CorrelationId::new(&json!({
+        "echo_downstream": true
+    }))
+    .unwrap();
+    assert!(echo_enabled.applies_after_proxy_on_reject());
+
+    let echo_disabled = CorrelationId::new(&json!({
+        "echo_downstream": false
+    }))
+    .unwrap();
+    assert!(!echo_disabled.applies_after_proxy_on_reject());
 }
 
 // ── Default configuration ───────────────────────────────────────────

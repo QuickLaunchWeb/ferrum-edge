@@ -13,30 +13,44 @@ use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const MAX_STATE_ENTRIES: usize = 100_000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LimitBy {
+    Ip,
+    Consumer,
+}
+
 pub struct RateLimiting {
-    limit_by: String,
+    limit_by: LimitBy,
     expose_headers: bool,
     limiter: RateLimitBackend<String, HttpRateLimitAlgorithm>,
 }
 
 impl RateLimiting {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        let limit_by = config["limit_by"].as_str().unwrap_or("ip").to_string();
-        let expose_headers = config["expose_headers"].as_bool().unwrap_or(false);
+        let object = config
+            .as_object()
+            .ok_or_else(|| format!("rate_limiting: config must be an object, got: {config}"))?;
+        let limit_by = parse_limit_by(object)?;
+        let expose_headers = parse_optional_bool(object, "expose_headers")?.unwrap_or(false);
 
-        let window_specs = if let Some(window_seconds) = config["window_seconds"].as_u64() {
-            let max_requests = config["max_requests"].as_u64().unwrap_or(10);
+        let window_specs = if let Some(window_seconds) =
+            parse_optional_u64(object, "window_seconds")?
+        {
+            if window_seconds == 0 {
+                return Err("rate_limiting: 'window_seconds' must be greater than zero".to_string());
+            }
+            let max_requests = parse_optional_u64(object, "max_requests")?.unwrap_or(10);
             if max_requests == 0 {
                 return Err("rate_limiting: 'max_requests' must be greater than zero".to_string());
             }
             vec![RateLimitWindowSpec {
                 limit: max_requests,
-                duration: Duration::from_secs(window_seconds.max(1)),
+                duration: Duration::from_secs(window_seconds),
             }]
         } else {
             let mut specs = Vec::new();
 
-            if let Some(limit) = config["requests_per_second"].as_u64() {
+            if let Some(limit) = parse_optional_u64(object, "requests_per_second")? {
                 if limit == 0 {
                     return Err(
                         "rate_limiting: 'requests_per_second' must be greater than zero"
@@ -49,7 +63,7 @@ impl RateLimiting {
                 });
             }
 
-            if let Some(limit) = config["requests_per_minute"].as_u64() {
+            if let Some(limit) = parse_optional_u64(object, "requests_per_minute")? {
                 if limit == 0 {
                     return Err(
                         "rate_limiting: 'requests_per_minute' must be greater than zero"
@@ -62,7 +76,7 @@ impl RateLimiting {
                 });
             }
 
-            if let Some(limit) = config["requests_per_hour"].as_u64() {
+            if let Some(limit) = parse_optional_u64(object, "requests_per_hour")? {
                 if limit == 0 {
                     return Err(
                         "rate_limiting: 'requests_per_hour' must be greater than zero".to_string(),
@@ -89,7 +103,7 @@ impl RateLimiting {
             config,
             &http_client,
             HttpRateLimitAlgorithm::new(window_specs),
-        );
+        )?;
 
         Ok(Self {
             limit_by,
@@ -100,8 +114,29 @@ impl RateLimiting {
 
     fn evict_stale_entries(&self) {
         if self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES {
-            self.limiter.retain_active_at(Instant::now());
+            self.limiter
+                .enforce_capacity(MAX_STATE_ENTRIES, Instant::now());
         }
+    }
+
+    fn request_key(&self, ctx: &RequestContext) -> String {
+        if self.limit_by == LimitBy::Consumer
+            && let Some(identity) = ctx.effective_identity()
+        {
+            return prefixed_key("consumer:", identity);
+        }
+
+        prefixed_key("ip:", &ctx.client_ip)
+    }
+
+    fn stream_key(&self, ctx: &super::StreamConnectionContext) -> String {
+        if self.limit_by == LimitBy::Consumer
+            && let Some(identity) = ctx.effective_identity()
+        {
+            return prefixed_key("consumer:", identity);
+        }
+
+        prefixed_key("ip:", &ctx.client_ip)
     }
 
     fn reject(&self, key: &str, outcome: &RateLimitOutcome) -> PluginResult {
@@ -146,8 +181,8 @@ impl RateLimiting {
     }
 
     async fn check_rate(&self, key: String, ctx: &mut RequestContext) -> PluginResult {
-        self.evict_stale_entries();
         let outcome = self.limiter.check(key.clone(), &key, &RequestUnit).await;
+        self.evict_stale_entries();
         if !outcome.allowed {
             warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded");
             return self.reject(&key, &outcome);
@@ -158,8 +193,8 @@ impl RateLimiting {
     }
 
     async fn check_rate_stream(&self, key: String) -> PluginResult {
-        self.evict_stale_entries();
         let outcome = self.limiter.check(key.clone(), &key, &RequestUnit).await;
+        self.evict_stale_entries();
         if !outcome.allowed {
             warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded (stream)");
             return self.reject(&key, &outcome);
@@ -199,31 +234,26 @@ impl Plugin for RateLimiting {
         &self,
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
-        let key = if self.limit_by == "consumer" {
-            ctx.effective_identity()
-                .map(|identity| format!("consumer:{identity}"))
-                .unwrap_or_else(|| format!("ip:{}", ctx.client_ip))
-        } else {
-            format!("ip:{}", ctx.client_ip)
-        };
+        let key = self.stream_key(ctx);
         self.check_rate_stream(key).await
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        let ip_key = format!("ip:{}", ctx.client_ip);
+        if self.limit_by != LimitBy::Ip {
+            return PluginResult::Continue;
+        }
+
+        let ip_key = self.request_key(ctx);
         self.check_rate(ip_key, ctx).await
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
-        if self.limit_by != "consumer" {
+        if self.limit_by != LimitBy::Consumer {
             return PluginResult::Continue;
         }
 
-        if let Some(identity) = ctx.effective_identity() {
-            self.check_rate(format!("consumer:{identity}"), ctx).await
-        } else {
-            PluginResult::Continue
-        }
+        let key = self.request_key(ctx);
+        self.check_rate(key, ctx).await
     }
 
     async fn before_proxy(
@@ -250,6 +280,57 @@ impl Plugin for RateLimiting {
         inject_rate_limit_headers_from_metadata(&ctx.metadata, response_headers);
         PluginResult::Continue
     }
+}
+
+fn parse_limit_by(object: &serde_json::Map<String, Value>) -> Result<LimitBy, String> {
+    match object.get("limit_by") {
+        None | Some(Value::Null) => Ok(LimitBy::Ip),
+        Some(Value::String(value)) => match value.to_ascii_lowercase().as_str() {
+            "ip" => Ok(LimitBy::Ip),
+            "consumer" => Ok(LimitBy::Consumer),
+            _ => Err(format!(
+                "rate_limiting: 'limit_by' must be one of 'ip' or 'consumer', got: {value:?}"
+            )),
+        },
+        Some(other) => Err(format!(
+            "rate_limiting: 'limit_by' must be a string, got: {other}"
+        )),
+    }
+}
+
+fn parse_optional_bool(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<bool>, String> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| format!("rate_limiting: '{field}' must be a boolean"))
+        })
+        .transpose()
+}
+
+fn parse_optional_u64(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<u64>, String> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| format!("rate_limiting: '{field}' must be an integer"))
+        })
+        .transpose()
+}
+
+fn prefixed_key(prefix: &str, value: &str) -> String {
+    let mut key = String::with_capacity(prefix.len() + value.len());
+    key.push_str(prefix);
+    key.push_str(value);
+    key
 }
 
 fn inject_rate_limit_headers_from_metadata(

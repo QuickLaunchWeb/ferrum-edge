@@ -1,4 +1,4 @@
-use ferrum_edge::plugins::{PluginResult, create_plugin};
+use ferrum_edge::plugins::{GRPC_ONLY_PROTOCOLS, PluginResult, create_plugin, priority};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -24,7 +24,12 @@ fn test_plugin_creation() {
         .unwrap()
         .unwrap();
     assert_eq!(plugin.name(), "grpc_method_router");
-    assert_eq!(plugin.priority(), 275);
+    assert_eq!(plugin.priority(), priority::GRPC_METHOD_ROUTER);
+    assert!(!plugin.is_auth_plugin());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.applies_after_proxy_on_reject());
 }
 
 #[test]
@@ -39,9 +44,7 @@ fn test_supported_protocols() {
     let plugin = create_plugin("grpc_method_router", &config)
         .unwrap()
         .unwrap();
-    let protocols = plugin.supported_protocols();
-    assert_eq!(protocols.len(), 1);
-    assert_eq!(protocols[0], ferrum_edge::plugins::ProxyProtocol::Grpc);
+    assert_eq!(plugin.supported_protocols(), GRPC_ONLY_PROTOCOLS);
 }
 
 // ── gRPC path parsing and metadata population ──
@@ -388,6 +391,32 @@ async fn test_rejection_body_format() {
 }
 
 #[tokio::test]
+async fn test_rejection_body_escapes_untrusted_method_path() {
+    let config = json!({
+        "allow_methods": ["/pkg.Svc/Allowed"]
+    });
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    let mut ctx = create_grpc_context("/pkg.Svc/Bad\"Method");
+    let _ = plugin.on_request_received(&mut ctx).await;
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    match result {
+        PluginResult::Reject { body, .. } => {
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                parsed["error"],
+                "gRPC method 'pkg.Svc/Bad\"Method' is not permitted"
+            );
+        }
+        _ => panic!("Expected Reject"),
+    }
+}
+
+#[tokio::test]
 async fn test_rate_limit_rejection_includes_headers() {
     let config = json!({
         "method_rate_limits": {
@@ -486,6 +515,63 @@ fn test_limit_by_consumer_accepted() {
     assert!(result.is_ok());
 }
 
+// ── Constructor validation: method lists ──
+
+#[test]
+fn test_non_array_method_list_rejected() {
+    let result = create_plugin(
+        "grpc_method_router",
+        &json!({"deny_methods": "/pkg.Svc/Blocked"}),
+    );
+    let err = result
+        .err()
+        .expect("non-array deny_methods must be rejected");
+    assert!(
+        err.contains("'deny_methods' must be an array"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_non_string_method_list_entry_rejected() {
+    let result = create_plugin("grpc_method_router", &json!({"allow_methods": [42]}));
+    let err = result
+        .err()
+        .expect("non-string allow_methods entry must be rejected");
+    assert!(
+        err.contains("'allow_methods[0]' must be a string"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_invalid_method_list_entry_rejected() {
+    let result = create_plugin(
+        "grpc_method_router",
+        &json!({"deny_methods": ["/pkg.Svc/"]}),
+    );
+    let err = result.err().expect("invalid method path must be rejected");
+    assert!(err.contains("invalid gRPC method path"), "got: {err}");
+}
+
+#[test]
+fn test_duplicate_method_list_entry_rejected_after_normalization() {
+    let result = create_plugin(
+        "grpc_method_router",
+        &json!({"deny_methods": ["/pkg.Svc/Blocked", "pkg.Svc/Blocked"]}),
+    );
+    let err = result
+        .err()
+        .expect("duplicate normalized method must be rejected");
+    assert!(err.contains("duplicate method"), "got: {err}");
+}
+
+#[test]
+fn test_empty_allow_list_is_valid_block_all_config() {
+    let result = create_plugin("grpc_method_router", &json!({"allow_methods": []}));
+    assert!(result.is_ok());
+}
+
 // ── Constructor validation: rate-limit specs ──
 
 #[test]
@@ -535,6 +621,50 @@ fn test_missing_window_seconds_rejected() {
         .err()
         .expect("missing window_seconds should be rejected, not silently dropped");
     assert!(err.contains("'window_seconds' is required"), "got: {err}");
+}
+
+#[test]
+fn test_method_rate_limits_must_be_object() {
+    let result = create_plugin("grpc_method_router", &json!({"method_rate_limits": []}));
+    let err = result
+        .err()
+        .expect("non-object method_rate_limits must be rejected");
+    assert!(
+        err.contains("'method_rate_limits' must be an object"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_method_rate_limit_spec_must_be_object() {
+    let result = create_plugin(
+        "grpc_method_router",
+        &json!({
+            "method_rate_limits": {
+                "/svc/M": 10
+            }
+        }),
+    );
+    let err = result
+        .err()
+        .expect("non-object rate-limit spec must be rejected");
+    assert!(err.contains("must be an object"), "got: {err}");
+}
+
+#[test]
+fn test_invalid_method_rate_limit_key_rejected() {
+    let result = create_plugin(
+        "grpc_method_router",
+        &json!({
+            "method_rate_limits": {
+                "/svc/": { "max_requests": 5, "window_seconds": 60 }
+            }
+        }),
+    );
+    let err = result
+        .err()
+        .expect("invalid rate-limit method key must be rejected");
+    assert!(err.contains("invalid gRPC method path"), "got: {err}");
 }
 
 // ── Path edge cases ──

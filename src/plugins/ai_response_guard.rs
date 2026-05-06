@@ -17,6 +17,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{debug, warn};
 
+use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -117,34 +118,41 @@ fn builtin_pii_pattern(name: &str) -> Option<&'static str> {
 
 impl AiResponseGuard {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let action = match config["action"].as_str().unwrap_or("reject") {
+        if !config.is_object() {
+            return Err("ai_response_guard: config must be an object".to_string());
+        }
+
+        let action = match optional_string(config, "action")?.unwrap_or("reject") {
+            "reject" => GuardAction::Reject,
             "redact" => GuardAction::Redact,
             "warn" => GuardAction::Warn,
-            _ => GuardAction::Reject,
+            other => {
+                return Err(format!(
+                    "ai_response_guard: 'action' must be one of 'reject', 'redact', or 'warn', got {other:?}"
+                ));
+            }
         };
 
-        let scan_mode = if config["scan_fields"].as_str().unwrap_or("content") == "all" {
-            ScanMode::All
-        } else {
-            ScanMode::Content
+        let scan_mode = match optional_string(config, "scan_fields")?.unwrap_or("content") {
+            "content" => ScanMode::Content,
+            "all" => ScanMode::All,
+            other => {
+                return Err(format!(
+                    "ai_response_guard: 'scan_fields' must be one of 'content' or 'all', got {other:?}"
+                ));
+            }
         };
 
-        let redaction_template = config["redaction_placeholder"]
-            .as_str()
+        let redaction_template = optional_string(config, "redaction_placeholder")?
             .unwrap_or("[REDACTED:{type}]")
             .to_string();
 
-        let max_scan_bytes = config["max_scan_bytes"].as_u64().unwrap_or(1_048_576) as usize;
+        let max_scan_bytes =
+            optional_positive_usize(config, "max_scan_bytes")?.unwrap_or(1_048_576);
 
         // Build PII pattern list
-        let pii_pattern_names: Vec<String> = config["pii_patterns"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let pii_pattern_names: Vec<String> =
+            optional_string_vec(config, "pii_patterns")?.unwrap_or_default();
 
         let mut pii_patterns: Vec<ContentPattern> = Vec::new();
 
@@ -179,16 +187,16 @@ impl AiResponseGuard {
         }
 
         // Add custom PII patterns
-        if let Some(custom) = config["custom_pii_patterns"].as_array() {
-            for entry in custom {
-                let name = match entry["name"].as_str() {
-                    Some(n) => n.to_string(),
-                    None => continue,
-                };
-                let regex_str = match entry["regex"].as_str() {
-                    Some(r) => r,
-                    None => continue,
-                };
+        if let Some(custom) = optional_array(config, "custom_pii_patterns")? {
+            for (idx, entry) in custom.iter().enumerate() {
+                if !entry.is_object() {
+                    return Err(format!(
+                        "ai_response_guard: 'custom_pii_patterns[{idx}]' must be an object"
+                    ));
+                }
+                let name = required_non_empty_string(entry, "custom_pii_patterns", idx, "name")?;
+                let regex_str =
+                    required_non_empty_string(entry, "custom_pii_patterns", idx, "regex")?;
                 match Regex::new(regex_str) {
                     Ok(regex) => {
                         let full_name = format!("pii:{}", name);
@@ -211,12 +219,14 @@ impl AiResponseGuard {
 
         // Build blocked phrases list
         let mut blocked_phrases: Vec<ContentPattern> = Vec::new();
-        if let Some(phrases) = config["blocked_phrases"].as_array() {
+        if let Some(phrases) = optional_string_vec(config, "blocked_phrases")? {
             for (i, phrase) in phrases.iter().enumerate() {
-                let phrase_str = match phrase.as_str() {
-                    Some(p) => p,
-                    None => continue,
-                };
+                let phrase_str = phrase.as_str();
+                if phrase_str.is_empty() {
+                    return Err(format!(
+                        "ai_response_guard: 'blocked_phrases[{i}]' must not be empty"
+                    ));
+                }
                 // Treat as case-insensitive literal match
                 let escaped = regex::escape(phrase_str);
                 match Regex::new(&format!("(?i){}", escaped)) {
@@ -240,21 +250,20 @@ impl AiResponseGuard {
         }
 
         // Build blocked regex patterns
-        if let Some(patterns) = config["blocked_patterns"].as_array() {
-            for entry in patterns {
-                let name = match entry["name"].as_str() {
-                    Some(n) => n.to_string(),
-                    None => continue,
-                };
-                let regex_str = match entry["regex"].as_str() {
-                    Some(r) => r,
-                    None => continue,
-                };
+        if let Some(patterns) = optional_array(config, "blocked_patterns")? {
+            for (idx, entry) in patterns.iter().enumerate() {
+                if !entry.is_object() {
+                    return Err(format!(
+                        "ai_response_guard: 'blocked_patterns[{idx}]' must be an object"
+                    ));
+                }
+                let name = required_non_empty_string(entry, "blocked_patterns", idx, "name")?;
+                let regex_str = required_non_empty_string(entry, "blocked_patterns", idx, "regex")?;
                 match Regex::new(regex_str) {
                     Ok(regex) => {
-                        let placeholder = redaction_template.replace("{type}", &name);
+                        let placeholder = redaction_template.replace("{type}", name);
                         blocked_phrases.push(ContentPattern {
-                            name,
+                            name: name.to_string(),
                             regex,
                             placeholder,
                         });
@@ -269,18 +278,19 @@ impl AiResponseGuard {
             }
         }
 
-        let require_json = config["require_json"].as_bool().unwrap_or(false);
+        let require_json = optional_bool(config, "require_json")?.unwrap_or(false);
 
-        let required_fields: Vec<String> = config["required_fields"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let required_fields: Vec<String> =
+            optional_string_vec(config, "required_fields")?.unwrap_or_default();
+        for (idx, field) in required_fields.iter().enumerate() {
+            if field.is_empty() {
+                return Err(format!(
+                    "ai_response_guard: 'required_fields[{idx}]' must not be empty"
+                ));
+            }
+        }
 
-        let max_completion_length = config["max_completion_length"].as_u64().unwrap_or(0) as usize;
+        let max_completion_length = optional_usize(config, "max_completion_length")?.unwrap_or(0);
 
         let has_validation_rules = !pii_patterns.is_empty()
             || !blocked_phrases.is_empty()
@@ -552,8 +562,6 @@ impl Plugin for AiResponseGuard {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        // Only buffer for POST requests — AI/LLM responses to inspect.
-        // Method-only check covers multipart uploads that return JSON responses.
         self.has_validation_rules && ctx.method == "POST"
     }
 
@@ -574,7 +582,7 @@ impl Plugin for AiResponseGuard {
             .map(|s| s.as_str())
             .unwrap_or("");
 
-        if !content_type.contains("json") {
+        if !is_json_content_type(content_type) {
             return PluginResult::Continue;
         }
 
@@ -710,7 +718,7 @@ impl Plugin for AiResponseGuard {
         }
 
         if let Some(ct) = content_type
-            && !ct.contains("json")
+            && !is_json_content_type(ct)
         {
             return None;
         }
@@ -753,6 +761,112 @@ impl Plugin for AiResponseGuard {
 
         serde_json::to_vec(&json).ok()
     }
+}
+
+fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(Some)
+        .ok_or_else(|| format!("ai_response_guard: '{field}' must be a string"))
+}
+
+fn optional_array<'a>(
+    config: &'a Value,
+    field: &'static str,
+) -> Result<Option<&'a Vec<Value>>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_array()
+        .map(Some)
+        .ok_or_else(|| format!("ai_response_guard: '{field}' must be an array"))
+}
+
+fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec<String>>, String> {
+    let Some(values) = optional_array(config, field)? else {
+        return Ok(None);
+    };
+    let mut out = Vec::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        let Some(value) = value.as_str() else {
+            return Err(format!(
+                "ai_response_guard: '{field}[{idx}]' must be a string"
+            ));
+        };
+        out.push(value.to_string());
+    }
+    Ok(Some(out))
+}
+
+fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| format!("ai_response_guard: '{field}' must be a boolean"))
+}
+
+fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option<usize>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_u64() else {
+        return Err(format!(
+            "ai_response_guard: '{field}' must be an integer greater than zero"
+        ));
+    };
+    if value == 0 {
+        return Err(format!(
+            "ai_response_guard: '{field}' must be greater than zero"
+        ));
+    }
+    usize::try_from(value)
+        .map(Some)
+        .map_err(|_| format!("ai_response_guard: '{field}' is too large for this platform"))
+}
+
+fn optional_usize(config: &Value, field: &'static str) -> Result<Option<usize>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_u64() else {
+        return Err(format!(
+            "ai_response_guard: '{field}' must be an unsigned integer"
+        ));
+    };
+    usize::try_from(value)
+        .map(Some)
+        .map_err(|_| format!("ai_response_guard: '{field}' is too large for this platform"))
+}
+
+fn required_non_empty_string<'a>(
+    value: &'a Value,
+    list_field: &'static str,
+    idx: usize,
+    field: &'static str,
+) -> Result<&'a str, String> {
+    let Some(value) = value.get(field) else {
+        return Err(format!(
+            "ai_response_guard: '{list_field}[{idx}].{field}' is required"
+        ));
+    };
+    let Some(value) = value.as_str() else {
+        return Err(format!(
+            "ai_response_guard: '{list_field}[{idx}].{field}' must be a string"
+        ));
+    };
+    if value.is_empty() {
+        return Err(format!(
+            "ai_response_guard: '{list_field}[{idx}].{field}' must not be empty"
+        ));
+    }
+    Ok(value)
 }
 
 /// Recursively redact matches in all string values within a JSON Value,
