@@ -544,19 +544,19 @@ When `FERRUM_TLS_CIPHER_SUITES` is not set, the gateway uses secure AEAD-only de
 **TLS 1.3 (always AEAD):**
 | Name | Description |
 |------|-------------|
-| `TLS_AES_256_GCM_SHA384` | AES-256-GCM (strongest) |
-| `TLS_AES_128_GCM_SHA256` | AES-128-GCM |
+| `TLS_AES_128_GCM_SHA256` | AES-128-GCM (default preference; secure and cheaper on the record path) |
+| `TLS_AES_256_GCM_SHA384` | AES-256-GCM |
 | `TLS_CHACHA20_POLY1305_SHA256` | ChaCha20-Poly1305 (fast on non-AES-NI hardware) |
 
 **TLS 1.2 (ECDHE + AEAD only):**
 | Name | Description |
 |------|-------------|
-| `ECDHE-ECDSA-AES256-GCM-SHA384` | ECDSA key exchange, AES-256-GCM |
-| `ECDHE-RSA-AES256-GCM-SHA384` | RSA key exchange, AES-256-GCM |
-| `ECDHE-ECDSA-AES128-GCM-SHA256` | ECDSA key exchange, AES-128-GCM |
-| `ECDHE-RSA-AES128-GCM-SHA256` | RSA key exchange, AES-128-GCM |
+| `ECDHE-ECDSA-AES128-GCM-SHA256` | ECDSA key exchange, AES-128-GCM (default preference) |
+| `ECDHE-RSA-AES128-GCM-SHA256` | RSA key exchange, AES-128-GCM (default preference) |
 | `ECDHE-ECDSA-CHACHA20-POLY1305` | ECDSA key exchange, ChaCha20-Poly1305 |
 | `ECDHE-RSA-CHACHA20-POLY1305` | RSA key exchange, ChaCha20-Poly1305 |
+| `ECDHE-ECDSA-AES256-GCM-SHA384` | ECDSA key exchange, AES-256-GCM |
+| `ECDHE-RSA-AES256-GCM-SHA384` | RSA key exchange, AES-256-GCM |
 
 No CBC or non-AEAD cipher suites are supported.
 
@@ -589,7 +589,7 @@ export FERRUM_TLS_CURVES="X25519,secp256r1,secp384r1"
 
 ### Server Cipher Order
 
-When `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` is `true` (the default), the server's cipher suite preference takes priority over the client's during TLS 1.2 negotiation. This ensures the strongest cipher is selected regardless of client ordering. TLS 1.3 does not use this setting (server always selects).
+When `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` is `true` (the default), the server's cipher suite preference takes priority over the client's during TLS 1.2 negotiation. This ensures the gateway's configured preference is selected regardless of client ordering. TLS 1.3 does not use this setting (server always selects).
 
 ```bash
 # Let server choose (recommended, default)
@@ -604,7 +604,7 @@ export FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER="false"
 The gateway logs the active TLS policy at startup:
 
 ```
-TLS policy: versions=["TLS 1.2", "TLS 1.3"], cipher_suites=["TLS13_AES_256_GCM_SHA384", ...], curves=["X25519", "SECP256R1"], prefer_server_order=true
+TLS policy: versions=["TLS 1.2", "TLS 1.3"], cipher_suites=["TLS13_AES_128_GCM_SHA256", ...], curves=["X25519", "SECP256R1"], prefer_server_order=true
 ```
 
 You can also verify externally:
