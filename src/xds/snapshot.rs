@@ -118,7 +118,12 @@ pub struct XdsSnapshotCache {
     // ADS is gated by FERRUM_XDS_ENABLED and Phase B keeps node cardinality low.
     // Use DashMap's default sharding here; revisit with util::sharding when
     // mesh node counts become hot-path scale in later phases.
-    snapshots: DashMap<String, Arc<XdsSnapshot>>,
+    snapshots: DashMap<String, CachedXdsSnapshot>,
+}
+
+struct CachedXdsSnapshot {
+    fingerprint: String,
+    snapshot: Arc<XdsSnapshot>,
 }
 
 impl XdsSnapshotCache {
@@ -131,18 +136,40 @@ impl XdsSnapshotCache {
     pub fn get(&self, node_id: &str) -> Option<Arc<XdsSnapshot>> {
         self.snapshots
             .get(node_id)
-            .map(|snapshot| Arc::clone(snapshot.value()))
+            .map(|cached| Arc::clone(&cached.snapshot))
+    }
+
+    pub fn get_if_fingerprint(&self, node_id: &str, fingerprint: &str) -> Option<Arc<XdsSnapshot>> {
+        self.snapshots.get(node_id).and_then(|cached| {
+            (cached.fingerprint == fingerprint).then(|| Arc::clone(&cached.snapshot))
+        })
     }
 
     pub fn insert(&self, snapshot: XdsSnapshot) -> Arc<XdsSnapshot> {
+        self.insert_with_fingerprint(snapshot, String::new())
+    }
+
+    pub fn insert_with_fingerprint(
+        &self,
+        snapshot: XdsSnapshot,
+        fingerprint: String,
+    ) -> Arc<XdsSnapshot> {
         let node_id = snapshot.node_id.clone();
         let snapshot = Arc::new(snapshot);
-        self.snapshots.insert(node_id, Arc::clone(&snapshot));
+        self.snapshots.insert(
+            node_id,
+            CachedXdsSnapshot {
+                fingerprint,
+                snapshot: Arc::clone(&snapshot),
+            },
+        );
         snapshot
     }
 
     pub fn remove(&self, node_id: &str) -> Option<(String, Arc<XdsSnapshot>)> {
-        self.snapshots.remove(node_id)
+        self.snapshots
+            .remove(node_id)
+            .map(|(node_id, cached)| (node_id, cached.snapshot))
     }
 
     pub fn len(&self) -> usize {

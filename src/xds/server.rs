@@ -1,6 +1,7 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -187,14 +188,17 @@ impl XdsAdsServer {
     }
 
     fn snapshot_for_config(&self, node_id: &str, config: &GatewayConfig) -> Arc<XdsSnapshot> {
-        let next = self.rebuild_snapshot_from_config(node_id, config);
-        if let Some(snapshot) = self.snapshot_cache.get(node_id)
-            && snapshot.version == next.version
+        let fingerprint = config_fingerprint(config);
+        if let Some(snapshot) = self
+            .snapshot_cache
+            .get_if_fingerprint(node_id, &fingerprint)
         {
             return snapshot;
         }
 
-        self.snapshot_cache.insert(next)
+        let next = self.rebuild_snapshot_from_config(node_id, config);
+        self.snapshot_cache
+            .insert_with_fingerprint(next, fingerprint)
     }
 
     fn stream_guard(&self) -> XdsStreamGuard {
@@ -551,6 +555,18 @@ impl XdsAdsServer {
             }
         }
     }
+}
+
+fn config_fingerprint(config: &GatewayConfig) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(config.loaded_at.to_rfc3339().as_bytes());
+    hasher.update([0]);
+    match serde_json::to_vec(config) {
+        Ok(bytes) => hasher.update(bytes),
+        Err(error) => hasher.update(error.to_string().as_bytes()),
+    }
+    let digest = hex::encode(hasher.finalize());
+    digest[..16].to_string()
 }
 
 #[tonic::async_trait]
