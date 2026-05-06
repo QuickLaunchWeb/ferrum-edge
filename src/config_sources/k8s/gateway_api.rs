@@ -6,8 +6,9 @@ use crate::config::mesh::{AppProtocol, MeshService, ServicePort};
 use crate::config::types::BackendScheme;
 
 use super::{
-    K8sAccumulator, K8sObject, K8sTranslateError, RouteProxySpec, SourceKind, invalid_resource,
-    proxy_for_route, resource_id, service_dns_name, string_array, string_field,
+    K8sAccumulator, K8sObject, K8sTranslateError, RouteProxySpec, SourceKind,
+    exact_path_listen_path, invalid_resource, proxy_for_route, resource_id, service_dns_name,
+    string_array, string_field,
 };
 
 pub(super) fn translate(
@@ -157,6 +158,7 @@ fn http_route_proxies(
             namespace: object.metadata.namespace.clone(),
             hosts: hostnames.clone(),
             listen_path,
+            strip_listen_path: false,
             backend_host: backend_host.clone(),
             backend_port,
             backend_scheme: BackendScheme::Http,
@@ -205,6 +207,7 @@ fn l4_route_proxies(
             namespace: object.metadata.namespace.clone(),
             hosts: string_array(&object.spec, "hostnames"),
             listen_path: None,
+            strip_listen_path: false,
             backend_host: service_dns_name(backend_name, &backend_namespace),
             backend_port,
             backend_scheme: scheme,
@@ -254,6 +257,7 @@ fn first_backend_ref(rule: &Value) -> Option<&Value> {
 fn http_path_match(path: &Value) -> Option<String> {
     let value = string_field(path, "value")?;
     match string_field(path, "type").unwrap_or("PathPrefix") {
+        "Exact" => Some(exact_path_listen_path(value)),
         "RegularExpression" => Some(format!("~{value}")),
         _ => Some(value.to_string()),
     }
@@ -329,7 +333,54 @@ mod tests {
             result.config.proxies[0].listen_path.as_deref(),
             Some("/api")
         );
+        assert!(!result.config.proxies[0].strip_listen_path);
         assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn translates_http_route_exact_path_to_anchored_regex_proxy() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "Exact", "value": "/api.v1"}}],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("~/api\\.v1")
+        );
+        assert!(!result.config.proxies[0].strip_listen_path);
+    }
+
+    #[test]
+    fn translates_http_route_regular_expression_path_to_regex_proxy() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "RegularExpression", "value": "/v[0-9]+/items"}}],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("~/v[0-9]+/items")
+        );
+        assert!(!result.config.proxies[0].strip_listen_path);
     }
 
     #[test]

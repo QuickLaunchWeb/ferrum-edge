@@ -10,8 +10,9 @@ use crate::config::mesh::{
 use crate::identity::spiffe::SpiffeId;
 
 use super::{
-    K8sAccumulator, K8sObject, K8sTranslateError, RouteProxySpec, SourceKind, invalid_resource,
-    proxy_for_route, resource_id, selector_from_istio, string_array, string_field, string_map,
+    K8sAccumulator, K8sObject, K8sTranslateError, RouteProxySpec, SourceKind,
+    exact_path_listen_path, invalid_resource, proxy_for_route, resource_id, selector_from_istio,
+    string_array, string_field, string_map,
 };
 use crate::config::types::BackendScheme;
 
@@ -360,6 +361,7 @@ fn virtual_service_routes(
             namespace: object.metadata.namespace.clone(),
             hosts: hosts.clone(),
             listen_path: listen_path.or_else(|| Some("/".to_string())),
+            strip_listen_path: false,
             backend_host: host.to_string(),
             backend_port: port,
             backend_scheme: BackendScheme::Http,
@@ -371,9 +373,13 @@ fn virtual_service_routes(
 }
 
 fn path_match(uri: &Value) -> Option<String> {
-    string_field(uri, "prefix")
-        .or_else(|| string_field(uri, "exact"))
-        .map(ToOwned::to_owned)
+    if let Some(prefix) = string_field(uri, "prefix") {
+        return Some(prefix.to_string());
+    }
+    if let Some(exact) = string_field(uri, "exact") {
+        return Some(exact_path_listen_path(exact));
+    }
+    string_field(uri, "regex").map(|pattern| format!("~{pattern}"))
 }
 
 fn service_ports(spec: &Value) -> Vec<ServicePort> {
@@ -541,6 +547,55 @@ mod tests {
 
         assert_eq!(result.config.proxies.len(), 1);
         assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/v1"));
+        assert!(!result.config.proxies[0].strip_listen_path);
         assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn translates_virtual_service_exact_uri_to_anchored_regex_proxy() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"exact": "/v1.items"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("~/v1\\.items")
+        );
+        assert!(!result.config.proxies[0].strip_listen_path);
+    }
+
+    #[test]
+    fn translates_virtual_service_regex_uri_to_regex_proxy() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"regex": "/v[0-9]+/items"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("~/v[0-9]+/items")
+        );
+        assert!(!result.config.proxies[0].strip_listen_path);
     }
 }
