@@ -174,7 +174,7 @@ Priority order, lower = first. Multiple instances per proxy allowed. Each has `i
 
 **Lifecycle phases** (see `src/plugins/mod.rs` for `priority::*` constants, `docs/plugin_execution_order.md` for the protocol matrix):
 
-1. `on_request_received` — tracing/CORS/termination/IP+geo/bot/spec_expose/SSE validate/gRPC-Web/size+rate/tx_debug
+1. `on_request_received` — tracing/CORS/termination/IP+geo/bot/spec_expose/spiffe_identity (940)/SSE validate/gRPC-Web/size+rate/tx_debug
 2. `authenticate` — mTLS (950), JWKS (1000), JWT (1100), keyauth (1200), LDAP (1250), basicauth (1300), HMAC (1400)
 3. `authorize` — ACL (2000), rate_limiting (2900)
 4. `before_proxy` — SOAP WS-Security, AI cache/dedup/guards/federation, request_transformer, serverless, response_mock, gRPC deadline, mirror, load_testing, response_caching, compression, ai_rate_limiter

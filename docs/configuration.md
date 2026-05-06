@@ -128,6 +128,7 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | If CP gRPC TLS | — | CP gRPC server TLS private key |
 | `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | No | — | CA bundle for verifying DP client certificates (mTLS) |
 | `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` | No | `128` | CP broadcast channel capacity before lagging DPs receive a full snapshot |
+| `FERRUM_XDS_ENABLED` | No | `false` | Enable Phase B xDS ADS (`StreamAggregatedResources` and `DeltaAggregatedResources`) on the CP gRPC listener |
 | `FERRUM_DP_CP_GRPC_URL` | DP mode (unless `_URLS` set) | — | Control Plane gRPC URL |
 | `FERRUM_DP_CP_GRPC_URLS` | No | — | Comma-separated priority-ordered CP URLs for DP failover. Takes precedence over single URL |
 | `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` | No | `300` | Retry primary CP interval (seconds) when connected to a fallback. `0` = disabled |

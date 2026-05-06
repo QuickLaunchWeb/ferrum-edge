@@ -18,6 +18,7 @@ pub mod control_plane;
 pub mod data_plane;
 pub mod database;
 pub mod file;
+pub mod mesh;
 pub mod migrate;
 
 use std::sync::Arc;

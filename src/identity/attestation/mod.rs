@@ -79,8 +79,15 @@ pub trait Attestor: Send + Sync + 'static {
     async fn attest(&self, peer: &PeerInfo) -> Result<WorkloadIdentity, AttestError>;
 }
 
-/// Run a chain of attestors, returning the first successful identity. If
-/// every attestor declines (`NotApplicable`), returns an aggregate failure.
+/// Run a chain of attestors, returning the first successful identity. If every
+/// attestor declines (`NotApplicable`), returns an aggregate failure.
+///
+/// Hard attestor failures are intentionally non-terminal: a K8s PSAT failure
+/// records diagnostic context, but a later Unix peer-creds or static-dev
+/// attestor may still succeed. This matches Ferrum's existing multi-auth
+/// first-success-wins model and SPIRE-style selector composition. Operators
+/// who need terminal rejection should configure mutually exclusive attestor
+/// chains for that listener instead of mixing fallback identity sources.
 pub async fn attest_chain(
     attestors: &[std::sync::Arc<dyn Attestor>],
     peer: &PeerInfo,

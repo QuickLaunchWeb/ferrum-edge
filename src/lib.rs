@@ -44,6 +44,7 @@ pub mod startup;
 pub mod tls;
 pub mod tls_offload;
 pub mod util;
+pub mod xds;
 
 pub use admin::api_specs::ExtractedBundle;
 pub use admin::spec_codec::{compress_gzip, decompress_gzip_capped, sha256_hex};
