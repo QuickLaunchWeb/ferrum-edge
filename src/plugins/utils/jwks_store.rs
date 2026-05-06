@@ -12,6 +12,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
@@ -37,6 +38,7 @@ pub struct JwksKeyStore {
     keys: Arc<ArcSwap<HashMap<String, CachedJwk>>>,
     jwks_uri: String,
     http_client: PluginHttpClient,
+    fetch_lock: Arc<Mutex<()>>,
 }
 
 /// Raw JWKS response from the endpoint.
@@ -83,6 +85,7 @@ impl JwksKeyStore {
             keys: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             jwks_uri,
             http_client,
+            fetch_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -109,6 +112,23 @@ impl JwksKeyStore {
 
     /// Fetch keys from the JWKS endpoint and update the cache.
     pub async fn fetch_keys(&self) -> Result<usize, String> {
+        let _fetch_guard = self.fetch_lock.lock().await;
+        self.fetch_keys_unlocked().await
+    }
+
+    /// Fetch keys only when the store is still empty.
+    ///
+    /// This lets an eager warmup share the store's immediate background refresh
+    /// without issuing a second successful JWKS request.
+    pub async fn fetch_keys_if_empty(&self) -> Result<usize, String> {
+        let _fetch_guard = self.fetch_lock.lock().await;
+        if self.has_keys() {
+            return Ok(self.keys.load().len());
+        }
+        self.fetch_keys_unlocked().await
+    }
+
+    async fn fetch_keys_unlocked(&self) -> Result<usize, String> {
         debug!("Fetching JWKS keys from {}", self.jwks_uri);
 
         let req = self.http_client.get().get(&self.jwks_uri);
@@ -179,11 +199,19 @@ impl JwksKeyStore {
         tokio::spawn(async move {
             let mut empty_store_retry_attempt = 0;
             let mut next_refresh_at = Instant::now();
+            let mut first_refresh = true;
             loop {
                 tokio::time::sleep_until(next_refresh_at).await;
                 let fetch_started_at = Instant::now();
 
-                if let Err(e) = store.fetch_keys().await {
+                let fetch_result = if first_refresh {
+                    store.fetch_keys_if_empty().await
+                } else {
+                    store.fetch_keys().await
+                };
+                first_refresh = false;
+
+                if let Err(e) = fetch_result {
                     warn!("JWKS background refresh failed: {}", e);
                 }
 

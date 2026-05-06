@@ -387,6 +387,56 @@ async fn test_jwks_auth_warmup_hostnames_includes_discovery_url_before_resolutio
 }
 
 #[tokio::test]
+async fn test_jwks_auth_oidc_discovery_eager_fetches_without_duplicate_jwks_call() {
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks_server = wiremock::MockServer::start().await;
+    let discovery_server = wiremock::MockServer::start().await;
+    let jwks_uri = format!("{}/jwks", jwks_server.uri());
+    let discovery_url = format!(
+        "{}/.well-known/openid-configuration",
+        discovery_server.uri()
+    );
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/jwks"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(build_rsa_jwks_from_pem(public_key_pem)),
+        )
+        .mount(&jwks_server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/.well-known/openid-configuration",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "jwks_uri": jwks_uri
+        })))
+        .mount(&discovery_server)
+        .await;
+
+    let _plugin = JwksAuth::new(
+        &json!({
+            "providers": [{"discovery_url": discovery_url}],
+            "jwks_refresh_interval_secs": 3600
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let initial_count = wait_for_received_request_count(&jwks_server, 1).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let final_count = jwks_server
+        .received_requests()
+        .await
+        .map(|requests| requests.len())
+        .unwrap_or(0);
+    assert_eq!(initial_count, 1);
+    assert_eq!(final_count, 1);
+}
+
+#[tokio::test]
 async fn test_jwks_auth_does_not_fetch_jwks_on_auth_hot_path_when_cache_empty() {
     let mock_server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
