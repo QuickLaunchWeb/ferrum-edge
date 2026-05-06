@@ -4,6 +4,23 @@ use std::sync::Arc;
 
 use super::proto;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct XdsConfigFingerprint {
+    loaded_at_seconds: i64,
+    loaded_at_nanos: u32,
+    config_addr: usize,
+}
+
+impl XdsConfigFingerprint {
+    pub(crate) fn new(loaded_at_seconds: i64, loaded_at_nanos: u32, config_addr: usize) -> Self {
+        Self {
+            loaded_at_seconds,
+            loaded_at_nanos,
+            config_addr,
+        }
+    }
+}
+
 // `proto::Any` is Ferrum's minimal wire-compatible xDS surface, not the
 // generated `google.protobuf.Any` type.
 /// One xDS resource encoded as an Any payload.
@@ -122,7 +139,7 @@ pub struct XdsSnapshotCache {
 }
 
 struct CachedXdsSnapshot {
-    fingerprint: String,
+    fingerprint: Option<XdsConfigFingerprint>,
     snapshot: Arc<XdsSnapshot>,
 }
 
@@ -139,27 +156,40 @@ impl XdsSnapshotCache {
             .map(|cached| Arc::clone(&cached.snapshot))
     }
 
-    pub fn get_if_fingerprint(&self, node_id: &str, fingerprint: &str) -> Option<Arc<XdsSnapshot>> {
+    pub(crate) fn get_if_fingerprint(
+        &self,
+        node_id: &str,
+        fingerprint: XdsConfigFingerprint,
+    ) -> Option<Arc<XdsSnapshot>> {
         self.snapshots.get(node_id).and_then(|cached| {
-            (cached.fingerprint == fingerprint).then(|| Arc::clone(&cached.snapshot))
+            (cached.fingerprint == Some(fingerprint)).then(|| Arc::clone(&cached.snapshot))
         })
     }
 
     pub fn insert(&self, snapshot: XdsSnapshot) -> Arc<XdsSnapshot> {
-        self.insert_with_fingerprint(snapshot, String::new())
+        let node_id = snapshot.node_id.clone();
+        let snapshot = Arc::new(snapshot);
+        self.snapshots.insert(
+            node_id,
+            CachedXdsSnapshot {
+                fingerprint: None,
+                snapshot: Arc::clone(&snapshot),
+            },
+        );
+        snapshot
     }
 
-    pub fn insert_with_fingerprint(
+    pub(crate) fn insert_with_fingerprint(
         &self,
         snapshot: XdsSnapshot,
-        fingerprint: String,
+        fingerprint: XdsConfigFingerprint,
     ) -> Arc<XdsSnapshot> {
         let node_id = snapshot.node_id.clone();
         let snapshot = Arc::new(snapshot);
         self.snapshots.insert(
             node_id,
             CachedXdsSnapshot {
-                fingerprint,
+                fingerprint: Some(fingerprint),
                 snapshot: Arc::clone(&snapshot),
             },
         );

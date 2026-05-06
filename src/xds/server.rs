@@ -1,7 +1,6 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -20,7 +19,7 @@ use super::proto::{
     DiscoveryResponse,
 };
 use super::slice::{MeshSlice, MeshSliceRequest};
-use super::snapshot::{XdsSnapshot, XdsSnapshotCache};
+use super::snapshot::{XdsConfigFingerprint, XdsSnapshot, XdsSnapshotCache};
 use super::translator::translate_mesh_slice_to_snapshot;
 use crate::FERRUM_VERSION;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
@@ -189,16 +188,17 @@ impl XdsAdsServer {
 
     fn snapshot_for_config(&self, node_id: &str, config: &GatewayConfig) -> Arc<XdsSnapshot> {
         let fingerprint = config_fingerprint(config);
-        if let Some(snapshot) = self
-            .snapshot_cache
-            .get_if_fingerprint(node_id, &fingerprint)
-        {
+        if let Some(snapshot) = self.snapshot_cache.get_if_fingerprint(node_id, fingerprint) {
             return snapshot;
         }
 
         let next = self.rebuild_snapshot_from_config(node_id, config);
         self.snapshot_cache
             .insert_with_fingerprint(next, fingerprint)
+    }
+
+    fn invalidate_snapshot_for_config_update(&self, node_id: &str) {
+        self.snapshot_cache.remove(node_id);
     }
 
     fn stream_guard(&self) -> XdsStreamGuard {
@@ -557,16 +557,14 @@ impl XdsAdsServer {
     }
 }
 
-fn config_fingerprint(config: &GatewayConfig) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(config.loaded_at.to_rfc3339().as_bytes());
-    hasher.update([0]);
-    match serde_json::to_vec(config) {
-        Ok(bytes) => hasher.update(bytes),
-        Err(error) => hasher.update(error.to_string().as_bytes()),
-    }
-    let digest = hex::encode(hasher.finalize());
-    digest[..16].to_string()
+fn config_fingerprint(config: &GatewayConfig) -> XdsConfigFingerprint {
+    // Keep cache-hit checks cheap: published configs are new Arc allocations,
+    // and stream-local mutations evict the node cache at the update boundary.
+    XdsConfigFingerprint::new(
+        config.loaded_at.timestamp(),
+        config.loaded_at.timestamp_subsec_nanos(),
+        config as *const GatewayConfig as usize,
+    )
 }
 
 #[tonic::async_trait]
@@ -654,6 +652,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 let Some(current_node_id) = node_id.as_ref() else {
                                     continue;
                                 };
+                                server.invalidate_snapshot_for_config_update(current_node_id);
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
@@ -677,6 +676,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 let Some(current_node_id) = node_id.as_ref() else {
                                     continue;
                                 };
+                                server.invalidate_snapshot_for_config_update(current_node_id);
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
@@ -823,6 +823,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 let Some(current_node_id) = node_id.as_ref() else {
                                     continue;
                                 };
+                                server.invalidate_snapshot_for_config_update(current_node_id);
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
@@ -846,6 +847,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 let Some(current_node_id) = node_id.as_ref() else {
                                     continue;
                                 };
+                                server.invalidate_snapshot_for_config_update(current_node_id);
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
@@ -1496,6 +1498,39 @@ mod tests {
 
         let new_config = gateway_config_with_named_service("new", 0);
         let new_snapshot = server.snapshot_for_config("node-a", &new_config);
+
+        assert_eq!(
+            new_snapshot.resources(super::super::translator::CDS_TYPE_URL)[0].name,
+            "cluster/default/new/8080"
+        );
+        assert_ne!(old_snapshot.version, new_snapshot.version);
+    }
+
+    #[test]
+    fn snapshot_cache_reuses_same_config_identity() {
+        let config = gateway_config_with_named_service("api", 0);
+        let server = test_server(config.clone());
+
+        let first = server.snapshot_for_config("node-a", &config);
+        let second = server.snapshot_for_config("node-a", &config);
+
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn snapshot_cache_rebuilds_after_stream_config_update() {
+        let old_config = gateway_config_with_named_service("old", 0);
+        let new_config = gateway_config_with_named_service("new", 0);
+        let server = test_server(old_config.clone());
+        let mut stream_config = old_config;
+
+        let old_snapshot = server.snapshot_for_config("node-a", &stream_config);
+        assert!(XdsAdsServer::apply_update_to_stream_config(
+            &mut stream_config,
+            &full_config_update(&new_config)
+        ));
+        server.invalidate_snapshot_for_config_update("node-a");
+        let new_snapshot = server.snapshot_for_config("node-a", &stream_config);
 
         assert_eq!(
             new_snapshot.resources(super::super::translator::CDS_TYPE_URL)[0].name,
