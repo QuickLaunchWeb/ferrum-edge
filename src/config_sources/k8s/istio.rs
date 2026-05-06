@@ -15,6 +15,8 @@ use super::{
 };
 use crate::config::types::BackendScheme;
 
+const ALLOW_NOTHING_SPIFFE_PATTERN: &str = "__ferrum_allow_nothing_never_matches__";
+
 pub(super) fn translate(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -101,7 +103,7 @@ fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateEr
         },
     };
 
-    let rules = object
+    let mut rules: Vec<MeshRule> = object
         .spec
         .get("rules")
         .and_then(Value::as_array)
@@ -109,6 +111,9 @@ fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateEr
         .flatten()
         .map(|rule| mesh_rule(rule, action))
         .collect();
+    if rules.is_empty() && action == PolicyAction::Allow {
+        rules.push(allow_nothing_rule());
+    }
 
     Ok(MeshPolicy {
         name: object.metadata.name.clone(),
@@ -116,6 +121,19 @@ fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateEr
         scope,
         rules,
     })
+}
+
+fn allow_nothing_rule() -> MeshRule {
+    MeshRule {
+        from: vec![PrincipalMatch {
+            spiffe_id_pattern: Some(ALLOW_NOTHING_SPIFFE_PATTERN.to_string()),
+            namespace_pattern: None,
+            trust_domain: None,
+        }],
+        to: Vec::new(),
+        when: Vec::new(),
+        action: PolicyAction::Allow,
+    }
 }
 
 fn mesh_rule(rule: &Value, action: PolicyAction) -> MeshRule {
@@ -426,6 +444,10 @@ mod tests {
     use super::*;
     use crate::config_sources::k8s::{K8sMetadata, K8sTranslationOptions, translate_k8s_objects};
     use crate::identity::spiffe::TrustDomain;
+    use crate::modes::mesh::policy::{
+        MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
+    };
+    use crate::xds::slice::MeshSlice;
 
     fn options() -> K8sTranslationOptions {
         K8sTranslationOptions::new(
@@ -470,6 +492,45 @@ mod tests {
         assert_eq!(mesh.mesh_policies.len(), 1);
         assert_eq!(mesh.mesh_policies[0].rules[0].action, PolicyAction::Deny);
         assert_eq!(mesh.mesh_policies[0].rules[0].to[0].ports, vec![8080]);
+    }
+
+    #[test]
+    fn translates_allow_authorization_policy_without_rules_to_allow_nothing() {
+        let result = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "selector": {"matchLabels": {"app": "api"}}
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.mesh_policies[0].rules.len(), 1);
+        assert_eq!(mesh.mesh_policies[0].rules[0].action, PolicyAction::Allow);
+        assert_eq!(
+            mesh.mesh_policies[0].rules[0].from[0]
+                .spiffe_id_pattern
+                .as_deref(),
+            Some(ALLOW_NOTHING_SPIFFE_PATTERN)
+        );
+
+        let decision = evaluate_mesh_authorization(
+            &MeshSlice {
+                mesh_policies: mesh.mesh_policies,
+                ..MeshSlice::default()
+            },
+            &MeshAuthzRequest::default(),
+        );
+        assert_eq!(
+            decision,
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
     }
 
     #[test]
