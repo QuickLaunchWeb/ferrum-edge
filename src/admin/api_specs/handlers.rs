@@ -24,7 +24,7 @@ use crate::admin::api_specs::{
 };
 use crate::admin::spec_codec;
 use crate::config::db_backend::{ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, SortOrder};
-use crate::config::types::{ApiSpec, PluginAssociation};
+use crate::config::types::{ApiSpec, PluginAssociation, Upstream};
 
 // ---------------------------------------------------------------------------
 // Internal error type
@@ -805,8 +805,8 @@ fn assign_ids_for_post(bundle: &mut ExtractedBundle) {
 /// - `proxy.id`: always use `existing_proxy_id` (the same-proxy-id rule
 ///   enforces this anyway; if the spec sets a non-matching proxy.id
 ///   explicitly, the immutability check catches it later).
-/// - `upstream.id`: if empty, reuse existing `proxy.upstream_id` if `Some`
-///   and non-empty, else mint UUID.
+/// - `upstream.id`: if empty, reuse the existing upstream tagged with this
+///   api_spec_id if present, else mint UUID.
 /// - `plugin.id`: if empty, match by canonical `(plugin_name, config_json,
 ///   priority_override)` tuple against existing spec-owned plugins (Fix 5).
 ///   If two extracted plugins share the same plugin_name with DIFFERENT
@@ -828,6 +828,7 @@ async fn assign_ids_for_put(
     db: &Arc<dyn DatabaseBackend>,
     namespace: &str,
     existing_spec: &ApiSpec,
+    existing_spec_upstream: Option<&Upstream>,
     spec_version: &str,
 ) -> Result<(), ApiSpecError> {
     // If proxy.id is empty (operator did not supply one), fill it in from
@@ -845,13 +846,14 @@ async fn assign_ids_for_put(
         Err(e) => return Err(classify_db_error(e)),
     };
 
-    // Upstream ID: reuse existing if empty.
+    // Upstream ID: reuse the existing spec-owned upstream if empty. Do not use
+    // the current proxy.upstream_id here; direct admin CRUD can drift that
+    // pointer to a hand-managed upstream while preserving proxy.api_spec_id.
     if let Some(ref mut u) = bundle.upstream
         && u.id.is_empty()
     {
-        let reuse_id = existing_proxy
-            .as_ref()
-            .and_then(|p| p.upstream_id.as_deref())
+        let reuse_id = existing_spec_upstream
+            .map(|u| u.id.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string);
         u.id = reuse_id.unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -991,17 +993,8 @@ async fn assign_ids_for_put(
         u.updated_at = now;
         // If the upstream ID matches what was previously stored, preserve its
         // created_at. Otherwise (new upstream) use now.
-        let stored_upstream_id = existing_proxy
-            .as_ref()
-            .and_then(|p| p.upstream_id.as_deref())
-            .unwrap_or("");
-        if u.id == stored_upstream_id {
-            // Fetch the stored upstream's created_at if available.
-            if let Ok(Some(stored_upstream)) = db.get_upstream(&u.id).await {
-                u.created_at = stored_upstream.created_at;
-            } else {
-                u.created_at = now;
-            }
+        if let Some(stored_upstream) = existing_spec_upstream.filter(|stored| stored.id == u.id) {
+            u.created_at = stored_upstream.created_at;
         } else {
             u.created_at = now;
         }
@@ -1042,6 +1035,25 @@ async fn assign_ids_for_put(
     bundle.proxy.plugins = assocs;
 
     Ok(())
+}
+
+async fn load_single_spec_owned_upstream(
+    db: &Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    spec_id: &str,
+) -> Result<Option<Upstream>, ApiSpecError> {
+    let upstreams = db
+        .list_spec_owned_upstreams(namespace, spec_id)
+        .await
+        .map_err(classify_db_error)?;
+    match upstreams.len() {
+        0 => Ok(None),
+        1 => Ok(upstreams.into_iter().next()),
+        n => Err(ApiSpecError::Internal(format!(
+            "api_spec '{}' owns {} upstreams; expected at most one",
+            spec_id, n
+        ))),
+    }
 }
 
 /// Maximum recursion depth for [`sort_json_keys`].
@@ -2013,6 +2025,12 @@ pub async fn handle_put_api_spec(
         Err(e) => return Ok(error_response(ApiSpecError::Extract(e))),
     };
 
+    let existing_spec_upstream =
+        match load_single_spec_owned_upstream(db, namespace, &existing_spec.id).await {
+            Ok(upstream) => upstream,
+            Err(e) => return Ok(error_response(e)),
+        };
+
     // Assign IDs for PUT: reuse existing stored IDs for empty-id resources so
     // re-submitting the same ID-less spec is idempotent (Fix 1). This must
     // happen BEFORE the proxy-id immutability check and hash comparison.
@@ -2021,6 +2039,7 @@ pub async fn handle_put_api_spec(
         db,
         namespace,
         &existing_spec,
+        existing_spec_upstream.as_ref(),
         &metadata.version,
     )
     .await
@@ -2056,9 +2075,7 @@ pub async fn handle_put_api_spec(
             Ok(p) => p,
             Err(e) => return Ok(error_response(classify_db_error(e))),
         };
-    let existing_upstream_id: Option<&str> = existing_proxy_row
-        .as_ref()
-        .and_then(|p| p.upstream_id.as_deref());
+    let existing_upstream_id: Option<&str> = existing_spec_upstream.as_ref().map(|u| u.id.as_str());
 
     let ValidatedBundle { bundle, metadata } = match validate_bundle(
         bundle,

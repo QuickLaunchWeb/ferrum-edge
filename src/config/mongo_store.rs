@@ -35,7 +35,7 @@ mod inner {
     use arc_swap::ArcSwap;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
-    use mongodb::bson::{Bson, Document, doc};
+    use mongodb::bson::{Binary, Bson, Document, doc, spec::BinarySubtype};
     use mongodb::options::{ClientOptions, FindOptions, IndexOptions, Tls, TlsOptions};
     use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
     use std::collections::HashSet;
@@ -873,11 +873,52 @@ mod inner {
     fn api_spec_to_doc(spec: &ApiSpec) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(spec)?;
         doc.insert("_id", spec.id.as_str());
+        doc.insert(
+            "spec_content",
+            Bson::Binary(Binary {
+                subtype: BinarySubtype::Generic,
+                bytes: spec.spec_content.clone(),
+            }),
+        );
         Ok(doc)
     }
 
-    fn doc_to_api_spec(doc: Document) -> Result<ApiSpec, anyhow::Error> {
-        Ok(mongodb::bson::from_document(doc)?)
+    fn doc_to_api_spec(mut doc: Document) -> Result<ApiSpec, anyhow::Error> {
+        let spec_content = match doc.remove("spec_content") {
+            Some(Bson::Binary(binary)) => binary.bytes,
+            Some(Bson::Array(values)) => {
+                let mut bytes = Vec::with_capacity(values.len());
+                for value in values {
+                    let byte = match value {
+                        Bson::Int32(v) if (0..=u8::MAX as i32).contains(&v) => v as u8,
+                        Bson::Int64(v) if (0..=u8::MAX as i64).contains(&v) => v as u8,
+                        other => {
+                            anyhow::bail!(
+                                "api_specs.spec_content array contains non-byte value: {:?}",
+                                other
+                            );
+                        }
+                    };
+                    bytes.push(byte);
+                }
+                bytes
+            }
+            Some(other) => {
+                anyhow::bail!(
+                    "api_specs.spec_content has unexpected BSON type: {:?}",
+                    other
+                );
+            }
+            None => anyhow::bail!("api_specs.spec_content missing"),
+        };
+
+        // Let serde populate the rest of the struct, then restore the bytes
+        // from the BSON Binary above. This avoids materializing a huge BSON
+        // integer array just to satisfy Vec<u8> deserialization.
+        doc.insert("spec_content", Bson::Array(Vec::new()));
+        let mut spec: ApiSpec = mongodb::bson::from_document(doc)?;
+        spec.spec_content = spec_content;
+        Ok(spec)
     }
 
     // -----------------------------------------------------------------------
@@ -1260,22 +1301,21 @@ mod inner {
             }
 
             // Non-replica-set best-effort path.
-            let upstream_id_to_check: Option<String> = self
-                .proxies()
-                .find_one(doc! { "_id": id })
-                .await?
+            let proxy_doc = self.proxies().find_one(doc! { "_id": id }).await?;
+            let upstream_id_to_check: Option<String> = proxy_doc
+                .as_ref()
                 .and_then(|doc| doc.get_str("upstream_id").ok().map(str::to_string));
+            let spec_id: Option<String> =
+                match self.api_specs().find_one(doc! { "proxy_id": id }).await {
+                    Ok(Some(doc)) => doc.get_str("_id").ok().map(str::to_string),
+                    _ => None,
+                };
 
-            self.plugin_configs()
-                .delete_many(doc! { "proxy_id": id })
-                .await?;
             let result = self.proxies().delete_one(doc! { "_id": id }).await?;
             if result.deleted_count > 0 {
-                let spec_id: Option<String> =
-                    match self.api_specs().find_one(doc! { "proxy_id": id }).await {
-                        Ok(Some(doc)) => doc.get_str("_id").ok().map(str::to_string),
-                        _ => None,
-                    };
+                self.plugin_configs()
+                    .delete_many(doc! { "proxy_id": id })
+                    .await?;
                 let _ = self.api_specs().delete_one(doc! { "proxy_id": id }).await;
                 if let Some(ref sid) = spec_id {
                     let _ = self
@@ -2882,6 +2922,34 @@ mod inner {
             Ok(configs)
         }
 
+        async fn list_spec_owned_upstreams(
+            &self,
+            namespace: &str,
+            spec_id: &str,
+        ) -> Result<Vec<crate::config::types::Upstream>, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let options = FindOptions::builder()
+                .sort(doc! { "created_at": 1, "_id": 1 })
+                .build();
+            let mut cursor = self
+                .upstreams()
+                .find(doc! { "namespace": namespace, "api_spec_id": spec_id })
+                .with_options(options)
+                .await?;
+            let mut upstreams = Vec::new();
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                match doc_to_upstream(doc) {
+                    Ok(upstream) => upstreams.push(upstream),
+                    Err(e) => {
+                        tracing::warn!("list_spec_owned_upstreams: skipping malformed doc: {}", e);
+                    }
+                }
+            }
+            self.check_slow_query("list_spec_owned_upstreams", start);
+            Ok(upstreams)
+        }
+
         async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
 
@@ -3192,6 +3260,46 @@ mod inner {
                 removed.is_empty(),
                 "additions in current should not appear as removals"
             );
+        }
+
+        #[test]
+        fn api_spec_doc_stores_spec_content_as_bson_binary() {
+            let now = chrono::Utc::now();
+            let spec = ApiSpec {
+                id: "spec-1".to_string(),
+                namespace: "ferrum".to_string(),
+                proxy_id: "proxy-1".to_string(),
+                spec_version: "3.1.0".to_string(),
+                spec_format: crate::config::types::SpecFormat::Json,
+                spec_content: vec![0, 1, 2, 253, 254, 255],
+                content_encoding: "gzip".to_string(),
+                uncompressed_size: 128,
+                content_hash: "a".repeat(64),
+                title: Some("Example".to_string()),
+                info_version: Some("1.0.0".to_string()),
+                description: None,
+                contact_name: None,
+                contact_email: None,
+                license_name: None,
+                license_identifier: None,
+                tags: vec!["api".to_string()],
+                server_urls: vec!["https://api.example.com".to_string()],
+                operation_count: 3,
+                resource_hash: "b".repeat(64),
+                created_at: now,
+                updated_at: now,
+            };
+
+            let doc = api_spec_to_doc(&spec).expect("api_spec_to_doc");
+            assert!(
+                matches!(doc.get("spec_content"), Some(Bson::Binary(_))),
+                "spec_content must be BSON Binary, not an integer array"
+            );
+
+            let restored = doc_to_api_spec(doc).expect("doc_to_api_spec");
+            assert_eq!(restored.spec_content, spec.spec_content);
+            assert_eq!(restored.tags, spec.tags);
+            assert_eq!(restored.server_urls, spec.server_urls);
         }
 
         #[test]
@@ -3890,6 +3998,27 @@ mod inner {
                 DELETE_PROXY_SEQUENTIAL_ORDER.first().copied(),
                 Some("delete_proxy_document"),
                 "delete_proxy MUST start by removing the proxy document"
+            );
+        }
+
+        #[test]
+        fn delete_proxy_standalone_implementation_deletes_proxy_before_plugins() {
+            let source = include_str!("mongo_store.rs");
+            let standalone_start = source
+                .find("// Non-replica-set best-effort path.")
+                .expect("standalone delete_proxy marker");
+            let standalone_path = &source[standalone_start..];
+            let proxy_delete = standalone_path
+                .find("let result = self.proxies().delete_one")
+                .expect("standalone proxy delete call");
+            let plugin_cleanup = standalone_path
+                .find("self.plugin_configs()")
+                .expect("standalone plugin config cleanup call");
+            assert!(
+                proxy_delete < plugin_cleanup,
+                "standalone delete_proxy must delete the proxy document before \
+                 proxy-scoped plugin_configs so partial failure leaves a \
+                 runtime-safe database shape"
             );
         }
 

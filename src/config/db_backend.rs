@@ -541,6 +541,21 @@ pub trait DatabaseBackend: Send + Sync {
         namespace: &str,
         spec_id: &str,
     ) -> Result<Vec<crate::config::types::PluginConfig>, anyhow::Error>;
+
+    /// List upstreams owned by a specific api spec (tagged with
+    /// `api_spec_id = spec_id`).
+    ///
+    /// Used by the PUT handler to resolve the existing spec-owned upstream
+    /// independently from the mutable proxy.upstream_id pointer, which regular
+    /// admin CRUD can change.
+    ///
+    /// Admin-only. NEVER call from polling loops, gRPC distribution, or
+    /// GatewayConfig loading.
+    async fn list_spec_owned_upstreams(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+    ) -> Result<Vec<crate::config::types::Upstream>, anyhow::Error>;
 }
 
 /// Extract known IDs from a full config (used to seed the incremental poller).

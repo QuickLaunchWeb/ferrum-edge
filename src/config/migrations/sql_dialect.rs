@@ -125,7 +125,7 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_api_specs_namespace_updated_at ON api_specs (namespace, updated_at)",
             // Wave 5 indexes — for spec_version filter, title sort, operation_count sort, created_at sort
             "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_spec_version ON api_specs (namespace, spec_version)",
-            "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_title ON api_specs (namespace, title)",
+            self.api_specs_title_index_sql(),
             "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_operation_count ON api_specs (namespace, operation_count)",
             "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_created_at ON api_specs (namespace, created_at)",
             // Back-link indexes: replace_api_spec_bundle and delete_api_spec
@@ -184,6 +184,18 @@ impl V001SqlBuilder {
 
     fn is_sqlite(&self) -> bool {
         matches!(self.dialect, SqlDialect::Sqlite)
+    }
+
+    fn api_specs_title_index_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            // MySQL cannot index a TEXT column without a key length. The
+            // extractor caps title at 1024 bytes; a 255-character prefix keeps
+            // the namespace+title index comfortably inside InnoDB's common
+            // utf8mb4 key length limits while preserving useful title sorting.
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_title ON api_specs (namespace, title(255))"
+        } else {
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_title ON api_specs (namespace, title)"
+        }
     }
 
     fn create_upstreams_sql(&self) -> &'static str {
@@ -481,8 +493,8 @@ impl V001SqlBuilder {
                 contact_email TEXT,
                 license_name TEXT,
                 license_identifier TEXT,
-                tags VARCHAR(8192) NOT NULL DEFAULT '[]',
-                server_urls VARCHAR(8192) NOT NULL DEFAULT '[]',
+                tags LONGTEXT NOT NULL,
+                server_urls LONGTEXT NOT NULL,
                 operation_count INTEGER NOT NULL DEFAULT 0,
                 resource_hash VARCHAR(64) NOT NULL DEFAULT '',
                 created_at VARCHAR(50) NOT NULL,
@@ -594,6 +606,29 @@ mod tests {
             builder
                 .unique_listen_port_sql()
                 .contains("CREATE UNIQUE INDEX idx_proxies_unique_listen_port")
+        );
+    }
+
+    #[test]
+    fn test_mysql_api_specs_title_index_uses_prefix_length() {
+        let builder = V001SqlBuilder::new("mysql");
+        assert!(
+            builder.api_specs_title_index_sql().contains("title(255)"),
+            "MySQL must use a prefix length when indexing api_specs.title TEXT"
+        );
+    }
+
+    #[test]
+    fn test_mysql_api_specs_metadata_columns_hold_extractor_caps() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_api_specs_sql();
+        assert!(
+            sql.contains("tags LONGTEXT NOT NULL"),
+            "tags must not be capped at VARCHAR(8192); extractor caps can exceed that"
+        );
+        assert!(
+            sql.contains("server_urls LONGTEXT NOT NULL"),
+            "server_urls must not be capped at VARCHAR(8192); extractor caps can exceed that"
         );
     }
 

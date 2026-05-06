@@ -19,7 +19,7 @@ use ferrum_edge::{
     },
     config::{
         db_loader::{DatabaseStore, DbPoolConfig},
-        types::Proxy,
+        types::{Proxy, Upstream},
     },
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -2053,6 +2053,101 @@ async fn put_keeps_same_upstream_name_succeeds() {
         s2,
         reqwest::StatusCode::OK,
         "PUT with same upstream name must succeed (not 409/422); body: {b2}"
+    );
+}
+
+#[tokio::test]
+async fn put_idless_upstream_reuses_spec_owned_upstream_after_proxy_drift() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let state = make_admin_state(store.clone(), 10);
+    let (base, _shutdown) = start_admin(state).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let spec_upstream_id = uid("spec-upstream");
+    let hand_upstream_id = uid("hand-upstream");
+    let shared_name = uid("shared-name");
+    let listen_path = format!("/{proxy_id}");
+
+    let spec_v1 = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "PUT idless drift", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": listen_path
+        },
+        "x-ferrum-upstream": {
+            "id": spec_upstream_id,
+            "name": shared_name,
+            "targets": [{"host": "target.internal", "port": 443}]
+        }
+    });
+    let (s1, b1) = client.post_json("/api-specs", &spec_v1).await;
+    assert_eq!(s1, reqwest::StatusCode::CREATED, "POST: {b1}");
+    let spec_id = b1["id"].as_str().unwrap().to_string();
+
+    // Drift the proxy through the direct DB/admin path to a hand-created
+    // upstream. The later id-less PUT must still reuse the upstream tagged
+    // with api_spec_id, not this mutable proxy pointer.
+    let hand_upstream: Upstream = serde_json::from_value(json!({
+        "id": hand_upstream_id,
+        "namespace": "ferrum",
+        "name": uid("manual-name"),
+        "targets": [{"host": "manual.internal", "port": 443}]
+    }))
+    .expect("hand upstream");
+    store
+        .create_upstream(&hand_upstream)
+        .await
+        .expect("create hand upstream");
+    let mut drifted_proxy = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get proxy")
+        .expect("proxy exists");
+    drifted_proxy.upstream_id = Some(hand_upstream.id.clone());
+    store
+        .update_proxy(&drifted_proxy)
+        .await
+        .expect("drift proxy upstream_id");
+
+    let spec_v2 = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "PUT idless drift", "version": "1.0.1"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": listen_path
+        },
+        "x-ferrum-upstream": {
+            "id": "",
+            "name": shared_name,
+            "targets": [{"host": "target-v2.internal", "port": 443}]
+        }
+    });
+
+    let (s2, b2) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec_v2)
+        .await;
+    assert_eq!(
+        s2,
+        reqwest::StatusCode::OK,
+        "id-less PUT must reuse the spec-owned upstream, not the drifted proxy pointer; body: {b2}"
+    );
+
+    let proxy_after = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get proxy after PUT")
+        .expect("proxy after PUT");
+    assert_eq!(
+        proxy_after.upstream_id.as_deref(),
+        Some(spec_upstream_id.as_str()),
+        "PUT must restore the proxy to the original spec-owned upstream id"
     );
 }
 

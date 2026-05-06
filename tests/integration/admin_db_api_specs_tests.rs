@@ -3240,6 +3240,61 @@ async fn delete_proxy_cleans_up_orphaned_upstream() {
     );
 }
 
+#[tokio::test]
+async fn delete_proxy_removes_drifted_spec_owned_upstream() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let spec_id = uid("spec");
+    let proxy_id = uid("proxy");
+    let spec_upstream_id = uid("spec-upstream");
+    let hand_upstream_id = uid("hand-upstream");
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.upstream_id = Some(spec_upstream_id.clone());
+    let bundle = ExtractedBundle {
+        proxy: proxy.clone(),
+        upstream: Some(make_upstream(&spec_upstream_id, ns)),
+        plugins: vec![],
+    };
+    let spec = make_spec(&spec_id, &proxy_id, ns, br#"{"openapi":"3.1.0"}"#);
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("submit api spec bundle");
+
+    // Simulate direct admin CRUD drift: the spec-owned proxy now points at a
+    // hand-managed upstream, but the original spec-owned upstream still carries
+    // api_spec_id = spec_id.
+    store
+        .create_upstream(&make_upstream(&hand_upstream_id, ns))
+        .await
+        .expect("create hand upstream");
+    let mut drifted_proxy = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get proxy")
+        .expect("proxy exists");
+    drifted_proxy.upstream_id = Some(hand_upstream_id.clone());
+    store
+        .update_proxy(&drifted_proxy)
+        .await
+        .expect("drift proxy upstream");
+
+    let deleted = store.delete_proxy(&proxy_id).await.expect("delete proxy");
+    assert!(deleted, "delete_proxy must delete the spec-owned proxy");
+
+    let spec_upstream = store
+        .get_upstream(&spec_upstream_id)
+        .await
+        .expect("get spec upstream");
+    assert!(
+        spec_upstream.is_none(),
+        "delete_proxy must delete the upstream tagged with the cascaded api_spec_id"
+    );
+}
+
 // ===========================================================================
 // Round 8 PR review fixes — concurrency and MongoDB gap documentation
 // ===========================================================================

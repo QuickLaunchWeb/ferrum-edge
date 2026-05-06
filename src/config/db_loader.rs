@@ -1026,14 +1026,34 @@ impl DatabaseStore {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
 
-        // Look up the proxy's upstream_id before deleting so we can cascade-delete
-        // the upstream if it becomes orphaned.
-        let upstream_id: Option<String> =
+        // Look up the proxy's current upstream_id before deleting so we can
+        // cascade-delete that upstream if it becomes orphaned. Also capture the
+        // api_spec row, if this proxy owns one, before the FK cascade removes it.
+        let proxy_row: Option<AnyRow> =
             sqlx::query(&self.q("SELECT upstream_id FROM proxies WHERE id = ?"))
                 .bind(id)
                 .fetch_optional(&mut *tx)
-                .await?
-                .and_then(|row| row.try_get::<String, _>("upstream_id").ok());
+                .await?;
+        let Some(proxy_row) = proxy_row else {
+            tx.rollback().await?;
+            self.check_slow_query("delete_proxy", start);
+            return Ok(false);
+        };
+        let upstream_id: Option<String> = proxy_row.try_get::<String, _>("upstream_id").ok();
+
+        let spec_row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT id, namespace FROM api_specs WHERE proxy_id = ?"))
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let spec_owner: Option<(String, String)> = spec_row
+            .as_ref()
+            .map(|row| Ok::<_, anyhow::Error>((row.try_get("id")?, row.try_get("namespace")?)))
+            .transpose()?;
+        if let Some((ref spec_id, ref namespace)) = spec_owner {
+            self.ensure_no_external_spec_upstream_refs_tx(&mut tx, namespace, spec_id, id)
+                .await?;
+        }
 
         // Clean up junction table (defense in depth alongside ON DELETE CASCADE)
         sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE proxy_id = ?"))
@@ -1048,11 +1068,23 @@ impl DatabaseStore {
 
         if result.rows_affected() == 0 {
             tx.rollback().await?;
+            self.check_slow_query("delete_proxy", start);
             return Ok(false);
         }
 
         // Clean up orphaned proxy_group plugin configs (no remaining associations)
         self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
+
+        // If this was a spec-owned proxy, delete every upstream tagged with the
+        // spec id, not only the proxy's current upstream_id. Direct admin CRUD
+        // can drift the pointer away from the original spec-owned upstream.
+        if let Some((ref spec_id, ref namespace)) = spec_owner {
+            sqlx::query(&self.q("DELETE FROM upstreams WHERE api_spec_id = ? AND namespace = ?"))
+                .bind(spec_id)
+                .bind(namespace)
+                .execute(&mut *tx)
+                .await?;
+        }
 
         // If the proxy had an upstream, check if it's now orphaned and delete it
         if let Some(ref uid) = upstream_id {
@@ -4370,6 +4402,36 @@ impl DatabaseStore {
         self.check_slow_query("list_spec_owned_plugin_configs", start);
         Ok(configs)
     }
+
+    /// List upstreams owned by `spec_id` (i.e., tagged with
+    /// `api_spec_id = spec_id`).
+    ///
+    /// Used by the PUT handler to reuse the previous spec-owned upstream ID
+    /// even when direct admin CRUD drifted the proxy's upstream pointer.
+    /// Admin-only — NEVER call from polling loops or GatewayConfig loading.
+    pub async fn list_spec_owned_upstreams(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+    ) -> Result<Vec<Upstream>, anyhow::Error> {
+        let start = std::time::Instant::now();
+        let rows: Vec<AnyRow> = sqlx::query(&self.q(concat!(
+            "SELECT * FROM upstreams ",
+            "WHERE namespace = ? AND api_spec_id = ? ",
+            "ORDER BY created_at ASC, id ASC"
+        )))
+        .bind(namespace)
+        .bind(spec_id)
+        .fetch_all(&self.pool())
+        .await?;
+
+        let mut upstreams = Vec::with_capacity(rows.len());
+        for row in rows {
+            upstreams.push(row_to_upstream(&row)?);
+        }
+        self.check_slow_query("list_spec_owned_upstreams", start);
+        Ok(upstreams)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4801,6 +4863,14 @@ impl DatabaseBackend for DatabaseStore {
         spec_id: &str,
     ) -> Result<Vec<PluginConfig>, anyhow::Error> {
         DatabaseStore::list_spec_owned_plugin_configs(self, namespace, spec_id).await
+    }
+
+    async fn list_spec_owned_upstreams(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+    ) -> Result<Vec<Upstream>, anyhow::Error> {
+        DatabaseStore::list_spec_owned_upstreams(self, namespace, spec_id).await
     }
 }
 
