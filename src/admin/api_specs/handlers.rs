@@ -1368,12 +1368,14 @@ async fn validate_bundle(
     if failures.is_empty() {
         let proxy = &bundle.proxy;
 
-        // --- Fix 1: upstream_id existence check ---
         // Mirrors Proxy::after_validate in crud.rs: when the proxy references an
         // upstream by ID, verify the upstream actually exists.  If the bundle
         // includes its own upstream (x-ferrum-upstream) whose ID matches, we
         // accept it without a DB round-trip (it's about to be inserted).
-        // Otherwise call check_upstream_exists and reject with 422 if missing.
+        // Otherwise load the upstream row and reject missing, cross-namespace,
+        // or spec-owned upstreams. Referencing a spec-owned upstream without
+        // including it in this bundle is unsafe: PUT/DELETE lifecycle cleanup
+        // owns those rows by api_spec_id and can remove them.
         if let Some(ref upstream_id) = proxy.upstream_id {
             let bundled_id_matches = bundle
                 .upstream
@@ -1381,9 +1383,30 @@ async fn validate_bundle(
                 .map(|u| u.id.as_str() == upstream_id.as_str())
                 .unwrap_or(false);
             if !bundled_id_matches {
-                match db.check_upstream_exists(upstream_id, namespace).await {
-                    Ok(true) => {}
-                    Ok(false) => failures.push(ValidationFailure {
+                match db.get_upstream(upstream_id).await {
+                    Ok(Some(existing)) if existing.namespace != namespace => {
+                        failures.push(ValidationFailure {
+                            resource_type: "proxy",
+                            id: proxy.id.clone(),
+                            errors: vec![format!(
+                                "upstream_id '{}' belongs to namespace '{}', not '{}'",
+                                upstream_id, existing.namespace, namespace
+                            )],
+                        });
+                    }
+                    Ok(Some(existing)) if existing.api_spec_id.is_some() => {
+                        failures.push(ValidationFailure {
+                            resource_type: "proxy",
+                            id: proxy.id.clone(),
+                            errors: vec![format!(
+                                "upstream_id '{}' is owned by api_spec '{}' and cannot be referenced as an external upstream; include x-ferrum-upstream with this id in the spec instead",
+                                upstream_id,
+                                existing.api_spec_id.as_deref().unwrap_or("<unknown>")
+                            )],
+                        });
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => failures.push(ValidationFailure {
                         resource_type: "proxy",
                         id: proxy.id.clone(),
                         errors: vec![format!("upstream_id '{upstream_id}' does not exist")],

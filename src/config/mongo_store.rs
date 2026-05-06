@@ -110,6 +110,26 @@ mod inner {
         "delete_api_spec_document",
     ];
 
+    /// Step labels for standalone-mongod api-spec bundle inserts/reinserts.
+    /// Dependency documents are created before the proxy document so polling can
+    /// never observe a live proxy that points at missing plugin/upstream docs.
+    pub(super) const API_SPEC_STANDALONE_INSERT_ORDER: &[&str] = &[
+        "insert_upstream_document",
+        "insert_plugin_config_documents",
+        "insert_proxy_document",
+        "insert_api_spec_document",
+    ];
+
+    /// Step labels for compensating rollback after a partial standalone insert.
+    /// The proxy is removed before plugin/upstream dependencies so rollback
+    /// failures preserve a runtime-safe route if the proxy cannot be deleted.
+    pub(super) const COMPENSATE_BUNDLE_INSERT_ORDER: &[&str] = &[
+        "delete_api_spec_document",
+        "delete_proxy_document",
+        "delete_plugin_config_documents",
+        "delete_upstream_document",
+    ];
+
     /// Step labels for the standalone-mongod (no-replica-set) `update_proxy`
     /// path, in execution order. Cleanup runs after the replace because the
     /// new proxy.plugins array determines which proxy_group plugin_configs
@@ -2525,18 +2545,18 @@ mod inner {
                         inserted_upstream = Some(u.id.clone());
                     }
 
-                    {
-                        let mut doc = proxy_to_doc(&bundle.proxy)?;
-                        doc.insert("api_spec_id", spec.id.as_str());
-                        self.proxies().insert_one(doc).await?;
-                        inserted_proxy = Some(bundle.proxy.id.clone());
-                    }
-
                     for pc in &bundle.plugins {
                         let mut doc = plugin_config_to_doc(pc)?;
                         doc.insert("api_spec_id", spec.id.as_str());
                         self.plugin_configs().insert_one(doc).await?;
                         inserted_plugins.push(pc.id.clone());
+                    }
+
+                    {
+                        let mut doc = proxy_to_doc(&bundle.proxy)?;
+                        doc.insert("api_spec_id", spec.id.as_str());
+                        self.proxies().insert_one(doc).await?;
+                        inserted_proxy = Some(bundle.proxy.id.clone());
                     }
 
                     let spec_doc = api_spec_to_doc(spec)?;
@@ -2708,6 +2728,14 @@ mod inner {
                 let mut session = self.client.load().start_session().await?;
                 session.start_transaction().await?;
 
+                self.ensure_no_external_spec_upstream_refs_opt_session(
+                    Some(&mut session),
+                    &spec.namespace,
+                    &spec.id,
+                    &spec.proxy_id,
+                )
+                .await?;
+
                 // Delete spec-owned resources (leaf-first).
                 self.plugin_configs()
                     .delete_many(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
@@ -2841,17 +2869,17 @@ mod inner {
                         self.upstreams().insert_one(doc).await?;
                         inserted_upstream_id = Some(u.id.clone());
                     }
-                    {
-                        let mut doc = proxy_to_doc(&effective_bundle.proxy)?;
-                        doc.insert("api_spec_id", spec.id.as_str());
-                        self.proxies().insert_one(doc).await?;
-                        inserted_proxy_id = Some(effective_bundle.proxy.id.clone());
-                    }
                     for pc in &effective_bundle.plugins {
                         let mut doc = plugin_config_to_doc(pc)?;
                         doc.insert("api_spec_id", spec.id.as_str());
                         self.plugin_configs().insert_one(doc).await?;
                         inserted_plugin_ids.push(pc.id.clone());
+                    }
+                    {
+                        let mut doc = proxy_to_doc(&effective_bundle.proxy)?;
+                        doc.insert("api_spec_id", spec.id.as_str());
+                        self.proxies().insert_one(doc).await?;
+                        inserted_proxy_id = Some(effective_bundle.proxy.id.clone());
                     }
                     let spec_doc = api_spec_to_doc(spec)?;
                     self.api_specs().insert_one(spec_doc).await?;
@@ -3092,6 +3120,14 @@ mod inner {
                 let mut session = self.client.load().start_session().await?;
                 session.start_transaction().await?;
 
+                self.ensure_no_external_spec_upstream_refs_opt_session(
+                    Some(&mut session),
+                    namespace,
+                    id,
+                    proxy_id.as_deref().unwrap_or(""),
+                )
+                .await?;
+
                 // 1. Spec-owned plugin_configs.
                 self.plugin_configs()
                     .delete_many(doc! { "api_spec_id": id, "namespace": namespace })
@@ -3285,6 +3321,17 @@ mod inner {
                     sid, e
                 );
             }
+            if let Some(pid) = proxy_id
+                && let Err(e) = self.proxies().delete_one(doc! { "_id": pid }).await
+            {
+                warn!(
+                    "compensate_bundle_insert: failed to delete proxy {}; \
+                     leaving inserted dependencies in place to avoid a live proxy \
+                     with dangling references: {}",
+                    pid, e
+                );
+                return;
+            }
             for pid in plugin_ids {
                 if let Err(e) = self.plugin_configs().delete_one(doc! { "_id": pid }).await {
                     warn!(
@@ -3292,14 +3339,6 @@ mod inner {
                         pid, e
                     );
                 }
-            }
-            if let Some(pid) = proxy_id
-                && let Err(e) = self.proxies().delete_one(doc! { "_id": pid }).await
-            {
-                warn!(
-                    "compensate_bundle_insert: failed to delete proxy {}: {}",
-                    pid, e
-                );
             }
             if let Some(uid) = upstream_id
                 && let Err(e) = self.upstreams().delete_one(doc! { "_id": uid }).await
@@ -4225,6 +4264,94 @@ mod inner {
                 proxy_delete < plugin_cleanup,
                 "standalone delete_api_spec must remove the proxy before \
                  deleting plugin_configs"
+            );
+        }
+
+        #[test]
+        fn api_spec_standalone_insert_order_dependencies_before_proxy() {
+            assert_eq!(
+                API_SPEC_STANDALONE_INSERT_ORDER,
+                &[
+                    "insert_upstream_document",
+                    "insert_plugin_config_documents",
+                    "insert_proxy_document",
+                    "insert_api_spec_document",
+                ],
+                "standalone api-spec bundle writes must create dependencies before \
+                 the proxy document becomes pollable"
+            );
+        }
+
+        #[test]
+        fn submit_api_spec_standalone_implementation_inserts_plugins_before_proxy() {
+            let source = include_str!("mongo_store.rs");
+            let standalone_start = source
+                .find("// No replica set: best-effort with compensating rollback on failure.")
+                .expect("standalone submit_api_spec marker");
+            let standalone_path = &source[standalone_start..];
+            let plugin_insert = standalone_path
+                .find("self.plugin_configs().insert_one(doc).await")
+                .expect("standalone submit plugin insert");
+            let proxy_insert = standalone_path
+                .find("self.proxies().insert_one(doc).await")
+                .expect("standalone submit proxy insert");
+            assert!(
+                plugin_insert < proxy_insert,
+                "standalone submit_api_spec_bundle must insert plugin_configs before \
+                 the proxy so a partial insert cannot expose a proxy with missing plugins"
+            );
+        }
+
+        #[test]
+        fn replace_api_spec_standalone_reinsert_implementation_inserts_plugins_before_proxy() {
+            let source = include_str!("mongo_store.rs");
+            let reinsert_start = source
+                .find("// Re-insert new bundle with manual associations preserved.")
+                .expect("standalone replace_api_spec reinsert marker");
+            let reinsert_path = &source[reinsert_start..];
+            let plugin_insert = reinsert_path
+                .find("self.plugin_configs().insert_one(doc).await")
+                .expect("standalone replace plugin insert");
+            let proxy_insert = reinsert_path
+                .find("self.proxies().insert_one(doc).await")
+                .expect("standalone replace proxy insert");
+            assert!(
+                plugin_insert < proxy_insert,
+                "standalone replace_api_spec_bundle must reinsert plugin_configs before \
+                 the proxy so a partial reinsert cannot expose a proxy with missing plugins"
+            );
+        }
+
+        #[test]
+        fn compensate_bundle_insert_order_proxy_before_dependencies() {
+            assert_eq!(
+                COMPENSATE_BUNDLE_INSERT_ORDER,
+                &[
+                    "delete_api_spec_document",
+                    "delete_proxy_document",
+                    "delete_plugin_config_documents",
+                    "delete_upstream_document",
+                ],
+                "compensating rollback must remove the proxy before dependencies"
+            );
+        }
+
+        #[test]
+        fn compensate_bundle_insert_implementation_deletes_proxy_before_plugins() {
+            let source = include_str!("mongo_store.rs");
+            let compensate_start = source
+                .find("async fn compensate_bundle_insert(")
+                .expect("compensate_bundle_insert function");
+            let compensate_path = &source[compensate_start..];
+            let proxy_delete = compensate_path
+                .find("self.proxies().delete_one")
+                .expect("compensating proxy delete");
+            let plugin_delete = compensate_path
+                .find("self.plugin_configs().delete_one")
+                .expect("compensating plugin delete");
+            assert!(
+                proxy_delete < plugin_delete,
+                "compensating rollback must delete the proxy before plugin_configs"
             );
         }
 
