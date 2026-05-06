@@ -509,6 +509,11 @@ pub trait DatabaseBackend: Send + Sync {
 
     /// List ApiSpecs in a namespace, with filtering, sorting, and pagination.
     ///
+    /// This is a summary path: implementations must not hydrate the
+    /// `spec_content` blob for each row. Returned items carry empty
+    /// `spec_content`; callers that need the original document must use
+    /// `get_api_spec` or `get_api_spec_by_proxy`.
+    ///
     /// Default sort is `updated_at DESC` (most recent first).
     /// `filter.limit` and `filter.offset` drive pagination.
     /// The returned [`PaginatedResult`] includes a `total` count of all matching

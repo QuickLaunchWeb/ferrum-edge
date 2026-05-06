@@ -4268,7 +4268,12 @@ impl DatabaseStore {
         };
 
         let sql = self.q(&format!(
-            "SELECT * FROM api_specs WHERE {where_clause} \
+            "SELECT id, namespace, proxy_id, spec_version, spec_format, \
+             content_encoding, uncompressed_size, content_hash, title, \
+             info_version, description, contact_name, contact_email, \
+             license_name, license_identifier, tags, server_urls, \
+             operation_count, created_at, updated_at \
+             FROM api_specs WHERE {where_clause} \
              ORDER BY {order_col} {order_dir} LIMIT ? OFFSET ?"
         ));
 
@@ -4295,7 +4300,7 @@ impl DatabaseStore {
             .await?;
         let mut specs = Vec::with_capacity(rows.len());
         for row in &rows {
-            specs.push(row_to_api_spec(row)?);
+            specs.push(row_to_api_spec_summary(row)?);
         }
         Ok(PaginatedResult {
             items: specs,
@@ -5356,6 +5361,24 @@ pub(crate) fn strip_api_spec_id_from_runtime_config(config: &mut GatewayConfig) 
 /// This function is used exclusively by the admin-layer api_spec methods.
 /// It must NEVER be called from runtime polling paths.
 fn row_to_api_spec(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
+    // spec_content is stored as BLOB/BYTEA — sqlx returns Vec<u8>.
+    let spec_content: Vec<u8> = row.try_get("spec_content")?;
+    row_to_api_spec_with_content(row, spec_content)
+}
+
+/// Parse an api_specs list row into an [`ApiSpec`] summary.
+///
+/// The list endpoint must not pull the compressed `spec_content` blob for
+/// every row. Keep `spec_content` empty here; full document retrieval goes
+/// through [`row_to_api_spec`].
+fn row_to_api_spec_summary(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
+    row_to_api_spec_with_content(row, Vec::new())
+}
+
+fn row_to_api_spec_with_content(
+    row: &AnyRow,
+    spec_content: Vec<u8>,
+) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
     use crate::config::types::{ApiSpec, SpecFormat};
 
     let spec_format_str: String = row.try_get("spec_format")?;
@@ -5363,8 +5386,6 @@ fn row_to_api_spec(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow
         "json" => SpecFormat::Json,
         _ => SpecFormat::Yaml,
     };
-    // spec_content is stored as BLOB/BYTEA — sqlx returns Vec<u8>.
-    let spec_content: Vec<u8> = row.try_get("spec_content")?;
     let uncompressed_size: i64 = row.try_get("uncompressed_size")?;
 
     // Wave 5: parse JSON-text arrays for tags / server_urls.

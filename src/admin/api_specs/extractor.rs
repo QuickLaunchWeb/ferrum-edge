@@ -854,87 +854,174 @@ pub(crate) const MAX_YAML_EXPANDED_NODES: usize = 500_000;
 fn reject_yaml_alias_or_anchor_syntax(body: &[u8]) -> Result<(), ExtractError> {
     let mut in_single_quote = false;
     let mut in_double_quote = false;
-    let mut in_comment = false;
     let mut escaped = false;
     let mut previous_plain_byte: Option<u8> = None;
     let mut i = 0;
+    let mut block_scalar_min_indent: Option<usize> = None;
 
     while i < body.len() {
-        let byte = body[i];
-
-        if in_comment {
-            if byte == b'\n' || byte == b'\r' {
-                in_comment = false;
-                previous_plain_byte = Some(byte);
-            }
-            i += 1;
-            continue;
+        let line_start = i;
+        let mut line_end = i;
+        while line_end < body.len() && body[line_end] != b'\n' && body[line_end] != b'\r' {
+            line_end += 1;
         }
 
-        if in_single_quote {
-            if byte == b'\'' {
-                if body.get(i + 1) == Some(&b'\'') {
-                    i += 2;
-                    continue;
-                }
-                in_single_quote = false;
-                previous_plain_byte = Some(byte);
+        let mut next_line_start = line_end;
+        if next_line_start < body.len() {
+            if body[next_line_start] == b'\r'
+                && body.get(next_line_start + 1).copied() == Some(b'\n')
+            {
+                next_line_start += 2;
+            } else {
+                next_line_start += 1;
             }
-            i += 1;
-            continue;
         }
 
-        if in_double_quote {
-            if escaped {
-                escaped = false;
-                i += 1;
+        let line = &body[line_start..line_end];
+        let indent = line.iter().take_while(|&&b| b == b' ').count();
+        let line_blank = line.iter().all(|b| b.is_ascii_whitespace());
+
+        if let Some(min_indent) = block_scalar_min_indent {
+            if line_blank || indent >= min_indent {
+                previous_plain_byte = Some(b'\n');
+                i = next_line_start;
                 continue;
             }
-            match byte {
-                b'\\' => escaped = true,
-                b'"' => {
-                    in_double_quote = false;
+            block_scalar_min_indent = None;
+        }
+
+        let mut j = line_start;
+        while j < line_end {
+            let byte = body[j];
+
+            if in_single_quote {
+                if byte == b'\'' {
+                    if body.get(j + 1) == Some(&b'\'') {
+                        j += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
                     previous_plain_byte = Some(byte);
                 }
-                _ => {}
+                j += 1;
+                continue;
             }
-            i += 1;
-            continue;
+
+            if in_double_quote {
+                if escaped {
+                    escaped = false;
+                    j += 1;
+                    continue;
+                }
+                match byte {
+                    b'\\' => escaped = true,
+                    b'"' => {
+                        in_double_quote = false;
+                        previous_plain_byte = Some(byte);
+                    }
+                    _ => {}
+                }
+                j += 1;
+                continue;
+            }
+
+            match byte {
+                b'#' => {
+                    break;
+                }
+                b'\'' => {
+                    in_single_quote = true;
+                    previous_plain_byte = Some(byte);
+                }
+                b'"' => {
+                    in_double_quote = true;
+                    previous_plain_byte = Some(byte);
+                }
+                b'|' | b'>'
+                    if yaml_block_scalar_header_min_indent(line, j - line_start, indent)
+                        .is_some() =>
+                {
+                    block_scalar_min_indent =
+                        yaml_block_scalar_header_min_indent(line, j - line_start, indent);
+                    break;
+                }
+                b'&' | b'*'
+                    if yaml_indicator_can_start_after(previous_plain_byte)
+                        && body
+                            .get(j + 1)
+                            .copied()
+                            .is_some_and(is_yaml_anchor_name_byte) =>
+                {
+                    return Err(ExtractError::InvalidYaml(format!(
+                        "{YAML_ANCHORS_UNSUPPORTED_MESSAGE} (found '{}' at byte {j})",
+                        char::from(byte)
+                    )));
+                }
+                _ => {
+                    previous_plain_byte = Some(byte);
+                }
+            }
+
+            j += 1;
         }
 
-        match byte {
-            b'#' => {
-                in_comment = true;
-            }
-            b'\'' => {
-                in_single_quote = true;
-                previous_plain_byte = Some(byte);
-            }
-            b'"' => {
-                in_double_quote = true;
-                previous_plain_byte = Some(byte);
-            }
-            b'&' | b'*'
-                if yaml_indicator_can_start_after(previous_plain_byte)
-                    && body
-                        .get(i + 1)
-                        .copied()
-                        .is_some_and(is_yaml_anchor_name_byte) =>
-            {
-                return Err(ExtractError::InvalidYaml(format!(
-                    "{YAML_ANCHORS_UNSUPPORTED_MESSAGE} (found '{}' at byte {i})",
-                    char::from(byte)
-                )));
-            }
-            _ => {
-                previous_plain_byte = Some(byte);
-            }
+        if next_line_start > line_end {
+            previous_plain_byte = Some(b'\n');
         }
-
-        i += 1;
+        i = next_line_start;
     }
 
     Ok(())
+}
+
+fn yaml_block_scalar_header_min_indent(
+    line: &[u8],
+    indicator_idx: usize,
+    line_indent: usize,
+) -> Option<usize> {
+    let prefix = line.get(..indicator_idx)?;
+    let prefix_trimmed_end = prefix
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let prefix_trimmed = &prefix[..prefix_trimmed_end];
+
+    if !prefix_trimmed.is_empty()
+        && !matches!(prefix_trimmed.last().copied(), Some(b':' | b'-' | b'?'))
+    {
+        return None;
+    }
+
+    let mut explicit_indent: Option<usize> = None;
+    let mut suffix_idx = indicator_idx + 1;
+    while let Some(byte) = line.get(suffix_idx).copied() {
+        match byte {
+            b'1'..=b'9' => {
+                explicit_indent = Some((byte - b'0') as usize);
+                suffix_idx += 1;
+            }
+            b'+' | b'-' => {
+                suffix_idx += 1;
+            }
+            b' ' | b'\t' => {
+                suffix_idx += 1;
+                break;
+            }
+            b'#' => break,
+            _ => return None,
+        }
+    }
+
+    while let Some(byte) = line.get(suffix_idx).copied() {
+        match byte {
+            b' ' | b'\t' => suffix_idx += 1,
+            b'#' => break,
+            _ => return None,
+        }
+    }
+
+    Some(line_indent + explicit_indent.unwrap_or(1))
 }
 
 fn yaml_indicator_can_start_after(previous: Option<u8>) -> bool {
@@ -2361,15 +2448,64 @@ x-ferrum-proxy:
 
     #[test]
     fn yaml_anchor_like_text_in_quotes_and_comments_allowed() {
-        let yaml = b"openapi: '3.1.0'\n\
-                     info:\n\
-                       title: \"R&D *literal*\"\n\
-                       version: '1.0'\n\
-                       description: 'quoted &anchor and *alias text'\n\
-                     # comment mentions &anchor and *alias\n\
-                     x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}";
+        let yaml = concat!(
+            "openapi: '3.1.0'\n",
+            "info:\n",
+            "  title: \"R&D *literal*\"\n",
+            "  version: '1.0'\n",
+            "  description: 'quoted &anchor and *alias text'\n",
+            "# comment mentions &anchor and *alias\n",
+            "x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}",
+        )
+        .as_bytes();
         let (bundle, _meta) = extract(yaml, Some(SpecFormat::Yaml), "default").unwrap();
         assert_eq!(bundle.proxy.id, "test");
+    }
+
+    #[test]
+    fn yaml_anchor_like_text_in_block_scalars_allowed() {
+        let yaml = concat!(
+            "openapi: '3.1.0'\n",
+            "info:\n",
+            "  title: Block Scalars\n",
+            "  version: '1.0'\n",
+            "  description: |\n",
+            "    Use *bold* text in Markdown.\n",
+            "    HTML entity text like &copy; is literal here.\n",
+            "x-ferrum-proxy:\n",
+            "  id: test\n",
+            "  backend_host: x.com\n",
+            "  backend_port: 443",
+        )
+        .as_bytes();
+        let (bundle, meta) = extract(yaml, Some(SpecFormat::Yaml), "default").unwrap();
+        assert_eq!(bundle.proxy.id, "test");
+        assert!(
+            meta.description
+                .as_deref()
+                .is_some_and(|desc| desc.contains("*bold*"))
+        );
+    }
+
+    #[test]
+    fn yaml_anchor_after_block_scalar_still_rejected() {
+        let yaml = concat!(
+            "openapi: '3.1.0'\n",
+            "info:\n",
+            "  title: Block Scalars\n",
+            "  version: '1.0'\n",
+            "  description: >-\n",
+            "    Folded *literal* text is fine.\n",
+            "servers: &servers\n",
+            "  - url: https://example.com\n",
+            "x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}",
+        )
+        .as_bytes();
+        let err = extract(yaml, Some(SpecFormat::Yaml), "default").unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("anchors and aliases")),
+            "expected YAML anchor preflight rejection after block scalar, got {err:?}"
+        );
     }
 
     #[test]

@@ -777,6 +777,51 @@ async fn list_api_specs_namespace_scoped_and_paginated() {
     );
 }
 
+#[tokio::test]
+async fn list_api_specs_does_not_hydrate_spec_content_blob() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let spec_id = uid("spec");
+    let bundle = ExtractedBundle {
+        proxy: make_proxy(&proxy_id, ns),
+        upstream: None,
+        plugins: vec![],
+    };
+    let raw_content = vec![b'x'; 1024 * 64];
+    let spec = make_spec(&spec_id, &proxy_id, ns, &raw_content);
+    let stored_spec_content = spec.spec_content.clone();
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("submit failed");
+
+    let listed = store
+        .list_api_specs(ns, &simple_filter(100, 0))
+        .await
+        .expect("list_api_specs failed")
+        .items;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, spec_id);
+    assert_eq!(listed[0].content_hash, spec.content_hash);
+    assert!(
+        listed[0].spec_content.is_empty(),
+        "list_api_specs is a summary path and must not hydrate the compressed spec blob"
+    );
+
+    let fetched = store
+        .get_api_spec(ns, &spec_id)
+        .await
+        .expect("get_api_spec failed")
+        .expect("spec not found");
+    assert_eq!(
+        fetched.spec_content, stored_spec_content,
+        "single-spec GET must still hydrate the compressed spec blob"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // delete_api_spec — cascade behaviour
 // ---------------------------------------------------------------------------
