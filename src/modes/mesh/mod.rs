@@ -17,11 +17,11 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
-use crate::config::mesh::EastWestGateway;
+use crate::config::mesh::{EastWestGateway, MeshConfig};
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, GatewayConfig, PluginAssociation, PluginConfig, PluginScope,
     Proxy, ResponseBodyMode,
@@ -258,6 +258,25 @@ pub fn prepare_gateway_config_for_mesh(
 ) -> Result<GatewayConfig, anyhow::Error> {
     config.normalize_fields();
     config.normalize_mesh_fields();
+    let mesh_slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+    prepare_normalized_gateway_config_for_mesh(config, runtime, &mesh_slice)
+}
+
+fn prepare_gateway_config_for_native_slice(
+    mut config: GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) -> Result<GatewayConfig, anyhow::Error> {
+    config.normalize_fields();
+    config.normalize_mesh_fields();
+    prepare_normalized_gateway_config_for_mesh(config, runtime, mesh_slice)
+}
+
+fn prepare_normalized_gateway_config_for_mesh(
+    mut config: GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) -> Result<GatewayConfig, anyhow::Error> {
     let mesh_errors = config.validate_mesh_fields();
     if !mesh_errors.is_empty() {
         return Err(anyhow::anyhow!(
@@ -266,11 +285,51 @@ pub fn prepare_gateway_config_for_mesh(
         ));
     }
 
-    let mesh_slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
-    inject_mesh_global_plugins(&mut config, runtime, &mesh_slice);
+    inject_mesh_global_plugins(&mut config, runtime, mesh_slice);
     materialize_east_west_gateway_proxies(&mut config, runtime);
     config.normalize_fields();
     Ok(config)
+}
+
+fn gateway_config_from_mesh_slice(
+    slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+) -> Result<GatewayConfig, anyhow::Error> {
+    let loaded_at = chrono::DateTime::parse_from_rfc3339(&slice.version)
+        .map(|ts| ts.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+    let config = GatewayConfig {
+        mesh: Some(Box::new(MeshConfig {
+            workloads: slice.workloads.clone(),
+            services: slice.services.clone(),
+            mesh_policies: slice.mesh_policies.clone(),
+            peer_authentications: slice.peer_authentications.clone(),
+            service_entries: slice.service_entries.clone(),
+            trust_bundles: slice.trust_bundles.clone(),
+            multi_cluster: slice.multi_cluster.clone(),
+        })),
+        loaded_at,
+        ..GatewayConfig::default()
+    };
+    prepare_gateway_config_for_native_slice(config, runtime, slice)
+}
+
+async fn wait_for_initial_mesh_slice(
+    mesh_state: &MeshRuntimeState,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), anyhow::Error> {
+    tokio::select! {
+        _ = mesh_state.wait_for_first_slice() => Ok(()),
+        _ = wait_for_mesh_shutdown(&mut shutdown_rx) => Err(anyhow::anyhow!("shutdown requested")),
+    }
+}
+
+async fn wait_for_mesh_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    while !*shutdown_rx.borrow() {
+        if shutdown_rx.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 fn materialize_east_west_gateway_proxies(config: &mut GatewayConfig, runtime: &MeshRuntimeConfig) {
@@ -469,12 +528,6 @@ pub async fn run(
     );
 
     let mesh_state = MeshRuntimeState::new();
-    let bootstrap_config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime)
-        .context("failed to prepare mesh plugin bootstrap config")?;
-    info!(
-        mesh_global_plugins = bootstrap_config.plugin_configs.len(),
-        "Mesh global plugin chain prepared"
-    );
 
     let jwt_secret = GrpcJwtSecret::with_issuer(
         env_config.cp_dp_grpc_jwt_secret.clone().ok_or_else(|| {
@@ -485,7 +538,7 @@ pub async fn run(
     let grpc_tls = build_dp_grpc_tls_config(&env_config, &runtime.cp_urls, "Mesh")?;
     let mut background_handles = Vec::new();
 
-    match runtime.config_protocol {
+    let bootstrap_config = match runtime.config_protocol {
         MeshConfigProtocol::Native => {
             let client_config = runtime.native_client_config();
             let request = client_config.subscribe_request(crate::FERRUM_VERSION);
@@ -510,6 +563,23 @@ pub async fn run(
                 has_first_slice = mesh_state.has_first_slice(),
                 "Mesh mode initialized native MeshSubscribe consumer"
             );
+            wait_for_initial_mesh_slice(&mesh_state, shutdown_tx.subscribe())
+                .await
+                .context("mesh runtime stopped before receiving initial mesh slice")?;
+            let initial_slice = mesh_state
+                .snapshot()
+                .as_ref()
+                .as_ref()
+                .cloned()
+                .context("mesh state signaled ready without an installed slice")?;
+            let config = gateway_config_from_mesh_slice(&initial_slice, &runtime)
+                .context("failed to prepare mesh plugin bootstrap config")?;
+            info!(
+                mesh_global_plugins = config.plugin_configs.len(),
+                mesh_slice_version = %initial_slice.version,
+                "Mesh global plugin chain prepared from initial native slice"
+            );
+            config
         }
         MeshConfigProtocol::Xds => {
             let consumer = XdsConfigConsumer::new(runtime.xds_client_config(), mesh_state.clone());
@@ -520,14 +590,22 @@ pub async fn run(
                 has_first_slice = consumer.state().has_first_slice(),
                 "Mesh mode initialized xDS config consumer"
             );
+            let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime)
+                .context("failed to prepare mesh plugin bootstrap config")?;
+            info!(
+                mesh_global_plugins = config.plugin_configs.len(),
+                "Mesh global plugin chain prepared for xDS bootstrap"
+            );
+            config
         }
-    }
+    };
 
     serve_mesh_runtime(
         env_config,
         runtime,
         bootstrap_config,
         shutdown_tx,
+        mesh_state,
         background_handles,
     )
     .await
@@ -538,6 +616,7 @@ async fn serve_mesh_runtime(
     runtime: MeshRuntimeConfig,
     config: GatewayConfig,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    mesh_state: MeshRuntimeState,
     mesh_background_handles: Vec<JoinHandle<()>>,
 ) -> Result<(), anyhow::Error> {
     let dns_cache = DnsCache::new(DnsConfig {
@@ -623,6 +702,12 @@ async fn serve_mesh_runtime(
         proxy_state.status_counts.clone(),
         proxy_state.windowed_metrics.clone(),
         env_config.status_metrics_window_seconds,
+        shutdown_tx.subscribe(),
+    );
+    let mesh_apply_handle = start_mesh_slice_apply_task(
+        mesh_state,
+        proxy_state.clone(),
+        runtime.clone(),
         shutdown_tx.subscribe(),
     );
 
@@ -714,7 +799,12 @@ async fn serve_mesh_runtime(
         shutdown_and_join_mesh(
             proxy_state,
             MeshBackgroundTasks {
-                handles: vec![dns_handle, overload_handle, metrics_handle],
+                handles: vec![
+                    dns_handle,
+                    overload_handle,
+                    metrics_handle,
+                    mesh_apply_handle,
+                ],
                 dns_retry_handle,
                 per_ip_cleanup_handle,
                 health_check_handles,
@@ -732,7 +822,12 @@ async fn serve_mesh_runtime(
     shutdown_and_join_mesh(
         proxy_state,
         MeshBackgroundTasks {
-            handles: vec![dns_handle, overload_handle, metrics_handle],
+            handles: vec![
+                dns_handle,
+                overload_handle,
+                metrics_handle,
+                mesh_apply_handle,
+            ],
             dns_retry_handle,
             per_ip_cleanup_handle,
             health_check_handles,
@@ -784,6 +879,57 @@ fn listener_tls_config(
         MeshListenerKind::PlaintextCapture => None,
         MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination => frontend_tls,
     }
+}
+
+fn start_mesh_slice_apply_task(
+    mesh_state: MeshRuntimeState,
+    proxy_state: ProxyState,
+    runtime: MeshRuntimeConfig,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut updates = mesh_state.subscribe();
+        loop {
+            if *shutdown_rx.borrow() {
+                return;
+            }
+
+            if let Some(slice) = mesh_state.snapshot().as_ref().as_ref().cloned() {
+                match gateway_config_from_mesh_slice(&slice, &runtime) {
+                    Ok(config) => {
+                        let applied = proxy_state.update_config(config);
+                        if applied {
+                            info!(
+                                mesh_slice_version = %slice.version,
+                                "Applied mesh slice to proxy runtime"
+                            );
+                        } else {
+                            debug!(
+                                mesh_slice_version = %slice.version,
+                                "Mesh slice produced no proxy runtime changes"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            mesh_slice_version = %slice.version,
+                            error = %e,
+                            "Ignoring invalid mesh slice update"
+                        );
+                    }
+                }
+            }
+
+            tokio::select! {
+                changed = updates.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                _ = wait_for_mesh_shutdown(&mut shutdown_rx) => return,
+            }
+        }
+    })
 }
 
 struct MeshBackgroundTasks {
@@ -1072,10 +1218,15 @@ mod tests {
             workload_spiffe_id: None,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
+        let mesh_state = MeshRuntimeState::new();
+        mesh_state.install_slice(MeshSlice {
+            version: chrono::Utc::now().to_rfc3339(),
+            ..MeshSlice::default()
+        });
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let task_shutdown = shutdown_tx.clone();
         let task = tokio::spawn(async move {
-            serve_mesh_runtime(env, runtime, config, task_shutdown, Vec::new()).await
+            serve_mesh_runtime(env, runtime, config, task_shutdown, mesh_state, Vec::new()).await
         });
 
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1346,6 +1497,84 @@ mod tests {
                         .pointer("/labels/app")
                         .and_then(|label| label.as_str()),
                     Some("api")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_uses_native_slice_without_reslicing_policies() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_NODE_ID", "node-a"),
+                ("FERRUM_NAMESPACE", "default"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let slice = MeshSlice {
+                    node_id: "node-a".to_string(),
+                    namespace: "default".to_string(),
+                    labels: [("app".to_string(), "api".to_string())].into(),
+                    version: chrono::Utc::now().to_rfc3339(),
+                    mesh_policies: vec![MeshPolicy {
+                        name: "api-only".to_string(),
+                        namespace: "default".to_string(),
+                        scope: PolicyScope::WorkloadSelector {
+                            selector: WorkloadSelector {
+                                labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                                namespace: Some("default".to_string()),
+                            },
+                        },
+                        rules: vec![MeshRule {
+                            from: vec![PrincipalMatch {
+                                spiffe_id_pattern: Some(
+                                    "spiffe://cluster.local/ns/default/sa/client".to_string(),
+                                ),
+                                namespace_pattern: None,
+                                trust_domain: None,
+                            }],
+                            to: Vec::new(),
+                            when: Vec::new(),
+                            action: PolicyAction::Allow,
+                        }],
+                    }],
+                    ..MeshSlice::default()
+                };
+
+                let prepared =
+                    gateway_config_from_mesh_slice(&slice, &runtime).expect("native slice config");
+                let mesh_authz = prepared
+                    .plugin_configs
+                    .iter()
+                    .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+                    .expect("mesh_authz plugin");
+                let plugin_slice = mesh_authz
+                    .config
+                    .get("mesh_slice")
+                    .expect("mesh_authz mesh_slice");
+
+                assert_eq!(
+                    plugin_slice
+                        .pointer("/labels/app")
+                        .and_then(|label| label.as_str()),
+                    Some("api")
+                );
+                let policies = plugin_slice
+                    .get("mesh_policies")
+                    .and_then(|policies| policies.as_array())
+                    .expect("mesh policies array");
+                assert_eq!(policies.len(), 1);
+                assert_eq!(
+                    policies[0].get("name").and_then(|name| name.as_str()),
+                    Some("api-only")
                 );
             },
         );
