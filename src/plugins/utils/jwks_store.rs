@@ -12,6 +12,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use super::PluginHttpClient;
@@ -166,7 +167,8 @@ impl JwksKeyStore {
     /// Start a background task that refreshes keys periodically.
     ///
     /// The task runs until the returned [`tokio::task::JoinHandle`] is aborted
-    /// or the process exits.
+    /// or the process exits. Populated stores keep the configured refresh cadence
+    /// based on fetch start time; empty stores retry on a short capped backoff.
     pub fn start_background_refresh(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
         let store = self.clone();
         let interval = if interval.is_zero() {
@@ -176,18 +178,24 @@ impl JwksKeyStore {
         };
         tokio::spawn(async move {
             let mut empty_store_retry_attempt = 0;
+            let mut next_refresh_at = Instant::now();
             loop {
+                tokio::time::sleep_until(next_refresh_at).await;
+                let fetch_started_at = Instant::now();
+
                 if let Err(e) = store.fetch_keys().await {
                     warn!("JWKS background refresh failed: {}", e);
                 }
 
+                let fetch_completed_at = Instant::now();
                 let has_keys = store.has_keys();
-                tokio::time::sleep(refresh_delay_after_attempt(
+                next_refresh_at = next_refresh_deadline(
+                    fetch_started_at,
+                    fetch_completed_at,
                     has_keys,
                     interval,
                     empty_store_retry_attempt,
-                ))
-                .await;
+                );
 
                 if has_keys {
                     empty_store_retry_attempt = 0;
@@ -285,13 +293,28 @@ fn empty_store_retry_interval(empty_store_retry_attempt: u32) -> Duration {
     }
 }
 
+fn next_refresh_deadline(
+    fetch_started_at: Instant,
+    fetch_completed_at: Instant,
+    store_has_keys: bool,
+    interval: Duration,
+    empty_store_retry_attempt: u32,
+) -> Instant {
+    if store_has_keys {
+        fetch_started_at + interval
+    } else {
+        fetch_completed_at + refresh_delay_after_attempt(false, interval, empty_store_retry_attempt)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         EMPTY_STORE_RETRY_1, EMPTY_STORE_RETRY_2, EMPTY_STORE_RETRY_MAX,
-        empty_store_retry_interval, refresh_delay_after_attempt,
+        empty_store_retry_interval, next_refresh_deadline, refresh_delay_after_attempt,
     };
     use std::time::Duration;
+    use tokio::time::Instant;
 
     #[test]
     fn populated_store_uses_configured_refresh_interval() {
@@ -333,5 +356,29 @@ mod tests {
         assert_eq!(empty_store_retry_interval(1), EMPTY_STORE_RETRY_2);
         assert_eq!(empty_store_retry_interval(2), EMPTY_STORE_RETRY_MAX);
         assert_eq!(empty_store_retry_interval(u32::MAX), EMPTY_STORE_RETRY_MAX);
+    }
+
+    #[test]
+    fn populated_store_next_refresh_is_based_on_fetch_start() {
+        let started = Instant::now();
+        let completed = started + Duration::from_secs(10);
+        let interval = Duration::from_secs(60);
+
+        assert_eq!(
+            next_refresh_deadline(started, completed, true, interval, 0),
+            started + interval
+        );
+    }
+
+    #[test]
+    fn empty_store_next_retry_is_based_on_fetch_completion() {
+        let started = Instant::now();
+        let completed = started + Duration::from_secs(10);
+        let interval = Duration::from_secs(900);
+
+        assert_eq!(
+            next_refresh_deadline(started, completed, false, interval, 1),
+            completed + EMPTY_STORE_RETRY_2
+        );
     }
 }
