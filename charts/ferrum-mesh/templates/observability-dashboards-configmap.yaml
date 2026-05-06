@@ -1,0 +1,57 @@
+{{- if and .Values.observability.enabled .Values.observability.dashboards.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ferrum-mesh-dashboards
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-observability
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    grafana_dashboard: "1"
+data:
+  ferrum-mesh-red.json: |-
+    {
+      "uid": "ferrum-mesh-red",
+      "title": "Ferrum Mesh RED",
+      "schemaVersion": 39,
+      "version": 1,
+      "tags": ["ferrum", "mesh", "istio", "gamma"],
+      "time": { "from": "now-1h", "to": "now" },
+      "refresh": "30s",
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Requests by destination service",
+          "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "sum by (destination_service, response_code) (rate(ferrum_mesh_requests_total[5m]))",
+              "legendFormat": "{{ "{{destination_service}}" }} {{ "{{response_code}}" }}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "P99 request duration by destination service",
+          "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.99, sum by (le, destination_service) (rate(ferrum_mesh_request_duration_ms_bucket[5m])))",
+              "legendFormat": "{{ "{{destination_service}}" }} p99"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Error rate by source and destination",
+          "gridPos": { "x": 0, "y": 8, "w": 24, "h": 8 },
+          "targets": [
+            {
+              "expr": "sum by (source_workload, destination_service) (rate(ferrum_mesh_requests_total{response_code=~\"5..\"}[5m])) / clamp_min(sum by (source_workload, destination_service) (rate(ferrum_mesh_requests_total[5m])), 1)",
+              "legendFormat": "{{ "{{source_workload}}" }} -> {{ "{{destination_service}}" }}"
+            }
+          ]
+        }
+      ]
+    }
+{{- end }}

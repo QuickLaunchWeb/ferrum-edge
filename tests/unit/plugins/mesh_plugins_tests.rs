@@ -120,7 +120,16 @@ async fn mesh_authz_reads_hbone_baggage_source_identity() {
 
 #[tokio::test]
 async fn workload_metrics_adds_identity_metadata_without_header_changes() {
-    let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
+    let plugin = WorkloadMetrics::new(&json!({
+        "node_id": "node-a",
+        "topology": "sidecar",
+        "namespace": "default",
+        "labels": {
+            "app": "client",
+            "service.istio.io/canonical-name": "client-svc"
+        }
+    }))
+    .expect("plugin config");
     let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
     let proxy: Proxy = serde_json::from_value(json!({
         "id": "svc-proxy",
@@ -156,6 +165,20 @@ async fn workload_metrics_adds_identity_metadata_without_header_changes() {
             .map(String::as_str),
         Some("payments")
     );
+    assert_eq!(
+        ctx.metadata.get("mesh.topology").map(String::as_str),
+        Some("sidecar")
+    );
+    assert_eq!(
+        ctx.metadata.get("mesh.source.workload").map(String::as_str),
+        Some("client-svc")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.request_protocol")
+            .map(String::as_str),
+        Some("http")
+    );
 }
 
 #[tokio::test]
@@ -180,6 +203,50 @@ async fn workload_metrics_reads_hbone_baggage_source_identity() {
             .get("mesh.source.service_account")
             .map(String::as_str),
         Some("client")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.connection_security_policy")
+            .map(String::as_str),
+        Some("mutual_tls")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_uses_workload_hint_when_peer_identity_absent() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "topology": "ambient",
+        "namespace": "default",
+        "workload_spiffe_id": "spiffe://cluster.local/ns/default/sa/api",
+        "labels": {
+            "app.kubernetes.io/name": "api"
+        }
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(None);
+    let mut headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc+proto".to_string(),
+    )]);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/default/sa/api")
+    );
+    assert_eq!(
+        ctx.metadata.get("mesh.source.workload").map(String::as_str),
+        Some("api")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.request_protocol")
+            .map(String::as_str),
+        Some("grpc")
     );
 }
 

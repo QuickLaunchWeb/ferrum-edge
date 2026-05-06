@@ -1,9 +1,10 @@
 //! Mesh runtime mode scaffolding.
 //!
-//! Phase C turns `FERRUM_MODE=mesh` into a real data-plane mode. This module
-//! owns the mesh-specific runtime knobs and the config-consumer boundary that
-//! later listener code uses; it deliberately keeps the generic proxy/plugin
-//! chain unchanged so existing plugins work in mesh context.
+//! `FERRUM_MODE=mesh` data-plane mode.
+//!
+//! This module owns the mesh-specific runtime knobs and the config-consumer
+//! boundary. It deliberately keeps the generic proxy/plugin chain unchanged so
+//! existing plugins work in mesh context.
 
 pub mod config_consumer;
 pub mod hbone;
@@ -33,6 +34,7 @@ use crate::xds::slice::{MeshSlice, MeshSliceRequest};
 
 const DEFAULT_INBOUND_LISTEN_ADDR: &str = "0.0.0.0:15006";
 const DEFAULT_OUTBOUND_LISTEN_ADDR: &str = "127.0.0.1:15001";
+const DEFAULT_HBONE_LISTEN_ADDR: &str = "0.0.0.0:15008";
 
 pub const MESH_SPIFFE_IDENTITY_PLUGIN_ID: &str = "__mesh_spiffe_identity";
 pub const MESH_AUTHZ_PLUGIN_ID: &str = "__mesh_authz";
@@ -49,6 +51,7 @@ pub enum MeshTrafficDirection {
 pub enum MeshListenerKind {
     PlaintextCapture,
     MtlsTermination,
+    HboneTermination,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,8 +61,8 @@ pub struct MeshListener {
     pub addr: SocketAddr,
 }
 
-/// Mesh data-plane topology. Phase C wires both values through the same
-/// runtime path; ambient operator-visible behavior materializes later.
+/// Mesh data-plane topology. Sidecar and ambient share the same runtime path;
+/// ambient selects HBONE termination instead of sidecar inbound mTLS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshTopology {
     Sidecar,
@@ -111,7 +114,7 @@ impl MeshConfigProtocol {
     }
 }
 
-/// Parsed mesh runtime settings kept separate from `EnvConfig` so Phase C
+/// Parsed mesh runtime settings kept separate from `EnvConfig` so mesh mode
 /// stays strictly additive and non-mesh deployments do not carry new fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeshRuntimeConfig {
@@ -122,6 +125,7 @@ pub struct MeshRuntimeConfig {
     pub topology: MeshTopology,
     pub inbound_listen_addr: SocketAddr,
     pub outbound_listen_addr: SocketAddr,
+    pub hbone_listen_addr: SocketAddr,
     pub workload_spiffe_id: Option<String>,
 }
 
@@ -158,6 +162,12 @@ impl MeshRuntimeConfig {
                 .as_deref()
                 .unwrap_or(DEFAULT_OUTBOUND_LISTEN_ADDR),
         )?;
+        let hbone_listen_addr = parse_socket_addr(
+            "FERRUM_MESH_HBONE_LISTEN_ADDR",
+            resolve_ferrum_var("FERRUM_MESH_HBONE_LISTEN_ADDR")
+                .as_deref()
+                .unwrap_or(DEFAULT_HBONE_LISTEN_ADDR),
+        )?;
         let workload_spiffe_id = resolve_ferrum_var("FERRUM_MESH_WORKLOAD_SPIFFE_ID")
             .filter(|value| !value.trim().is_empty());
 
@@ -169,6 +179,7 @@ impl MeshRuntimeConfig {
             topology,
             inbound_listen_addr,
             outbound_listen_addr,
+            hbone_listen_addr,
             workload_spiffe_id,
         })
     }
@@ -201,9 +212,12 @@ impl MeshRuntimeConfig {
                 direction: MeshTrafficDirection::Inbound,
                 kind: match self.topology {
                     MeshTopology::Sidecar => MeshListenerKind::MtlsTermination,
-                    MeshTopology::Ambient => MeshListenerKind::PlaintextCapture,
+                    MeshTopology::Ambient => MeshListenerKind::HboneTermination,
                 },
-                addr: self.inbound_listen_addr,
+                addr: match self.topology {
+                    MeshTopology::Sidecar => self.inbound_listen_addr,
+                    MeshTopology::Ambient => self.hbone_listen_addr,
+                },
             },
         ]
     }
@@ -514,11 +528,16 @@ async fn serve_mesh_runtime(
     let mut startup_signals = Vec::new();
     for listener in runtime.listener_plan() {
         let tls_config = listener_tls_config(&listener, frontend_tls.clone());
-        if tls_config.is_none() && listener.kind == MeshListenerKind::MtlsTermination {
+        if tls_config.is_none()
+            && matches!(
+                listener.kind,
+                MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
+            )
+        {
             warn!(
                 direction = ?listener.direction,
                 addr = %listener.addr,
-                "Mesh mTLS listener is running without frontend TLS because no mesh/frontend certificate is configured"
+                "Mesh TLS listener is running without frontend TLS because no mesh/frontend certificate is configured"
             );
         }
 
@@ -649,7 +668,7 @@ fn listener_tls_config(
 ) -> Option<Arc<rustls::ServerConfig>> {
     match listener.kind {
         MeshListenerKind::PlaintextCapture => None,
-        MeshListenerKind::MtlsTermination => frontend_tls,
+        MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination => frontend_tls,
     }
 }
 
@@ -746,6 +765,7 @@ mod tests {
             "FERRUM_MESH_TOPOLOGY",
             "FERRUM_MESH_INBOUND_LISTEN_ADDR",
             "FERRUM_MESH_OUTBOUND_LISTEN_ADDR",
+            "FERRUM_MESH_HBONE_LISTEN_ADDR",
             "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
             "FERRUM_POOL_WARMUP_ENABLED",
             "FERRUM_SHUTDOWN_DRAIN_SECONDS",
@@ -795,6 +815,10 @@ mod tests {
                     runtime.outbound_listen_addr,
                     DEFAULT_OUTBOUND_LISTEN_ADDR.parse::<SocketAddr>().unwrap()
                 );
+                assert_eq!(
+                    runtime.hbone_listen_addr,
+                    DEFAULT_HBONE_LISTEN_ADDR.parse::<SocketAddr>().unwrap()
+                );
             },
         );
     }
@@ -817,6 +841,7 @@ mod tests {
                 ("FERRUM_MESH_TOPOLOGY", "ambient"),
                 ("FERRUM_MESH_INBOUND_LISTEN_ADDR", "127.0.0.1:16006"),
                 ("FERRUM_MESH_OUTBOUND_LISTEN_ADDR", "127.0.0.1:16001"),
+                ("FERRUM_MESH_HBONE_LISTEN_ADDR", "127.0.0.1:16008"),
                 (
                     "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
                     "spiffe://cluster.local/ns/default/sa/api",
@@ -842,6 +867,10 @@ mod tests {
                 assert_eq!(
                     runtime.outbound_listen_addr,
                     "127.0.0.1:16001".parse::<SocketAddr>().unwrap()
+                );
+                assert_eq!(
+                    runtime.hbone_listen_addr,
+                    "127.0.0.1:16008".parse::<SocketAddr>().unwrap()
                 );
             },
         );
@@ -884,6 +913,7 @@ mod tests {
             topology: MeshTopology::Sidecar,
             inbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
             outbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            hbone_listen_addr: "127.0.0.1:0".parse().unwrap(),
             workload_spiffe_id: None,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
@@ -954,6 +984,39 @@ mod tests {
                     listener.direction == MeshTrafficDirection::Inbound
                         && listener.kind == MeshListenerKind::MtlsTermination
                         && listener.addr.port() == 15006
+                }));
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_listener_plan_uses_ambient_hbone_port() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "ambient"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let plan = runtime.listener_plan();
+
+                assert_eq!(plan.len(), 2);
+                assert!(plan.iter().any(|listener| {
+                    listener.direction == MeshTrafficDirection::Outbound
+                        && listener.kind == MeshListenerKind::PlaintextCapture
+                        && listener.addr.port() == 15001
+                }));
+                assert!(plan.iter().any(|listener| {
+                    listener.direction == MeshTrafficDirection::Inbound
+                        && listener.kind == MeshListenerKind::HboneTermination
+                        && listener.addr.port() == 15008
                 }));
             },
         );
