@@ -147,6 +147,8 @@ See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_
 
 Mesh mode consumes Layer 2 mesh slices from the control protocols and prepares the shared sidecar/ambient data-plane listeners. Non-mesh modes do not instantiate this runtime.
 
+The native `MeshSubscribe` client reconnects with exponential backoff capped at 30 seconds and applies jitter to avoid synchronized reconnect storms. A clean stream end resets the next reconnect delay to the initial 1 second; connection errors increase the backoff.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_MESH_CONFIG_PROTOCOL` | No | `native` | Mesh config source: `native` for Ferrum `MeshSubscribe`, `xds` for ADS |
