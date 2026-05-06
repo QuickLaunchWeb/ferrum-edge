@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use http::{HeaderMap, Method, Version};
+use percent_encoding::percent_decode_str;
 
 use crate::identity::SpiffeId;
 
@@ -85,13 +86,12 @@ pub fn is_hbone_connect(method: &Method, version: Version, headers: &HeaderMap) 
 
 pub fn parse_baggage(headers: &HeaderMap) -> BTreeMap<String, String> {
     let mut baggage = BTreeMap::new();
-    let Some(raw) = headers
-        .get(BAGGAGE_HEADER)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return baggage;
-    };
-    parse_baggage_header_into(raw, &mut baggage);
+    for value in headers.get_all(BAGGAGE_HEADER) {
+        let Ok(raw) = value.to_str() else {
+            continue;
+        };
+        parse_baggage_header_into(raw, &mut baggage);
+    }
     baggage
 }
 
@@ -119,8 +119,15 @@ fn parse_baggage_header_into(raw: &str, baggage: &mut BTreeMap<String, String>) 
         if value.is_empty() {
             continue;
         }
-        baggage.insert(key.to_string(), value.to_string());
+        baggage.insert(key.to_string(), decode_baggage_value(value));
     }
+}
+
+fn decode_baggage_value(value: &str) -> String {
+    percent_decode_str(value)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| value.to_string())
 }
 
 fn first_baggage_value<'a>(
@@ -167,6 +174,53 @@ mod tests {
         );
 
         let identity = HboneIdentity::from_headers(&headers);
+        assert_eq!(
+            identity.source_principal.as_ref().map(ToString::to_string),
+            Some("spiffe://cluster.local/ns/default/sa/client".to_string())
+        );
+        assert_eq!(
+            identity
+                .destination_principal
+                .as_ref()
+                .map(ToString::to_string),
+            Some("spiffe://cluster.local/ns/default/sa/server".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_percent_encoded_identity_from_baggage() {
+        let identity = HboneIdentity::from_baggage_header(
+            "source.principal=spiffe%3A%2F%2Fcluster.local%2Fns%2Fdefault%2Fsa%2Fclient",
+        );
+
+        assert_eq!(
+            identity.source_principal.as_ref().map(ToString::to_string),
+            Some("spiffe://cluster.local/ns/default/sa/client".to_string())
+        );
+        assert_eq!(
+            identity.baggage.get("source.principal").map(String::as_str),
+            Some("spiffe://cluster.local/ns/default/sa/client")
+        );
+    }
+
+    #[test]
+    fn parses_split_baggage_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            BAGGAGE_HEADER,
+            "source.principal=spiffe://cluster.local/ns/default/sa/client"
+                .parse()
+                .expect("valid baggage header"),
+        );
+        headers.append(
+            BAGGAGE_HEADER,
+            "destination.principal=spiffe://cluster.local/ns/default/sa/server"
+                .parse()
+                .expect("valid baggage header"),
+        );
+
+        let identity = HboneIdentity::from_headers(&headers);
+
         assert_eq!(
             identity.source_principal.as_ref().map(ToString::to_string),
             Some("spiffe://cluster.local/ns/default/sa/client".to_string())
