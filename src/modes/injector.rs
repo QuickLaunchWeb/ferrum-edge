@@ -23,7 +23,7 @@ use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info};
 
-use crate::capture::{CaptureConfig, CaptureMode, IptablesPlan};
+use crate::capture::{CaptureConfig, CaptureMode, DEFAULT_PROXY_UID, IptablesPlan};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::tls::{self, TlsPolicy};
@@ -367,7 +367,7 @@ fn sidecar_container(config: &InjectorConfig) -> Value {
         "image": config.sidecar_image,
         "imagePullPolicy": "IfNotPresent",
         "securityContext": {
-            "runAsUser": config.proxy_uid.unwrap_or(1337),
+            "runAsUser": config.proxy_uid.unwrap_or(DEFAULT_PROXY_UID),
             "allowPrivilegeEscalation": false
         },
         "ports": [
@@ -394,7 +394,7 @@ fn init_container(config: &InjectorConfig) -> Value {
         },
         "env": [
             {"name": "FERRUM_MESH_CAPTURE_MODE", "value": "iptables"},
-            {"name": "FERRUM_MESH_PROXY_UID", "value": config.proxy_uid.unwrap_or(1337).to_string()}
+            {"name": "FERRUM_MESH_PROXY_UID", "value": config.proxy_uid.unwrap_or(DEFAULT_PROXY_UID).to_string()}
         ],
         "command": ["/bin/sh", "-c"],
         "args": [plan.commands.join("\n")]
@@ -404,7 +404,7 @@ fn init_container(config: &InjectorConfig) -> Value {
 fn capture_config(config: &InjectorConfig) -> CaptureConfig {
     let mut capture = CaptureConfig::explicit(15006, 15001);
     capture.mode = config.capture_mode;
-    capture.proxy_uid = Some(config.proxy_uid.unwrap_or(1337));
+    capture.proxy_uid = Some(config.proxy_uid.unwrap_or(DEFAULT_PROXY_UID));
     capture
 }
 
