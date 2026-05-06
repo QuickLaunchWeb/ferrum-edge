@@ -321,11 +321,7 @@ fn virtual_service_routes(
         .flatten()
         .enumerate()
     {
-        let Some(route) = http
-            .get("route")
-            .and_then(Value::as_array)
-            .and_then(|routes| routes.first())
-        else {
+        let Some(route) = first_positive_weighted_route(http) else {
             continue;
         };
         let Some(destination) = route.get("destination") else {
@@ -368,6 +364,16 @@ fn virtual_service_routes(
     }
 
     Ok(proxies)
+}
+
+fn first_positive_weighted_route(http: &Value) -> Option<&Value> {
+    http.get("route")
+        .and_then(Value::as_array)
+        .and_then(|routes| routes.iter().find(|route| route_weight(route) > 0))
+}
+
+fn route_weight(route: &Value) -> u64 {
+    route.get("weight").and_then(Value::as_u64).unwrap_or(1)
 }
 
 fn path_match(uri: &Value) -> Option<String> {
@@ -542,5 +548,69 @@ mod tests {
         assert_eq!(result.config.proxies.len(), 1);
         assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/v1"));
         assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn virtual_service_skips_zero_weight_destinations() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "route": [
+                            {
+                                "destination": {
+                                    "host": "dark.default.svc.cluster.local",
+                                    "port": {"number": 8080}
+                                },
+                                "weight": 0
+                            },
+                            {
+                                "destination": {
+                                    "host": "stable.default.svc.cluster.local",
+                                    "port": {"number": 9090}
+                                },
+                                "weight": 100
+                            }
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "stable.default.svc.cluster.local"
+        );
+        assert_eq!(result.config.proxies[0].backend_port, 9090);
+    }
+
+    #[test]
+    fn virtual_service_with_only_zero_weight_destinations_is_not_materialized() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "route": [{
+                            "destination": {
+                                "host": "dark.default.svc.cluster.local",
+                                "port": {"number": 8080}
+                            },
+                            "weight": 0
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.proxies.is_empty());
     }
 }

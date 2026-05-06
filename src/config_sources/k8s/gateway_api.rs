@@ -248,7 +248,18 @@ fn checked_backend_namespace(
 fn first_backend_ref(rule: &Value) -> Option<&Value> {
     rule.get("backendRefs")
         .and_then(Value::as_array)
-        .and_then(|backend_refs| backend_refs.first())
+        .and_then(|backend_refs| {
+            backend_refs
+                .iter()
+                .find(|backend_ref| backend_ref_weight(backend_ref) > 0)
+        })
+}
+
+fn backend_ref_weight(backend_ref: &Value) -> u64 {
+    backend_ref
+        .get("weight")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
 }
 
 fn http_path_match(path: &Value) -> Option<String> {
@@ -330,6 +341,50 @@ mod tests {
             Some("/api")
         );
         assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn http_route_skips_zero_weight_backend_refs() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [
+                            {"name": "dark", "port": 8080, "weight": 0},
+                            {"name": "stable", "port": 9090, "weight": 100}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "stable.default.svc.cluster.local"
+        );
+        assert_eq!(result.config.proxies[0].backend_port, 9090);
+    }
+
+    #[test]
+    fn http_route_with_only_zero_weight_backend_refs_is_not_materialized() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [{"name": "dark", "port": 8080, "weight": 0}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.proxies.is_empty());
     }
 
     #[test]
