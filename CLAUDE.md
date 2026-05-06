@@ -56,6 +56,8 @@ PRs: format check → tests (parallel) → lint → perf regression → build 5 
 - `file` — R/O admin + proxy; YAML/JSON, SIGHUP reload (Unix)
 - `cp` (Control Plane) — R/W admin, **no proxy**, database + gRPC distribution
 - `dp` (Data Plane) — R/O admin + proxy; gRPC from CP (multi-CP failover via `FERRUM_DP_CP_GRPC_URLS`)
+- `mesh` — R/O admin + proxy; service-mesh data plane consuming xDS or native MeshSubscribe
+- `injector` — Kubernetes admission webhook; emits JSON patches that add Ferrum mesh sidecars/init capture
 - `migrate` — runs DB migrations, exits
 
 **TLS-only listeners**: port `0` on `FERRUM_PROXY_HTTP_PORT`/`FERRUM_ADMIN_HTTP_PORT`/inside `FERRUM_CP_GRPC_LISTEN_ADDR` disables plaintext. Excluded from `reserved_gateway_ports()`. Gateway warns if plaintext disabled and no TLS configured.
@@ -530,7 +532,7 @@ Imperative mood, concise (e.g., `Fix rate limiter to handle zero-window edge cas
 
 Full docs reference: `docs/configuration.md`. Runtime parsing/defaults: `src/config/env_config.rs`. Editable template: `ferrum.conf`. Most-common essentials below.
 
-- `FERRUM_MODE` (required): `database`/`file`/`cp`/`dp`/`migrate`
+- `FERRUM_MODE` (required): `database`/`file`/`cp`/`dp`/`mesh`/`injector`/`migrate`
 - `FERRUM_NAMESPACE` (`ferrum`): which namespace this instance loads
 - `FERRUM_LOG_LEVEL` (`error`)
 - `FERRUM_LOG_REDACT_METADATA_KEYS` (empty) — comma-separated extra substrings (case-insensitive) to redact from `TransactionSummary.metadata` / `StreamTransactionSummary.metadata` in addition to the built-in `authorization`/`cookie`/`set-cookie`/`x-api-key`/`x-auth-token`/`x-csrf-token`/`bearer`/`password`/`secret`/`token` defaults. Applies to every logging plugin (stdout/http/tcp/kafka/loki/udp/ws/statsd) via the central serde adapter.
@@ -547,6 +549,8 @@ Full docs reference: `docs/configuration.md`. Runtime parsing/defaults: `src/con
 - `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` (128; lagging DPs auto-snapshot)
 - `FERRUM_XDS_ENABLED` (`false`); `FERRUM_XDS_STREAM_CHANNEL_CAPACITY` (32; per-ADS-stream response queue)
 - `FERRUM_DP_CP_GRPC_URL`/`URLS` (required dp); `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` (300)
+- `FERRUM_MESH_CAPTURE_MODE` (`explicit`; `iptables` or `ebpf` for mesh capture planning, with eBPF fallback to iptables); `FERRUM_MESH_PROXY_UID` (1337 in injected sidecars)
+- `FERRUM_INJECTOR_LISTEN_ADDR` (`0.0.0.0:9443`); `FERRUM_INJECTOR_SIDECAR_IMAGE` (`ferrum-edge:latest`); `FERRUM_INJECTOR_REQUIRE_ANNOTATION` (`true`); `FERRUM_INJECTOR_TLS_CERT_PATH`/`KEY_PATH` for Kubernetes webhook HTTPS
 - `FERRUM_MAX_CONNECTIONS` (100000)/`MAX_REQUESTS` (0 = unlimited)
 - `FERRUM_SHUTDOWN_DRAIN_SECONDS` (30; `0` immediate)
 - `FERRUM_WORKER_THREADS` (CPU cores); `FERRUM_BLOCKING_THREADS` (512; **bump to ≥1024 with io_uring splice at scale**)

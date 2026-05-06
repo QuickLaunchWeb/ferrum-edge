@@ -1,0 +1,44 @@
+{{- if .Values.ambient.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ferrum-mesh-ambient
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-ambient
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-mesh-ambient
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-mesh-ambient
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: ferrum-mesh
+      hostNetwork: true
+      containers:
+        - name: ferrum-edge
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+                - NET_RAW
+          ports:
+            - name: outbound
+              containerPort: {{ .Values.ambient.outboundPort }}
+            - name: inbound
+              containerPort: {{ .Values.ambient.inboundPort }}
+          env:
+            - name: FERRUM_MESH_CAPTURE_MODE
+              value: {{ .Values.ambient.captureMode | quote }}
+            {{- range $name, $value := .Values.ambient.env }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+{{- end }}
