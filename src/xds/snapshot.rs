@@ -62,11 +62,11 @@ impl XdsSnapshot {
         }
     }
 
-    pub fn resources(&self, type_url: &str) -> Vec<XdsResource> {
+    pub fn resources(&self, type_url: &str) -> &[XdsResource] {
         self.resources_by_type
             .get(type_url)
-            .cloned()
-            .unwrap_or_default()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     pub fn filtered_resources(
@@ -77,32 +77,33 @@ impl XdsSnapshot {
     ) -> Vec<XdsResource> {
         let resources = self.resources(type_url);
         if wildcard {
-            return resources;
+            return resources.to_vec();
         }
         if names.is_empty() {
             return Vec::new();
         }
         let wanted: HashSet<&str> = names.iter().map(String::as_str).collect();
         resources
-            .into_iter()
+            .iter()
             .filter(|resource| wanted.contains(resource.name.as_str()))
+            .cloned()
             .collect()
     }
 
     pub fn removed_resource_names(&self, next: &Self, type_url: &str) -> Vec<String> {
         let next_names: HashSet<String> = next
             .resources(type_url)
-            .into_iter()
-            .map(|resource| resource.name)
+            .iter()
+            .map(|resource| resource.name.clone())
             .collect();
         let mut removed: Vec<String> = self
             .resources(type_url)
-            .into_iter()
+            .iter()
             .filter_map(|resource| {
                 if next_names.contains(&resource.name) {
                     None
                 } else {
-                    Some(resource.name)
+                    Some(resource.name.clone())
                 }
             })
             .collect();

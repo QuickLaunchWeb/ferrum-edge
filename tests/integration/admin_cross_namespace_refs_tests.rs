@@ -96,6 +96,7 @@ async fn build_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDir) {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),

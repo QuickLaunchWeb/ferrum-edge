@@ -25,6 +25,8 @@ pub enum OperatingMode {
     File,
     ControlPlane,
     DataPlane,
+    Mesh,
+    Injector,
     Migrate,
 }
 
@@ -41,9 +43,11 @@ impl OperatingMode {
             "file" => Ok(Self::File),
             "cp" => Ok(Self::ControlPlane),
             "dp" => Ok(Self::DataPlane),
+            "mesh" => Ok(Self::Mesh),
+            "injector" => Ok(Self::Injector),
             "migrate" => Ok(Self::Migrate),
             other => Err(format!(
-                "Invalid FERRUM_MODE '{}'. Expected: database, file, cp, dp, migrate",
+                "Invalid FERRUM_MODE '{}'. Expected: database, file, cp, dp, mesh, injector, migrate",
                 other
             )),
         }
@@ -501,6 +505,9 @@ pub struct EnvConfig {
     /// Mount Envoy ADS (`AggregatedDiscoveryService`) on the CP gRPC listener.
     /// Default false so existing CP/DP deployments expose only ConfigSync.
     pub xds_enabled: bool,
+    /// Capacity of the per-ADS-stream response queue between the request
+    /// reader task and tonic response stream. Default: 32.
+    pub xds_stream_channel_capacity: usize,
 
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
@@ -921,6 +928,10 @@ pub struct EnvConfig {
     /// Default: 100 MiB.
     pub admin_restore_max_body_size_mib: usize,
 
+    /// Max request body size in MiB for POST/PUT /api-specs.
+    /// Default: 25 MiB.
+    pub admin_spec_max_body_size_mib: usize,
+
     /// Migration action: up, status, config (migrate mode only).
     /// Default: "up".
     pub migrate_action: String,
@@ -1176,6 +1187,7 @@ impl Default for EnvConfig {
             cp_grpc_tls_client_ca_path: None,
             cp_broadcast_channel_capacity: 128,
             xds_enabled: false,
+            xds_stream_channel_capacity: 32,
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -1280,6 +1292,7 @@ impl Default for EnvConfig {
             tls_crl_file_path: None,
             admin_allowed_cidrs: String::new(),
             admin_restore_max_body_size_mib: 100,
+            admin_spec_max_body_size_mib: 25,
             migrate_action: "up".into(),
             migrate_dry_run: false,
             auto_apply_plugin_migrations: false,
@@ -1404,6 +1417,25 @@ impl EnvConfig {
             mongo_server_selection_timeout_seconds: u64 = "FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS" => 30u64;
             mongo_connect_timeout_seconds: u64 = "FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS" => 10u64;
         }
+        let db_tls_mode = Self::resolve_db_tls_mode_legacy_alias(conf, db_tls_mode)?;
+        let db_tls_ca_cert_path = Self::resolve_legacy_db_tls_path_alias(
+            conf,
+            db_tls_ca_cert_path,
+            "FERRUM_DB_SSL_ROOT_CERT",
+            "FERRUM_DB_TLS_CA_CERT_PATH",
+        );
+        let db_tls_client_cert_path = Self::resolve_legacy_db_tls_path_alias(
+            conf,
+            db_tls_client_cert_path,
+            "FERRUM_DB_SSL_CLIENT_CERT",
+            "FERRUM_DB_TLS_CLIENT_CERT_PATH",
+        );
+        let db_tls_client_key_path = Self::resolve_legacy_db_tls_path_alias(
+            conf,
+            db_tls_client_key_path,
+            "FERRUM_DB_SSL_CLIENT_KEY",
+            "FERRUM_DB_TLS_CLIENT_KEY_PATH",
+        );
 
         // Clamp statement timeout at parse time so the warning fires once at
         // startup instead of on every new database connection.
@@ -1425,7 +1457,7 @@ impl EnvConfig {
             conf = conf, mode = &mode;
             [cp_dp]
             cp_dp_grpc_jwt_secret: Option<String> = "FERRUM_CP_DP_GRPC_JWT_SECRET"
-                => required_for(["cp", "dp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
+                => required_for(["cp", "dp", "mesh"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
             cp_dp_grpc_jwt_issuer: String = "FERRUM_CP_DP_GRPC_JWT_ISSUER" => "ferrum-edge-cp-dp".to_string();
             dp_cp_grpc_url: Option<String> = "FERRUM_DP_CP_GRPC_URL";
             dp_cp_grpc_urls: Vec<String> = "FERRUM_DP_CP_GRPC_URLS" => Vec::new();
@@ -1435,6 +1467,7 @@ impl EnvConfig {
             cp_grpc_tls_client_ca_path: Option<String> = "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH";
             cp_broadcast_channel_capacity: usize = "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY" => 128usize;
             xds_enabled: bool = "FERRUM_XDS_ENABLED" => false;
+            xds_stream_channel_capacity: usize = "FERRUM_XDS_STREAM_CHANNEL_CAPACITY" => 32usize;
             dp_grpc_tls_ca_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CA_CERT_PATH";
             dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
@@ -1555,6 +1588,7 @@ impl EnvConfig {
             tls_crl_file_path: Option<String> = "FERRUM_TLS_CRL_FILE_PATH";
             admin_allowed_cidrs: String = "FERRUM_ADMIN_ALLOWED_CIDRS" => String::new();
             admin_restore_max_body_size_mib: usize = "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB" => 100usize;
+            admin_spec_max_body_size_mib: usize = "FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB" => 25usize;
             migrate_action: String = "FERRUM_MIGRATE_ACTION" => "up".to_string(), lowercase();
             migrate_dry_run: bool = "FERRUM_MIGRATE_DRY_RUN" => false;
             auto_apply_plugin_migrations: bool = "FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS" => false;
@@ -1773,6 +1807,7 @@ impl EnvConfig {
             cp_grpc_tls_client_ca_path,
             cp_broadcast_channel_capacity,
             xds_enabled,
+            xds_stream_channel_capacity,
             dp_grpc_tls_ca_cert_path,
             dp_grpc_tls_client_cert_path,
             dp_grpc_tls_client_key_path,
@@ -1877,6 +1912,7 @@ impl EnvConfig {
             tls_crl_file_path,
             admin_allowed_cidrs,
             admin_restore_max_body_size_mib,
+            admin_spec_max_body_size_mib,
             migrate_action,
             migrate_dry_run,
             auto_apply_plugin_migrations,
@@ -2126,6 +2162,107 @@ impl EnvConfig {
         }
     }
 
+    fn resolve_legacy_db_tls_path_alias(
+        conf: &ConfFile,
+        current: Option<String>,
+        legacy_key: &'static str,
+        canonical_key: &'static str,
+    ) -> Option<String> {
+        let Some(legacy_value) = resolve_var(conf, legacy_key) else {
+            return current;
+        };
+
+        if current.is_some() {
+            tracing::warn!(
+                legacy_key,
+                canonical_key,
+                "Deprecated database TLS env var ignored because canonical replacement is set"
+            );
+            return current;
+        }
+
+        tracing::warn!(
+            legacy_key,
+            canonical_key,
+            "Deprecated database TLS env var is still accepted for compatibility; rename it to the canonical replacement"
+        );
+        Some(legacy_value)
+    }
+
+    fn resolve_legacy_db_tls_bool_alias(
+        conf: &ConfFile,
+        legacy_key: &'static str,
+        canonical_key: &'static str,
+    ) -> Result<Option<bool>, String> {
+        resolve_var(conf, legacy_key)
+            .map(|raw| {
+                tracing::warn!(
+                    legacy_key,
+                    canonical_key,
+                    "Deprecated database TLS env var is still accepted for compatibility; rename it to the canonical replacement"
+                );
+                <bool as env_config_macro::EnvValue>::parse_env(&raw, legacy_key)
+            })
+            .transpose()
+    }
+
+    fn warn_legacy_db_tls_mode_alias_ignored(conf: &ConfFile, legacy_key: &'static str) {
+        if resolve_var(conf, legacy_key).is_some() {
+            tracing::warn!(
+                legacy_key,
+                canonical_key = "FERRUM_DB_TLS_MODE",
+                "Deprecated database TLS env var ignored because FERRUM_DB_TLS_MODE is set"
+            );
+        }
+    }
+
+    fn resolve_db_tls_mode_legacy_alias(
+        conf: &ConfFile,
+        current: Option<DbTlsMode>,
+    ) -> Result<Option<DbTlsMode>, String> {
+        if current.is_some() {
+            for legacy_key in [
+                "FERRUM_DB_SSL_MODE",
+                "FERRUM_DB_TLS_ENABLED",
+                "FERRUM_DB_TLS_INSECURE",
+            ] {
+                Self::warn_legacy_db_tls_mode_alias_ignored(conf, legacy_key);
+            }
+            return Ok(current);
+        }
+
+        if let Some(raw) = resolve_var(conf, "FERRUM_DB_SSL_MODE") {
+            tracing::warn!(
+                legacy_key = "FERRUM_DB_SSL_MODE",
+                canonical_key = "FERRUM_DB_TLS_MODE",
+                "Deprecated database TLS env var is still accepted for compatibility; rename it to the canonical replacement"
+            );
+            return <DbTlsMode as env_config_macro::EnvValue>::parse_env(
+                &raw,
+                "FERRUM_DB_SSL_MODE",
+            )
+            .map(Some);
+        }
+
+        let enabled = Self::resolve_legacy_db_tls_bool_alias(
+            conf,
+            "FERRUM_DB_TLS_ENABLED",
+            "FERRUM_DB_TLS_MODE",
+        )?;
+        let insecure = Self::resolve_legacy_db_tls_bool_alias(
+            conf,
+            "FERRUM_DB_TLS_INSECURE",
+            "FERRUM_DB_TLS_MODE",
+        )?;
+
+        let mode = match (enabled, insecure) {
+            (Some(false), _) => Some(DbTlsMode::Disable),
+            (Some(true), _) | (None, Some(true)) => Some(DbTlsMode::Require),
+            _ => None,
+        };
+        Ok(mode)
+    }
+
     pub fn db_tls_enabled(&self) -> bool {
         self.db_tls_mode.is_some_and(DbTlsMode::enables_tls)
     }
@@ -2286,6 +2423,15 @@ impl EnvConfig {
                     );
                 }
             }
+            OperatingMode::Mesh => {
+                if self.dp_cp_grpc_url.is_none() && self.dp_cp_grpc_urls.is_empty() {
+                    return Err(
+                        "FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS is required in mesh mode"
+                            .into(),
+                    );
+                }
+            }
+            OperatingMode::Injector => {}
             OperatingMode::Migrate => {
                 // Migrate mode: validation depends on FERRUM_MIGRATE_ACTION.
                 // For "config", FERRUM_FILE_CONFIG_PATH is required.

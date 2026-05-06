@@ -456,6 +456,14 @@ pub(crate) async fn check_credential_value_uniqueness(
     Ok(None)
 }
 
+// Strip api_spec_id from client-submitted resources.  This field is
+// admin-only ownership metadata set exclusively by the spec import
+// handlers.  Allowing clients to set it via regular CRUD endpoints
+// would let them claim spec ownership of hand-managed resources,
+// causing unintended deletion during spec lifecycle operations.
+// SQL INSERT/UPDATE statements already exclude the column, but Mongo's
+// replace_one serializes the full struct.
+
 impl AdminResource for Upstream {
     const RESOURCE_NAME: &'static str = "upstream";
     const RESOURCE_LABEL: &'static str = "Upstream";
@@ -487,6 +495,7 @@ impl AdminResource for Upstream {
     }
 
     fn normalize(&mut self) {
+        self.api_spec_id = None;
         self.normalize_fields();
     }
 
@@ -599,6 +608,7 @@ impl AdminResource for PluginConfig {
     }
 
     fn normalize(&mut self) {
+        self.api_spec_id = None;
         self.normalize_fields();
     }
 
@@ -755,6 +765,7 @@ impl AdminResource for Proxy {
     }
 
     fn normalize(&mut self) {
+        self.api_spec_id = None;
         if let Some(methods) = self.allowed_methods.as_mut() {
             for method in methods {
                 *method = method.to_uppercase();
@@ -917,20 +928,31 @@ impl AdminResource for Proxy {
         ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
         if let Some(upstream_id) = resource.upstream_id.as_deref() {
-            match db.check_upstream_exists(upstream_id, namespace).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    // Distinguish "missing" from "wrong namespace" so the
-                    // operator gets a precise diagnostic instead of a
-                    // misleading "does not exist".
-                    let message = match db.get_upstream(upstream_id).await {
-                        Ok(Some(other)) => format!(
-                            "Cross-namespace reference forbidden: upstream_id '{}' belongs to namespace '{}' but proxy is in namespace '{}'",
-                            upstream_id, other.namespace, namespace
-                        ),
-                        _ => format!("upstream_id '{}' does not exist", upstream_id),
-                    };
-                    return Err(AfterValidateError::BadRequest(vec![message]));
+            match db.get_upstream(upstream_id).await {
+                Ok(Some(upstream)) if upstream.namespace != namespace => {
+                    return Err(AfterValidateError::BadRequest(vec![format!(
+                        "Cross-namespace reference forbidden: upstream_id '{}' belongs to namespace '{}' but proxy is in namespace '{}'",
+                        upstream_id, upstream.namespace, namespace
+                    )]));
+                }
+                Ok(Some(upstream)) => {
+                    if let Some(owner_spec_id) = upstream.api_spec_id.as_deref() {
+                        let same_spec_proxy = existing
+                            .and_then(|proxy| proxy.api_spec_id.as_deref())
+                            == Some(owner_spec_id);
+                        if !same_spec_proxy {
+                            return Err(AfterValidateError::BadRequest(vec![format!(
+                                "upstream_id '{}' is owned by api_spec '{}' and cannot be attached to proxy '{}'; create a hand-managed upstream or update the owning API spec",
+                                upstream_id, owner_spec_id, resource.id
+                            )]));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    return Err(AfterValidateError::BadRequest(vec![format!(
+                        "upstream_id '{}' does not exist",
+                        upstream_id
+                    )]));
                 }
                 Err(error) => return Err(AfterValidateError::Db(error)),
             }

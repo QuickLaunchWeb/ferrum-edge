@@ -138,23 +138,28 @@ pub fn translate_sds(slice: &MeshSlice) -> Vec<XdsResource> {
         return Vec::new();
     };
     let mut resources = Vec::new();
+    let mut seen_names = HashSet::new();
     let local = bundle_set.local.trust_domain.as_str();
     let local_name = format!("secret/spiffe-bundle/{local}");
-    resources.push(resource(
+    push_unique_resource(
+        &mut resources,
+        &mut seen_names,
         local_name.clone(),
         SDS_TYPE_URL,
         &slice.version,
         proto::Secret { name: local_name },
-    ));
+    );
     for bundle in &bundle_set.federated {
         let trust_domain = bundle.trust_domain.as_str();
         let name = format!("secret/spiffe-bundle/{trust_domain}");
-        resources.push(resource(
+        push_unique_resource(
+            &mut resources,
+            &mut seen_names,
             name.clone(),
             SDS_TYPE_URL,
             &slice.version,
             proto::Secret { name },
-        ));
+        );
     }
     resources
 }

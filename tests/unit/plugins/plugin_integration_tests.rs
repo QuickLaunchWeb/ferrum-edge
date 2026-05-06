@@ -240,6 +240,9 @@ async fn test_all_plugins_available() {
         "soap_ws_security",
         "spec_expose",
         "spiffe_identity",
+        "mesh_authz",
+        "workload_metrics",
+        "access_log",
         "ai_federation",
         "api_chargeback",
     ]
@@ -350,6 +353,7 @@ async fn test_plugin_scope_configuration() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -367,6 +371,7 @@ async fn test_plugin_scope_configuration() {
         proxy_id: Some("test-proxy".to_string()),
         enabled: true,
         priority_override: None,
+        api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };

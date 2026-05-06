@@ -127,6 +127,51 @@ async fn test_registry_records_request_counter() {
 }
 
 #[tokio::test]
+async fn test_registry_renders_mesh_red_metrics_when_metadata_present() {
+    let registry = MetricsRegistry::new();
+    let mut summary = make_summary("payments-proxy", "GET", 200, 42.0, 35.0);
+    summary.metadata = HashMap::from([
+        ("mesh.source.workload".to_string(), "frontend".to_string()),
+        ("mesh.source.namespace".to_string(), "default".to_string()),
+        (
+            "mesh.source.principal".to_string(),
+            "spiffe://cluster.local/ns/default/sa/frontend".to_string(),
+        ),
+        ("mesh.source.app".to_string(), "frontend".to_string()),
+        ("mesh.source.service".to_string(), "frontend".to_string()),
+        (
+            "mesh.destination.workload".to_string(),
+            "payments".to_string(),
+        ),
+        (
+            "mesh.destination.namespace".to_string(),
+            "default".to_string(),
+        ),
+        (
+            "mesh.destination.service".to_string(),
+            "payments".to_string(),
+        ),
+        ("mesh.request_protocol".to_string(), "http".to_string()),
+        (
+            "mesh.connection_security_policy".to_string(),
+            "mutual_tls".to_string(),
+        ),
+    ]);
+
+    registry.record(&summary);
+    let output = registry.render_uncached();
+
+    assert!(output.contains("# TYPE ferrum_mesh_requests_total counter"));
+    assert!(output.contains("ferrum_mesh_requests_total{"));
+    assert!(output.contains("source_workload=\"frontend\""));
+    assert!(output.contains("destination_service=\"payments\""));
+    assert!(output.contains("connection_security_policy=\"mutual_tls\""));
+    assert!(output.contains("# TYPE ferrum_mesh_request_duration_ms histogram"));
+    assert!(output.contains("ferrum_mesh_request_duration_ms_bucket{"));
+    assert!(output.contains("le=\"+Inf\""));
+}
+
+#[tokio::test]
 async fn test_registry_increments_counter_on_repeated_requests() {
     let registry = MetricsRegistry::new();
 

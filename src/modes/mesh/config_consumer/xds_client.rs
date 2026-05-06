@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+use crate::modes::mesh::runtime::MeshRuntimeState;
+use crate::xds::slice::MeshSlice;
+
 /// Phase B shell for an xDS-backed mesh config consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XdsClientConfig {
@@ -8,17 +11,26 @@ pub struct XdsClientConfig {
     pub namespace: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct XdsConfigConsumer {
     config: XdsClientConfig,
+    state: MeshRuntimeState,
 }
 
 impl XdsConfigConsumer {
-    pub fn new(config: XdsClientConfig) -> Self {
-        Self { config }
+    pub fn new(config: XdsClientConfig, state: MeshRuntimeState) -> Self {
+        Self { config, state }
     }
 
     pub fn config(&self) -> &XdsClientConfig {
         &self.config
+    }
+
+    pub fn state(&self) -> &MeshRuntimeState {
+        &self.state
+    }
+
+    pub fn apply_slice(&self, slice: MeshSlice) {
+        self.state.install_slice(slice);
     }
 }

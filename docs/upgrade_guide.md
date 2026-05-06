@@ -401,4 +401,8 @@ FERRUM_MODE=file \
 
 ### Environment Variable Changes
 
-New Ferrum versions may introduce new `FERRUM_*` environment variables. Review `ferrum.conf` in the release for new defaults. Existing variables that are removed will be silently ignored — check release notes for any behavioral changes.
+New Ferrum versions may introduce new `FERRUM_*` environment variables. Review `ferrum.conf` in the release for new defaults. Deprecated database TLS aliases (`FERRUM_DB_SSL_MODE`, `FERRUM_DB_SSL_ROOT_CERT`, `FERRUM_DB_SSL_CLIENT_CERT`, `FERRUM_DB_SSL_CLIENT_KEY`, `FERRUM_DB_TLS_ENABLED`, `FERRUM_DB_TLS_INSECURE`) are still accepted with startup warnings; rename them to the canonical `FERRUM_DB_TLS_*` variables before a future major release.
+
+### Logging Metadata Redaction
+
+Transaction metadata is redacted at serialization time before any built-in logger sink writes it. Keys matching built-in sensitive substrings such as `authorization`, `cookie`, `password`, `secret`, or `token` now serialize as `[REDACTED]`; use `FERRUM_LOG_REDACT_METADATA_KEYS` to add operator-specific substrings. The in-memory metadata map is unchanged for plugin logic.

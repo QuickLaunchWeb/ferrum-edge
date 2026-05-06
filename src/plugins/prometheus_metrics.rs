@@ -6,8 +6,10 @@
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -81,6 +83,25 @@ pub struct StreamDisconnectKey {
     pub direction: &'static str,
 }
 
+/// Istio/GAMMA-style RED metric key for mesh HTTP-family requests.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MeshRequestKey {
+    pub source_workload: Arc<str>,
+    pub source_namespace: Arc<str>,
+    pub source_principal: Arc<str>,
+    pub source_app: Arc<str>,
+    pub source_service: Arc<str>,
+    pub destination_workload: Arc<str>,
+    pub destination_namespace: Arc<str>,
+    pub destination_principal: Arc<str>,
+    pub destination_app: Arc<str>,
+    pub destination_service: Arc<str>,
+    pub request_protocol: Arc<str>,
+    pub response_code: u16,
+    pub response_flags: Arc<str>,
+    pub connection_security_policy: Arc<str>,
+}
+
 /// Map a `DisconnectCause` variant to its snake_case label, reusing static
 /// strings so hot-path label values cost nothing to copy.
 fn disconnect_cause_label(cause: Option<super::DisconnectCause>) -> &'static str {
@@ -105,15 +126,15 @@ fn direction_label(direction: Option<super::Direction>) -> &'static str {
 
 /// Atomic counter paired with a last-updated timestamp for stale entry eviction.
 pub struct TimestampedCounter {
-    pub value: AtomicU64,
-    pub last_updated: AtomicU64, // Instant encoded as nanos since registry creation
+    pub value: CachePadded<AtomicU64>,
+    pub last_updated: CachePadded<AtomicU64>, // Instant encoded as nanos since registry creation
 }
 
 impl TimestampedCounter {
     fn new(epoch: Instant) -> Self {
         Self {
-            value: AtomicU64::new(0),
-            last_updated: AtomicU64::new(epoch.elapsed().as_nanos() as u64),
+            value: CachePadded::new(AtomicU64::new(0)),
+            last_updated: CachePadded::new(AtomicU64::new(epoch.elapsed().as_nanos() as u64)),
         }
     }
 
@@ -135,13 +156,13 @@ pub struct HistogramBuckets {
     /// Bucket boundaries in milliseconds
     pub boundaries: Vec<f64>,
     /// Count of observations <= each boundary
-    pub counts: Vec<AtomicU64>,
+    pub counts: Vec<CachePadded<AtomicU64>>,
     /// Sum of all observations
-    pub sum: std::sync::atomic::AtomicU64, // stored as bits of f64
+    pub sum: CachePadded<AtomicU64>, // stored as bits of f64
     /// Total count
-    pub count: AtomicU64,
+    pub count: CachePadded<AtomicU64>,
     /// Last-updated timestamp (nanos since registry epoch)
-    last_updated: AtomicU64,
+    last_updated: CachePadded<AtomicU64>,
 }
 
 impl HistogramBuckets {
@@ -149,13 +170,16 @@ impl HistogramBuckets {
         let boundaries = vec![
             5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
         ];
-        let counts = boundaries.iter().map(|_| AtomicU64::new(0)).collect();
+        let counts = boundaries
+            .iter()
+            .map(|_| CachePadded::new(AtomicU64::new(0)))
+            .collect();
         Self {
             boundaries,
             counts,
-            sum: std::sync::atomic::AtomicU64::new(0),
-            count: AtomicU64::new(0),
-            last_updated: AtomicU64::new(epoch.elapsed().as_nanos() as u64),
+            sum: CachePadded::new(AtomicU64::new(0)),
+            count: CachePadded::new(AtomicU64::new(0)),
+            last_updated: CachePadded::new(AtomicU64::new(epoch.elapsed().as_nanos() as u64)),
         }
     }
 
@@ -215,6 +239,10 @@ pub struct MetricsRegistry {
     pub backend_duration_buckets: DashMap<Arc<str>, HistogramBuckets>,
     /// Gateway overhead histogram buckets by proxy_id
     pub gateway_overhead_buckets: DashMap<Arc<str>, HistogramBuckets>,
+    /// Mesh request count by Istio/GAMMA RED label set.
+    pub mesh_request_counter: DashMap<MeshRequestKey, TimestampedCounter>,
+    /// Mesh request duration histogram by the same bounded RED label set.
+    pub mesh_request_duration_buckets: DashMap<MeshRequestKey, HistogramBuckets>,
     /// Rate limit exceeded counter
     pub rate_limit_exceeded: AtomicU64,
     /// Stream connections by (proxy_id, protocol)
@@ -259,6 +287,8 @@ impl MetricsRegistry {
             request_duration_buckets: DashMap::new(),
             backend_duration_buckets: DashMap::new(),
             gateway_overhead_buckets: DashMap::new(),
+            mesh_request_counter: DashMap::new(),
+            mesh_request_duration_buckets: DashMap::new(),
             rate_limit_exceeded: AtomicU64::new(0),
             stream_connection_counter: DashMap::new(),
             stream_duration_buckets: DashMap::new(),
@@ -372,6 +402,17 @@ impl MetricsRegistry {
             .or_insert_with(|| HistogramBuckets::new(self.epoch))
             .observe(summary.latency_gateway_overhead_ms, self.epoch);
 
+        if let Some(mesh_key) = mesh_request_key(summary) {
+            self.mesh_request_counter
+                .entry(mesh_key.clone())
+                .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                .increment(self.epoch);
+            self.mesh_request_duration_buckets
+                .entry(mesh_key)
+                .or_insert_with(|| HistogramBuckets::new(self.epoch))
+                .observe(summary.latency_total_ms, self.epoch);
+        }
+
         // Increment the client-disconnect counter whenever the summary flags
         // the client as having aborted before receiving the full response.
         // Today this stays at zero for HTTP-family protocols (the field is
@@ -436,6 +477,22 @@ impl MetricsRegistry {
         });
 
         self.gateway_overhead_buckets.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.mesh_request_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.mesh_request_duration_buckets.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
                 evicted += 1;
@@ -516,6 +573,8 @@ impl MetricsRegistry {
             + self.request_duration_buckets.len() * 800
             + self.backend_duration_buckets.len() * 800
             + self.gateway_overhead_buckets.len() * 800
+            + self.mesh_request_counter.len() * 600
+            + self.mesh_request_duration_buckets.len() * 1800
             + self.stream_connection_counter.len() * 200
             + self.stream_duration_buckets.len() * 800;
         let mut output = String::with_capacity(estimated_cap);
@@ -584,6 +643,31 @@ impl MetricsRegistry {
                 entry.value(),
                 &ns_label,
             );
+        }
+
+        if !self.mesh_request_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_mesh_requests_total Mesh requests by Istio/GAMMA identity labels.\n",
+            );
+            output.push_str("# TYPE ferrum_mesh_requests_total counter\n");
+            for entry in self.mesh_request_counter.iter() {
+                let count = entry.value().value.load(Ordering::Relaxed);
+                let labels = mesh_label_fragment(entry.key(), None);
+                output.push_str(&format!(
+                    "ferrum_mesh_requests_total{{{}}} {}\n",
+                    labels, count
+                ));
+            }
+        }
+
+        if !self.mesh_request_duration_buckets.is_empty() {
+            output.push_str(
+                "# HELP ferrum_mesh_request_duration_ms Mesh request duration in milliseconds.\n",
+            );
+            output.push_str("# TYPE ferrum_mesh_request_duration_ms histogram\n");
+            for entry in self.mesh_request_duration_buckets.iter() {
+                render_mesh_histogram(&mut output, entry.key(), entry.value());
+            }
         }
 
         // Rate limit exceeded
@@ -711,6 +795,157 @@ fn render_histogram(
         "{}_count{{proxy_id=\"{}\"{}}} {}\n",
         metric_name, proxy_id, ns_label, total_count
     ));
+}
+
+fn mesh_request_key(summary: &TransactionSummary) -> Option<MeshRequestKey> {
+    if !summary.metadata.keys().any(|key| key.starts_with("mesh.")) {
+        return None;
+    }
+
+    let source_workload = metadata_arc(&summary.metadata, "mesh.source.workload", "unknown");
+    let source_namespace = metadata_arc(&summary.metadata, "mesh.source.namespace", "unknown");
+    let source_principal = metadata_arc(&summary.metadata, "mesh.source.principal", "unknown");
+    let source_app = metadata_arc_or_clone(&summary.metadata, "mesh.source.app", &source_workload);
+    let source_service =
+        metadata_arc_or_clone(&summary.metadata, "mesh.source.service", &source_workload);
+    let destination_default = summary
+        .proxy_name
+        .as_deref()
+        .or(summary.proxy_id.as_deref())
+        .unwrap_or("unknown");
+    let destination_workload = metadata_arc(
+        &summary.metadata,
+        "mesh.destination.workload",
+        destination_default,
+    );
+    let destination_namespace =
+        metadata_arc(&summary.metadata, "mesh.destination.namespace", "unknown");
+    let destination_principal =
+        metadata_arc(&summary.metadata, "mesh.destination.principal", "unknown");
+    let destination_app = metadata_arc_or_clone(
+        &summary.metadata,
+        "mesh.destination.app",
+        &destination_workload,
+    );
+    let destination_service = metadata_arc_or_clone(
+        &summary.metadata,
+        "mesh.destination.service",
+        &destination_workload,
+    );
+    let request_protocol = metadata_arc_any(
+        &summary.metadata,
+        &["mesh.request_protocol", "request_protocol"],
+        "http",
+    );
+    let response_flags = metadata_arc(
+        &summary.metadata,
+        "mesh.response_flags",
+        inferred_response_flags(summary),
+    );
+    let connection_security_policy =
+        metadata_arc(&summary.metadata, "mesh.connection_security_policy", "none");
+
+    Some(MeshRequestKey {
+        source_workload,
+        source_namespace,
+        source_principal,
+        source_app,
+        source_service,
+        destination_workload,
+        destination_namespace,
+        destination_principal,
+        destination_app,
+        destination_service,
+        request_protocol,
+        response_code: summary.response_status_code,
+        response_flags,
+        connection_security_policy,
+    })
+}
+
+fn metadata_arc(metadata: &HashMap<String, String>, key: &str, default: &str) -> Arc<str> {
+    Arc::from(metadata.get(key).map(String::as_str).unwrap_or(default))
+}
+
+fn metadata_arc_any(metadata: &HashMap<String, String>, keys: &[&str], default: &str) -> Arc<str> {
+    Arc::from(
+        keys.iter()
+            .find_map(|key| metadata.get(*key).map(String::as_str))
+            .unwrap_or(default),
+    )
+}
+
+fn metadata_arc_or_clone(
+    metadata: &HashMap<String, String>,
+    key: &str,
+    default: &Arc<str>,
+) -> Arc<str> {
+    metadata
+        .get(key)
+        .map(|value| Arc::from(value.as_str()))
+        .unwrap_or_else(|| Arc::clone(default))
+}
+
+fn inferred_response_flags(summary: &TransactionSummary) -> &'static str {
+    if summary.client_disconnected {
+        "DC"
+    } else if summary.error_class.is_some() || summary.body_error_class.is_some() {
+        "UF"
+    } else {
+        "-"
+    }
+}
+
+fn render_mesh_histogram(output: &mut String, key: &MeshRequestKey, histogram: &HistogramBuckets) {
+    for (i, boundary) in histogram.boundaries.iter().enumerate() {
+        let le = boundary.to_string();
+        let labels = mesh_label_fragment(key, Some(&le));
+        let count = histogram.counts[i].load(Ordering::Relaxed);
+        output.push_str(&format!(
+            "ferrum_mesh_request_duration_ms_bucket{{{}}} {}\n",
+            labels, count
+        ));
+    }
+    let total_count = histogram.count.load(Ordering::Relaxed);
+    let labels = mesh_label_fragment(key, Some("+Inf"));
+    output.push_str(&format!(
+        "ferrum_mesh_request_duration_ms_bucket{{{}}} {}\n",
+        labels, total_count
+    ));
+    let labels = mesh_label_fragment(key, None);
+    let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
+    output.push_str(&format!(
+        "ferrum_mesh_request_duration_ms_sum{{{}}} {:.2}\n",
+        labels, sum
+    ));
+    output.push_str(&format!(
+        "ferrum_mesh_request_duration_ms_count{{{}}} {}\n",
+        labels, total_count
+    ));
+}
+
+fn mesh_label_fragment(key: &MeshRequestKey, le: Option<&str>) -> String {
+    let mut labels = format!(
+        "source_workload=\"{}\",source_namespace=\"{}\",source_principal=\"{}\",source_app=\"{}\",source_service=\"{}\",destination_workload=\"{}\",destination_namespace=\"{}\",destination_principal=\"{}\",destination_app=\"{}\",destination_service=\"{}\",request_protocol=\"{}\",response_code=\"{}\",response_flags=\"{}\",connection_security_policy=\"{}\"",
+        escape_label_value(&key.source_workload),
+        escape_label_value(&key.source_namespace),
+        escape_label_value(&key.source_principal),
+        escape_label_value(&key.source_app),
+        escape_label_value(&key.source_service),
+        escape_label_value(&key.destination_workload),
+        escape_label_value(&key.destination_namespace),
+        escape_label_value(&key.destination_principal),
+        escape_label_value(&key.destination_app),
+        escape_label_value(&key.destination_service),
+        escape_label_value(&key.request_protocol),
+        key.response_code,
+        escape_label_value(&key.response_flags),
+        escape_label_value(&key.connection_security_policy)
+    );
+    if let Some(le) = le {
+        labels.push_str(&format!(",le=\"{}\"", le));
+    }
+    labels
 }
 
 pub struct PrometheusMetrics {
