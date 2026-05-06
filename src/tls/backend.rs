@@ -199,7 +199,8 @@ impl<'a> BackendTlsConfigBuilder<'a> {
 
     fn build_server_verifier(&self) -> Result<Arc<WebPkiServerVerifier>, TlsError> {
         let root_store = build_root_cert_store(self.custom_ca_path(), self.global_ca)?;
-        build_server_verifier_with_crls(root_store, self.crls)
+        let provider = self.policy.map(|policy| policy.crypto_provider.clone());
+        build_server_verifier_with_crls(root_store, self.crls, provider)
             .map_err(|e| TlsError::Rustls(format!("Failed to build server verifier: {}", e)))
     }
 
@@ -519,6 +520,7 @@ mod tests {
         TlsPolicy {
             protocol_versions: vec![&rustls::version::TLS13],
             crypto_provider: Arc::new(provider),
+            crypto_provider_kind: crate::tls::TlsCryptoProviderKind::Ring,
             prefer_server_cipher_order: false,
             session_cache_size: 4096,
             early_data_max_size: 0,

@@ -362,6 +362,7 @@ fn build_h3_test_tls_policy() -> ferrum_edge::tls::TlsPolicy {
     ferrum_edge::tls::TlsPolicy {
         protocol_versions: vec![&rustls::version::TLS13],
         crypto_provider: provider,
+        crypto_provider_kind: ferrum_edge::tls::TlsCryptoProviderKind::Ring,
         prefer_server_cipher_order: true,
         session_cache_size: 4096,
         early_data_max_size: 0,

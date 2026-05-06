@@ -34,7 +34,7 @@ http = "1"
 
 # TLS
 ring = "0.17"
-rustls = { version = "0.23", features = ["ring", "std"] }
+rustls = { version = "0.23", features = ["aws_lc_rs", "ring", "std"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
 webpki-roots = "1.0"

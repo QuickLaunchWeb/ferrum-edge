@@ -395,7 +395,10 @@ fn health_request_tls(
     // before the global `CryptoProvider::install_default()` call. Build the
     // ClientConfig with an explicit provider so we don't depend on (or panic
     // on) a globally installed one.
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(
+        crate::tls::crypto_provider_from_env_or_default()
+            .map_err(|e| format!("Failed to select rustls crypto provider: {}", e))?,
+    );
 
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());

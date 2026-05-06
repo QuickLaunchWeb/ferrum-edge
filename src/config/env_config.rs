@@ -815,6 +815,11 @@ pub struct EnvConfig {
     ///          ECDHE-ECDSA-AES128-GCM-SHA256, ECDHE-RSA-AES128-GCM-SHA256,
     ///          ECDHE-ECDSA-CHACHA20-POLY1305, ECDHE-RSA-CHACHA20-POLY1305
     pub tls_cipher_suites: Option<String>,
+    /// Rustls cryptography provider: "ring" (default) or "aws-lc-rs".
+    /// This selects the provider for gateway-managed frontend/backend TLS
+    /// configs; dependency-owned TLS surfaces may still select their own
+    /// provider through crate features.
+    pub tls_crypto_provider: String,
     /// Prefer server cipher order for TLS 1.2 (default: true)
     pub tls_prefer_server_cipher_order: bool,
     /// Comma-separated ECDH curves/groups: X25519, secp256r1, secp384r1 (default: "X25519,secp256r1")
@@ -1260,6 +1265,7 @@ impl Default for EnvConfig {
             tls_min_version: "1.2".into(),
             tls_max_version: "1.3".into(),
             tls_cipher_suites: None,
+            tls_crypto_provider: "ring".into(),
             tls_prefer_server_cipher_order: true,
             tls_curves: None,
             tls_session_cache_size: 4096,
@@ -1531,6 +1537,7 @@ impl EnvConfig {
             tls_min_version: String = "FERRUM_TLS_MIN_VERSION" => "1.2".to_string();
             tls_max_version: String = "FERRUM_TLS_MAX_VERSION" => "1.3".to_string();
             tls_cipher_suites: Option<String> = "FERRUM_TLS_CIPHER_SUITES";
+            tls_crypto_provider: String = "FERRUM_TLS_CRYPTO_PROVIDER" => "ring".to_string();
             tls_prefer_server_cipher_order: bool = "FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER" => true;
             tls_curves: Option<String> = "FERRUM_TLS_CURVES";
             tls_session_cache_size: usize = "FERRUM_TLS_SESSION_CACHE_SIZE" => 4096usize;
@@ -1849,6 +1856,7 @@ impl EnvConfig {
             tls_min_version,
             tls_max_version,
             tls_cipher_suites,
+            tls_crypto_provider,
             tls_prefer_server_cipher_order,
             tls_curves,
             tls_session_cache_size,

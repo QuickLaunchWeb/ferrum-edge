@@ -160,7 +160,7 @@ fn build_tls_connector(
     } else {
         // Apply gateway CRL list via `build_server_verifier_with_crls` (uses
         // `allow_unknown_revocation_status() + only_check_end_entity_revocation()`).
-        let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
+        let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls, None)
             .map_err(|e| format!("ws_logging: failed to build TLS verifier: {e}"))?;
         rustls::ClientConfig::builder()
             .with_webpki_verifier(verifier)

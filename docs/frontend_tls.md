@@ -515,6 +515,7 @@ The gateway supports fine-grained control over TLS protocol versions, cipher sui
 | `FERRUM_TLS_MIN_VERSION` | `1.2` | Minimum TLS version (inbound + outbound). Allowed: `1.2`, `1.3` |
 | `FERRUM_TLS_MAX_VERSION` | `1.3` | Maximum TLS version (inbound + outbound). Allowed: `1.2`, `1.3` |
 | `FERRUM_TLS_CIPHER_SUITES` | *(see defaults below)* | Comma-separated cipher suites (inbound + outbound) |
+| `FERRUM_TLS_CRYPTO_PROVIDER` | `ring` | Rustls crypto provider for gateway-managed TLS configs. Allowed: `ring`, `aws-lc-rs` |
 | `FERRUM_TLS_CURVES` | *(see defaults below)* | Comma-separated key exchange groups (inbound + outbound) |
 | `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | `true` | Server cipher preference for TLS 1.2 (inbound only) |
 | `FERRUM_TLS_SESSION_CACHE_SIZE` | `4096` | Session ID cache for TLS 1.2 resumption (inbound only) |

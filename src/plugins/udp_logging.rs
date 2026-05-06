@@ -229,8 +229,9 @@ async fn build_sender_for_addr(
             // Apply gateway CRL list (`FERRUM_TLS_CRL_FILE_PATH`) so revoked
             // DTLS log-sink certificates are rejected, matching the proxy
             // backend / DTLS / frontend mTLS surfaces.
-            let verifier = crate::tls::build_server_verifier_with_crls(root_store, &cfg.dtls_crls)
-                .map_err(|error| format!("udp_logging: DTLS verifier build failed: {error}"))?;
+            let verifier =
+                crate::tls::build_server_verifier_with_crls(root_store, &cfg.dtls_crls, None)
+                    .map_err(|error| format!("udp_logging: DTLS verifier build failed: {error}"))?;
             (
                 Some(server_name),
                 Some(verifier as Arc<dyn rustls::client::danger::ServerCertVerifier>),

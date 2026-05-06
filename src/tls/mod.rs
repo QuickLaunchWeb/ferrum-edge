@@ -122,11 +122,70 @@ pub fn load_crls(path: Option<&str>) -> Result<CrlList, anyhow::Error> {
 /// Default number of days before expiration to emit a warning.
 pub const DEFAULT_CERT_EXPIRY_WARNING_DAYS: u64 = 30;
 
+/// Rustls cryptography provider selected for gateway-owned TLS configs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsCryptoProviderKind {
+    Ring,
+    AwsLcRs,
+}
+
+impl TlsCryptoProviderKind {
+    pub fn parse(input: &str) -> Result<Self, anyhow::Error> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "ring" => Ok(Self::Ring),
+            "aws-lc-rs" | "aws_lc_rs" | "awslc" | "aws-lc" => Ok(Self::AwsLcRs),
+            other => Err(anyhow::anyhow!(
+                "Unknown FERRUM_TLS_CRYPTO_PROVIDER '{}'. Supported values: ring, aws-lc-rs",
+                other
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ring => "ring",
+            Self::AwsLcRs => "aws-lc-rs",
+        }
+    }
+
+    pub fn default_provider(self) -> CryptoProvider {
+        match self {
+            Self::Ring => rustls::crypto::ring::default_provider(),
+            Self::AwsLcRs => rustls::crypto::aws_lc_rs::default_provider(),
+        }
+    }
+}
+
+pub fn crypto_provider_from_name(name: &str) -> Result<CryptoProvider, anyhow::Error> {
+    Ok(TlsCryptoProviderKind::parse(name)?.default_provider())
+}
+
+pub fn crypto_provider_from_env_or_default() -> Result<CryptoProvider, anyhow::Error> {
+    let provider_name =
+        std::env::var("FERRUM_TLS_CRYPTO_PROVIDER").unwrap_or_else(|_| "ring".to_string());
+    crypto_provider_from_name(&provider_name)
+}
+
+pub fn install_default_crypto_provider_from_env() -> Result<(), anyhow::Error> {
+    let provider_name =
+        std::env::var("FERRUM_TLS_CRYPTO_PROVIDER").unwrap_or_else(|_| "ring".to_string());
+    let provider_kind = TlsCryptoProviderKind::parse(&provider_name)?;
+    rustls::crypto::CryptoProvider::install_default(provider_kind.default_provider()).map_err(
+        |_| {
+            anyhow::anyhow!(
+                "Failed to install rustls {} crypto provider",
+                provider_kind.as_str()
+            )
+        },
+    )
+}
+
 /// TLS hardening policy parsed from environment variables.
 #[derive(Debug, Clone)]
 pub struct TlsPolicy {
     pub protocol_versions: Vec<&'static rustls::SupportedProtocolVersion>,
     pub crypto_provider: Arc<CryptoProvider>,
+    pub crypto_provider_kind: TlsCryptoProviderKind,
     pub prefer_server_cipher_order: bool,
     pub session_cache_size: usize,
     /// Maximum 0-RTT early data size in bytes. 0 = disabled (default).
@@ -162,18 +221,20 @@ impl TlsPolicy {
             ));
         }
 
+        let provider_kind = TlsCryptoProviderKind::parse(&env_config.tls_crypto_provider)?;
+
         // Build cipher suites
         let cipher_suites = if let Some(ref suites_str) = env_config.tls_cipher_suites {
-            parse_cipher_suites(suites_str)?
+            parse_cipher_suites(provider_kind, suites_str)?
         } else {
-            default_cipher_suites()
+            default_cipher_suites(provider_kind)
         };
 
         // Build key exchange groups
         let kx_groups = if let Some(ref curves_str) = env_config.tls_curves {
-            parse_kx_groups(curves_str)?
+            parse_kx_groups(provider_kind, curves_str)?
         } else {
-            default_kx_groups()
+            default_kx_groups(provider_kind)
         };
 
         // Log the TLS policy
@@ -197,12 +258,16 @@ impl TlsPolicy {
             .collect();
 
         info!(
-            "TLS policy: versions={:?}, cipher_suites={:?}, curves={:?}, prefer_server_order={}",
-            version_names, suite_names, group_names, env_config.tls_prefer_server_cipher_order
+            "TLS policy: provider={}, versions={:?}, cipher_suites={:?}, curves={:?}, prefer_server_order={}",
+            provider_kind.as_str(),
+            version_names,
+            suite_names,
+            group_names,
+            env_config.tls_prefer_server_cipher_order
         );
 
         // Build custom CryptoProvider
-        let base_provider = rustls::crypto::ring::default_provider();
+        let base_provider = provider_kind.default_provider();
         let provider = CryptoProvider {
             cipher_suites,
             kx_groups,
@@ -220,6 +285,7 @@ impl TlsPolicy {
         Ok(Self {
             protocol_versions: versions,
             crypto_provider: Arc::new(provider),
+            crypto_provider_kind: provider_kind,
             prefer_server_cipher_order: env_config.tls_prefer_server_cipher_order,
             session_cache_size: env_config.tls_session_cache_size,
             early_data_max_size,
@@ -228,65 +294,112 @@ impl TlsPolicy {
 }
 
 /// Default secure cipher suites (TLS 1.3 + TLS 1.2 AEAD-only).
-fn default_cipher_suites() -> Vec<rustls::SupportedCipherSuite> {
-    vec![
-        // TLS 1.3
-        rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
-        rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256,
-        rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
-        // TLS 1.2
-        rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-        rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-        rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-        rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-        rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-        rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-    ]
+fn default_cipher_suites(kind: TlsCryptoProviderKind) -> Vec<rustls::SupportedCipherSuite> {
+    match kind {
+        TlsCryptoProviderKind::Ring => vec![
+            rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
+            rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256,
+            rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+            rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        ],
+        TlsCryptoProviderKind::AwsLcRs => vec![
+            rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384,
+            rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256,
+            rustls::crypto::aws_lc_rs::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+            rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        ],
+    }
 }
 
 /// Default key exchange groups.
-fn default_kx_groups() -> Vec<&'static dyn rustls::crypto::SupportedKxGroup> {
-    vec![
-        rustls::crypto::ring::kx_group::X25519,
-        rustls::crypto::ring::kx_group::SECP256R1,
-    ]
+fn default_kx_groups(
+    kind: TlsCryptoProviderKind,
+) -> Vec<&'static dyn rustls::crypto::SupportedKxGroup> {
+    match kind {
+        TlsCryptoProviderKind::Ring => vec![
+            rustls::crypto::ring::kx_group::X25519,
+            rustls::crypto::ring::kx_group::SECP256R1,
+        ],
+        TlsCryptoProviderKind::AwsLcRs => vec![
+            rustls::crypto::aws_lc_rs::kx_group::X25519,
+            rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+        ],
+    }
 }
 
 /// Parse comma-separated cipher suite names (OpenSSL naming convention) into rustls suites.
-fn parse_cipher_suites(input: &str) -> Result<Vec<rustls::SupportedCipherSuite>, anyhow::Error> {
+fn parse_cipher_suites(
+    kind: TlsCryptoProviderKind,
+    input: &str,
+) -> Result<Vec<rustls::SupportedCipherSuite>, anyhow::Error> {
     let mut suites = Vec::new();
     for name in input.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let suite = match name {
-            // TLS 1.3
-            "TLS_AES_256_GCM_SHA384" => {
+        let suite = match (kind, name) {
+            (TlsCryptoProviderKind::Ring, "TLS_AES_256_GCM_SHA384") => {
                 rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384
             }
-            "TLS_AES_128_GCM_SHA256" => {
+            (TlsCryptoProviderKind::Ring, "TLS_AES_128_GCM_SHA256") => {
                 rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
             }
-            "TLS_CHACHA20_POLY1305_SHA256" => {
+            (TlsCryptoProviderKind::Ring, "TLS_CHACHA20_POLY1305_SHA256") => {
                 rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256
             }
-            // TLS 1.2 (OpenSSL naming)
-            "ECDHE-ECDSA-AES256-GCM-SHA384" => {
+            (TlsCryptoProviderKind::Ring, "ECDHE-ECDSA-AES256-GCM-SHA384") => {
                 rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
             }
-            "ECDHE-RSA-AES256-GCM-SHA384" => {
+            (TlsCryptoProviderKind::Ring, "ECDHE-RSA-AES256-GCM-SHA384") => {
                 rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
             }
-            "ECDHE-ECDSA-AES128-GCM-SHA256" => {
+            (TlsCryptoProviderKind::Ring, "ECDHE-ECDSA-AES128-GCM-SHA256") => {
                 rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
             }
-            "ECDHE-RSA-AES128-GCM-SHA256" => {
+            (TlsCryptoProviderKind::Ring, "ECDHE-RSA-AES128-GCM-SHA256") => {
                 rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
             }
-            "ECDHE-ECDSA-CHACHA20-POLY1305" => {
+            (TlsCryptoProviderKind::Ring, "ECDHE-ECDSA-CHACHA20-POLY1305") => {
                 rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
             }
-            "ECDHE-RSA-CHACHA20-POLY1305" => {
+            (TlsCryptoProviderKind::Ring, "ECDHE-RSA-CHACHA20-POLY1305") => {
                 rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
             }
-            unknown => {
+            (TlsCryptoProviderKind::AwsLcRs, "TLS_AES_256_GCM_SHA384") => {
+                rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384
+            }
+            (TlsCryptoProviderKind::AwsLcRs, "TLS_AES_128_GCM_SHA256") => {
+                rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
+            }
+            (TlsCryptoProviderKind::AwsLcRs, "TLS_CHACHA20_POLY1305_SHA256") => {
+                rustls::crypto::aws_lc_rs::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256
+            }
+            (TlsCryptoProviderKind::AwsLcRs, "ECDHE-ECDSA-AES256-GCM-SHA384") => {
+                rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+            }
+            (TlsCryptoProviderKind::AwsLcRs, "ECDHE-RSA-AES256-GCM-SHA384") => {
+                rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+            }
+            (TlsCryptoProviderKind::AwsLcRs, "ECDHE-ECDSA-AES128-GCM-SHA256") => {
+                rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+            }
+            (TlsCryptoProviderKind::AwsLcRs, "ECDHE-RSA-AES128-GCM-SHA256") => {
+                rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+            }
+            (TlsCryptoProviderKind::AwsLcRs, "ECDHE-ECDSA-CHACHA20-POLY1305") => {
+                rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+            }
+            (TlsCryptoProviderKind::AwsLcRs, "ECDHE-RSA-CHACHA20-POLY1305") => {
+                rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+            }
+            (_, unknown) => {
                 return Err(anyhow::anyhow!(
                     "Unknown cipher suite '{}'. Supported TLS 1.3: TLS_AES_256_GCM_SHA384, TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256. \
                  Supported TLS 1.2: ECDHE-ECDSA-AES256-GCM-SHA384, ECDHE-RSA-AES256-GCM-SHA384, \
@@ -306,18 +419,30 @@ fn parse_cipher_suites(input: &str) -> Result<Vec<rustls::SupportedCipherSuite>,
 
 /// Parse comma-separated curve/key-exchange group names.
 fn parse_kx_groups(
+    kind: TlsCryptoProviderKind,
     input: &str,
 ) -> Result<Vec<&'static dyn rustls::crypto::SupportedKxGroup>, anyhow::Error> {
     let mut groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = Vec::new();
     for name in input.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let group: &'static dyn rustls::crypto::SupportedKxGroup = match name
-            .to_lowercase()
-            .as_str()
-        {
-            "x25519" => rustls::crypto::ring::kx_group::X25519,
-            "secp256r1" | "p-256" | "p256" => rustls::crypto::ring::kx_group::SECP256R1,
-            "secp384r1" | "p-384" | "p384" => rustls::crypto::ring::kx_group::SECP384R1,
-            unknown => {
+        let lower = name.to_ascii_lowercase();
+        let group: &'static dyn rustls::crypto::SupportedKxGroup = match (kind, lower.as_str()) {
+            (TlsCryptoProviderKind::Ring, "x25519") => rustls::crypto::ring::kx_group::X25519,
+            (TlsCryptoProviderKind::Ring, "secp256r1" | "p-256" | "p256") => {
+                rustls::crypto::ring::kx_group::SECP256R1
+            }
+            (TlsCryptoProviderKind::Ring, "secp384r1" | "p-384" | "p384") => {
+                rustls::crypto::ring::kx_group::SECP384R1
+            }
+            (TlsCryptoProviderKind::AwsLcRs, "x25519") => {
+                rustls::crypto::aws_lc_rs::kx_group::X25519
+            }
+            (TlsCryptoProviderKind::AwsLcRs, "secp256r1" | "p-256" | "p256") => {
+                rustls::crypto::aws_lc_rs::kx_group::SECP256R1
+            }
+            (TlsCryptoProviderKind::AwsLcRs, "secp384r1" | "p-384" | "p384") => {
+                rustls::crypto::aws_lc_rs::kx_group::SECP384R1
+            }
+            (_, unknown) => {
                 return Err(anyhow::anyhow!(
                     "Unknown curve/group '{}'. Supported: X25519, secp256r1 (P-256), secp384r1 (P-384)",
                     unknown
@@ -582,10 +707,14 @@ pub fn backend_client_config_builder(
 pub fn build_server_verifier_with_crls(
     root_store: rustls::RootCertStore,
     crls: &[CertificateRevocationListDer<'static>],
+    crypto_provider: Option<Arc<CryptoProvider>>,
 ) -> Result<Arc<rustls::client::WebPkiServerVerifier>, anyhow::Error> {
-    // Use ring provider explicitly so this works even when no global CryptoProvider
-    // is installed (e.g., in unit/integration tests).
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    // Use an explicit provider so this works even when no global
+    // CryptoProvider is installed (e.g., in unit/integration tests).
+    let provider = match crypto_provider {
+        Some(provider) => provider,
+        None => Arc::new(crypto_provider_from_env_or_default()?),
+    };
     let mut builder =
         rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(root_store), provider);
     if !crls.is_empty() {
@@ -839,6 +968,7 @@ mod tests {
         let policy = TlsPolicy {
             protocol_versions: vec![&rustls::version::TLS13],
             crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
+            crypto_provider_kind: TlsCryptoProviderKind::Ring,
             prefer_server_cipher_order: false,
             session_cache_size: 123,
             early_data_max_size: 0,
@@ -879,6 +1009,7 @@ mod tests {
         let policy = TlsPolicy {
             protocol_versions: vec![&rustls::version::TLS13],
             crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
+            crypto_provider_kind: TlsCryptoProviderKind::Ring,
             prefer_server_cipher_order: false,
             session_cache_size: 4096,
             early_data_max_size: 0,
@@ -893,6 +1024,7 @@ mod tests {
         let policy = TlsPolicy {
             protocol_versions: vec![&rustls::version::TLS12],
             crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
+            crypto_provider_kind: TlsCryptoProviderKind::Ring,
             prefer_server_cipher_order: false,
             session_cache_size: 4096,
             early_data_max_size: 0,
@@ -915,6 +1047,7 @@ mod tests {
         let policy = TlsPolicy {
             protocol_versions: vec![&rustls::version::TLS13],
             crypto_provider: Arc::new(provider),
+            crypto_provider_kind: TlsCryptoProviderKind::Ring,
             prefer_server_cipher_order: false,
             session_cache_size: 4096,
             early_data_max_size: 0,

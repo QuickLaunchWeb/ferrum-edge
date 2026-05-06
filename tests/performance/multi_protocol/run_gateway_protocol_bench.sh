@@ -302,6 +302,7 @@ start_ferrum() {
         -e "FERRUM_UDP_RECVMMSG_BATCH_SIZE=64" \
         -e "FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0" \
         -e "FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS=0" \
+        -e "FERRUM_TLS_CRYPTO_PROVIDER=aws-lc-rs" \
         "${extra_env[@]}" \
         "$FERRUM_IMAGE")
 

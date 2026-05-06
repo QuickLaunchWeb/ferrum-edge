@@ -4110,7 +4110,8 @@ fn build_websocket_tls_connector(
     // Build client config with TLS policy (cipher suites, protocol versions)
     let builder = match crate::tls::backend_client_config_builder(tls_policy) {
         Ok(b) => {
-            let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)?;
+            let provider = tls_policy.map(|policy| policy.crypto_provider.clone());
+            let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls, provider)?;
             b.with_webpki_verifier(verifier)
         }
         Err(e) => {
@@ -4120,7 +4121,7 @@ fn build_websocket_tls_connector(
             );
             let fallback_store =
                 rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let verifier = crate::tls::build_server_verifier_with_crls(fallback_store, crls)?;
+            let verifier = crate::tls::build_server_verifier_with_crls(fallback_store, crls, None)?;
             rustls::ClientConfig::builder().with_webpki_verifier(verifier)
         }
     };
