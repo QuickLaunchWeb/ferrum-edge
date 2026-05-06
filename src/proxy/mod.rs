@@ -1400,6 +1400,9 @@ impl ProxyState {
                     tracing::info!(enabled = v, config = %env_config_arc.tcp_fastopen_enabled, "TCP_FASTOPEN auto-detection");
                     v
                 },
+                env_config_arc.tcp_listen_backlog,
+                env_config_arc.accept_threads,
+                env_config_arc.tcp_fastopen_queue_len,
                 overload.clone(),
                 {
                     let v = env_config_arc
@@ -4883,17 +4886,20 @@ pub async fn start_proxy_listener_with_bound_listener(
     Ok(())
 }
 
-/// Create a bound TCP socket with SO_REUSEADDR and SO_REUSEPORT enabled.
+/// Create a bound TCP socket with SO_REUSEADDR and optional SO_REUSEPORT.
 /// Used by the multi-listener accept architecture where N sockets are bound
 /// to the same address, each with its own accept loop.
+/// `SO_REUSEPORT` is enabled only when `reuse_port` is true, which keeps
+/// single-listener sockets from being co-bound unnecessarily.
 ///
 /// When `tcp_fastopen_queue_len` is `Some(n)`, enables TCP Fast Open on the
 /// listening socket (Linux only), allowing repeat clients with a cached TFO
 /// cookie to send data in the SYN packet (saves 1 RTT).
-fn create_proxy_socket(
+pub(crate) fn create_proxy_socket(
     addr: SocketAddr,
     backlog: i32,
     tcp_fastopen_queue_len: Option<u16>,
+    reuse_port: bool,
 ) -> Result<TcpListener, anyhow::Error> {
     let socket = socket2::Socket::new(
         if addr.is_ipv6() {
@@ -4910,9 +4916,11 @@ fn create_proxy_socket(
 
     // SO_REUSEPORT: let the kernel distribute incoming connections across
     // multiple listener tasks (Linux 3.9+, macOS, BSDs). This eliminates
-    // the single-thread accept() bottleneck at 50k+ connections/sec.
+    // the single-thread accept() bottleneck at high connection rates.
     #[cfg(unix)]
-    socket.set_reuse_port(true)?;
+    if reuse_port {
+        socket.set_reuse_port(true)?;
+    }
 
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
@@ -4951,7 +4959,20 @@ pub async fn start_proxy_listener_with_tls_and_signal(
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     let backlog = state.env_config.tcp_listen_backlog as i32;
-    let accept_threads = state.env_config.accept_threads.max(1);
+    let configured_accept_threads = state.env_config.accept_threads.max(1);
+    #[cfg(unix)]
+    let accept_threads = configured_accept_threads;
+    #[cfg(not(unix))]
+    let accept_threads = {
+        if configured_accept_threads > 1 {
+            tracing::warn!(
+                configured_accept_threads,
+                "FERRUM_ACCEPT_THREADS > 1 requires SO_REUSEPORT; using one accept loop on this platform"
+            );
+        }
+        1
+    };
+    let reuse_port = accept_threads > 1;
     let tfo_enabled = state
         .env_config
         .tcp_fastopen_enabled
@@ -4963,7 +4984,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
     };
 
     // Create the first listener — this one validates that the port is available.
-    let first_listener = create_proxy_socket(addr, backlog, tfo_queue)?;
+    let first_listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
 
     // Optional connection limit. Shared across all accept threads so the global
     // max_connections limit is enforced regardless of which thread accepted.
@@ -4988,7 +5009,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
 
         // Spawn additional listeners (threads 1..N-1)
         for i in 1..accept_threads {
-            let listener = create_proxy_socket(addr, backlog, tfo_queue)?;
+            let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
             let state = state.clone();
             let tls_config = tls_config.clone();
             let semaphore = conn_semaphore.clone();

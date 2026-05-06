@@ -335,11 +335,11 @@ TCP connections are monitored for idle activity. When no data is transferred in 
 - Maximum: 86,400 seconds (24 hours)
 
 **How it works:**
-- An `IdleTrackingStream` wrapper monitors reads on both the client and backend sides
-- A background checker polls every 1 second to compare the last activity timestamp against the timeout
+- The relay refreshes a shared activity watermark whenever either direction makes read or write progress
+- A watchdog compares the last activity timestamp against the timeout. It ticks every 1 second for sub-30s timeouts and every 5 seconds for 30s+ timeouts, reducing timer churn for production-length connections
 - When the timeout fires, the connection is closed gracefully and logged as a TCP idle timeout
 - Connections with active data flow in either direction are never affected
-- When disabled (0), the fast path uses `copy_bidirectional` with zero overhead. On Linux, plaintext TCP connections (no TLS on either side) use `splice(2)` zero-copy relay, eliminating userspace memory copies entirely. When `FERRUM_KTLS_ENABLED=auto` or `true` and the kernel `tls` module is loaded, frontend-TLS connections with AES-GCM cipher suites also use splice — the kernel handles encrypt/decrypt via kTLS
+- When the TCP idle timeout, TCP half-close cap, `backend_read_timeout_ms`, and `backend_write_timeout_ms` are all disabled (`0`), TLS userspace relays use the `copy_bidirectional` fast path. On Linux, plaintext TCP connections (no TLS on either side) use `splice(2)` zero-copy relay, eliminating userspace memory copies entirely. When `FERRUM_KTLS_ENABLED=auto` or `true` and the kernel `tls` module is loaded, frontend-TLS connections with AES-GCM cipher suites also use splice — the kernel handles encrypt/decrypt via kTLS
 
 ```yaml
 proxies:
@@ -360,14 +360,14 @@ proxies:
 
 ## TCP Backend Timeouts
 
-`backend_read_timeout_ms` and `backend_write_timeout_ms` apply to TCP proxies as **per-direction inactivity timeouts**. They are enforced by a watchdog that polls per-direction watermarks once per second:
+`backend_read_timeout_ms` and `backend_write_timeout_ms` apply to TCP proxies as **per-direction inactivity timeouts**. They are enforced by a watchdog that polls per-direction watermarks:
 
 - **`backend_read_timeout_ms`**: fires when the backend stops producing bytes (b2c direction goes stale). The watermark is refreshed on every successful read from the backend.
 - **`backend_write_timeout_ms`**: fires when progress stalls writing to the backend (c2b direction goes stale). The watermark is refreshed on every partial `write()` that accepts bytes, so a slow-but-progressing backend keeps the watermark fresh.
 
 Both default to 30,000 ms. Set to **`0` to disable** per-direction enforcement for long-lived TCP workloads (database keep-alives, message-broker streams, SSH/IMAP passthrough). When disabled, the TCP relay relies solely on `tcp_idle_timeout_seconds` (bidirectional) and the OS TCP keep-alive.
 
-**Watchdog granularity**: The 1-second poll tick means a configured 5,000 ms timeout fires within ~6 s (timeout + one tick). Production timeouts are typically >= 5 s where 1 s drift is acceptable.
+**Watchdog granularity**: The watchdog ticks every 1 second when the shortest active timeout is below 30 seconds, and every 5 seconds when all active timeouts are 30 seconds or longer. A configured 5,000 ms timeout therefore fires within ~6 s; the default 30,000 ms backend timeouts fire within ~35 s. This keeps short test/dev timeouts responsive while reducing per-connection timer churn for production-length TCP sessions.
 
 **Splice/kTLS paths**: The per-direction inactivity timeouts only apply to the `bidirectional_copy` userspace relay path. The Linux `splice(2)`, io_uring splice, and kTLS-accelerated splice paths have no per-read hook and continue to rely on `tcp_idle_timeout_seconds`.
 

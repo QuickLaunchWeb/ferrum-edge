@@ -1,16 +1,20 @@
 //! Raw TCP stream proxy with optional TLS termination (frontend) and origination (backend).
 //!
 //! Each TCP proxy binds its own dedicated port. Incoming connections are
-//! forwarded bidirectionally to the configured backend using
-//! `tokio::io::copy_bidirectional` for optimal zero-copy throughput.
+//! forwarded bidirectionally to the configured backend using the fastest
+//! relay path available for the configured protocol and timeout policy.
 
+use std::cell::RefCell;
+use std::future::poll_fn;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::Poll;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
@@ -37,7 +41,7 @@ pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::Erro
 /// shutdown rather than a genuine transport failure.
 ///
 /// When the *opposite* half of a bidirectional relay has already completed
-/// with a clean EOF (`Ok(())` from `copy_one_direction`), the two peers are
+/// with a clean EOF (`Ok(())` from `poll_copy_direction`), the two peers are
 /// in the middle of a normal close dance — TLS `close_notify` followed by
 /// the TCP FIN. A write on the still-live half racing against that FIN can
 /// surface as `EPIPE` (BrokenPipe), `ECONNRESET` (ConnectionReset), or a
@@ -519,12 +523,39 @@ pub struct TcpListenerConfig {
     pub adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     /// Whether TCP Fast Open is enabled (from `FERRUM_TCP_FASTOPEN_ENABLED`).
     pub tcp_fastopen_enabled: bool,
+    /// Listen backlog for the TCP stream proxy socket.
+    pub tcp_listen_backlog: u32,
+    /// Number of SO_REUSEPORT accept loops for this stream proxy.
+    pub accept_threads: usize,
+    /// Server-side TCP Fast Open queue length.
+    pub tcp_fastopen_queue_len: u16,
     /// Shared overload state for connection accounting and load shedding.
     pub overload: Arc<crate::overload::OverloadState>,
     /// Enable kTLS for splice on TLS paths (from `FERRUM_KTLS_ENABLED`).
     pub ktls_enabled: bool,
     /// Enable io_uring-based splice (from `FERRUM_IO_URING_SPLICE_ENABLED`).
     pub io_uring_splice_enabled: bool,
+}
+
+#[derive(Clone)]
+struct TcpAcceptLoopState {
+    port: u16,
+    proxy_id: Arc<str>,
+    dns_cache: DnsCache,
+    request_epoch: Arc<RequestEpochStore>,
+    frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
+    metrics: Arc<TcpProxyMetrics>,
+    backend_tls_cache: Option<Arc<CachedBackendTlsConfig>>,
+    global_tcp_idle_timeout: u64,
+    tcp_half_close_max_wait_seconds: u64,
+    frontend_tls_handshake_timeout_seconds: u64,
+    circuit_breaker_cache: Arc<CircuitBreakerCache>,
+    sni_proxy_ids: Option<Vec<String>>,
+    adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
+    tcp_fastopen_enabled: bool,
+    overload: Arc<crate::overload::OverloadState>,
+    ktls_enabled: bool,
+    io_uring_splice_enabled: bool,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -558,20 +589,41 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         sni_proxy_ids,
         adaptive_buffer,
         tcp_fastopen_enabled,
+        tcp_listen_backlog,
+        accept_threads,
+        tcp_fastopen_queue_len,
         overload,
         ktls_enabled,
         io_uring_splice_enabled,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let backlog = tcp_listen_backlog as i32;
+    let configured_accept_threads = accept_threads.max(1);
+    #[cfg(unix)]
+    let accept_threads = configured_accept_threads;
+    #[cfg(not(unix))]
+    let accept_threads = {
+        if configured_accept_threads > 1 {
+            warn!(
+                configured_accept_threads,
+                "FERRUM_ACCEPT_THREADS > 1 requires SO_REUSEPORT; using one TCP stream accept loop on this platform"
+            );
+        }
+        1
+    };
+    let reuse_port = accept_threads > 1;
+    let tfo_queue = if tcp_fastopen_enabled {
+        Some(tcp_fastopen_queue_len)
+    } else {
+        None
+    };
+
+    // Create the first listener up front; additional listeners bind below via
+    // SO_REUSEPORT so the kernel can distribute stream accepts across workers.
+    let first_listener = crate::proxy::create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
+
     // Convert to Arc<str> so per-connection clones are a cheap pointer bump.
     let proxy_id: Arc<str> = Arc::from(proxy_id);
-    started.store(true, Ordering::Release);
-    info!(
-        proxy_id = %proxy_id,
-        "TCP proxy listener started on {}",
-        addr
-    );
 
     // Pre-build backend TLS config if this proxy uses Tcps (TCP+TLS) backend scheme.
     // This avoids reading certificate files from disk on every connection.
@@ -607,51 +659,136 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
             })
     };
 
-    let mut shutdown_rx = shutdown;
-    // Optional global gateway shutdown — fires on SIGTERM/SIGINT regardless of
-    // per-listener config-driven removal. We watch BOTH so accept loops exit
-    // promptly during graceful drain. When `None` (e.g. tests that build a
-    // listener directly without the manager), we substitute a never-fires
-    // pending future so the existing per-listener channel still works.
-    let mut global_shutdown_rx = global_shutdown;
+    let loop_state = TcpAcceptLoopState {
+        port,
+        proxy_id: proxy_id.clone(),
+        dns_cache,
+        request_epoch,
+        frontend_tls_config,
+        metrics,
+        backend_tls_cache,
+        global_tcp_idle_timeout,
+        tcp_half_close_max_wait_seconds,
+        frontend_tls_handshake_timeout_seconds,
+        circuit_breaker_cache,
+        sni_proxy_ids,
+        adaptive_buffer,
+        tcp_fastopen_enabled,
+        overload,
+        ktls_enabled,
+        io_uring_splice_enabled,
+    };
 
+    // Bind all extra sockets before spawning any accept loops. If one bind
+    // fails, every already-bound socket is dropped here and startup fails
+    // cleanly without leaving orphan listener tasks behind.
+    let mut extra_listeners = Vec::with_capacity(accept_threads.saturating_sub(1));
+    for _ in 1..accept_threads {
+        extra_listeners.push(crate::proxy::create_proxy_socket(
+            addr, backlog, tfo_queue, reuse_port,
+        )?);
+    }
+
+    let mut handles = Vec::with_capacity(extra_listeners.len());
+    for (accept_loop_id, listener) in extra_listeners.into_iter().enumerate() {
+        let accept_loop_id = accept_loop_id + 1;
+        let state = loop_state.clone();
+        let shutdown_rx = shutdown.clone();
+        let global_shutdown_rx = global_shutdown.clone();
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = run_tcp_accept_loop(
+                listener,
+                state,
+                shutdown_rx,
+                global_shutdown_rx,
+                accept_loop_id,
+            )
+            .await
+            {
+                warn!(
+                    accept_loop = accept_loop_id,
+                    "TCP proxy accept loop exited with error: {}", e
+                );
+            }
+        }));
+    }
+
+    started.store(true, Ordering::Release);
+    info!(
+        proxy_id = %proxy_id,
+        backlog = backlog,
+        accept_threads = accept_threads,
+        "TCP proxy listener started on {}",
+        addr
+    );
+
+    run_tcp_accept_loop(first_listener, loop_state, shutdown, global_shutdown, 0).await?;
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    Ok(())
+}
+
+async fn run_tcp_accept_loop(
+    listener: TcpListener,
+    state: TcpAcceptLoopState,
+    mut shutdown_rx: watch::Receiver<bool>,
+    mut global_shutdown_rx: Option<watch::Receiver<bool>>,
+    accept_loop_id: usize,
+) -> Result<(), anyhow::Error> {
     loop {
         tokio::select! {
             result = listener.accept() => {
                 let (stream, remote_addr) = match result {
                     Ok(conn) => conn,
                     Err(e) => {
-                        warn!(proxy_id = %proxy_id, "TCP accept error: {}", e);
+                        warn!(
+                            proxy_id = %state.proxy_id,
+                            accept_loop = accept_loop_id,
+                            "TCP accept error: {}",
+                            e
+                        );
                         continue;
                     }
                 };
 
                 // Reject new connections under critical overload (same as HTTP proxy).
-                if overload.reject_new_connections.load(Ordering::Relaxed) {
+                if state.overload.reject_new_connections.load(Ordering::Relaxed) {
                     drop(stream); // TCP RST
                     continue;
                 }
 
-                metrics.total_connections.fetch_add(1, Ordering::Relaxed);
-                metrics.active_connections.fetch_add(1, Ordering::Relaxed);
+                state.metrics.total_connections.fetch_add(1, Ordering::Relaxed);
+                state.metrics.active_connections.fetch_add(1, Ordering::Relaxed);
 
-                let proxy_id = proxy_id.clone();
-                let dns_cache = dns_cache.clone();
-                let request_epoch = request_epoch.clone();
-                let frontend_tls = frontend_tls_config.clone();
-                let metrics = metrics.clone();
-                let backend_tls = backend_tls_cache.clone();
-                let cb_cache = circuit_breaker_cache.clone();
-                let sni_proxy_ids = sni_proxy_ids.clone();
-                let adaptive_buf = adaptive_buffer.clone();
-                let overload_for_conn = overload.clone();
+                let port = state.port;
+                let proxy_id = state.proxy_id.clone();
+                let dns_cache = state.dns_cache.clone();
+                let request_epoch = state.request_epoch.clone();
+                let frontend_tls = state.frontend_tls_config.clone();
+                let metrics = state.metrics.clone();
+                let backend_tls = state.backend_tls_cache.clone();
+                let cb_cache = state.circuit_breaker_cache.clone();
+                let sni_proxy_ids = state.sni_proxy_ids.clone();
+                let adaptive_buf = state.adaptive_buffer.clone();
+                let overload_for_conn = state.overload.clone();
+                let global_tcp_idle_timeout = state.global_tcp_idle_timeout;
+                let tcp_half_close_max_wait_seconds = state.tcp_half_close_max_wait_seconds;
+                let frontend_tls_handshake_timeout_seconds =
+                    state.frontend_tls_handshake_timeout_seconds;
+                let tcp_fastopen_enabled = state.tcp_fastopen_enabled;
+                let ktls_enabled = state.ktls_enabled;
+                let io_uring_splice_enabled = state.io_uring_splice_enabled;
 
                 tokio::spawn(async move {
                     // Track this connection for global overload accounting and graceful drain.
                     // The guard decrements the counter on drop (all exit paths).
                     let _conn_guard = crate::overload::ConnectionGuard::new(&overload_for_conn);
 
-                    let connected_at = chrono::Utc::now();
+                    let connected_at = Instant::now();
+                    let connected_wall_at = chrono::Utc::now();
+                    let client_ip = remote_addr.ip().to_string();
                     let epoch = request_epoch.load();
                     let base_proxy = epoch
                         .config
@@ -664,7 +801,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                     // Build stream context — plugins run inside handle_tcp_connection
                     // (after TLS handshake for TLS proxies, so client cert is available).
                     let mut stream_ctx = StreamConnectionContext {
-                        client_ip: remote_addr.ip().to_string(),
+                        client_ip: client_ip.clone(),
                         proxy_id: proxy_id.to_string(),
                         proxy_name: base_proxy.and_then(|p| p.name.clone()),
                         listen_port: port,
@@ -696,14 +833,13 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         sni_proxy_ids.as_deref(),
                         &adaptive_buf,
                         tcp_fastopen_enabled,
-                                        ktls_enabled,
+                        ktls_enabled,
                         io_uring_splice_enabled,
                         &overload_for_conn,
                     )
                     .await;
 
-                    let disconnected_at = chrono::Utc::now();
-                    let duration_ms = (disconnected_at - connected_at).num_milliseconds().max(0) as f64;
+                    let duration_ms = connected_at.elapsed().as_millis() as f64;
                     let final_proxy_id = stream_ctx.proxy_id.clone();
                     // Keep disconnect hooks/logging on the same epoch that
                     // admitted the connection. Long-lived TCP streams can span
@@ -744,7 +880,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                             }
                             debug!(
                                 proxy_id = %proxy_id,
-                                client = %remote_addr.ip(),
+                                client = %client_ip,
                                 bytes_in = s.bytes_in,
                                 bytes_out = s.bytes_out,
                                 splice = s.splice_used,
@@ -790,7 +926,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         Err(e) => {
                             debug!(
                                 proxy_id = %proxy_id,
-                                client = %remote_addr.ip(),
+                                client = %client_ip,
                                 error = %e,
                                 "TCP connection error"
                             );
@@ -818,12 +954,13 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
 
                     // Run on_stream_disconnect plugins (logging, metrics, etc.)
                     if !plugins.is_empty() {
+                        let disconnected_wall_at = chrono::Utc::now();
                         let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
                         let summary = StreamTransactionSummary {
                             namespace: proxy_namespace,
                             proxy_id: final_proxy_id,
                             proxy_name,
-                            client_ip: remote_addr.ip().to_string(),
+                            client_ip,
                             consumer_username,
                             backend_target: result.backend.backend_target,
                             backend_resolved_ip: result.backend.backend_resolved_ip,
@@ -836,8 +973,8 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                             error_class,
                             disconnect_direction,
                             disconnect_cause,
-                            timestamp_connected: connected_at.to_rfc3339(),
-                            timestamp_disconnected: disconnected_at.to_rfc3339(),
+                            timestamp_connected: connected_wall_at.to_rfc3339(),
+                            timestamp_disconnected: disconnected_wall_at.to_rfc3339(),
                             sni_hostname: stream_ctx.sni_hostname.clone(),
                             metadata: stream_ctx.take_metadata(),
                         };
@@ -850,7 +987,12 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                 });
             }
             _ = shutdown_rx.changed() => {
-                info!(proxy_id = %proxy_id, "TCP proxy listener shutting down on port {}", port);
+                info!(
+                    proxy_id = %state.proxy_id,
+                    accept_loop = accept_loop_id,
+                    "TCP proxy listener shutting down on port {}",
+                    state.port
+                );
                 return Ok(());
             }
             _ = async {
@@ -859,7 +1001,12 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                info!(proxy_id = %proxy_id, "TCP proxy listener shutting down on port {} (global SIGTERM)", port);
+                info!(
+                    proxy_id = %state.proxy_id,
+                    accept_loop = accept_loop_id,
+                    "TCP proxy listener shutting down on port {} (global SIGTERM)",
+                    state.port
+                );
                 return Ok(());
             }
         }
@@ -1947,8 +2094,110 @@ async fn connect_backend_tls_cached(
 /// finishes (cleanly or with an error). Matches the splice-path grace window.
 const BIDIRECTIONAL_DRAIN_GRACE: Duration = Duration::from_millis(100);
 
-/// Copy bytes from `reader` into `writer` until EOF, updating shared
-/// counters on each read/write cycle.
+const TCP_COPY_BUFFER_MIN_SIZE: usize = 4096;
+const TCP_COPY_BUFFER_POOL_MAX_BUFFERS: usize = 64;
+const TCP_COPY_BUFFER_POOL_MAX_RETAIN: usize = 512 * 1024;
+
+thread_local! {
+    static TCP_COPY_BUFFER_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+struct PooledCopyBuffer {
+    buf: Vec<u8>,
+}
+
+impl PooledCopyBuffer {
+    fn new(buf_size: usize) -> Self {
+        let buf_size = buf_size.max(TCP_COPY_BUFFER_MIN_SIZE);
+        let mut buf = TCP_COPY_BUFFER_POOL
+            .with(|pool| pool.borrow_mut().pop())
+            .unwrap_or_else(|| Vec::with_capacity(buf_size));
+        if buf.len() < buf_size {
+            buf.resize(buf_size, 0);
+        } else {
+            buf.truncate(buf_size);
+        }
+        Self { buf }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.buf.as_mut_slice()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.buf.as_slice()
+    }
+}
+
+impl Drop for PooledCopyBuffer {
+    fn drop(&mut self) {
+        let mut buf = std::mem::take(&mut self.buf);
+        if buf.capacity() > TCP_COPY_BUFFER_POOL_MAX_RETAIN {
+            return;
+        }
+        buf.clear();
+        TCP_COPY_BUFFER_POOL.with(move |pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < TCP_COPY_BUFFER_POOL_MAX_BUFFERS {
+                pool.push(buf);
+            }
+        });
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopyPhase {
+    Reading,
+    Writing,
+    ShuttingDown,
+    Done,
+}
+
+struct CopyDirectionState {
+    phase: CopyPhase,
+    buf: PooledCopyBuffer,
+    pos: usize,
+    cap: usize,
+}
+
+impl CopyDirectionState {
+    fn new(buf_size: usize) -> Self {
+        Self {
+            phase: CopyPhase::Reading,
+            buf: PooledCopyBuffer::new(buf_size),
+            pos: 0,
+            cap: 0,
+        }
+    }
+}
+
+enum Phase1Outcome {
+    ClientToBackend(Result<(), (StreamIoSide, std::io::Error)>),
+    BackendToClient(Result<(), (StreamIoSide, std::io::Error)>),
+    Watchdog(StreamFirstFailure),
+}
+
+fn relay_watchdog_interval(timeouts: &[Option<Duration>]) -> Duration {
+    let min_active = timeouts
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|d| !d.is_zero())
+        .min();
+    if min_active.is_some_and(|d| d >= Duration::from_secs(30)) {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs(1)
+    }
+}
+
+fn relay_watchdog(interval: Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker
+}
+
+/// Poll one half-duplex copy without splitting the underlying streams.
 ///
 /// **Idle-timer refresh pattern (two-phase):**
 /// `last_activity` is stored **before** the write (post-read, pre-write)
@@ -1959,92 +2208,213 @@ const BIDIRECTIONAL_DRAIN_GRACE: Duration = Duration::from_millis(100);
 /// timestamps polled by the `bidirectional_copy` watchdog. Shared via
 /// bare references to parent-scoped `AtomicU64`s — no `Arc` indirection
 /// on the hot path.
-///
-/// When `write_watermark` is `None`, the write path uses `write_all` for
-/// maximum throughput (tokio's internal vectored-write optimisations).
-/// When `Some`, a chunked `write()` loop refreshes the watermark on each
-/// partial progress so slow-but-progressing backends are not misclassified.
-async fn copy_one_direction<'a, R, W>(
-    mut reader: R,
-    mut writer: W,
-    buf_size: usize,
-    bytes: &'a AtomicU64,
-    last_activity: Option<&'a AtomicU64>,
-    read_watermark: Option<&'a AtomicU64>,
-    write_watermark: Option<&'a AtomicU64>,
+#[allow(clippy::too_many_arguments)]
+fn poll_copy_direction<R, W>(
+    cx: &mut std::task::Context<'_>,
+    mut reader: Pin<&mut R>,
+    mut writer: Pin<&mut W>,
+    state: &mut CopyDirectionState,
+    bytes: &AtomicU64,
+    last_activity: Option<&AtomicU64>,
+    read_watermark: Option<&AtomicU64>,
+    write_watermark: Option<&AtomicU64>,
+) -> Poll<Result<(), (StreamIoSide, std::io::Error)>>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        match state.phase {
+            CopyPhase::Done => return Poll::Ready(Ok(())),
+            CopyPhase::ShuttingDown => {
+                return match writer.as_mut().poll_shutdown(cx) {
+                    Poll::Ready(_) => {
+                        state.phase = CopyPhase::Done;
+                        Poll::Ready(Ok(()))
+                    }
+                    Poll::Pending => Poll::Pending,
+                };
+            }
+            CopyPhase::Reading => {
+                let n = {
+                    let mut read_buf = ReadBuf::new(state.buf.as_mut_slice());
+                    match reader.as_mut().poll_read(cx, &mut read_buf) {
+                        Poll::Ready(Ok(())) => read_buf.filled().len(),
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err((StreamIoSide::Read, e))),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                };
+                if n == 0 {
+                    state.phase = CopyPhase::ShuttingDown;
+                    continue;
+                }
+
+                // Single clock read for both watermark + idle refresh.
+                let now = coarse_now_ms();
+                if let Some(wm) = read_watermark {
+                    wm.store(now, Ordering::Relaxed);
+                }
+                if let Some(la) = last_activity {
+                    la.store(now, Ordering::Relaxed);
+                }
+                if let Some(wm) = write_watermark {
+                    // Prime the watermark before entering the write loop —
+                    // captures "we have `n` bytes ready to write as of `now`".
+                    wm.store(now, Ordering::Relaxed);
+                }
+                state.pos = 0;
+                state.cap = n;
+                state.phase = CopyPhase::Writing;
+            }
+            CopyPhase::Writing => {
+                while state.pos < state.cap {
+                    let poll_result = {
+                        let chunk = &state.buf.as_slice()[state.pos..state.cap];
+                        writer.as_mut().poll_write(cx, chunk)
+                    };
+                    match poll_result {
+                        Poll::Ready(Ok(0)) => {
+                            return Poll::Ready(Err((
+                                StreamIoSide::Write,
+                                std::io::Error::new(
+                                    std::io::ErrorKind::WriteZero,
+                                    "write returned 0 bytes",
+                                ),
+                            )));
+                        }
+                        Poll::Ready(Ok(nw)) => {
+                            state.pos += nw;
+                            if let Some(wm) = write_watermark {
+                                wm.store(coarse_now_ms(), Ordering::Relaxed);
+                            }
+                        }
+                        Poll::Ready(Err(e)) => {
+                            return Poll::Ready(Err((StreamIoSide::Write, e)));
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+
+                bytes.fetch_add(state.cap as u64, Ordering::Relaxed);
+                state.pos = 0;
+                state.cap = 0;
+                state.phase = CopyPhase::Reading;
+                if let Some(la) = last_activity {
+                    la.store(coarse_now_ms(), Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+async fn copy_direction_to_completion<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    state: &mut CopyDirectionState,
+    bytes: &AtomicU64,
+    last_activity: Option<&AtomicU64>,
+    read_watermark: Option<&AtomicU64>,
+    write_watermark: Option<&AtomicU64>,
 ) -> Result<(), (StreamIoSide, std::io::Error)>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; buf_size.max(4096)];
-    loop {
-        let n = match reader.read(&mut buf).await {
-            Ok(n) => n,
-            Err(e) => return Err((StreamIoSide::Read, e)),
-        };
-        if n == 0 {
-            let _ = writer.shutdown().await;
-            return Ok(());
-        }
-        // Single clock read for both watermark + idle refresh.
-        let now = coarse_now_ms();
-        if let Some(wm) = read_watermark {
-            wm.store(now, Ordering::Relaxed);
-        }
-        if let Some(la) = last_activity {
-            la.store(now, Ordering::Relaxed);
-        }
-        if let Some(wm) = write_watermark {
-            // Prime the watermark before entering the write loop — captures
-            // "we have `n` bytes ready to write as of `now`". Without this,
-            // the u64::MAX sentinel installed at session start would keep
-            // the watchdog comparison (`now - watermark`) saturating at 0
-            // forever when the first write is immediately stuck (stuck
-            // backend send buffer), and `backend_write_timeout` would never
-            // fire. Push-only safety is preserved because we only reach
-            // this point after a read actually succeeded — a silent c2b
-            // reader never primes the watermark.
-            wm.store(now, Ordering::Relaxed);
-            // Chunked write: refresh watermark on each partial progress.
-            let mut written = 0;
-            while written < n {
-                match writer.write(&buf[written..n]).await {
-                    Ok(0) => {
-                        return Err((
-                            StreamIoSide::Write,
-                            std::io::Error::new(
-                                std::io::ErrorKind::WriteZero,
-                                "write returned 0 bytes",
-                            ),
-                        ));
-                    }
-                    Ok(nw) => {
-                        written += nw;
-                        wm.store(coarse_now_ms(), Ordering::Relaxed);
-                    }
-                    Err(e) => return Err((StreamIoSide::Write, e)),
-                }
-            }
-        } else {
-            // Fast path: no write watermark — use write_all which lets tokio
-            // use vectored writes and avoids per-chunk branch overhead.
-            if let Err(e) = writer.write_all(&buf[..n]).await {
-                return Err((StreamIoSide::Write, e));
-            }
-        }
-        bytes.fetch_add(n as u64, Ordering::Relaxed);
-        if let Some(la) = last_activity {
-            la.store(coarse_now_ms(), Ordering::Relaxed);
-        }
+    poll_fn(|cx| {
+        poll_copy_direction(
+            cx,
+            Pin::new(&mut *reader),
+            Pin::new(&mut *writer),
+            state,
+            bytes,
+            last_activity,
+            read_watermark,
+            write_watermark,
+        )
+    })
+    .await
+}
+
+fn direction_label(direction: Direction) -> &'static str {
+    match direction {
+        Direction::ClientToBackend => "client→backend",
+        Direction::BackendToClient => "backend→client",
+        Direction::Unknown => "unknown",
     }
+}
+
+fn classify_phase1_copy_failure(
+    direction: Direction,
+    side: StreamIoSide,
+    e: std::io::Error,
+) -> (StreamFirstFailure, bool) {
+    // Capture raw kind before `e` is consumed by anyhow::Error::new.
+    let benign_write = is_post_eof_benign_write_error(side, e.kind());
+    let label = direction_label(direction);
+    let msg = format!("Bidirectional copy error ({}, {:?}): {}", label, side, e);
+    // Wrap via `anyhow::Error::new(e)` so the source chain keeps the
+    // underlying `io::Error` — `classify_stream_error` walks
+    // `Error::source()` to downcast and read `io::ErrorKind`.
+    let err: anyhow::Error =
+        anyhow::Error::new(e).context(format!("Bidirectional copy error ({}, {:?})", label, side));
+    (
+        (direction, classify_stream_error(&err), Some(side), msg),
+        benign_write,
+    )
+}
+
+fn phase1_watchdog_failure(
+    last_activity: Option<&AtomicU64>,
+    timeout_ms: u64,
+    b2c_read_watermark: Option<&AtomicU64>,
+    backend_read_timeout_ms: u64,
+    c2b_write_watermark: Option<&AtomicU64>,
+    backend_write_timeout_ms: u64,
+) -> Option<StreamFirstFailure> {
+    let now = coarse_now_ms();
+    // Per-direction inactivity checks (backend_read_timeout /
+    // backend_write_timeout). Checked before the bidirectional idle timeout so
+    // a stale single direction is caught even when the other direction is
+    // still active.
+    if let Some(wm) = b2c_read_watermark
+        && now.saturating_sub(wm.load(Ordering::Relaxed)) >= backend_read_timeout_ms
+    {
+        return Some((
+            Direction::BackendToClient,
+            ErrorClass::ReadWriteTimeout,
+            Some(StreamIoSide::Read),
+            "backend read inactivity timeout".to_string(),
+        ));
+    }
+    if let Some(wm) = c2b_write_watermark
+        && now.saturating_sub(wm.load(Ordering::Relaxed)) >= backend_write_timeout_ms
+    {
+        return Some((
+            Direction::ClientToBackend,
+            ErrorClass::ReadWriteTimeout,
+            Some(StreamIoSide::Write),
+            "backend write inactivity timeout".to_string(),
+        ));
+    }
+    if let Some(la) = last_activity
+        && now.saturating_sub(la.load(Ordering::Relaxed)) >= timeout_ms
+    {
+        return Some((
+            Direction::Unknown,
+            ErrorClass::ReadWriteTimeout,
+            None,
+            "idle timeout".to_string(),
+        ));
+    }
+    None
 }
 
 /// Bidirectional stream copy between client and backend.
 ///
-/// Runs the two half-duplex copies concurrently via `tokio::select!` so that
-/// whichever direction fails first is recorded in `first_failure`. Per-direction
-/// byte counts are preserved even when one half errors.
+/// Polls both half-duplex copies from one task against pinned mutable stream
+/// references so whichever direction fails first is recorded in
+/// `first_failure`. Per-direction byte counts are preserved even when one half
+/// errors.
 ///
 /// After Phase 1 (race the two directions) completes, Phase 2 waits for the
 /// remaining direction:
@@ -2062,15 +2432,15 @@ where
 /// When `idle_timeout` is `Some(d)` and non-zero, the connection is closed
 /// if no data is received on either side for the given duration.
 ///
-/// **Fast path**: When both `idle_timeout` and `half_close_cap` are `None` and
-/// zero, the function delegates to `tokio::io::copy_bidirectional_with_sizes`,
-/// skipping the `tokio::io::split` + Phase 1/Phase 2 machinery. This restores
-/// the historical zero-overhead behaviour for deployments that explicitly
-/// disable all drain bounds (`FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0` +
-/// `FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS=0`). The trade-off: on error the
-/// fast path loses `first_failure` direction attribution (reports
-/// `Direction::Unknown`) — acceptable because the user opted out of both
-/// observability bounds. Clean completion preserves per-direction byte counts.
+/// **Fast path**: When `idle_timeout`, `half_close_cap`,
+/// `backend_read_timeout`, and `backend_write_timeout` are all `None` or zero,
+/// the function delegates to `tokio::io::copy_bidirectional_with_sizes`,
+/// skipping the Phase 1/Phase 2 machinery. This restores the historical
+/// zero-overhead behaviour for deployments that explicitly disable all relay
+/// bounds. The trade-off: on error the fast path loses `first_failure`
+/// direction attribution (reports `Direction::Unknown`) — acceptable because
+/// the user opted out of those observability bounds. Clean completion preserves
+/// per-direction byte counts.
 async fn bidirectional_copy<C, B>(
     mut client: C,
     mut backend: B,
@@ -2089,9 +2459,9 @@ where
     // loop. On error we classify with `Direction::Unknown` because
     // `copy_bidirectional_with_sizes` doesn't report which half failed first.
     // `backend_read_timeout` / `backend_write_timeout` inherently require the
-    // direction-tracking path — they wrap individual `read`/`write` calls
-    // inside `copy_one_direction`, which tokio's bidirectional copy does not
-    // expose. Any non-zero timeout here opts out of the fast path.
+    // direction-tracking path — they wrap individual `read`/`write` polls,
+    // which tokio's bidirectional copy does not expose. Any non-zero timeout
+    // here opts out of the fast path.
     let idle_disabled = idle_timeout.is_none_or(|d| d.is_zero());
     let cap_disabled = half_close_cap.is_none_or(|d| d.is_zero());
     let read_to_disabled = backend_read_timeout.is_none_or(|d| d.is_zero());
@@ -2145,7 +2515,7 @@ where
     // futures they protect — zero heap allocation, zero pointer chase.
     // Read watermark starts at `now` — a silent backend is immediately stale.
     // Write watermark starts at u64::MAX (sentinel) so the check stays inert
-    // while c2b has no data queued to send. `copy_one_direction` primes it
+    // while c2b has no data queued to send. `poll_copy_direction` primes it
     // with `now` the moment a read succeeds (before the write loop), so a
     // stuck backend send buffer still fires the timeout. Without the sentinel,
     // push-only traffic (backend→client, client silent) would falsely fire the
@@ -2165,34 +2535,17 @@ where
         None
     };
 
-    let (client_read, client_write) = tokio::io::split(client);
-    let (backend_read, backend_write) = tokio::io::split(backend);
-
     // Per-direction layout:
     // * c2b reads from CLIENT and writes to BACKEND — the write watermark
     //   tracks `backend_write_timeout` (c2b_write_watermark).
     // * b2c reads from BACKEND and writes to CLIENT — the read watermark
     //   tracks `backend_read_timeout` (b2c_read_watermark).
-    let c2b_fut = copy_one_direction(
-        client_read,
-        backend_write,
-        buf_size,
-        &c2b_bytes,
-        last_activity,
-        None,
-        c2b_write_watermark,
-    );
-    let b2c_fut = copy_one_direction(
-        backend_read,
-        client_write,
-        buf_size,
-        &b2c_bytes,
-        last_activity,
-        b2c_read_watermark,
-        None,
-    );
-    tokio::pin!(c2b_fut);
-    tokio::pin!(b2c_fut);
+    //
+    // Both states are polled from this single task against pinned `&mut`
+    // streams. That preserves the old race/timeout semantics without
+    // `tokio::io::split()`'s BiLock on every read/write.
+    let mut c2b_state = CopyDirectionState::new(buf_size);
+    let mut b2c_state = CopyDirectionState::new(buf_size);
 
     let timeout_ms = idle_timeout.map(|t| t.as_millis() as u64).unwrap_or(0);
     let backend_read_timeout_ms = backend_read_timeout
@@ -2202,6 +2555,13 @@ where
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let any_watchdog_active = idle_timeout_active || read_wm_active || write_wm_active;
+    let mut watchdog = any_watchdog_active.then(|| {
+        relay_watchdog(relay_watchdog_interval(&[
+            idle_timeout,
+            backend_read_timeout,
+            backend_write_timeout,
+        ]))
+    });
 
     // Phase 1: race the two directions (plus optional idle check).
     let mut first_failure: Option<(Direction, ErrorClass, Option<StreamIoSide>, String)> = None;
@@ -2217,98 +2577,75 @@ where
     let mut c2b_done = false;
     let mut b2c_done = false;
 
-    loop {
-        tokio::select! {
-            biased;
-            result = &mut c2b_fut, if !c2b_done => {
-                c2b_done = true;
-                if let Err((side, e)) = result {
-                    // Capture raw kind before `e` is consumed by anyhow::Error::new.
-                    let benign_write = is_post_eof_benign_write_error(side, e.kind());
-                    let msg = format!("Bidirectional copy error (client→backend, {:?}): {}", side, e);
-                    // Wrap via `anyhow::Error::new(e)` so the source chain keeps
-                    // the underlying `io::Error` — `classify_stream_error` walks
-                    // `Error::source()` to downcast and read `io::ErrorKind`. A
-                    // `anyhow!("{:?}: {}", side, e)` formats `e` into a string
-                    // and drops the type, so `ErrorKind::TimedOut` would no
-                    // longer classify as `ReadWriteTimeout`.
-                    let err: anyhow::Error = anyhow::Error::new(e).context(format!(
-                        "Bidirectional copy error (client→backend, {:?})",
-                        side
-                    ));
-                    if first_failure.is_none() {
-                        first_failure = Some((
-                            Direction::ClientToBackend,
-                            classify_stream_error(&err),
-                            Some(side),
-                            msg,
-                        ));
-                        phase1_benign_write_candidate = benign_write;
-                    }
-                }
-                break;
+    let phase1_outcome = poll_fn(|cx| {
+        if !c2b_done {
+            match poll_copy_direction(
+                cx,
+                Pin::new(&mut client),
+                Pin::new(&mut backend),
+                &mut c2b_state,
+                &c2b_bytes,
+                last_activity,
+                None,
+                c2b_write_watermark,
+            ) {
+                Poll::Ready(result) => return Poll::Ready(Phase1Outcome::ClientToBackend(result)),
+                Poll::Pending => {}
             }
-            result = &mut b2c_fut, if !b2c_done => {
-                b2c_done = true;
-                if let Err((side, e)) = result {
-                    let benign_write = is_post_eof_benign_write_error(side, e.kind());
-                    let msg = format!("Bidirectional copy error (backend→client, {:?}): {}", side, e);
-                    let err: anyhow::Error = anyhow::Error::new(e).context(format!(
-                        "Bidirectional copy error (backend→client, {:?})",
-                        side
-                    ));
-                    if first_failure.is_none() {
-                        first_failure = Some((
-                            Direction::BackendToClient,
-                            classify_stream_error(&err),
-                            Some(side),
-                            msg,
-                        ));
-                        phase1_benign_write_candidate = benign_write;
-                    }
-                }
-                break;
+        }
+        if !b2c_done {
+            match poll_copy_direction(
+                cx,
+                Pin::new(&mut backend),
+                Pin::new(&mut client),
+                &mut b2c_state,
+                &b2c_bytes,
+                last_activity,
+                b2c_read_watermark,
+                None,
+            ) {
+                Poll::Ready(result) => return Poll::Ready(Phase1Outcome::BackendToClient(result)),
+                Poll::Pending => {}
             }
-            _ = tokio::time::sleep(Duration::from_secs(1)), if any_watchdog_active => {
-                let now = coarse_now_ms();
-                // Per-direction inactivity checks (backend_read_timeout /
-                // backend_write_timeout). Checked before the bidirectional
-                // idle timeout so a stale single direction is caught even
-                // when the other direction is still active.
-                if let Some(wm) = b2c_read_watermark
-                    && now.saturating_sub(wm.load(Ordering::Relaxed)) >= backend_read_timeout_ms
-                {
-                    first_failure = Some((
-                        Direction::BackendToClient,
-                        ErrorClass::ReadWriteTimeout,
-                        Some(StreamIoSide::Read),
-                        "backend read inactivity timeout".to_string(),
-                    ));
-                    break;
-                }
-                if let Some(wm) = c2b_write_watermark
-                    && now.saturating_sub(wm.load(Ordering::Relaxed)) >= backend_write_timeout_ms
-                {
-                    first_failure = Some((
-                        Direction::ClientToBackend,
-                        ErrorClass::ReadWriteTimeout,
-                        Some(StreamIoSide::Write),
-                        "backend write inactivity timeout".to_string(),
-                    ));
-                    break;
-                }
-                if let Some(la) = last_activity
-                    && now.saturating_sub(la.load(Ordering::Relaxed)) >= timeout_ms
-                {
-                    first_failure = Some((
-                        Direction::Unknown,
-                        ErrorClass::ReadWriteTimeout,
-                        None,
-                        "idle timeout".to_string(),
-                    ));
-                    break;
-                }
+        }
+        if let Some(watchdog) = watchdog.as_mut()
+            && Pin::new(watchdog).poll_tick(cx).is_ready()
+            && let Some(failure) = phase1_watchdog_failure(
+                last_activity,
+                timeout_ms,
+                b2c_read_watermark,
+                backend_read_timeout_ms,
+                c2b_write_watermark,
+                backend_write_timeout_ms,
+            )
+        {
+            return Poll::Ready(Phase1Outcome::Watchdog(failure));
+        }
+        Poll::Pending
+    })
+    .await;
+
+    match phase1_outcome {
+        Phase1Outcome::ClientToBackend(result) => {
+            c2b_done = true;
+            if let Err((side, e)) = result {
+                let (failure, benign_write) =
+                    classify_phase1_copy_failure(Direction::ClientToBackend, side, e);
+                first_failure = Some(failure);
+                phase1_benign_write_candidate = benign_write;
             }
+        }
+        Phase1Outcome::BackendToClient(result) => {
+            b2c_done = true;
+            if let Err((side, e)) = result {
+                let (failure, benign_write) =
+                    classify_phase1_copy_failure(Direction::BackendToClient, side, e);
+                first_failure = Some(failure);
+                phase1_benign_write_candidate = benign_write;
+            }
+        }
+        Phase1Outcome::Watchdog(failure) => {
+            first_failure = Some(failure);
         }
     }
 
@@ -2336,10 +2673,13 @@ where
     let clean_eof = first_failure.is_none();
     if !c2b_done {
         if clean_eof {
-            first_failure = drain_half_close_copy(
-                &mut c2b_fut,
+            first_failure = drain_half_close_direction(
+                &mut client,
+                &mut backend,
+                &mut c2b_state,
+                &c2b_bytes,
                 last_activity,
-                idle_timeout_active,
+                idle_timeout,
                 timeout_ms,
                 half_close_cap,
                 Direction::ClientToBackend,
@@ -2350,7 +2690,20 @@ where
             )
             .await;
         } else {
-            match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut c2b_fut).await {
+            match tokio::time::timeout(
+                BIDIRECTIONAL_DRAIN_GRACE,
+                copy_direction_to_completion(
+                    &mut client,
+                    &mut backend,
+                    &mut c2b_state,
+                    &c2b_bytes,
+                    last_activity,
+                    None,
+                    c2b_write_watermark,
+                ),
+            )
+            .await
+            {
                 Ok(Ok(())) => {
                     // Phase 1 errored on b2c but c2b completed cleanly in
                     // the grace window. Reclassify as graceful only if:
@@ -2371,20 +2724,9 @@ where
                 }
                 Ok(Err((side, e))) => {
                     if first_failure.is_none() {
-                        let msg = format!(
-                            "Bidirectional copy error (client→backend, {:?}): {}",
-                            side, e
-                        );
-                        let err: anyhow::Error = anyhow::Error::new(e).context(format!(
-                            "Bidirectional copy error (client→backend, {:?})",
-                            side
-                        ));
-                        first_failure = Some((
-                            Direction::ClientToBackend,
-                            classify_stream_error(&err),
-                            Some(side),
-                            msg,
-                        ));
+                        let (failure, _) =
+                            classify_phase1_copy_failure(Direction::ClientToBackend, side, e);
+                        first_failure = Some(failure);
                     }
                 }
                 Err(_) => { /* grace expired — leave counters as-is */ }
@@ -2393,10 +2735,13 @@ where
     }
     if !b2c_done {
         if clean_eof {
-            first_failure = drain_half_close_copy(
-                &mut b2c_fut,
+            first_failure = drain_half_close_direction(
+                &mut backend,
+                &mut client,
+                &mut b2c_state,
+                &b2c_bytes,
                 last_activity,
-                idle_timeout_active,
+                idle_timeout,
                 timeout_ms,
                 half_close_cap,
                 Direction::BackendToClient,
@@ -2407,7 +2752,20 @@ where
             )
             .await;
         } else {
-            match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut b2c_fut).await {
+            match tokio::time::timeout(
+                BIDIRECTIONAL_DRAIN_GRACE,
+                copy_direction_to_completion(
+                    &mut backend,
+                    &mut client,
+                    &mut b2c_state,
+                    &b2c_bytes,
+                    last_activity,
+                    b2c_read_watermark,
+                    None,
+                ),
+            )
+            .await
+            {
                 Ok(Ok(())) => {
                     // Symmetric to the c2b grace path — see comment above.
                     if phase1_benign_write_candidate
@@ -2418,20 +2776,9 @@ where
                 }
                 Ok(Err((side, e))) => {
                     if first_failure.is_none() {
-                        let msg = format!(
-                            "Bidirectional copy error (backend→client, {:?}): {}",
-                            side, e
-                        );
-                        let err: anyhow::Error = anyhow::Error::new(e).context(format!(
-                            "Bidirectional copy error (backend→client, {:?})",
-                            side
-                        ));
-                        first_failure = Some((
-                            Direction::BackendToClient,
-                            classify_stream_error(&err),
-                            Some(side),
-                            msg,
-                        ));
+                        let (failure, _) =
+                            classify_phase1_copy_failure(Direction::BackendToClient, side, e);
+                        first_failure = Some(failure);
                     }
                 }
                 Err(_) => { /* grace expired — leave counters as-is */ }
@@ -2459,10 +2806,13 @@ where
 /// peer's TLS close_notify → FIN dance, and should be reported as
 /// graceful shutdown (return `None`) rather than a transport error.
 #[allow(clippy::too_many_arguments)]
-async fn drain_half_close_copy<F>(
-    drain_fut: &mut F,
+async fn drain_half_close_direction<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    state: &mut CopyDirectionState,
+    bytes: &AtomicU64,
     last_activity: Option<&AtomicU64>,
-    idle_timeout_active: bool,
+    idle_timeout: Option<Duration>,
     timeout_ms: u64,
     half_close_cap: Option<Duration>,
     direction: Direction,
@@ -2472,17 +2822,42 @@ async fn drain_half_close_copy<F>(
     b2c_bytes: &AtomicU64,
 ) -> Option<(Direction, ErrorClass, Option<StreamIoSide>, String)>
 where
-    F: std::future::Future<Output = Result<(), (StreamIoSide, std::io::Error)>> + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
 {
+    let half_close_cap_active = half_close_cap.is_some_and(|d| !d.is_zero());
     let any_timer_active =
-        idle_timeout_active || direction_watermark.is_some() || half_close_cap.is_some();
+        last_activity.is_some() || direction_watermark.is_some() || half_close_cap_active;
+    let mut watchdog = any_timer_active.then(|| {
+        relay_watchdog(relay_watchdog_interval(&[
+            idle_timeout,
+            direction_watermark.map(|_| Duration::from_millis(direction_timeout_ms)),
+            half_close_cap,
+        ]))
+    });
     let phase2_start = Instant::now();
-    loop {
-        tokio::select! {
-            biased;
-            result = &mut *drain_fut => {
+    poll_fn(|cx| {
+        match poll_copy_direction(
+            cx,
+            Pin::new(&mut *reader),
+            Pin::new(&mut *writer),
+            state,
+            bytes,
+            last_activity,
+            if direction == Direction::BackendToClient {
+                direction_watermark
+            } else {
+                None
+            },
+            if direction == Direction::ClientToBackend {
+                direction_watermark
+            } else {
+                None
+            },
+        ) {
+            Poll::Ready(result) => {
                 if let Err((side, e)) = result {
-                    // Opposite half already EOF'd cleanly (drain_half_close_copy
+                    // Opposite half already EOF'd cleanly (drain_half_close_direction
                     // precondition). A benign write-after-close here is the tail
                     // of graceful shutdown — but only if both directions
                     // actually transferred bytes. Without that second piece of
@@ -2493,67 +2868,75 @@ where
                     if is_post_eof_benign_write_error(side, e.kind())
                         && both_directions_transferred(c2b_bytes, b2c_bytes)
                     {
-                        return None;
+                        return Poll::Ready(None);
                     }
                     let msg = e.to_string();
-                    let dir_label = match direction {
-                        Direction::ClientToBackend => "client→backend",
-                        Direction::BackendToClient => "backend→client",
-                        Direction::Unknown => "unknown",
-                    };
+                    let dir_label = direction_label(direction);
                     let err: anyhow::Error = anyhow::Error::new(e).context(format!(
                         "Bidirectional copy error ({}, {:?})",
                         dir_label, side
                     ));
-                    return Some((direction, classify_stream_error(&err), Some(side), msg));
-                }
-                return None;
-            }
-            _ = tokio::time::sleep(Duration::from_secs(1)), if any_timer_active => {
-                let now = coarse_now_ms();
-                if let Some(wm) = direction_watermark
-                    && now.saturating_sub(wm.load(Ordering::Relaxed)) >= direction_timeout_ms
-                {
-                    let side = match direction {
-                        Direction::BackendToClient => Some(StreamIoSide::Read),
-                        Direction::ClientToBackend => Some(StreamIoSide::Write),
-                        Direction::Unknown => None,
-                    };
-                    let label = match direction {
-                        Direction::BackendToClient => "backend read inactivity timeout",
-                        Direction::ClientToBackend => "backend write inactivity timeout",
-                        Direction::Unknown => "backend inactivity timeout",
-                    };
-                    return Some((
+                    return Poll::Ready(Some((
                         direction,
-                        ErrorClass::ReadWriteTimeout,
-                        side,
-                        label.to_string(),
-                    ));
+                        classify_stream_error(&err),
+                        Some(side),
+                        msg,
+                    )));
                 }
-                if let Some(la) = last_activity
-                    && now.saturating_sub(la.load(Ordering::Relaxed)) >= timeout_ms
-                {
-                    return Some((
-                        Direction::Unknown,
-                        ErrorClass::ReadWriteTimeout,
-                        None,
-                        "idle timeout".to_string(),
-                    ));
-                }
-                if let Some(cap) = half_close_cap
-                    && phase2_start.elapsed() >= cap
-                {
-                    return Some((
-                        Direction::Unknown,
-                        ErrorClass::ReadWriteTimeout,
-                        None,
-                        "tcp half-close max wait exceeded".to_string(),
-                    ));
-                }
+                return Poll::Ready(None);
+            }
+            Poll::Pending => {}
+        }
+
+        if let Some(watchdog) = watchdog.as_mut()
+            && Pin::new(watchdog).poll_tick(cx).is_ready()
+        {
+            let now = coarse_now_ms();
+            if let Some(wm) = direction_watermark
+                && now.saturating_sub(wm.load(Ordering::Relaxed)) >= direction_timeout_ms
+            {
+                let side = match direction {
+                    Direction::BackendToClient => Some(StreamIoSide::Read),
+                    Direction::ClientToBackend => Some(StreamIoSide::Write),
+                    Direction::Unknown => None,
+                };
+                let label = match direction {
+                    Direction::BackendToClient => "backend read inactivity timeout",
+                    Direction::ClientToBackend => "backend write inactivity timeout",
+                    Direction::Unknown => "backend inactivity timeout",
+                };
+                return Poll::Ready(Some((
+                    direction,
+                    ErrorClass::ReadWriteTimeout,
+                    side,
+                    label.to_string(),
+                )));
+            }
+            if let Some(la) = last_activity
+                && now.saturating_sub(la.load(Ordering::Relaxed)) >= timeout_ms
+            {
+                return Poll::Ready(Some((
+                    Direction::Unknown,
+                    ErrorClass::ReadWriteTimeout,
+                    None,
+                    "idle timeout".to_string(),
+                )));
+            }
+            if let Some(cap) = half_close_cap
+                && !cap.is_zero()
+                && phase2_start.elapsed() >= cap
+            {
+                return Poll::Ready(Some((
+                    Direction::Unknown,
+                    ErrorClass::ReadWriteTimeout,
+                    None,
+                    "tcp half-close max wait exceeded".to_string(),
+                )));
             }
         }
-    }
+        Poll::Pending
+    })
+    .await
 }
 
 /// Wait the full `half_close_cap` duration or return immediately when `None`.

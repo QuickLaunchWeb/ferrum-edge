@@ -306,6 +306,9 @@ async fn test_http3_proxy_state_creation() {
             )),
             64,
             true,
+            2048,
+            1,
+            256,
             Arc::new(ferrum_edge::overload::OverloadState::new()),
             false, // ktls_enabled
             false, // io_uring_splice_enabled
@@ -551,6 +554,9 @@ async fn test_http3_full_integration() {
             )),
             64,
             true,
+            2048,
+            1,
+            256,
             Arc::new(ferrum_edge::overload::OverloadState::new()),
             false, // ktls_enabled
             false, // io_uring_splice_enabled
