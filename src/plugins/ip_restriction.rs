@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::net::Ipv6Addr;
 use tracing::warn;
 
 use super::{Plugin, PluginResult, RequestContext};
@@ -59,9 +60,15 @@ impl IpRestriction {
             );
         }
 
-        let mode = match config["mode"].as_str() {
-            Some("deny_first") => Mode::DenyFirst,
-            _ => Mode::AllowFirst,
+        let mode = match config.get("mode") {
+            None | Some(Value::Null) => Mode::AllowFirst,
+            Some(Value::String(mode)) if mode == "allow_first" => Mode::AllowFirst,
+            Some(Value::String(mode)) if mode == "deny_first" => Mode::DenyFirst,
+            Some(other) => {
+                return Err(format!(
+                    "ip_restriction: 'mode' must be 'allow_first' or 'deny_first', got: {other}"
+                ));
+            }
         };
 
         Ok(Self { allow, deny, mode })
@@ -118,8 +125,16 @@ impl IpRestriction {
 
     /// Parse a JSON array of IP/CIDR strings into pre-computed rules at config load time.
     fn parse_rule_list(config: &Value, key: &str) -> Result<Vec<ParsedRule>, String> {
-        let Some(arr) = config[key].as_array() else {
+        let Some(value) = config.get(key) else {
             return Ok(Vec::new());
+        };
+        if value.is_null() {
+            return Ok(Vec::new());
+        }
+        let Value::Array(arr) = value else {
+            return Err(format!(
+                "ip_restriction: '{key}' must be an array of IP/CIDR strings"
+            ));
         };
 
         let mut rules = Vec::with_capacity(arr.len());
@@ -127,6 +142,12 @@ impl IpRestriction {
             let rule = value
                 .as_str()
                 .ok_or_else(|| format!("ip_restriction: '{key}' entries must be strings"))?;
+            let rule = rule.trim();
+            if rule.is_empty() {
+                return Err(format!(
+                    "ip_restriction: '{key}' entries must be non-empty strings"
+                ));
+            }
             rules.push(parse_rule(rule).ok_or_else(|| {
                 format!("ip_restriction: invalid {key} rule '{rule}' — expected exact IP or CIDR")
             })?);
@@ -135,9 +156,6 @@ impl IpRestriction {
     }
 }
 
-/// Plugin priority: early pre-processing, before auth.
-pub const IP_RESTRICTION_PRIORITY: u16 = 150;
-
 #[async_trait]
 impl Plugin for IpRestriction {
     fn name(&self) -> &str {
@@ -145,7 +163,7 @@ impl Plugin for IpRestriction {
     }
 
     fn priority(&self) -> u16 {
-        IP_RESTRICTION_PRIORITY
+        super::priority::IP_RESTRICTION
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -291,7 +309,10 @@ fn parse_ipv4(ip: &str) -> Option<[u8; 4]> {
 
 fn parse_ipv6(ip: &str) -> Option<[u16; 8]> {
     // Strip surrounding brackets if present (e.g. from URL-style "[::1]").
-    let ip = ip.trim_matches('[').trim_matches(']');
+    let ip = ip
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(ip);
 
     // Strip a zone identifier suffix like "%eth0" — IPv6 zones are interface
     // scope hints and are not part of the address itself (RFC 6874). They never
@@ -304,57 +325,7 @@ fn parse_ipv6(ip: &str) -> Option<[u16; 8]> {
         None => ip,
     };
 
-    if ip.contains("::") {
-        let parts: Vec<&str> = ip.split("::").collect();
-        if parts.len() > 2 {
-            return None;
-        }
-
-        let left: Vec<u16> = if parts[0].is_empty() {
-            vec![]
-        } else {
-            parts[0]
-                .split(':')
-                .map(|p| u16::from_str_radix(p, 16))
-                .collect::<Result<Vec<_>, _>>()
-                .ok()?
-        };
-
-        let right: Vec<u16> = if parts.len() < 2 || parts[1].is_empty() {
-            vec![]
-        } else {
-            parts[1]
-                .split(':')
-                .map(|p| u16::from_str_radix(p, 16))
-                .collect::<Result<Vec<_>, _>>()
-                .ok()?
-        };
-
-        if left.len() + right.len() > 8 {
-            return None;
-        }
-        let zeros_needed = 8 - left.len() - right.len();
-        let mut result = [0u16; 8];
-        for (i, &v) in left.iter().enumerate() {
-            result[i] = v;
-        }
-        for (i, &v) in right.iter().enumerate() {
-            result[left.len() + zeros_needed + i] = v;
-        }
-        Some(result)
-    } else {
-        let parts: Vec<u16> = ip
-            .split(':')
-            .map(|p| u16::from_str_radix(p, 16))
-            .collect::<Result<Vec<_>, _>>()
-            .ok()?;
-        if parts.len() != 8 {
-            return None;
-        }
-        let mut result = [0u16; 8];
-        result.copy_from_slice(&parts);
-        Some(result)
-    }
+    ip.parse::<Ipv6Addr>().ok().map(|ip| ip.segments())
 }
 
 fn ipv6_to_u128(parts: &[u16; 8]) -> u128 {

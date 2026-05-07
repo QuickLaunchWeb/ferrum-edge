@@ -33,6 +33,11 @@ fn make_ctx(client_ip: &str, datagram_size: usize) -> UdpDatagramContext {
 fn name() {
     let plugin = make_plugin(json!({"datagrams_per_second": 100}));
     assert_eq!(plugin.name(), "udp_rate_limiting");
+    assert!(!plugin.is_auth_plugin());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
 }
 
 #[test]
@@ -63,7 +68,36 @@ fn tracked_keys_count_starts_at_zero() {
     assert_eq!(plugin.tracked_keys_count(), Some(0));
 }
 
+#[test]
+fn warmup_hostnames_for_redis() {
+    let plugin = make_plugin(json!({
+        "datagrams_per_second": 100,
+        "sync_mode": "redis",
+        "redis_url": "redis://redis.internal:6379"
+    }));
+
+    assert_eq!(
+        plugin.warmup_hostnames(),
+        vec!["redis.internal".to_string()]
+    );
+}
+
 // ── Config Validation ─────────────────────────────────────────────────
+
+#[test]
+fn config_rejects_non_object() {
+    let result = ferrum_edge::plugins::udp_rate_limiting::UdpRateLimiting::new_with_http_client(
+        &json!("bad"),
+        PluginHttpClient::default(),
+    );
+    match result {
+        Err(msg) => assert!(
+            msg.contains("config must be an object"),
+            "unexpected error: {msg}"
+        ),
+        Ok(_) => panic!("expected error but got Ok"),
+    }
+}
 
 #[test]
 fn config_requires_at_least_one_limit() {
@@ -101,6 +135,48 @@ fn config_window_seconds_defaults_to_one() {
 #[test]
 fn config_custom_window_seconds() {
     make_plugin(json!({"datagrams_per_second": 100, "window_seconds": 5}));
+}
+
+#[test]
+fn config_rejects_zero_limits_and_window() {
+    for config in [
+        json!({"datagrams_per_second": 0}),
+        json!({"bytes_per_second": 0}),
+        json!({"datagrams_per_second": 100, "window_seconds": 0}),
+    ] {
+        let result = ferrum_edge::plugins::udp_rate_limiting::UdpRateLimiting::new_with_http_client(
+            &config,
+            PluginHttpClient::default(),
+        );
+        assert!(result.is_err(), "config should be rejected: {config:?}");
+    }
+}
+
+#[test]
+fn config_rejects_invalid_numeric_types() {
+    for config in [
+        json!({"datagrams_per_second": "100"}),
+        json!({"bytes_per_second": "1000"}),
+        json!({"datagrams_per_second": 100, "window_seconds": "5"}),
+    ] {
+        let result = ferrum_edge::plugins::udp_rate_limiting::UdpRateLimiting::new_with_http_client(
+            &config,
+            PluginHttpClient::default(),
+        );
+        assert!(result.is_err(), "config should be rejected: {config:?}");
+    }
+}
+
+#[test]
+fn config_rejects_per_window_overflow() {
+    let result = ferrum_edge::plugins::udp_rate_limiting::UdpRateLimiting::new_with_http_client(
+        &json!({"datagrams_per_second": u64::MAX, "window_seconds": 2}),
+        PluginHttpClient::default(),
+    );
+    match result {
+        Err(msg) => assert!(msg.contains("overflows u64"), "unexpected error: {msg}"),
+        Ok(_) => panic!("expected overflow error but got Ok"),
+    }
 }
 
 // ── Datagram Rate Limiting ────────────────────────────────────────────

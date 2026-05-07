@@ -1,6 +1,7 @@
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, Validation, decode, decode_header};
+use serde_json::Map;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,30 +95,38 @@ struct JwksProvider {
     consumer_header_claim: Option<String>,
     /// The JWKS key store (shared via global cache).
     jwks_store: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
+    /// Outbound hosts used by direct JWKS or discovery URLs.
+    warmup_hostnames: Vec<String>,
 }
 
 impl JwksAuth {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        let refresh_interval_secs = config["jwks_refresh_interval_secs"]
-            .as_u64()
-            .unwrap_or(DEFAULT_JWKS_REFRESH_INTERVAL_SECS);
+        let config_obj = config
+            .as_object()
+            .ok_or_else(|| format!("jwks_auth: config must be an object, got: {config}"))?;
+
+        let refresh_interval_secs = optional_u64(
+            config_obj,
+            "jwks_refresh_interval_secs",
+            DEFAULT_JWKS_REFRESH_INTERVAL_SECS,
+        )?;
+        if refresh_interval_secs == 0 {
+            return Err(
+                "jwks_auth: 'jwks_refresh_interval_secs' must be greater than 0".to_string(),
+            );
+        }
         let refresh_interval = Duration::from_secs(refresh_interval_secs);
 
-        let global_scope_claim = config["scope_claim"]
-            .as_str()
-            .unwrap_or("scope")
-            .to_string();
-        let global_role_claim = config["role_claim"].as_str().unwrap_or("roles").to_string();
-        let consumer_identity_claim = config["consumer_identity_claim"]
-            .as_str()
-            .unwrap_or("sub")
-            .to_string();
-        let consumer_header_claim = config["consumer_header_claim"]
-            .as_str()
-            .unwrap_or(&consumer_identity_claim)
-            .to_string();
+        let global_scope_claim = optional_claim_path(config_obj, "scope_claim", "scope")?;
+        let global_role_claim = optional_claim_path(config_obj, "role_claim", "roles")?;
+        let consumer_identity_claim =
+            optional_claim_path(config_obj, "consumer_identity_claim", "sub")?;
+        let consumer_header_claim = match config_obj.get("consumer_header_claim") {
+            Some(value) => parse_claim_path_value("consumer_header_claim", value)?,
+            None => consumer_identity_claim.clone(),
+        };
 
-        let providers_val = &config["providers"];
+        let providers_val = config_obj.get("providers").unwrap_or(&Value::Null);
         let Some(providers_arr) = providers_val.as_array() else {
             return Err("jwks_auth: 'providers' must be a non-empty array".to_string());
         };
@@ -128,8 +137,16 @@ impl JwksAuth {
         let mut providers = Vec::with_capacity(providers_arr.len());
 
         for (idx, prov_cfg) in providers_arr.iter().enumerate() {
-            let jwks_uri = prov_cfg["jwks_uri"].as_str().map(|s| s.to_string());
-            let discovery_url = prov_cfg["discovery_url"].as_str().map(|s| s.to_string());
+            let prov_obj = prov_cfg.as_object().ok_or_else(|| {
+                format!("jwks_auth: provider[{idx}] must be an object, got: {prov_cfg}")
+            })?;
+
+            let jwks_endpoint = parse_url_field(prov_obj, "jwks_uri", idx)?;
+            let discovery_endpoint = parse_url_field(prov_obj, "discovery_url", idx)?;
+            let jwks_uri = jwks_endpoint.as_ref().map(|endpoint| endpoint.url.clone());
+            let discovery_url = discovery_endpoint
+                .as_ref()
+                .map(|endpoint| endpoint.url.clone());
 
             if jwks_uri.is_none() && discovery_url.is_none() {
                 return Err(format!(
@@ -138,20 +155,30 @@ impl JwksAuth {
                 ));
             }
 
-            let issuer = prov_cfg["issuer"].as_str().map(|s| s.to_string());
-            let audience = prov_cfg["audience"].as_str().map(|s| s.to_string());
+            let issuer = optional_non_empty_string(prov_obj, "issuer", idx)?;
+            let audience = optional_non_empty_string(prov_obj, "audience", idx)?;
 
-            let required_scopes = parse_string_array(&prov_cfg["required_scopes"]);
-            let required_roles = parse_string_array(&prov_cfg["required_roles"]);
+            let required_scopes = parse_string_array(prov_obj, "required_scopes", idx)?;
+            let required_roles = parse_string_array(prov_obj, "required_roles", idx)?;
 
-            let scope_claim = prov_cfg["scope_claim"].as_str().map(|s| s.to_string());
-            let role_claim = prov_cfg["role_claim"].as_str().map(|s| s.to_string());
-            let prov_consumer_identity_claim = prov_cfg["consumer_identity_claim"]
-                .as_str()
-                .map(|s| s.to_string());
-            let prov_consumer_header_claim = prov_cfg["consumer_header_claim"]
-                .as_str()
-                .map(|s| s.to_string());
+            let scope_claim = optional_provider_claim_path(prov_obj, "scope_claim", idx)?;
+            let role_claim = optional_provider_claim_path(prov_obj, "role_claim", idx)?;
+            let prov_consumer_identity_claim =
+                optional_provider_claim_path(prov_obj, "consumer_identity_claim", idx)?;
+            let prov_consumer_header_claim =
+                optional_provider_claim_path(prov_obj, "consumer_header_claim", idx)?;
+
+            let mut warmup_hostnames = Vec::new();
+            if let Some(endpoint) = jwks_endpoint.as_ref() {
+                warmup_hostnames.push(endpoint.hostname.clone());
+            }
+            if let Some(endpoint) = discovery_endpoint.as_ref()
+                && !warmup_hostnames
+                    .iter()
+                    .any(|host| host == &endpoint.hostname)
+            {
+                warmup_hostnames.push(endpoint.hostname.clone());
+            }
 
             let jwks_store_slot: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>> =
                 Arc::new(ArcSwap::from_pointee(None));
@@ -165,7 +192,9 @@ impl JwksAuth {
                 // indefinite retries. The background task keeps trying with
                 // exponential backoff (2s → 4s → … → 5min cap) until discovery
                 // succeeds. Once resolved, the JwksKeyStore's own background
-                // refresh task takes over for periodic key rotation.
+                // task starts immediately; the eager fetch below coalesces with
+                // that task so keys are populated before publication without a
+                // second successful JWKS request.
                 //
                 // This ensures a prolonged IdP outage during gateway startup
                 // does not permanently disable the provider — it self-heals
@@ -198,7 +227,7 @@ impl JwksAuth {
                             Ok(uri) => {
                                 info!("jwks_auth OIDC discovery: resolved jwks_uri={}", uri);
                                 let store = get_or_create_jwks_store(&uri, &client, interval);
-                                if let Err(e) = store.fetch_keys().await {
+                                if let Err(e) = store.fetch_keys_if_empty().await {
                                     warn!("jwks_auth OIDC: initial JWKS fetch failed: {}", e);
                                 }
                                 slot.store(Arc::new(Some(store)));
@@ -228,6 +257,7 @@ impl JwksAuth {
                 consumer_identity_claim: prov_consumer_identity_claim,
                 consumer_header_claim: prov_consumer_header_claim,
                 jwks_store: jwks_store_slot,
+                warmup_hostnames,
             });
         }
 
@@ -445,9 +475,11 @@ auth_flow::impl_auth_plugin!(
     fn warmup_hostnames(&self) -> Vec<String> {
         let mut hosts = Vec::new();
         for prov in &self.providers {
+            hosts.extend(prov.warmup_hostnames.iter().cloned());
             let guard = prov.jwks_store.load();
             if let Some(ref store) = **guard
                 && let Some(host) = hostname_from_url(store.jwks_uri())
+                && !hosts.iter().any(|known| known == &host)
             {
                 hosts.push(host);
             }
@@ -476,10 +508,8 @@ async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Opt
     let guard = provider.jwks_store.load();
     let store = guard.as_ref().as_ref()?;
 
-    if !store.has_keys()
-        && let Err(e) = store.fetch_keys().await
-    {
-        debug!("jwks_auth: on-demand JWKS fetch failed: {}", e);
+    if !store.has_keys() {
+        debug!("jwks_auth: JWKS store has no cached keys; rejecting without hot-path fetch");
         return None;
     }
 
@@ -526,14 +556,17 @@ async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Opt
 ///
 /// Used to route the token to the correct provider before doing real validation.
 fn peek_issuer(token: &str) -> Option<String> {
-    // Decode the payload segment (second part) without verification
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload_segment = parts.next()?;
+    let _signature = parts.next()?;
+    if parts.next().is_some() {
         return None;
     }
+
     use base64::Engine;
     let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(parts[1])
+        .decode(payload_segment)
         .ok()?;
     let payload: Value = serde_json::from_slice(&payload_bytes).ok()?;
     payload
@@ -585,14 +618,145 @@ fn extract_claim_string(claims: &Value, claim_path: &str) -> Option<String> {
 }
 
 /// Parse a JSON value as an array of strings, or empty vec if not present/valid.
-fn parse_string_array(val: &Value) -> Vec<String> {
-    val.as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
+struct ParsedEndpoint {
+    url: String,
+    hostname: String,
+}
+
+fn optional_u64(
+    config: &Map<String, Value>,
+    field: &str,
+    default_value: u64,
+) -> Result<u64, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(default_value);
+    };
+    value
+        .as_u64()
+        .ok_or_else(|| format!("jwks_auth: '{field}' must be an unsigned integer, got: {value}"))
+}
+
+fn optional_claim_path(
+    config: &Map<String, Value>,
+    field: &str,
+    default_value: &str,
+) -> Result<String, String> {
+    match config.get(field) {
+        Some(value) => parse_claim_path_value(field, value),
+        None => Ok(default_value.to_string()),
+    }
+}
+
+fn optional_provider_claim_path(
+    config: &Map<String, Value>,
+    field: &str,
+    provider_idx: usize,
+) -> Result<Option<String>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    parse_claim_path_value(&format!("provider[{provider_idx}].{field}"), value).map(Some)
+}
+
+fn parse_claim_path_value(field: &str, value: &Value) -> Result<String, String> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| format!("jwks_auth: '{field}' must be a string, got: {value}"))?;
+    let path = raw.trim();
+    if path.is_empty() || path.split('.').any(str::is_empty) {
+        return Err(format!(
+            "jwks_auth: '{field}' must be a non-empty dot path without empty segments"
+        ));
+    }
+    Ok(path.to_string())
+}
+
+fn optional_non_empty_string(
+    config: &Map<String, Value>,
+    field: &str,
+    provider_idx: usize,
+) -> Result<Option<String>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let raw = value.as_str().ok_or_else(|| {
+        format!("jwks_auth: 'provider[{provider_idx}].{field}' must be a string, got: {value}")
+    })?;
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(format!(
+            "jwks_auth: 'provider[{provider_idx}].{field}' must not be empty"
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn parse_url_field(
+    config: &Map<String, Value>,
+    field: &str,
+    provider_idx: usize,
+) -> Result<Option<ParsedEndpoint>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let raw = value.as_str().ok_or_else(|| {
+        format!("jwks_auth: 'provider[{provider_idx}].{field}' must be a URL string, got: {value}")
+    })?;
+    let url = raw.trim();
+    if url.is_empty() {
+        return Err(format!(
+            "jwks_auth: 'provider[{provider_idx}].{field}' must not be empty"
+        ));
+    }
+    let parsed = Url::parse(url).map_err(|e| {
+        format!("jwks_auth: 'provider[{provider_idx}].{field}' is not a valid URL: {e}")
+    })?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(format!(
+                "jwks_auth: 'provider[{provider_idx}].{field}' must use http or https, got: {scheme}"
+            ));
+        }
+    }
+    let hostname = parsed.host_str().ok_or_else(|| {
+        format!("jwks_auth: 'provider[{provider_idx}].{field}' must include a hostname")
+    })?;
+    Ok(Some(ParsedEndpoint {
+        url: url.to_string(),
+        hostname: hostname.to_string(),
+    }))
+}
+
+fn parse_string_array(
+    config: &Map<String, Value>,
+    field: &str,
+    provider_idx: usize,
+) -> Result<Vec<String>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(Vec::new());
+    };
+    let Some(arr) = value.as_array() else {
+        return Err(format!(
+            "jwks_auth: 'provider[{provider_idx}].{field}' must be an array of strings, got: {value}"
+        ));
+    };
+    let mut values = Vec::with_capacity(arr.len());
+    for (idx, entry) in arr.iter().enumerate() {
+        let raw = entry.as_str().ok_or_else(|| {
+            format!(
+                "jwks_auth: 'provider[{provider_idx}].{field}[{idx}]' must be a string, got: {entry}"
+            )
+        })?;
+        let value = raw.trim();
+        if value.is_empty() {
+            return Err(format!(
+                "jwks_auth: 'provider[{provider_idx}].{field}[{idx}]' must not be empty"
+            ));
+        }
+        values.push(value.to_string());
+    }
+    Ok(values)
 }
 
 /// Escape characters that could cause JSON injection in error response bodies.

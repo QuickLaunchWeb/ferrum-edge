@@ -5,9 +5,10 @@ use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginAssociation, PluginConfig,
     PluginScope, Proxy,
 };
-use ferrum_edge::plugins::{PluginResult, ProxyProtocol, RequestContext};
+use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
 use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
+use std::sync::Arc;
 
 /// Returns the minimal valid config for a given plugin name so that `create_plugin` succeeds.
 fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
@@ -37,7 +38,7 @@ fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
         "ws_logging" => json!({"endpoint_url": "ws://localhost:9300/logs"}),
         "otel_tracing" => json!({"endpoint": "http://localhost:4318/v1/traces"}),
         "jwks_auth" => {
-            json!({"providers": [{"jwks_uri": "https://example.com/.well-known/jwks.json"}]})
+            json!({"providers": [{"jwks_uri": "http://127.0.0.1:9/.well-known/jwks.json"}]})
         }
         "udp_rate_limiting" => json!({"datagrams_per_second": 1000}),
         "serverless_function" => {
@@ -95,6 +96,7 @@ fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         upstream_id: None,
+        api_spec_id: None,
         circuit_breaker: None,
         retry: None,
         response_body_mode: Default::default(),
@@ -129,6 +131,7 @@ fn make_plugin_config(
         proxy_id: proxy_id.map(|s| s.to_string()),
         enabled,
         priority_override: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -145,6 +148,14 @@ fn make_config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> Gatewa
         known_namespaces: Vec::new(),
         ..Default::default()
     }
+}
+
+fn plugin_ptr_by_name(plugins: &[Arc<dyn Plugin>], name: &str) -> usize {
+    let plugin = plugins
+        .iter()
+        .find(|plugin| plugin.name() == name)
+        .unwrap_or_else(|| panic!("expected plugin named {name}"));
+    Arc::as_ptr(plugin) as *const () as usize
 }
 
 // ---- Plugin caching correctness ----
@@ -429,6 +440,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 proxy_id: Some("graphql-empty".to_string()),
                 enabled: true,
                 priority_override: None,
+                api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -441,6 +453,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 proxy_id: Some("graphql-guarded".to_string()),
                 enabled: true,
                 priority_override: None,
+                api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -453,6 +466,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 proxy_id: Some("response-only".to_string()),
                 enabled: true,
                 priority_override: None,
+                api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -465,6 +479,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 proxy_id: Some("request-xml".to_string()),
                 enabled: true,
                 priority_override: None,
+                api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -573,6 +588,7 @@ async fn test_cors_preflight_runs_before_request_termination() {
                 proxy_id: Some("p1".to_string()),
                 enabled: true,
                 priority_override: None,
+                api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -585,6 +601,7 @@ async fn test_cors_preflight_runs_before_request_termination() {
                 proxy_id: Some("p1".to_string()),
                 enabled: true,
                 priority_override: None,
+                api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -673,6 +690,7 @@ async fn test_rate_limiter_state_persists_across_calls() {
             proxy_id: None,
             enabled: true,
             priority_override: None,
+            api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }],
@@ -824,6 +842,7 @@ fn test_apply_delta_rejects_invalid_security_plugin() {
                 proxy_id: Some("p1".to_string()),
                 enabled: true,
                 priority_override: None,
+                api_spec_id: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -876,6 +895,148 @@ fn test_apply_delta_accepts_valid_config() {
     assert!(result.is_ok(), "apply_delta should accept valid config");
 }
 
+#[test]
+fn test_apply_delta_preserves_proxy_group_instance_for_unchanged_group_config() {
+    let config1 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["group1"]),
+            make_proxy("p2", "/web", vec!["group1"]),
+        ],
+        vec![make_plugin_config(
+            "group1",
+            "rate_limiting",
+            PluginScope::ProxyGroup,
+            None,
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+
+    let p1_before = cache.get_plugins("p1");
+    let p2_before = cache.get_plugins("p2");
+    let group_ptr_before = plugin_ptr_by_name(&p1_before, "rate_limiting");
+    assert_eq!(
+        group_ptr_before,
+        plugin_ptr_by_name(&p2_before, "rate_limiting"),
+        "initial proxy-group plugin instance should be shared"
+    );
+
+    let config2 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["group1", "ps1"]),
+            make_proxy("p2", "/web", vec!["group1"]),
+        ],
+        vec![
+            make_plugin_config(
+                "group1",
+                "rate_limiting",
+                PluginScope::ProxyGroup,
+                None,
+                true,
+            ),
+            make_plugin_config(
+                "ps1",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let mut proxy_ids = std::collections::HashSet::new();
+    proxy_ids.insert("p1".to_string());
+
+    cache.apply_delta(&config2, &proxy_ids, &[], false).unwrap();
+
+    let p1_after = cache.get_plugins("p1");
+    let p2_after = cache.get_plugins("p2");
+    assert_eq!(
+        plugin_ptr_by_name(&p1_after, "rate_limiting"),
+        group_ptr_before,
+        "rebuilt proxy should reuse the existing proxy-group instance"
+    );
+    assert_eq!(
+        plugin_ptr_by_name(&p1_after, "rate_limiting"),
+        plugin_ptr_by_name(&p2_after, "rate_limiting"),
+        "partial proxy rebuild must not split proxy-group state"
+    );
+    assert!(
+        p1_after
+            .iter()
+            .any(|plugin| plugin.name() == "stdout_logging"),
+        "rebuilt proxy should still pick up its new proxy-scoped plugin"
+    );
+}
+
+#[test]
+fn test_apply_delta_prunes_proxy_group_instance_after_last_association_removed() {
+    let config1 = make_config(
+        vec![make_proxy("p1", "/api", vec!["group1"])],
+        vec![make_plugin_config(
+            "group1",
+            "rate_limiting",
+            PluginScope::ProxyGroup,
+            None,
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+
+    let p1_before = cache.get_plugins("p1");
+    let held_group_plugin = Arc::clone(
+        p1_before
+            .iter()
+            .find(|plugin| plugin.name() == "rate_limiting")
+            .unwrap_or_else(|| panic!("expected initial proxy-group rate limiter")),
+    );
+
+    let config2 = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config(
+            "group1",
+            "rate_limiting",
+            PluginScope::ProxyGroup,
+            None,
+            true,
+        )],
+    );
+    let mut proxy_ids = std::collections::HashSet::new();
+    proxy_ids.insert("p1".to_string());
+
+    cache.apply_delta(&config2, &proxy_ids, &[], false).unwrap();
+
+    let p1_after_removal = cache.get_plugins("p1");
+    assert!(
+        p1_after_removal
+            .iter()
+            .all(|plugin| plugin.name() != "rate_limiting"),
+        "last association removal should remove the proxy-group plugin from the proxy"
+    );
+
+    let config3 = make_config(
+        vec![make_proxy("p1", "/api", vec!["group1"])],
+        vec![make_plugin_config(
+            "group1",
+            "rate_limiting",
+            PluginScope::ProxyGroup,
+            None,
+            true,
+        )],
+    );
+    cache.apply_delta(&config3, &proxy_ids, &[], false).unwrap();
+
+    let p1_after_reattach = cache.get_plugins("p1");
+    let reattached_group_plugin = p1_after_reattach
+        .iter()
+        .find(|plugin| plugin.name() == "rate_limiting")
+        .unwrap_or_else(|| panic!("expected reattached proxy-group rate limiter"));
+
+    assert!(
+        !Arc::ptr_eq(&held_group_plugin, reattached_group_plugin),
+        "reattaching a previously unused proxy-group config should create fresh state"
+    );
+}
+
 // ---- Protocol-filtered plugin lookup tests ----
 
 fn make_plugin_config_with_json(
@@ -894,6 +1055,7 @@ fn make_plugin_config_with_json(
         proxy_id: proxy_id.map(|s| s.to_string()),
         enabled: true,
         priority_override: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -1445,6 +1607,7 @@ fn make_plugin_config_with_priority(
         proxy_id: proxy_id.map(|s| s.to_string()),
         enabled,
         priority_override,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -1593,6 +1756,78 @@ fn test_priority_override_applied_correctly() {
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].priority(), 100);
     assert_eq!(plugins[0].name(), "stdout_logging");
+}
+
+#[test]
+fn test_priority_override_delegates_response_buffering_refinement() {
+    let mut plugin_config = make_plugin_config_with_json(
+        "ps1",
+        "response_size_limiting",
+        json!({"max_bytes": 1024, "require_buffered_check": true}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin_config.priority_override = Some(100);
+
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![plugin_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].priority(), 100);
+    assert!(plugins[0].requires_response_body_buffering());
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/events".to_string(),
+    );
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+
+    assert!(
+        !plugins[0].should_buffer_response_body(&ctx),
+        "priority override wrapper must preserve plugin-specific SSE buffering skip"
+    );
+}
+
+#[test]
+fn test_priority_override_delegates_request_buffering_refinement() {
+    let mut plugin_config = make_plugin_config_with_json(
+        "ps1",
+        "graphql",
+        json!({"max_depth": 4}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin_config.priority_override = Some(100);
+
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![plugin_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].priority(), 100);
+    assert!(plugins[0].requires_request_body_buffering());
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/graphql".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+
+    assert!(
+        !plugins[0].should_buffer_request_body(&ctx),
+        "priority override wrapper must preserve plugin-specific GET buffering skip"
+    );
 }
 
 #[test]

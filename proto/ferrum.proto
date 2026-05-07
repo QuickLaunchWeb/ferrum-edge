@@ -7,6 +7,8 @@ service ConfigSync {
   rpc Subscribe(SubscribeRequest) returns (stream ConfigUpdate);
   // DP can request a full config snapshot
   rpc GetFullConfig(FullConfigRequest) returns (FullConfigResponse);
+  // Mesh data planes subscribe to their canonical per-workload mesh slice.
+  rpc MeshSubscribe(MeshSubscribeRequest) returns (stream MeshConfigUpdate);
 }
 
 message SubscribeRequest {
@@ -43,4 +45,27 @@ message ConfigUpdate {
   int64 timestamp = 4;
   // Ferrum Edge binary version of the CP (e.g. "0.9.0")
   string ferrum_version = 5;
+}
+
+message MeshSubscribeRequest {
+  string node_id = 1;
+  // Ferrum Edge binary version of the mesh data plane (e.g. "0.9.0")
+  string ferrum_version = 2;
+  // Namespace this mesh data plane loads and enforces
+  string namespace = 3;
+  // Optional workload identity for sidecar mode. Ambient nodes may leave this
+  // empty and rely on labels/topology metadata until HBONE is wired in Phase C.
+  string workload_spiffe_id = 4;
+  // Workload labels used to select workload-scoped policy.
+  map<string, string> labels = 5;
+}
+
+message MeshConfigUpdate {
+  string version = 1;
+  int64 timestamp = 2;
+  // JSON-encoded src/xds::MeshSlice. Kept JSON for native ConfigSync so the
+  // canonical model remains the stable contract and old DPs ignore this RPC.
+  string mesh_slice_json = 3;
+  // Ferrum Edge binary version of the CP (e.g. "0.9.0")
+  string ferrum_version = 4;
 }

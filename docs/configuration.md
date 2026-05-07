@@ -11,10 +11,11 @@ This page is the canonical human-readable reference for `FERRUM_*` variables and
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_CONF_PATH` | No | `./ferrum.conf` | Path to optional conf file (provides defaults; env vars override) |
-| `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp`, `migrate` |
+| `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp`, `mesh`, `injector`, `migrate` |
 | `FERRUM_NAMESPACE` | No | `ferrum` | Namespace this gateway loads and manages |
 | `FERRUM_LOG_LEVEL` | No | `error` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace` |
 | `FERRUM_LOG_BUFFER_CAPACITY` | No | `128000` | Max buffered log lines in the non-blocking writer channel. When full, new events are dropped to avoid backpressure on request threads |
+| `FERRUM_LOG_REDACT_METADATA_KEYS` | No | — | Comma-separated additional metadata-key substrings to redact from `TransactionSummary.metadata` and `StreamTransactionSummary.metadata` before log serialization. Built-in sensitive substrings such as `authorization`, `cookie`, `password`, `secret`, and `token` are always redacted |
 | `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` | No | `30` | Timeout for each external secret fetch during startup |
 
 ### Proxy Listener
@@ -45,6 +46,7 @@ This page is the canonical human-readable reference for `FERRUM_*` variables and
 | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | PEM CA bundle for Admin API client certificate verification |
 | `FERRUM_ADMIN_TLS_NO_VERIFY` | No | `false` | Skip Admin API TLS certificate verification (testing only) |
 | `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` | No | `100` | Max request body size in MiB for `POST /restore` |
+| `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` | No | `25` | Max request body size in MiB for `POST/PUT /api-specs`. Specs are stored gzip-compressed; large API definitions (e.g. AWS combined services) can approach 30–50 MiB uncompressed. MongoDB backends are additionally bounded by the BSON 16 MB document limit, enforced at write time |
 
 ### Database
 
@@ -79,6 +81,8 @@ This page is the canonical human-readable reference for `FERRUM_*` variables and
 | `FERRUM_DB_TLS_CA_CERT_PATH` | No | — | Path to CA certificate for database server verification |
 | `FERRUM_DB_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for database mTLS. SQL requires pairing with `FERRUM_DB_TLS_CLIENT_KEY_PATH`; MongoDB may use this alone as an already-combined cert+key PEM |
 | `FERRUM_DB_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for database mTLS; must be paired with `FERRUM_DB_TLS_CLIENT_CERT_PATH` |
+
+Deprecated aliases `FERRUM_DB_SSL_MODE`, `FERRUM_DB_SSL_ROOT_CERT`, `FERRUM_DB_SSL_CLIENT_CERT`, `FERRUM_DB_SSL_CLIENT_KEY`, `FERRUM_DB_TLS_ENABLED`, and `FERRUM_DB_TLS_INSECURE` are accepted for compatibility and emit startup warnings. Prefer the canonical variables above.
 
 See [database_tls.md](database_tls.md) for detailed configuration examples and TLS mode descriptions.
 
@@ -122,13 +126,15 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_CP_GRPC_LISTEN_ADDR` | No | `0.0.0.0:50051` in CP mode | gRPC listen address. Port `0` disables plaintext gRPC |
-| `FERRUM_CP_DP_GRPC_JWT_SECRET` | CP & DP modes | — | Shared JWT secret for CP/DP gRPC auth (DP generates short-lived JWTs, CP validates). Must be at least 32 characters |
+| `FERRUM_CP_DP_GRPC_JWT_SECRET` | CP, DP & mesh modes | — | Shared JWT secret for CP/DP/mesh gRPC auth (DP/mesh clients generate short-lived JWTs, CP validates). Must be at least 32 characters |
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | If CP gRPC TLS | — | CP gRPC server TLS certificate |
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | If CP gRPC TLS | — | CP gRPC server TLS private key |
 | `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | No | — | CA bundle for verifying DP client certificates (mTLS) |
 | `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` | No | `128` | CP broadcast channel capacity before lagging DPs receive a full snapshot |
-| `FERRUM_DP_CP_GRPC_URL` | DP mode (unless `_URLS` set) | — | Control Plane gRPC URL |
-| `FERRUM_DP_CP_GRPC_URLS` | No | — | Comma-separated priority-ordered CP URLs for DP failover. Takes precedence over single URL |
+| `FERRUM_XDS_ENABLED` | No | `false` | Enable Phase B xDS ADS (`StreamAggregatedResources` and `DeltaAggregatedResources`) on the CP gRPC listener |
+| `FERRUM_XDS_STREAM_CHANNEL_CAPACITY` | No | `32` | Per-ADS-stream response queue capacity before slow xDS readers apply backpressure to their own stream task |
+| `FERRUM_DP_CP_GRPC_URL` | DP/mesh mode (unless `_URLS` set) | — | Control Plane gRPC URL |
+| `FERRUM_DP_CP_GRPC_URLS` | No | — | Comma-separated priority-ordered CP URLs for DP/mesh failover. Takes precedence over single URL |
 | `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` | No | `300` | Retry primary CP interval (seconds) when connected to a fallback. `0` = disabled |
 | `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | No | — | CA certificate for verifying the CP server |
 | `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` | No | — | DP client certificate for CP mTLS |
@@ -136,6 +142,54 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 | `FERRUM_DP_GRPC_TLS_NO_VERIFY` | No | `false` | Skip DP gRPC TLS verification (testing only) |
 
 See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_CP_GRPC_TLS_*`, `FERRUM_DP_GRPC_TLS_*`) and [multi_region_ha.md](multi_region_ha.md) for multi-region deployment patterns.
+
+### Mesh Runtime
+
+Mesh mode consumes Layer 2 mesh slices from the control protocols and prepares the shared sidecar/ambient data-plane listeners. Non-mesh modes do not instantiate this runtime.
+
+With the native `MeshSubscribe` protocol, mesh mode waits for the first delivered mesh slice before serving, builds the proxy/plugin runtime from that slice, and hot-applies later valid slices atomically. Invalid slice updates are logged and ignored so the last accepted runtime config keeps serving.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FERRUM_MESH_CONFIG_PROTOCOL` | No | `native` | Mesh config source. Mesh runtime currently supports `native` Ferrum `MeshSubscribe`; `xds` is rejected during settings validation until the mesh DP xDS client is wired. `FERRUM_XDS_ENABLED` only exposes CP ADS for Envoy-compatible clients |
+| `FERRUM_MESH_NODE_ID` | No | `$HOSTNAME` or `ferrum-mesh-node` | Stable mesh data-plane node ID used for xDS/MeshSubscribe |
+| `FERRUM_MESH_TOPOLOGY` | No | `sidecar` | Mesh topology flag: `sidecar`, `ambient`, or `east_west_gateway`. All share the same data-plane path |
+| `FERRUM_MESH_INBOUND_LISTEN_ADDR` | No | `0.0.0.0:15006` | Sidecar inbound mTLS listener address |
+| `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` | No | `127.0.0.1:15001` | Mesh outbound capture listener address for plaintext-in to mTLS-out or HBONE encapsulation |
+| `FERRUM_MESH_HBONE_LISTEN_ADDR` | No | `0.0.0.0:15008` | Ambient HBONE termination listener address (Istio-flavored HBONE over mTLS) |
+| `FERRUM_MESH_EAST_WEST_LISTEN_PORT` | No | `15443` | Shared TCP passthrough listener port for `east_west_gateway` topology; routes by TLS SNI using `mesh.multi_cluster.east_west_gateways` |
+| `FERRUM_MESH_WORKLOAD_SPIFFE_ID` | No | — | Optional workload SPIFFE ID hint sent to native MeshSubscribe |
+| `FERRUM_MESH_CAPTURE_MODE` | No | `explicit` | Traffic capture mode used by injector/capture planning: `explicit`, `iptables`, or `ebpf`. eBPF always falls back to iptables when unsupported |
+| `FERRUM_MESH_PROXY_UID` | No | `1337` in injector patches | UID used to exempt Ferrum's own outbound traffic from iptables capture |
+
+Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Prometheus plugin when mesh metadata is present. The added series are `ferrum_mesh_requests_total` and `ferrum_mesh_request_duration_ms`, labelled with source/destination workload, namespace, principal, app, service, request protocol, response code, response flags, and connection security policy.
+
+HBONE identity metadata is read from all `baggage` headers on an HBONE request. Baggage values may be percent-encoded, and Ferrum decodes them before extracting `source.principal` or `destination.principal`.
+
+Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the canonical config. Remote clusters carry trust domains and federation endpoints, VM `WorkloadEntry` resources populate workload addresses/network/cluster metadata, and east-west gateway entries are materialized as SNI-routed passthrough stream proxies only in `east_west_gateway` topology.
+
+### Kubernetes Mesh Integration
+
+Phase D adds Kubernetes source translation and sidecar-injector scaffolding. Kubernetes resources translate into `GatewayConfig` / `MeshConfig`; no config source talks directly to the proxy runtime or xDS server.
+
+Gateway API `HTTPRoute` path matches preserve Kubernetes semantics: `PathPrefix` stays a prefix route, `Exact` is translated to an exact-path route for whole-path matching, and `RegularExpression` is passed through as a Ferrum regex route. Istio `VirtualService` URI matches follow the same shape for `prefix`, `exact`, and `regex`. Translated mesh routes do not strip the listen path before forwarding, so upgrades from older mesh previews should expect backends to receive the original Kubernetes request path.
+
+Gateway API cross-namespace `backendRefs` require an exact matching `ReferenceGrant`, including the source API group/kind and target group/kind. Ferrum currently supports core Kubernetes `Service` backend references and fails closed for other backend target kinds in both same-namespace and cross-namespace routes.
+
+Kubernetes Gateway API and Istio mesh translators fail closed when a resource declares a port outside the Kubernetes service-port range (`1`-`65535`). Invalid ports are rejected during translation instead of wrapping into an unintended backend/listener port.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FERRUM_INJECTOR_LISTEN_ADDR` | Injector mode | `0.0.0.0:9443` | Admission webhook bind address for `POST /mutate` |
+| `FERRUM_INJECTOR_SIDECAR_IMAGE` | No | `ferrum-edge:latest` | Image injected into workload pods as the Ferrum mesh sidecar |
+| `FERRUM_INJECTOR_REQUIRE_ANNOTATION` | No | `true` | Require pod label `ferrum.io/mesh=enabled` or annotation `ferrum.io/inject=true` before injecting |
+| `FERRUM_INJECTOR_TRUST_DOMAIN` | No | `cluster.local` | Trust domain used to derive injected sidecar `FERRUM_MESH_WORKLOAD_SPIFFE_ID` from pod namespace and service account |
+| `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` | No | — | Kubernetes Secret name used as the injected sidecar `FERRUM_CP_DP_GRPC_JWT_SECRET` source |
+| `FERRUM_INJECTOR_JWT_SECRET_REF_KEY` | No | — | Key inside `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` used as the injected sidecar `FERRUM_CP_DP_GRPC_JWT_SECRET` source |
+| `FERRUM_INJECTOR_TLS_CERT_PATH` | Kubernetes webhook deployments | — | TLS certificate presented by the injector webhook server |
+| `FERRUM_INJECTOR_TLS_KEY_PATH` | Kubernetes webhook deployments | — | TLS private key for `FERRUM_INJECTOR_TLS_CERT_PATH` |
+
+The injector copies non-secret mesh sidecar control-plane env vars from its own environment into injected containers when set: `FERRUM_DP_CP_GRPC_URL`, `FERRUM_DP_CP_GRPC_URLS`, `FERRUM_CP_DP_GRPC_JWT_ISSUER`, DP gRPC TLS vars, and `FERRUM_MESH_CONFIG_PROTOCOL`. It does not copy plaintext `FERRUM_CP_DP_GRPC_JWT_SECRET`; set `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` and `FERRUM_INJECTOR_JWT_SECRET_REF_KEY` to inject that variable via `valueFrom.secretKeyRef`.
 
 ### Migration
 

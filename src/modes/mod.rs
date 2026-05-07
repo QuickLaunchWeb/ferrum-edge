@@ -8,6 +8,8 @@
 //! | `file`     | Yes   | Read-only   | YAML/JSON file, SIGHUP reload    |
 //! | `cp`       | No    | Read/Write  | DB polling + gRPC broadcast to DPs |
 //! | `dp`       | Yes   | Read-only   | gRPC stream from CP              |
+//! | `mesh`     | Yes   | Read-only   | xDS or native MeshSubscribe      |
+//! | `injector` | No    | No          | Kubernetes admission webhook     |
 //! | `migrate`  | No    | No          | Runs DB migrations then exits    |
 //!
 //! All modes share the same `ProxyState` and atomic config swap mechanism.
@@ -18,6 +20,8 @@ pub mod control_plane;
 pub mod data_plane;
 pub mod database;
 pub mod file;
+pub mod injector;
+pub mod mesh;
 pub mod migrate;
 
 use std::sync::Arc;

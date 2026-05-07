@@ -9,6 +9,7 @@
 //! disclosure risk.
 
 use async_trait::async_trait;
+use http::header::HeaderName;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -40,28 +41,32 @@ pub struct TransactionDebugger {
 
 impl TransactionDebugger {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let extra_redacted_headers = config["redacted_headers"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        if !config.is_object() {
+            return Err("transaction_debugger: config must be an object".to_string());
+        }
+
+        let extra_redacted_headers =
+            optional_header_names(config, "redacted_headers")?.unwrap_or_default();
 
         Ok(Self {
-            log_request_body: config["log_request_body"].as_bool().unwrap_or(false),
-            log_response_body: config["log_response_body"].as_bool().unwrap_or(false),
+            log_request_body: optional_bool(config, "log_request_body")?.unwrap_or(false),
+            log_response_body: optional_bool(config, "log_response_body")?.unwrap_or(false),
             extra_redacted_headers,
         })
     }
 
     /// Returns true if the given header name should be redacted.
-    /// Header names are already lowercased by hyper, and SENSITIVE_HEADERS
-    /// and extra_redacted_headers are stored lowercase — no conversion needed.
+    /// Header names are normally lowercased by hyper, but tests/custom callers
+    /// may provide different ASCII casing; compare case-insensitively without
+    /// allocating.
     fn is_sensitive(&self, header_name: &str) -> bool {
-        SENSITIVE_HEADERS.contains(&header_name)
-            || self.extra_redacted_headers.iter().any(|h| h == header_name)
+        SENSITIVE_HEADERS
+            .iter()
+            .any(|h| header_name.eq_ignore_ascii_case(h))
+            || self
+                .extra_redacted_headers
+                .iter()
+                .any(|h| header_name.eq_ignore_ascii_case(h))
     }
 
     /// Create a redacted copy of headers for safe logging.
@@ -94,10 +99,12 @@ impl Plugin for TransactionDebugger {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        let safe_headers = self.redact_headers(&ctx.headers);
-        tracing::debug!(target: "transaction_debug", method = %ctx.method, path = %ctx.path, client_ip = %ctx.client_ip, headers = ?safe_headers, "Incoming request");
-        if self.log_request_body {
-            tracing::debug!(target: "transaction_debug", "Request body logging enabled");
+        if tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG) {
+            let safe_headers = self.redact_headers(&ctx.headers);
+            tracing::debug!(target: "transaction_debug", method = %ctx.method, path = %ctx.path, client_ip = %ctx.client_ip, headers = ?safe_headers, "Incoming request");
+            if self.log_request_body {
+                tracing::debug!(target: "transaction_debug", "Request body logging enabled");
+            }
         }
         PluginResult::Continue
     }
@@ -108,10 +115,12 @@ impl Plugin for TransactionDebugger {
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        let safe_headers = self.redact_headers(response_headers);
-        tracing::debug!(target: "transaction_debug", status = response_status, method = %ctx.method, path = %ctx.path, headers = ?safe_headers, "Backend response");
-        if self.log_response_body {
-            tracing::debug!(target: "transaction_debug", "Response body logging enabled");
+        if tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG) {
+            let safe_headers = self.redact_headers(response_headers);
+            tracing::debug!(target: "transaction_debug", status = response_status, method = %ctx.method, path = %ctx.path, headers = ?safe_headers, "Backend response");
+            if self.log_response_body {
+                tracing::debug!(target: "transaction_debug", "Response body logging enabled");
+            }
         }
         PluginResult::Continue
     }
@@ -171,4 +180,45 @@ impl Plugin for TransactionDebugger {
             );
         }
     }
+}
+
+fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| format!("transaction_debugger: '{field}' must be a boolean"))
+}
+
+fn optional_header_names(
+    config: &Value,
+    field: &'static str,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!("transaction_debugger: '{field}' must be an array"));
+    };
+    let mut headers = Vec::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        let Some(raw) = value.as_str() else {
+            return Err(format!(
+                "transaction_debugger: '{field}[{idx}]' must be a string"
+            ));
+        };
+        if raw.is_empty() {
+            return Err(format!(
+                "transaction_debugger: '{field}[{idx}]' must not be empty"
+            ));
+        }
+        let raw = raw.to_ascii_lowercase();
+        let name = HeaderName::from_bytes(raw.as_bytes()).map_err(|_| {
+            format!("transaction_debugger: '{field}[{idx}]' is not a valid HTTP header name")
+        })?;
+        headers.push(name.as_str().to_string());
+    }
+    Ok(Some(headers))
 }

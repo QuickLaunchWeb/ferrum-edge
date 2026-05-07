@@ -1,4 +1,6 @@
-use ferrum_edge::plugins::{PluginResult, RequestContext, create_plugin};
+use ferrum_edge::plugins::{
+    HTTP_ONLY_PROTOCOLS, PluginResult, RequestContext, create_plugin, priority,
+};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -44,8 +46,14 @@ fn test_graphql_plugin_creation() {
     });
     let plugin = create_plugin("graphql", &config).unwrap().unwrap();
     assert_eq!(plugin.name(), "graphql");
-    assert_eq!(plugin.priority(), 2850);
+    assert_eq!(plugin.priority(), priority::GRAPHQL);
+    assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
     assert!(plugin.requires_request_body_buffering());
+    assert!(plugin.requires_request_body_before_before_proxy());
+    assert!(!plugin.requires_response_body_buffering());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.is_auth_plugin());
 }
 
 #[test]
@@ -54,6 +62,42 @@ fn test_graphql_empty_config_returns_error() {
     assert!(result.is_err(), "Empty config should return Err");
     let err = result.err().unwrap();
     assert!(err.contains("no protection rules configured"));
+}
+
+#[test]
+fn test_graphql_non_object_config_returns_error() {
+    let result = create_plugin("graphql", &json!("bad"));
+    assert!(result.is_err(), "Non-object config should return Err");
+    assert!(result.err().unwrap().contains("config must be an object"));
+}
+
+#[test]
+fn test_graphql_rejects_invalid_scalar_config_types() {
+    for config in [
+        json!({"max_depth": "5"}),
+        json!({"max_complexity": "100"}),
+        json!({"max_aliases": "3"}),
+        json!({"introspection_allowed": "false"}),
+    ] {
+        let result = create_plugin("graphql", &config);
+        assert!(result.is_err(), "config should be rejected: {config:?}");
+    }
+}
+
+#[test]
+fn test_graphql_rejects_invalid_rate_limit_shapes() {
+    for config in [
+        json!({"type_rate_limits": "query"}),
+        json!({"operation_rate_limits": []}),
+        json!({"type_rate_limits": {"other": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"operation_rate_limits": {"": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"operation_rate_limits": {"bad-name": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"type_rate_limits": {"query": "bad"}}),
+        json!({"type_rate_limits": {"query": {"max_requests": "1", "window_seconds": 60}}}),
+    ] {
+        let result = create_plugin("graphql", &config);
+        assert!(result.is_err(), "config should be rejected: {config:?}");
+    }
 }
 
 #[test]
@@ -470,6 +514,49 @@ async fn test_string_braces_not_counted() {
     let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_introspection_tokens_in_strings_and_comments_are_ignored() {
+    let config = json!({ "introspection_allowed": false });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = r#"{
+        # __schema in a comment is not an introspection field
+        user(filter: "__type") { name }
+    }"#;
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_non_ascii_query_text_does_not_panic() {
+    let config = json!({ "max_depth": 10 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "{ café { name } }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_leading_comment_before_operation_keyword() {
+    let config = json!({ "max_depth": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "# warm-up comment\nmutation CreateUser { createUser(name: \"a\") { id } }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata.get("graphql_operation_type").unwrap(),
+        "mutation"
+    );
 }
 
 // ── Metadata populated ──

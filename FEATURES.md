@@ -19,12 +19,15 @@ A comprehensive feature list for Ferrum Edge.
 - **File** — single-instance with YAML/JSON config, SIGHUP reload (Unix only; restart required on other platforms)
 - **Control Plane (CP)** — centralized config authority, gRPC distribution to DPs
 - **Data Plane (DP)** — horizontally scalable traffic processing nodes with multi-CP failover (`FERRUM_DP_CP_GRPC_URLS`)
+- **Mesh** — service-mesh data plane that consumes native `MeshSubscribe` slices, waits for an initial valid slice, and hot-applies later valid mesh updates atomically
+- **Injector** — Kubernetes admission webhook that injects Ferrum mesh sidecars/init capture into opted-in workloads
 
 ## Routing
 
-- Longest prefix match on `listen_path` with unique path enforcement
+- Exact-path routes (`=/path`) take priority, followed by longest prefix match
+  on `listen_path`, with unique path enforcement
 - Host-based routing with exact and wildcard prefix support (`*.example.com`)
-- **Host-only routing** — HTTP proxies can match purely on `hosts` with no `listen_path`. A host-only proxy serves any path under the configured host. Per-host matching order: exact path → regex path → host-only fallback.
+- **Host-only routing** — HTTP proxies can match purely on `hosts` with no `listen_path`. A host-only proxy serves any path under the configured host. Per-host matching order: exact path → prefix path → regex path → host-only fallback.
 - Pre-sorted route table with bounded O(1) path cache, rebuilt atomically on config changes
 - Configurable path stripping and backend path prefixing
 - Per-proxy HTTP method filtering (`allowed_methods`) with 405 Method Not Allowed responses
@@ -266,6 +269,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 - Config version validation on restore endpoint
 - Database error masking in API responses (internal details logged, not exposed)
 - Batch operations and full config backup/restore
+- API Spec import — submit OpenAPI/Swagger documents to atomically provision proxy + upstream + plugins as a bundle (`POST /api-specs`); see [docs/api_specs.md](docs/api_specs.md)
 - Zero-downtime config reload via DB polling, SIGHUP, or CP push
 - Atomic config swap via ArcSwap (no partial config visible to requests)
 - Incremental database polling with indexed `updated_at` queries and full config validation

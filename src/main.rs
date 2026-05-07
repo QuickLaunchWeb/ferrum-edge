@@ -8,6 +8,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod adaptive_buffer;
 mod admin;
+mod capture;
 mod circuit_breaker;
 mod cli;
 mod config;
@@ -45,6 +46,7 @@ mod tls;
 #[allow(dead_code)]
 mod tls_offload;
 mod util;
+mod xds;
 
 use clap::Parser;
 use config::{EnvConfig, OperatingMode};
@@ -106,7 +108,7 @@ impl<'a> MakeWriter<'a> for SeverityWriter {
 /// 4. Initialize structured JSON logging
 /// 5. Parse environment configuration (`EnvConfig::from_env()`)
 /// 6. Build the multi-threaded tokio runtime with configured worker/blocking threads
-/// 7. Dispatch to the appropriate operating mode (database, file, cp, dp, migrate)
+/// 7. Dispatch to the appropriate operating mode (database, file, cp, dp, mesh, injector, migrate)
 ///    — each mode then loads TLS certs (frontend, admin, DTLS, gRPC) and validates
 ///    per-proxy backend TLS paths before starting listeners
 /// 8. Wait for SIGINT/SIGTERM for graceful shutdown
@@ -411,6 +413,8 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             OperatingMode::File => modes::file::run(env_config, shutdown_tx).await,
             OperatingMode::ControlPlane => modes::control_plane::run(env_config, shutdown_tx).await,
             OperatingMode::DataPlane => modes::data_plane::run(env_config, shutdown_tx).await,
+            OperatingMode::Mesh => modes::mesh::run(env_config, shutdown_tx).await,
+            OperatingMode::Injector => modes::injector::run(env_config, shutdown_tx).await,
             OperatingMode::Migrate => modes::migrate::run(env_config, shutdown_tx).await,
         };
 

@@ -21,7 +21,7 @@
 //! - Cross-trust-domain federation (the upstream wrappers handle that).
 
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Utc};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, SerialNumber, SigningKey,
@@ -232,9 +232,8 @@ impl InternalCa {
             .map_err(|e| CaError::Internal(format!("rcgen sign failed: {e}")))?;
 
         let leaf_der = cert.der().to_vec();
+        let not_after = issued_cert_not_after(&leaf_der)?;
         let chain = vec![leaf_der, self.root_cert_der.clone()];
-
-        let not_after = Utc::now() + Duration::seconds(ttl_secs as i64);
 
         Ok(SignedSvid {
             spiffe_id: id.clone(),
@@ -291,7 +290,7 @@ impl CertificateAuthority for InternalCa {
                 debug!(spiffe_id = %spiffe_id, ttl_secs = ttl, "internal CA: issued SVID from CSR");
 
                 let leaf_der = cert.der().to_vec();
-                let not_after = Utc::now() + Duration::seconds(ttl as i64);
+                let not_after = issued_cert_not_after(&leaf_der)?;
                 Ok(SignedSvid {
                     spiffe_id,
                     cert_chain_der: vec![leaf_der, self.root_cert_der.clone()],
@@ -421,4 +420,14 @@ fn rand_u64() -> u64 {
 /// Convenience wrapper that returns the internal CA as a [`SharedCa`].
 pub fn shared_internal_ca(config: InternalCaConfig) -> Result<Arc<InternalCa>, CaError> {
     Ok(Arc::new(InternalCa::new(config)?))
+}
+
+fn issued_cert_not_after(leaf_der: &[u8]) -> Result<DateTime<Utc>, CaError> {
+    use x509_parser::prelude::{FromDer, X509Certificate};
+
+    let (_, parsed) = X509Certificate::from_der(leaf_der)
+        .map_err(|e| CaError::Internal(format!("issued SVID parse failed: {e}")))?;
+    DateTime::<Utc>::from_timestamp(parsed.validity().not_after.timestamp(), 0).ok_or_else(|| {
+        CaError::Internal("issued SVID notAfter is outside supported timestamp range".to_string())
+    })
 }

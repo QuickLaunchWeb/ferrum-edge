@@ -2,10 +2,10 @@
 //! backwards-compat, decode helpers.
 
 use ferrum_edge::config::mesh::{
-    AppProtocol, MeshConfig, MeshEndpoint, MeshPolicy, MeshRule, MeshService, MtlsMode,
-    PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch, Resolution,
-    ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet, Workload,
-    WorkloadPort, WorkloadRef, WorkloadSelector,
+    AppProtocol, EastWestGateway, MeshConfig, MeshEndpoint, MeshPolicy, MeshRule, MeshService,
+    MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch,
+    RemoteCluster, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+    TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
@@ -40,6 +40,7 @@ fn mesh_config_round_trips_through_serde() {
                     namespace: Some("svc".into()),
                 },
                 service_name: "api".into(),
+                addresses: Vec::new(),
                 ports: vec![WorkloadPort {
                     port: 8443,
                     protocol: AppProtocol::Http2,
@@ -47,6 +48,8 @@ fn mesh_config_round_trips_through_serde() {
                 }],
                 trust_domain: td.clone(),
                 namespace: "svc".into(),
+                network: None,
+                cluster: None,
             }],
             services: vec![MeshService {
                 name: "api".into(),
@@ -210,6 +213,58 @@ fn trust_bundle_set_to_runtime_fills_local_and_federated() {
     assert_eq!(runtime.federated.len(), 1);
     let partner_td = TrustDomain::new("partner.test").unwrap();
     assert!(runtime.federated.contains_key(&partner_td));
+}
+
+#[test]
+fn multi_cluster_config_round_trips_through_serde() {
+    let cfg = MultiClusterConfig {
+        local_cluster: Some("cluster-a".to_string()),
+        federation_endpoint: Some("https://eastwest-a.example/.well-known/spiffe".to_string()),
+        remote_clusters: vec![RemoteCluster {
+            name: "cluster-b".to_string(),
+            trust_domain: TrustDomain::new("remote.test").unwrap(),
+            network: Some("network-b".to_string()),
+            control_plane_url: Some("https://cp-b.example:50051".to_string()),
+            federation_endpoint: Some("https://eastwest-b.example/.well-known/spiffe".to_string()),
+        }],
+        east_west_gateways: vec![EastWestGateway {
+            name: "cluster-b".to_string(),
+            namespace: "mesh-system".to_string(),
+            host: "eastwest-b.example".to_string(),
+            port: 15443,
+            sni_hosts: vec!["*.global".to_string()],
+            trust_domain: Some(TrustDomain::new("remote.test").unwrap()),
+            network: Some("network-b".to_string()),
+        }],
+    };
+
+    let json = serde_json::to_string(&cfg).unwrap();
+    let back: MultiClusterConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, cfg);
+}
+
+#[test]
+fn mesh_normalize_lowercases_multi_cluster_sni_hosts() {
+    let mut mesh = MeshConfig {
+        multi_cluster: Some(MultiClusterConfig {
+            east_west_gateways: vec![EastWestGateway {
+                name: "cluster-b".to_string(),
+                namespace: "mesh-system".to_string(),
+                host: "EastWest-B.Example".to_string(),
+                port: 15443,
+                sni_hosts: vec!["API.Global".to_string()],
+                trust_domain: None,
+                network: None,
+            }],
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshConfig::default()
+    };
+
+    mesh.normalize();
+    let gateway = &mesh.multi_cluster.as_ref().unwrap().east_west_gateways[0];
+    assert_eq!(gateway.host, "eastwest-b.example");
+    assert_eq!(gateway.sni_hosts, vec!["api.global"]);
 }
 
 #[test]

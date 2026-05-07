@@ -556,7 +556,7 @@ async fn test_http_family_plugins_complete_coverage() {
         ("hmac_auth", json!({})),
         (
             "jwks_auth",
-            json!({"providers": [{"issuer": "test", "jwks_uri": "http://example.com/.well-known/jwks.json"}]}),
+            json!({"providers": [{"issuer": "test", "jwks_uri": "http://127.0.0.1:9/.well-known/jwks.json"}]}),
         ),
         (
             "jwt_auth",

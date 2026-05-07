@@ -1,10 +1,10 @@
 //! `validate_mesh_config()` tests.
 
 use ferrum_edge::config::mesh::{
-    AppProtocol, MeshEndpoint, MeshPolicy, MeshRule, MeshService, PeerAuthentication, PolicyAction,
-    PolicyScope, PrincipalMatch, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation,
-    TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
-    validate_mesh_config,
+    AppProtocol, EastWestGateway, MeshConfig, MeshEndpoint, MeshPolicy, MeshRule, MeshService,
+    MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch,
+    RemoteCluster, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, TrustBundle,
+    TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
 };
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
@@ -16,6 +16,7 @@ fn fresh_workload() -> Workload {
         spiffe_id: SpiffeId::from_parts(&td, "ns/svc/sa/api").unwrap(),
         selector: WorkloadSelector::default(),
         service_name: "api".into(),
+        addresses: Vec::new(),
         ports: vec![WorkloadPort {
             port: 8443,
             protocol: AppProtocol::Http2,
@@ -23,6 +24,8 @@ fn fresh_workload() -> Workload {
         }],
         trust_domain: td,
         namespace: "svc".into(),
+        network: None,
+        cluster: None,
     }
 }
 
@@ -258,17 +261,105 @@ fn trust_bundle_set_rejects_invalid_base64() {
 }
 
 #[test]
+fn multi_cluster_remote_cluster_requires_federated_trust_bundle_when_bundles_are_configured() {
+    use base64::Engine;
+
+    let engine = base64::engine::general_purpose::STANDARD;
+    let trust_bundles = TrustBundleSet {
+        local: TrustBundle {
+            trust_domain: TrustDomain::new("local.test").unwrap(),
+            x509_authorities: vec![engine.encode(b"local-root")],
+            jwt_authorities: Vec::new(),
+            refresh_hint_seconds: None,
+        },
+        federated: Vec::new(),
+    };
+    let mut mesh = MeshConfig {
+        trust_bundles: Some(trust_bundles),
+        multi_cluster: Some(MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "cluster-b".to_string(),
+                trust_domain: TrustDomain::new("remote.test").unwrap(),
+                network: Some("network-b".to_string()),
+                control_plane_url: None,
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors
+            .iter()
+            .any(|err| err.contains("no matching federated trust bundle")),
+        "expected federated bundle error, got: {errors:?}"
+    );
+
+    mesh.trust_bundles
+        .as_mut()
+        .unwrap()
+        .federated
+        .push(TrustBundle {
+            trust_domain: TrustDomain::new("remote.test").unwrap(),
+            x509_authorities: vec![engine.encode(b"remote-root")],
+            jwt_authorities: Vec::new(),
+            refresh_hint_seconds: None,
+        });
+    assert!(mesh.validate().is_empty());
+}
+
+#[test]
+fn multi_cluster_rejects_duplicate_east_west_sni_hosts_on_same_backend_port() {
+    let mesh = MeshConfig {
+        multi_cluster: Some(MultiClusterConfig {
+            east_west_gateways: vec![
+                EastWestGateway {
+                    name: "cluster-b".to_string(),
+                    namespace: "mesh-system".to_string(),
+                    host: "eastwest-b.example".to_string(),
+                    port: 443,
+                    sni_hosts: vec!["api.global".to_string()],
+                    trust_domain: None,
+                    network: None,
+                },
+                EastWestGateway {
+                    name: "cluster-c".to_string(),
+                    namespace: "mesh-system".to_string(),
+                    host: "eastwest-c.example".to_string(),
+                    port: 443,
+                    sni_hosts: vec!["API.Global".to_string()],
+                    trust_domain: None,
+                    network: None,
+                },
+            ],
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|err| err.contains("duplicate SNI host")),
+        "expected duplicate SNI error, got: {errors:?}"
+    );
+}
+
+#[test]
 fn gateway_config_validate_mesh_fields_dispatches() {
-    use ferrum_edge::config::mesh::MeshConfig;
     let cfg = GatewayConfig {
         mesh: Some(Box::new(MeshConfig {
             workloads: vec![Workload {
                 spiffe_id: SpiffeId::new("spiffe://other/ns/foo/sa/bar").unwrap(),
                 selector: WorkloadSelector::default(),
                 service_name: "x".into(),
+                addresses: Vec::new(),
                 ports: Vec::new(),
                 trust_domain: TrustDomain::new("td").unwrap(),
                 namespace: "default".into(),
+                network: None,
+                cluster: None,
             }],
             ..Default::default()
         })),

@@ -21,7 +21,7 @@ Ferrum Edge is a lightweight, extensible edge proxy designed for modern microser
 
 - **Multi-protocol**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, raw TCP/UDP with TLS/DTLS
 - **58 built-in plugins**: Authentication, authorization, rate limiting, compression, SSE stream handling, transformation, response mocking, spec exposure, serverless functions, AI/LLM-specific plugins (including AI federation for multi-provider routing), load testing, API chargeback, and observability
-- **Four operating modes**: Database, File, Control Plane, Data Plane
+- **Seven operating modes**: Database, File, Control Plane, Data Plane, Mesh, Injector, and Migrate
 - **Lock-free hot path**: All request-path reads use `ArcSwap` or `DashMap` — no mutexes on the proxy path
 - **Zero-downtime config reloads**: Atomic config swap via DB polling, SIGHUP, or CP push
 
@@ -35,6 +35,8 @@ For the full feature list, see [FEATURES.md](FEATURES.md).
 | **File** | `FERRUM_MODE=file` | Single-instance, YAML/JSON config, SIGHUP reload | Read-only | Yes |
 | **Control Plane** | `FERRUM_MODE=cp` | Centralized config authority, gRPC distribution to DPs | Read/Write | No |
 | **Data Plane** | `FERRUM_MODE=dp` | Horizontally scalable traffic processing nodes | Read-only | Yes |
+| **Mesh** | `FERRUM_MODE=mesh` | Service-mesh data plane consuming native MeshSubscribe slices or future xDS feeds | Read-only | Yes |
+| **Injector** | `FERRUM_MODE=injector` | Kubernetes admission webhook that injects Ferrum mesh sidecars/init capture | No | No |
 | **Migrate** | `FERRUM_MODE=migrate` | Runs DB schema migrations then exits | No | No |
 
 See [docs/cp_dp_mode.md](docs/cp_dp_mode.md) for distributed deployment details.
@@ -259,6 +261,8 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/backup > backup.json
 curl -X POST -H "Authorization: Bearer $TOKEN" -d @backup.json "http://localhost:9000/restore?confirm=true"
 ```
+
+Submit an OpenAPI/Swagger spec to atomically provision a proxy, upstream, and plugins in one call — see [docs/api_specs.md](docs/api_specs.md).
 
 See [docs/admin_api.md](docs/admin_api.md) for the full endpoint reference, and [openapi.yaml](openapi.yaml) for the OpenAPI specification.
 

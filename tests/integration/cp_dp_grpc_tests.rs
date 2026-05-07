@@ -15,6 +15,9 @@ use tonic::transport::server::ServerTlsConfig;
 use tonic::transport::{Certificate, Identity, Server};
 
 use ferrum_edge::config::db_loader::IncrementalResult;
+use ferrum_edge::config::mesh::{
+    AppProtocol, MeshConfig, MeshService, ServicePort, Workload, WorkloadPort, WorkloadSelector,
+};
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, LoadBalancerAlgorithm, Proxy,
     Upstream, UpstreamTarget,
@@ -22,7 +25,13 @@ use ferrum_edge::config::types::{
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::grpc::cp_server::CpGrpcServer;
 use ferrum_edge::grpc::dp_client::{self, DpGrpcTlsConfig, GrpcJwtSecret};
+use ferrum_edge::identity::{SpiffeId, TrustDomain};
+use ferrum_edge::modes::mesh::config_consumer::native_client::{
+    NativeMeshClientConfig, start_native_mesh_client_with_shutdown,
+};
+use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::xds::{LDS_TYPE_URL, XdsAdsServer};
 
 const TEST_JWT_SECRET: &str = "test-grpc-secret-key";
 
@@ -72,6 +81,7 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         upstream_id: None,
+        api_spec_id: None,
         circuit_breaker: None,
         retry: None,
         response_body_mode: Default::default(),
@@ -103,6 +113,47 @@ fn create_test_config(proxy_count: usize) -> GatewayConfig {
         known_namespaces: Vec::new(),
         ..Default::default()
     }
+}
+
+fn create_test_mesh_config() -> GatewayConfig {
+    let trust_domain = TrustDomain::new("cluster.local").unwrap();
+    let mut config = GatewayConfig {
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    config.mesh = Some(Box::new(MeshConfig {
+        workloads: vec![Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/api").unwrap(),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                namespace: Some("ferrum".to_string()),
+            },
+            service_name: "api".to_string(),
+            addresses: Vec::new(),
+            ports: vec![WorkloadPort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            trust_domain,
+            namespace: "ferrum".to_string(),
+            network: None,
+            cluster: None,
+        }],
+        services: vec![MeshService {
+            name: "api".to_string(),
+            namespace: "ferrum".to_string(),
+            ports: vec![ServicePort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: HashMap::new(),
+        }],
+        ..MeshConfig::default()
+    }));
+    config
 }
 
 /// Create a minimal EnvConfig for testing (file mode with dummy path).
@@ -200,6 +251,7 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         dtls_client_ca_cert_path: None,
         plugin_http_slow_threshold_ms: 1000,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         migrate_action: "up".into(),
         migrate_dry_run: false,
         worker_threads: None,
@@ -320,6 +372,152 @@ async fn test_dp_receives_initial_config_from_cp() {
         Ok(Err(e)) => panic!("connect_and_subscribe failed: {}", e),
         Err(_) => {} // Timeout is acceptable - we already verified config was received
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mesh_subscribe_receives_initial_mesh_slice() {
+    let cp_config = create_test_mesh_config();
+    let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+    let token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "mesh-node").unwrap();
+    let auth_header = format!("Bearer {token}");
+    let channel =
+        tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", addr.port()))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+    let mut client =
+        ferrum_edge::grpc::proto::config_sync_client::ConfigSyncClient::with_interceptor(
+            channel,
+            move |mut req: tonic::Request<()>| {
+                req.metadata_mut().insert(
+                    "authorization",
+                    tonic::metadata::MetadataValue::try_from(auth_header.as_str()).unwrap(),
+                );
+                Ok(req)
+            },
+        );
+
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
+        node_id: "mesh-node".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+        workload_spiffe_id: "spiffe://cluster.local/ns/ferrum/sa/api".to_string(),
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+    });
+    let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
+    let update = stream.message().await.unwrap().unwrap();
+    let slice: ferrum_edge::xds::MeshSlice = serde_json::from_str(&update.mesh_slice_json).unwrap();
+
+    assert_eq!(slice.node_id, "mesh-node");
+    assert_eq!(slice.services.len(), 1);
+    assert_eq!(slice.services[0].name, "api");
+    assert_eq!(slice.workloads.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_native_mesh_client_installs_mesh_slice_from_cp() {
+    let cp_config = create_test_mesh_config();
+    let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+    let state = MeshRuntimeState::new();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let client_config = NativeMeshClientConfig {
+        node_id: "mesh-node".to_string(),
+        namespace: "ferrum".to_string(),
+        workload_spiffe_id: Some("spiffe://cluster.local/ns/ferrum/sa/api".to_string()),
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+    };
+    let handle = tokio::spawn(start_native_mesh_client_with_shutdown(
+        vec![format!("http://127.0.0.1:{}", addr.port())],
+        test_secret(),
+        client_config,
+        state.clone(),
+        shutdown_rx,
+        None,
+    ));
+
+    timeout(Duration::from_secs(5), state.wait_for_first_slice())
+        .await
+        .expect("native mesh client should install first slice");
+    let snapshot = state.snapshot();
+    let slice = snapshot.as_ref().as_ref().expect("slice installed");
+    assert_eq!(slice.node_id, "mesh-node");
+    assert_eq!(slice.services.len(), 1);
+    assert_eq!(slice.workloads.len(), 1);
+
+    shutdown_tx.send(true).expect("shutdown signal sent");
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("native mesh client should exit on shutdown")
+        .expect("native mesh client task should not panic");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_xds_ads_stream_returns_lds_snapshot() {
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(create_test_mesh_config())));
+    let (_cp_server, update_tx) =
+        CpGrpcServer::new(config_arc.clone(), TEST_JWT_SECRET.to_string());
+    let xds_server = XdsAdsServer::new(
+        config_arc,
+        update_tx,
+        TEST_JWT_SECRET.to_string(),
+        ferrum_edge::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER.to_string(),
+        "ferrum".to_string(),
+        32,
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let _server_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(xds_server.into_service())
+            .serve_with_incoming(incoming)
+            .await
+            .expect("xDS server failed");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let channel =
+        tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", addr.port()))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+    let mut client =
+        ferrum_edge::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient::new(
+            channel,
+        );
+    let token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "xds-node").unwrap();
+    let requests = tokio_stream::iter(vec![ferrum_edge::xds::proto::DiscoveryRequest {
+        version_info: String::new(),
+        node: Some(ferrum_edge::xds::proto::Node {
+            id: "xds-node".to_string(),
+            cluster: String::new(),
+            metadata: Vec::new(),
+        }),
+        resource_names: Vec::new(),
+        type_url: LDS_TYPE_URL.to_string(),
+        response_nonce: String::new(),
+        error_detail: None,
+    }]);
+    let mut request = tonic::Request::new(requests);
+    request.metadata_mut().insert(
+        "authorization",
+        tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+    );
+
+    let mut stream = client
+        .stream_aggregated_resources(request)
+        .await
+        .unwrap()
+        .into_inner();
+    let response = stream.message().await.unwrap().unwrap();
+
+    assert_eq!(response.type_url, LDS_TYPE_URL);
+    assert_eq!(response.resources.len(), 1);
+    assert!(!response.version_info.is_empty());
+    assert!(!response.nonce.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -563,7 +761,7 @@ async fn test_cp_accepts_token_with_matching_issuer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cp_rejects_token_with_wrong_issuer() {
     let cp_config = create_test_config(1);
-    let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+    let (addr, _update_tx, server_handle) = start_test_cp_server(cp_config).await;
 
     // Mint a token signed with the correct secret but bearing a foreign issuer.
     let token =
@@ -589,6 +787,48 @@ async fn test_cp_rejects_token_with_wrong_issuer() {
         "Expected Unauthenticated, got: {}",
         status
     );
+
+    server_handle.abort();
+}
+
+/// `MeshSubscribe` shares the same CP/DP JWT security boundary as the
+/// classic DP Subscribe stream. Cover it explicitly so mesh config cannot
+/// accidentally drift into a weaker auth path.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mesh_subscribe_rejects_token_with_wrong_issuer() {
+    let cp_config = create_test_mesh_config();
+    let (addr, _update_tx, server_handle) = start_test_cp_server(cp_config).await;
+
+    let token = dp_client::generate_dp_jwt_with_issuer(
+        TEST_JWT_SECRET,
+        "mesh-iss-bad",
+        "some-other-service",
+    )
+    .unwrap();
+    let mut client = connect_client_with_token!(addr, token);
+
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
+        node_id: "mesh-iss-bad".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+        workload_spiffe_id: "spiffe://cluster.local/ns/ferrum/sa/api".to_string(),
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+    });
+
+    let result = client.mesh_subscribe(request).await;
+    assert!(
+        result.is_err(),
+        "CP should reject MeshSubscribe token with wrong issuer"
+    );
+    let status = result.unwrap_err();
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unauthenticated,
+        "Expected Unauthenticated, got: {}",
+        status
+    );
+
+    server_handle.abort();
 }
 
 /// Verify that the CP rejects a DP token that has no `iss` claim at all.
@@ -1858,6 +2098,7 @@ fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -2577,6 +2818,46 @@ async fn test_cp_rejects_dp_with_mismatched_namespace_subscribe() {
     assert!(
         status.message().contains("staging"),
         "Error should mention DP namespace 'staging', got: {}",
+        status.message()
+    );
+    assert!(
+        status.message().contains("production"),
+        "Error should mention CP namespace 'production', got: {}",
+        status.message()
+    );
+
+    server_handle.abort();
+}
+
+/// `MeshSubscribe` enforces the same namespace boundary as classic Subscribe:
+/// a mesh node in `staging` must not receive a CP's `production` mesh slice.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_rejects_mesh_subscribe_with_mismatched_namespace() {
+    let cp_config = create_test_mesh_config();
+    let (addr, _update_tx, server_handle) =
+        start_test_cp_server_with_namespace(cp_config, "production").await;
+
+    let generated_token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "test-mesh-dp").unwrap();
+    let mut client = connect_client_with_token!(addr, generated_token);
+
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
+        node_id: "test-mesh-dp".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "staging".to_string(),
+        workload_spiffe_id: "spiffe://cluster.local/ns/staging/sa/api".to_string(),
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+    });
+
+    let result = client.mesh_subscribe(request).await;
+    assert!(
+        result.is_err(),
+        "CP should reject MeshSubscribe with mismatched namespace"
+    );
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("staging"),
+        "Error should mention mesh node namespace 'staging', got: {}",
         status.message()
     );
     assert!(

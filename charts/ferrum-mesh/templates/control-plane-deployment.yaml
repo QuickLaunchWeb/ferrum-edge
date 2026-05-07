@@ -1,0 +1,49 @@
+{{- if .Values.controlPlane.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferrum-mesh-control-plane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-control-plane
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.controlPlane.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-mesh-control-plane
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-mesh-control-plane
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: ferrum-mesh
+      containers:
+        - name: ferrum-edge
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.controlPlane.grpcPort }}
+          env:
+            {{- range $name, $value := .Values.controlPlane.env }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferrum-mesh-control-plane
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    app.kubernetes.io/name: ferrum-mesh-control-plane
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: grpc
+      port: {{ .Values.controlPlane.grpcPort }}
+      targetPort: grpc
+{{- end }}

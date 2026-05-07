@@ -56,6 +56,8 @@ PRs: format check → tests (parallel) → lint → perf regression → build 5 
 - `file` — R/O admin + proxy; YAML/JSON, SIGHUP reload (Unix)
 - `cp` (Control Plane) — R/W admin, **no proxy**, database + gRPC distribution
 - `dp` (Data Plane) — R/O admin + proxy; gRPC from CP (multi-CP failover via `FERRUM_DP_CP_GRPC_URLS`)
+- `mesh` — R/O admin + proxy; service-mesh data plane consuming xDS or native MeshSubscribe
+- `injector` — Kubernetes admission webhook; emits JSON patches that add Ferrum mesh sidecars/init capture
 - `migrate` — runs DB migrations, exits
 
 **TLS-only listeners**: port `0` on `FERRUM_PROXY_HTTP_PORT`/`FERRUM_ADMIN_HTTP_PORT`/inside `FERRUM_CP_GRPC_LISTEN_ADDR` disables plaintext. Excluded from `reserved_gateway_ports()`. Gateway warns if plaintext disabled and no TLS configured.
@@ -105,7 +107,7 @@ At startup, before config load. Env var suffixes resolve the base name: `_VAULT`
 ### Source Layout (pointers)
 
 - `src/{main,cli}.rs` — CLI, mode dispatch, signals
-- `src/admin/` — REST API + JWT middleware
+- `src/admin/` — REST API + JWT middleware; `api_specs/` (extractor + handlers), `spec_codec.rs` (gzip + sha256)
 - `src/config/` — `types.rs` (domain model), `env_config.rs` (90+ vars), `db_backend.rs` trait + `db_loader.rs`/`mongo_store.rs`, `file_loader.rs`, `migrations/`
 - `src/modes/` — database/file/control_plane/data_plane/migrate
 - `src/proxy/` — `mod.rs` (handle_proxy_request), `handler.rs`, `body.rs` (ProxyBody + Coalescing adapters), `grpc_proxy.rs`, `http2_pool.rs`, `tcp_proxy.rs`, `udp_proxy.rs`, `udp_batch.rs`, `sni.rs`, `stream_listener.rs`, `client_ip.rs`
@@ -123,20 +125,22 @@ At startup, before config load. Env var suffixes resolve the base name: `_VAULT`
 
 **Hostname normalization**: ASCII-lowercase at admission via `normalize_fields()` — `Proxy.hosts`, `Proxy.backend_host`, `UpstreamTarget.host`. Applied in every entry point (admin API, loaders, DP gRPC, restore). Downstream consumers rely on this — **do not re-lowercase** in DNS/pool/health/LB keys.
 
+**`ApiSpec` is intentionally not in `GatewayConfig`** — it is admin-only metadata (one row per `(namespace, proxy_id)`), accessed via the `DatabaseBackend` trait surface from admin handlers only. `Proxy`/`Upstream`/`PluginConfig` carry an optional `api_spec_id: Option<String>` ownership tag (NULL for resources created via direct admin endpoints; set when extracted from a spec). PUT-replace and DELETE semantics depend on this tag — see "API Spec Management" below.
+
 ### Route Matching
 
-Per host tier (exact host → wildcard → catch-all): prefix routes first (O(path_depth) via `IndexedPrefixRoutes` HashMap), regex routes second (O(path_length) via `IndexedRegexRoutes` `RegexSet` — single DFA pass regardless of pattern count), host-only fallback (`listen_path: None` + `hosts` set; never applies to catch-all tier).
+Per host tier (exact host → wildcard → catch-all): exact-path routes first (`=/path`, O(1) HashMap lookup), prefix routes second (O(path_depth) via `IndexedPrefixRoutes` HashMap), regex routes third (O(path_length) via `IndexedRegexRoutes` `RegexSet` — single DFA pass regardless of pattern count), host-only fallback (`listen_path: None` + `hosts` set; never applies to catch-all tier).
 
 **NEVER** replace prefix matching with O(n) linear scan; **NEVER** replace regex matching with sequential per-pattern — both caused 30-46% throughput degradation at scale. Router cache (`DashMap`) sized by `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (default auto = `max(10_000, proxies × 3)`). Negative lookups cached to repel scanners.
 
-Regex listen_paths (`~` prefix) auto-anchored full-path (`^...$`). For prefix-style, end with `.*`. Helper: `anchor_regex_pattern()` in `src/config/types.rs`.
+Exact listen_paths (`=` prefix) match the whole path after query stripping. Regex listen_paths (`~` prefix) auto-anchored full-path (`^...$`). For prefix-style regex, end with `.*`. Helper: `anchor_regex_pattern()` in `src/config/types.rs`.
 
 ### Proxy `hosts`/`listen_path`/`listen_port` contract
 
 - **HTTP-family** (`http`/`https`/`ws`/`wss`/`grpc`/`grpcs`/`h3`): route on hosts + listen_path. At least one of `hosts`/`listen_path` required. `listen_port` MUST be `None`.
 - **Stream-family** (`tcp`/`tcp_tls`/`udp`/`dtls`): route on `listen_port`. `listen_path` MUST be `None` (hard error).
 
-Host-only HTTP proxy matches all paths under its hosts; `strip_listen_path: true` is a no-op there. `hosts: []` + `listen_path: None` is rejected. Uniqueness: two HTTP proxies conflict iff same `listen_path` + overlapping `hosts` (empty hosts = catch-all, overlaps all). Host-only and path-carrying on same host coexist (different match tiers). See `DatabaseBackend::check_listen_path_unique()` in `src/config/db_backend.rs`.
+Host-only HTTP proxy matches all paths under its hosts; `strip_listen_path: true` is a no-op there. Exact listen_paths use `=/path`; prefix listen_paths use `/path`; regex listen_paths use `~pattern`. `hosts: []` + `listen_path: None` is rejected. Uniqueness: two HTTP proxies conflict iff same `listen_path` + overlapping `hosts` (empty hosts = catch-all, overlaps all). Host-only and path-carrying on same host coexist (different match tiers). See `DatabaseBackend::check_listen_path_unique()` in `src/config/db_backend.rs`.
 
 **`backend_scheme` + runtime flavor**: HTTP-family proxies accept `http`/`https` and `backend_scheme` is optional (defaults to `https`). Stream-family (`tcp`/`tcps`/`udp`/`dtls`) requires an explicit scheme. gRPC and WebSocket are NOT schemes — they are runtime flavors classified per-request via `backend_dispatch::detect_http_flavor()` (one header lookup, zero allocation). A single `https` proxy serves Plain/gRPC/WebSocket traffic uniformly. HTTPS backends are classified out of band into the usable plain-HTTP buckets (`h1`, `h2_tls`, `h3`) plus the gRPC transport buckets (`h2_tls`, `h2c`).
 
@@ -176,17 +180,17 @@ Priority order, lower = first. Multiple instances per proxy allowed. Each has `i
 
 **Lifecycle phases** (see `src/plugins/mod.rs` for `priority::*` constants, `docs/plugin_execution_order.md` for the protocol matrix):
 
-1. `on_request_received` — tracing/CORS/termination/IP+geo/bot/spec_expose/SSE validate/gRPC-Web/size+rate/tx_debug
+1. `on_request_received` — tracing/CORS/termination/IP+geo/bot/spec_expose/spiffe_identity (940)/SSE validate/gRPC-Web/size+rate/tx_debug
 2. `authenticate` — mTLS (950), JWKS (1000), JWT (1100), keyauth (1200), LDAP (1250), basicauth (1300), HMAC (1400)
-3. `authorize` — ACL (2000), rate_limiting (2900)
-4. `before_proxy` — SOAP WS-Security, AI cache/dedup/guards/federation, request_transformer, serverless, response_mock, gRPC deadline, mirror, load_testing, response_caching, compression, ai_rate_limiter
+3. `authorize` — ACL (2000), mesh_authz (2075), rate_limiting (2900)
+4. `before_proxy` — SOAP WS-Security, AI cache/dedup/guards/federation, workload_metrics, request_transformer, serverless, response_mock, gRPC deadline, mirror, load_testing, response_caching, compression, ai_rate_limiter
 5. `on_final_request_body` — body_validator (gRPC protobuf + JSON/XML after transformer), gRPC-Web validation
 6. `after_proxy` — counterpart to before_proxy; rejects enforced on response path across HTTP/H3/gRPC
 7. `on_final_response_body` — dedup + semantic cache store, size limiting, response_caching LRU uncacheable predictor
 8. `on_response_body` — AI response guard, AI token metrics
-9. `log` — stdout, statsd, http, tcp, kafka, loki, udp, ws, tx_debug, prometheus, chargeback
+9. `log` — stdout, statsd, http, tcp, kafka, loki, udp, ws, tx_debug, prometheus, chargeback, access_log
 10. `on_ws_frame` — ws_message_size_limiting, ws_rate_limit, ws_frame_logging
-11. `on_stream_connect`/`on_stream_disconnect` — TCP+TLS runs after handshake (client cert available); UDP+DTLS after DTLS handshake
+11. `on_stream_connect`/`on_stream_disconnect` — TCP+TLS runs after handshake (client cert available); UDP+DTLS after DTLS handshake; mesh_authz and workload_metrics use SPIFFE/HBONE identity metadata here
 12. `on_udp_datagram` — bidirectional hooks; zero overhead unless `requires_udp_datagram_hooks()`
 
 **Multi-auth**: `AuthMode::Multi` accepts `ctx.identified_consumer` OR `ctx.authenticated_identity` (JWKS/OIDC). First-success-wins. Empty chain → reject.
@@ -199,7 +203,7 @@ Priority order, lower = first. Multiple instances per proxy allowed. Each has `i
 
 **CRITICAL — `before_proxy(ctx, headers)`**: always read headers from the `headers` parameter, NEVER from `ctx.headers`. When no plugin sets `modifies_request_headers() == true`, the handler `std::mem::take()`s headers out of `ctx.headers` — `ctx.headers` is empty during this phase. Only this phase has this quirk.
 
-**External identity**: `ctx.authenticated_identity` is first-class across rate-limit/cache keys, log summaries, backend identity-header injection. **Response mock path scoping**: `response_mock` strips the proxy's `listen_path` prefix before rule matching (no stripping for root/regex listen_paths).
+**External identity**: `ctx.authenticated_identity` is first-class across rate-limit/cache keys, log summaries, backend identity-header injection. **Response mock path scoping**: `response_mock` strips the proxy's prefix `listen_path` before rule matching (no stripping for root/regex/exact listen_paths).
 
 ### Transaction Summary Fields
 
@@ -216,6 +220,36 @@ Shared singleton; pre-warmed. Native TTL by default, floored by `FERRUM_DNS_MIN_
 Four rate plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`) support `sync_mode: "redis"`. Shared client in `src/plugins/utils/redis_rate_limiter.rs`. Algorithm: two-window weighted via pipelined `INCR`/`GET`/`EXPIRE` — no Lua. Keys `{prefix}:{rate_key}:{window_index}`; default prefix `{FERRUM_NAMESPACE}:{plugin_name}` prevents cross-gateway collisions. Auto-fallback to in-memory on outage + background reconnect. TLS via `rediss://` uses global `FERRUM_TLS_*`. Works with Redis/Valkey/DragonflyDB/KeyDB/Garnet.
 
 **ACL credentials**: `redis_username` / `redis_password` plugin fields are honored on both plain and TLS code paths — they are injected into the parsed `redis::ConnectionInfo` (via `set_username` / `set_password`) before the client connects, and used by both the main connection and the background health-check pinger. Explicit fields override any user-info embedded in `redis_url`; with both unset, URL-embedded credentials flow through unchanged.
+
+### API Spec Management (admin-only metadata)
+
+Operators submit OpenAPI 2.0 / 3.0.x / 3.1.x / 3.2.x docs (JSON or YAML, autodetected) augmented with `x-ferrum-proxy` (required), `x-ferrum-upstream` (optional), `x-ferrum-plugins` (optional) extensions at the doc root. The handler extracts native Ferrum resources, runs the SAME validation pipeline as direct admin POSTs, persists transactionally, and stores the original doc gzip-compressed for retrieval. Endpoints: `POST/PUT/GET/DELETE /api-specs[/{id}]`, `GET /api-specs/by-proxy/{proxy_id}`, `GET /api-specs`. See [docs/api_specs.md](docs/api_specs.md).
+
+**Hot-path invariant — `api_specs` is admin-only metadata, NEVER loaded by gateway runtime.** Required guards:
+- Not a `GatewayConfig` field — adding `Vec<ApiSpec>` would put 25 MiB+ blobs through `ArcSwap` and the polling loop
+- Not in `src/config/db_loader.rs` `load_*` / poll path — only the per-bundle admin trait methods touch the table
+- Not in `src/grpc/cp_server.rs` `broadcast_update` — DPs never see specs (CP-only storage)
+- Not added to any periodic refresh, snapshot, or runtime cache
+
+Specs are admin-API on-demand only. Adding them to any runtime path is a regression. Integration test in `tests/integration/admin_db_api_specs_tests.rs` covers the trait contract; preserve hot-path isolation when modifying.
+
+**Validation reuse — do NOT fork the admit path.** Spec-extracted resources go through identical validators to direct admin POSTs: `Proxy::normalize_fields() + validate_fields()`, `validate_host_entry()`, `plugins::validate_plugin_config()`, `db.check_listen_path_unique() / check_proxy_name_unique() / check_upstream_name_unique()`. See `extract_and_validate()` in `src/admin/api_specs/handlers.rs`. Forking creates silent admit-rules drift between routes.
+
+**Ownership model**: nullable `api_spec_id: Option<String>` column on `proxies`, `upstreams`, `plugin_configs` (added inline to v1 schema in `src/config/migrations/sql_dialect.rs`). PUT `/api-specs/{id}` deletes spec-owned resources (`WHERE api_spec_id = {id}`) and re-inserts; hand-added resources (api_spec_id NULL) survive. DELETE `/api-specs/{id}` deletes the spec-owned proxy → existing FK cascade wipes attached plugins + the api_spec row; spec-owned upstream is cleaned manually (no FK on the back-link by design — would require complex cross-table create ordering on MySQL).
+
+**Forbidden in specs** (rejected at extract time, `src/admin/api_specs/extractor.rs`): `x-ferrum-consumers` (use `POST /consumers` instead), plugin `scope != proxy` (only proxy-scoped allowed), plugin `proxy_id != spec proxy.id`, embedded credential keys (`credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`, `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`) anywhere in plugin config (recursive walk on the `config` value, NOT the plugin name — a `jwt` plugin with normal config is fine).
+
+**Storage**: gzip-compressed bytes (BYTEA / LONGBLOB / BLOB on SQL, BinData on Mongo) + sha256 hex `content_hash` (ETag for `If-None-Match` 304s) + `uncompressed_size`. Body cap on submit: `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25). MongoDB BSON 16 MB cap is enforced pre-flight at write time — operators with >~14 MiB compressed specs should use a SQL backend.
+
+**Atomicity**: SQL backends use `sqlx::Transaction` for submit/replace. MongoDB uses `with_transaction` when `FERRUM_MONGO_REPLICA_SET` is configured; otherwise best-effort with compensating deletes (partial-failure window on infrastructure faults). Production MongoDB deployments should use a replica set.
+
+**Mode behavior**: db/cp = read+write; dp/file = both endpoints reject (no DB). Same gating as other write endpoints via `AdminState::check_write_allowed()`.
+
+**Idempotent PUT (no-churn for doc-only edits)**: `replace_api_spec_bundle` compares `old.resource_hash` (sha256 of the bundle's resource fields, excluding `api_spec_id` / `created_at` / `updated_at`) to the new bundle's hash. On match, only the `api_specs` row updates; `proxies` / `upstreams` / `plugin_configs` are untouched and their `updated_at` does NOT advance — so the polling cycle does not trigger router-cache rebuild, plugin-cache rebuild, pool warmup, capability-registry refresh, or DP gRPC broadcast. Hash helper: `hash_resource_bundle()` in [src/admin/api_specs/extractor.rs](src/admin/api_specs/extractor.rs). When changing the hash function, update the `resource_hash` column comparison in `replace_api_spec_bundle` impls in `db_loader.rs` and `mongo_store.rs` together — otherwise existing rows look like they always need a re-write.
+
+**Listable metadata** (Tier 1 — extracted at submit time, queryable as columns): `description` (truncated 4 KiB at UTF-8 boundary), `contact_name`, `contact_email`, `license_name`, `license_identifier` (`info.license.identifier` in 3.1+, falls back to `info.license.url`), `tags` (top-level `tags[].name`, deduped + sorted), `server_urls` (`servers[].url` in 3.x; `{scheme}://{host}{basePath}` in 2.0), `operation_count` (HTTP methods summed across all `paths.*`). All extracted from the same `serde_yaml::Value` walk used for Ferrum extensions — zero extra parse cost. The `ApiSpecSummary` returned by `GET /api-specs` and `GET /api-specs/by-proxy/{proxy_id}` includes these fields but EXCLUDES `resource_hash` (internal use only).
+
+**List filters** on `GET /api-specs` (Tier 2): `?proxy_id` (exact), `?spec_version` (prefix match — `3.1` matches `3.1.0`/`3.1.1`), `?title_contains` (case-insensitive substring), `?updated_since` (ISO-8601 — `updated_at >= ?`), `?has_tag` (exact tag membership), `?sort_by` (whitelist: `updated_at` (default) / `title` / `operation_count` / `created_at`), `?order` (`asc` / `desc` — default `desc`). Unknown `sort_by` / `order` values return 400. Default sort is `updated_at desc` (most recent first — matches UI expectation). The `has_tag` SQL backend uses LIKE pattern matching against the JSON-stored tag array; tag names containing `"` or `%` could cause false matches (documented limitation in [src/config/db_loader.rs](src/config/db_loader.rs); MongoDB uses native array membership and is unaffected).
 
 ## Test Structure
 
@@ -502,12 +536,13 @@ Imperative mood, concise (e.g., `Fix rate limiter to handle zero-window edge cas
 
 Full docs reference: `docs/configuration.md`. Runtime parsing/defaults: `src/config/env_config.rs`. Editable template: `ferrum.conf`. Most-common essentials below.
 
-- `FERRUM_MODE` (required): `database`/`file`/`cp`/`dp`/`migrate`
+- `FERRUM_MODE` (required): `database`/`file`/`cp`/`dp`/`mesh`/`injector`/`migrate`
 - `FERRUM_NAMESPACE` (`ferrum`): which namespace this instance loads
 - `FERRUM_LOG_LEVEL` (`error`)
 - `FERRUM_LOG_REDACT_METADATA_KEYS` (empty) — comma-separated extra substrings (case-insensitive) to redact from `TransactionSummary.metadata` / `StreamTransactionSummary.metadata` in addition to the built-in `authorization`/`cookie`/`set-cookie`/`x-api-key`/`x-auth-token`/`x-csrf-token`/`bearer`/`password`/`secret`/`token` defaults. Applies to every logging plugin (stdout/http/tcp/kafka/loki/udp/ws/statsd) via the central serde adapter.
 - `FERRUM_PROXY_HTTP_PORT`/`HTTPS_PORT` (8000/8443); `FERRUM_ADMIN_HTTP_PORT`/`HTTPS_PORT` (9000/9443) — `0` disables plaintext
 - `FERRUM_ADMIN_JWT_SECRET` (required db/cp, ≥32 chars)
+- `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (25; body cap for `POST/PUT /api-specs`. Mongo backends are additionally bounded by the BSON 16 MB doc limit, enforced at write time)
 - `FERRUM_FRONTEND_TLS_CERT_PATH`/`KEY_PATH`
 - `FERRUM_TLS_CA_BUNDLE_PATH` (global backend CA, exclusive); `FERRUM_TLS_NO_VERIFY` (**testing only**); `FERRUM_TLS_CRL_FILE_PATH`
 - `FERRUM_FILE_CONFIG_PATH` (required file mode)
@@ -516,7 +551,10 @@ Full docs reference: `docs/configuration.md`. Runtime parsing/defaults: `src/con
 - `FERRUM_CP_GRPC_LISTEN_ADDR` (`0.0.0.0:50051`; port `0` disables)
 - `FERRUM_CP_DP_GRPC_JWT_SECRET` (required cp/dp, ≥32 chars)
 - `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` (128; lagging DPs auto-snapshot)
+- `FERRUM_XDS_ENABLED` (`false`); `FERRUM_XDS_STREAM_CHANNEL_CAPACITY` (32; per-ADS-stream response queue)
 - `FERRUM_DP_CP_GRPC_URL`/`URLS` (required dp); `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` (300)
+- `FERRUM_MESH_CAPTURE_MODE` (`explicit`; `iptables` or `ebpf` for mesh capture planning, with eBPF fallback to iptables); `FERRUM_MESH_PROXY_UID` (1337 in injected sidecars)
+- `FERRUM_INJECTOR_LISTEN_ADDR` (`0.0.0.0:9443`); `FERRUM_INJECTOR_SIDECAR_IMAGE` (`ferrum-edge:latest`); `FERRUM_INJECTOR_REQUIRE_ANNOTATION` (`true`); `FERRUM_INJECTOR_TLS_CERT_PATH`/`KEY_PATH` for Kubernetes webhook HTTPS
 - `FERRUM_MAX_CONNECTIONS` (100000)/`MAX_REQUESTS` (0 = unlimited)
 - `FERRUM_SHUTDOWN_DRAIN_SECONDS` (30; `0` immediate)
 - `FERRUM_WORKER_THREADS` (CPU cores); `FERRUM_BLOCKING_THREADS` (512; **bump to ≥1024 with io_uring splice at scale**)

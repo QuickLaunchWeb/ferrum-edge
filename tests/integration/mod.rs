@@ -1,6 +1,8 @@
+mod admin_api_specs_handler_tests;
 mod admin_backend_capabilities_tests;
 mod admin_cached_config_tests;
 mod admin_cross_namespace_refs_tests;
+mod admin_db_api_specs_tests;
 mod apply_incremental_outcome_tests;
 mod backend_mtls_tests;
 mod connection_pool_tests;
@@ -13,6 +15,7 @@ mod graceful_shutdown_tests;
 mod grpc_proxy_tests;
 mod http2_pool_tests;
 mod http3_integration_tests;
+mod mesh_hbone_tests;
 mod scripted_backend_smoke_tests;
 mod tcp_fast_path_l4_plugins_tests;
 mod tcp_frontend_tls_order_tests;

@@ -140,77 +140,9 @@ pub async fn run(
         env_config.cp_dp_grpc_jwt_issuer.clone(),
     );
 
-    // Build DP gRPC TLS config if any TLS settings are provided
-    let dp_grpc_tls = {
-        let has_tls = env_config.dp_grpc_tls_ca_cert_path.is_some()
-            || env_config.dp_grpc_tls_client_cert_path.is_some()
-            || env_config.dp_grpc_tls_no_verify
-            || cp_urls.iter().any(|u| u.starts_with("https://"));
-
-        if has_tls {
-            // Check certificate expiration for DP gRPC certs
-            if let Some(ref path) = env_config.dp_grpc_tls_ca_cert_path {
-                tls::check_cert_expiry(
-                    path,
-                    "DP gRPC TLS CA cert",
-                    env_config.tls_cert_expiry_warning_days,
-                )?;
-            }
-            if let Some(ref path) = env_config.dp_grpc_tls_client_cert_path {
-                tls::check_cert_expiry(
-                    path,
-                    "DP gRPC TLS client cert",
-                    env_config.tls_cert_expiry_warning_days,
-                )?;
-            }
-
-            let ca_cert_pem = if let Some(ref path) = env_config.dp_grpc_tls_ca_cert_path {
-                Some(std::fs::read(path).map_err(|e| {
-                    anyhow::anyhow!("Failed to read DP gRPC TLS CA cert {}: {}", path, e)
-                })?)
-            } else {
-                None
-            };
-
-            let (client_cert_pem, client_key_pem) = if let (Some(cert_path), Some(key_path)) = (
-                &env_config.dp_grpc_tls_client_cert_path,
-                &env_config.dp_grpc_tls_client_key_path,
-            ) {
-                let cert = std::fs::read(cert_path).map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to read DP gRPC TLS client cert {}: {}",
-                        cert_path,
-                        e
-                    )
-                })?;
-                let key = std::fs::read(key_path).map_err(|e| {
-                    anyhow::anyhow!("Failed to read DP gRPC TLS client key {}: {}", key_path, e)
-                })?;
-                (Some(cert), Some(key))
-            } else {
-                (None, None)
-            };
-
-            if ca_cert_pem.is_some() && client_cert_pem.is_some() {
-                info!("DP gRPC TLS configured with mTLS (CA cert + client cert)");
-            } else if ca_cert_pem.is_some() {
-                info!("DP gRPC TLS configured with server verification (CA cert)");
-            } else if env_config.dp_grpc_tls_no_verify {
-                warn!("DP gRPC TLS configured with server verification DISABLED (testing mode)");
-            } else {
-                info!("DP gRPC TLS configured (https URL, system roots)");
-            }
-
-            Some(crate::grpc::dp_client::DpGrpcTlsConfig {
-                ca_cert_pem,
-                client_cert_pem,
-                client_key_pem,
-                no_verify: env_config.dp_grpc_tls_no_verify,
-            })
-        } else {
-            None
-        }
-    };
+    // Build DP gRPC TLS config if any TLS settings are provided.
+    let dp_grpc_tls =
+        crate::grpc::dp_client::build_dp_grpc_tls_config(&env_config, &cp_urls, "DP")?;
 
     // Load TLS configuration if provided
     let tls_config = if let (Some(cert_path), Some(key_path)) = (
@@ -415,6 +347,7 @@ pub async fn run(
         startup_ready: Some(startup_ready.clone()),
         db_available: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+        admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
         reserved_ports: reserved_ports.clone(),
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         admin_allowed_cidrs: admin_allowed_cidrs.clone(),

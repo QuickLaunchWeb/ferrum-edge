@@ -102,6 +102,7 @@ pub fn create_test_proxy() -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         upstream_id: None,
+        api_spec_id: None,
         circuit_breaker: None,
         retry: None,
         response_body_mode: Default::default(),
@@ -150,6 +151,33 @@ pub fn create_test_transaction_summary() -> ferrum_edge::plugins::TransactionSum
         request_bytes: 0,
         response_bytes: 0,
         mirror: false,
+        metadata: HashMap::new(),
+    }
+}
+
+/// Create a test stream transaction summary for stream-aware logging plugins
+#[allow(dead_code)]
+pub fn create_test_stream_transaction_summary() -> ferrum_edge::plugins::StreamTransactionSummary {
+    ferrum_edge::plugins::StreamTransactionSummary {
+        namespace: "ferrum".to_string(),
+        proxy_id: "test-stream-proxy".to_string(),
+        proxy_name: Some("Test Stream Proxy".to_string()),
+        client_ip: "127.0.0.1".to_string(),
+        consumer_username: Some("testuser".to_string()),
+        backend_target: "127.0.0.1:9000".to_string(),
+        backend_resolved_ip: Some("127.0.0.1".to_string()),
+        protocol: "tcp".to_string(),
+        listen_port: 9000,
+        duration_ms: 25.0,
+        bytes_sent: 128,
+        bytes_received: 256,
+        connection_error: None,
+        error_class: None,
+        disconnect_direction: None,
+        disconnect_cause: None,
+        timestamp_connected: Utc::now().to_rfc3339(),
+        timestamp_disconnected: Utc::now().to_rfc3339(),
+        sni_hostname: None,
         metadata: HashMap::new(),
     }
 }

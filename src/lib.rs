@@ -10,10 +10,12 @@ pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod adaptive_buffer;
 pub mod admin;
+pub mod capture;
 pub mod circuit_breaker;
 pub mod cli;
 pub mod config;
 pub mod config_delta;
+pub mod config_sources;
 pub mod connection_pool;
 pub mod consumer_index;
 #[path = "../custom_plugins/mod.rs"]
@@ -44,9 +46,13 @@ pub mod startup;
 pub mod tls;
 pub mod tls_offload;
 pub mod util;
+pub mod xds;
 
+pub use admin::api_specs::ExtractedBundle;
+pub use admin::spec_codec::{compress_gzip, decompress_gzip_capped, sha256_hex};
 pub use config::types::{
-    AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HttpFlavor, Proxy,
+    ApiSpec, AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HttpFlavor,
+    Proxy, SpecFormat,
 };
 pub use consumer_index::ConsumerIndex;
 pub use load_balancer::LoadBalancerCache;

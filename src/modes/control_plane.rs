@@ -26,10 +26,15 @@ use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::db_backend::{self, DatabaseBackend};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
+use crate::config::incremental_apply::apply_incremental_to_config_snapshot as apply_incremental_to_config;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::cp_server::CpGrpcServer;
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
+use crate::xds::XdsAdsServer;
+
+#[cfg(test)]
+use crate::config::incremental_apply::upsert_by_id;
 
 pub async fn run(
     env_config: EnvConfig,
@@ -144,12 +149,25 @@ pub async fn run(
     let (grpc_server, update_tx) =
         CpGrpcServer::with_channel_capacity_registry_issuer_and_namespace(
             config_arc.clone(),
-            grpc_secret,
+            grpc_secret.clone(),
             env_config.cp_broadcast_channel_capacity,
             dp_registry.clone(),
             env_config.cp_dp_grpc_jwt_issuer.clone(),
             env_config.namespace.clone(),
         );
+    let xds_server = if env_config.xds_enabled {
+        info!("FERRUM_XDS_ENABLED=true — mounting xDS ADS on the CP gRPC listener");
+        Some(XdsAdsServer::new(
+            config_arc.clone(),
+            update_tx.clone(),
+            grpc_secret,
+            env_config.cp_dp_grpc_jwt_issuer.clone(),
+            env_config.namespace.clone(),
+            env_config.xds_stream_channel_capacity,
+        ))
+    } else {
+        None
+    };
 
     // Build TLS hardening policy from environment
     let tls_policy = TlsPolicy::from_env_config(&env_config)?;
@@ -181,6 +199,7 @@ pub async fn run(
         startup_ready: Some(startup_ready.clone()),
         db_available: Some(db_available.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+        admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
         reserved_ports: reserved_ports.clone(),
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         admin_allowed_cidrs: admin_allowed_cidrs.clone(),
@@ -372,7 +391,16 @@ pub async fn run(
             };
             let incoming = TcpListenerStream::new(grpc_listener);
             let _ = grpc_started_tx.send(());
-            if let Err(e) = builder
+            if let Some(xds_server) = xds_server {
+                if let Err(e) = builder
+                    .add_service(grpc_server.into_service())
+                    .add_service(xds_server.into_service())
+                    .serve_with_incoming_shutdown(incoming, shutdown_signal)
+                    .await
+                {
+                    error!("gRPC server error: {}", e);
+                }
+            } else if let Err(e) = builder
                 .add_service(grpc_server.into_service())
                 .serve_with_incoming_shutdown(incoming, shutdown_signal)
                 .await
@@ -391,6 +419,7 @@ pub async fn run(
     } else {
         info!("CP gRPC listen port is 0 — gRPC listener disabled");
         drop(grpc_server); // consumed by the gRPC spawn when enabled
+        drop(xds_server);
         None
     };
     // Mark CP as ready — same rationale as database mode: the initial
@@ -576,7 +605,6 @@ pub async fn run(
                                 let mut new_config = (*config_poll.load_full()).clone();
                                 apply_incremental_to_config(&mut new_config, result);
                                 new_config.normalize_fields();
-                                new_config.loaded_at = poll_ts;
                                 config_poll.store(Arc::new(new_config));
 
                                 info!("Incremental config update pushed to DPs");
@@ -713,90 +741,6 @@ pub async fn run(
     Ok(())
 }
 
-/// Apply an incremental result to a config snapshot in-place.
-///
-/// Removes deleted resources by ID, then upserts added/modified resources.
-/// This keeps the CP's in-memory config in sync without a full DB reload.
-fn apply_incremental_to_config(
-    config: &mut crate::config::types::GatewayConfig,
-    result: crate::config::db_loader::IncrementalResult,
-) {
-    use std::collections::HashSet;
-
-    // Remove deleted resources
-    let removed_proxies: HashSet<&str> = result
-        .removed_proxy_ids
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-    let removed_consumers: HashSet<&str> = result
-        .removed_consumer_ids
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-    let removed_plugins: HashSet<&str> = result
-        .removed_plugin_config_ids
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-    let removed_upstreams: HashSet<&str> = result
-        .removed_upstream_ids
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-
-    config
-        .proxies
-        .retain(|p| !removed_proxies.contains(p.id.as_str()));
-    config
-        .consumers
-        .retain(|c| !removed_consumers.contains(c.id.as_str()));
-    config
-        .plugin_configs
-        .retain(|pc| !removed_plugins.contains(pc.id.as_str()));
-    config
-        .upstreams
-        .retain(|u| !removed_upstreams.contains(u.id.as_str()));
-
-    // Upsert added/modified resources using index for O(1) lookups
-    upsert_by_id(&mut config.proxies, result.added_or_modified_proxies, |p| {
-        p.id.clone()
-    });
-    upsert_by_id(
-        &mut config.consumers,
-        result.added_or_modified_consumers,
-        |c| c.id.clone(),
-    );
-    upsert_by_id(
-        &mut config.plugin_configs,
-        result.added_or_modified_plugin_configs,
-        |pc| pc.id.clone(),
-    );
-    upsert_by_id(
-        &mut config.upstreams,
-        result.added_or_modified_upstreams,
-        |u| u.id.clone(),
-    );
-}
-
-/// Upsert items into a vec by ID: replace existing entries, append new ones.
-fn upsert_by_id<T>(existing: &mut Vec<T>, updates: Vec<T>, get_id: fn(&T) -> String) {
-    let index: std::collections::HashMap<String, usize> = existing
-        .iter()
-        .enumerate()
-        .map(|(i, item)| (get_id(item), i))
-        .collect();
-
-    for item in updates {
-        let id = get_id(&item);
-        if let Some(&pos) = index.get(&id) {
-            existing[pos] = item;
-        } else {
-            existing.push(item);
-        }
-    }
-}
-
 /// Update a known ID set by adding new IDs and removing deleted ones.
 fn update_known_ids(
     known: &mut std::collections::HashSet<String>,
@@ -873,6 +817,7 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             upstream_id: None,
+            api_spec_id: None,
             circuit_breaker: None,
             retry: None,
             response_body_mode: ResponseBodyMode::default(),
@@ -907,7 +852,7 @@ mod tests {
     #[test]
     fn upsert_replaces_existing_by_id() {
         let mut items = vec![("a", 1), ("b", 2)];
-        upsert_by_id(&mut items, vec![("b", 99)], |item| item.0.to_string());
+        upsert_by_id(&mut items, vec![("b", 99)], |item| item.0);
         assert_eq!(items[1].1, 99);
         assert_eq!(items.len(), 2);
     }
@@ -915,7 +860,7 @@ mod tests {
     #[test]
     fn upsert_appends_new_items() {
         let mut items = vec![("a", 1)];
-        upsert_by_id(&mut items, vec![("c", 3)], |item| item.0.to_string());
+        upsert_by_id(&mut items, vec![("c", 3)], |item| item.0);
         assert_eq!(items.len(), 2);
         assert_eq!(items[1], ("c", 3));
     }
@@ -923,9 +868,7 @@ mod tests {
     #[test]
     fn upsert_mixed_replace_and_append() {
         let mut items = vec![("a", 1), ("b", 2)];
-        upsert_by_id(&mut items, vec![("b", 20), ("c", 30)], |item| {
-            item.0.to_string()
-        });
+        upsert_by_id(&mut items, vec![("b", 20), ("c", 30)], |item| item.0);
         assert_eq!(items.len(), 3);
         assert_eq!(items[1].1, 20); // b replaced
         assert_eq!(items[2], ("c", 30)); // c appended
@@ -934,14 +877,14 @@ mod tests {
     #[test]
     fn upsert_empty_updates_is_noop() {
         let mut items = vec![("a", 1)];
-        upsert_by_id(&mut items, vec![], |item| item.0.to_string());
+        upsert_by_id(&mut items, vec![], |item| item.0);
         assert_eq!(items.len(), 1);
     }
 
     #[test]
     fn upsert_into_empty_list() {
         let mut items: Vec<(&str, i32)> = vec![];
-        upsert_by_id(&mut items, vec![("a", 1)], |item| item.0.to_string());
+        upsert_by_id(&mut items, vec![("a", 1)], |item| item.0);
         assert_eq!(items.len(), 1);
     }
 

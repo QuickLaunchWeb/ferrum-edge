@@ -3,7 +3,7 @@
 use ferrum_edge::plugins::prometheus_metrics::{
     CounterKey, MetricsRegistry, PrometheusMetrics, global_registry,
 };
-use ferrum_edge::plugins::{Plugin, StreamTransactionSummary, TransactionSummary};
+use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, StreamTransactionSummary, TransactionSummary};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -80,6 +80,33 @@ async fn test_prometheus_plugin_creation() {
     let plugin = PrometheusMetrics::new(&config, "ferrum").unwrap();
     assert_eq!(plugin.name(), "prometheus_metrics");
     assert_eq!(plugin.priority(), 9300);
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
+}
+
+#[tokio::test]
+async fn test_prometheus_plugin_rejects_invalid_config_shapes() {
+    let cases = [
+        json!("bad"),
+        json!({"render_cache_ttl_seconds": "5"}),
+        json!({"stale_entry_ttl_seconds": -1}),
+        json!({"cache_invalidation_min_age_ms": true}),
+    ];
+
+    for config in cases {
+        assert!(
+            PrometheusMetrics::new(&config, "ferrum").is_err(),
+            "expected invalid config to be rejected: {config}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_prometheus_plugin_accepts_null_config_as_defaults() {
+    let plugin = PrometheusMetrics::new(&serde_json::Value::Null, "ferrum")
+        .expect("null config should use defaults");
+    assert_eq!(plugin.name(), "prometheus_metrics");
+    assert_eq!(plugin.priority(), 9300);
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
 }
 
 #[tokio::test]
@@ -97,6 +124,51 @@ async fn test_registry_records_request_counter() {
     assert!(registry.request_counter.contains_key(&key));
     let count = registry.request_counter.get(&key).unwrap();
     assert_eq!(count.value.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn test_registry_renders_mesh_red_metrics_when_metadata_present() {
+    let registry = MetricsRegistry::new();
+    let mut summary = make_summary("payments-proxy", "GET", 200, 42.0, 35.0);
+    summary.metadata = HashMap::from([
+        ("mesh.source.workload".to_string(), "frontend".to_string()),
+        ("mesh.source.namespace".to_string(), "default".to_string()),
+        (
+            "mesh.source.principal".to_string(),
+            "spiffe://cluster.local/ns/default/sa/frontend".to_string(),
+        ),
+        ("mesh.source.app".to_string(), "frontend".to_string()),
+        ("mesh.source.service".to_string(), "frontend".to_string()),
+        (
+            "mesh.destination.workload".to_string(),
+            "payments".to_string(),
+        ),
+        (
+            "mesh.destination.namespace".to_string(),
+            "default".to_string(),
+        ),
+        (
+            "mesh.destination.service".to_string(),
+            "payments".to_string(),
+        ),
+        ("mesh.request_protocol".to_string(), "http".to_string()),
+        (
+            "mesh.connection_security_policy".to_string(),
+            "mutual_tls".to_string(),
+        ),
+    ]);
+
+    registry.record(&summary);
+    let output = registry.render_uncached();
+
+    assert!(output.contains("# TYPE ferrum_mesh_requests_total counter"));
+    assert!(output.contains("ferrum_mesh_requests_total{"));
+    assert!(output.contains("source_workload=\"frontend\""));
+    assert!(output.contains("destination_service=\"payments\""));
+    assert!(output.contains("connection_security_policy=\"mutual_tls\""));
+    assert!(output.contains("# TYPE ferrum_mesh_request_duration_ms histogram"));
+    assert!(output.contains("ferrum_mesh_request_duration_ms_bucket{"));
+    assert!(output.contains("le=\"+Inf\""));
 }
 
 #[tokio::test]
@@ -524,6 +596,18 @@ async fn test_plugin_config_sets_registry_tunables() {
     // Can't read atomics directly from outside, but we can verify the plugin
     // didn't error on valid config
     assert_eq!(_plugin.name(), "prometheus_metrics");
+}
+
+#[tokio::test]
+async fn test_plugin_config_saturates_extreme_tunables() {
+    let config = serde_json::json!({
+        "render_cache_ttl_seconds": u64::MAX,
+        "stale_entry_ttl_seconds": u64::MAX,
+        "cache_invalidation_min_age_ms": u64::MAX
+    });
+
+    let plugin = PrometheusMetrics::new(&config, "ferrum").unwrap();
+    assert_eq!(plugin.name(), "prometheus_metrics");
 }
 
 #[tokio::test]

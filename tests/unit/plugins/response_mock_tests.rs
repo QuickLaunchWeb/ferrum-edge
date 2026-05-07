@@ -45,6 +45,12 @@ fn test_creation_valid_config() {
 }
 
 #[test]
+fn test_creation_rejects_non_object_config() {
+    let err = ResponseMock::new(&json!("bad")).err().unwrap();
+    assert!(err.contains("config must be an object"));
+}
+
+#[test]
 fn test_creation_missing_rules() {
     let err = ResponseMock::new(&json!({})).err().unwrap();
     assert!(err.contains("'rules' must be a JSON array"));
@@ -54,6 +60,12 @@ fn test_creation_missing_rules() {
 fn test_creation_empty_rules() {
     let err = ResponseMock::new(&json!({ "rules": [] })).err().unwrap();
     assert!(err.contains("must not be empty"));
+}
+
+#[test]
+fn test_creation_rejects_non_object_rule() {
+    let err = ResponseMock::new(&json!({ "rules": [42] })).err().unwrap();
+    assert!(err.contains("rule[0] must be an object"));
 }
 
 #[test]
@@ -74,6 +86,46 @@ fn test_creation_invalid_regex() {
     .err()
     .unwrap();
     assert!(err.contains("invalid regex"));
+}
+
+#[test]
+fn test_creation_rejects_invalid_field_shapes() {
+    for (config, expected) in [
+        (
+            json!({
+                "rules": [{ "path": "/test" }],
+                "passthrough_on_no_match": "yes"
+            }),
+            "'passthrough_on_no_match' must be a boolean",
+        ),
+        (
+            json!({ "rules": [{ "path": "/test", "method": 42 }] }),
+            "'method' must be a string",
+        ),
+        (
+            json!({ "rules": [{ "path": "", "body": "test" }] }),
+            "'path' must not be empty",
+        ),
+        (
+            json!({ "rules": [{ "path": "/test", "headers": [] }] }),
+            "'headers' must be an object",
+        ),
+        (
+            json!({ "rules": [{ "path": "/test", "headers": { "x-test": 42 } }] }),
+            "header 'x-test' value must be a string",
+        ),
+        (
+            json!({ "rules": [{ "path": "/test", "body": 42 }] }),
+            "'body' must be a string",
+        ),
+        (
+            json!({ "rules": [{ "path": "/test", "delay_ms": "50" }] }),
+            "'delay_ms' must be an unsigned integer",
+        ),
+    ] {
+        let err = ResponseMock::new(&config).err().unwrap();
+        assert!(err.contains(expected), "expected {expected}, got: {err}");
+    }
 }
 
 // === Path stripping — mock rules are relative to proxy listen_path ===
@@ -186,6 +238,29 @@ async fn test_regex_listen_path_uses_full_path() {
     .unwrap();
 
     let mut ctx = make_ctx("GET", "/api/v1/users", "~/api/v[0-9]+");
+    let mut headers = HashMap::new();
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject { body, .. } => {
+            assert_eq!(body, "full path match");
+        }
+        _ => panic!("Expected Reject"),
+    }
+}
+
+#[tokio::test]
+async fn test_exact_listen_path_uses_full_path() {
+    // Exact listen_paths (= prefix) are not prefix scopes for response_mock;
+    // mock rules match against the full incoming path.
+    let plugin = ResponseMock::new(&json!({
+        "rules": [{
+            "path": "/api/v1",
+            "body": "full path match"
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/v1", "=/api/v1");
     let mut headers = HashMap::new();
 
     match plugin.before_proxy(&mut ctx, &mut headers).await {
@@ -522,19 +597,15 @@ async fn test_default_status_code_200() {
     }
 }
 
-#[tokio::test]
-async fn test_invalid_status_code_defaults_to_200() {
-    let plugin = ResponseMock::new(&json!({
+#[test]
+fn test_invalid_status_code_rejects() {
+    let err = ResponseMock::new(&json!({
         "rules": [{ "path": "/test", "status_code": 999, "body": "ok" }]
     }))
+    .err()
     .unwrap();
 
-    let mut ctx = make_ctx("GET", "/svc/test", "/svc");
-    let mut headers = HashMap::new();
-    match plugin.before_proxy(&mut ctx, &mut headers).await {
-        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 200),
-        _ => panic!("Expected Reject"),
-    }
+    assert!(err.contains("'status_code' must be in range 100-599"));
 }
 
 // === Delay ===

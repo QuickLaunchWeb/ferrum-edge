@@ -10,6 +10,7 @@
 //! (OTLP/HTTP with JSON encoding, per the OpenTelemetry specification).
 
 use async_trait::async_trait;
+use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
@@ -20,6 +21,9 @@ use uuid::Uuid;
 
 use super::utils::PluginHttpClient;
 use super::{Plugin, PluginResult, RequestContext, StreamTransactionSummary, TransactionSummary};
+
+const TRACEPARENT_HEADER: &str = "traceparent";
+const TRACESTATE_HEADER: &str = "tracestate";
 
 pub struct OtelTracing {
     /// Service name for spans.
@@ -60,6 +64,20 @@ struct SpanData {
     error_class: Option<String>,
     response_streamed: bool,
     client_disconnected: bool,
+    mesh_attributes: Vec<(String, String)>,
+}
+
+struct GeneratedTraceContext {
+    trace_id: String,
+    span_id: String,
+    traceparent: String,
+}
+
+struct ParsedTraceParent<'a> {
+    version: &'a str,
+    trace_id: &'a str,
+    parent_span_id: &'a str,
+    flags: &'a str,
 }
 
 impl OtelTracing {
@@ -67,40 +85,23 @@ impl OtelTracing {
         config: &Value,
         http_client: PluginHttpClient,
     ) -> Result<Self, String> {
-        let service_name = config["service_name"]
-            .as_str()
-            .unwrap_or("ferrum-edge")
-            .to_string();
-        let generate_trace_id = config["generate_trace_id"].as_bool().unwrap_or(true);
+        let service_name = string_config(config, "service_name", "ferrum-edge")?;
+        let generate_trace_id = bool_config(config, "generate_trace_id", true)?;
 
-        let deployment_environment = config["deployment_environment"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+        let deployment_environment = optional_string_config(config, "deployment_environment")?;
 
         // Endpoint is optional — when absent, plugin runs in propagation-only mode
-        let endpoint = config["endpoint"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+        let endpoint = optional_string_config(config, "endpoint")?;
 
         let (otlp_sender, otlp_hostname) = if let Some(endpoint) = endpoint {
-            let batch_size = config["batch_size"].as_u64().unwrap_or(50).max(1) as usize;
-            let flush_interval_ms = config["flush_interval_ms"]
-                .as_u64()
-                .unwrap_or(5000)
-                .max(100);
-            let buffer_capacity =
-                config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
-
-            let otlp_hostname = Url::parse(&endpoint)
-                .ok()
-                .and_then(|u| u.host_str().map(|h| h.to_string()));
-
-            let authorization = config["authorization"].as_str().map(|s| s.to_string());
+            let otlp_hostname = validate_endpoint(&endpoint)?;
+            let batch_size = usize_config(config, "batch_size", 50, 1)?;
+            let flush_interval_ms = u64_config(config, "flush_interval_ms", 5000, 100)?;
+            let buffer_capacity = usize_config(config, "buffer_capacity", 10000, 1)?;
+            let authorization = optional_string_config(config, "authorization")?;
 
             // Parse custom headers from config
-            let custom_headers = parse_custom_headers(&config["headers"]);
+            let custom_headers = parse_custom_headers(config.get("headers"))?;
 
             let (sender, receiver) = mpsc::channel(buffer_capacity);
 
@@ -111,17 +112,15 @@ impl OtelTracing {
                 http_client,
                 batch_size,
                 flush_interval: Duration::from_millis(flush_interval_ms),
-                max_retries: config["max_retries"].as_u64().unwrap_or(2) as u32,
-                retry_delay: Duration::from_millis(
-                    config["retry_delay_ms"].as_u64().unwrap_or(1000),
-                ),
+                max_retries: u32_config(config, "max_retries", 2, 0)?,
+                retry_delay: Duration::from_millis(u64_config(config, "retry_delay_ms", 1000, 0)?),
                 service_name: service_name.clone(),
                 deployment_environment: deployment_environment.clone(),
             };
 
             tokio::spawn(otlp_flush_loop(receiver, otlp_config));
 
-            (Some(sender), otlp_hostname)
+            (Some(sender), Some(otlp_hostname))
         } else {
             (None, None)
         };
@@ -134,23 +133,28 @@ impl OtelTracing {
         })
     }
 
-    /// Generate a W3C traceparent header value.
-    fn generate_traceparent() -> String {
-        let trace_id = Uuid::new_v4().as_simple().to_string();
-        let span_id = &Uuid::new_v4().as_simple().to_string()[..16];
-        format!("00-{}-{}-01", trace_id, span_id)
+    /// Generate a W3C trace context without reparsing the generated header.
+    fn generate_trace_context() -> GeneratedTraceContext {
+        let trace_id = Self::generate_trace_id();
+        let span_id = Self::generate_span_id();
+        let traceparent = build_traceparent("00", &trace_id, &span_id, "01");
+        GeneratedTraceContext {
+            trace_id,
+            span_id,
+            traceparent,
+        }
     }
 
     /// Parse a traceparent header into (version, trace_id, parent_span_id, flags).
-    fn parse_traceparent(value: &str) -> Option<(String, String, String, String)> {
-        let parts: Vec<&str> = value.split('-').collect();
-        if parts.len() != 4 {
+    fn parse_traceparent(value: &str) -> Option<ParsedTraceParent<'_>> {
+        let mut parts = value.split('-');
+        let version = parts.next()?;
+        let trace_id = parts.next()?;
+        let parent_span_id = parts.next()?;
+        let flags = parts.next()?;
+        if parts.next().is_some() {
             return None;
         }
-        let version = parts[0];
-        let trace_id = parts[1];
-        let parent_span_id = parts[2];
-        let flags = parts[3];
 
         if version.len() != 2
             || trace_id.len() != 32
@@ -167,17 +171,22 @@ impl OtelTracing {
             return None;
         }
 
-        Some((
-            version.to_string(),
-            trace_id.to_string(),
-            parent_span_id.to_string(),
-            flags.to_string(),
-        ))
+        Some(ParsedTraceParent {
+            version,
+            trace_id,
+            parent_span_id,
+            flags,
+        })
+    }
+
+    /// Generate a new trace ID.
+    fn generate_trace_id() -> String {
+        hex_encode(Uuid::new_v4().as_bytes())
     }
 
     /// Generate a new span ID for the gateway hop.
     fn generate_span_id() -> String {
-        Uuid::new_v4().as_simple().to_string()[..16].to_string()
+        hex_encode(&Uuid::new_v4().as_bytes()[..8])
     }
 }
 
@@ -208,7 +217,7 @@ impl Plugin for OtelTracing {
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
         if self.generate_trace_id {
-            let trace_id = Uuid::new_v4().as_simple().to_string();
+            let trace_id = Self::generate_trace_id();
             let span_id = Self::generate_span_id();
             ctx.insert_metadata("trace_id".to_string(), trace_id);
             ctx.insert_metadata("span_id".to_string(), span_id);
@@ -245,51 +254,52 @@ impl Plugin for OtelTracing {
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         // Extract or generate trace context
-        let traceparent = if let Some(existing) = ctx.headers.get("traceparent") {
-            if let Some((version, trace_id, _parent_span, flags)) =
-                Self::parse_traceparent(existing)
-            {
+        let traceparent = if let Some(existing) = ctx.headers.get(TRACEPARENT_HEADER) {
+            if let Some(parsed) = Self::parse_traceparent(existing) {
                 // Store incoming trace context
                 ctx.metadata
-                    .insert("trace_id".to_string(), trace_id.clone());
-                ctx.metadata
-                    .insert("parent_span_id".to_string(), _parent_span.clone());
+                    .insert("trace_id".to_string(), parsed.trace_id.to_string());
+                ctx.metadata.insert(
+                    "parent_span_id".to_string(),
+                    parsed.parent_span_id.to_string(),
+                );
 
                 // Generate new span ID for the gateway
                 let gateway_span = Self::generate_span_id();
                 ctx.metadata
                     .insert("span_id".to_string(), gateway_span.clone());
 
-                format!("{}-{}-{}-{}", version, trace_id, gateway_span, flags)
+                build_traceparent(parsed.version, parsed.trace_id, &gateway_span, parsed.flags)
             } else {
                 if !self.generate_trace_id {
                     return PluginResult::Continue;
                 }
 
-                let traceparent = Self::generate_traceparent();
-                if let Some((_, trace_id, span_id, _)) = Self::parse_traceparent(&traceparent) {
-                    ctx.metadata.insert("trace_id".to_string(), trace_id);
-                    ctx.metadata.insert("span_id".to_string(), span_id);
-                }
-                traceparent
+                let generated = Self::generate_trace_context();
+                ctx.metadata
+                    .insert("trace_id".to_string(), generated.trace_id);
+                ctx.metadata
+                    .insert("span_id".to_string(), generated.span_id);
+                generated.traceparent
             }
         } else if self.generate_trace_id {
-            let traceparent = Self::generate_traceparent();
-            if let Some((_, trace_id, span_id, _)) = Self::parse_traceparent(&traceparent) {
-                ctx.metadata.insert("trace_id".to_string(), trace_id);
-                ctx.metadata.insert("span_id".to_string(), span_id);
-            }
-            traceparent
+            let generated = Self::generate_trace_context();
+            ctx.metadata
+                .insert("trace_id".to_string(), generated.trace_id);
+            ctx.metadata
+                .insert("span_id".to_string(), generated.span_id);
+            generated.traceparent
         } else {
             return PluginResult::Continue;
         };
 
-        ctx.metadata.insert("traceparent".to_string(), traceparent);
+        ctx.metadata
+            .insert(TRACEPARENT_HEADER.to_string(), traceparent);
 
         // Preserve tracestate if present
-        if let Some(tracestate) = ctx.headers.get("tracestate") {
+        if let Some(tracestate) = ctx.headers.get(TRACESTATE_HEADER) {
             ctx.metadata
-                .insert("tracestate".to_string(), tracestate.clone());
+                .insert(TRACESTATE_HEADER.to_string(), tracestate.clone());
         }
 
         PluginResult::Continue
@@ -301,11 +311,11 @@ impl Plugin for OtelTracing {
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Inject traceparent into outgoing request
-        if let Some(traceparent) = ctx.metadata.get("traceparent") {
-            headers.insert("traceparent".to_string(), traceparent.clone());
+        if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
+            headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
         }
-        if let Some(tracestate) = ctx.metadata.get("tracestate") {
-            headers.insert("tracestate".to_string(), tracestate.clone());
+        if let Some(tracestate) = ctx.metadata.get(TRACESTATE_HEADER) {
+            headers.insert(TRACESTATE_HEADER.to_string(), tracestate.clone());
         }
         PluginResult::Continue
     }
@@ -317,8 +327,8 @@ impl Plugin for OtelTracing {
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Echo traceparent to the client
-        if let Some(traceparent) = ctx.metadata.get("traceparent") {
-            response_headers.insert("traceparent".to_string(), traceparent.clone());
+        if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
+            response_headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
         }
         PluginResult::Continue
     }
@@ -387,6 +397,7 @@ impl Plugin for OtelTracing {
                 error_class: summary.error_class.as_ref().map(|e| format!("{e:?}")),
                 response_streamed: summary.response_streamed,
                 client_disconnected: summary.client_disconnected,
+                mesh_attributes: mesh_trace_attributes(&summary.metadata),
             };
 
             if sender.try_send(span_data).is_err() {
@@ -420,14 +431,37 @@ struct OtlpConfig {
 
 /// Parse custom headers from the `headers` config field.
 /// Accepts an object like `{"x-honeycomb-team": "abc", "X-Scope-OrgID": "123"}`.
-fn parse_custom_headers(value: &Value) -> Vec<(String, String)> {
-    match value.as_object() {
-        Some(map) => map
-            .iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-            .collect(),
-        None => Vec::new(),
+fn parse_custom_headers(value: Option<&Value>) -> Result<Vec<(String, String)>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Value::Object(map) = value else {
+        if value.is_null() {
+            return Ok(Vec::new());
+        }
+        return Err("otel_tracing: 'headers' must be an object".to_string());
+    };
+
+    let mut headers = Vec::with_capacity(map.len());
+    for (key, value) in map {
+        if HeaderName::from_bytes(key.as_bytes()).is_err() {
+            return Err(format!(
+                "otel_tracing: 'headers' contains an invalid HTTP header name: {key:?}"
+            ));
+        }
+        let Some(value) = value.as_str() else {
+            return Err(format!(
+                "otel_tracing: 'headers.{key}' must be a string value"
+            ));
+        };
+        if HeaderValue::from_str(value).is_err() {
+            return Err(format!(
+                "otel_tracing: 'headers.{key}' contains characters not permitted in HTTP header values"
+            ));
+        }
+        headers.push((key.clone(), value.to_string()));
     }
+    Ok(headers)
 }
 
 async fn otlp_flush_loop(mut receiver: mpsc::Receiver<SpanData>, cfg: OtlpConfig) {
@@ -444,14 +478,13 @@ async fn otlp_flush_loop(mut receiver: mpsc::Receiver<SpanData>, cfg: OtlpConfig
                     Some(span) => {
                         buffer.push(span);
                         if buffer.len() >= cfg.batch_size {
-                            let batch = std::mem::take(&mut buffer);
-                            send_otlp_batch(&cfg, batch).await;
+                            send_otlp_batch(&cfg, &buffer).await;
+                            buffer.clear();
                         }
                     }
                     None => {
                         if !buffer.is_empty() {
-                            let batch = std::mem::take(&mut buffer);
-                            send_otlp_batch(&cfg, batch).await;
+                            send_otlp_batch(&cfg, &buffer).await;
                         }
                         break;
                     }
@@ -460,21 +493,21 @@ async fn otlp_flush_loop(mut receiver: mpsc::Receiver<SpanData>, cfg: OtlpConfig
 
             _ = timer.tick() => {
                 if !buffer.is_empty() {
-                    let batch = std::mem::take(&mut buffer);
-                    send_otlp_batch(&cfg, batch).await;
+                    send_otlp_batch(&cfg, &buffer).await;
+                    buffer.clear();
                 }
             }
         }
     }
 }
 
-async fn send_otlp_batch(cfg: &OtlpConfig, batch: Vec<SpanData>) {
+async fn send_otlp_batch(cfg: &OtlpConfig, batch: &[SpanData]) {
     let total_attempts = cfg.max_retries + 1;
     let entry_count = batch.len();
     let payload = build_otlp_payload(
         &cfg.service_name,
         cfg.deployment_environment.as_deref(),
-        &batch,
+        batch,
     );
 
     for attempt in 1..=total_attempts {
@@ -611,6 +644,9 @@ fn build_otlp_payload(
             if s.client_disconnected {
                 attributes.push(otlp_attribute_bool("gateway.client.disconnected", true));
             }
+            for (key, value) in &s.mesh_attributes {
+                attributes.push(otlp_attribute(key, value));
+            }
 
             // Build span events for error conditions
             let mut events = Vec::new();
@@ -690,6 +726,113 @@ fn build_otlp_payload(
     })
 }
 
+fn string_config(config: &Value, key: &str, default: &str) -> Result<String, String> {
+    match config.get(key) {
+        None | Some(Value::Null) => Ok(default.to_string()),
+        Some(Value::String(value)) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Err(format!("otel_tracing: '{key}' must be a non-empty string"))
+            } else {
+                Ok(trimmed.to_string())
+            }
+        }
+        Some(other) => Err(format!(
+            "otel_tracing: '{key}' must be a string, got: {other}"
+        )),
+    }
+}
+
+fn optional_string_config(config: &Value, key: &str) -> Result<Option<String>, String> {
+    match config.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Some(other) => Err(format!(
+            "otel_tracing: '{key}' must be a string, got: {other}"
+        )),
+    }
+}
+
+fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String> {
+    match config.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(other) => Err(format!(
+            "otel_tracing: '{key}' must be a boolean, got: {other}"
+        )),
+    }
+}
+
+fn u64_config(config: &Value, key: &str, default: u64, min: u64) -> Result<u64, String> {
+    match config.get(key) {
+        None | Some(Value::Null) => Ok(default.max(min)),
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .map(|n| n.max(min))
+            .ok_or_else(|| format!("otel_tracing: '{key}' must be a non-negative integer")),
+        Some(other) => Err(format!(
+            "otel_tracing: '{key}' must be a non-negative integer, got: {other}"
+        )),
+    }
+}
+
+fn usize_config(config: &Value, key: &str, default: usize, min: usize) -> Result<usize, String> {
+    let value = u64_config(config, key, default as u64, min as u64)?;
+    usize::try_from(value).map_err(|_| format!("otel_tracing: '{key}' is too large"))
+}
+
+fn u32_config(config: &Value, key: &str, default: u32, min: u32) -> Result<u32, String> {
+    let value = u64_config(config, key, default as u64, min as u64)?;
+    u32::try_from(value).map_err(|_| format!("otel_tracing: '{key}' is too large"))
+}
+
+fn validate_endpoint(endpoint: &str) -> Result<String, String> {
+    let url = Url::parse(endpoint)
+        .map_err(|e| format!("otel_tracing: 'endpoint' must be a valid URL: {e}"))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(format!(
+                "otel_tracing: 'endpoint' scheme must be http or https, got: {scheme}"
+            ));
+        }
+    }
+    url.host_str()
+        .filter(|host| !host.is_empty())
+        .map(|host| host.to_string())
+        .ok_or_else(|| "otel_tracing: 'endpoint' must include a hostname".to_string())
+}
+
+fn build_traceparent(version: &str, trace_id: &str, span_id: &str, flags: &str) -> String {
+    let mut traceparent =
+        String::with_capacity(version.len() + trace_id.len() + span_id.len() + flags.len() + 3);
+    traceparent.push_str(version);
+    traceparent.push('-');
+    traceparent.push_str(trace_id);
+    traceparent.push('-');
+    traceparent.push_str(span_id);
+    traceparent.push('-');
+    traceparent.push_str(flags);
+    traceparent
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 fn otlp_attribute(key: &str, value: &str) -> Value {
     serde_json::json!({
         "key": key,
@@ -716,6 +859,16 @@ fn otlp_attribute_bool(key: &str, value: bool) -> Value {
         "key": key,
         "value": { "boolValue": value }
     })
+}
+
+fn mesh_trace_attributes(metadata: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut attributes: Vec<_> = metadata
+        .iter()
+        .filter(|(key, _)| key.starts_with("mesh."))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    attributes.sort_by(|left, right| left.0.cmp(&right.0));
+    attributes
 }
 
 /// Convert a hex string to base64-encoded bytes (OTLP/HTTP JSON encoding).
@@ -784,5 +937,60 @@ mod tests {
         // Non-hex chars are filtered out via from_str_radix Err.
         let encoded = hex_to_base64("XX");
         assert_eq!(encoded, ""); // no valid bytes decoded
+    }
+
+    #[test]
+    fn otlp_payload_includes_mesh_identity_attributes() {
+        let span = SpanData {
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+            span_id: "00f067aa0ba902b7".to_string(),
+            parent_span_id: String::new(),
+            service_name: "ferrum-edge".to_string(),
+            http_method: "GET".to_string(),
+            http_url: "/".to_string(),
+            http_status_code: 200,
+            client_ip: "127.0.0.1".to_string(),
+            duration_ms: 10.0,
+            gateway_processing_ms: 1.0,
+            backend_ttfb_ms: 2.0,
+            backend_ms: 3.0,
+            plugin_execution_ms: 1.0,
+            gateway_overhead_ms: 1.0,
+            consumer: None,
+            timestamp_received: "2025-01-01T00:00:00Z".to_string(),
+            user_agent: None,
+            proxy_id: Some("proxy-a".to_string()),
+            matched_route: Some("payments".to_string()),
+            backend_target_url: None,
+            backend_resolved_ip: None,
+            error_class: None,
+            response_streamed: false,
+            client_disconnected: false,
+            mesh_attributes: vec![
+                (
+                    "mesh.source.principal".to_string(),
+                    "spiffe://cluster.local/ns/default/sa/frontend".to_string(),
+                ),
+                (
+                    "mesh.destination.service".to_string(),
+                    "payments".to_string(),
+                ),
+            ],
+        };
+
+        let payload = build_otlp_payload("ferrum-edge", None, &[span]);
+        let attributes = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap();
+
+        assert!(attributes.iter().any(|attribute| {
+            attribute["key"] == "mesh.source.principal"
+                && attribute["value"]["stringValue"]
+                    == "spiffe://cluster.local/ns/default/sa/frontend"
+        }));
+        assert!(attributes.iter().any(|attribute| {
+            attribute["key"] == "mesh.destination.service"
+                && attribute["value"]["stringValue"] == "payments"
+        }));
     }
 }
