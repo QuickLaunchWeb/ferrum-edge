@@ -3,6 +3,8 @@
 //! This is the Layer 5 policy core used by the future `mesh_authz` plugin.
 //! It evaluates the Layer 2 `MeshPolicy` model without changing the plugin
 //! trait or proxy hot path.
+//! Path matching is intentionally literal; callers must pass already-normalized
+//! request paths when they want dot-segment, slash, or percent-decoding policy.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
@@ -423,6 +425,8 @@ mod tests {
 
     #[test]
     fn wildcard_match_handles_degenerate_patterns_without_panics() {
+        assert!(wildcard_match("exact", "exact"));
+        assert!(!wildcard_match("exact", "other"));
         assert!(wildcard_match("*", ""));
         assert!(wildcard_match("**", ""));
         assert!(wildcard_match("***", "anything"));
