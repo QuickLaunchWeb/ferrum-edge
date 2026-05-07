@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::config::mesh::{
-    MeshPolicy, MeshService, MultiClusterConfig, PeerAuthentication, PolicyScope, ServiceEntry,
-    TrustBundleSet, Workload, WorkloadSelector,
+    MeshPolicy, MeshService, MultiClusterConfig, PeerAuthentication, ServiceEntry, TrustBundleSet,
+    Workload, policy_scope_applies_to_workload, workload_selector_matches,
 };
 use crate::config::types::GatewayConfig;
 
@@ -139,7 +139,11 @@ impl MeshSlice {
             .iter()
             .filter(|policy| {
                 policy.namespace == namespace
-                    && policy_applies(policy, effective_namespace, &effective_labels)
+                    && policy_scope_applies_to_workload(
+                        policy,
+                        effective_namespace,
+                        &effective_labels,
+                    )
             })
             .cloned()
             .collect();
@@ -149,7 +153,7 @@ impl MeshSlice {
             .filter(|peer_auth| {
                 peer_auth.namespace == namespace
                     && peer_auth.selector.as_ref().is_none_or(|selector| {
-                        selector_matches(selector, effective_namespace, &effective_labels)
+                        workload_selector_matches(selector, effective_namespace, &effective_labels)
                     })
             })
             .cloned()
@@ -187,30 +191,4 @@ fn labels_to_btree(labels: &HashMap<String, String>) -> BTreeMap<String, String>
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
-}
-
-fn policy_applies(policy: &MeshPolicy, namespace: &str, labels: &BTreeMap<String, String>) -> bool {
-    match &policy.scope {
-        PolicyScope::MeshWide => true,
-        PolicyScope::Namespace {
-            namespace: policy_namespace,
-        } => policy_namespace == namespace,
-        PolicyScope::WorkloadSelector { selector } => selector_matches(selector, namespace, labels),
-    }
-}
-
-fn selector_matches(
-    selector: &WorkloadSelector,
-    namespace: &str,
-    labels: &BTreeMap<String, String>,
-) -> bool {
-    if let Some(selector_namespace) = selector.namespace.as_ref()
-        && selector_namespace != namespace
-    {
-        return false;
-    }
-    selector
-        .labels
-        .iter()
-        .all(|(key, value)| labels.get(key) == Some(value))
 }
