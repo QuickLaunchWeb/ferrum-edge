@@ -19,6 +19,8 @@ A comprehensive feature list for Ferrum Edge.
 - **File** — single-instance with YAML/JSON config, SIGHUP reload (Unix only; restart required on other platforms)
 - **Control Plane (CP)** — centralized config authority, gRPC distribution to DPs
 - **Data Plane (DP)** — horizontally scalable traffic processing nodes with multi-CP failover (`FERRUM_DP_CP_GRPC_URLS`)
+- **Mesh** — service-mesh data plane that consumes native `MeshSubscribe` slices, waits for an initial valid slice, and hot-applies later valid mesh updates atomically
+- **Injector** — Kubernetes admission webhook that injects Ferrum mesh sidecars/init capture into opted-in workloads
 
 ## Routing
 

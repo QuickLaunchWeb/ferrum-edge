@@ -918,10 +918,7 @@ fn start_mesh_slice_apply_task(
             }
 
             if let Some(slice) = mesh_state.snapshot().as_ref().as_ref().cloned() {
-                if last_applied_slice
-                    .as_ref()
-                    .is_some_and(|applied| applied.content_eq(&slice))
-                {
+                if mesh_slice_matches_last_applied(last_applied_slice.as_ref(), &slice) {
                     debug!(
                         mesh_slice_version = %slice.version,
                         "Skipping no-op mesh slice update"
@@ -930,16 +927,20 @@ fn start_mesh_slice_apply_task(
                     match gateway_config_from_mesh_slice(&slice, &runtime) {
                         Ok(config) => {
                             let applied = proxy_state.update_config(config);
-                            last_applied_slice = Some(slice.clone());
+                            record_mesh_slice_apply_result(
+                                &mut last_applied_slice,
+                                &slice,
+                                applied,
+                            );
                             if applied {
                                 info!(
                                     mesh_slice_version = %slice.version,
                                     "Applied mesh slice to proxy runtime"
                                 );
                             } else {
-                                debug!(
+                                warn!(
                                     mesh_slice_version = %slice.version,
-                                    "Mesh slice produced no proxy runtime changes"
+                                    "Mesh slice was not applied to proxy runtime; retaining last accepted slice"
                                 );
                             }
                         }
@@ -964,6 +965,23 @@ fn start_mesh_slice_apply_task(
             }
         }
     })
+}
+
+fn mesh_slice_matches_last_applied(
+    last_applied_slice: Option<&MeshSlice>,
+    slice: &MeshSlice,
+) -> bool {
+    last_applied_slice.is_some_and(|applied| applied.content_eq(slice))
+}
+
+fn record_mesh_slice_apply_result(
+    last_applied_slice: &mut Option<MeshSlice>,
+    slice: &MeshSlice,
+    applied: bool,
+) {
+    if applied {
+        *last_applied_slice = Some(slice.clone());
+    }
 }
 
 struct MeshBackgroundTasks {
@@ -1052,6 +1070,7 @@ mod tests {
         WorkloadSelector,
     };
     use crate::config::types::PluginScope;
+    use crate::dns::{DnsCache, DnsConfig};
     use crate::identity::{SpiffeId, TrustDomain};
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -1308,6 +1327,62 @@ mod tests {
             network: None,
             cluster: None,
         }
+    }
+
+    fn test_mesh_runtime_config() -> MeshRuntimeConfig {
+        MeshRuntimeConfig {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            cp_urls: vec!["http://127.0.0.1:1".to_string()],
+            config_protocol: MeshConfigProtocol::Native,
+            topology: MeshTopology::Sidecar,
+            inbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            outbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            hbone_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            east_west_listen_port: DEFAULT_EAST_WEST_LISTEN_PORT,
+            workload_spiffe_id: None,
+        }
+    }
+
+    fn make_test_proxy_state(initial_config: GatewayConfig) -> ProxyState {
+        ProxyState::new(
+            initial_config,
+            DnsCache::new(DnsConfig::default()),
+            EnvConfig {
+                pool_warmup_enabled: false,
+                shutdown_drain_seconds: 0,
+                ..EnvConfig::default()
+            },
+            None,
+            None,
+        )
+        .expect("ProxyState construction should succeed in tests")
+        .0
+    }
+
+    async fn wait_for_mesh_authz_label(proxy_state: &ProxyState, key: &str, expected: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let observed = proxy_state
+                    .current_config()
+                    .plugin_configs
+                    .iter()
+                    .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+                    .and_then(|plugin| {
+                        plugin
+                            .config
+                            .pointer(&format!("/mesh_slice/labels/{key}"))
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string)
+                    });
+                if observed.as_deref() == Some(expected) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("mesh_authz label {key} did not become {expected}"));
     }
 
     #[test]
@@ -1624,20 +1699,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mesh_slice_rejection_does_not_advance_apply_dedupe_baseline() {
+        let mut last_applied_slice = None;
+        let rejected = MeshSlice {
+            version: "bad-v1".to_string(),
+            labels: [("app".to_string(), "api".to_string())].into(),
+            ..MeshSlice::default()
+        };
+        record_mesh_slice_apply_result(&mut last_applied_slice, &rejected, false);
+        assert!(last_applied_slice.is_none());
+        assert!(!mesh_slice_matches_last_applied(
+            last_applied_slice.as_ref(),
+            &MeshSlice {
+                version: "bad-v2".to_string(),
+                labels: [("app".to_string(), "api".to_string())].into(),
+                ..MeshSlice::default()
+            }
+        ));
+
+        record_mesh_slice_apply_result(&mut last_applied_slice, &rejected, true);
+        assert!(mesh_slice_matches_last_applied(
+            last_applied_slice.as_ref(),
+            &MeshSlice {
+                version: "bad-v2".to_string(),
+                labels: [("app".to_string(), "api".to_string())].into(),
+                ..MeshSlice::default()
+            }
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mesh_runtime_apply_task_propagates_subsequent_native_slices() {
+        let runtime = test_mesh_runtime_config();
+        let mesh_state = MeshRuntimeState::new();
+        let proxy_state = make_test_proxy_state(GatewayConfig::default());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let apply_task = start_mesh_slice_apply_task(
+            mesh_state.clone(),
+            proxy_state.clone(),
+            runtime,
+            None,
+            shutdown_rx,
+        );
+
+        mesh_state.install_slice(MeshSlice {
+            version: "slice-v1".to_string(),
+            labels: [("app".to_string(), "api".to_string())].into(),
+            ..MeshSlice::default()
+        });
+        wait_for_mesh_authz_label(&proxy_state, "app", "api").await;
+
+        mesh_state.install_slice(MeshSlice {
+            version: "slice-v2".to_string(),
+            labels: [("app".to_string(), "worker".to_string())].into(),
+            ..MeshSlice::default()
+        });
+        wait_for_mesh_authz_label(&proxy_state, "app", "worker").await;
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), apply_task)
+            .await
+            .expect("apply task should stop")
+            .expect("apply task should join");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn mesh_runtime_waits_for_valid_initial_native_slice() {
-        let runtime = MeshRuntimeConfig {
-            node_id: "node-a".to_string(),
-            namespace: "default".to_string(),
-            cp_urls: vec!["http://127.0.0.1:1".to_string()],
-            config_protocol: MeshConfigProtocol::Native,
-            topology: MeshTopology::Sidecar,
-            inbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
-            outbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
-            hbone_listen_addr: "127.0.0.1:0".parse().unwrap(),
-            east_west_listen_port: DEFAULT_EAST_WEST_LISTEN_PORT,
-            workload_spiffe_id: None,
-        };
+        let runtime = test_mesh_runtime_config();
         let mesh_state = MeshRuntimeState::new();
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let state = mesh_state.clone();

@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
 use tokio::sync::{Notify, watch};
@@ -18,7 +18,6 @@ pub struct MeshRuntimeState {
     current: Arc<ArcSwap<Option<MeshSlice>>>,
     first_ready: Arc<Notify>,
     has_first: Arc<AtomicBool>,
-    revision: Arc<AtomicU64>,
     revision_tx: Arc<watch::Sender<u64>>,
 }
 
@@ -29,7 +28,6 @@ impl MeshRuntimeState {
             current: Arc::new(ArcSwap::new(Arc::new(None))),
             first_ready: Arc::new(Notify::new()),
             has_first: Arc::new(AtomicBool::new(false)),
-            revision: Arc::new(AtomicU64::new(0)),
             revision_tx: Arc::new(revision_tx),
         }
     }
@@ -52,8 +50,7 @@ impl MeshRuntimeState {
     /// Hot-swap the live mesh slice and notify waiters on the first install.
     pub fn install_slice(&self, slice: MeshSlice) {
         self.current.store(Arc::new(Some(slice)));
-        let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
-        let _ = self.revision_tx.send(revision);
+        self.revision_tx.send_modify(|revision| *revision += 1);
         let was_first = self.has_first.swap(true, Ordering::AcqRel);
         if !was_first {
             self.first_ready.notify_waiters();
