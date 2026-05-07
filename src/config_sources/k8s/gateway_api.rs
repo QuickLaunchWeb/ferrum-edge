@@ -229,7 +229,17 @@ fn match_paths(object: &K8sObject, rule: &Value) -> Vec<Option<String>> {
 
     matches
         .iter()
-        .filter_map(|m| m.get("path").and_then(http_path_match).map(Some))
+        .filter_map(|m| {
+            if let Some(path) = m.get("path").and_then(http_path_match) {
+                return Some(Some(path));
+            }
+            if m.as_object().is_some_and(|object| object.is_empty()) {
+                return Some(Some("/".to_string()));
+            }
+            // Pathless predicate-only matches default to "/" in Gateway API, but
+            // Ferrum route proxies do not encode those predicates yet.
+            None
+        })
         .filter(|listen_path| seen_paths.insert(listen_path.clone()))
         .collect()
 }
@@ -519,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn http_route_skips_explicit_pathless_matches() {
+    fn http_route_skips_predicate_only_pathless_matches() {
         let result = translate_k8s_objects(
             &[object(
                 "HTTPRoute",
@@ -542,6 +552,29 @@ mod tests {
         .expect("translation succeeds");
 
         assert!(result.config.proxies.is_empty());
+        assert!(result.config.upstreams.is_empty());
+    }
+
+    #[test]
+    fn http_route_keeps_empty_match_as_default_catch_all() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "hostnames": ["api.example.com"],
+                    "rules": [{
+                        "matches": [{}],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/"));
+        assert_eq!(result.config.proxies[0].backend_port, 8080);
         assert!(result.config.upstreams.is_empty());
     }
 

@@ -403,6 +403,9 @@ fn match_paths(http: &Value) -> Vec<Option<String>> {
     let mut seen_paths = HashSet::new();
     matches
         .iter()
+        // Istio forbids empty HTTPMatchRequest blocks; URI-less entries depend on
+        // unsupported predicates such as headers/method/queryParams, so do not
+        // broaden them into Ferrum catch-all routes.
         .filter_map(|m| m.get("uri").and_then(path_match).map(Some))
         .filter(|listen_path| seen_paths.insert(listen_path.clone()))
         .collect()
