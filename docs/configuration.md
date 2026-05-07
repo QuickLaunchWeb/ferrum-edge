@@ -170,6 +170,8 @@ Phase D adds Kubernetes source translation and sidecar-injector scaffolding. Kub
 
 Gateway API `backendRefs` with `weight: 0` are skipped during translation and negative weights are rejected as invalid. Istio `VirtualService` destinations with `weight: 0` or an omitted split weight are skipped only when the HTTP route splits across multiple destinations; a single destination is preserved because Istio sends all traffic to the lone destination. Skipped zero-weight entries are reported in translation warnings.
 
+Kubernetes Gateway API and Istio mesh translators fail closed when a resource declares a port outside the Kubernetes service-port range (`1`-`65535`). Invalid ports are rejected during translation instead of wrapping into an unintended backend/listener port.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_INJECTOR_LISTEN_ADDR` | Injector mode | `0.0.0.0:9443` | Admission webhook bind address for `POST /mutate` |

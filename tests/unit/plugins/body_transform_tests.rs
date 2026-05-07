@@ -308,6 +308,17 @@ fn test_body_rules_null_target_rejected() {
     assert!(err.contains("'target' must be a string"), "got: {err}");
 }
 
+#[test]
+fn test_body_rules_reject_invalid_rules_container_shapes() {
+    for config in [json!({"rules": "not-array"}), json!({"rules": [42]})] {
+        let err = parse_body_rules(&config).expect_err("expected invalid rules shape");
+        assert!(
+            err.contains("'rules' must be an array") || err.contains("rule must be an object"),
+            "unexpected error for {config:?}: {err}"
+        );
+    }
+}
+
 // ── rename array-index rejection ──────────────────────────────────────────
 // `rename` on array indices is ambiguous (move? swap? overwrite?) and the
 // forward path combined with `Vec::remove`'s leftward shift silently drops

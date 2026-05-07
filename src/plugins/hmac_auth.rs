@@ -57,8 +57,16 @@ pub struct HmacAuth {
 
 impl HmacAuth {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let clock_skew_seconds = config["clock_skew_seconds"].as_u64().unwrap_or(300);
-        let require_digest = config["require_digest"].as_bool().unwrap_or(true);
+        let config_obj = config
+            .as_object()
+            .ok_or_else(|| format!("hmac_auth: config must be an object, got: {config}"))?;
+        let clock_skew_seconds = parse_u64_field(
+            config_obj.get("clock_skew_seconds"),
+            "clock_skew_seconds",
+            300,
+        )?;
+        let require_digest =
+            parse_bool_field(config_obj.get("require_digest"), "require_digest", true)?;
 
         if !require_digest {
             warn!(
@@ -73,19 +81,25 @@ impl HmacAuth {
         })
     }
 
-    fn compute_hmac(secret: &[u8], data: &[u8], algorithm: &str) -> Option<Vec<u8>> {
+    fn hmac_matches(secret: &[u8], data: &[u8], algorithm: &str, expected: &[u8]) -> bool {
         match algorithm {
             "hmac-sha512" => {
-                let mut mac = HmacSha512::new_from_slice(secret).ok()?;
+                let Ok(mut mac) = HmacSha512::new_from_slice(secret) else {
+                    return false;
+                };
                 mac.update(data);
-                Some(mac.finalize().into_bytes().to_vec())
+                let computed = mac.finalize().into_bytes();
+                constant_time_eq(&computed, expected)
             }
             "hmac-sha256" => {
-                let mut mac = HmacSha256::new_from_slice(secret).ok()?;
+                let Ok(mut mac) = HmacSha256::new_from_slice(secret) else {
+                    return false;
+                };
                 mac.update(data);
-                Some(mac.finalize().into_bytes().to_vec())
+                let computed = mac.finalize().into_bytes();
+                constant_time_eq(&computed, expected)
             }
-            _ => None,
+            _ => false,
         }
     }
 
@@ -321,21 +335,34 @@ impl AuthMechanism for HmacAuth {
         // Signing string includes the digest header value when require_digest
         // is true. Tampering with the digest header itself (without re-signing
         // with the secret) breaks the HMAC.
-        let signing_string = if self.require_digest {
-            format!("{}\n{}\n{}\n{}", method, path, date, digest_header)
-        } else {
-            format!("{}\n{}\n{}", method, path, date)
+        let signing_string = build_signing_string(
+            &method,
+            &path,
+            &date,
+            self.require_digest.then_some(digest_header.as_str()),
+        );
+
+        let expected_signature = match base64::engine::general_purpose::STANDARD.decode(&signature)
+        {
+            Ok(signature) => signature,
+            Err(_) => {
+                debug!("hmac_auth: signature is not valid base64");
+                return VerifyOutcome::VerificationFailed(
+                    r#"{"error":"Invalid signature"}"#.to_string(),
+                );
+            }
         };
 
         for hmac_cred in &hmac_entries {
             if let Some(secret) = hmac_cred.get("secret").and_then(|secret| secret.as_str())
-                && let Some(expected_mac) =
-                    Self::compute_hmac(secret.as_bytes(), signing_string.as_bytes(), &algorithm)
+                && Self::hmac_matches(
+                    secret.as_bytes(),
+                    signing_string.as_bytes(),
+                    &algorithm,
+                    &expected_signature,
+                )
             {
-                let expected_sig = base64::engine::general_purpose::STANDARD.encode(&expected_mac);
-                if constant_time_eq(signature.as_bytes(), expected_sig.as_bytes()) {
-                    return VerifyOutcome::consumer(consumer);
-                }
+                return VerifyOutcome::consumer(consumer);
             }
         }
 
@@ -363,6 +390,49 @@ auth_flow::impl_auth_plugin!(
         self.require_digest
     }
 );
+
+fn parse_u64_field(value: Option<&Value>, field: &str, default_value: u64) -> Result<u64, String> {
+    let Some(value) = value else {
+        return Ok(default_value);
+    };
+    value
+        .as_u64()
+        .ok_or_else(|| format!("hmac_auth: '{field}' must be an unsigned integer, got: {value}"))
+}
+
+fn parse_bool_field(
+    value: Option<&Value>,
+    field: &str,
+    default_value: bool,
+) -> Result<bool, String> {
+    let Some(value) = value else {
+        return Ok(default_value);
+    };
+    value
+        .as_bool()
+        .ok_or_else(|| format!("hmac_auth: '{field}' must be a boolean, got: {value}"))
+}
+
+fn build_signing_string(
+    method: &str,
+    path: &str,
+    date: &str,
+    digest_header: Option<&str>,
+) -> String {
+    let digest_len = digest_header.map_or(0, str::len);
+    let mut signing_string =
+        String::with_capacity(method.len() + path.len() + date.len() + digest_len + 3);
+    signing_string.push_str(method);
+    signing_string.push('\n');
+    signing_string.push_str(path);
+    signing_string.push('\n');
+    signing_string.push_str(date);
+    if let Some(digest_header) = digest_header {
+        signing_string.push('\n');
+        signing_string.push_str(digest_header);
+    }
+    signing_string
+}
 
 #[cfg(test)]
 mod tests {

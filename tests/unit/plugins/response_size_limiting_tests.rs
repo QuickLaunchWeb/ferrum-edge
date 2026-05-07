@@ -30,6 +30,23 @@ async fn test_zero_max_bytes_returns_error() {
     assert!(err.contains("max_bytes"));
 }
 
+#[tokio::test]
+async fn test_non_object_config_returns_error() {
+    let result = ResponseSizeLimiting::new(&json!("bad"));
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("config must be an object"));
+}
+
+#[tokio::test]
+async fn test_invalid_require_buffered_check_type_returns_error() {
+    let result = ResponseSizeLimiting::new(&json!({
+        "max_bytes": 1024,
+        "require_buffered_check": "yes"
+    }));
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("require_buffered_check"));
+}
+
 // === Content-Length fast path (after_proxy) ===
 
 #[tokio::test]

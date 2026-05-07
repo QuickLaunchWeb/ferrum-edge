@@ -1,5 +1,5 @@
 use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -129,6 +129,13 @@ fn reject_body(result: &PluginResult) -> &str {
 // ── Constructor validation tests ────────────────────────────────────────────
 
 #[test]
+fn test_non_object_config_is_error() {
+    let result = SoapWsSecurity::new(&json!(null));
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("config must be an object"));
+}
+
+#[test]
 fn test_no_features_enabled_is_error() {
     let config = json!({
         "timestamp": { "require": false },
@@ -213,6 +220,24 @@ fn test_saml_no_issuers_is_error() {
 fn test_valid_timestamp_only_config() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     assert_eq!(plugin.name(), "soap_ws_security");
+}
+
+#[test]
+fn test_plugin_contract() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+
+    assert_eq!(plugin.priority(), priority::SOAP_WS_SECURITY);
+    assert_eq!(plugin.priority(), 1500);
+    assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    assert!(plugin.is_auth_plugin());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(plugin.requires_request_body_before_before_proxy());
+    assert!(!plugin.requires_request_body_before_authenticate());
+    assert!(!plugin.needs_request_body_bytes());
+    assert!(plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
+    assert!(!plugin.applies_after_proxy_on_reject());
 }
 
 #[test]
@@ -866,6 +891,26 @@ async fn test_non_envelope_soap_body_rejects() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("not a SOAP envelope"));
+}
+
+#[tokio::test]
+async fn test_doctype_entity_payload_rejected() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let body = format!(
+        r#"<?xml version="1.0"?>
+<!DOCTYPE soap:Envelope [
+  <!ENTITY xxe SYSTEM "file:///etc/passwd">
+]>
+{}"#,
+        wrap_soap(&fresh_timestamp())
+    );
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert_eq!(reject_status(&result), 400);
+    assert!(reject_body(&result).contains("forbidden XML declaration"));
 }
 
 // ── Plugin metadata tests ───────────────────────────────────────────────────

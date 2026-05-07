@@ -5,7 +5,7 @@ use url::Url;
 
 use crate::plugins::{StreamTransactionSummary, TransactionSummary};
 
-use super::{BatchConfig, RetryPolicy};
+use super::{BatchConfig, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy};
 
 #[derive(Clone, Copy)]
 pub struct BatchConfigDefaults {
@@ -58,28 +58,35 @@ pub fn build_batch_config(
     plugin_name: &'static str,
     defaults: BatchConfigDefaults,
 ) -> BatchConfig {
+    let batch_size = config[defaults.batch_size_key]
+        .as_u64()
+        .unwrap_or(defaults.batch_size)
+        .max(1)
+        .min(MAX_BATCH_SIZE as u64)
+        .min(usize::MAX as u64) as usize;
+    let buffer_capacity = config["buffer_capacity"]
+        .as_u64()
+        .unwrap_or(defaults.buffer_capacity)
+        .max(1)
+        .min(MAX_BUFFER_CAPACITY as u64)
+        .min(usize::MAX as u64) as usize;
+    let max_retries = config["max_retries"]
+        .as_u64()
+        .unwrap_or(defaults.max_retries);
+
     BatchConfig {
-        batch_size: config[defaults.batch_size_key]
-            .as_u64()
-            .unwrap_or(defaults.batch_size)
-            .max(1) as usize,
+        batch_size,
         flush_interval: Duration::from_millis(
             config["flush_interval_ms"]
                 .as_u64()
                 .unwrap_or(defaults.flush_interval_ms)
                 .max(defaults.min_flush_interval_ms),
         ),
-        buffer_capacity: config["buffer_capacity"]
-            .as_u64()
-            .unwrap_or(defaults.buffer_capacity)
-            .max(1) as usize,
+        buffer_capacity,
         retry: RetryPolicy {
             // Plugin config remains `max_retries`; RetryPolicy stores total
             // attempts, so add the initial try here.
-            max_attempts: config["max_retries"]
-                .as_u64()
-                .unwrap_or(defaults.max_retries) as u32
-                + 1,
+            max_attempts: max_retries.saturating_add(1).min(u64::from(u32::MAX)) as u32,
             delay: Duration::from_millis(
                 config["retry_delay_ms"]
                     .as_u64()
@@ -88,6 +95,29 @@ pub fn build_batch_config(
         },
         plugin_name,
     }
+}
+
+pub fn validate_batch_config(
+    config: &Value,
+    plugin_name: &'static str,
+    defaults: BatchConfigDefaults,
+) -> Result<(), String> {
+    for key in [
+        defaults.batch_size_key,
+        "flush_interval_ms",
+        "buffer_capacity",
+        "max_retries",
+        "retry_delay_ms",
+    ] {
+        if let Some(value) = config.get(key)
+            && value.as_u64().is_none()
+        {
+            return Err(format!(
+                "{plugin_name}: '{key}' must be an unsigned integer"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn parse_http_endpoint(

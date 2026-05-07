@@ -1,6 +1,8 @@
 //! Tests for request_transformer plugin
 
-use ferrum_edge::plugins::{Plugin, RequestContext, request_transformer::RequestTransformer};
+use ferrum_edge::plugins::{
+    HTTP_GRPC_PROTOCOLS, Plugin, RequestContext, priority, request_transformer::RequestTransformer,
+};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -21,6 +23,11 @@ async fn test_request_transformer_creation() {
     }))
     .unwrap();
     assert_eq!(plugin.name(), "request_transformer");
+    assert_eq!(plugin.priority(), priority::REQUEST_TRANSFORMER);
+    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
+    assert!(plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.is_auth_plugin());
 }
 
 #[tokio::test]
@@ -194,6 +201,25 @@ async fn test_request_transformer_no_config() {
     let result = RequestTransformer::new(&json!({}));
     let err = result.err().expect("expected error for no config");
     assert!(err.contains("no 'rules' configured"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_invalid_rules_container_shapes() {
+    for config in [
+        json!("bad"),
+        json!({"rules": "not-array"}),
+        json!({"rules": [42]}),
+    ] {
+        let err = RequestTransformer::new(&config)
+            .err()
+            .expect("expected invalid config to be rejected");
+        assert!(
+            err.contains("config must be an object")
+                || err.contains("'rules' must be an array")
+                || err.contains("rule must be an object"),
+            "unexpected error for {config:?}: {err}"
+        );
+    }
 }
 
 #[tokio::test]

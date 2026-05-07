@@ -29,8 +29,12 @@ impl UdpRateLimiting {
         config: &Value,
         http_client: PluginHttpClient,
     ) -> Result<Self, String> {
-        let datagrams_per_second = config["datagrams_per_second"].as_u64();
-        let bytes_per_second = config["bytes_per_second"].as_u64();
+        if !config.is_object() {
+            return Err("udp_rate_limiting: config must be an object".to_string());
+        }
+
+        let datagrams_per_second = optional_positive_u64(config, "datagrams_per_second")?;
+        let bytes_per_second = optional_positive_u64(config, "bytes_per_second")?;
 
         if datagrams_per_second.is_none() && bytes_per_second.is_none() {
             return Err(
@@ -39,9 +43,9 @@ impl UdpRateLimiting {
             );
         }
 
-        let window_seconds = config["window_seconds"].as_u64().unwrap_or(1).max(1);
-        let datagrams_per_window = datagrams_per_second.map(|value| value * window_seconds);
-        let bytes_per_window = bytes_per_second.map(|value| value * window_seconds);
+        let window_seconds = optional_positive_u64(config, "window_seconds")?.unwrap_or(1);
+        let datagrams_per_window = per_window_limit(datagrams_per_second, window_seconds)?;
+        let bytes_per_window = per_window_limit(bytes_per_second, window_seconds)?;
         let epoch_base = Instant::now();
 
         Ok(Self {
@@ -58,8 +62,15 @@ impl UdpRateLimiting {
                     window_seconds,
                     epoch_base,
                 ),
-            ),
+            )?,
         })
+    }
+
+    fn redis_ip_key(client_ip: &str) -> String {
+        let mut key = String::with_capacity(3 + client_ip.len());
+        key.push_str("ip:");
+        key.push_str(client_ip);
+        key
     }
 
     fn secs_since_base(&self) -> u64 {
@@ -123,12 +134,11 @@ impl Plugin for UdpRateLimiting {
             return UdpDatagramVerdict::Drop;
         }
 
-        let redis_key = format!("ip:{}", ctx.client_ip);
         let outcome = self
             .limiter
-            .check(
+            .check_with_redis_key(
                 Arc::clone(&key),
-                &redis_key,
+                || Self::redis_ip_key(&ctx.client_ip),
                 &UdpRateLimitOp {
                     datagram_size: ctx.datagram_size as u64,
                 },
@@ -160,4 +170,32 @@ impl Plugin for UdpRateLimiting {
 
         UdpDatagramVerdict::Drop
     }
+}
+
+fn optional_positive_u64(config: &Value, field: &'static str) -> Result<Option<u64>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_u64() else {
+        return Err(format!(
+            "udp_rate_limiting: '{field}' must be an integer greater than zero"
+        ));
+    };
+    if value == 0 {
+        return Err(format!(
+            "udp_rate_limiting: '{field}' must be greater than zero"
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn per_window_limit(limit: Option<u64>, window_seconds: u64) -> Result<Option<u64>, String> {
+    limit
+        .map(|value| {
+            value.checked_mul(window_seconds).ok_or_else(|| {
+                "udp_rate_limiting: per-window limit overflows u64; reduce the rate or window"
+                    .to_string()
+            })
+        })
+        .transpose()
 }

@@ -1,5 +1,7 @@
 use ferrum_edge::plugins::request_mirror::RequestMirror;
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use ferrum_edge::plugins::{
+    HTTP_GRPC_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,7 +57,7 @@ fn test_plugin_priority() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    assert_eq!(plugin.priority(), 3075);
+    assert_eq!(plugin.priority(), priority::REQUEST_MIRROR);
 }
 
 #[test]
@@ -65,10 +67,7 @@ fn test_supported_protocols() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let protos = plugin.supported_protocols();
-    assert!(protos.contains(&ferrum_edge::plugins::ProxyProtocol::Http));
-    assert!(protos.contains(&ferrum_edge::plugins::ProxyProtocol::Grpc));
-    assert!(!protos.contains(&ferrum_edge::plugins::ProxyProtocol::WebSocket));
+    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
 }
 
 // ---------------------------------------------------------------------------
@@ -76,10 +75,58 @@ fn test_supported_protocols() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn test_non_object_config_is_error() {
+    let result = RequestMirror::new(&json!("bad"), PluginHttpClient::default());
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("config must be an object"));
+}
+
+#[test]
 fn test_missing_mirror_host_is_error() {
     let result = RequestMirror::new(&json!({}), PluginHttpClient::default());
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("mirror_host"));
+}
+
+#[test]
+fn test_invalid_field_types_are_error() {
+    for (config, expected) in [
+        (
+            json!({ "mirror_host": "mirror.local", "mirror_protocol": true }),
+            "'mirror_protocol' must be a string",
+        ),
+        (
+            json!({ "mirror_host": "mirror.local", "mirror_port": "8080" }),
+            "'mirror_port' must be an unsigned integer",
+        ),
+        (
+            json!({ "mirror_host": "mirror.local", "mirror_path": 42 }),
+            "'mirror_path' must be a string",
+        ),
+        (
+            json!({ "mirror_host": "mirror.local", "percentage": "50" }),
+            "'percentage' must be a number",
+        ),
+        (
+            json!({ "mirror_host": "mirror.local", "mirror_request_body": "true" }),
+            "'mirror_request_body' must be a boolean",
+        ),
+    ] {
+        let err = RequestMirror::new(&config, PluginHttpClient::default())
+            .err()
+            .unwrap();
+        assert!(err.contains(expected), "expected {expected}, got: {err}");
+    }
+}
+
+#[test]
+fn test_mirror_path_must_start_with_slash() {
+    let result = RequestMirror::new(
+        &json!({ "mirror_host": "mirror.local", "mirror_path": "shadow" }),
+        PluginHttpClient::default(),
+    );
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("must start with '/'"));
 }
 
 #[test]

@@ -1,6 +1,8 @@
 //! Tests for ai_request_guard plugin
 
-use ferrum_edge::plugins::{Plugin, ai_request_guard::AiRequestGuard};
+use ferrum_edge::plugins::{
+    HTTP_GRPC_PROTOCOLS, Plugin, ai_request_guard::AiRequestGuard, priority,
+};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -32,9 +34,12 @@ async fn test_plugin_name_and_priority() {
     // policy so we can still verify name/priority/buffering metadata.
     let plugin = AiRequestGuard::new(&json!({"max_messages": 1})).unwrap();
     assert_eq!(plugin.name(), "ai_request_guard");
-    assert_eq!(plugin.priority(), 2975);
+    assert_eq!(plugin.priority(), priority::AI_REQUEST_GUARD);
+    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
     assert!(!plugin.requires_response_body_buffering());
     assert!(plugin.requires_request_body_buffering());
+    assert!(plugin.requires_request_body_before_before_proxy());
+    assert!(!plugin.is_auth_plugin());
 }
 
 #[test]
@@ -45,6 +50,27 @@ fn test_empty_config_rejected() {
         err.contains("at least one policy must be configured"),
         "got: {err}"
     );
+}
+
+#[test]
+fn test_invalid_config_shapes_rejected() {
+    for config in [
+        json!("bad"),
+        json!({"max_tokens_limit": "1000"}),
+        json!({"enforce_max_tokens": "truncate"}),
+        json!({"default_max_tokens": "4096"}),
+        json!({"allowed_models": "gpt-4"}),
+        json!({"allowed_models": ["gpt-4", 123]}),
+        json!({"blocked_models": ["gpt-4", false]}),
+        json!({"require_user_field": "true"}),
+        json!({"max_messages": "10"}),
+        json!({"max_prompt_characters": "1000"}),
+        json!({"block_system_prompts": "false"}),
+        json!({"required_metadata_fields": ["stream", 123]}),
+    ] {
+        let result = AiRequestGuard::new(&config);
+        assert!(result.is_err(), "config should be rejected: {config:?}");
+    }
 }
 
 #[test]

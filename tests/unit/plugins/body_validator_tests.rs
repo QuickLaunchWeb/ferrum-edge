@@ -1,6 +1,8 @@
 //! Tests for body_validator plugin — XML CDATA, comments, processing instructions
 
-use ferrum_edge::plugins::{Plugin, RequestContext, body_validator::BodyValidator};
+use ferrum_edge::plugins::{
+    HTTP_GRPC_PROTOCOLS, Plugin, RequestContext, body_validator::BodyValidator, priority,
+};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -47,6 +49,56 @@ fn xml_plugin_with_required(elements: Vec<&str>) -> BodyValidator {
 }
 
 #[test]
+fn test_plugin_metadata_and_protocol_scope() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    assert_eq!(plugin.name(), "body_validator");
+    assert_eq!(plugin.priority(), priority::BODY_VALIDATOR);
+    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
+    assert!(plugin.requires_request_body_before_before_proxy());
+    assert!(plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
+    assert!(!plugin.is_auth_plugin());
+}
+
+#[test]
+fn test_invalid_config_shapes_rejected() {
+    for config in [
+        json!("bad"),
+        json!({"json_schema": {}}),
+        json!({"json_schema": true}),
+        json!({"json_schema": {"type": "string", "pattern": "["}}),
+        json!({"required_fields": "name"}),
+        json!({"required_fields": ["name", 123]}),
+        json!({"required_fields": [""]}),
+        json!({"validate_xml": "true"}),
+        json!({"required_xml_elements": [123]}),
+        json!({"content_types": "application/json"}),
+        json!({"content_types": ["application/json", 123]}),
+        json!({"response_json_schema": false}),
+        json!({"response_json_schema": {"type": "string", "pattern": "["}}),
+        json!({"response_required_fields": [false]}),
+        json!({"response_validate_xml": "false"}),
+        json!({"response_content_types": [""]}),
+        json!({"protobuf_descriptor_path": 42}),
+        json!({"protobuf_request_type": "test.HelloRequest"}),
+        json!({"protobuf_reject_unknown_fields": "true"}),
+        json!({
+            "protobuf_descriptor_path": test_descriptor_path(),
+            "protobuf_method_messages": []
+        }),
+        json!({
+            "protobuf_descriptor_path": test_descriptor_path(),
+            "protobuf_method_messages": {
+                "/test.Greeter/SayHello": {}
+            }
+        }),
+    ] {
+        let result = BodyValidator::new(&config);
+        assert!(result.is_err(), "config should be rejected: {config:?}");
+    }
+}
+
+#[test]
 fn test_request_vs_response_buffering_flags_are_config_sensitive() {
     let request_plugin = BodyValidator::new(&json!({"validate_xml": true})).unwrap();
     assert!(request_plugin.requires_request_body_buffering());
@@ -77,6 +129,26 @@ fn test_request_body_buffering_only_for_matching_request_methods_and_types() {
         "application/octet-stream".to_string(),
     );
     assert!(!plugin.should_buffer_request_body(&json_only_ctx));
+}
+
+#[tokio::test]
+async fn test_case_insensitive_content_type_is_validated_without_lowercase_copy() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "Application/JSON; Charset=UTF-8".to_string(),
+    );
+    ctx.metadata
+        .insert("request_body".to_string(), r#"{"other": true}"#.to_string());
+    assert!(plugin.should_buffer_request_body(&ctx));
+
+    let mut headers = ctx.headers.clone();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
 #[test]
@@ -1816,11 +1888,13 @@ fn test_protobuf_invalid_descriptor_path_degrades_gracefully() {
         "protobuf_descriptor_path": "/nonexistent/path/descriptor.bin",
         "protobuf_request_type": "test.HelloRequest"
     }));
-    // Invalid descriptor path yields no valid rules, so plugin creation fails
     let err = result
         .err()
         .expect("expected error for invalid descriptor path");
-    assert!(err.contains("no validation rules configured"), "got: {err}");
+    assert!(
+        err.contains("failed to read protobuf descriptor file"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -1829,11 +1903,13 @@ fn test_protobuf_invalid_message_type_degrades_gracefully() {
         "protobuf_descriptor_path": test_descriptor_path(),
         "protobuf_request_type": "nonexistent.MessageType"
     }));
-    // Invalid message type yields no valid descriptor, so plugin creation fails
     let err = result
         .err()
         .expect("expected error for invalid message type");
-    assert!(err.contains("no validation rules configured"), "got: {err}");
+    assert!(
+        err.contains("protobuf_request_type 'nonexistent.MessageType' not found"),
+        "got: {err}"
+    );
 }
 
 // ─── gRPC before_proxy is skipped (uses on_final_request_body instead) ──
