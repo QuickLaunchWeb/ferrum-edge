@@ -563,6 +563,8 @@ export FERRUM_TLS_MAX_VERSION="1.2"
 
 When `FERRUM_TLS_CIPHER_SUITES` is not set, the gateway uses secure AEAD-only defaults:
 
+The default preference starts with AES-128-GCM. Operators that set `FERRUM_TLS_CIPHER_SUITES` keep their explicit order, so pinned cipher configurations are not affected by default-order changes.
+
 **TLS 1.3 (always AEAD):**
 | Name | Description |
 |------|-------------|

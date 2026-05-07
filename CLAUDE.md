@@ -166,9 +166,9 @@ Plain TCP server-first protocols and passthrough may require different upstream 
 
 Splice/kTLS-splice/io_uring paths use the syscall fast path; userspace runs only when splice unavailable (non-Linux, TLS w/o kTLS, backend TLS-terminated).
 
-Userspace modes: **fast path** (both `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0` AND `FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS=0`) delegates to `copy_bidirectional_with_sizes` — best throughput, no BiLock overhead, but no idle watchdog (OS keepalive ~2h), no half-close cap, `disconnect_direction: unknown` on error. **Direction-tracking** (default, either timeout non-zero) gives idle timeout + half-close cap + per-direction byte counters + first-failure attribution at ~5ns BiLock per r/w + two 4-64 KB buffers per conn. Pick fast path when upstream L4 LB enforces timeouts and throughput matters; stay on direction-tracking when self-hosted or dashboards consume `disconnect_direction`.
+Userspace modes: **fast path** (all relay bounds disabled: `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0`, `FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS=0`, and per-proxy `backend_read_timeout_ms=0` / `backend_write_timeout_ms=0`) delegates to `copy_bidirectional_with_sizes` — best throughput, no BiLock overhead, but no idle/per-direction watchdog, no half-close cap, `disconnect_direction: unknown` on error. **Direction-tracking** (default, any bound non-zero) gives idle timeout + half-close cap + per-direction byte counters + first-failure attribution at ~5ns BiLock per r/w + two 4-64 KB buffers per conn. Pick fast path when upstream L4 LB enforces timeouts and throughput matters; stay on direction-tracking when self-hosted, enforcing backend inactivity, or dashboards consume `disconnect_direction`.
 
-**`backend_read_timeout_ms` / `backend_write_timeout_ms`** on TCP relays: per-direction inactivity watermarks (`Arc<AtomicU64>`) refreshed on read progress (b2c) or partial-write progress (c2b). Phase 1 watchdog polls 1/sec. Chunked write loop refreshes on each partial progress — slow-but-progressing backends NOT misclassified. Schema allows `0` to disable for long-lived workloads (DB keepalives, SSH, IMAP). Splice/kTLS/io_uring paths rely only on `tcp_idle_timeout_seconds`.
+**`backend_read_timeout_ms` / `backend_write_timeout_ms`** on TCP relays: per-direction inactivity watermarks refreshed on read progress (b2c) or partial-write progress (c2b). The watchdog ticks every 1s when the shortest active timeout is below 30s, and every 5s when all active timeouts are 30s or longer, so the default 30,000 ms backend timeouts fire within ~35s. Chunked write loop refreshes on each partial progress — slow-but-progressing backends NOT misclassified. Schema allows `0` to disable for long-lived workloads (DB keepalives, SSH, IMAP). Splice/kTLS/io_uring paths rely only on `tcp_idle_timeout_seconds`.
 
 ### Stream Proxy Port Validation
 
@@ -558,8 +558,8 @@ Full docs reference: `docs/configuration.md`. Runtime parsing/defaults: `src/con
 - `FERRUM_MAX_CONNECTIONS` (100000)/`MAX_REQUESTS` (0 = unlimited)
 - `FERRUM_SHUTDOWN_DRAIN_SECONDS` (30; `0` immediate)
 - `FERRUM_WORKER_THREADS` (CPU cores); `FERRUM_BLOCKING_THREADS` (512; **bump to ≥1024 with io_uring splice at scale**)
-- `FERRUM_ACCEPT_THREADS` (0 = CPU cores; SO_REUSEPORT)
-- `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`/`HALF_CLOSE_MAX_WAIT_SECONDS` (300/300; both `0` → TCP fast path)
+- `FERRUM_ACCEPT_THREADS` (0 = CPU cores; SO_REUSEPORT, Unix-only)
+- `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`/`HALF_CLOSE_MAX_WAIT_SECONDS` (300/300; TCP fast path also requires per-proxy backend read/write timeouts `0`)
 - `FERRUM_UDP_MAX_SESSIONS` (10000); `FERRUM_UDP_RECVMMSG_BATCH_SIZE` (64)
 - `FERRUM_WEBSOCKET_MAX_CONNECTIONS` (20000; 0 = disabled)
 - `FERRUM_WEBSOCKET_TUNNEL_MODE` (`false`) — raw TCP copy; **frame-loss risk for server-push** (stock tickers, Socket.IO) where backend writes in same TCP segment as 101

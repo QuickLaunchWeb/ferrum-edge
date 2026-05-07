@@ -629,9 +629,9 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     let backlog = tcp_listen_backlog as i32;
     let configured_accept_threads = accept_threads.max(1);
     #[cfg(unix)]
-    let accept_threads = configured_accept_threads;
+    let actual_accept_threads = configured_accept_threads;
     #[cfg(not(unix))]
-    let accept_threads = {
+    let actual_accept_threads = {
         if configured_accept_threads > 1 {
             warn!(
                 configured_accept_threads,
@@ -640,7 +640,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         }
         1
     };
-    let reuse_port = accept_threads > 1;
+    let reuse_port = actual_accept_threads > 1;
     let tfo_queue = if tcp_fastopen_enabled {
         Some(tcp_fastopen_queue_len)
     } else {
@@ -711,16 +711,16 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     // Bind all extra sockets before spawning any accept loops. If one bind
     // fails, every already-bound socket is dropped here and startup fails
     // cleanly without leaving orphan listener tasks behind.
-    let mut extra_listeners = Vec::with_capacity(accept_threads.saturating_sub(1));
-    for _ in 1..accept_threads {
+    let mut extra_listeners = Vec::with_capacity(actual_accept_threads.saturating_sub(1));
+    for _ in 1..actual_accept_threads {
         extra_listeners.push(crate::proxy::create_proxy_socket(
             addr, backlog, tfo_queue, reuse_port,
         )?);
     }
 
     let mut handles = Vec::with_capacity(extra_listeners.len());
-    for (accept_loop_id, listener) in extra_listeners.into_iter().enumerate() {
-        let accept_loop_id = accept_loop_id + 1;
+    for (extra_loop_index, listener) in extra_listeners.into_iter().enumerate() {
+        let accept_loop_id = extra_loop_index + 1;
         let state = loop_state.clone();
         let shutdown_rx = shutdown.clone();
         let global_shutdown_rx = global_shutdown.clone();
@@ -746,7 +746,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     info!(
         proxy_id = %proxy_id,
         backlog = backlog,
-        accept_threads = accept_threads,
+        accept_threads = actual_accept_threads,
         "TCP proxy listener started on {}",
         addr
     );
@@ -2788,6 +2788,8 @@ where
     let mut poll_c2b_first = true;
 
     let phase1_outcome = poll_fn(|cx| {
+        // Fairness invariant: each live direction is polled exactly once per
+        // poll_fn invocation; the first-polled direction alternates each call.
         let poll_c2b_this_turn = poll_c2b_first;
         poll_c2b_first = !poll_c2b_first;
 
