@@ -164,6 +164,8 @@ With the native `MeshSubscribe` protocol, mesh mode waits for the first delivere
 
 Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Prometheus plugin when mesh metadata is present. The added series are `ferrum_mesh_requests_total` and `ferrum_mesh_request_duration_ms`, labelled with source/destination workload, namespace, principal, app, service, request protocol, response code, response flags, and connection security policy.
 
+HBONE identity metadata is read from all `baggage` headers on an HBONE request. Baggage values may be percent-encoded, and Ferrum decodes them before extracting `source.principal` or `destination.principal`.
+
 Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the canonical config. Remote clusters carry trust domains and federation endpoints, VM `WorkloadEntry` resources populate workload addresses/network/cluster metadata, and east-west gateway entries are materialized as SNI-routed passthrough stream proxies only in `east_west_gateway` topology.
 
 ### Kubernetes Mesh Integration
@@ -174,6 +176,8 @@ Translation notes: Istio `AuthorizationPolicy` resources preserve Istio's action
 
 Gateway API `HTTPRoute` path matches preserve Kubernetes semantics: `PathPrefix` stays a prefix route, `Exact` is translated to an exact-path route for whole-path matching, and `RegularExpression` is passed through as a Ferrum regex route. Istio `VirtualService` URI matches follow the same shape for `prefix`, `exact`, and `regex`. Translated mesh routes do not strip the listen path before forwarding, so upgrades from older mesh previews should expect backends to receive the original Kubernetes request path.
 
+Gateway API cross-namespace `backendRefs` require an exact matching `ReferenceGrant`, including the source API group/kind and target group/kind. Ferrum currently supports core Kubernetes `Service` backend references and fails closed for other backend target kinds in both same-namespace and cross-namespace routes.
+
 Kubernetes Gateway API and Istio mesh translators fail closed when a resource declares a port outside the Kubernetes service-port range (`1`-`65535`). Invalid ports are rejected during translation instead of wrapping into an unintended backend/listener port.
 
 | Variable | Required | Default | Description |
@@ -181,8 +185,13 @@ Kubernetes Gateway API and Istio mesh translators fail closed when a resource de
 | `FERRUM_INJECTOR_LISTEN_ADDR` | Injector mode | `0.0.0.0:9443` | Admission webhook bind address for `POST /mutate` |
 | `FERRUM_INJECTOR_SIDECAR_IMAGE` | No | `ferrum-edge:latest` | Image injected into workload pods as the Ferrum mesh sidecar |
 | `FERRUM_INJECTOR_REQUIRE_ANNOTATION` | No | `true` | Require pod label `ferrum.io/mesh=enabled` or annotation `ferrum.io/inject=true` before injecting |
+| `FERRUM_INJECTOR_TRUST_DOMAIN` | No | `cluster.local` | Trust domain used to derive injected sidecar `FERRUM_MESH_WORKLOAD_SPIFFE_ID` from pod namespace and service account |
+| `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` | No | — | Kubernetes Secret name used as the injected sidecar `FERRUM_CP_DP_GRPC_JWT_SECRET` source |
+| `FERRUM_INJECTOR_JWT_SECRET_REF_KEY` | No | — | Key inside `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` used as the injected sidecar `FERRUM_CP_DP_GRPC_JWT_SECRET` source |
 | `FERRUM_INJECTOR_TLS_CERT_PATH` | Kubernetes webhook deployments | — | TLS certificate presented by the injector webhook server |
 | `FERRUM_INJECTOR_TLS_KEY_PATH` | Kubernetes webhook deployments | — | TLS private key for `FERRUM_INJECTOR_TLS_CERT_PATH` |
+
+The injector copies non-secret mesh sidecar control-plane env vars from its own environment into injected containers when set: `FERRUM_DP_CP_GRPC_URL`, `FERRUM_DP_CP_GRPC_URLS`, `FERRUM_CP_DP_GRPC_JWT_ISSUER`, DP gRPC TLS vars, and `FERRUM_MESH_CONFIG_PROTOCOL`. It does not copy plaintext `FERRUM_CP_DP_GRPC_JWT_SECRET`; set `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` and `FERRUM_INJECTOR_JWT_SECRET_REF_KEY` to inject that variable via `valueFrom.secretKeyRef`.
 
 ### Migration
 
