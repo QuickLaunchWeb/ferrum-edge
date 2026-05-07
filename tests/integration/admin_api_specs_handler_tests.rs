@@ -2496,6 +2496,95 @@ async fn put_with_explicit_plugin_id_overrides_match() {
     assert_eq!(plugin.plugin_name, "cors");
 }
 
+/// PUT can create duplicate final plugin IDs when one empty-id plugin reuses an
+/// existing spec-owned ID and another plugin explicitly names that same ID.
+/// This must be rejected before persistence rather than falling through to a
+/// database uniqueness error.
+#[tokio::test]
+async fn put_with_empty_plugin_reuse_and_explicit_duplicate_id_returns_422() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let listen_path = format!("/{proxy_id}");
+
+    let spec_v1 = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Final duplicate plugin ID test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": listen_path
+        },
+        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {}}]
+    });
+
+    let (post_status, post_body) = client.post_json("/api-specs", &spec_v1).await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "POST: {post_body}"
+    );
+    let spec_id = post_body["id"].as_str().unwrap().to_string();
+
+    let plugins = store
+        .list_spec_owned_plugin_configs("ferrum", &spec_id)
+        .await
+        .expect("list_spec_owned_plugin_configs");
+    assert_eq!(plugins.len(), 1, "POST should create one spec-owned plugin");
+    let reused_plugin_id = plugins[0].id.clone();
+
+    let spec_v2 = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Final duplicate plugin ID test v2", "version": "2.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": listen_path
+        },
+        "x-ferrum-plugins": [
+            {"id": "", "plugin_name": "cors", "config": {}},
+            {"id": reused_plugin_id, "plugin_name": "correlation_id", "config": {}}
+        ]
+    });
+
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec_v2)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "PUT with duplicate final plugin IDs must return 422; body: {put_body}"
+    );
+    let failures = put_body["failures"].as_array().expect("failures array");
+    let plugin_failure = failures
+        .iter()
+        .find(|f| f["resource_type"].as_str() == Some("plugin"))
+        .unwrap_or_else(|| panic!("expected plugin failure; body: {put_body}"));
+    let errors = plugin_failure["errors"].as_array().expect("errors array");
+    assert!(
+        errors.iter().any(|e| e
+            .as_str()
+            .is_some_and(|msg| msg.contains("duplicate plugin id"))),
+        "error must mention duplicate plugin id; body: {put_body}"
+    );
+
+    let plugins_after = store
+        .list_spec_owned_plugin_configs("ferrum", &spec_id)
+        .await
+        .expect("list_spec_owned_plugin_configs after failed PUT");
+    assert_eq!(
+        plugins_after.len(),
+        1,
+        "failed PUT must not replace the original plugin set"
+    );
+    assert_eq!(plugins_after[0].id, reused_plugin_id);
+}
+
 // ============================================================================
 // Fix 2 — Validate proxy.plugins associations
 // ============================================================================
@@ -4246,5 +4335,217 @@ async fn loaded_gateway_config_excludes_api_specs_after_submission() {
     assert!(
         config_json.get("api_specs").is_none(),
         "GatewayConfig JSON must not contain an api_specs key — this would leak to DPs via gRPC"
+    );
+}
+
+// ============================================================================
+// Follow-up coverage from PR #526 review
+// ============================================================================
+
+/// Empty body (0 bytes) must return a parse error, not panic.
+#[tokio::test]
+async fn post_empty_body_returns_400() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let (status, body) = client
+        .post_raw("/api-specs", vec![], "application/json")
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "empty body must be rejected as a parse error; body: {body}"
+    );
+}
+
+/// Irrelevant Accept header (text/html) must still return a response
+/// (RFC 7231 permits serving any representation when no Accept rules match
+/// our supported formats).
+#[tokio::test]
+async fn get_with_irrelevant_accept_returns_stored_format() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let (status, body) = client
+        .post_json("/api-specs", &minimal_json_spec(&proxy_id))
+        .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    let spec_id = body["id"].as_str().unwrap();
+
+    // text/html is not a known format — server should default to stored.
+    let (status, _bytes, headers) = client
+        .get_raw(&format!("/api-specs/{spec_id}"), Some("text/html"), None)
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "unsupported Accept must not return 406; server should default to stored format"
+    );
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.contains("json"),
+        "stored format is JSON, so Content-Type must be JSON; got: {ct}"
+    );
+}
+
+/// YAML with anchor/alias syntax must be rejected at parse time.
+#[tokio::test]
+async fn post_yaml_with_anchor_alias_returns_400() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let yaml_with_anchor = r#"openapi: "3.1.0"
+info:
+  title: &title Bomb Test
+  version: "1.0.0"
+x-ferrum-proxy:
+  id: anchor-test
+  backend_host: backend.internal
+  backend_port: 443
+  listen_path: /anchor-test
+alias_ref: *title
+"#;
+
+    let (status, body) = client.post_yaml("/api-specs", yaml_with_anchor).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "YAML with anchor/alias must be rejected; body: {body}"
+    );
+    let details = body["details"].as_str().unwrap_or("");
+    assert!(
+        details.contains("anchor") || details.contains("alias"),
+        "error must mention anchor/alias; got: {details}"
+    );
+}
+
+/// Combined list filters must work together (regression for multi-clause SQL).
+#[tokio::test]
+async fn list_with_combined_filters() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    // Submit two specs with different titles and tags.
+    let proxy_id_a = uid("proxy");
+    let spec_a = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Orders Service", "version": "1.0.0"},
+        "tags": [{"name": "public"}],
+        "x-ferrum-proxy": {
+            "id": &proxy_id_a,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id_a}")
+        }
+    });
+    let (s1, _) = client.post_json("/api-specs", &spec_a).await;
+    assert_eq!(s1, reqwest::StatusCode::CREATED);
+
+    let proxy_id_b = uid("proxy");
+    let spec_b = json!({
+        "openapi": "3.0.3",
+        "info": {"title": "Users Service", "version": "2.0.0"},
+        "tags": [{"name": "internal"}],
+        "x-ferrum-proxy": {
+            "id": &proxy_id_b,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id_b}")
+        }
+    });
+    let (s2, _) = client.post_json("/api-specs", &spec_b).await;
+    assert_eq!(s2, reqwest::StatusCode::CREATED);
+
+    // Combined: title_contains=Orders AND spec_version=3.1 → only spec_a
+    let (status, body) = client
+        .get_json("/api-specs?title_contains=Orders&spec_version=3.1")
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let items = body["items"].as_array().expect("items must be array");
+    assert_eq!(
+        items.len(),
+        1,
+        "combined filter must return exactly one match; got: {items:?}"
+    );
+    assert_eq!(items[0]["title"].as_str(), Some("Orders Service"));
+}
+
+/// Case-insensitive Content-Type must work end-to-end.
+#[tokio::test]
+async fn post_with_uppercase_content_type_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let spec = minimal_json_spec(&proxy_id);
+    let body_bytes = serde_json::to_vec(&spec).unwrap();
+
+    // Send with mixed-case Content-Type.
+    let (status, _body) = client
+        .post_raw("/api-specs", body_bytes, "Application/JSON")
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "mixed-case Content-Type must be accepted per RFC 7231"
+    );
+}
+
+/// Duplicate plugin IDs in a spec must be rejected at extraction time.
+#[tokio::test]
+async fn post_with_duplicate_plugin_ids_returns_error() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Dup Plugin Test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": &proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-plugins": [
+            {
+                "id": "same-id",
+                "plugin_name": "cors",
+                "config": {}
+            },
+            {
+                "id": "same-id",
+                "plugin_name": "compression",
+                "config": {}
+            }
+        ]
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "duplicate plugin IDs must be rejected as malformed extension; body: {body}"
+    );
+    let details = body["details"].as_str().unwrap_or("");
+    assert!(
+        details.contains("duplicate plugin id"),
+        "error must mention duplicate plugin id; got: {details}"
     );
 }
