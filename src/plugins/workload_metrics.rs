@@ -55,6 +55,8 @@ impl WorkloadMetrics {
     fn annotate_http_context(&self, ctx: &mut RequestContext, headers: &HashMap<String, String>) {
         self.insert_common_metadata(&mut ctx.metadata);
         let hbone_identity = authenticated_hbone_identity(ctx, headers);
+        // For authenticated ambient HBONE, the peer cert identifies the
+        // ztunnel, while baggage identifies the originating workload.
         let source_identity = hbone_identity
             .as_ref()
             .and_then(|identity| identity.source_principal.clone())

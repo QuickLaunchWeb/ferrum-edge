@@ -114,6 +114,7 @@ async fn mesh_authz_reads_hbone_baggage_source_identity() {
             .expect("header value"),
     );
     ctx.set_raw_headers(headers);
+    ctx.materialize_headers();
 
     let result = plugin.authorize(&mut ctx).await;
 
@@ -168,6 +169,12 @@ async fn mesh_authz_ignores_hbone_baggage_without_authenticated_peer() {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
         other => panic!("expected reject, got {other:?}"),
     }
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_baggage")
+            .map(String::as_str),
+        Some("unauthenticated_hbone")
+    );
 }
 
 #[tokio::test]
@@ -259,6 +266,25 @@ async fn workload_metrics_reads_hbone_baggage_source_identity() {
             .map(String::as_str),
         Some("mutual_tls")
     );
+}
+
+#[tokio::test]
+async fn workload_metrics_marks_mtls_when_http_peer_cert_has_no_spiffe_id() {
+    let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
+    let mut ctx = request_context(None);
+    ctx.tls_client_cert_der = Some(Arc::new(vec![0x30, 0x82, 0x01, 0x00]));
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.connection_security_policy")
+            .map(String::as_str),
+        Some("mutual_tls")
+    );
+    assert!(!ctx.metadata.contains_key("mesh.source.principal"));
 }
 
 #[tokio::test]
