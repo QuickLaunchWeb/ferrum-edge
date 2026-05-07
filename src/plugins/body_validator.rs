@@ -14,9 +14,10 @@ use async_trait::async_trait;
 use flate2::read::GzDecoder;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Read as _;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -25,6 +26,13 @@ struct ProtobufMethodEntry {
     request: Option<MessageDescriptor>,
     response: Option<MessageDescriptor>,
 }
+
+type ProtobufConfig = (
+    Option<DescriptorPool>,
+    Option<MessageDescriptor>,
+    Option<MessageDescriptor>,
+    HashMap<String, ProtobufMethodEntry>,
+);
 
 pub struct BodyValidator {
     // ── Request validation config ──
@@ -81,80 +89,28 @@ pub struct BodyValidator {
 
 impl BodyValidator {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let json_schema = config.get("json_schema").cloned();
+        if !config.is_object() {
+            return Err("body_validator: config must be an object".to_string());
+        }
 
-        let required_fields: Vec<String> = config["required_fields"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let validate_xml = config["validate_xml"].as_bool().unwrap_or(false);
-
-        let required_xml_elements: Vec<String> = config["required_xml_elements"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let content_types = config["content_types"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                vec![
-                    "application/json".to_string(),
-                    "application/xml".to_string(),
-                    "text/xml".to_string(),
-                ]
-            });
+        let json_schema = optional_schema(config, "json_schema")?.cloned();
+        let required_fields = optional_string_vec(config, "required_fields")?.unwrap_or_default();
+        let validate_xml = optional_bool(config, "validate_xml")?.unwrap_or(false);
+        let required_xml_elements =
+            optional_string_vec(config, "required_xml_elements")?.unwrap_or_default();
+        let content_types =
+            optional_content_types(config, "content_types")?.unwrap_or_else(default_content_types);
 
         // ── Response validation config ──
-        let response_json_schema = config.get("response_json_schema").cloned();
-
-        let response_required_fields: Vec<String> = config["response_required_fields"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let response_validate_xml = config["response_validate_xml"].as_bool().unwrap_or(false);
-
-        let response_required_xml_elements: Vec<String> = config["response_required_xml_elements"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let response_content_types = config["response_content_types"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                vec![
-                    "application/json".to_string(),
-                    "application/xml".to_string(),
-                    "text/xml".to_string(),
-                ]
-            });
+        let response_json_schema = optional_schema(config, "response_json_schema")?.cloned();
+        let response_required_fields =
+            optional_string_vec(config, "response_required_fields")?.unwrap_or_default();
+        let response_validate_xml =
+            optional_bool(config, "response_validate_xml")?.unwrap_or(false);
+        let response_required_xml_elements =
+            optional_string_vec(config, "response_required_xml_elements")?.unwrap_or_default();
+        let response_content_types = optional_content_types(config, "response_content_types")?
+            .unwrap_or_else(default_content_types);
 
         // ── Protobuf validation config ──
         let (
@@ -162,10 +118,9 @@ impl BodyValidator {
             protobuf_request_descriptor,
             protobuf_response_descriptor,
             protobuf_method_messages,
-        ) = load_protobuf_config(config);
-        let protobuf_reject_unknown_fields = config["protobuf_reject_unknown_fields"]
-            .as_bool()
-            .unwrap_or(false);
+        ) = load_protobuf_config(config)?;
+        let protobuf_reject_unknown_fields =
+            optional_bool(config, "protobuf_reject_unknown_fields")?.unwrap_or(false);
 
         let has_protobuf_request_validation = protobuf_request_descriptor.is_some()
             || protobuf_method_messages
@@ -198,11 +153,15 @@ impl BodyValidator {
         // Pre-compile all regex patterns found in schemas at config load time.
         let mut compiled_patterns = HashMap::new();
         if let Some(ref schema) = json_schema {
-            collect_patterns(schema, &mut compiled_patterns);
+            collect_patterns(schema, &mut compiled_patterns, "json_schema")?;
         }
         let mut response_compiled_patterns = HashMap::new();
         if let Some(ref schema) = response_json_schema {
-            collect_patterns(schema, &mut response_compiled_patterns);
+            collect_patterns(
+                schema,
+                &mut response_compiled_patterns,
+                "response_json_schema",
+            )?;
         }
 
         Ok(Self {
@@ -333,20 +292,10 @@ impl BodyValidator {
                         ));
                     }
                 } else {
-                    // Fallback: pattern wasn't found during schema walk (shouldn't happen)
-                    match regex::Regex::new(pattern) {
-                        Ok(re) => {
-                            if !re.is_match(s) {
-                                return Err(format!(
-                                    "String '{}' does not match pattern '{}'",
-                                    s, pattern
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            return Err(format!("Invalid regex pattern '{}': {}", pattern, e));
-                        }
-                    }
+                    return Err(format!(
+                        "Pattern '{}' was not compiled at config load time",
+                        pattern
+                    ));
                 }
             }
             if let Some(format_name) = schema.get("format").and_then(|v| v.as_str()) {
@@ -554,8 +503,7 @@ impl BodyValidator {
 
         // Check for required elements
         for element in required_xml_elements {
-            let open_tag = format!("<{}", element);
-            if !trimmed.contains(&open_tag) {
+            if !contains_xml_open_tag(trimmed, element) {
                 return Err(format!("Missing required XML element: {}", element));
             }
         }
@@ -667,7 +615,7 @@ impl BodyValidator {
         descriptor: &MessageDescriptor,
     ) -> Result<(), String> {
         let payload = parse_grpc_frame(body)?;
-        let msg = DynamicMessage::decode(descriptor.clone(), payload.as_slice())
+        let msg = DynamicMessage::decode(descriptor.clone(), payload.as_ref())
             .map_err(|e| format!("Protobuf decode failed: {}", e))?;
         if self.protobuf_reject_unknown_fields {
             let unknown_count = msg.unknown_fields().count();
@@ -709,7 +657,7 @@ impl BodyValidator {
 /// When the compressed flag is set (byte 0 == 1), the payload is decompressed using
 /// gzip (deflate), which is the standard gRPC compression algorithm. Other compression
 /// algorithms (e.g., zstd, snappy) are not supported and will return an error.
-fn parse_grpc_frame(body: &[u8]) -> Result<Vec<u8>, String> {
+fn parse_grpc_frame(body: &[u8]) -> Result<Cow<'_, [u8]>, String> {
     if body.len() < 5 {
         return Err(format!(
             "gRPC frame too short: {} bytes (minimum 5)",
@@ -733,167 +681,315 @@ fn parse_grpc_frame(body: &[u8]) -> Result<Vec<u8>, String> {
         decoder
             .read_to_end(&mut decompressed)
             .map_err(|e| format!("Failed to decompress gRPC frame (gzip): {}", e))?;
-        Ok(decompressed)
+        Ok(Cow::Owned(decompressed))
     } else {
-        Ok(payload.to_vec())
+        Ok(Cow::Borrowed(payload))
     }
+}
+
+fn optional_schema<'a>(
+    config: &'a Value,
+    field: &'static str,
+) -> Result<Option<&'a Value>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    if let Some(object) = value.as_object() {
+        if object.is_empty() {
+            return Err(format!("body_validator: '{field}' must not be empty"));
+        }
+        Ok(Some(value))
+    } else {
+        Err(format!(
+            "body_validator: '{field}' must be a JSON Schema object"
+        ))
+    }
+}
+
+fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| format!("body_validator: '{field}' must be a boolean"))
+}
+
+fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_str() else {
+        return Err(format!("body_validator: '{field}' must be a string"));
+    };
+    if value.is_empty() {
+        return Err(format!("body_validator: '{field}' must not be empty"));
+    }
+    Ok(Some(value))
+}
+
+fn optional_object<'a>(
+    config: &'a Value,
+    field: &'static str,
+) -> Result<Option<&'a serde_json::Map<String, Value>>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_object()
+        .map(Some)
+        .ok_or_else(|| format!("body_validator: '{field}' must be an object"))
+}
+
+fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!("body_validator: '{field}' must be an array"));
+    };
+
+    let mut parsed = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let Some(value) = value.as_str() else {
+            return Err(format!(
+                "body_validator: '{field}' entries must be strings (invalid entry at index {index})"
+            ));
+        };
+        if value.is_empty() {
+            return Err(format!(
+                "body_validator: '{field}' entries must not be empty (invalid entry at index {index})"
+            ));
+        }
+        parsed.push(value.to_string());
+    }
+    Ok(Some(parsed))
+}
+
+fn optional_content_types(
+    config: &Value,
+    field: &'static str,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(values) = optional_string_vec(config, field)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        values
+            .into_iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect(),
+    ))
+}
+
+fn default_content_types() -> Vec<String> {
+    vec![
+        "application/json".to_string(),
+        "application/xml".to_string(),
+        "text/xml".to_string(),
+    ]
+}
+
+fn content_type_matches(configured: &[String], content_type: &str) -> bool {
+    configured.is_empty()
+        || configured
+            .iter()
+            .any(|expected| ascii_contains_ignore_case(content_type, expected))
+}
+
+fn is_grpc_content_type(content_type: &str) -> bool {
+    ascii_starts_with_ignore_case(content_type, "application/grpc")
+}
+
+fn is_json_like_content_type(content_type: &str) -> bool {
+    ascii_contains_ignore_case(content_type, "json")
+}
+
+fn is_xml_like_content_type(content_type: &str) -> bool {
+    ascii_contains_ignore_case(content_type, "xml")
+}
+
+fn ascii_starts_with_ignore_case(value: &str, prefix: &str) -> bool {
+    let value = value.as_bytes();
+    let prefix = prefix.as_bytes();
+    value.len() >= prefix.len()
+        && value[..prefix.len()]
+            .iter()
+            .zip(prefix)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    'outer: for start in 0..=(haystack.len() - needle.len()) {
+        for offset in 0..needle.len() {
+            if haystack[start + offset].eq_ignore_ascii_case(&needle[offset]) {
+                continue;
+            }
+            continue 'outer;
+        }
+        return true;
+    }
+    false
+}
+
+fn contains_xml_open_tag(body: &str, element: &str) -> bool {
+    let body = body.as_bytes();
+    let element = element.as_bytes();
+    if element.is_empty() || body.len() <= element.len() {
+        return false;
+    }
+    body.windows(element.len() + 1)
+        .any(|window| window[0] == b'<' && &window[1..] == element)
 }
 
 /// Load protobuf validation config from the plugin config JSON.
 ///
 /// Reads `protobuf_descriptor_path`, resolves message types from
 /// `protobuf_request_type`, `protobuf_response_type`, and `protobuf_method_messages`.
-fn load_protobuf_config(
-    config: &Value,
-) -> (
-    Option<DescriptorPool>,
-    Option<MessageDescriptor>,
-    Option<MessageDescriptor>,
-    HashMap<String, ProtobufMethodEntry>,
-) {
-    let descriptor_path = match config
-        .get("protobuf_descriptor_path")
-        .and_then(|v| v.as_str())
-    {
+fn load_protobuf_config(config: &Value) -> Result<ProtobufConfig, String> {
+    let descriptor_path = match optional_string(config, "protobuf_descriptor_path")? {
         Some(p) => p,
-        None => return (None, None, None, HashMap::new()),
-    };
-
-    let descriptor_bytes = match std::fs::read(descriptor_path) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(
-                "body_validator: failed to read protobuf descriptor file '{}': {}",
-                descriptor_path, e
-            );
-            return (None, None, None, HashMap::new());
-        }
-    };
-
-    let pool = match DescriptorPool::decode(descriptor_bytes.as_slice()) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(
-                "body_validator: failed to parse protobuf descriptor '{}': {}",
-                descriptor_path, e
-            );
-            return (None, None, None, HashMap::new());
-        }
-    };
-
-    let request_desc = config
-        .get("protobuf_request_type")
-        .and_then(|v| v.as_str())
-        .and_then(|name| {
-            pool.get_message_by_name(name).or_else(|| {
-                warn!(
-                    "body_validator: protobuf_request_type '{}' not found in descriptor",
-                    name
-                );
-                None
-            })
-        });
-
-    let response_desc = config
-        .get("protobuf_response_type")
-        .and_then(|v| v.as_str())
-        .and_then(|name| {
-            pool.get_message_by_name(name).or_else(|| {
-                warn!(
-                    "body_validator: protobuf_response_type '{}' not found in descriptor",
-                    name
-                );
-                None
-            })
-        });
-
-    let mut method_map = HashMap::new();
-    if let Some(methods) = config
-        .get("protobuf_method_messages")
-        .and_then(|v| v.as_object())
-    {
-        for (method_path, method_config) in methods {
-            let req = method_config
-                .get("request")
-                .and_then(|v| v.as_str())
-                .and_then(|name| {
-                    pool.get_message_by_name(name).or_else(|| {
-                        warn!(
-                            "body_validator: method '{}' request type '{}' not found in descriptor",
-                            method_path, name
-                        );
-                        None
-                    })
-                });
-            let resp = method_config
-                .get("response")
-                .and_then(|v| v.as_str())
-                .and_then(|name| {
-                    pool.get_message_by_name(name).or_else(|| {
-                        warn!(
-                            "body_validator: method '{}' response type '{}' not found in descriptor",
-                            method_path, name
-                        );
-                        None
-                    })
-                });
-            if req.is_some() || resp.is_some() {
-                method_map.insert(
-                    method_path.clone(),
-                    ProtobufMethodEntry {
-                        request: req,
-                        response: resp,
-                    },
+        None => {
+            if config.get("protobuf_request_type").is_some()
+                || config.get("protobuf_response_type").is_some()
+                || config.get("protobuf_method_messages").is_some()
+            {
+                return Err(
+                    "body_validator: 'protobuf_descriptor_path' is required when configuring protobuf validation"
+                        .to_string(),
                 );
             }
+            return Ok((None, None, None, HashMap::new()));
+        }
+    };
+
+    let descriptor_bytes = std::fs::read(descriptor_path).map_err(|e| {
+        format!("body_validator: failed to read protobuf descriptor file '{descriptor_path}': {e}")
+    })?;
+
+    let pool = DescriptorPool::decode(descriptor_bytes.as_slice()).map_err(|e| {
+        format!("body_validator: failed to parse protobuf descriptor '{descriptor_path}': {e}")
+    })?;
+
+    let request_desc = optional_string(config, "protobuf_request_type")?
+        .map(|name| {
+            pool.get_message_by_name(name).ok_or_else(|| {
+                format!("body_validator: protobuf_request_type '{name}' not found in descriptor")
+            })
+        })
+        .transpose()?;
+
+    let response_desc = optional_string(config, "protobuf_response_type")?
+        .map(|name| {
+            pool.get_message_by_name(name).ok_or_else(|| {
+                format!("body_validator: protobuf_response_type '{name}' not found in descriptor")
+            })
+        })
+        .transpose()?;
+
+    let mut method_map = HashMap::new();
+    if let Some(methods) = optional_object(config, "protobuf_method_messages")? {
+        for (method_path, method_config) in methods {
+            if method_path.is_empty() {
+                return Err(
+                    "body_validator: protobuf_method_messages method paths must not be empty"
+                        .to_string(),
+                );
+            }
+            if !method_config.is_object() {
+                return Err(format!(
+                    "body_validator: protobuf_method_messages['{method_path}'] must be an object"
+                ));
+            }
+
+            let req = optional_string(method_config, "request")?
+                .map(|name| {
+                    pool.get_message_by_name(name).ok_or_else(|| {
+                        format!(
+                            "body_validator: method '{method_path}' request type '{name}' not found in descriptor"
+                        )
+                    })
+                })
+                .transpose()?;
+            let resp = optional_string(method_config, "response")?
+                .map(|name| {
+                    pool.get_message_by_name(name).ok_or_else(|| {
+                        format!(
+                            "body_validator: method '{method_path}' response type '{name}' not found in descriptor"
+                        )
+                    })
+                })
+                .transpose()?;
+
+            if req.is_none() && resp.is_none() {
+                return Err(format!(
+                    "body_validator: protobuf_method_messages['{method_path}'] must configure 'request' or 'response'"
+                ));
+            }
+            method_map.insert(
+                method_path.clone(),
+                ProtobufMethodEntry {
+                    request: req,
+                    response: resp,
+                },
+            );
         }
     }
 
-    (Some(pool), request_desc, response_desc, method_map)
+    Ok((Some(pool), request_desc, response_desc, method_map))
 }
 
 /// Recursively walk a JSON Schema and pre-compile all `pattern` regex strings.
-fn collect_patterns(schema: &Value, patterns: &mut HashMap<String, regex::Regex>) {
-    if let Some(pattern) = schema.get("pattern").and_then(|v| v.as_str())
-        && !patterns.contains_key(pattern)
-    {
-        match regex::Regex::new(pattern) {
-            Ok(re) => {
-                patterns.insert(pattern.to_string(), re);
-            }
-            Err(e) => {
-                warn!(
-                    "body_validator: invalid regex pattern '{}' in schema: {}",
-                    pattern, e
-                );
-            }
+fn collect_patterns(
+    schema: &Value,
+    patterns: &mut HashMap<String, regex::Regex>,
+    field: &'static str,
+) -> Result<(), String> {
+    if let Some(pattern_value) = schema.get("pattern") {
+        let pattern = pattern_value
+            .as_str()
+            .ok_or_else(|| format!("body_validator: '{field}' pattern values must be strings"))?;
+        if !patterns.contains_key(pattern) {
+            let re = regex::Regex::new(pattern).map_err(|e| {
+                format!("body_validator: invalid regex pattern '{pattern}' in '{field}': {e}")
+            })?;
+            patterns.insert(pattern.to_string(), re);
         }
     }
 
     // Recurse into sub-schemas
     if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
         for prop_schema in props.values() {
-            collect_patterns(prop_schema, patterns);
+            collect_patterns(prop_schema, patterns, field)?;
         }
     }
     if let Some(items) = schema.get("items") {
-        collect_patterns(items, patterns);
+        collect_patterns(items, patterns, field)?;
     }
     if let Some(additional) = schema.get("additionalProperties")
         && additional.is_object()
     {
-        collect_patterns(additional, patterns);
+        collect_patterns(additional, patterns, field)?;
     }
     for keyword in &["allOf", "anyOf", "oneOf"] {
         if let Some(arr) = schema.get(*keyword).and_then(|v| v.as_array()) {
             for sub in arr {
-                collect_patterns(sub, patterns);
+                collect_patterns(sub, patterns, field)?;
             }
         }
     }
     if let Some(not_schema) = schema.get("not") {
-        collect_patterns(not_schema, patterns);
+        collect_patterns(not_schema, patterns, field)?;
     }
+    Ok(())
 }
 
 /// Find the position of a byte subsequence within a slice.
@@ -987,24 +1083,20 @@ fn protobuf_reject(status_code: u16, direction: &str, msg: &str) -> PluginResult
         "body_validator: {} protobuf validation failed: {}",
         direction, msg
     );
-    let escaped_msg = msg.replace('\\', "\\\\").replace('"', "\\\"");
     PluginResult::Reject {
         status_code,
-        body: format!(
-            r#"{{"error":"{} body validation failed","details":"{}"}}"#,
-            if status_code == 400 {
-                "Request"
+        body: serde_json::json!({
+            "error": if status_code == 400 {
+                "Request body validation failed"
             } else {
-                "Response"
+                "Response body validation failed"
             },
-            escaped_msg
-        ),
+            "details": msg
+        })
+        .to_string(),
         headers: HashMap::new(),
     }
 }
-
-/// Plugin priority: runs in transform band, before proxying.
-pub const BODY_VALIDATOR_PRIORITY: u16 = 2950;
 
 #[async_trait]
 impl Plugin for BodyValidator {
@@ -1013,7 +1105,7 @@ impl Plugin for BodyValidator {
     }
 
     fn priority(&self) -> u16 {
-        BODY_VALIDATOR_PRIORITY
+        super::priority::BODY_VALIDATOR
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -1040,19 +1132,15 @@ impl Plugin for BodyValidator {
         let content_type = ctx
             .headers
             .get("content-type")
-            .map(|value| value.to_lowercase())
-            .unwrap_or_default();
+            .map(String::as_str)
+            .unwrap_or("");
 
         // For gRPC protobuf validation, buffer if content-type is application/grpc
-        if self.has_protobuf_request_validation && content_type.starts_with("application/grpc") {
+        if self.has_protobuf_request_validation && is_grpc_content_type(content_type) {
             return true;
         }
 
-        self.content_types.is_empty()
-            || self
-                .content_types
-                .iter()
-                .any(|ct| content_type.contains(ct.as_str()))
+        content_type_matches(&self.content_types, content_type)
     }
 
     async fn before_proxy(
@@ -1068,20 +1156,15 @@ impl Plugin for BodyValidator {
         // Check content type
         let content_type = headers
             .get("content-type")
-            .cloned()
-            .unwrap_or_default()
-            .to_lowercase();
+            .map(String::as_str)
+            .unwrap_or("");
 
         // gRPC protobuf validation is handled in on_final_request_body, not here
-        if content_type.starts_with("application/grpc") {
+        if is_grpc_content_type(content_type) {
             return PluginResult::Continue;
         }
 
-        let should_validate = self.content_types.is_empty()
-            || self
-                .content_types
-                .iter()
-                .any(|ct| content_type.contains(ct.as_str()));
+        let should_validate = content_type_matches(&self.content_types, content_type);
 
         if !should_validate {
             return PluginResult::Continue;
@@ -1089,7 +1172,7 @@ impl Plugin for BodyValidator {
 
         // Get body from metadata (set by proxy handler if body collection is early)
         let body = match ctx.metadata.get("request_body") {
-            Some(b) => b.clone(),
+            Some(b) => b.as_str(),
             None => {
                 // No body available — can't validate
                 debug!("body_validator: no request body available for validation");
@@ -1102,15 +1185,15 @@ impl Plugin for BodyValidator {
         }
 
         // Determine validation type
-        let result = if content_type.contains("json") {
+        let result = if is_json_like_content_type(content_type) {
             self.validate_json_body(
-                &body,
+                body,
                 &self.required_fields,
                 self.json_schema.as_ref(),
                 &self.compiled_patterns,
             )
-        } else if content_type.contains("xml") && self.validate_xml {
-            Self::validate_xml_body(&body, &self.required_xml_elements)
+        } else if is_xml_like_content_type(content_type) && self.validate_xml {
+            Self::validate_xml_body(body, &self.required_xml_elements)
         } else {
             Ok(())
         };
@@ -1119,13 +1202,13 @@ impl Plugin for BodyValidator {
             Ok(()) => PluginResult::Continue,
             Err(msg) => {
                 debug!("body_validator: request validation failed: {}", msg);
-                let escaped_msg = msg.replace('\\', "\\\\").replace('"', "\\\"");
                 PluginResult::Reject {
                     status_code: 400,
-                    body: format!(
-                        r#"{{"error":"Request body validation failed","details":"{}"}}"#,
-                        escaped_msg
-                    ),
+                    body: serde_json::json!({
+                        "error": "Request body validation failed",
+                        "details": msg
+                    })
+                    .to_string(),
                     headers: HashMap::new(),
                 }
             }
@@ -1143,9 +1226,9 @@ impl Plugin for BodyValidator {
 
         let content_type = headers
             .get("content-type")
-            .map(|v| v.to_lowercase())
-            .unwrap_or_default();
-        if !content_type.starts_with("application/grpc") {
+            .map(String::as_str)
+            .unwrap_or("");
+        if !is_grpc_content_type(content_type) {
             return PluginResult::Continue;
         }
 
@@ -1202,12 +1285,11 @@ impl Plugin for BodyValidator {
         // Determine content type from response headers
         let content_type = response_headers
             .get("content-type")
-            .cloned()
-            .unwrap_or_default()
-            .to_lowercase();
+            .map(String::as_str)
+            .unwrap_or("");
 
         // gRPC protobuf response validation
-        if content_type.starts_with("application/grpc") {
+        if is_grpc_content_type(content_type) {
             if !self.has_protobuf_response_validation || body.is_empty() {
                 return PluginResult::Continue;
             }
@@ -1225,7 +1307,10 @@ impl Plugin for BodyValidator {
                     if m.starts_with('/') {
                         m.clone()
                     } else {
-                        format!("/{}", m)
+                        let mut path = String::with_capacity(m.len() + 1);
+                        path.push('/');
+                        path.push_str(m);
+                        path
                     }
                 })
                 .unwrap_or_else(|| ctx.path.clone());
@@ -1242,11 +1327,7 @@ impl Plugin for BodyValidator {
             };
         }
 
-        let should_validate = self.response_content_types.is_empty()
-            || self
-                .response_content_types
-                .iter()
-                .any(|ct| content_type.contains(ct.as_str()));
+        let should_validate = content_type_matches(&self.response_content_types, content_type);
 
         if !should_validate {
             return PluginResult::Continue;
@@ -1266,14 +1347,14 @@ impl Plugin for BodyValidator {
         };
 
         // Determine validation type
-        let result = if content_type.contains("json") {
+        let result = if is_json_like_content_type(content_type) {
             self.validate_json_body(
                 body_str,
                 &self.response_required_fields,
                 self.response_json_schema.as_ref(),
                 &self.response_compiled_patterns,
             )
-        } else if content_type.contains("xml") && self.response_validate_xml {
+        } else if is_xml_like_content_type(content_type) && self.response_validate_xml {
             Self::validate_xml_body(body_str, &self.response_required_xml_elements)
         } else {
             Ok(())
@@ -1283,13 +1364,13 @@ impl Plugin for BodyValidator {
             Ok(()) => PluginResult::Continue,
             Err(msg) => {
                 debug!("body_validator: response validation failed: {}", msg);
-                let escaped_msg = msg.replace('\\', "\\\\").replace('"', "\\\"");
                 PluginResult::Reject {
                     status_code: 502,
-                    body: format!(
-                        r#"{{"error":"Response body validation failed","details":"{}"}}"#,
-                        escaped_msg
-                    ),
+                    body: serde_json::json!({
+                        "error": "Response body validation failed",
+                        "details": msg
+                    })
+                    .to_string(),
                     headers: HashMap::new(),
                 }
             }

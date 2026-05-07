@@ -1,4 +1,4 @@
-use ferrum_edge::plugins::{Plugin, PluginResult, create_plugin};
+use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, create_plugin, priority};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -23,7 +23,8 @@ fn create_plugin_default() -> std::sync::Arc<dyn Plugin> {
 fn test_plugin_creation_default() {
     let plugin = create_plugin_default();
     assert_eq!(plugin.name(), "grpc_web");
-    assert_eq!(plugin.priority(), 260);
+    assert_eq!(plugin.priority(), priority::GRPC_WEB);
+    assert!(!plugin.is_auth_plugin());
 }
 
 #[test]
@@ -33,6 +34,21 @@ fn test_plugin_creation_with_expose_headers() {
     });
     let plugin = create_plugin("grpc_web", &config).unwrap().unwrap();
     assert_eq!(plugin.name(), "grpc_web");
+}
+
+#[test]
+fn test_invalid_expose_headers_rejected() {
+    for config in [
+        json!({"expose_headers": "x-request-id"}),
+        json!({"expose_headers": [42]}),
+        json!({"expose_headers": [""]}),
+        json!({"expose_headers": ["bad header"]}),
+    ] {
+        let err = create_plugin("grpc_web", &config)
+            .err()
+            .expect("invalid expose_headers config must be rejected");
+        assert!(err.contains("expose_headers"), "got: {err}");
+    }
 }
 
 // ── on_request_received — detection and header rewriting ──
@@ -730,9 +746,7 @@ async fn test_transform_response_body_no_content_type() {
 #[test]
 fn test_supported_protocols() {
     let plugin = create_plugin_default();
-    let protocols = plugin.supported_protocols();
-    assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Http));
-    assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Grpc));
+    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
 }
 
 // ── Trait flags ──
@@ -753,6 +767,9 @@ fn test_modifies_request_body() {
 fn test_requires_response_body_buffering() {
     let plugin = create_plugin_default();
     assert!(plugin.requires_response_body_buffering());
+    assert!(plugin.requires_request_body_buffering());
+    assert!(!plugin.needs_request_body_bytes());
+    assert!(!plugin.applies_after_proxy_on_reject());
 }
 
 // ── End-to-end flow ──
@@ -907,6 +924,10 @@ fn test_response_content_type() {
         response_content_type("application/grpc-web-text+proto"),
         "application/grpc-web-text+proto"
     );
+    assert_eq!(
+        response_content_type("Application/Grpc-Web-Text+Proto"),
+        "application/grpc-web-text+proto"
+    );
 }
 
 #[test]
@@ -936,6 +957,21 @@ fn test_build_trailer_frame_default_status() {
     assert_eq!(frame[0], GRPC_FRAME_TRAILER);
     let trailer_str = String::from_utf8_lossy(&frame[5..]);
     assert!(trailer_str.contains("grpc-status: 0"));
+}
+
+#[test]
+fn test_build_trailer_frame_skips_invalid_trailer_lines() {
+    use ferrum_edge::_test_support::build_trailer_frame;
+    let mut headers = HashMap::new();
+    headers.insert("grpc-status".to_string(), "0\r\nx-bad: yes".to_string());
+    headers.insert("bad header".to_string(), "secret".to_string());
+    headers.insert("grpc-message".to_string(), "OK".to_string());
+
+    let frame = build_trailer_frame(&headers);
+    let trailer_str = String::from_utf8_lossy(&frame[5..]);
+    assert!(!trailer_str.contains("x-bad"));
+    assert!(!trailer_str.contains("bad header"));
+    assert!(trailer_str.contains("grpc-message: OK"));
 }
 
 #[test]

@@ -1,5 +1,7 @@
 use ferrum_edge::plugins::load_testing::LoadTesting;
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use ferrum_edge::plugins::{
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,15 +29,12 @@ fn test_plugin_name() {
 
 #[test]
 fn test_plugin_priority() {
-    assert_eq!(make_plugin().priority(), 3080);
+    assert_eq!(make_plugin().priority(), priority::LOAD_TESTING);
 }
 
 #[test]
 fn test_supported_protocols() {
-    let protos = make_plugin().supported_protocols();
-    assert!(protos.contains(&ferrum_edge::plugins::ProxyProtocol::Http));
-    assert!(!protos.contains(&ferrum_edge::plugins::ProxyProtocol::Grpc));
-    assert!(!protos.contains(&ferrum_edge::plugins::ProxyProtocol::WebSocket));
+    assert_eq!(make_plugin().supported_protocols(), HTTP_ONLY_PROTOCOLS);
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +155,14 @@ fn test_valid_full_config() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn test_non_object_config_is_error() {
+    let err = LoadTesting::new(&json!("bad"), PluginHttpClient::default())
+        .err()
+        .unwrap();
+    assert!(err.contains("config must be an object"), "got: {}", err);
+}
+
+#[test]
 fn test_missing_key_is_error() {
     let config = json!({
         "concurrent_clients": 5,
@@ -165,6 +172,95 @@ fn test_missing_key_is_error() {
         .err()
         .unwrap();
     assert!(err.contains("'key' is required"), "got: {}", err);
+}
+
+#[test]
+fn test_invalid_field_types_are_error() {
+    for (config, expected) in [
+        (
+            json!({
+                "key": 42,
+                "concurrent_clients": 5,
+                "duration_seconds": 10
+            }),
+            "'key' must be a string",
+        ),
+        (
+            json!({
+                "key": "test",
+                "concurrent_clients": "5",
+                "duration_seconds": 10
+            }),
+            "'concurrent_clients' must be an unsigned integer",
+        ),
+        (
+            json!({
+                "key": "test",
+                "concurrent_clients": 5,
+                "duration_seconds": "10"
+            }),
+            "'duration_seconds' must be an unsigned integer",
+        ),
+        (
+            json!({
+                "key": "test",
+                "concurrent_clients": 5,
+                "duration_seconds": 10,
+                "ramp": "true"
+            }),
+            "'ramp' must be a boolean",
+        ),
+        (
+            json!({
+                "key": "test",
+                "concurrent_clients": 5,
+                "duration_seconds": 10,
+                "request_timeout_ms": "5000"
+            }),
+            "'request_timeout_ms' must be an unsigned integer",
+        ),
+        (
+            json!({
+                "key": "test",
+                "concurrent_clients": 5,
+                "duration_seconds": 10,
+                "gateway_tls": "true"
+            }),
+            "'gateway_tls' must be a boolean",
+        ),
+        (
+            json!({
+                "key": "test",
+                "concurrent_clients": 5,
+                "duration_seconds": 10,
+                "gateway_tls_no_verify": "false"
+            }),
+            "'gateway_tls_no_verify' must be a boolean",
+        ),
+        (
+            json!({
+                "key": "test",
+                "concurrent_clients": 5,
+                "duration_seconds": 10,
+                "gateway_port": "8000"
+            }),
+            "'gateway_port' must be an unsigned integer",
+        ),
+        (
+            json!({
+                "key": "test",
+                "concurrent_clients": 5,
+                "duration_seconds": 10,
+                "gateway_addresses": "https://node1:8443"
+            }),
+            "'gateway_addresses' must be an array",
+        ),
+    ] {
+        let err = LoadTesting::new(&config, PluginHttpClient::default())
+            .err()
+            .unwrap();
+        assert!(err.contains(expected), "expected {expected}, got: {err}");
+    }
 }
 
 #[test]
@@ -357,6 +453,20 @@ fn test_gateway_addresses_with_non_string_is_error() {
         .err()
         .unwrap();
     assert!(err.contains("must be a string"), "got: {}", err);
+}
+
+#[test]
+fn test_gateway_addresses_invalid_url_is_error() {
+    let config = json!({
+        "key": "test",
+        "concurrent_clients": 5,
+        "duration_seconds": 10,
+        "gateway_addresses": ["not-a-url"]
+    });
+    let err = LoadTesting::new(&config, PluginHttpClient::default())
+        .err()
+        .unwrap();
+    assert!(err.contains("invalid gateway address"), "got: {}", err);
 }
 
 // ---------------------------------------------------------------------------

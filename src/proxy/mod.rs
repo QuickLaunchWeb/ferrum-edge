@@ -107,6 +107,8 @@ use self::http2_pool::Http2ConnectionPool;
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
+const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+
 /// Capability probes run during startup and background refresh, so they should
 /// not inherit long per-request connect timeouts that could hold readiness.
 const BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP: u64 = 5_000;
@@ -5519,6 +5521,11 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
     status_code: u16,
     response_headers: &mut HashMap<String, String>,
 ) {
+    let previous_marker = ctx.metadata.insert(
+        REJECTION_RESPONSE_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+
     for plugin in plugins.iter().filter(|p| p.applies_after_proxy_on_reject()) {
         match plugin.after_proxy(ctx, status_code, response_headers).await {
             PluginResult::Reject {
@@ -5537,6 +5544,13 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
             }
             PluginResult::Continue => {}
         }
+    }
+
+    if let Some(previous_marker) = previous_marker {
+        ctx.metadata
+            .insert(REJECTION_RESPONSE_METADATA_KEY.to_string(), previous_marker);
+    } else {
+        ctx.metadata.remove(REJECTION_RESPONSE_METADATA_KEY);
     }
 }
 
@@ -5941,6 +5955,11 @@ async fn handle_proxy_request_inner(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    ctx.frontend_listen_port = Some(if is_tls {
+        state.env_config.proxy_https_port
+    } else {
+        state.env_config.proxy_http_port
+    });
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     // Store raw query string on ctx for lazy parsing. The local `query_string`
