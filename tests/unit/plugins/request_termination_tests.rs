@@ -1,7 +1,7 @@
 //! Tests for request_termination plugin
 
 use ferrum_edge::plugins::request_termination::RequestTermination;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::{HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use serde_json::json;
 
 fn make_ctx(method: &str, path: &str) -> RequestContext {
@@ -24,10 +24,12 @@ fn make_ctx_with_header(method: &str, path: &str, header: &str, value: &str) -> 
 async fn test_creation_defaults() {
     let plugin = RequestTermination::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "request_termination");
-    assert_eq!(
-        plugin.priority(),
-        ferrum_edge::plugins::priority::REQUEST_TERMINATION
-    );
+    assert_eq!(plugin.priority(), priority::REQUEST_TERMINATION);
+    assert_eq!(plugin.priority(), 125);
+    assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.applies_after_proxy_on_reject());
+    assert!(!plugin.is_auth_plugin());
 }
 
 // === Always trigger ===
@@ -72,35 +74,74 @@ async fn test_custom_status_code() {
 }
 
 #[tokio::test]
-async fn test_invalid_status_code_falls_back_to_503() {
-    let plugin = RequestTermination::new(&json!({
+async fn test_invalid_status_code_rejects_creation() {
+    let err = RequestTermination::new(&json!({
         "status_code": 999
     }))
-    .unwrap();
-    let mut ctx = make_ctx("GET", "/");
+    .err()
+    .expect("invalid status code should be rejected");
 
-    match plugin.on_request_received(&mut ctx).await {
-        PluginResult::Reject { status_code, .. } => {
-            assert_eq!(status_code, 503);
-        }
-        _ => panic!("Expected Reject"),
-    }
+    assert!(err.contains("status_code"), "got: {err}");
 }
 
 #[tokio::test]
-async fn test_status_code_zero_falls_back_to_503() {
-    let plugin = RequestTermination::new(&json!({
+async fn test_status_code_zero_rejects_creation() {
+    let err = RequestTermination::new(&json!({
         "status_code": 0
     }))
-    .unwrap();
-    let mut ctx = make_ctx("GET", "/");
+    .err()
+    .expect("zero status code should be rejected");
 
-    match plugin.on_request_received(&mut ctx).await {
-        PluginResult::Reject { status_code, .. } => {
-            assert_eq!(status_code, 503);
+    assert!(err.contains("status_code"), "got: {err}");
+}
+
+#[test]
+fn test_status_code_non_integer_rejects_creation() {
+    let err = RequestTermination::new(&json!({
+        "status_code": "503"
+    }))
+    .err()
+    .expect("non-integer status code should be rejected");
+
+    assert!(err.contains("status_code"), "got: {err}");
+}
+
+#[test]
+fn test_invalid_content_type_rejects_creation() {
+    let err = RequestTermination::new(&json!({
+        "content_type": "text/plain\r\nx-bad: yes"
+    }))
+    .err()
+    .expect("invalid content-type header value should be rejected");
+
+    assert!(err.contains("content_type"), "got: {err}");
+}
+
+#[test]
+fn test_trigger_rejects_invalid_header_name() {
+    let err = RequestTermination::new(&json!({
+        "trigger": {
+            "header": "bad header"
         }
-        _ => panic!("Expected Reject"),
-    }
+    }))
+    .err()
+    .expect("invalid trigger header should be rejected");
+
+    assert!(err.contains("trigger.header"), "got: {err}");
+}
+
+#[test]
+fn test_trigger_rejects_ambiguous_fields() {
+    let err = RequestTermination::new(&json!({
+        "trigger": {
+            "path_prefix": "/admin",
+            "header": "x-maintenance"
+        }
+    }))
+    .err()
+    .expect("ambiguous trigger fields should be rejected");
+
+    assert!(err.contains("only one"), "got: {err}");
 }
 
 // === Custom body ===

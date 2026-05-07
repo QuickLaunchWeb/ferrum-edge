@@ -1,9 +1,11 @@
 //! Tests for tcp_logging plugin
 
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, tcp_logging::TcpLogging};
+use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginHttpClient, tcp_logging::TcpLogging};
 use serde_json::json;
 
-use super::plugin_utils::create_test_transaction_summary;
+use super::plugin_utils::{
+    create_test_stream_transaction_summary, create_test_transaction_summary,
+};
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -20,6 +22,8 @@ async fn test_tcp_logging_plugin_creation() {
     )
     .unwrap();
     assert_eq!(plugin.name(), "tcp_logging");
+    assert_eq!(plugin.priority(), 9125);
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
 }
 
 #[tokio::test]
@@ -83,6 +87,27 @@ async fn test_tcp_logging_plugin_creation_empty_host() {
 }
 
 #[tokio::test]
+async fn test_tcp_logging_rejects_invalid_config_shapes() {
+    let cases = [
+        json!(null),
+        json!({"host": 123, "port": 5140}),
+        json!({"host": "localhost", "port": "5140"}),
+        json!({"host": "localhost", "port": 5140, "tls": "true"}),
+        json!({"host": "localhost", "port": 5140, "tls_server_name": ""}),
+        json!({"host": "localhost", "port": 5140, "connect_timeout_ms": false}),
+        json!({"host": "localhost", "port": 5140, "batch_size": []}),
+        json!({"host": "localhost", "port": 5140, "max_retries": -1}),
+    ];
+
+    for config in cases {
+        assert!(
+            TcpLogging::new(&config, default_client()).is_err(),
+            "expected invalid config to be rejected: {config}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_tcp_logging_log_does_not_panic() {
     let plugin = TcpLogging::new(
         &json!({
@@ -101,6 +126,25 @@ async fn test_tcp_logging_log_does_not_panic() {
     plugin.log(&summary).await;
 
     // Give the background flush task time to attempt delivery
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+}
+
+#[tokio::test]
+async fn test_tcp_logging_stream_disconnect_does_not_panic() {
+    let plugin = TcpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 1,
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let summary = create_test_stream_transaction_summary();
+
+    plugin.on_stream_disconnect(&summary).await;
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 }
 

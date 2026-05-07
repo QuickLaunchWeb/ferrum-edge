@@ -26,11 +26,10 @@ pub struct TcpConnectionThrottle {
 
 impl TcpConnectionThrottle {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let max_connections_per_key = config["max_connections_per_key"]
-            .as_u64()
-            .ok_or_else(|| {
-                "tcp_connection_throttle: 'max_connections_per_key' is required and must be a positive integer".to_string()
-            })?;
+        let object = config.as_object().ok_or_else(|| {
+            format!("tcp_connection_throttle: config must be an object, got: {config}")
+        })?;
+        let max_connections_per_key = parse_required_u64(object, "max_connections_per_key")?;
 
         if max_connections_per_key == 0 {
             return Err(
@@ -39,10 +38,8 @@ impl TcpConnectionThrottle {
             );
         }
 
-        let cleanup_interval_seconds = config
-            .get("cleanup_interval_seconds")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(60);
+        let cleanup_interval_seconds =
+            parse_optional_u64(object, "cleanup_interval_seconds")?.unwrap_or(60);
 
         let active_counts = Arc::new(DashMap::new());
 
@@ -71,8 +68,26 @@ impl TcpConnectionThrottle {
 
     fn throttle_key(&self, ctx: &StreamConnectionContext) -> String {
         match ctx.effective_identity() {
-            Some(identity) => format!("proxy:{}:consumer:{identity}", ctx.proxy_id),
-            None => format!("proxy:{}:ip:{}", ctx.proxy_id, ctx.client_ip),
+            Some(identity) => {
+                let mut key = String::with_capacity(
+                    "proxy::consumer:".len() + ctx.proxy_id.len() + identity.len(),
+                );
+                key.push_str("proxy:");
+                key.push_str(&ctx.proxy_id);
+                key.push_str(":consumer:");
+                key.push_str(identity);
+                key
+            }
+            None => {
+                let mut key = String::with_capacity(
+                    "proxy::ip:".len() + ctx.proxy_id.len() + ctx.client_ip.len(),
+                );
+                key.push_str("proxy:");
+                key.push_str(&ctx.proxy_id);
+                key.push_str(":ip:");
+                key.push_str(&ctx.client_ip);
+                key
+            }
         }
     }
 
@@ -104,6 +119,26 @@ impl TcpConnectionThrottle {
             }
         }
     }
+}
+
+fn parse_required_u64(object: &serde_json::Map<String, Value>, field: &str) -> Result<u64, String> {
+    object.get(field).and_then(Value::as_u64).ok_or_else(|| {
+        format!("tcp_connection_throttle: '{field}' is required and must be a positive integer")
+    })
+}
+
+fn parse_optional_u64(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<u64>, String> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| format!("tcp_connection_throttle: '{field}' must be an integer"))
+        })
+        .transpose()
 }
 
 #[async_trait]
@@ -140,10 +175,7 @@ impl Plugin for TcpConnectionThrottle {
             });
             return PluginResult::Reject {
                 status_code: 429,
-                body: serde_json::json!({
-                    "error": "TCP connection limit exceeded"
-                })
-                .to_string(),
+                body: r#"{"error":"TCP connection limit exceeded"}"#.into(),
                 headers: HashMap::new(),
             };
         }

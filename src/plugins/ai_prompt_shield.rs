@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, warn};
 
-use super::utils::json_escape::escape_json_string;
+use super::utils::body_transform::is_json_content_type;
 use super::{Plugin, PluginResult, RequestContext};
 
 /// JSON object keys that are structural metadata (model names, IDs, roles,
@@ -99,43 +99,43 @@ fn builtin_pattern(name: &str) -> Option<&'static str> {
 
 impl AiPromptShield {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let action = match config["action"].as_str().unwrap_or("reject") {
+        if !config.is_object() {
+            return Err("ai_prompt_shield: config must be an object".to_string());
+        }
+
+        let action = match optional_string(config, "action")?.unwrap_or("reject") {
+            "reject" => ShieldAction::Reject,
             "redact" => ShieldAction::Redact,
             "warn" => ShieldAction::Warn,
-            _ => ShieldAction::Reject,
+            other => {
+                return Err(format!(
+                    "ai_prompt_shield: 'action' must be one of 'reject', 'redact', or 'warn', got: {other:?}"
+                ));
+            }
         };
 
-        let scan_mode = if config["scan_fields"].as_str().unwrap_or("content") == "all" {
-            ScanMode::All
-        } else {
-            ScanMode::Content
+        let scan_mode = match optional_string(config, "scan_fields")?.unwrap_or("content") {
+            "content" => ScanMode::Content,
+            "all" => ScanMode::All,
+            other => {
+                return Err(format!(
+                    "ai_prompt_shield: 'scan_fields' must be one of 'content' or 'all', got: {other:?}"
+                ));
+            }
         };
 
-        let exclude_roles: HashSet<String> = config["exclude_roles"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let exclude_roles: HashSet<String> =
+            optional_string_array(config, "exclude_roles")?.unwrap_or_default();
 
-        let redaction_template = config["redaction_placeholder"]
-            .as_str()
-            .unwrap_or("[REDACTED:{type}]")
-            .to_string();
+        let redaction_template =
+            optional_string(config, "redaction_placeholder")?.unwrap_or("[REDACTED:{type}]");
 
-        let max_scan_bytes = config["max_scan_bytes"].as_u64().unwrap_or(1_048_576) as usize;
+        let max_scan_bytes =
+            optional_positive_usize(config, "max_scan_bytes")?.unwrap_or(1_048_576);
 
         // Build pattern list from config
-        let pattern_names: Vec<String> = config["patterns"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_else(|| {
+        let pattern_names: Vec<String> =
+            optional_string_vec(config, "patterns")?.unwrap_or_else(|| {
                 vec![
                     "ssn".to_string(),
                     "credit_card".to_string(),
@@ -176,21 +176,19 @@ impl AiPromptShield {
         }
 
         // Add custom patterns
-        if let Some(custom) = config["custom_patterns"].as_array() {
+        if let Some(custom) = optional_array(config, "custom_patterns")? {
             for entry in custom {
-                let name = match entry["name"].as_str() {
-                    Some(n) => n.to_string(),
-                    None => continue,
-                };
-                let regex_str = match entry["regex"].as_str() {
-                    Some(r) => r,
-                    None => continue,
-                };
+                let name = entry["name"]
+                    .as_str()
+                    .ok_or("ai_prompt_shield: custom_patterns entries require string 'name'")?;
+                let regex_str = entry["regex"]
+                    .as_str()
+                    .ok_or("ai_prompt_shield: custom_patterns entries require string 'regex'")?;
                 match Regex::new(regex_str) {
                     Ok(regex) => {
-                        let placeholder = redaction_template.replace("{type}", &name);
+                        let placeholder = redaction_template.replace("{type}", name);
                         patterns.push(PiiPattern {
-                            name,
+                            name: name.to_string(),
                             regex,
                             placeholder,
                         });
@@ -395,7 +393,7 @@ impl Plugin for AiPromptShield {
             && ctx
                 .headers
                 .get("content-type")
-                .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
+                .is_some_and(|ct| is_json_content_type(ct))
     }
 
     async fn before_proxy(
@@ -413,13 +411,13 @@ impl Plugin for AiPromptShield {
             .get("content-type")
             .map(|s| s.as_str())
             .unwrap_or("");
-        if !content_type.contains("json") {
+        if !is_json_content_type(content_type) {
             return PluginResult::Continue;
         }
 
         // Get request body
         let body = match ctx.metadata.get("request_body") {
-            Some(b) if !b.is_empty() => b.clone(),
+            Some(b) if !b.is_empty() => b.as_str(),
             _ => return PluginResult::Continue,
         };
 
@@ -435,9 +433,9 @@ impl Plugin for AiPromptShield {
 
         // Detect PII
         let detected = if self.scan_mode == ScanMode::All {
-            self.detect_pii_in_str(&body)
+            self.detect_pii_in_str(body)
         } else {
-            match serde_json::from_str::<Value>(&body) {
+            match serde_json::from_str::<Value>(body) {
                 Ok(json) => {
                     let texts = self.extract_scan_text(&json);
                     self.detect_pii(&texts)
@@ -456,16 +454,14 @@ impl Plugin for AiPromptShield {
                     "ai_prompt_shield: PII detected (types: {:?}), rejecting request",
                     detected
                 );
-                let types_json: Vec<String> = detected
-                    .iter()
-                    .map(|t| format!("\"{}\"", escape_json_string(t)))
-                    .collect();
                 PluginResult::Reject {
                     status_code: 400,
-                    body: format!(
-                        r#"{{"error":"PII detected in request","detected_types":[{}],"message":"Request blocked: potential PII detected. Remove sensitive data before sending to AI provider."}}"#,
-                        types_json.join(","),
-                    ),
+                    body: serde_json::json!({
+                        "error": "PII detected in request",
+                        "detected_types": detected,
+                        "message": "Request blocked: potential PII detected. Remove sensitive data before sending to AI provider."
+                    })
+                    .to_string(),
                     headers: HashMap::new(),
                 }
             }
@@ -500,7 +496,7 @@ impl Plugin for AiPromptShield {
 
         // Only transform JSON
         if let Some(ct) = content_type
-            && !ct.contains("json")
+            && !is_json_content_type(ct)
         {
             return None;
         }
@@ -548,6 +544,72 @@ impl Plugin for AiPromptShield {
         self.redact_body(&mut json);
         serde_json::to_vec(&json).ok()
     }
+}
+
+fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(Some)
+        .ok_or_else(|| format!("ai_prompt_shield: '{field}' must be a string"))
+}
+
+fn optional_array<'a>(
+    config: &'a Value,
+    field: &'static str,
+) -> Result<Option<&'a Vec<Value>>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_array()
+        .map(Some)
+        .ok_or_else(|| format!("ai_prompt_shield: '{field}' must be an array"))
+}
+
+fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec<String>>, String> {
+    let Some(values) = optional_array(config, field)? else {
+        return Ok(None);
+    };
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(value) = value.as_str() else {
+            return Err(format!(
+                "ai_prompt_shield: '{field}' must contain only strings"
+            ));
+        };
+        out.push(value.to_string());
+    }
+    Ok(Some(out))
+}
+
+fn optional_string_array(
+    config: &Value,
+    field: &'static str,
+) -> Result<Option<HashSet<String>>, String> {
+    optional_string_vec(config, field)
+        .map(|values| values.map(|values| values.into_iter().collect()))
+}
+
+fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option<usize>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_u64() else {
+        return Err(format!(
+            "ai_prompt_shield: '{field}' must be an integer greater than zero"
+        ));
+    };
+    if value == 0 {
+        return Err(format!(
+            "ai_prompt_shield: '{field}' must be greater than zero"
+        ));
+    }
+    usize::try_from(value)
+        .map(Some)
+        .map_err(|_| format!("ai_prompt_shield: '{field}' is too large for this platform"))
 }
 
 /// Recursively redact PII in all string values within a JSON Value,
