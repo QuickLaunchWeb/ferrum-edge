@@ -2179,8 +2179,9 @@ fn take_pooled_copy_buffer(buf_size: usize) -> Option<Vec<u8>> {
         }
 
         // The pool is thread-local rather than task-local. Tokio may move a
-        // relay future before drop, so treat the pool as best-effort and let
-        // its retained capacities adapt when the worker-local pool is full.
+        // relay future before drop, so a miss on a full worker-local pool
+        // evicts the least useful retained buffer without returning one here;
+        // the current allocation can then be retained on drop if it is reusable.
         if buf_size <= TCP_COPY_BUFFER_POOL_MAX_RETAIN
             && pool.len() >= TCP_COPY_BUFFER_POOL_MAX_BUFFERS
             && let Some(idx) = pool
