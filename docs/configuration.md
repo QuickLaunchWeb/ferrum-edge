@@ -164,6 +164,8 @@ With the native `MeshSubscribe` protocol, mesh mode waits for the first delivere
 
 Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Prometheus plugin when mesh metadata is present. The added series are `ferrum_mesh_requests_total` and `ferrum_mesh_request_duration_ms`, labelled with source/destination workload, namespace, principal, app, service, request protocol, response code, response flags, and connection security policy.
 
+HBONE identity metadata is read from all `baggage` headers on an HBONE request. Baggage values may be percent-encoded, and Ferrum decodes them before extracting `source.principal` or `destination.principal`.
+
 Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the canonical config. Remote clusters carry trust domains and federation endpoints, VM `WorkloadEntry` resources populate workload addresses/network/cluster metadata, and east-west gateway entries are materialized as SNI-routed passthrough stream proxies only in `east_west_gateway` topology.
 
 ### Kubernetes Mesh Integration
