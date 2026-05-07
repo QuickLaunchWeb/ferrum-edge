@@ -129,6 +129,7 @@ fn mesh_policy_serializes_with_oneof_scope() {
                 ..Default::default()
             }],
             when: Vec::new(),
+            never_matches: false,
             action: PolicyAction::Deny,
         }],
     };

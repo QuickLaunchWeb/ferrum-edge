@@ -230,6 +230,8 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
 | **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `kafka_logging` (9150), `loki_logging` (9155), `udp_logging` (9160), `ws_logging` (9175), `transaction_debugger` (9200), `prometheus_metrics` (9300), `api_chargeback` (9350), `workload_metrics` (9360), `access_log` (9375) |
 
+`soap_ws_security` keeps AuthN-band priority 1500 for ordering, but validates SOAP bodies in `before_proxy` after request-body buffering is available.
+
 ## Complete Execution Order
 
 Given all built-in plugins enabled, the execution order is:

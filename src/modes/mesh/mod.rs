@@ -1552,6 +1552,7 @@ mod tests {
                         }],
                         to: Vec::new(),
                         when: Vec::new(),
+                        never_matches: false,
                         action: PolicyAction::Allow,
                     }],
                 };
@@ -1666,6 +1667,7 @@ mod tests {
                             }],
                             to: Vec::new(),
                             when: Vec::new(),
+                            never_matches: false,
                             action: PolicyAction::Allow,
                         }],
                     }],

@@ -229,7 +229,10 @@ fn test_plugin_contract() {
     assert_eq!(plugin.priority(), priority::SOAP_WS_SECURITY);
     assert_eq!(plugin.priority(), 1500);
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
-    assert!(plugin.is_auth_plugin());
+    // SOAP WS-Security validates in before_proxy after SOAP bodies are buffered;
+    // enrolling it in the generic auth phase rejects before it can inspect the
+    // UsernameToken.
+    assert!(!plugin.is_auth_plugin());
     assert!(!plugin.modifies_request_headers());
     assert!(!plugin.modifies_request_body());
     assert!(plugin.requires_request_body_before_before_proxy());
