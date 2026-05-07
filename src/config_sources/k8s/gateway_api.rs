@@ -281,8 +281,16 @@ fn route_backends(
 }
 
 fn backend_weight(object: &K8sObject, backend_ref: &Value) -> Result<u32, K8sTranslateError> {
-    let Some(weight) = backend_ref.get("weight").and_then(Value::as_u64) else {
+    let Some(weight_value) = backend_ref.get("weight") else {
         return Ok(1);
+    };
+    let Some(weight) = weight_value.as_u64() else {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "backendRefs[].weight must be between 0 and {MAX_TARGET_WEIGHT} (got {weight_value})"
+            ),
+        ));
     };
     if weight > u64::from(MAX_TARGET_WEIGHT) {
         return Err(invalid_resource(
@@ -783,6 +791,29 @@ mod tests {
             err.to_string()
                 .contains("weight must be between 0 and 65535")
         );
+    }
+
+    #[test]
+    fn http_route_rejects_malformed_backend_weights() {
+        for weight in [serde_json::json!(-1), serde_json::json!(1.5)] {
+            let err = translate_k8s_objects(
+                &[object(
+                    "HTTPRoute",
+                    serde_json::json!({
+                        "rules": [{
+                            "backendRefs": [{"name": "api", "port": 8080, "weight": weight}]
+                        }]
+                    }),
+                )],
+                options(),
+            )
+            .expect_err("malformed backend weight should fail translation");
+
+            assert!(
+                err.to_string()
+                    .contains("weight must be between 0 and 65535")
+            );
+        }
     }
 
     #[test]

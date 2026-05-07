@@ -452,8 +452,16 @@ fn route_backends(
 }
 
 fn route_weight(object: &K8sObject, route: &Value) -> Result<u32, K8sTranslateError> {
-    let Some(weight) = route.get("weight").and_then(Value::as_u64) else {
+    let Some(weight_value) = route.get("weight") else {
         return Ok(0);
+    };
+    let Some(weight) = weight_value.as_u64() else {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService route.weight must be between 0 and {MAX_TARGET_WEIGHT} (got {weight_value})"
+            ),
+        ));
     };
     if weight > u64::from(MAX_TARGET_WEIGHT) {
         return Err(invalid_resource(
@@ -906,5 +914,31 @@ mod tests {
             err.to_string()
                 .contains("weight must be between 0 and 65535")
         );
+    }
+
+    #[test]
+    fn virtual_service_rejects_malformed_route_weights() {
+        for weight in [serde_json::json!(-1), serde_json::json!(1.5)] {
+            let err = translate_k8s_objects(
+                &[object(
+                    "VirtualService",
+                    serde_json::json!({
+                        "hosts": ["api.example.com"],
+                        "http": [{
+                            "route": [
+                                {"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}, "weight": weight}
+                            ]
+                        }]
+                    }),
+                )],
+                options(),
+            )
+            .expect_err("malformed route weight should fail translation");
+
+            assert!(
+                err.to_string()
+                    .contains("weight must be between 0 and 65535")
+            );
+        }
     }
 }
