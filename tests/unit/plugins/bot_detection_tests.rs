@@ -1,7 +1,7 @@
 //! Tests for the Bot Detection plugin
 
 use ferrum_edge::plugins::bot_detection::{BOT_DETECTION_PRIORITY, BotDetection};
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::{HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use serde_json::json;
 
 use super::plugin_utils;
@@ -37,7 +37,12 @@ fn test_plugin_name() {
 fn test_plugin_priority() {
     let plugin = BotDetection::new(&json!({})).unwrap();
     assert_eq!(plugin.priority(), BOT_DETECTION_PRIORITY);
+    assert_eq!(plugin.priority(), priority::BOT_DETECTION);
     assert_eq!(plugin.priority(), 200);
+    assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.applies_after_proxy_on_reject());
+    assert!(!plugin.is_auth_plugin());
 }
 
 // ── Normal browser user-agents pass ─────────────────────────────────────
@@ -332,50 +337,46 @@ async fn test_custom_response_code_boundary_599() {
     plugin_utils::assert_reject(result, Some(599));
 }
 
-// ── Invalid custom response code gets clamped to 403 ────────────────────
+// ── Invalid config is rejected at construction ──────────────────────────
 
-#[tokio::test]
-async fn test_invalid_response_code_below_range_defaults_to_403() {
-    let plugin = BotDetection::new(&json!({
+#[test]
+fn test_invalid_response_code_below_range_rejects_creation() {
+    let err = BotDetection::new(&json!({
         "custom_response_code": 99
     }))
-    .unwrap();
-    let mut ctx = make_ctx_with_ua("curl/7.88.1");
-    let result = plugin.on_request_received(&mut ctx).await;
-    plugin_utils::assert_reject(result, Some(403));
+    .err()
+    .expect("below-range status code must be rejected");
+    assert!(err.contains("custom_response_code"), "got: {err}");
 }
 
-#[tokio::test]
-async fn test_invalid_response_code_above_range_defaults_to_403() {
-    let plugin = BotDetection::new(&json!({
+#[test]
+fn test_invalid_response_code_above_range_rejects_creation() {
+    let err = BotDetection::new(&json!({
         "custom_response_code": 600
     }))
-    .unwrap();
-    let mut ctx = make_ctx_with_ua("curl/7.88.1");
-    let result = plugin.on_request_received(&mut ctx).await;
-    plugin_utils::assert_reject(result, Some(403));
+    .err()
+    .expect("above-range status code must be rejected");
+    assert!(err.contains("custom_response_code"), "got: {err}");
 }
 
-#[tokio::test]
-async fn test_invalid_response_code_zero_defaults_to_403() {
-    let plugin = BotDetection::new(&json!({
+#[test]
+fn test_invalid_response_code_zero_rejects_creation() {
+    let err = BotDetection::new(&json!({
         "custom_response_code": 0
     }))
-    .unwrap();
-    let mut ctx = make_ctx_with_ua("curl/7.88.1");
-    let result = plugin.on_request_received(&mut ctx).await;
-    plugin_utils::assert_reject(result, Some(403));
+    .err()
+    .expect("zero status code must be rejected");
+    assert!(err.contains("custom_response_code"), "got: {err}");
 }
 
-#[tokio::test]
-async fn test_invalid_response_code_string_defaults_to_403() {
-    let plugin = BotDetection::new(&json!({
+#[test]
+fn test_invalid_response_code_string_rejects_creation() {
+    let err = BotDetection::new(&json!({
         "custom_response_code": "not_a_number"
     }))
-    .unwrap();
-    let mut ctx = make_ctx_with_ua("curl/7.88.1");
-    let result = plugin.on_request_received(&mut ctx).await;
-    plugin_utils::assert_reject(result, Some(403));
+    .err()
+    .expect("non-integer status code must be rejected");
+    assert!(err.contains("custom_response_code"), "got: {err}");
 }
 
 #[tokio::test]
@@ -384,6 +385,46 @@ async fn test_missing_response_code_defaults_to_403() {
     let mut ctx = make_ctx_with_ua("curl/7.88.1");
     let result = plugin.on_request_received(&mut ctx).await;
     plugin_utils::assert_reject(result, Some(403));
+}
+
+#[test]
+fn test_non_array_blocked_patterns_rejects_creation() {
+    let err = BotDetection::new(&json!({
+        "blocked_patterns": "curl"
+    }))
+    .err()
+    .expect("blocked_patterns must be an array");
+    assert!(err.contains("blocked_patterns"), "got: {err}");
+}
+
+#[test]
+fn test_non_string_allow_list_entry_rejects_creation() {
+    let err = BotDetection::new(&json!({
+        "allow_list": [42]
+    }))
+    .err()
+    .expect("allow_list entries must be strings");
+    assert!(err.contains("allow_list"), "got: {err}");
+}
+
+#[test]
+fn test_empty_blocked_pattern_rejects_creation() {
+    let err = BotDetection::new(&json!({
+        "blocked_patterns": [""]
+    }))
+    .err()
+    .expect("empty blocked pattern must be rejected");
+    assert!(err.contains("non-empty"), "got: {err}");
+}
+
+#[test]
+fn test_non_bool_allow_missing_user_agent_rejects_creation() {
+    let err = BotDetection::new(&json!({
+        "allow_missing_user_agent": "false"
+    }))
+    .err()
+    .expect("allow_missing_user_agent must be boolean");
+    assert!(err.contains("allow_missing_user_agent"), "got: {err}");
 }
 
 // ── Case-insensitive matching ───────────────────────────────────────────
@@ -422,6 +463,22 @@ async fn test_case_insensitive_custom_pattern() {
     }))
     .unwrap();
     let mut ctx = make_ctx_with_ua("EvilCrawler/3.0");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn test_custom_patterns_treat_regex_metacharacters_as_literals() {
+    let plugin = BotDetection::new(&json!({
+        "blocked_patterns": ["bot.*"]
+    }))
+    .unwrap();
+
+    let mut ctx = make_ctx_with_ua("bot-123");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_continue(result);
+
+    let mut ctx = make_ctx_with_ua("bot.*/1.0");
     let result = plugin.on_request_received(&mut ctx).await;
     plugin_utils::assert_reject(result, Some(403));
 }

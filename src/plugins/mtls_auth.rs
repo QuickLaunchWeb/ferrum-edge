@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
 use x509_parser::prelude::*;
@@ -70,16 +70,57 @@ struct IssuerFilter {
 }
 
 impl IssuerFilter {
-    fn from_json(val: &Value) -> Option<Self> {
-        let obj = val.as_object()?;
-        let cn = obj.get("cn").and_then(|v| v.as_str()).map(String::from);
-        let o = obj.get("o").and_then(|v| v.as_str()).map(String::from);
-        let ou = obj.get("ou").and_then(|v| v.as_str()).map(String::from);
-        // At least one field must be specified
-        if cn.is_none() && o.is_none() && ou.is_none() {
-            return None;
+    fn from_json(val: &Value, context: &str) -> Result<Self, String> {
+        let obj = val
+            .as_object()
+            .ok_or_else(|| format!("mtls_auth: '{context}' entries must be objects, got: {val}"))?;
+        for key in obj.keys() {
+            if !matches!(key.as_str(), "cn" | "o" | "ou") {
+                return Err(format!(
+                    "mtls_auth: '{context}' contains unsupported issuer field '{key}'"
+                ));
+            }
         }
-        Some(Self { cn, o, ou })
+        Self::from_fields(
+            string_field(obj, "cn", context)?,
+            string_field(obj, "o", context)?,
+            string_field(obj, "ou", context)?,
+            context,
+        )
+    }
+
+    fn from_legacy_json(val: &Value) -> Result<Self, String> {
+        let context = "issuer_verification";
+        let obj = val
+            .as_object()
+            .ok_or_else(|| format!("mtls_auth: '{context}' must be an object, got: {val}"))?;
+        for key in obj.keys() {
+            if !matches!(key.as_str(), "issuer_cn" | "issuer_o" | "issuer_ou") {
+                return Err(format!(
+                    "mtls_auth: '{context}' contains unsupported issuer field '{key}'"
+                ));
+            }
+        }
+        Self::from_fields(
+            string_field(obj, "issuer_cn", context)?,
+            string_field(obj, "issuer_o", context)?,
+            string_field(obj, "issuer_ou", context)?,
+            context,
+        )
+    }
+
+    fn from_fields(
+        cn: Option<String>,
+        o: Option<String>,
+        ou: Option<String>,
+        context: &str,
+    ) -> Result<Self, String> {
+        if cn.is_none() && o.is_none() && ou.is_none() {
+            return Err(format!(
+                "mtls_auth: '{context}' issuer filter must specify at least one field"
+            ));
+        }
+        Ok(Self { cn, o, ou })
     }
 
     /// Check if this filter matches the given certificate's issuer DN.
@@ -181,29 +222,14 @@ pub struct MtlsAuth {
     /// Optional per-proxy issuer DN filters (OR across filters, AND within).
     allowed_issuers: Vec<IssuerFilter>,
     /// Optional SHA-256 fingerprints of allowed CA/intermediate certificates.
-    allowed_ca_fingerprints_sha256: Vec<String>,
+    allowed_ca_fingerprints_sha256: HashSet<[u8; 32]>,
 }
 
 impl MtlsAuth {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let cert_field = config["cert_field"]
-            .as_str()
-            .and_then(CertField::from_str)
-            .unwrap_or(CertField::SubjectCn);
-
-        let allowed_issuers = config["allowed_issuers"]
-            .as_array()
-            .map(|arr| arr.iter().filter_map(IssuerFilter::from_json).collect())
-            .unwrap_or_default();
-
-        let allowed_ca_fingerprints_sha256 = config["allowed_ca_fingerprints_sha256"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let cert_field = parse_cert_field(config)?;
+        let allowed_issuers = parse_allowed_issuers(config)?;
+        let allowed_ca_fingerprints_sha256 = parse_allowed_ca_fingerprints(config)?;
 
         Ok(Self {
             cert_field,
@@ -249,12 +275,10 @@ impl MtlsAuth {
 
             let chain = chain_der.unwrap_or(&[]);
             let matched = chain.iter().any(|cert_der| {
-                let mut hasher = Sha256::new();
-                hasher.update(cert_der);
-                let fingerprint = hex::encode(hasher.finalize());
-                self.allowed_ca_fingerprints_sha256
-                    .iter()
-                    .any(|allowed| allowed == &fingerprint)
+                let digest = Sha256::digest(cert_der);
+                let mut fingerprint = [0u8; 32];
+                fingerprint.copy_from_slice(&digest);
+                self.allowed_ca_fingerprints_sha256.contains(&fingerprint)
             });
             if !matched {
                 return Err(
@@ -388,6 +412,97 @@ impl MtlsAuth {
             ),
         }
     }
+}
+
+fn string_field(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    context: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = obj.get(key) else {
+        return Ok(None);
+    };
+    let raw = value
+        .as_str()
+        .ok_or_else(|| format!("mtls_auth: '{context}.{key}' must be a string, got: {value}"))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("mtls_auth: '{context}.{key}' must not be empty"));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn parse_cert_field(config: &Value) -> Result<CertField, String> {
+    match config.get("cert_field") {
+        None | Some(Value::Null) => Ok(CertField::SubjectCn),
+        Some(Value::String(value)) => CertField::from_str(value).ok_or_else(|| {
+            format!("mtls_auth: 'cert_field' must be a supported certificate field, got: {value:?}")
+        }),
+        Some(other) => Err(format!(
+            "mtls_auth: 'cert_field' must be a string, got: {other}"
+        )),
+    }
+}
+
+fn parse_allowed_issuers(config: &Value) -> Result<Vec<IssuerFilter>, String> {
+    let mut filters = Vec::new();
+
+    if let Some(value) = config.get("allowed_issuers")
+        && !value.is_null()
+    {
+        let arr = value.as_array().ok_or_else(|| {
+            format!("mtls_auth: 'allowed_issuers' must be an array, got: {value}")
+        })?;
+        filters.reserve(arr.len());
+        for (idx, entry) in arr.iter().enumerate() {
+            filters.push(IssuerFilter::from_json(
+                entry,
+                &format!("allowed_issuers[{idx}]"),
+            )?);
+        }
+    }
+
+    if let Some(value) = config.get("issuer_verification")
+        && !value.is_null()
+    {
+        filters.push(IssuerFilter::from_legacy_json(value)?);
+    }
+
+    Ok(filters)
+}
+
+fn parse_allowed_ca_fingerprints(config: &Value) -> Result<HashSet<[u8; 32]>, String> {
+    let Some(value) = config.get("allowed_ca_fingerprints_sha256") else {
+        return Ok(HashSet::new());
+    };
+    if value.is_null() {
+        return Ok(HashSet::new());
+    }
+
+    let arr = value.as_array().ok_or_else(|| {
+        format!("mtls_auth: 'allowed_ca_fingerprints_sha256' must be an array, got: {value}")
+    })?;
+    let mut fingerprints = HashSet::with_capacity(arr.len());
+    for (idx, entry) in arr.iter().enumerate() {
+        let raw = entry.as_str().ok_or_else(|| {
+            format!(
+                "mtls_auth: 'allowed_ca_fingerprints_sha256[{idx}]' must be a string, got: {entry}"
+            )
+        })?;
+        let trimmed = raw.trim();
+        let decoded = hex::decode(trimmed).map_err(|_| {
+            format!("mtls_auth: 'allowed_ca_fingerprints_sha256[{idx}]' must be 64 hex characters")
+        })?;
+        if decoded.len() != 32 {
+            return Err(format!(
+                "mtls_auth: 'allowed_ca_fingerprints_sha256[{idx}]' must be 64 hex characters"
+            ));
+        }
+        let mut fingerprint = [0u8; 32];
+        fingerprint.copy_from_slice(&decoded);
+        fingerprints.insert(fingerprint);
+    }
+    Ok(fingerprints)
 }
 
 #[async_trait]

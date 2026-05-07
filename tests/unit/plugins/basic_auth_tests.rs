@@ -1,7 +1,12 @@
 //! Tests for basic_auth plugin
 
 use ferrum_edge::ConsumerIndex;
-use ferrum_edge::plugins::{Plugin, RequestContext, basic_auth::BasicAuth};
+use ferrum_edge::plugins::{
+    HTTP_FAMILY_PROTOCOLS, Plugin, RequestContext,
+    basic_auth::{BasicAuth, DEFAULT_HMAC_SECRET},
+    priority,
+};
+use hmac::{KeyInit, Mac};
 use serde_json::json;
 
 use super::plugin_utils::{assert_continue, assert_reject};
@@ -45,10 +50,84 @@ fn create_basic_auth_consumer() -> ferrum_edge::config::types::Consumer {
     }
 }
 
+fn create_basic_auth_consumer_with_hash(
+    username: &str,
+    password_hash: String,
+) -> ferrum_edge::config::types::Consumer {
+    use chrono::Utc;
+    use serde_json::{Map, Value};
+    use std::collections::HashMap;
+
+    let mut credentials = HashMap::new();
+    let mut basicauth_creds = Map::new();
+    basicauth_creds.insert("password_hash".to_string(), Value::String(password_hash));
+    credentials.insert("basicauth".to_string(), Value::Object(basicauth_creds));
+
+    ferrum_edge::config::types::Consumer {
+        id: format!("{username}-consumer"),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: username.to_string(),
+        custom_id: None,
+        credentials,
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn hmac_sha256_password_hash(password: &str) -> String {
+    type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+
+    let secret =
+        ferrum_edge::config::conf_file::resolve_ferrum_var("FERRUM_BASIC_AUTH_HMAC_SECRET")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_HMAC_SECRET.to_string());
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(password.as_bytes());
+    format!("hmac_sha256:{}", hex::encode(mac.finalize().into_bytes()))
+}
+
 #[tokio::test]
 async fn test_basic_auth_plugin_creation() {
     let plugin = BasicAuth::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "basic_auth");
+}
+
+#[test]
+fn test_basic_auth_plugin_contract() {
+    let plugin = BasicAuth::new(&json!({})).unwrap();
+
+    assert_eq!(plugin.priority(), priority::BASIC_AUTH);
+    assert_eq!(plugin.priority(), 1300);
+    assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
+    assert!(plugin.is_auth_plugin());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.requires_request_body_before_before_proxy());
+    assert!(!plugin.requires_request_body_before_authenticate());
+    assert!(!plugin.needs_request_body_bytes());
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
+    assert!(!plugin.applies_after_proxy_on_reject());
+}
+
+#[test]
+fn test_basic_auth_rejects_invalid_config() {
+    let invalid_configs = [
+        json!(""),
+        json!(true),
+        json!({"unexpected": true}),
+        json!({"realm": "private"}),
+    ];
+
+    for config in invalid_configs {
+        assert!(
+            BasicAuth::new(&config).is_err(),
+            "config should be rejected: {config}"
+        );
+    }
+
+    assert!(BasicAuth::new(&json!(null)).is_ok());
 }
 
 #[tokio::test]
@@ -284,6 +363,53 @@ async fn test_basic_auth_bcrypt_fallback() {
 
     let result2 = plugin.authenticate(&mut ctx2, &consumer_index).await;
     assert_reject(result2, Some(401));
+}
+
+#[tokio::test]
+async fn test_basic_auth_hmac_sha256_password_hash() {
+    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let consumer = create_basic_auth_consumer_with_hash(
+        "hmacuser",
+        hmac_sha256_password_hash("correct-password"),
+    );
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("hmacuser", "correct-password"),
+    );
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(ctx.identified_consumer.unwrap().username, "hmacuser");
+
+    let mut wrong_ctx = make_ctx();
+    wrong_ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("hmacuser", "wrong-password"),
+    );
+
+    let result = plugin.authenticate(&mut wrong_ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_basic_auth_malformed_hmac_hash_is_rejected() {
+    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let consumer =
+        create_basic_auth_consumer_with_hash("hmacuser", "hmac_sha256:not-hex".to_string());
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("hmacuser", "correct-password"),
+    );
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
 }
 
 // ---- Multi-credential rotation tests ----

@@ -1,5 +1,5 @@
 use ferrum_edge::plugins::serverless_function::ServerlessFunction;
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult};
+use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, priority};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -37,7 +37,7 @@ fn test_plugin_name_and_priority() {
     .unwrap();
 
     assert_eq!(plugin.name(), "serverless_function");
-    assert_eq!(plugin.priority(), 3025);
+    assert_eq!(plugin.priority(), priority::SERVERLESS_FUNCTION);
 }
 
 #[test]
@@ -51,8 +51,7 @@ fn test_supported_protocols() {
     )
     .unwrap();
 
-    let protocols = plugin.supported_protocols();
-    assert_eq!(protocols.len(), 2);
+    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
 }
 
 #[test]
@@ -94,6 +93,12 @@ fn test_warmup_hostnames_aws() {
 // ---------------------------------------------------------------------------
 // Config validation
 // ---------------------------------------------------------------------------
+
+#[test]
+fn test_non_object_config_rejects() {
+    let err = expect_err(ServerlessFunction::new(&json!("bad"), default_client()));
+    assert!(err.contains("config must be an object"), "got: {}", err);
+}
 
 #[test]
 fn test_missing_provider_rejects() {
@@ -317,6 +322,87 @@ fn test_non_string_mode_rejects() {
         default_client(),
     ));
     assert!(err.contains("'mode' must be a string"), "got: {}", err);
+}
+
+#[test]
+fn test_non_bool_forward_body_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "forward_body": "yes"
+        }),
+        default_client(),
+    ));
+    assert!(
+        err.contains("'forward_body' must be a boolean"),
+        "got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_non_bool_forward_query_params_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "forward_query_params": 1
+        }),
+        default_client(),
+    ));
+    assert!(
+        err.contains("'forward_query_params' must be a boolean"),
+        "got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_invalid_forward_headers_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "forward_headers": ["X-Request-ID", "bad header"]
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("valid HTTP header name"), "got: {}", err);
+}
+
+#[test]
+fn test_non_array_forward_headers_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "forward_headers": "X-Request-ID"
+        }),
+        default_client(),
+    ));
+    assert!(
+        err.contains("'forward_headers' must be an array"),
+        "got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_non_integer_timeout_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "timeout_ms": "5000"
+        }),
+        default_client(),
+    ));
+    assert!(
+        err.contains("'timeout_ms' must be an unsigned integer"),
+        "got: {}",
+        err
+    );
 }
 
 #[test]
@@ -590,6 +676,52 @@ async fn test_terminate_mode_rejects_grpc_requests() {
 }
 
 #[tokio::test]
+async fn test_terminate_mode_returns_function_response_as_reject_binary() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .set_body_bytes(br#"{"ok":true}"#.to_vec())
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 202);
+            assert_eq!(&body[..], br#"{"ok":true}"#);
+            assert_eq!(
+                headers.get("content-type").map(|v| v.as_str()),
+                Some("application/json")
+            );
+        }
+        other => panic!("Expected RejectBinary, got {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn test_pre_proxy_mode_allows_grpc_requests() {
     // pre_proxy mode should NOT reject gRPC — only terminate does
     let plugin = ServerlessFunction::new(
@@ -643,7 +775,8 @@ fn test_aws_sigv4_includes_security_token_when_present() {
         url,
         b"{}",
         &now,
-    );
+    )
+    .expect("SigV4 signing should succeed");
 
     // Should produce 4 headers (including x-amz-security-token)
     assert_eq!(headers.len(), 4);
@@ -672,7 +805,8 @@ fn test_aws_sigv4_omits_security_token_when_absent() {
         url,
         b"{}",
         &now,
-    );
+    )
+    .expect("SigV4 signing should succeed");
 
     // Should produce 3 headers (no x-amz-security-token)
     assert_eq!(headers.len(), 3);
@@ -681,6 +815,23 @@ fn test_aws_sigv4_omits_security_token_when_absent() {
     // Authorization header should NOT include x-amz-security-token in SignedHeaders
     let auth_header = headers.iter().find(|(k, _)| k == "authorization").unwrap();
     assert!(!auth_header.1.contains("x-amz-security-token"));
+}
+
+#[test]
+fn test_aws_sigv4_rejects_invalid_url() {
+    let aws_config = create_test_aws_config();
+    let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    let result = ferrum_edge::plugins::serverless_function::test_helpers::sign_aws_request_test(
+        &aws_config,
+        "not a url",
+        b"{}",
+        &now,
+    );
+
+    assert!(result.is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -870,7 +1021,8 @@ fn test_aws_sigv4_produces_valid_authorization_header() {
         url,
         payload,
         &now,
-    );
+    )
+    .expect("SigV4 signing should succeed");
 
     assert_eq!(headers.len(), 3);
 
@@ -906,13 +1058,15 @@ fn test_aws_sigv4_different_payloads_produce_different_signatures() {
         url,
         b"{}",
         &now,
-    );
+    )
+    .expect("SigV4 signing should succeed");
     let headers2 = ferrum_edge::plugins::serverless_function::test_helpers::sign_aws_request_test(
         &aws_config,
         url,
         b"{\"key\":\"value\"}",
         &now,
-    );
+    )
+    .expect("SigV4 signing should succeed");
 
     let sig1 = &headers1
         .iter()

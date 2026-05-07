@@ -77,10 +77,6 @@ impl Plugin for MeshAuthz {
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
-        let host = ctx
-            .raw_header_get("host")
-            .or_else(|| ctx.raw_header_get(":authority"))
-            .map(str::to_string);
         ctx.materialize_headers();
         if is_hbone_request(ctx)
             && has_baggage_header_from_request(ctx)
@@ -92,6 +88,10 @@ impl Plugin for MeshAuthz {
             );
         }
         let source_principal = source_principal_from_request(ctx);
+        // The proxy handler backfills HTTP/2/3 `:authority` into materialized
+        // `host` before plugin phases run, so the materialized map is the
+        // single source of truth here.
+        let host = ctx.headers.get("host").cloned();
         let headers: BTreeMap<String, String> = ctx
             .headers
             .iter()
@@ -102,10 +102,11 @@ impl Plugin for MeshAuthz {
             method: Some(ctx.method.clone()),
             path: Some(ctx.path.clone()),
             host,
-            port: ctx
-                .matched_proxy
-                .as_ref()
-                .and_then(|proxy| proxy.listen_port),
+            port: ctx.frontend_listen_port.or_else(|| {
+                ctx.matched_proxy
+                    .as_ref()
+                    .and_then(|proxy| proxy.listen_port)
+            }),
             headers,
             attributes: BTreeMap::new(),
         };

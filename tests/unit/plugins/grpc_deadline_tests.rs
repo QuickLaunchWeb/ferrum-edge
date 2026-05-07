@@ -1,4 +1,4 @@
-use ferrum_edge::plugins::{PluginResult, create_plugin};
+use ferrum_edge::plugins::{GRPC_ONLY_PROTOCOLS, PluginResult, create_plugin, priority};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -26,7 +26,7 @@ fn test_plugin_creation() {
     });
     let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
     assert_eq!(plugin.name(), "grpc_deadline");
-    assert_eq!(plugin.priority(), 3050);
+    assert_eq!(plugin.priority(), priority::GRPC_DEADLINE);
 }
 
 #[test]
@@ -39,9 +39,7 @@ fn test_in_available_plugins() {
 fn test_supported_protocols() {
     let config = json!({ "max_deadline_ms": 30000 });
     let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
-    let protocols = plugin.supported_protocols();
-    assert_eq!(protocols.len(), 1);
-    assert_eq!(protocols[0], ferrum_edge::plugins::ProxyProtocol::Grpc);
+    assert_eq!(plugin.supported_protocols(), GRPC_ONLY_PROTOCOLS);
 }
 
 #[test]
@@ -54,12 +52,47 @@ fn test_modifies_request_headers() {
 // ── Constructor validation ─────────────────────────────────────────
 
 #[test]
+fn test_non_object_config_rejected() {
+    let err = create_plugin("grpc_deadline", &json!("bad"))
+        .err()
+        .expect("non-object config should be rejected");
+    assert!(err.contains("config must be an object"), "got: {err}");
+}
+
+#[test]
 fn test_empty_config_rejected() {
     // Plugin with no rules would be a no-op — must be rejected per CLAUDE.md
     let err = create_plugin("grpc_deadline", &json!({}))
         .err()
         .expect("empty config should be rejected");
     assert!(err.contains("no rules configured"), "got: {err}");
+}
+
+#[test]
+fn test_invalid_field_types_rejected() {
+    for (config, expected) in [
+        (
+            json!({ "max_deadline_ms": "30000" }),
+            "'max_deadline_ms' must be an unsigned integer",
+        ),
+        (
+            json!({ "default_deadline_ms": -1 }),
+            "'default_deadline_ms' must be an unsigned integer",
+        ),
+        (
+            json!({ "subtract_gateway_processing": "true" }),
+            "'subtract_gateway_processing' must be a boolean",
+        ),
+        (
+            json!({ "reject_no_deadline": 1 }),
+            "'reject_no_deadline' must be a boolean",
+        ),
+    ] {
+        let err = create_plugin("grpc_deadline", &config)
+            .err()
+            .expect("invalid field shape should be rejected");
+        assert!(err.contains(expected), "expected {expected}, got: {err}");
+    }
 }
 
 #[test]

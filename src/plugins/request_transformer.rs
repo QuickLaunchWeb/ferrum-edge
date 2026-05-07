@@ -83,11 +83,22 @@ fn contains_crlf(s: &str) -> bool {
 
 impl RequestTransformer {
     pub fn new(config: &Value) -> Result<Self, String> {
+        if !config.is_object() {
+            return Err("request_transformer: config must be an object".to_string());
+        }
         let mut header_rules: Vec<HeaderRule> = Vec::new();
         let mut query_rules: Vec<QueryRule> = Vec::new();
 
-        if let Some(arr) = config["rules"].as_array() {
+        if let Some(rules) = config.get("rules") {
+            let arr = rules
+                .as_array()
+                .ok_or("request_transformer: 'rules' must be an array")?;
             for (idx, r) in arr.iter().enumerate() {
+                if !r.is_object() {
+                    return Err(format!(
+                        "request_transformer: rule[{idx}]: rule must be an object"
+                    ));
+                }
                 // `target` defaults to "header" only when the field is
                 // ABSENT (backward compat for terse header-only configs).
                 // An explicit `"target": null` — or any non-string value —

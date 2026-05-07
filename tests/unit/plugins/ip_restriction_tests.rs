@@ -1,5 +1,7 @@
 use ferrum_edge::plugins::ip_restriction::IpRestriction;
-use ferrum_edge::plugins::{Plugin, RequestContext, StreamConnectionContext};
+use ferrum_edge::plugins::{
+    ALL_PROTOCOLS, Plugin, RequestContext, StreamConnectionContext, priority,
+};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -390,7 +392,12 @@ async fn plugin_name_is_ip_restriction() {
 #[tokio::test]
 async fn plugin_priority_is_150() {
     let plugin = IpRestriction::new(&json!({"allow": ["0.0.0.0/0"]})).unwrap();
+    assert_eq!(plugin.priority(), priority::IP_RESTRICTION);
     assert_eq!(plugin.priority(), 150);
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.applies_after_proxy_on_reject());
+    assert!(!plugin.is_auth_plugin());
 }
 
 // ── IPv6 with :: shorthand ──────────────────────────────────────────
@@ -513,6 +520,37 @@ fn invalid_deny_cidr_rule_rejects_creation() {
     );
 }
 
+#[test]
+fn invalid_mode_rejects_creation() {
+    let result = IpRestriction::new(&json!({
+        "allow": ["10.0.0.0/8"],
+        "mode": "permit_first"
+    }));
+
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("mode"));
+}
+
+#[test]
+fn non_array_allow_rejects_creation() {
+    let result = IpRestriction::new(&json!({
+        "allow": "10.0.0.0/8"
+    }));
+
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("allow"));
+}
+
+#[test]
+fn empty_rule_string_rejects_creation() {
+    let result = IpRestriction::new(&json!({
+        "deny": [""]
+    }));
+
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("non-empty"));
+}
+
 // ── IPv6 zone identifier handling ───────────────────────────────────
 // A malformed X-Forwarded-For from an upstream proxy could surface a
 // client IP with a zone suffix (e.g. "fe80::1%eth0"). Stripping the zone
@@ -554,6 +592,18 @@ async fn ipv6_rule_with_zone_suffix_is_normalized_to_address() {
     .unwrap();
 
     let mut ctx = create_context_with_ip("fe80::1");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_continue(result);
+}
+
+#[tokio::test]
+async fn ipv6_mapped_ipv4_form_matches_cidr_without_heap_parser() {
+    let plugin = IpRestriction::new(&json!({
+        "allow": ["::ffff:192.168.0.0/112"]
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("::ffff:192.168.1.1");
     let result = plugin.on_request_received(&mut ctx).await;
     plugin_utils::assert_continue(result);
 }
