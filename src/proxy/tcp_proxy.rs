@@ -2165,6 +2165,37 @@ thread_local! {
     static TCP_COPY_BUFFER_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
 }
 
+fn take_pooled_copy_buffer(buf_size: usize) -> Option<Vec<u8>> {
+    TCP_COPY_BUFFER_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let best_fit = pool
+            .iter()
+            .enumerate()
+            .filter(|(_, buf)| buf.capacity() >= buf_size)
+            .min_by_key(|(_, buf)| buf.capacity())
+            .map(|(idx, _)| idx);
+        if let Some(idx) = best_fit {
+            return Some(pool.swap_remove(idx));
+        }
+
+        // The pool is thread-local rather than task-local. Tokio may move a
+        // relay future before drop, so treat the pool as best-effort and let
+        // its retained capacities adapt when the worker-local pool is full.
+        if buf_size <= TCP_COPY_BUFFER_POOL_MAX_RETAIN
+            && pool.len() >= TCP_COPY_BUFFER_POOL_MAX_BUFFERS
+            && let Some(idx) = pool
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, buf)| buf.capacity())
+                .map(|(idx, _)| idx)
+        {
+            let _ = pool.swap_remove(idx);
+        }
+
+        None
+    })
+}
+
 struct PooledCopyBuffer {
     buf: Vec<u8>,
 }
@@ -2172,14 +2203,9 @@ struct PooledCopyBuffer {
 impl PooledCopyBuffer {
     fn new(buf_size: usize) -> Self {
         let buf_size = buf_size.max(TCP_COPY_BUFFER_MIN_SIZE);
-        let mut buf = TCP_COPY_BUFFER_POOL
-            .with(|pool| pool.borrow_mut().pop())
-            .unwrap_or_else(|| Vec::with_capacity(buf_size));
-        if buf.len() < buf_size {
-            buf.resize(buf_size, 0);
-        } else {
-            buf.truncate(buf_size);
-        }
+        let mut buf =
+            take_pooled_copy_buffer(buf_size).unwrap_or_else(|| Vec::with_capacity(buf_size));
+        buf.resize(buf_size, 0);
         Self { buf }
     }
 
@@ -2656,9 +2682,13 @@ where
     let mut phase1_benign_write_candidate: bool = false;
     let mut c2b_done = false;
     let mut b2c_done = false;
+    let mut poll_c2b_first = true;
 
     let phase1_outcome = poll_fn(|cx| {
-        if !c2b_done {
+        let poll_c2b_this_turn = poll_c2b_first;
+        poll_c2b_first = !poll_c2b_first;
+
+        if poll_c2b_this_turn && !c2b_done {
             match poll_copy_direction(
                 cx,
                 Pin::new(&mut client),
@@ -2685,6 +2715,21 @@ where
                 None,
             ) {
                 Poll::Ready(result) => return Poll::Ready(Phase1Outcome::BackendToClient(result)),
+                Poll::Pending => {}
+            }
+        }
+        if !poll_c2b_this_turn && !c2b_done {
+            match poll_copy_direction(
+                cx,
+                Pin::new(&mut client),
+                Pin::new(&mut backend),
+                &mut c2b_state,
+                &c2b_bytes,
+                last_activity,
+                None,
+                c2b_write_watermark,
+            ) {
+                Poll::Ready(result) => return Poll::Ready(Phase1Outcome::ClientToBackend(result)),
                 Poll::Pending => {}
             }
         }
