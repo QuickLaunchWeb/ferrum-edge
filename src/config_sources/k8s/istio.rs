@@ -16,8 +16,6 @@ use super::{
 };
 use crate::config::types::BackendScheme;
 
-const ALLOW_NOTHING_SPIFFE_PATTERN: &str = "__ferrum_allow_nothing_never_matches__";
-
 pub(super) fn translate(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -113,6 +111,11 @@ fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateEr
         .map(|rule| mesh_rule(object, rule, action))
         .collect::<Result<Vec<_>, _>>()?;
     if rules.is_empty() && action == PolicyAction::Allow {
+        tracing::warn!(
+            namespace = %object.metadata.namespace,
+            policy = %object.metadata.name,
+            "Istio ALLOW AuthorizationPolicy has no rules; emitting synthetic never-match allow rule to preserve allow-nothing semantics",
+        );
         rules.push(allow_nothing_rule());
     }
 
@@ -126,13 +129,10 @@ fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateEr
 
 fn allow_nothing_rule() -> MeshRule {
     MeshRule {
-        from: vec![PrincipalMatch {
-            spiffe_id_pattern: Some(ALLOW_NOTHING_SPIFFE_PATTERN.to_string()),
-            namespace_pattern: None,
-            trust_domain: None,
-        }],
+        from: Vec::new(),
         to: Vec::new(),
         when: Vec::new(),
+        never_matches: true,
         action: PolicyAction::Allow,
     }
 }
@@ -168,6 +168,7 @@ fn mesh_rule(
         from,
         to,
         when,
+        never_matches: false,
         action,
     })
 }
@@ -565,10 +566,8 @@ mod tests {
         ));
         assert_eq!(policy.rules.len(), 1);
         assert_eq!(policy.rules[0].action, PolicyAction::Allow);
-        assert_eq!(
-            policy.rules[0].from[0].spiffe_id_pattern.as_deref(),
-            Some(ALLOW_NOTHING_SPIFFE_PATTERN)
-        );
+        assert!(policy.rules[0].never_matches);
+        assert!(policy.rules[0].from.is_empty());
 
         let decision = evaluate_mesh_authorization(
             &MeshSlice {
@@ -597,10 +596,7 @@ mod tests {
         ));
         assert_eq!(policy.rules.len(), 1);
         assert_eq!(policy.rules[0].action, PolicyAction::Allow);
-        assert_eq!(
-            policy.rules[0].from[0].spiffe_id_pattern.as_deref(),
-            Some(ALLOW_NOTHING_SPIFFE_PATTERN)
-        );
+        assert!(policy.rules[0].never_matches);
     }
 
     #[test]
@@ -609,10 +605,7 @@ mod tests {
 
         assert_eq!(policy.rules.len(), 1);
         assert_eq!(policy.rules[0].action, PolicyAction::Allow);
-        assert_eq!(
-            policy.rules[0].from[0].spiffe_id_pattern.as_deref(),
-            Some(ALLOW_NOTHING_SPIFFE_PATTERN)
-        );
+        assert!(policy.rules[0].never_matches);
     }
 
     #[test]
