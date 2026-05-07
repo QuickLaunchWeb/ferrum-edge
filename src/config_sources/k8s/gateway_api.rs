@@ -273,6 +273,8 @@ fn validate_supported_backend_ref(
 }
 
 fn api_group(api_version: &str) -> &str {
+    // Core Kubernetes API versions such as "v1" have no slash; Gateway API
+    // represents that core group as the empty string in ReferenceGrant fields.
     api_version
         .split_once('/')
         .map(|(group, _version)| group)
@@ -554,6 +556,90 @@ mod tests {
         assert_eq!(
             result.config.proxies[0].backend_host,
             "api.backend.svc.cluster.local"
+        );
+    }
+
+    #[test]
+    fn accepts_tcp_route_cross_namespace_backend_ref_with_reference_grant() {
+        let route = object(
+            "TCPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "backendRefs": [{
+                        "name": "db",
+                        "namespace": "backend",
+                        "port": 5432
+                    }]
+                }]
+            }),
+        );
+        let grant = object_in_namespace(
+            "ReferenceGrant",
+            "backend",
+            serde_json::json!({
+                "from": [{
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "TCPRoute",
+                    "namespace": "default"
+                }],
+                "to": [{
+                    "group": "",
+                    "kind": "Service"
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[route, grant], options())
+            .expect("ReferenceGrant should authorize TCPRoute backendRef");
+
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "db.backend.svc.cluster.local"
+        );
+        assert_eq!(result.config.proxies[0].listen_port, Some(5432));
+        assert_eq!(
+            result.config.proxies[0].backend_scheme,
+            Some(BackendScheme::Tcp)
+        );
+    }
+
+    #[test]
+    fn rejects_tls_route_cross_namespace_backend_ref_when_reference_grant_from_group_mismatches() {
+        let route = object(
+            "TLSRoute",
+            serde_json::json!({
+                "hostnames": ["db.example.com"],
+                "rules": [{
+                    "backendRefs": [{
+                        "name": "db",
+                        "namespace": "backend",
+                        "port": 15443
+                    }]
+                }]
+            }),
+        );
+        let grant = object_in_namespace(
+            "ReferenceGrant",
+            "backend",
+            serde_json::json!({
+                "from": [{
+                    "group": "",
+                    "kind": "TLSRoute",
+                    "namespace": "default"
+                }],
+                "to": [{
+                    "group": "",
+                    "kind": "Service"
+                }]
+            }),
+        );
+
+        let err = translate_k8s_objects(&[route, grant], options())
+            .expect_err("ReferenceGrant group must match TLSRoute API group");
+
+        assert!(
+            err.to_string()
+                .contains("requires a matching ReferenceGrant")
         );
     }
 }
