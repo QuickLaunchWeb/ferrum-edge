@@ -4,14 +4,17 @@
 //! configurable patterns. Supports an allow-list for legitimate bots.
 
 use async_trait::async_trait;
+use regex::{RegexSet, RegexSetBuilder};
 use serde_json::Value;
 use std::collections::HashMap;
 
 use super::{Plugin, PluginResult, RequestContext};
 
+const FORBIDDEN_BODY: &str = r#"{"error":"Forbidden"}"#;
+
 pub struct BotDetection {
-    blocked_patterns: Vec<String>,
-    allow_list: Vec<String>,
+    blocked_patterns: Option<RegexSet>,
+    allow_list: Option<RegexSet>,
     custom_response_code: u16,
     /// Whether to allow requests with no User-Agent header.
     /// Defaults to true so health checks (which often omit User-Agent) pass.
@@ -20,58 +23,127 @@ pub struct BotDetection {
 
 impl BotDetection {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let blocked_patterns = config["blocked_patterns"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                    .collect()
-            })
-            .unwrap_or_else(default_blocked_patterns);
-
-        let allow_list = config["allow_list"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let custom_response_code = config["custom_response_code"]
-            .as_u64()
-            .map(|c| c as u16)
-            .filter(|&c| (100..=599).contains(&c))
-            .unwrap_or(403);
-
-        let allow_missing_user_agent = config["allow_missing_user_agent"].as_bool().unwrap_or(true);
+        let blocked_patterns =
+            parse_pattern_list(config, "blocked_patterns", Some(default_blocked_patterns()))?;
+        let allow_list = parse_pattern_list(config, "allow_list", None)?;
+        let custom_response_code = parse_response_code(config)?;
+        let allow_missing_user_agent = parse_bool(config, "allow_missing_user_agent", true)?;
 
         Ok(Self {
-            blocked_patterns,
-            allow_list,
+            blocked_patterns: compile_literal_pattern_set("blocked_patterns", &blocked_patterns)?,
+            allow_list: compile_literal_pattern_set("allow_list", &allow_list)?,
             custom_response_code,
             allow_missing_user_agent,
         })
     }
 }
 
-fn default_blocked_patterns() -> Vec<String> {
+fn default_blocked_patterns() -> Vec<&'static str> {
     vec![
-        "curl".to_string(),
-        "wget".to_string(),
-        "python-requests".to_string(),
-        "python-urllib".to_string(),
-        "scrapy".to_string(),
-        "httpclient".to_string(),
-        "java/".to_string(),
-        "libwww-perl".to_string(),
-        "mechanize".to_string(),
-        "php/".to_string(),
+        "curl",
+        "wget",
+        "python-requests",
+        "python-urllib",
+        "scrapy",
+        "httpclient",
+        "java/",
+        "libwww-perl",
+        "mechanize",
+        "php/",
     ]
 }
 
+fn parse_pattern_list(
+    config: &Value,
+    key: &str,
+    default: Option<Vec<&'static str>>,
+) -> Result<Vec<String>, String> {
+    let Some(value) = config.get(key) else {
+        return Ok(default
+            .unwrap_or_default()
+            .into_iter()
+            .map(str::to_string)
+            .collect());
+    };
+    if value.is_null() {
+        return Ok(default
+            .unwrap_or_default()
+            .into_iter()
+            .map(str::to_string)
+            .collect());
+    }
+    let Value::Array(arr) = value else {
+        return Err(format!(
+            "bot_detection: '{key}' must be an array of User-Agent substrings"
+        ));
+    };
+
+    let mut patterns = Vec::with_capacity(arr.len());
+    for value in arr {
+        let pattern = value
+            .as_str()
+            .ok_or_else(|| format!("bot_detection: '{key}' entries must be strings"))?
+            .trim();
+        if pattern.is_empty() {
+            return Err(format!(
+                "bot_detection: '{key}' entries must be non-empty strings"
+            ));
+        }
+        patterns.push(pattern.to_string());
+    }
+    Ok(patterns)
+}
+
+fn compile_literal_pattern_set(key: &str, patterns: &[String]) -> Result<Option<RegexSet>, String> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+
+    let escaped_patterns = patterns.iter().map(|pattern| regex::escape(pattern));
+    let mut builder = RegexSetBuilder::new(escaped_patterns);
+    builder.case_insensitive(true);
+    builder
+        .build()
+        .map(Some)
+        .map_err(|e| format!("bot_detection: failed to compile '{key}' patterns: {e}"))
+}
+
+fn parse_response_code(config: &Value) -> Result<u16, String> {
+    match config.get("custom_response_code") {
+        None | Some(Value::Null) => Ok(403),
+        Some(Value::Number(value)) => {
+            let Some(code) = value.as_u64() else {
+                return Err(
+                    "bot_detection: 'custom_response_code' must be an integer from 100 to 599"
+                        .to_string(),
+                );
+            };
+            if !(100..=599).contains(&code) {
+                return Err(format!(
+                    "bot_detection: 'custom_response_code' must be from 100 to 599, got {code}"
+                ));
+            }
+            u16::try_from(code)
+                .map_err(|_| "bot_detection: 'custom_response_code' is too large".to_string())
+        }
+        Some(other) => Err(format!(
+            "bot_detection: 'custom_response_code' must be an integer from 100 to 599, got: {other}"
+        )),
+    }
+}
+
+fn parse_bool(config: &Value, key: &str, default: bool) -> Result<bool, String> {
+    match config.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(other) => Err(format!(
+            "bot_detection: '{key}' must be a boolean, got: {other}"
+        )),
+    }
+}
+
 /// Plugin priority: runs early in pre-processing (before auth).
-pub const BOT_DETECTION_PRIORITY: u16 = 200;
+pub const BOT_DETECTION_PRIORITY: u16 = super::priority::BOT_DETECTION;
 
 #[async_trait]
 impl Plugin for BotDetection {
@@ -88,8 +160,8 @@ impl Plugin for BotDetection {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        let user_agent = match ctx.headers.get("user-agent") {
-            Some(ua) => ua.to_lowercase(),
+        let user_agent = match ctx.headers.get("user-agent").map(String::as_str) {
+            Some(ua) => ua,
             None => {
                 // No user-agent header — allow or reject based on configuration.
                 // Health checks, load balancers, and internal services often omit
@@ -99,28 +171,32 @@ impl Plugin for BotDetection {
                 }
                 return PluginResult::Reject {
                     status_code: self.custom_response_code,
-                    body: r#"{"error":"Forbidden"}"#.to_string(),
+                    body: FORBIDDEN_BODY.to_string(),
                     headers: HashMap::new(),
                 };
             }
         };
 
         // Check allow-list first
-        for allowed in &self.allow_list {
-            if user_agent.contains(allowed.as_str()) {
-                return PluginResult::Continue;
-            }
+        if self
+            .allow_list
+            .as_ref()
+            .is_some_and(|allow_list| allow_list.is_match(user_agent))
+        {
+            return PluginResult::Continue;
         }
 
         // Check blocked patterns
-        for pattern in &self.blocked_patterns {
-            if user_agent.contains(pattern.as_str()) {
-                return PluginResult::Reject {
-                    status_code: self.custom_response_code,
-                    body: r#"{"error":"Forbidden"}"#.to_string(),
-                    headers: HashMap::new(),
-                };
-            }
+        if self
+            .blocked_patterns
+            .as_ref()
+            .is_some_and(|blocked_patterns| blocked_patterns.is_match(user_agent))
+        {
+            return PluginResult::Reject {
+                status_code: self.custom_response_code,
+                body: FORBIDDEN_BODY.to_string(),
+                headers: HashMap::new(),
+            };
         }
 
         PluginResult::Continue

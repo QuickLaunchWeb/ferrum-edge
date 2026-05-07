@@ -47,8 +47,21 @@ pub struct BasicAuth {
 }
 
 impl BasicAuth {
-    pub fn new(_config: &Value) -> Result<Self, String> {
+    pub fn new(config: &Value) -> Result<Self, String> {
         use crate::config::conf_file::resolve_ferrum_var;
+
+        match config {
+            Value::Null => {}
+            Value::Object(obj) if obj.is_empty() => {}
+            Value::Object(_) => {
+                return Err("basic_auth: no configuration fields are supported".to_string());
+            }
+            other => {
+                return Err(format!(
+                    "basic_auth: config must be an object, got: {other}"
+                ));
+            }
+        }
 
         let (hmac_secret, is_default) = match resolve_ferrum_var("FERRUM_BASIC_AUTH_HMAC_SECRET")
             .filter(|s| !s.is_empty())
@@ -83,10 +96,14 @@ impl BasicAuth {
                 return false;
             };
             mac.update(password.as_bytes());
-            let computed = hex::encode(mac.finalize().into_bytes());
+            let computed = mac.finalize().into_bytes();
+            let mut expected = [0u8; 32];
+            if hex::decode_to_slice(hex_hash, &mut expected).is_err() {
+                return false;
+            }
 
             // Constant-time comparison to prevent timing attacks
-            constant_time_eq(computed.as_bytes(), hex_hash.as_bytes())
+            constant_time_eq(&computed, &expected)
         } else {
             // Bcrypt fallback (handles $2b$, $2a$, $2y$ prefixes)
             bcrypt::verify(password, stored_hash).unwrap_or(false)
@@ -129,16 +146,15 @@ impl AuthMechanism for BasicAuth {
             }
         };
 
-        let parts: Vec<&str> = credential_str.splitn(2, ':').collect();
-        if parts.len() != 2 {
+        let Some((username, password)) = credential_str.split_once(':') else {
             return ExtractedCredential::InvalidFormat(
                 r#"{"error":"Invalid Basic auth format"}"#.into(),
             );
-        }
+        };
 
         ExtractedCredential::BasicAuth {
-            username: parts[0].to_string(),
-            password: parts[1].to_string(),
+            username: username.to_string(),
+            password: password.to_string(),
         }
     }
 

@@ -13,8 +13,17 @@ use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
 pub struct SpiffeIdentity;
 
 impl SpiffeIdentity {
-    pub fn new(_config: &Value) -> Result<Self, String> {
-        Ok(Self)
+    pub fn new(config: &Value) -> Result<Self, String> {
+        match config {
+            Value::Null => Ok(Self),
+            Value::Object(obj) if obj.is_empty() => Ok(Self),
+            Value::Object(_) => {
+                Err("spiffe_identity: no configuration fields are supported".to_string())
+            }
+            other => Err(format!(
+                "spiffe_identity: config must be an object, got: {other}"
+            )),
+        }
     }
 }
 
