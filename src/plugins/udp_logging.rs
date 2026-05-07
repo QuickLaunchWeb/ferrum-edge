@@ -30,6 +30,7 @@ use tracing::warn;
 use super::utils::{
     BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry,
     UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, resolve_udp_endpoint,
+    validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
@@ -64,12 +65,18 @@ pub struct UdpLogging {
 
 impl UdpLogging {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        let host = config["host"]
-            .as_str()
+        if !config.is_object() {
+            return Err("udp_logging: config must be an object".to_string());
+        }
+
+        let host = config
+            .get("host")
+            .and_then(Value::as_str)
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "udp_logging: 'host' is required".to_string())?
             .to_string();
-        let port = config["port"].as_u64().ok_or_else(|| {
+        let port = config.get("port").and_then(Value::as_u64).ok_or_else(|| {
             "udp_logging: 'port' is required and must be a positive integer".to_string()
         })?;
         if port == 0 || port > 65535 {
@@ -78,11 +85,11 @@ impl UdpLogging {
             ));
         }
 
-        let dtls_enabled = config["dtls"].as_bool().unwrap_or(false);
-        let dtls_cert_path = config["dtls_cert_path"].as_str().map(|s| s.to_string());
-        let dtls_key_path = config["dtls_key_path"].as_str().map(|s| s.to_string());
-        let dtls_ca_cert_path = config["dtls_ca_cert_path"].as_str().map(|s| s.to_string());
-        let dtls_no_verify = config["dtls_no_verify"].as_bool().unwrap_or(false);
+        let dtls_enabled = optional_bool(config, "dtls")?.unwrap_or(false);
+        let dtls_cert_path = optional_non_empty_string(config, "dtls_cert_path")?;
+        let dtls_key_path = optional_non_empty_string(config, "dtls_key_path")?;
+        let dtls_ca_cert_path = optional_non_empty_string(config, "dtls_ca_cert_path")?;
+        let dtls_no_verify = optional_bool(config, "dtls_no_verify")?.unwrap_or(false);
 
         if dtls_cert_path.is_some() != dtls_key_path.is_some() {
             return Err(
@@ -90,6 +97,17 @@ impl UdpLogging {
                     .to_string(),
             );
         }
+
+        let batch_defaults = BatchConfigDefaults {
+            batch_size_key: "batch_size",
+            batch_size: 10,
+            flush_interval_ms: 1000,
+            min_flush_interval_ms: 100,
+            buffer_capacity: 10000,
+            max_retries: 1,
+            retry_delay_ms: 500,
+        };
+        validate_batch_config(config, "udp_logging", batch_defaults)?;
 
         let flush_config = UdpFlushConfig {
             host: host.clone(),
@@ -110,19 +128,7 @@ impl UdpLogging {
         let logger = BatchingLogger::spawn(
             // Config remains `max_retries`; the shared retry policy counts the
             // initial attempt plus those retries.
-            build_batch_config(
-                config,
-                "udp_logging",
-                BatchConfigDefaults {
-                    batch_size_key: "batch_size",
-                    batch_size: 10,
-                    flush_interval_ms: 1000,
-                    min_flush_interval_ms: 100,
-                    buffer_capacity: 10000,
-                    max_retries: 1,
-                    retry_delay_ms: 500,
-                },
-            ),
+            build_batch_config(config, "udp_logging", batch_defaults),
             move |batch| {
                 let flush_config = flush_config.clone();
                 let state = Arc::clone(&state);
@@ -134,6 +140,32 @@ impl UdpLogging {
             logger,
             endpoint_hostname: host,
         })
+    }
+}
+
+fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
+    match config.get(key) {
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| format!("udp_logging: '{key}' must be a boolean")),
+        None => Ok(None),
+    }
+}
+
+fn optional_non_empty_string(config: &Value, key: &str) -> Result<Option<String>, String> {
+    match config.get(key) {
+        Some(value) => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("udp_logging: '{key}' must be a string"))?
+                .trim();
+            if value.is_empty() {
+                return Err(format!("udp_logging: '{key}' must not be empty"));
+            }
+            Ok(Some(value.to_string()))
+        }
+        None => Ok(None),
     }
 }
 

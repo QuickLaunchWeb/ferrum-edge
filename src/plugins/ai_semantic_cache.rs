@@ -38,11 +38,13 @@ use dashmap::DashMap;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+use super::utils::body_transform::is_json_content_type;
 use super::utils::cache_headers::sanitize_cached_headers;
 use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
@@ -93,48 +95,46 @@ struct SerializableCacheEntry {
 
 impl AiSemanticCache {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        let ttl_seconds = config["ttl_seconds"].as_u64().unwrap_or(300);
-        if ttl_seconds == 0 {
-            return Err("ai_semantic_cache: ttl_seconds must be greater than 0".to_string());
+        if !config.is_object() {
+            return Err("ai_semantic_cache: config must be an object".to_string());
         }
+
+        let ttl_seconds = optional_positive_u64(config, "ttl_seconds")?.unwrap_or(300);
         let ttl = Duration::from_secs(ttl_seconds);
 
-        let max_entries = config["max_entries"].as_u64().unwrap_or(10_000) as usize;
+        let max_entries = optional_positive_usize(config, "max_entries")?.unwrap_or(10_000);
         let max_entry_size_bytes =
-            config["max_entry_size_bytes"].as_u64().unwrap_or(1_048_576) as usize; // 1 MiB default
-        let max_total_size_bytes = config["max_total_size_bytes"]
-            .as_u64()
-            .unwrap_or(104_857_600) as usize; // 100 MiB default
+            optional_positive_usize(config, "max_entry_size_bytes")?.unwrap_or(1_048_576); // 1 MiB default
+        let max_total_size_bytes =
+            optional_positive_usize(config, "max_total_size_bytes")?.unwrap_or(104_857_600); // 100 MiB default
 
-        let include_model_in_key = config["include_model_in_key"].as_bool().unwrap_or(true);
+        let include_model_in_key = optional_bool(config, "include_model_in_key")?.unwrap_or(true);
         // SECURITY: Default `true` so two requests that differ only in
         // sampling parameters (temperature, top_p, max_tokens) cannot collapse
         // to the same cache entry and serve a wrong-shape response. Operators
         // who explicitly want cross-parameter cache reuse must set this to
         // `false`.
-        let include_params_in_key = config["include_params_in_key"].as_bool().unwrap_or(true);
+        let include_params_in_key = optional_bool(config, "include_params_in_key")?.unwrap_or(true);
         // SECURITY: Default `true` so cached responses are not replayed across
         // different authenticated consumers. Operators who explicitly want a
         // shared cache (e.g., a public LLM proxy with no per-tenant data)
         // must set this to `false`.
-        let scope_by_consumer = config["scope_by_consumer"].as_bool().unwrap_or(true);
+        let scope_by_consumer = optional_bool(config, "scope_by_consumer")?.unwrap_or(true);
 
         // Build optional Redis client
-        let redis_client = RedisConfig::from_plugin_config(
-            config,
-            &format!("{}:ai_cache", http_client.namespace()),
-        )
-        .map(|redis_config| {
-            let dns_cache = http_client.dns_cache();
-            let tls_no_verify = http_client.tls_no_verify();
-            let tls_ca_bundle_path = http_client.tls_ca_bundle_path();
-            Arc::new(RedisRateLimitClient::new(
-                redis_config,
-                dns_cache.cloned(),
-                tls_no_verify,
-                tls_ca_bundle_path,
-            ))
-        });
+        let default_redis_prefix = default_redis_key_prefix(http_client.namespace());
+        let redis_client =
+            RedisConfig::from_plugin_config(config, &default_redis_prefix)?.map(|redis_config| {
+                let dns_cache = http_client.dns_cache();
+                let tls_no_verify = http_client.tls_no_verify();
+                let tls_ca_bundle_path = http_client.tls_ca_bundle_path();
+                Arc::new(RedisRateLimitClient::new(
+                    redis_config,
+                    dns_cache.cloned(),
+                    tls_no_verify,
+                    tls_ca_bundle_path,
+                ))
+            });
 
         Ok(Self {
             ttl,
@@ -164,56 +164,70 @@ impl AiSemanticCache {
     ///    materially changes the response and must not collapse to the same key
     /// 7. SHA-256 hash the normalized representation
     fn build_cache_key(&self, ctx: &RequestContext, body: &Value) -> Option<String> {
-        let mut key_parts: Vec<String> = Vec::new();
+        let mut key_input = String::with_capacity(512);
+        let mut has_part = false;
 
         // Proxy scope
         if let Some(ref proxy) = ctx.matched_proxy {
-            key_parts.push(proxy.id.clone());
+            start_key_part(&mut key_input, &mut has_part);
+            key_input.push_str(&proxy.id);
         }
 
         // Consumer scope
         if self.scope_by_consumer
             && let Some(identity) = ctx.effective_identity()
         {
-            key_parts.push(identity.to_string());
+            start_key_part(&mut key_input, &mut has_part);
+            let _ = write!(&mut key_input, "{identity}");
         }
 
         // Model
         if self.include_model_in_key
             && let Some(model) = body.get("model").and_then(|m| m.as_str())
         {
-            key_parts.push(format!("m:{}", model.to_ascii_lowercase()));
+            start_key_part(&mut key_input, &mut has_part);
+            key_input.push_str("m:");
+            push_ascii_lowercase(&mut key_input, model);
         }
 
         // Sampling parameters
         if self.include_params_in_key {
             if let Some(temp) = body.get("temperature") {
-                key_parts.push(format!("t:{}", canonical_param_value(temp)));
+                start_key_part(&mut key_input, &mut has_part);
+                key_input.push_str("t:");
+                key_input.push_str(&canonical_param_value(temp));
             }
             if let Some(top_p) = body.get("top_p") {
-                key_parts.push(format!("p:{}", canonical_param_value(top_p)));
+                start_key_part(&mut key_input, &mut has_part);
+                key_input.push_str("p:");
+                key_input.push_str(&canonical_param_value(top_p));
             }
             if let Some(max_tokens) = body.get("max_tokens").and_then(|t| t.as_u64()) {
-                key_parts.push(format!("mt:{}", max_tokens));
+                start_key_part(&mut key_input, &mut has_part);
+                let _ = write!(&mut key_input, "mt:{max_tokens}");
             }
         }
 
         // Messages — the core of the cache key
         if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-            let mut normalized_messages: Vec<String> = Vec::with_capacity(messages.len());
-            for msg in messages {
+            start_key_part(&mut key_input, &mut has_part);
+            for (index, msg) in messages.iter().enumerate() {
+                if index > 0 {
+                    key_input.push('|');
+                }
                 let role = msg
                     .get("role")
                     .and_then(|r| r.as_str())
                     .unwrap_or("unknown");
                 let content = self.extract_message_content(msg);
-                normalized_messages.push(format!("{}:{}", role, content));
+                key_input.push_str(role);
+                key_input.push(':');
+                key_input.push_str(&content);
             }
             // Sort for order-independence (optional — most LLM APIs are order-sensitive,
             // but we sort to catch trivial reorderings of system/user messages)
             // Actually, message order matters for conversation context, so we preserve order
             // and only normalize content within each message.
-            key_parts.push(normalized_messages.join("|"));
         } else {
             // No messages array — not a chat completion request, skip caching
             return None;
@@ -246,7 +260,9 @@ impl AiSemanticCache {
                 // Unknown shape — hash the JSON repr so any change breaks the key.
                 normalize_text(&system.to_string())
             };
-            key_parts.push(format!("sys:{}", normalized));
+            start_key_part(&mut key_input, &mut has_part);
+            key_input.push_str("sys:");
+            key_input.push_str(&normalized);
         }
 
         // Other request fields that materially change the response shape or
@@ -264,7 +280,10 @@ impl AiSemanticCache {
             "logit_bias",
         ] {
             if let Some(value) = body.get(*field) {
-                key_parts.push(format!("{}:{}", field, value));
+                start_key_part(&mut key_input, &mut has_part);
+                key_input.push_str(field);
+                key_input.push(':');
+                let _ = write!(&mut key_input, "{value}");
             }
         }
 
@@ -276,11 +295,11 @@ impl AiSemanticCache {
         // served to a streaming client whose stored entry would be wrongly
         // formatted.
         if let Some(stream) = body.get("stream").and_then(|s| s.as_bool()) {
-            key_parts.push(format!("stream:{}", stream));
+            start_key_part(&mut key_input, &mut has_part);
+            let _ = write!(&mut key_input, "stream:{stream}");
         }
 
         // Hash the key parts into a fixed-size cache key
-        let key_input = key_parts.join("\n");
         let hash = Sha256::digest(key_input.as_bytes());
         Some(hex::encode(hash))
     }
@@ -370,6 +389,20 @@ impl AiSemanticCache {
     }
 }
 
+fn start_key_part(buffer: &mut String, has_part: &mut bool) {
+    if *has_part {
+        buffer.push('\n');
+    } else {
+        *has_part = true;
+    }
+}
+
+fn push_ascii_lowercase(buffer: &mut String, value: &str) {
+    for ch in value.chars() {
+        buffer.push(ch.to_ascii_lowercase());
+    }
+}
+
 fn canonical_param_value(value: &Value) -> String {
     value.to_string()
 }
@@ -423,7 +456,7 @@ impl Plugin for AiSemanticCache {
             && ctx
                 .headers
                 .get("content-type")
-                .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
+                .is_some_and(|ct| is_json_content_type(ct))
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -444,17 +477,17 @@ impl Plugin for AiSemanticCache {
             .get("content-type")
             .map(|s| s.as_str())
             .unwrap_or("");
-        if !content_type.contains("json") {
+        if !is_json_content_type(content_type) {
             return PluginResult::Continue;
         }
 
         // Get request body
         let body_str = match ctx.metadata.get("request_body") {
-            Some(b) if !b.is_empty() => b.clone(),
+            Some(b) if !b.is_empty() => b.as_str(),
             _ => return PluginResult::Continue,
         };
 
-        let json: Value = match serde_json::from_str(&body_str) {
+        let json: Value = match serde_json::from_str(body_str) {
             Ok(v) => v,
             Err(_) => return PluginResult::Continue,
         };
@@ -647,6 +680,49 @@ impl Plugin for AiSemanticCache {
     }
 }
 
+fn optional_positive_u64(config: &Value, field: &'static str) -> Result<Option<u64>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_u64() else {
+        return Err(format!(
+            "ai_semantic_cache: '{field}' must be an integer greater than zero"
+        ));
+    };
+    if value == 0 {
+        return Err(format!(
+            "ai_semantic_cache: '{field}' must be greater than zero"
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option<usize>, String> {
+    let Some(value) = optional_positive_u64(config, field)? else {
+        return Ok(None);
+    };
+    usize::try_from(value)
+        .map(Some)
+        .map_err(|_| format!("ai_semantic_cache: '{field}' is too large for this platform"))
+}
+
+fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| format!("ai_semantic_cache: '{field}' must be a boolean"))
+}
+
+fn default_redis_key_prefix(namespace: &str) -> String {
+    let mut prefix = String::with_capacity(namespace.len() + 9);
+    prefix.push_str(namespace);
+    prefix.push_str(":ai_cache");
+    prefix
+}
+
 #[cfg(test)]
 mod tests {
     //! Inline tests that need access to private fields (the cache map and
@@ -687,7 +763,7 @@ mod tests {
             &json!({"ttl_seconds": 600, "max_entries": 3}),
             PluginHttpClient::default(),
         )
-        .unwrap();
+        .unwrap_or_else(|err| panic!("test config should be valid: {err}"));
 
         let now = Instant::now();
         // Insert oldest → newest. Use 100ms spacing so ordering is well-defined

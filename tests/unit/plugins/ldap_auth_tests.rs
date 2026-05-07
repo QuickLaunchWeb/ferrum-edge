@@ -6,7 +6,9 @@
 //! those scenarios are covered by integration/functional tests.
 
 use ferrum_edge::consumer_index::ConsumerIndex;
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, RequestContext, ldap_auth::LdapAuth};
+use ferrum_edge::plugins::{
+    HTTP_FAMILY_PROTOCOLS, Plugin, PluginHttpClient, RequestContext, ldap_auth::LdapAuth, priority,
+};
 use serde_json::json;
 
 use super::plugin_utils::{assert_continue, assert_reject};
@@ -43,6 +45,49 @@ fn test_empty_ldap_url_rejected() {
     let result = LdapAuth::new(&json!({ "ldap_url": "" }), http_client());
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("ldap_url"));
+}
+
+#[test]
+fn test_invalid_config_types_rejected() {
+    let invalid_configs = [
+        json!(null),
+        json!(""),
+        json!({
+            "ldap_url": 123,
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+        }),
+        json!({
+            "ldap_url": "ldap://ldap.example.com:389",
+            "bind_dn_template": 123
+        }),
+        json!({
+            "ldap_url": "ldap://ldap.example.com:389",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "starttls": "yes"
+        }),
+        json!({
+            "ldap_url": "ldap://ldap.example.com:389",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "required_groups": "admins"
+        }),
+        json!({
+            "ldap_url": "ldap://ldap.example.com:389",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "connect_timeout_seconds": 0
+        }),
+        json!({
+            "ldap_url": "ldap://ldap.example.com:389",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "max_cache_entries": 0
+        }),
+    ];
+
+    for config in invalid_configs {
+        assert!(
+            LdapAuth::new(&config, http_client()).is_err(),
+            "config should be rejected: {config}"
+        );
+    }
 }
 
 #[test]
@@ -286,7 +331,31 @@ fn test_priority() {
         http_client(),
     )
     .unwrap();
+    assert_eq!(plugin.priority(), priority::LDAP_AUTH);
     assert_eq!(plugin.priority(), 1250);
+}
+
+#[test]
+fn test_ldap_auth_plugin_contract() {
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": "ldap://ldap.example.com:389",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+        }),
+        http_client(),
+    )
+    .unwrap();
+
+    assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
+    assert!(plugin.is_auth_plugin());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.requires_request_body_before_before_proxy());
+    assert!(!plugin.requires_request_body_before_authenticate());
+    assert!(!plugin.needs_request_body_bytes());
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
+    assert!(!plugin.applies_after_proxy_on_reject());
 }
 
 #[test]
