@@ -189,6 +189,8 @@ Priority order, lower = first. Multiple instances per proxy allowed. Each has `i
 11. `on_stream_connect`/`on_stream_disconnect` — TCP+TLS runs after handshake (client cert available); UDP+DTLS after DTLS handshake; mesh_authz and workload_metrics use SPIFFE/HBONE identity metadata here
 12. `on_udp_datagram` — bidirectional hooks; zero overhead unless `requires_udp_datagram_hooks()`
 
+**Istio empty-rule semantics**: Kubernetes translation must preserve `AuthorizationPolicy` action semantics. `ALLOW` with no `rules` is allow-nothing (emit a never-matching rule so the authz engine's implicit deny applies); `DENY`/`AUDIT` with no `rules` are no-ops. Do not collapse all empty-rule policies to the same representation.
+
 **Multi-auth**: `AuthMode::Multi` accepts `ctx.identified_consumer` OR `ctx.authenticated_identity` (JWKS/OIDC). First-success-wins. Empty chain → reject.
 
 **Multi-credential rotation**: Each credential type can be single object or array. `Consumer::credential_entries(cred_type)` normalizes. Index-based (keyauth, mtls) inserts all in `ConsumerIndex` (O(1)); secret-based (jwt, basicauth, hmac) iterates (typically 1-2). `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default 2). Admin: `POST /consumers/:id/credentials/:type` + `DELETE .../:index`.
