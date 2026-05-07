@@ -109,8 +109,7 @@ fn classify_db_error_str(msg: &str) -> ApiSpecError {
 }
 
 fn is_row_missing_error_message(lower: &str) -> bool {
-    lower.contains("rownotfound")
-        || lower.contains("row not found")
+    lower.contains("row not found")
         || lower.contains("record not found")
         || lower.contains("document not found")
         || lower.contains("no rows returned")

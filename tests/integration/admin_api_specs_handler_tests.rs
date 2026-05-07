@@ -4353,18 +4353,18 @@ async fn post_empty_body_returns_400() {
     let (status, body) = client
         .post_raw("/api-specs", vec![], "application/json")
         .await;
-    assert!(
-        status == reqwest::StatusCode::BAD_REQUEST
-            || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-        "empty body must be rejected (400 or 422); got: {status}, body: {body}"
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "empty body must be rejected as a parse error; body: {body}"
     );
 }
 
-/// Unsupported Accept header (text/html) must still return a response
+/// Irrelevant Accept header (text/html) must still return a response
 /// (RFC 7231 permits serving any representation when no Accept rules match
 /// our supported formats).
 #[tokio::test]
-async fn get_with_unsupported_accept_returns_stored_format() {
+async fn get_with_irrelevant_accept_returns_stored_format() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;
     let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
@@ -4538,10 +4538,10 @@ async fn post_with_duplicate_plugin_ids_returns_error() {
     });
 
     let (status, body) = client.post_json("/api-specs", &spec).await;
-    assert!(
-        status == reqwest::StatusCode::BAD_REQUEST
-            || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-        "duplicate plugin IDs must be rejected; got: {status}, body: {body}"
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "duplicate plugin IDs must be rejected as malformed extension; body: {body}"
     );
     let details = body["details"].as_str().unwrap_or("");
     assert!(
