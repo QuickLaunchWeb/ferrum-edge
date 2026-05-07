@@ -146,6 +146,47 @@ async fn mesh_authz_reads_split_hbone_baggage_headers() {
 }
 
 #[tokio::test]
+async fn mesh_authz_denies_percent_encoded_hbone_baggage_mismatch() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(None);
+    let mut headers = http::HeaderMap::new();
+    headers.append(
+        "baggage",
+        "destination.principal=spiffe://cluster.local/ns/default/sa/server"
+            .parse()
+            .expect("header value"),
+    );
+    headers.append(
+        "baggage",
+        "source.principal=spiffe%3A%2F%2Fcluster.local%2Fns%2Fdefault%2Fsa%2Fother"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert!(body.contains("Mesh authorization denied"));
+        }
+        other => panic!("expected reject, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("implicit-deny")
+    );
+}
+
+#[tokio::test]
 async fn workload_metrics_adds_identity_metadata_without_header_changes() {
     let plugin = WorkloadMetrics::new(&json!({
         "node_id": "node-a",
@@ -267,6 +308,12 @@ async fn workload_metrics_reads_split_hbone_baggage_headers() {
             .get("mesh.source.service_account")
             .map(String::as_str),
         Some("client")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.connection_security_policy")
+            .map(String::as_str),
+        Some("mutual_tls")
     );
 }
 
