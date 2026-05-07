@@ -254,6 +254,25 @@ async fn mesh_authz_strips_host_port_before_matching_policy() {
 }
 
 #[tokio::test]
+async fn mesh_authz_preserves_host_policy_authority_port() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_host_policy("api.example.com:8443")]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(None);
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "host",
+        "api.example.com:8443".parse().expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
 async fn mesh_authz_rejects_non_matching_host_policy() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_policies": [allow_host_policy("api.example.com")]

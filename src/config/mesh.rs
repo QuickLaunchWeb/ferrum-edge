@@ -185,6 +185,9 @@ pub struct RequestMatch {
     pub headers: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<u16>,
+    /// Glob port patterns, used for Istio string-match ports such as "*".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub port_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -594,7 +597,7 @@ fn validate_mesh_config_internal(
                 let any_path = !request.paths.is_empty();
                 let any_host = !request.hosts.is_empty();
                 let any_header = !request.headers.is_empty();
-                let any_port = !request.ports.is_empty();
+                let any_port = !request.ports.is_empty() || !request.port_patterns.is_empty();
                 if !(any_method || any_path || any_host || any_header || any_port) {
                     errors.push(format!(
                         "MeshPolicy '{}'.rules[{}].to[{}]: at least one of \

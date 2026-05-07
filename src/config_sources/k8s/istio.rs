@@ -131,13 +131,25 @@ fn mesh_rule(
         .flatten()
         .flat_map(|from| principal_matches(from.get("source").unwrap_or(&Value::Null)))
         .collect();
-    let to = rule
+    let mut to = Vec::new();
+    let mut has_unconstrained_to = false;
+    for request in rule
         .get("to")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .map(|to| request_match(object, to.get("operation").unwrap_or(&Value::Null)))
-        .collect::<Result<Vec<_>, _>>()?;
+    {
+        let request = request?;
+        if request_match_is_unconstrained(&request) {
+            has_unconstrained_to = true;
+        } else {
+            to.push(request);
+        }
+    }
+    if has_unconstrained_to {
+        to.clear();
+    }
     let when = rule
         .get("when")
         .and_then(Value::as_array)
@@ -174,10 +186,8 @@ fn principal_matches(source: &Value) -> Vec<PrincipalMatch> {
 }
 
 fn request_match(object: &K8sObject, operation: &Value) -> Result<RequestMatch, K8sTranslateError> {
-    let ports = string_array(operation, "ports")
-        .into_iter()
-        .map(|port| port_from_string(object, &port, "rules[].to[].operation.ports"))
-        .collect::<Result<Vec<_>, _>>()?;
+    validate_supported_operation_fields(object, operation)?;
+    let (ports, port_patterns) = operation_ports(object, operation)?;
 
     Ok(RequestMatch {
         methods: string_array(operation, "methods"),
@@ -185,7 +195,72 @@ fn request_match(object: &K8sObject, operation: &Value) -> Result<RequestMatch, 
         hosts: string_array(operation, "hosts"),
         headers: HashMap::new(),
         ports,
+        port_patterns,
     })
+}
+
+fn validate_supported_operation_fields(
+    object: &K8sObject,
+    operation: &Value,
+) -> Result<(), K8sTranslateError> {
+    for key in operation
+        .as_object()
+        .into_iter()
+        .flat_map(|fields| fields.keys())
+    {
+        match key.as_str() {
+            "methods" | "paths" | "hosts" | "ports" => {}
+            _ => {
+                return Err(invalid_resource(
+                    object,
+                    format!("rules[].to[].operation.{key} is unsupported"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn operation_ports(
+    object: &K8sObject,
+    operation: &Value,
+) -> Result<(Vec<u16>, Vec<String>), K8sTranslateError> {
+    let mut ports = Vec::new();
+    let mut port_patterns = Vec::new();
+    for port in string_array(operation, "ports") {
+        if is_istio_port_pattern(&port) {
+            port_patterns.push(port);
+            continue;
+        }
+        ports.push(port_from_string(
+            object,
+            &port,
+            "rules[].to[].operation.ports",
+        )?);
+    }
+    Ok((ports, port_patterns))
+}
+
+fn is_istio_port_pattern(port: &str) -> bool {
+    if port == "*" {
+        return true;
+    }
+    if let Some(prefix) = port.strip_suffix('*') {
+        return !prefix.is_empty() && prefix.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    if let Some(suffix) = port.strip_prefix('*') {
+        return !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    false
+}
+
+fn request_match_is_unconstrained(request: &RequestMatch) -> bool {
+    request.methods.is_empty()
+        && request.paths.is_empty()
+        && request.hosts.is_empty()
+        && request.headers.is_empty()
+        && request.ports.is_empty()
+        && request.port_patterns.is_empty()
 }
 
 fn condition_match(value: &Value) -> Option<ConditionMatch> {
@@ -576,6 +651,155 @@ mod tests {
 
         assert!(err.to_string().contains("rules[].to[].operation.ports"));
         assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn preserves_authorization_policy_wildcard_ports() {
+        let result = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [{"operation": {"ports": ["*"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("wildcard AuthorizationPolicy port must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let request = &mesh.mesh_policies[0].rules[0].to[0];
+        assert!(request.ports.is_empty());
+        assert_eq!(request.port_patterns, vec!["*"]);
+    }
+
+    #[test]
+    fn preserves_authorization_policy_prefix_port_patterns() {
+        let result = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [{"operation": {"ports": ["8*"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("prefix AuthorizationPolicy port pattern must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let request = &mesh.mesh_policies[0].rules[0].to[0];
+        assert!(request.ports.is_empty());
+        assert_eq!(request.port_patterns, vec!["8*"]);
+    }
+
+    #[test]
+    fn preserves_authorization_policy_suffix_port_patterns() {
+        let result = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [{"operation": {"ports": ["*43"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("suffix AuthorizationPolicy port pattern must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let request = &mesh.mesh_policies[0].rules[0].to[0];
+        assert!(request.ports.is_empty());
+        assert_eq!(request.port_patterns, vec!["*43"]);
+    }
+
+    #[test]
+    fn rejects_authorization_policy_mid_string_port_patterns() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [{"operation": {"ports": ["8*9"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("mid-string AuthorizationPolicy port pattern is unsupported");
+
+        assert!(err.to_string().contains("rules[].to[].operation.ports"));
+        assert!(err.to_string().contains("8*9"));
+    }
+
+    #[test]
+    fn rejects_authorization_policy_non_numeric_non_pattern_ports() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [{"operation": {"ports": ["http"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("named AuthorizationPolicy port is not representable");
+
+        assert!(err.to_string().contains("rules[].to[].operation.ports"));
+        assert!(err.to_string().contains("http"));
+    }
+
+    #[test]
+    fn validates_later_authorization_policy_to_entries_after_unconstrained_match() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [
+                            {"operation": {}},
+                            {"operation": {"ports": ["70000"]}}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("later invalid AuthorizationPolicy port must still fail closed");
+
+        assert!(err.to_string().contains("rules[].to[].operation.ports"));
+        assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn rejects_unsupported_authorization_policy_operation_fields() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "DENY",
+                    "rules": [{
+                        "to": [{"operation": {"notPorts": ["8080"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("unsupported negative operation fields must fail closed");
+
+        assert!(err.to_string().contains("rules[].to[].operation.notPorts"));
+        assert!(err.to_string().contains("unsupported"));
     }
 
     #[test]

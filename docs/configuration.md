@@ -176,7 +176,7 @@ Gateway API `HTTPRoute` path matches preserve Kubernetes semantics: `PathPrefix`
 
 Gateway API cross-namespace `backendRefs` require an exact matching `ReferenceGrant`, including the source API group/kind and target group/kind. Ferrum currently supports core Kubernetes `Service` backend references and fails closed for other backend target kinds in both same-namespace and cross-namespace routes.
 
-Kubernetes Gateway API and Istio mesh translators fail closed when a resource declares a port outside the Kubernetes service-port range (`1`-`65535`). Invalid ports are rejected during translation instead of wrapping into an unintended backend/listener port.
+Kubernetes Gateway API and Istio mesh translators fail closed when a resource declares a port outside the Kubernetes service-port range (`1`-`65535`). Invalid ports are rejected during translation instead of wrapping into an unintended backend/listener port. Istio `AuthorizationPolicy.rules[].to[].operation.ports` also preserves wildcard string matches such as `"*"` and `"8*"` through Ferrum mesh policy `port_patterns`; non-numeric, non-pattern port strings still fail closed.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|

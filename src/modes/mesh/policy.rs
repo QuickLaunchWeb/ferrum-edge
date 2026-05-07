@@ -148,15 +148,21 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
             match_
                 .hosts
                 .iter()
-                .any(|pattern| wildcard_match(pattern, host))
+                .any(|pattern| normalized_host_matches(pattern, host))
         })
     {
         return false;
     }
-    if !match_.ports.is_empty()
-        && !request
-            .port
-            .is_some_and(|port| match_.ports.contains(&port))
+    if (!match_.ports.is_empty() || !match_.port_patterns.is_empty())
+        && !request.port.is_some_and(|port| {
+            match_.ports.contains(&port) || {
+                let port = port.to_string();
+                match_
+                    .port_patterns
+                    .iter()
+                    .any(|pattern| wildcard_match(pattern, &port))
+            }
+        })
     {
         return false;
     }
@@ -172,7 +178,18 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
     true
 }
 
-fn normalize_match_host(host: &str) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedHost {
+    name: String,
+    authority: String,
+}
+
+fn normalized_host_matches(pattern: &str, host: &NormalizedHost) -> bool {
+    let pattern = normalize_host_pattern(pattern);
+    wildcard_match(&pattern, &host.name) || wildcard_match(&pattern, &host.authority)
+}
+
+fn normalize_match_host(host: &str) -> Option<NormalizedHost> {
     let host = host.trim();
     if host.is_empty() || host.contains('@') {
         return None;
@@ -187,18 +204,45 @@ fn normalize_match_host(host: &str) -> Option<String> {
                 .strip_prefix(':')
                 .is_some_and(is_valid_authority_port)
         {
-            return Some(literal.to_ascii_lowercase());
+            let name = literal.to_ascii_lowercase();
+            let authority = if suffix.is_empty() {
+                name.clone()
+            } else {
+                format!("{name}{suffix}")
+            };
+            return Some(NormalizedHost { name, authority });
         }
         return None;
     }
 
     match host.rsplit_once(':') {
         Some((name, port)) if !name.contains(':') && is_valid_authority_port(port) => {
-            normalize_hostname(name)
+            let name = normalize_hostname(name)?;
+            Some(NormalizedHost {
+                authority: format!("{name}:{port}"),
+                name,
+            })
         }
         Some(_) => None,
-        None => normalize_hostname(host),
+        None => normalize_hostname(host).map(|name| NormalizedHost {
+            authority: name.clone(),
+            name,
+        }),
     }
+}
+
+fn normalize_host_pattern(pattern: &str) -> String {
+    let pattern = pattern.trim().to_ascii_lowercase();
+    if pattern.starts_with('[') {
+        return pattern;
+    }
+    if let Some((name, port)) = pattern.rsplit_once(':')
+        && !name.contains(':')
+    {
+        let name = name.strip_suffix('.').unwrap_or(name);
+        return format!("{name}:{port}");
+    }
+    pattern.strip_suffix('.').unwrap_or(&pattern).to_string()
 }
 
 fn normalize_hostname(host: &str) -> Option<String> {
@@ -359,6 +403,7 @@ mod tests {
                             .into_iter()
                             .collect(),
                         ports: vec![8080],
+                        port_patterns: Vec::new(),
                     }],
                     when: Vec::new(),
                     action: PolicyAction::Allow,
@@ -434,6 +479,128 @@ mod tests {
         };
         let request = MeshAuthzRequest {
             host: Some("[2001:DB8::1]:443".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn request_match_preserves_authority_port_for_host_policy() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-port-host".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: vec![RequestMatch {
+                        hosts: vec!["api.default:8443".to_string()],
+                        ..RequestMatch::default()
+                    }],
+                    when: Vec::new(),
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+        let request = MeshAuthzRequest {
+            host: Some("Api.Default:8443".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn request_match_rejects_different_authority_port_for_host_policy() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-port-host".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: vec![RequestMatch {
+                        hosts: vec!["api.default:8443".to_string()],
+                        ..RequestMatch::default()
+                    }],
+                    when: Vec::new(),
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+        let request = MeshAuthzRequest {
+            host: Some("api.default:9443".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn request_match_supports_wildcard_authority_port_for_host_policy() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-any-port-host".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: vec![RequestMatch {
+                        hosts: vec!["api.default:*".to_string()],
+                        ..RequestMatch::default()
+                    }],
+                    when: Vec::new(),
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+        let request = MeshAuthzRequest {
+            host: Some("api.default:8443".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn request_match_checks_istio_port_patterns() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-port-pattern".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: vec![RequestMatch {
+                        port_patterns: vec!["8*".to_string()],
+                        ..RequestMatch::default()
+                    }],
+                    when: Vec::new(),
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+        let request = MeshAuthzRequest {
+            port: Some(8443),
             ..MeshAuthzRequest::default()
         };
 
