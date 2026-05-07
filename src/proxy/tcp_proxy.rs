@@ -2234,6 +2234,108 @@ impl Drop for PooledCopyBuffer {
     }
 }
 
+#[cfg(test)]
+mod pooled_copy_buffer_tests {
+    use super::{
+        PooledCopyBuffer, TCP_COPY_BUFFER_POOL, TCP_COPY_BUFFER_POOL_MAX_BUFFERS,
+        TCP_COPY_BUFFER_POOL_MAX_RETAIN,
+    };
+
+    fn clear_pool() {
+        TCP_COPY_BUFFER_POOL.with(|pool| pool.borrow_mut().clear());
+    }
+
+    fn pool_capacities() -> Vec<usize> {
+        TCP_COPY_BUFFER_POOL
+            .with(|pool| pool.borrow().iter().map(Vec::capacity).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn new_reuses_smallest_sufficient_pooled_capacity() {
+        clear_pool();
+
+        let small = Vec::<u8>::with_capacity(4 * 1024);
+        let medium = Vec::<u8>::with_capacity(64 * 1024);
+        let large = Vec::<u8>::with_capacity(256 * 1024);
+        let medium_capacity = medium.capacity();
+        TCP_COPY_BUFFER_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            pool.push(small);
+            pool.push(large);
+            pool.push(medium);
+        });
+
+        let buf = PooledCopyBuffer::new(32 * 1024);
+        assert_eq!(
+            buf.buf.capacity(),
+            medium_capacity,
+            "the pool should choose the smallest retained buffer that satisfies the request"
+        );
+        assert_eq!(buf.buf.len(), 32 * 1024);
+
+        drop(buf);
+        clear_pool();
+    }
+
+    #[test]
+    fn full_pool_evicts_undersized_buffer_so_larger_reusable_capacity_can_enter() {
+        clear_pool();
+
+        TCP_COPY_BUFFER_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            for _ in 0..TCP_COPY_BUFFER_POOL_MAX_BUFFERS {
+                pool.push(Vec::<u8>::with_capacity(4 * 1024));
+            }
+        });
+
+        let buf = PooledCopyBuffer::new(64 * 1024);
+        assert_eq!(
+            pool_capacities().len(),
+            TCP_COPY_BUFFER_POOL_MAX_BUFFERS - 1,
+            "taking a miss from a full undersized pool should make room for the new capacity"
+        );
+        drop(buf);
+
+        let capacities = pool_capacities();
+        assert_eq!(capacities.len(), TCP_COPY_BUFFER_POOL_MAX_BUFFERS);
+        assert!(
+            capacities.iter().any(|&capacity| capacity >= 64 * 1024),
+            "dropping the larger buffer should retain it for future matching requests"
+        );
+
+        clear_pool();
+    }
+
+    #[test]
+    fn oversized_buffer_is_not_retained_or_evicted_into_pool() {
+        clear_pool();
+
+        TCP_COPY_BUFFER_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            for _ in 0..TCP_COPY_BUFFER_POOL_MAX_BUFFERS {
+                pool.push(Vec::<u8>::with_capacity(4 * 1024));
+            }
+        });
+
+        let buf = PooledCopyBuffer::new(TCP_COPY_BUFFER_POOL_MAX_RETAIN + 1);
+        assert_eq!(
+            pool_capacities().len(),
+            TCP_COPY_BUFFER_POOL_MAX_BUFFERS,
+            "oversized allocations are not reusable, so they should not evict retained buffers"
+        );
+        drop(buf);
+
+        let capacities = pool_capacities();
+        assert_eq!(capacities.len(), TCP_COPY_BUFFER_POOL_MAX_BUFFERS);
+        assert!(
+            capacities.iter().all(|&capacity| capacity < 64 * 1024),
+            "oversized buffers should be discarded instead of retained in the pool"
+        );
+
+        clear_pool();
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CopyPhase {
     Reading,
