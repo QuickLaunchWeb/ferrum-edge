@@ -27,7 +27,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
 use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
-use crate::config::mesh::{MeshPolicy, policy_scope_applies_to_workload};
+use crate::config::mesh::{MeshPolicy, PolicyScope, policy_scope_applies_to_workload};
 use crate::identity::SpiffeId;
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
@@ -70,6 +70,8 @@ impl MeshAuthz {
             slice.labels = labels;
         }
 
+        validate_scope_filter_identity(&slice)?;
+
         // Pre-filter the slice's mesh_policies down to those whose `scope`
         // applies to this proxy's workload identity. Done once at construction
         // (cold path); the request hot path then iterates a smaller list.
@@ -103,6 +105,47 @@ impl MeshAuthz {
             }
         }
     }
+}
+
+fn validate_scope_filter_identity(slice: &MeshSlice) -> Result<(), String> {
+    let has_proxy_namespace = !slice.namespace.trim().is_empty();
+    let has_proxy_labels = !slice.labels.is_empty();
+
+    for policy in &slice.mesh_policies {
+        match &policy.scope {
+            PolicyScope::MeshWide => {}
+            PolicyScope::Namespace { .. } => {
+                if !has_proxy_namespace {
+                    return Err(format!(
+                        "mesh_authz: policy '{}' uses namespace scope but no proxy namespace is configured; set mesh_slice.namespace or namespace",
+                        policy.name
+                    ));
+                }
+            }
+            PolicyScope::WorkloadSelector { selector } => {
+                if let Some(selector_namespace) = selector.namespace.as_ref() {
+                    if !has_proxy_namespace {
+                        return Err(format!(
+                            "mesh_authz: policy '{}' uses workload selector namespace '{}' but no proxy namespace is configured; set mesh_slice.namespace or namespace",
+                            policy.name, selector_namespace
+                        ));
+                    }
+                    if selector_namespace != &slice.namespace {
+                        continue;
+                    }
+                }
+
+                if !selector.labels.is_empty() && !has_proxy_labels {
+                    return Err(format!(
+                        "mesh_authz: policy '{}' uses workload selector labels but no proxy labels are configured; set mesh_slice.labels or labels",
+                        policy.name
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[async_trait]

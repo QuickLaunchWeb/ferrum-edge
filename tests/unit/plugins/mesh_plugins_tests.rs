@@ -92,6 +92,45 @@ fn mesh_plugins_are_registered() {
     assert!(create_plugin("access_log", &json!({})).unwrap().is_some());
 }
 
+#[test]
+fn mesh_authz_rejects_namespace_scoped_direct_policy_without_namespace() {
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "ns-deny",
+            PolicyScope::Namespace { namespace: "default".to_string() },
+            PolicyAction::Deny,
+        )]
+    })) {
+        Ok(_) => panic!("namespace-scoped direct policy without proxy namespace must fail closed"),
+        Err(err) => err,
+    };
+
+    assert!(err.contains("namespace scope"));
+    assert!(err.contains("proxy namespace"));
+}
+
+#[test]
+fn mesh_authz_rejects_label_selector_direct_policy_without_labels() {
+    let selector = WorkloadSelector {
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+        namespace: None,
+    };
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "app-deny",
+            PolicyScope::WorkloadSelector { selector },
+            PolicyAction::Deny,
+        )],
+        "namespace": "default",
+    })) {
+        Ok(_) => panic!("label-scoped direct policy without proxy labels must fail closed"),
+        Err(err) => err,
+    };
+
+    assert!(err.contains("workload selector labels"));
+    assert!(err.contains("proxy labels"));
+}
+
 #[tokio::test]
 async fn mesh_authz_allows_matching_spiffe_identity() {
     let plugin = MeshAuthz::new(&json!({
