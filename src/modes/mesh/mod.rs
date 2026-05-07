@@ -445,6 +445,7 @@ pub async fn run(
     let runtime = MeshRuntimeConfig::from_env_config(&env_config)
         .map_err(|e| anyhow::anyhow!(e))
         .context("invalid mesh runtime configuration")?;
+    ensure_runtime_config_protocol_supported(&runtime)?;
 
     info!(
         node_id = %runtime.node_id,
@@ -458,8 +459,6 @@ pub async fn run(
         cp_urls = runtime.cp_urls.len(),
         "Mesh mode starting"
     );
-
-    ensure_runtime_config_protocol_supported(&runtime)?;
 
     let mesh_state = MeshRuntimeState::new();
     let bootstrap_config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime)
@@ -478,36 +477,29 @@ pub async fn run(
     let grpc_tls = build_dp_grpc_tls_config(&env_config, &runtime.cp_urls, "Mesh")?;
     let mut background_handles = Vec::new();
 
-    match runtime.config_protocol {
-        MeshConfigProtocol::Native => {
-            let client_config = runtime.native_client_config();
-            let request = client_config.subscribe_request(crate::FERRUM_VERSION);
-            let cp_urls = runtime.cp_urls.clone();
-            let state = mesh_state.clone();
-            let shutdown_rx = shutdown_tx.subscribe();
-            let handle = tokio::spawn(
-                config_consumer::native_client::start_native_mesh_client_with_shutdown(
-                    cp_urls,
-                    jwt_secret.clone(),
-                    client_config,
-                    state,
-                    shutdown_rx,
-                    grpc_tls.clone(),
-                ),
-            );
-            background_handles.push(handle);
-            info!(
-                node_id = %request.node_id,
-                namespace = %request.namespace,
-                cp_urls = runtime.cp_urls.len(),
-                has_first_slice = mesh_state.has_first_slice(),
-                "Mesh mode initialized native MeshSubscribe consumer"
-            );
-        }
-        MeshConfigProtocol::Xds => {
-            unreachable!("xDS mesh runtime is rejected by ensure_runtime_config_protocol_supported")
-        }
-    }
+    let client_config = runtime.native_client_config();
+    let request = client_config.subscribe_request(crate::FERRUM_VERSION);
+    let cp_urls = runtime.cp_urls.clone();
+    let state = mesh_state.clone();
+    let shutdown_rx = shutdown_tx.subscribe();
+    let handle = tokio::spawn(
+        config_consumer::native_client::start_native_mesh_client_with_shutdown(
+            cp_urls,
+            jwt_secret.clone(),
+            client_config,
+            state,
+            shutdown_rx,
+            grpc_tls.clone(),
+        ),
+    );
+    background_handles.push(handle);
+    info!(
+        node_id = %request.node_id,
+        namespace = %request.namespace,
+        cp_urls = runtime.cp_urls.len(),
+        has_first_slice = mesh_state.has_first_slice(),
+        "Mesh mode initialized native MeshSubscribe consumer"
+    );
 
     serve_mesh_runtime(
         env_config,
