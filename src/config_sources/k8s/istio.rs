@@ -322,14 +322,14 @@ fn virtual_service_routes(
         .flatten()
         .enumerate()
     {
-        let Some(route) = first_positive_weighted_route(http) else {
+        let Some(route) = first_positive_weighted_route(object, http)? else {
             acc.warnings.push(format!(
                 "VirtualService '{}' HTTP route {} has only zero-weight split destinations; no proxy was materialized",
                 object.metadata.name, index
             ));
             continue;
         };
-        if http_has_skipped_zero_weight_split_destination(http) {
+        if http_has_skipped_zero_weight_split_destination(object, http)? {
             acc.warnings.push(format!(
                 "VirtualService '{}' HTTP route {} skipped zero-weight split destination(s)",
                 object.metadata.name, index
@@ -377,28 +377,67 @@ fn virtual_service_routes(
     Ok(proxies)
 }
 
-fn first_positive_weighted_route(http: &Value) -> Option<&Value> {
-    http.get("route")
-        .and_then(Value::as_array)
-        .and_then(|routes| {
-            if routes.len() == 1 {
-                routes.first()
-            } else {
-                routes.iter().find(|route| route_weight(route) > 0)
-            }
-        })
+fn first_positive_weighted_route<'a>(
+    object: &K8sObject,
+    http: &'a Value,
+) -> Result<Option<&'a Value>, K8sTranslateError> {
+    let Some(routes) = http.get("route").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+
+    if routes.len() == 1 {
+        let Some(route) = routes.first() else {
+            return Ok(None);
+        };
+        route_weight(object, route, 1)?;
+        return Ok(Some(route));
+    }
+
+    let mut selected_route = None;
+    for route in routes {
+        if route_weight(object, route, 0)? > 0 {
+            selected_route.get_or_insert(route);
+        }
+    }
+
+    Ok(selected_route)
 }
 
-fn route_weight(route: &Value) -> u64 {
-    route.get("weight").and_then(Value::as_u64).unwrap_or(1)
+fn route_weight(
+    object: &K8sObject,
+    route: &Value,
+    default_weight: u64,
+) -> Result<u64, K8sTranslateError> {
+    match route.get("weight") {
+        Some(Value::Number(number)) if number.as_i64().is_some_and(|weight| weight < 0) => {
+            Err(invalid_resource(
+                object,
+                "VirtualService route.weight must be zero or positive",
+            ))
+        }
+        Some(value) => Ok(value.as_u64().unwrap_or(default_weight)),
+        None => Ok(default_weight),
+    }
 }
 
-fn http_has_skipped_zero_weight_split_destination(http: &Value) -> bool {
-    http.get("route")
-        .and_then(Value::as_array)
-        .is_some_and(|routes| {
-            routes.len() > 1 && routes.iter().any(|route| route_weight(route) == 0)
-        })
+fn http_has_skipped_zero_weight_split_destination(
+    object: &K8sObject,
+    http: &Value,
+) -> Result<bool, K8sTranslateError> {
+    let Some(routes) = http.get("route").and_then(Value::as_array) else {
+        return Ok(false);
+    };
+    if routes.len() <= 1 {
+        return Ok(false);
+    }
+
+    for route in routes {
+        if route_weight(object, route, 0)? == 0 {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn path_match(uri: &Value) -> Option<String> {
@@ -621,6 +660,50 @@ mod tests {
     }
 
     #[test]
+    fn virtual_service_treats_omitted_split_weight_as_zero() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "route": [
+                            {
+                                "destination": {
+                                    "host": "dark.default.svc.cluster.local",
+                                    "port": {"number": 8080}
+                                }
+                            },
+                            {
+                                "destination": {
+                                    "host": "stable.default.svc.cluster.local",
+                                    "port": {"number": 9090}
+                                },
+                                "weight": 100
+                            }
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "stable.default.svc.cluster.local"
+        );
+        assert_eq!(result.config.proxies[0].backend_port, 9090);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("skipped zero-weight"))
+        );
+    }
+
+    #[test]
     fn virtual_service_keeps_single_zero_weight_destination() {
         let result = translate_k8s_objects(
             &[object(
@@ -687,6 +770,81 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("only zero-weight"))
+        );
+    }
+
+    #[test]
+    fn virtual_service_with_only_omitted_split_weights_is_not_materialized() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "route": [
+                            {
+                                "destination": {
+                                    "host": "dark.default.svc.cluster.local",
+                                    "port": {"number": 8080}
+                                }
+                            },
+                            {
+                                "destination": {
+                                    "host": "canary.default.svc.cluster.local",
+                                    "port": {"number": 9090}
+                                }
+                            }
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.proxies.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("only zero-weight"))
+        );
+    }
+
+    #[test]
+    fn virtual_service_rejects_negative_split_weight() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "route": [
+                            {
+                                "destination": {
+                                    "host": "stable.default.svc.cluster.local",
+                                    "port": {"number": 8080}
+                                },
+                                "weight": 100
+                            },
+                            {
+                                "destination": {
+                                    "host": "invalid.default.svc.cluster.local",
+                                    "port": {"number": 9090}
+                                },
+                                "weight": -1
+                            }
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("negative VirtualService route weights are invalid");
+
+        assert!(
+            err.to_string()
+                .contains("route.weight must be zero or positive")
         );
     }
 }

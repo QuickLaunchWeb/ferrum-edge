@@ -254,18 +254,25 @@ fn first_backend_ref<'a>(
         return Ok(None);
     };
 
+    let mut selected_backend = None;
     let mut skipped_zero = 0usize;
     for backend_ref in backend_refs {
-        if backend_ref_weight(object, backend_ref)? > 0 {
-            if skipped_zero > 0 {
-                acc.warnings.push(format!(
-                    "{} skipped {} zero-weight backendRef(s)",
-                    object.kind, skipped_zero
-                ));
-            }
-            return Ok(Some(backend_ref));
+        let weight = backend_ref_weight(object, backend_ref)?;
+        if weight > 0 {
+            selected_backend.get_or_insert(backend_ref);
+        } else {
+            skipped_zero += 1;
         }
-        skipped_zero += 1;
+    }
+
+    if let Some(backend_ref) = selected_backend {
+        if skipped_zero > 0 {
+            acc.warnings.push(format!(
+                "{} skipped {} zero-weight backendRef(s)",
+                object.kind, skipped_zero
+            ));
+        }
+        return Ok(Some(backend_ref));
     }
 
     if skipped_zero > 0 {
@@ -519,6 +526,27 @@ mod tests {
             options(),
         )
         .expect_err("negative backendRef weights are invalid");
+
+        assert!(err.to_string().contains("weight must be zero or positive"));
+    }
+
+    #[test]
+    fn gateway_route_rejects_negative_backend_ref_after_selected_backend() {
+        let err = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [
+                            {"name": "stable", "port": 8080, "weight": 100},
+                            {"name": "invalid", "port": 9090, "weight": -1}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("negative backendRef weights are invalid even after a target is selected");
 
         assert!(err.to_string().contains("weight must be zero or positive"));
     }
