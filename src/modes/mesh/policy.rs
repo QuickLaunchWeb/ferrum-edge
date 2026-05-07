@@ -155,13 +155,11 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
     }
     if (!match_.ports.is_empty() || !match_.port_patterns.is_empty())
         && !request.port.is_some_and(|port| {
-            match_.ports.contains(&port) || {
-                let port = port.to_string();
-                match_
+            match_.ports.contains(&port)
+                || match_
                     .port_patterns
                     .iter()
-                    .any(|pattern| wildcard_match(pattern, &port))
-            }
+                    .any(|pattern| port_pattern_matches(pattern, port))
         })
     {
         return false;
@@ -185,8 +183,11 @@ struct NormalizedHost {
 }
 
 fn normalized_host_matches(pattern: &str, host: &NormalizedHost) -> bool {
-    let pattern = normalize_host_pattern(pattern);
-    wildcard_match(&pattern, &host.name) || wildcard_match(&pattern, &host.authority)
+    // Patterns are pre-normalized at config-load time
+    // (see `crate::config::mesh::normalize_request_match_host_pattern`),
+    // so the hot path can match directly against the request authority's
+    // bare name (no port) and full authority (host[:port]) forms.
+    wildcard_match(pattern, &host.name) || wildcard_match(pattern, &host.authority)
 }
 
 fn normalize_match_host(host: &str) -> Option<NormalizedHost> {
@@ -231,18 +232,44 @@ fn normalize_match_host(host: &str) -> Option<NormalizedHost> {
     }
 }
 
-fn normalize_host_pattern(pattern: &str) -> String {
-    let pattern = pattern.trim().to_ascii_lowercase();
-    if pattern.starts_with('[') {
-        return pattern;
+/// Direct port-pattern match without allocating a port string.
+///
+/// Istio + Ferrum direct-config validators only allow three pattern shapes
+/// (`*`, `<digits>*`, `*<digits>`), so a `starts_with` / `ends_with` /
+/// equality check on the digit form of `port` is enough — there is no need
+/// to invoke the general glob matcher. Writing the port into a 5-byte stack
+/// buffer (max `u16::MAX = 65535`) avoids the per-request `String` allocation
+/// the previous implementation paid for every `port_patterns` check.
+fn port_pattern_matches(pattern: &str, port: u16) -> bool {
+    if pattern == "*" {
+        return true;
     }
-    if let Some((name, port)) = pattern.rsplit_once(':')
-        && !name.contains(':')
-    {
-        let name = name.strip_suffix('.').unwrap_or(name);
-        return format!("{name}:{port}");
+    let mut buf = [0u8; 5];
+    let port_str = format_u16(&mut buf, port);
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return port_str.starts_with(prefix);
     }
-    pattern.strip_suffix('.').unwrap_or(&pattern).to_string()
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return port_str.ends_with(suffix);
+    }
+    pattern == port_str
+}
+
+fn format_u16(buf: &mut [u8; 5], port: u16) -> &str {
+    let mut idx = 5;
+    let mut value = port;
+    if value == 0 {
+        idx -= 1;
+        buf[idx] = b'0';
+    } else {
+        while value > 0 {
+            idx -= 1;
+            buf[idx] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+    }
+    // SAFETY: only ASCII digits written above, which are valid UTF-8.
+    std::str::from_utf8(&buf[idx..]).expect("ASCII digits are valid UTF-8")
 }
 
 fn normalize_hostname(host: &str) -> Option<String> {
@@ -578,6 +605,105 @@ mod tests {
             evaluate_mesh_authorization(&slice, &request),
             MeshAuthzDecision::Allow
         );
+    }
+
+    #[test]
+    fn request_match_combines_explicit_ports_and_port_patterns() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-mixed-ports".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: vec![RequestMatch {
+                        ports: vec![80],
+                        port_patterns: vec!["8*".to_string()],
+                        ..RequestMatch::default()
+                    }],
+                    when: Vec::new(),
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        let request_80 = MeshAuthzRequest {
+            port: Some(80),
+            ..MeshAuthzRequest::default()
+        };
+        let request_8443 = MeshAuthzRequest {
+            port: Some(8443),
+            ..MeshAuthzRequest::default()
+        };
+        let request_9000 = MeshAuthzRequest {
+            port: Some(9000),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request_80),
+            MeshAuthzDecision::Allow
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request_8443),
+            MeshAuthzDecision::Allow
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request_9000),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn request_match_normalises_trailing_dot_host_pattern_at_config_load() {
+        let mut config = crate::config::mesh::MeshConfig {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-trailing-dot".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: vec![RequestMatch {
+                        hosts: vec!["Example.COM.".to_string()],
+                        ..RequestMatch::default()
+                    }],
+                    when: Vec::new(),
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..crate::config::mesh::MeshConfig::default()
+        };
+        config.normalize();
+        let slice = MeshSlice {
+            mesh_policies: config.mesh_policies,
+            ..MeshSlice::default()
+        };
+        let request = MeshAuthzRequest {
+            host: Some("example.com".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn port_pattern_matches_handles_all_three_pattern_shapes() {
+        assert!(port_pattern_matches("*", 80));
+        assert!(port_pattern_matches("*", 65535));
+        assert!(port_pattern_matches("8*", 80));
+        assert!(port_pattern_matches("8*", 8443));
+        assert!(!port_pattern_matches("8*", 9080));
+        assert!(port_pattern_matches("*443", 443));
+        assert!(port_pattern_matches("*443", 8443));
+        assert!(!port_pattern_matches("*443", 8080));
+        assert!(port_pattern_matches("80", 80));
+        assert!(!port_pattern_matches("80", 8080));
     }
 
     #[test]
