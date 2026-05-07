@@ -420,8 +420,6 @@ fn route_backends(
         .flatten()
         .collect();
     let preserve_single_destination = routes.len() == 1;
-    let all_weights_omitted =
-        !preserve_single_destination && routes.iter().all(|route| route.get("weight").is_none());
     for route in routes {
         let Some(destination) = route.get("destination") else {
             continue;
@@ -437,11 +435,7 @@ fn route_backends(
             .and_then(|p| p.get("number"))
             .and_then(Value::as_u64)
             .unwrap_or(80) as u16;
-        let weight = if all_weights_omitted {
-            1
-        } else {
-            route_weight(object, route)?
-        };
+        let weight = route_weight(object, route)?;
         if weight == 0 && !preserve_single_destination {
             continue;
         }
@@ -699,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_service_evenly_splits_all_omitted_weights() {
+    fn virtual_service_skips_all_omitted_weights_in_multi_destination_split() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -718,19 +712,8 @@ mod tests {
         )
         .expect("translation succeeds");
 
-        assert_eq!(result.config.proxies.len(), 1);
-        assert_eq!(result.config.upstreams.len(), 1);
-        assert_eq!(
-            result.config.upstreams[0].algorithm,
-            crate::config::types::LoadBalancerAlgorithm::RoundRobin
-        );
-        assert_eq!(result.config.upstreams[0].targets.len(), 2);
-        assert!(
-            result.config.upstreams[0]
-                .targets
-                .iter()
-                .all(|target| target.weight == 1)
-        );
+        assert!(result.config.proxies.is_empty());
+        assert!(result.config.upstreams.is_empty());
     }
 
     #[test]
