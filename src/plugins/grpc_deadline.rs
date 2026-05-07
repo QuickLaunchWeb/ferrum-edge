@@ -29,12 +29,15 @@ pub struct GrpcDeadline {
 
 impl GrpcDeadline {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let max_deadline_ms = config["max_deadline_ms"].as_u64();
-        let default_deadline_ms = config["default_deadline_ms"].as_u64();
-        let subtract_gateway_processing = config["subtract_gateway_processing"]
-            .as_bool()
-            .unwrap_or(false);
-        let reject_no_deadline = config["reject_no_deadline"].as_bool().unwrap_or(false);
+        if !config.is_object() {
+            return Err("grpc_deadline: config must be an object".to_string());
+        }
+
+        let max_deadline_ms = optional_u64(config, "max_deadline_ms")?;
+        let default_deadline_ms = optional_u64(config, "default_deadline_ms")?;
+        let subtract_gateway_processing =
+            optional_bool(config, "subtract_gateway_processing")?.unwrap_or(false);
+        let reject_no_deadline = optional_bool(config, "reject_no_deadline")?.unwrap_or(false);
 
         if let Some(0) = max_deadline_ms {
             return Err(
@@ -85,6 +88,27 @@ impl GrpcDeadline {
             subtract_gateway_processing,
             reject_no_deadline,
         })
+    }
+}
+
+fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
+    match config.get(key) {
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("grpc_deadline: '{key}' must be a boolean")),
+    }
+}
+
+fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
+    match config.get(key) {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("grpc_deadline: '{key}' must be an unsigned integer")),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!(
+            "grpc_deadline: '{key}' must be an unsigned integer"
+        )),
     }
 }
 
@@ -155,11 +179,19 @@ fn format_grpc_timeout(d: Duration) -> String {
     for (unit, divisor) in candidates {
         let value = ceil_div_u64(ms, divisor);
         if value <= MAX_GRPC_TIMEOUT_VALUE {
-            return format!("{value}{unit}");
+            let mut timeout = value.to_string();
+            timeout.push(unit);
+            return timeout;
         }
     }
 
-    format!("{MAX_GRPC_TIMEOUT_VALUE}H")
+    let mut timeout = MAX_GRPC_TIMEOUT_VALUE.to_string();
+    timeout.push('H');
+    timeout
+}
+
+fn duration_millis_saturating(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 /// Returns a header map with `content-type: application/grpc`.
@@ -192,16 +224,15 @@ impl Plugin for GrpcDeadline {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        let existing_timeout = headers.get("grpc-timeout").cloned();
-
-        let mut deadline_ms: Option<u64> = match &existing_timeout {
+        let mut deadline_ms: Option<u64> = match headers.get("grpc-timeout") {
             Some(val) => match parse_grpc_timeout(val) {
                 Some(d) => {
+                    let original_ms = duration_millis_saturating(d);
                     ctx.metadata.insert(
                         "grpc_original_deadline_ms".to_string(),
-                        d.as_millis().to_string(),
+                        original_ms.to_string(),
                     );
-                    Some(d.as_millis() as u64)
+                    Some(original_ms)
                 }
                 None => {
                     debug!(

@@ -63,6 +63,7 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
+use http::header::HeaderName;
 use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
@@ -117,7 +118,7 @@ pub struct ServerlessFunction {
     function_hostname: Option<String>,
     aws_config: Option<AwsLambdaConfig>,
     azure_function_key: Option<String>,
-    gcp_bearer_token: Option<String>,
+    gcp_authorization_header: Option<String>,
     forward_body: bool,
     forward_headers: Vec<String>,
     forward_query_params: bool,
@@ -131,6 +132,10 @@ pub struct ServerlessFunction {
 
 impl ServerlessFunction {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        if !config.is_object() {
+            return Err("serverless_function: config must be an object".to_string());
+        }
+
         let provider = match config["provider"].as_str() {
             Some("aws_lambda") => Provider::AwsLambda,
             Some("azure_functions") => Provider::AzureFunctions,
@@ -170,29 +175,25 @@ impl ServerlessFunction {
             }
         };
 
-        let forward_body = config["forward_body"].as_bool().unwrap_or(false);
-        let forward_query_params = config["forward_query_params"].as_bool().unwrap_or(false);
+        let forward_body = optional_bool(config, "forward_body")?.unwrap_or(false);
+        let forward_query_params = optional_bool(config, "forward_query_params")?.unwrap_or(false);
 
-        let forward_headers: Vec<String> = config["forward_headers"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_ascii_lowercase()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let forward_headers = parse_forward_headers(config)?;
 
-        let timeout_ms = config["timeout_ms"].as_u64().unwrap_or(5000);
+        let timeout_ms = optional_u64(config, "timeout_ms")?.unwrap_or(5000);
         if timeout_ms == 0 {
             return Err("serverless_function: timeout_ms must be > 0".to_string());
         }
 
-        let max_response_body_bytes = config["max_response_body_bytes"]
-            .as_u64()
-            .unwrap_or(10 * 1024 * 1024) as usize;
+        let max_response_body_bytes =
+            optional_u64(config, "max_response_body_bytes")?.unwrap_or(10 * 1024 * 1024);
         if max_response_body_bytes == 0 {
             return Err("serverless_function: max_response_body_bytes must be > 0".to_string());
         }
+        let max_response_body_bytes = usize::try_from(max_response_body_bytes).map_err(|_| {
+            "serverless_function: max_response_body_bytes is too large for this platform"
+                .to_string()
+        })?;
 
         // Strict `on_error` validation — a typo here changes whether a function
         // failure rejects the request or silently continues, so silent
@@ -213,7 +214,7 @@ impl ServerlessFunction {
             }
         };
 
-        let raw_status = config["error_status_code"].as_u64().unwrap_or(502);
+        let raw_status = optional_u64(config, "error_status_code")?.unwrap_or(502);
         if !(100..=599).contains(&raw_status) {
             return Err(format!(
                 "serverless_function: error_status_code must be in range 100-599 (got {raw_status})"
@@ -223,146 +224,143 @@ impl ServerlessFunction {
 
         // Provider-specific config + URL construction.
         // Config fields take precedence; well-known env vars are used as fallback.
-        let (function_url, aws_config, azure_function_key, gcp_bearer_token) = match &provider {
-            Provider::AwsLambda => {
-                let region = config_or_env(&config["aws_region"], "AWS_DEFAULT_REGION")
-                    .or_else(|| config_or_env(&Value::Null, "AWS_REGION"))
-                    .ok_or_else(|| {
-                        "serverless_function: 'aws_region' is required for aws_lambda \
+        let (function_url, aws_config, azure_function_key, gcp_authorization_header) =
+            match &provider {
+                Provider::AwsLambda => {
+                    let region = optional_config_string(config, "aws_region")?
+                        .or_else(|| env_non_empty("AWS_DEFAULT_REGION"))
+                        .or_else(|| env_non_empty("AWS_REGION"))
+                        .ok_or_else(|| {
+                            "serverless_function: 'aws_region' is required for aws_lambda \
                          (or set AWS_DEFAULT_REGION / AWS_REGION env var)"
-                            .to_string()
-                    })?;
+                                .to_string()
+                        })?;
 
-                let access_key_id =
-                    config_or_env(&config["aws_access_key_id"], "AWS_ACCESS_KEY_ID").ok_or_else(
-                        || {
+                    let access_key_id = optional_config_string(config, "aws_access_key_id")?
+                        .or_else(|| env_non_empty("AWS_ACCESS_KEY_ID"))
+                        .ok_or_else(|| {
                             "serverless_function: 'aws_access_key_id' is required for aws_lambda \
                          (or set AWS_ACCESS_KEY_ID env var)"
                                 .to_string()
-                        },
-                    )?;
+                        })?;
 
-                let secret_access_key = config_or_env(
-                    &config["aws_secret_access_key"],
-                    "AWS_SECRET_ACCESS_KEY",
-                )
-                .ok_or_else(|| {
-                    "serverless_function: 'aws_secret_access_key' is required for aws_lambda \
+                    let secret_access_key = optional_config_string(
+                        config,
+                        "aws_secret_access_key",
+                    )?
+                    .or_else(|| env_non_empty("AWS_SECRET_ACCESS_KEY"))
+                    .ok_or_else(|| {
+                        "serverless_function: 'aws_secret_access_key' is required for aws_lambda \
                              (or set AWS_SECRET_ACCESS_KEY env var)"
-                        .to_string()
-                })?;
+                            .to_string()
+                    })?;
 
-                let function_name =
-                    config_or_env(&config["aws_function_name"], "AWS_LAMBDA_FUNCTION_NAME")
+                    let function_name = optional_config_string(config, "aws_function_name")?
+                        .or_else(|| env_non_empty("AWS_LAMBDA_FUNCTION_NAME"))
                         .ok_or_else(|| {
                             "serverless_function: 'aws_function_name' is required for aws_lambda \
                          (or set AWS_LAMBDA_FUNCTION_NAME env var)"
                                 .to_string()
                         })?;
 
-                let session_token =
-                    config_or_env(&config["aws_session_token"], "AWS_SESSION_TOKEN");
+                    let session_token = optional_config_string(config, "aws_session_token")?
+                        .or_else(|| env_non_empty("AWS_SESSION_TOKEN"));
 
-                let qualifier = config["aws_qualifier"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(String::from);
+                    let qualifier = optional_config_string(config, "aws_qualifier")?;
 
-                // Log which values came from env vars (without leaking secrets)
-                if config["aws_region"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .is_none()
-                {
-                    info!("serverless_function: aws_region resolved from environment variable");
-                }
-                if config["aws_access_key_id"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .is_none()
-                {
-                    info!(
-                        "serverless_function: aws_access_key_id resolved from environment variable"
+                    // Log which values came from env vars (without leaking secrets)
+                    if config["aws_region"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .is_none()
+                    {
+                        info!("serverless_function: aws_region resolved from environment variable");
+                    }
+                    if config["aws_access_key_id"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .is_none()
+                    {
+                        info!(
+                            "serverless_function: aws_access_key_id resolved from environment variable"
+                        );
+                    }
+
+                    // Build the Lambda Invoke API URL
+                    let mut url = format!(
+                        "https://lambda.{}.amazonaws.com/2015-03-31/functions/{}/invocations",
+                        region, function_name
                     );
+                    if let Some(ref q) = qualifier {
+                        url.push_str("?Qualifier=");
+                        url.push_str(&aws_sigv4::uri_encode(q, true));
+                    }
+
+                    let aws_cfg = AwsLambdaConfig {
+                        region,
+                        access_key_id,
+                        secret_access_key,
+                        session_token,
+                        function_name,
+                        qualifier,
+                    };
+
+                    (url, Some(aws_cfg), None, None)
                 }
-
-                // Build the Lambda Invoke API URL
-                let mut url = format!(
-                    "https://lambda.{}.amazonaws.com/2015-03-31/functions/{}/invocations",
-                    region, function_name
-                );
-                if let Some(ref q) = qualifier {
-                    url.push_str("?Qualifier=");
-                    url.push_str(&aws_sigv4::uri_encode(q, true));
-                }
-
-                let aws_cfg = AwsLambdaConfig {
-                    region,
-                    access_key_id,
-                    secret_access_key,
-                    session_token,
-                    function_name,
-                    qualifier,
-                };
-
-                (url, Some(aws_cfg), None, None)
-            }
-            Provider::AzureFunctions => {
-                let url = config["function_url"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
+                Provider::AzureFunctions => {
+                    let url = optional_config_string(config, "function_url")?.ok_or_else(|| {
                         "serverless_function: 'function_url' is required for azure_functions"
                             .to_string()
-                    })?
-                    .to_string();
+                    })?;
 
-                validate_function_url(&url)?;
+                    validate_function_url(&url)?;
 
-                let key = config_or_env(&config["azure_function_key"], "AZURE_FUNCTIONS_KEY");
-                if config["azure_function_key"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .is_none()
-                    && key.is_some()
-                {
-                    info!(
-                        "serverless_function: azure_function_key resolved from AZURE_FUNCTIONS_KEY env var"
-                    );
+                    let key = optional_config_string(config, "azure_function_key")?
+                        .or_else(|| env_non_empty("AZURE_FUNCTIONS_KEY"));
+                    if config["azure_function_key"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .is_none()
+                        && key.is_some()
+                    {
+                        info!(
+                            "serverless_function: azure_function_key resolved from AZURE_FUNCTIONS_KEY env var"
+                        );
+                    }
+
+                    (url, None, key, None)
                 }
-
-                (url, None, key, None)
-            }
-            Provider::GcpCloudFunctions => {
-                let url = config["function_url"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
+                Provider::GcpCloudFunctions => {
+                    let url = optional_config_string(config, "function_url")?.ok_or_else(|| {
                         "serverless_function: 'function_url' is required for gcp_cloud_functions"
                             .to_string()
-                    })?
-                    .to_string();
+                    })?;
 
-                validate_function_url(&url)?;
+                    validate_function_url(&url)?;
 
-                let token = config_or_env(
-                    &config["gcp_bearer_token"],
-                    "GCP_CLOUD_FUNCTIONS_BEARER_TOKEN",
-                );
-                if config["gcp_bearer_token"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .is_none()
-                    && token.is_some()
-                {
-                    info!(
-                        "serverless_function: gcp_bearer_token resolved from GCP_CLOUD_FUNCTIONS_BEARER_TOKEN env var"
-                    );
+                    let token = optional_config_string(config, "gcp_bearer_token")?
+                        .or_else(|| env_non_empty("GCP_CLOUD_FUNCTIONS_BEARER_TOKEN"));
+                    if config["gcp_bearer_token"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .is_none()
+                        && token.is_some()
+                    {
+                        info!(
+                            "serverless_function: gcp_bearer_token resolved from GCP_CLOUD_FUNCTIONS_BEARER_TOKEN env var"
+                        );
+                    }
+
+                    let authorization_header = token.map(|token| {
+                        let mut value = String::with_capacity("Bearer ".len() + token.len());
+                        value.push_str("Bearer ");
+                        value.push_str(&token);
+                        value
+                    });
+
+                    (url, None, None, authorization_header)
                 }
-
-                (url, None, None, token)
-            }
-        };
+            };
 
         // Extract hostname for DNS warmup
         let function_hostname = Url::parse(&function_url)
@@ -379,7 +377,7 @@ impl ServerlessFunction {
             function_hostname,
             aws_config,
             azure_function_key,
-            gcp_bearer_token,
+            gcp_authorization_header,
             forward_body,
             forward_headers,
             forward_query_params,
@@ -478,7 +476,7 @@ impl ServerlessFunction {
                 if let Some(ref aws) = self.aws_config {
                     let now = Utc::now();
                     let auth_headers =
-                        sign_aws_request(aws, &self.function_url, &payload_bytes, &now);
+                        sign_aws_request(aws, &self.function_url, &payload_bytes, &now)?;
                     for (k, v) in &auth_headers {
                         req_builder = req_builder.header(k.as_str(), v.as_str());
                     }
@@ -490,8 +488,8 @@ impl ServerlessFunction {
                 }
             }
             Provider::GcpCloudFunctions => {
-                if let Some(ref token) = self.gcp_bearer_token {
-                    req_builder = req_builder.header("authorization", format!("Bearer {}", token));
+                if let Some(ref auth_header) = self.gcp_authorization_header {
+                    req_builder = req_builder.header("authorization", auth_header.as_str());
                 }
             }
         }
@@ -542,14 +540,63 @@ impl ServerlessFunction {
     }
 }
 
-/// Resolve a config field with env var fallback.
-/// Config value takes precedence; if absent or empty, fall back to the named env var.
-fn config_or_env(config_value: &Value, env_var: &str) -> Option<String> {
-    config_value
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .or_else(|| std::env::var(env_var).ok().filter(|s| !s.is_empty()))
+fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
+    match config.get(key) {
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("serverless_function: '{key}' must be a boolean")),
+    }
+}
+
+fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
+    match config.get(key) {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("serverless_function: '{key}' must be an unsigned integer")),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!(
+            "serverless_function: '{key}' must be an unsigned integer"
+        )),
+    }
+}
+
+fn optional_config_string(config: &Value, key: &str) -> Result<Option<String>, String> {
+    match config.get(key) {
+        Some(Value::String(value)) => Ok((!value.is_empty()).then(|| value.clone())),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("serverless_function: '{key}' must be a string")),
+    }
+}
+
+fn env_non_empty(env_var: &str) -> Option<String> {
+    std::env::var(env_var).ok().filter(|s| !s.is_empty())
+}
+
+fn parse_forward_headers(config: &Value) -> Result<Vec<String>, String> {
+    let Some(value) = config.get("forward_headers") else {
+        return Ok(Vec::new());
+    };
+
+    let Value::Array(headers) = value else {
+        if value.is_null() {
+            return Ok(Vec::new());
+        }
+        return Err("serverless_function: 'forward_headers' must be an array".to_string());
+    };
+
+    let mut parsed = Vec::with_capacity(headers.len());
+    for (idx, header) in headers.iter().enumerate() {
+        let name = header.as_str().filter(|s| !s.is_empty()).ok_or_else(|| {
+            format!("serverless_function: forward_headers[{idx}] must be a non-empty string")
+        })?;
+        HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            format!("serverless_function: forward_headers[{idx}] is not a valid HTTP header name")
+        })?;
+        parsed.push(name.to_ascii_lowercase());
+    }
+
+    Ok(parsed)
 }
 
 /// Escape special characters for safe JSON string interpolation.
@@ -583,6 +630,20 @@ fn validate_function_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn contains_json_ascii(value: &str) -> bool {
+    value
+        .as_bytes()
+        .windows(b"json".len())
+        .any(|window| window.eq_ignore_ascii_case(b"json"))
+}
+
+fn starts_with_grpc_content_type(value: &str) -> bool {
+    value
+        .as_bytes()
+        .get(..b"application/grpc".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"application/grpc"))
+}
+
 // ---------------------------------------------------------------------------
 // AWS SigV4 request signing — delegates to shared utils::aws_sigv4 module
 // ---------------------------------------------------------------------------
@@ -594,7 +655,7 @@ fn sign_aws_request(
     url_str: &str,
     payload: &[u8],
     now: &chrono::DateTime<Utc>,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, String> {
     let config = aws_sigv4::AwsSigV4Config {
         region: aws.region.clone(),
         access_key_id: aws.access_key_id.clone(),
@@ -626,7 +687,7 @@ pub mod test_helpers {
         url: &str,
         payload: &[u8],
         now: &chrono::DateTime<Utc>,
-    ) -> Vec<(String, String)> {
+    ) -> Result<Vec<(String, String)>, String> {
         let config = aws_sigv4::AwsSigV4Config {
             region: aws_config["region"]
                 .as_str()
@@ -685,7 +746,7 @@ impl Plugin for ServerlessFunction {
             && ctx
                 .headers
                 .get("content-type")
-                .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
+                .is_some_and(|ct| contains_json_ascii(ct))
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -706,7 +767,7 @@ impl Plugin for ServerlessFunction {
         if self.mode == InvocationMode::Terminate {
             let is_grpc = headers
                 .get("content-type")
-                .is_some_and(|ct| ct.starts_with("application/grpc"));
+                .is_some_and(|ct| starts_with_grpc_content_type(ct));
             if is_grpc {
                 warn!(
                     "serverless_function: terminate mode is not supported for gRPC requests — \
@@ -779,7 +840,7 @@ impl Plugin for ServerlessFunction {
                         }
                         ErrorAction::Reject => PluginResult::Reject {
                             status_code: status,
-                            body: String::from_utf8(body).unwrap_or_default(),
+                            body: String::from_utf8_lossy(&body).into_owned(),
                             headers: HashMap::new(),
                         },
                     };
@@ -800,8 +861,11 @@ impl Plugin for ServerlessFunction {
                     if let Some(meta_map) = resp_json.get("metadata").and_then(|m| m.as_object()) {
                         for (key, val) in meta_map {
                             if let Some(v) = val.as_str() {
-                                ctx.metadata
-                                    .insert(format!("serverless_{}", key), v.to_string());
+                                let mut metadata_key =
+                                    String::with_capacity("serverless_".len() + key.len());
+                                metadata_key.push_str("serverless_");
+                                metadata_key.push_str(key);
+                                ctx.metadata.insert(metadata_key, v.to_string());
                             }
                         }
                     }

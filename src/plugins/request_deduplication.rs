@@ -18,6 +18,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
+use http::{HeaderName, Method};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,6 +55,12 @@ enum DeduplicationEntry {
     Completed(CachedResponse),
 }
 
+enum LocalDeduplicationAction {
+    Fresh,
+    Replay(CachedResponse),
+    Conflict,
+}
+
 pub struct RequestDeduplication {
     /// Header name to read the idempotency key from.
     header_name: String,
@@ -83,59 +91,41 @@ pub struct RequestDeduplication {
 
 impl RequestDeduplication {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        let header_name = config["header_name"]
-            .as_str()
-            .unwrap_or("Idempotency-Key")
-            .to_ascii_lowercase();
-
-        let ttl_seconds = config["ttl_seconds"].as_u64().unwrap_or(300);
-        if ttl_seconds == 0 {
-            return Err("request_deduplication: ttl_seconds must be greater than 0".to_string());
+        if !config.is_object() {
+            return Err("request_deduplication: config must be an object".to_string());
         }
+
+        let header_name = parse_header_name(
+            optional_string(config, "header_name")?.unwrap_or("Idempotency-Key"),
+        )?;
+
+        let ttl_seconds = optional_positive_u64(config, "ttl_seconds")?.unwrap_or(300);
         let ttl = Duration::from_secs(ttl_seconds);
 
-        let inflight_ttl_seconds = config["inflight_ttl_seconds"]
-            .as_u64()
-            .unwrap_or(ttl_seconds);
-        if inflight_ttl_seconds == 0 {
-            return Err(
-                "request_deduplication: inflight_ttl_seconds must be greater than 0".to_string(),
-            );
-        }
+        let inflight_ttl_seconds =
+            optional_positive_u64(config, "inflight_ttl_seconds")?.unwrap_or(ttl_seconds);
         let inflight_ttl = Duration::from_secs(inflight_ttl_seconds);
 
-        let max_entries = config["max_entries"].as_u64().unwrap_or(10_000) as usize;
+        let max_entries = optional_positive_usize(config, "max_entries")?.unwrap_or(10_000);
 
-        let applicable_methods: Vec<String> = config["applicable_methods"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_ascii_uppercase()))
-                    .collect()
-            })
-            .unwrap_or_else(|| vec!["POST".to_string(), "PUT".to_string(), "PATCH".to_string()]);
-
-        if applicable_methods.is_empty() {
-            return Err("request_deduplication: applicable_methods must not be empty".to_string());
-        }
-
-        let scope_by_consumer = config["scope_by_consumer"].as_bool().unwrap_or(true);
-        let enforce_required = config["enforce_required"].as_bool().unwrap_or(false);
+        let applicable_methods = parse_applicable_methods(config)?;
+        let scope_by_consumer = optional_bool(config, "scope_by_consumer")?.unwrap_or(true);
+        let enforce_required = optional_bool(config, "enforce_required")?.unwrap_or(false);
 
         // Build optional Redis client
+        let default_prefix = default_redis_key_prefix(http_client.namespace());
         let redis_client =
-            RedisConfig::from_plugin_config(config, &format!("{}:dedup", http_client.namespace()))
-                .map(|redis_config| {
-                    let dns_cache = http_client.dns_cache();
-                    let tls_no_verify = http_client.tls_no_verify();
-                    let tls_ca_bundle_path = http_client.tls_ca_bundle_path();
-                    Arc::new(RedisRateLimitClient::new(
-                        redis_config,
-                        dns_cache.cloned(),
-                        tls_no_verify,
-                        tls_ca_bundle_path,
-                    ))
-                });
+            RedisConfig::from_plugin_config(config, &default_prefix)?.map(|redis_config| {
+                let dns_cache = http_client.dns_cache();
+                let tls_no_verify = http_client.tls_no_verify();
+                let tls_ca_bundle_path = http_client.tls_ca_bundle_path();
+                Arc::new(RedisRateLimitClient::new(
+                    redis_config,
+                    dns_cache.cloned(),
+                    tls_no_verify,
+                    tls_ca_bundle_path,
+                ))
+            });
 
         Ok(Self {
             header_name,
@@ -162,10 +152,49 @@ impl RequestDeduplication {
         if self.scope_by_consumer
             && let Some(identity) = ctx.effective_identity()
         {
-            return format!("{}:{}:{}", proxy_id, identity, idempotency_value);
+            let mut key = String::with_capacity(
+                proxy_id.len() + identity.len() + idempotency_value.len() + 2,
+            );
+            key.push_str(proxy_id);
+            key.push(':');
+            key.push_str(identity);
+            key.push(':');
+            key.push_str(idempotency_value);
+            return key;
         }
 
-        format!("{}:{}", proxy_id, idempotency_value)
+        let mut key = String::with_capacity(proxy_id.len() + idempotency_value.len() + 1);
+        key.push_str(proxy_id);
+        key.push(':');
+        key.push_str(idempotency_value);
+        key
+    }
+
+    fn local_lookup_or_mark_inflight(&self, key: &str, now: Instant) -> LocalDeduplicationAction {
+        match self.local_cache.entry(key.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(DeduplicationEntry::InFlight { started_at: now });
+                LocalDeduplicationAction::Fresh
+            }
+            Entry::Occupied(mut entry) => match entry.get() {
+                DeduplicationEntry::Completed(cached) => {
+                    if now.duration_since(cached.inserted_at) < self.ttl {
+                        LocalDeduplicationAction::Replay(cached.clone())
+                    } else {
+                        entry.insert(DeduplicationEntry::InFlight { started_at: now });
+                        LocalDeduplicationAction::Fresh
+                    }
+                }
+                DeduplicationEntry::InFlight { started_at } => {
+                    if now.duration_since(*started_at) >= self.inflight_ttl {
+                        entry.insert(DeduplicationEntry::InFlight { started_at: now });
+                        LocalDeduplicationAction::Fresh
+                    } else {
+                        LocalDeduplicationAction::Conflict
+                    }
+                }
+            },
+        }
     }
 
     /// Try to retrieve a cached response from Redis.
@@ -218,7 +247,7 @@ impl RequestDeduplication {
             .set_bytes_with_expire(&redis_key, &data, ttl_seconds)
             .await
         {
-            debug!("request_deduplication: Redis SET failed for key '{}'", key);
+            debug!("request_deduplication: Redis SET failed");
         }
     }
 
@@ -231,7 +260,8 @@ impl RequestDeduplication {
 
         // Only run cleanup every 30 seconds
         let last = self.last_cleanup.load(Ordering::Relaxed);
-        if now_epoch.saturating_sub(last) < 30 {
+        let over_capacity = self.local_cache.len() > self.max_entries;
+        if !over_capacity && now_epoch.saturating_sub(last) < 30 {
             return;
         }
         if self
@@ -295,6 +325,112 @@ struct SerializableCachedResponse {
     body: Vec<u8>,
 }
 
+fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(Some)
+        .ok_or_else(|| format!("request_deduplication: '{field}' must be a string"))
+}
+
+fn optional_positive_u64(config: &Value, field: &'static str) -> Result<Option<u64>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_u64() else {
+        return Err(format!(
+            "request_deduplication: '{field}' must be an integer greater than zero"
+        ));
+    };
+    if value == 0 {
+        return Err(format!(
+            "request_deduplication: '{field}' must be greater than zero"
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option<usize>, String> {
+    let Some(value) = optional_positive_u64(config, field)? else {
+        return Ok(None);
+    };
+    usize::try_from(value)
+        .map(Some)
+        .map_err(|_| format!("request_deduplication: '{field}' is too large for this platform"))
+}
+
+fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| format!("request_deduplication: '{field}' must be a boolean"))
+}
+
+fn parse_header_name(value: &str) -> Result<String, String> {
+    HeaderName::from_bytes(value.as_bytes())
+        .map(|name| name.as_str().to_string())
+        .map_err(|_| {
+            "request_deduplication: 'header_name' must be a valid HTTP header name".to_string()
+        })
+}
+
+fn parse_applicable_methods(config: &Value) -> Result<Vec<String>, String> {
+    let Some(value) = config.get("applicable_methods") else {
+        return Ok(vec![
+            "POST".to_string(),
+            "PUT".to_string(),
+            "PATCH".to_string(),
+        ]);
+    };
+    let Some(methods) = value.as_array() else {
+        return Err(
+            "request_deduplication: 'applicable_methods' must be an array of method strings"
+                .to_string(),
+        );
+    };
+    if methods.is_empty() {
+        return Err("request_deduplication: applicable_methods must not be empty".to_string());
+    }
+
+    let mut parsed = Vec::with_capacity(methods.len());
+    for method in methods {
+        let Some(method) = method.as_str() else {
+            return Err(
+                "request_deduplication: 'applicable_methods' must contain only strings".to_string(),
+            );
+        };
+        let method = method.trim();
+        if method.is_empty() || Method::from_bytes(method.as_bytes()).is_err() {
+            return Err(
+                "request_deduplication: 'applicable_methods' contains an invalid HTTP method"
+                    .to_string(),
+            );
+        }
+        parsed.push(method.to_ascii_uppercase());
+    }
+
+    Ok(parsed)
+}
+
+fn default_redis_key_prefix(namespace: &str) -> String {
+    let mut prefix = String::with_capacity(namespace.len() + 6);
+    prefix.push_str(namespace);
+    prefix.push_str(":dedup");
+    prefix
+}
+
+fn missing_idempotency_body(header_name: &str) -> String {
+    let mut message = String::with_capacity(41 + header_name.len());
+    message.push_str("Missing required idempotency header: ");
+    message.push_str(header_name);
+    serde_json::json!({ "error": message }).to_string()
+}
+
 #[async_trait]
 impl Plugin for RequestDeduplication {
     fn name(&self) -> &str {
@@ -327,27 +463,24 @@ impl Plugin for RequestDeduplication {
             return PluginResult::Continue;
         }
 
-        // Get idempotency key from headers
-        let idempotency_value = headers.get(&self.header_name).cloned();
-
-        let idempotency_value = match idempotency_value {
-            Some(v) if !v.is_empty() => v,
-            _ => {
-                if self.enforce_required {
-                    return PluginResult::Reject {
-                        status_code: 400,
-                        body: format!(
-                            r#"{{"error":"Missing required idempotency header: {}"}}"#,
-                            self.header_name,
-                        ),
-                        headers: HashMap::new(),
-                    };
+        let key = {
+            // Get idempotency key from headers. Keep the borrow scoped so no
+            // header-map borrow survives across Redis/cache awaits below.
+            let idempotency_value = match headers.get(&self.header_name) {
+                Some(value) if !value.is_empty() => value.as_str(),
+                _ => {
+                    if self.enforce_required {
+                        return PluginResult::Reject {
+                            status_code: 400,
+                            body: missing_idempotency_body(&self.header_name),
+                            headers: HashMap::new(),
+                        };
+                    }
+                    return PluginResult::Continue;
                 }
-                return PluginResult::Continue;
-            }
+            };
+            self.build_key(ctx, idempotency_value)
         };
-
-        let key = self.build_key(ctx, &idempotency_value);
 
         // Periodic cleanup
         self.cleanup_local_cache();
@@ -356,10 +489,7 @@ impl Plugin for RequestDeduplication {
         if self.redis_client.is_some()
             && let Some(cached) = self.redis_get(&key).await
         {
-            debug!(
-                "request_deduplication: Redis cache hit for key '{}', replaying response",
-                idempotency_value
-            );
+            debug!("request_deduplication: Redis cache hit, replaying response");
             // Defense-in-depth: re-sanitize on replay even though insert
             // already strips. A stored entry written before this fix landed,
             // or by a peer running an older binary against a shared Redis,
@@ -373,67 +503,35 @@ impl Plugin for RequestDeduplication {
             };
         }
 
-        // Check local cache
-        let now = Instant::now();
-        if let Some(entry) = self.local_cache.get(&key) {
-            match entry.value() {
-                DeduplicationEntry::Completed(cached) => {
-                    // Check TTL
-                    if now.duration_since(cached.inserted_at) < self.ttl {
-                        debug!(
-                            "request_deduplication: cache hit for key '{}', replaying response",
-                            idempotency_value
-                        );
-                        // Defense-in-depth: re-sanitize on replay even though
-                        // insert already strips. Cheap (single HashMap pass)
-                        // and protects against any future code path that
-                        // populates the cache without going through
-                        // `on_final_response_body`.
-                        let mut response_headers = sanitize_cached_headers(&cached.headers);
-                        response_headers
-                            .insert("x-idempotent-replayed".to_string(), "true".to_string());
-                        return PluginResult::RejectBinary {
-                            status_code: cached.status_code,
-                            body: cached.body.clone(),
-                            headers: response_headers,
-                        };
-                    }
-                    // Expired — remove and continue
-                    drop(entry);
-                    self.local_cache.remove(&key);
-                }
-                DeduplicationEntry::InFlight { started_at } => {
-                    // If the in-flight marker has exceeded inflight_ttl, the
-                    // original request must have died without ever reaching
-                    // on_final_response_body. Treat as a fresh request and
-                    // replace the marker rather than blocking forever.
-                    if now.duration_since(*started_at) >= self.inflight_ttl {
-                        debug!(
-                            "request_deduplication: stale in-flight marker for key '{}' (age >= {:?}), treating as fresh request",
-                            idempotency_value, self.inflight_ttl
-                        );
-                        drop(entry);
-                        // Fall through to insert new InFlight marker below
-                    } else {
-                        // Another request with the same key is in-flight.
-                        // Return 409 Conflict rather than both hitting the backend.
-                        drop(entry);
-                        return PluginResult::Reject {
-                            status_code: 409,
-                            body: r#"{"error":"A request with this idempotency key is already in progress"}"#
-                                .to_string(),
-                            headers: HashMap::new(),
-                        };
-                    }
-                }
+        // Check local cache and mark fresh keys as in-flight atomically under
+        // the DashMap entry lock. This prevents two concurrent first requests
+        // with the same idempotency key from both reaching the backend.
+        match self.local_lookup_or_mark_inflight(&key, Instant::now()) {
+            LocalDeduplicationAction::Replay(cached) => {
+                debug!("request_deduplication: local cache hit, replaying response");
+                // Defense-in-depth: re-sanitize on replay even though insert
+                // already strips. Cheap (single HashMap pass) and protects
+                // against any future code path that populates the cache without
+                // going through `on_final_response_body`.
+                let mut response_headers = sanitize_cached_headers(&cached.headers);
+                response_headers.insert("x-idempotent-replayed".to_string(), "true".to_string());
+                return PluginResult::RejectBinary {
+                    status_code: cached.status_code,
+                    body: cached.body.clone(),
+                    headers: response_headers,
+                };
             }
+            LocalDeduplicationAction::Conflict => {
+                return PluginResult::Reject {
+                    status_code: 409,
+                    body:
+                        r#"{"error":"A request with this idempotency key is already in progress"}"#
+                            .to_string(),
+                    headers: HashMap::new(),
+                };
+            }
+            LocalDeduplicationAction::Fresh => {}
         }
-
-        // Mark as in-flight (replacing any expired marker)
-        self.local_cache.insert(
-            key.clone(),
-            DeduplicationEntry::InFlight { started_at: now },
-        );
 
         // Store the key in metadata so on_final_response_body can cache the response
         ctx.metadata.insert("_dedup_key".to_string(), key);
@@ -510,7 +608,10 @@ mod tests {
     #[test]
     fn cleanup_preserves_active_inflight_over_max_entries() {
         let config = json!({ "max_entries": 2 });
-        let plugin = RequestDeduplication::new(&config, PluginHttpClient::default()).unwrap();
+        let plugin = match RequestDeduplication::new(&config, PluginHttpClient::default()) {
+            Ok(plugin) => plugin,
+            Err(error) => panic!("request_deduplication config should be valid: {error}"),
+        };
 
         // 3 active in-flight markers, cap is 2 → over limit.
         let now = Instant::now();
@@ -539,7 +640,10 @@ mod tests {
     #[test]
     fn cleanup_evicts_oldest_completed_preserves_inflight() {
         let config = json!({ "max_entries": 2 });
-        let plugin = RequestDeduplication::new(&config, PluginHttpClient::default()).unwrap();
+        let plugin = match RequestDeduplication::new(&config, PluginHttpClient::default()) {
+            Ok(plugin) => plugin,
+            Err(error) => panic!("request_deduplication config should be valid: {error}"),
+        };
 
         let now = Instant::now();
         // 1 active in-flight

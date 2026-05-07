@@ -57,6 +57,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::warn;
@@ -94,15 +95,17 @@ pub struct RequestMirror {
 
 impl RequestMirror {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        let mirror_host = config["mirror_host"]
-            .as_str()
+        if !config.is_object() {
+            return Err("request_mirror: config must be an object".to_string());
+        }
+
+        let mirror_host = optional_string(config, "mirror_host")?
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "request_mirror: 'mirror_host' is required".to_string())?
             .to_ascii_lowercase();
 
-        let mirror_protocol = config["mirror_protocol"]
-            .as_str()
-            .unwrap_or("http")
+        let mirror_protocol = optional_string(config, "mirror_protocol")?
+            .unwrap_or_else(|| "http".to_string())
             .to_ascii_lowercase();
 
         if mirror_protocol != "http" && mirror_protocol != "https" {
@@ -113,8 +116,7 @@ impl RequestMirror {
         }
 
         let default_port: u16 = if mirror_protocol == "https" { 443 } else { 80 };
-        let mirror_port = config["mirror_port"]
-            .as_u64()
+        let mirror_port = optional_u64(config, "mirror_port")?
             .map(|p| {
                 if p == 0 || p > 65535 {
                     Err(format!(
@@ -128,12 +130,14 @@ impl RequestMirror {
             .transpose()?
             .unwrap_or(default_port);
 
-        let mirror_path = config["mirror_path"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(String::from);
+        let mirror_path = optional_string(config, "mirror_path")?.filter(|s| !s.is_empty());
+        if let Some(path) = &mirror_path
+            && !path.starts_with('/')
+        {
+            return Err("request_mirror: 'mirror_path' must start with '/'".to_string());
+        }
 
-        let percentage = config["percentage"].as_f64().unwrap_or(100.0);
+        let percentage = optional_f64(config, "percentage")?.unwrap_or(100.0);
         if !(0.0..=100.0).contains(&percentage) {
             return Err(format!(
                 "request_mirror: 'percentage' must be 0.0–100.0 (got {})",
@@ -141,14 +145,17 @@ impl RequestMirror {
             ));
         }
 
-        let mirror_request_body = config["mirror_request_body"].as_bool().unwrap_or(true);
+        let mirror_request_body = optional_bool(config, "mirror_request_body")?.unwrap_or(true);
 
         let max_response_body_bytes = match config.get("max_response_body_bytes") {
             Some(Value::Number(n)) => match n.as_u64() {
                 Some(0) => {
                     return Err("request_mirror: 'max_response_body_bytes' must be > 0".to_string());
                 }
-                Some(v) => v as usize,
+                Some(v) => usize::try_from(v).map_err(|_| {
+                    "request_mirror: 'max_response_body_bytes' is too large for this platform"
+                        .to_string()
+                })?,
                 None => {
                     return Err(
                         "request_mirror: 'max_response_body_bytes' must be a non-negative integer"
@@ -189,10 +196,15 @@ impl RequestMirror {
     ) -> String {
         let path = self.mirror_path.as_deref().unwrap_or(original_path);
 
-        let mut url = format!(
-            "{}://{}:{}{}",
-            self.mirror_protocol, self.mirror_host, self.mirror_port, path
+        let mut url = String::with_capacity(
+            self.mirror_protocol.len() + 3 + self.mirror_host.len() + 1 + 5 + path.len(),
         );
+        url.push_str(&self.mirror_protocol);
+        url.push_str("://");
+        url.push_str(&self.mirror_host);
+        url.push(':');
+        let _ = write!(&mut url, "{}", self.mirror_port);
+        url.push_str(path);
 
         if !query_params.is_empty() {
             url.push('?');
@@ -220,6 +232,46 @@ impl RequestMirror {
         let count = self.request_counter.fetch_add(1, Ordering::Relaxed);
         let threshold = (self.percentage * 10.0) as u64; // 0.1% granularity
         (count % 1000) < threshold
+    }
+}
+
+fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
+    match config.get(key) {
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("request_mirror: '{key}' must be a boolean")),
+    }
+}
+
+fn optional_f64(config: &Value, key: &str) -> Result<Option<f64>, String> {
+    match config.get(key) {
+        Some(Value::Number(value)) => value
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| format!("request_mirror: '{key}' must be a number")),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("request_mirror: '{key}' must be a number")),
+    }
+}
+
+fn optional_string(config: &Value, key: &str) -> Result<Option<String>, String> {
+    match config.get(key) {
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("request_mirror: '{key}' must be a string")),
+    }
+}
+
+fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
+    match config.get(key) {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("request_mirror: '{key}' must be an unsigned integer")),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!(
+            "request_mirror: '{key}' must be an unsigned integer"
+        )),
     }
 }
 

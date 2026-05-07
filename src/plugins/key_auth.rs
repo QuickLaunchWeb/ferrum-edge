@@ -28,19 +28,39 @@ pub struct KeyAuth {
 
 impl KeyAuth {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let key_location = config["key_location"]
-            .as_str()
-            .unwrap_or("header:X-API-Key")
-            .to_string();
+        let config_obj = config
+            .as_object()
+            .ok_or_else(|| format!("key_auth: config must be an object, got: {config}"))?;
+        let key_location = match config_obj.get("key_location") {
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| format!("key_auth: 'key_location' must be a string, got: {value}"))?
+                .trim(),
+            None => "header:X-API-Key",
+        };
+        if key_location.is_empty() {
+            return Err("key_auth: 'key_location' must not be empty".to_string());
+        }
 
-        let (header_name_lower, header_name_original, query_param_name) =
-            if let Some(name) = key_location.strip_prefix("header:") {
-                (Some(name.to_lowercase()), Some(name.to_string()), None)
-            } else if let Some(name) = key_location.strip_prefix("query:") {
-                (None, None, Some(name.to_string()))
-            } else {
-                (None, None, None)
-            };
+        let (header_name_lower, header_name_original, query_param_name) = if let Some(name) =
+            key_location.strip_prefix("header:")
+        {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err("key_auth: 'key_location' header name must not be empty".to_string());
+            }
+            (Some(name.to_lowercase()), Some(name.to_string()), None)
+        } else if let Some(name) = key_location.strip_prefix("query:") {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err("key_auth: 'key_location' query name must not be empty".to_string());
+            }
+            (None, None, Some(name.to_string()))
+        } else {
+            return Err(
+                "key_auth: 'key_location' must use 'header:<name>' or 'query:<name>'".to_string(),
+            );
+        };
 
         Ok(Self {
             header_name_lower,

@@ -170,6 +170,8 @@ Phase D adds Kubernetes source translation and sidecar-injector scaffolding. Kub
 
 Gateway API cross-namespace `backendRefs` require an exact matching `ReferenceGrant`, including the source API group/kind and target group/kind. Ferrum currently supports core Kubernetes `Service` backend references and fails closed for other backend target kinds in both same-namespace and cross-namespace routes.
 
+Kubernetes Gateway API and Istio mesh translators fail closed when a resource declares a port outside the Kubernetes service-port range (`1`-`65535`). Invalid ports are rejected during translation instead of wrapping into an unintended backend/listener port.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_INJECTOR_LISTEN_ADDR` | Injector mode | `0.0.0.0:9443` | Admission webhook bind address for `POST /mutate` |

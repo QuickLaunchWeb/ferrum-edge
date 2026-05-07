@@ -67,15 +67,26 @@ pub struct StatsdLogging {
 
 impl StatsdLogging {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        let host = config["host"]
-            .as_str()
+        if !config.is_object() {
+            return Err("statsd_logging: config must be an object".to_string());
+        }
+
+        let host = config
+            .get("host")
+            .and_then(Value::as_str)
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 "statsd_logging: 'host' is required — metrics will have nowhere to send".to_string()
             })?
             .to_string();
 
-        let port = config["port"].as_u64().unwrap_or(8125);
+        let port = match config.get("port") {
+            Some(value) => value.as_u64().ok_or_else(|| {
+                "statsd_logging: 'port' must be an integer between 1 and 65535".to_string()
+            })?,
+            None => 8125,
+        };
         if port == 0 || port > 65535 {
             return Err(format!(
                 "statsd_logging: 'port' must be between 1 and 65535 (got {port})"
@@ -83,20 +94,46 @@ impl StatsdLogging {
         }
 
         let ns = http_client.namespace();
-        let prefix = config["prefix"].as_str().unwrap_or(ns).to_string();
+        let prefix = match config.get("prefix") {
+            Some(value) => {
+                let prefix = value
+                    .as_str()
+                    .ok_or_else(|| "statsd_logging: 'prefix' must be a string".to_string())?
+                    .trim();
+                if prefix.is_empty() {
+                    return Err("statsd_logging: 'prefix' must not be empty".to_string());
+                }
+                prefix.to_string()
+            }
+            None => ns.to_string(),
+        };
         let global_tags = {
-            let mut pairs: Vec<String> = if let Some(tags_obj) = config["global_tags"].as_object() {
-                tags_obj
-                    .iter()
-                    .map(|(key, value)| format!("{key}:{}", value.as_str().unwrap_or("")))
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            let mut pairs = Vec::new();
+            if let Some(global_tags) = config.get("global_tags") {
+                let tags_obj = global_tags
+                    .as_object()
+                    .ok_or_else(|| "statsd_logging: 'global_tags' must be an object".to_string())?;
+                pairs.reserve(tags_obj.len());
+                for (key, value) in tags_obj {
+                    if key.trim().is_empty() {
+                        return Err(
+                            "statsd_logging: 'global_tags' keys must not be empty".to_string()
+                        );
+                    }
+                    let value = value.as_str().ok_or_else(|| {
+                        format!("statsd_logging: 'global_tags.{key}' must be a string")
+                    })?;
+                    pairs.push(format!(
+                        "{}:{}",
+                        sanitize_tag_value(key),
+                        sanitize_tag_value(value)
+                    ));
+                }
+            }
             if ns != crate::config::types::DEFAULT_NAMESPACE
                 && !pairs.iter().any(|pair| pair.starts_with("namespace:"))
             {
-                pairs.push(format!("namespace:{ns}"));
+                pairs.push(format!("namespace:{}", sanitize_tag_value(ns)));
             }
             if pairs.is_empty() {
                 String::new()
