@@ -323,10 +323,12 @@ fn virtual_service_routes(
         .enumerate()
     {
         let Some(route) = first_positive_weighted_route(object, http)? else {
-            acc.warnings.push(format!(
-                "VirtualService '{}' HTTP route {} has only zero-weight split destinations; no proxy was materialized",
-                object.metadata.name, index
-            ));
+            if http_has_only_zero_weight_split_destinations(object, http)? {
+                acc.warnings.push(format!(
+                    "VirtualService '{}' HTTP route {} has only zero-weight split destinations; no proxy was materialized",
+                    object.metadata.name, index
+                ));
+            }
             continue;
         };
         if http_has_skipped_zero_weight_split_destination(object, http)? {
@@ -438,6 +440,26 @@ fn http_has_skipped_zero_weight_split_destination(
     }
 
     Ok(false)
+}
+
+fn http_has_only_zero_weight_split_destinations(
+    object: &K8sObject,
+    http: &Value,
+) -> Result<bool, K8sTranslateError> {
+    let Some(routes) = http.get("route").and_then(Value::as_array) else {
+        return Ok(false);
+    };
+    if routes.len() <= 1 {
+        return Ok(false);
+    }
+
+    for route in routes {
+        if route_weight(object, route, 0)? > 0 {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 fn path_match(uri: &Value) -> Option<String> {
@@ -612,6 +634,32 @@ mod tests {
         assert_eq!(result.config.proxies.len(), 1);
         assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/v1"));
         assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn virtual_service_without_route_does_not_emit_zero_weight_warning() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/old"}}],
+                        "redirect": {"uri": "/new"}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.proxies.is_empty());
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("only zero-weight"))
+        );
     }
 
     #[test]
