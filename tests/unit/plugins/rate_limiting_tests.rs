@@ -1,6 +1,8 @@
 //! Tests for rate_limiting plugin
 
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult, rate_limiting::RateLimiting};
+use ferrum_edge::plugins::{
+    ALL_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, priority, rate_limiting::RateLimiting,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,6 +20,14 @@ async fn test_rate_limiting_plugin_creation() {
     });
     let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
     assert_eq!(plugin.name(), "rate_limiting");
+    assert_eq!(plugin.priority(), priority::RATE_LIMITING);
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
+    assert!(!plugin.is_auth_plugin());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
 }
 
 #[tokio::test]
@@ -130,17 +140,36 @@ async fn test_rate_limiting_plugin_zero_limit() {
 
 #[tokio::test]
 async fn test_rate_limiting_plugin_invalid_config() {
-    let config = json!({
-        "window_seconds": "invalid",
-        "max_requests": -1,
-        "limit_by": "invalid_type"
-    });
-    // Invalid config (non-numeric window_seconds and no fallback rate limits) should return error
-    let result = RateLimiting::new(&config, PluginHttpClient::default());
-    assert!(
-        result.is_err(),
-        "Expected error for invalid config with no valid rate limit windows"
-    );
+    let cases = [
+        json!(null),
+        json!([]),
+        json!({"window_seconds": "invalid", "max_requests": 1}),
+        json!({"window_seconds": 0, "max_requests": 1}),
+        json!({"window_seconds": 60, "max_requests": "10"}),
+        json!({"requests_per_second": "10"}),
+        json!({"requests_per_minute": false}),
+        json!({"requests_per_hour": []}),
+        json!({"window_seconds": 60, "max_requests": 1, "limit_by": "invalid_type"}),
+        json!({"window_seconds": 60, "max_requests": 1, "limit_by": false}),
+        json!({"window_seconds": 60, "max_requests": 1, "expose_headers": "true"}),
+        json!({"window_seconds": 60, "max_requests": 1, "sync_mode": "redsi"}),
+        json!({"window_seconds": 60, "max_requests": 1, "sync_mode": "redis"}),
+        json!({"window_seconds": 60, "max_requests": 1, "sync_mode": "redis", "redis_url": ""}),
+        json!({
+            "window_seconds": 60,
+            "max_requests": 1,
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379/0",
+            "redis_health_check_interval_seconds": 0
+        }),
+    ];
+
+    for config in cases {
+        assert!(
+            RateLimiting::new(&config, PluginHttpClient::default()).is_err(),
+            "config should fail validation: {config}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -185,6 +214,9 @@ async fn test_rate_limiting_consumer_mode_on_request_received_is_noop() {
     ctx.identified_consumer = Some(Arc::new(consumer.clone()));
     let result = plugin.on_request_received(&mut ctx).await;
     assert_continue(result);
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert_continue(result);
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
 
     // authorize uses the limit for consumer mode
     let result = plugin.authorize(&mut ctx).await;
@@ -209,13 +241,30 @@ async fn test_rate_limiting_consumer_fallback_to_ip() {
 
     // No consumer set — should fall back to IP-based key
     let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
     let result = plugin.authorize(&mut ctx).await;
     assert_continue(result);
 
     // Second request from same IP (no consumer) should be rejected
     let mut ctx2 = create_test_context();
+    ctx2.identified_consumer = None;
     let result = plugin.authorize(&mut ctx2).await;
     assert_reject(result, Some(429));
+}
+
+#[tokio::test]
+async fn test_rate_limiting_warmup_hostnames_for_redis() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "sync_mode": "redis",
+        "redis_url": "redis://cache.internal:6379/0"
+    });
+    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    assert_eq!(
+        plugin.warmup_hostnames(),
+        vec!["cache.internal".to_string()]
+    );
 }
 
 #[tokio::test]

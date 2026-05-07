@@ -835,7 +835,7 @@ fn normalize_mesh_fields_internal(
             address.make_ascii_lowercase();
         }
     }
-    normalize_mesh_policy_headers(policies);
+    normalize_mesh_policy_fields(policies);
     if let Some(multi_cluster) = multi_cluster {
         for gateway in &mut multi_cluster.east_west_gateways {
             gateway.host.make_ascii_lowercase();
@@ -846,10 +846,13 @@ fn normalize_mesh_fields_internal(
     }
 }
 
-fn normalize_mesh_policy_headers(policies: &mut [MeshPolicy]) {
+fn normalize_mesh_policy_fields(policies: &mut [MeshPolicy]) {
     for policy in policies {
         for rule in &mut policy.rules {
             for request in &mut rule.to {
+                for host in &mut request.hosts {
+                    host.make_ascii_lowercase();
+                }
                 normalize_mesh_policy_header_map(&mut request.headers);
             }
         }

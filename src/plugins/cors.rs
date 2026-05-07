@@ -9,11 +9,24 @@
 //! with a 204 response before reaching the backend.
 
 use async_trait::async_trait;
+use http::Method;
+use http::header::HeaderName;
 use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{debug, warn};
+use url::Url;
 
 use super::{Plugin, PluginResult, RequestContext};
+
+const DEFAULT_ALLOWED_METHODS: &[&str] =
+    &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+const DEFAULT_ALLOWED_HEADERS: &[&str] = &[
+    "Accept",
+    "Authorization",
+    "Content-Type",
+    "Origin",
+    "X-Requested-With",
+];
 
 /// A single origin pattern entry.
 #[derive(Debug, Clone)]
@@ -46,8 +59,9 @@ enum AllowedOrigins {
 pub struct CorsPlugin {
     allowed_origins: AllowedOrigins,
     allowed_methods: Vec<String>,
-    allowed_headers: Vec<String>,
-    exposed_headers: Vec<String>,
+    allowed_methods_header: String,
+    allowed_headers_header: String,
+    exposed_headers_header: Option<String>,
     allow_credentials: bool,
     max_age: u64,
     preflight_continue: bool,
@@ -55,31 +69,37 @@ pub struct CorsPlugin {
 
 impl CorsPlugin {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let allowed_origins = Self::parse_origins(config);
+        let allowed_origins = Self::parse_origins(config)?;
 
         let allowed_methods = Self::parse_string_array(
             config,
             "allowed_methods",
-            &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        );
+            DEFAULT_ALLOWED_METHODS,
+            false,
+            validate_method,
+        )?;
+        let allowed_methods_header = allowed_methods.join(", ");
 
         let allowed_headers = Self::parse_string_array(
             config,
             "allowed_headers",
-            &[
-                "Accept",
-                "Authorization",
-                "Content-Type",
-                "Origin",
-                "X-Requested-With",
-            ],
-        );
+            DEFAULT_ALLOWED_HEADERS,
+            false,
+            validate_header_name,
+        )?;
+        let allowed_headers_header = allowed_headers.join(", ");
 
-        let exposed_headers = Self::parse_string_array(config, "exposed_headers", &[]);
+        let exposed_headers =
+            Self::parse_string_array(config, "exposed_headers", &[], true, validate_header_name)?;
+        let exposed_headers_header = if exposed_headers.is_empty() {
+            None
+        } else {
+            Some(exposed_headers.join(", "))
+        };
 
-        let mut allow_credentials = config["allow_credentials"].as_bool().unwrap_or(false);
-        let max_age = config["max_age"].as_u64().unwrap_or(86400);
-        let preflight_continue = config["preflight_continue"].as_bool().unwrap_or(false);
+        let mut allow_credentials = bool_config(config, "allow_credentials", false)?;
+        let max_age = u64_config(config, "max_age", 86400)?;
+        let preflight_continue = bool_config(config, "preflight_continue", false)?;
 
         // Per CORS spec: Access-Control-Allow-Origin: * cannot be used with credentials.
         if allow_credentials && matches!(allowed_origins, AllowedOrigins::Wildcard) {
@@ -93,8 +113,9 @@ impl CorsPlugin {
         Ok(Self {
             allowed_origins,
             allowed_methods,
-            allowed_headers,
-            exposed_headers,
+            allowed_methods_header,
+            allowed_headers_header,
+            exposed_headers_header,
             allow_credentials,
             max_age,
             preflight_continue,
@@ -109,47 +130,81 @@ impl CorsPlugin {
     /// - `["*.company.com"]` → wildcard subdomain (matches any `*.company.com`)
     ///
     /// These can be mixed: `["https://exact.com", "*.company.com"]`.
-    fn parse_origins(config: &Value) -> AllowedOrigins {
-        match config["allowed_origins"].as_array() {
-            Some(arr) => {
-                let raw: Vec<String> = arr
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-
-                // Empty list or any entry being "*" → allow all origins
-                if raw.is_empty() || raw.iter().any(|o| o == "*") {
-                    return AllowedOrigins::Wildcard;
+    fn parse_origins(config: &Value) -> Result<AllowedOrigins, String> {
+        match config.get("allowed_origins") {
+            None | Some(Value::Null) => Ok(AllowedOrigins::Wildcard),
+            Some(Value::Array(arr)) => {
+                if arr.is_empty() {
+                    return Err(
+                        "cors: 'allowed_origins' must contain at least one origin or '*'"
+                            .to_string(),
+                    );
                 }
 
-                let patterns = raw
-                    .into_iter()
-                    .map(|o| {
-                        if let Some(suffix) = o.strip_prefix('*') {
-                            // "*.company.com" → suffix is ".company.com"
-                            OriginPattern::WildcardSubdomain(suffix.to_ascii_lowercase())
-                        } else {
-                            OriginPattern::Exact(o)
-                        }
-                    })
-                    .collect();
+                let mut patterns = Vec::with_capacity(arr.len());
+                for value in arr {
+                    let origin = value.as_str().ok_or_else(|| {
+                        format!("cors: 'allowed_origins' entries must be strings, got: {value}")
+                    })?;
+                    let origin = origin.trim();
+                    if origin.is_empty() {
+                        return Err(
+                            "cors: 'allowed_origins' entries must be non-empty strings".to_string()
+                        );
+                    }
+                    if origin == "*" {
+                        return Ok(AllowedOrigins::Wildcard);
+                    }
+                    if origin.starts_with('*') {
+                        patterns.push(OriginPattern::WildcardSubdomain(validate_wildcard_origin(
+                            origin,
+                        )?));
+                    } else {
+                        validate_exact_origin(origin)?;
+                        patterns.push(OriginPattern::Exact(origin.to_string()));
+                    }
+                }
 
-                AllowedOrigins::List(patterns)
+                Ok(AllowedOrigins::List(patterns))
             }
-            None => AllowedOrigins::Wildcard,
+            Some(other) => Err(format!(
+                "cors: 'allowed_origins' must be an array of strings, got: {other}"
+            )),
         }
     }
 
     /// Parse a JSON array of strings with a fallback default.
-    fn parse_string_array(config: &Value, key: &str, defaults: &[&str]) -> Vec<String> {
-        config[key]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_else(|| defaults.iter().map(|s| (*s).to_string()).collect())
+    fn parse_string_array(
+        config: &Value,
+        key: &str,
+        defaults: &[&str],
+        allow_empty: bool,
+        validate: fn(&str, &str) -> Result<(), String>,
+    ) -> Result<Vec<String>, String> {
+        match config.get(key) {
+            None | Some(Value::Null) => Ok(defaults.iter().map(|s| (*s).to_string()).collect()),
+            Some(Value::Array(arr)) => {
+                if arr.is_empty() && !allow_empty {
+                    return Err(format!("cors: '{key}' must contain at least one value"));
+                }
+                let mut values = Vec::with_capacity(arr.len());
+                for value in arr {
+                    let value = value.as_str().ok_or_else(|| {
+                        format!("cors: '{key}' entries must be strings, got: {value}")
+                    })?;
+                    let value = value.trim();
+                    if value.is_empty() {
+                        return Err(format!("cors: '{key}' entries must be non-empty strings"));
+                    }
+                    validate(key, value)?;
+                    values.push(value.to_string());
+                }
+                Ok(values)
+            }
+            Some(other) => Err(format!(
+                "cors: '{key}' must be an array of strings, got: {other}"
+            )),
+        }
     }
 
     /// Check whether a request origin is allowed.
@@ -167,21 +222,8 @@ impl CorsPlugin {
             AllowedOrigins::Wildcard => true,
             AllowedOrigins::List(patterns) => patterns.iter().any(|p| match p {
                 OriginPattern::Exact(expected) => expected.eq_ignore_ascii_case(origin),
-                OriginPattern::WildcardSubdomain(suffix) => {
-                    // Extract the host from the origin.
-                    // Origins look like "https://sub.company.com" or
-                    // "http://sub.company.com:8080".
-                    // We strip the scheme prefix, then match the host against the suffix.
-                    let host_part = origin
-                        .split("://")
-                        .nth(1)
-                        .unwrap_or(origin)
-                        // Strip port if present
-                        .split(':')
-                        .next()
-                        .unwrap_or("");
-                    host_part.to_ascii_lowercase().ends_with(suffix.as_str())
-                }
+                OriginPattern::WildcardSubdomain(suffix) => origin_host(origin)
+                    .is_some_and(|host| ascii_ends_with_ignore_case(host, suffix.as_str())),
             }),
         }
     }
@@ -215,10 +257,10 @@ impl CorsPlugin {
             );
         }
 
-        if !self.exposed_headers.is_empty() {
+        if let Some(exposed_headers) = &self.exposed_headers_header {
             headers.insert(
                 "access-control-expose-headers".to_string(),
-                self.exposed_headers.join(", "),
+                exposed_headers.clone(),
             );
         }
 
@@ -262,12 +304,12 @@ impl CorsPlugin {
 
         headers.insert(
             "access-control-allow-methods".to_string(),
-            self.allowed_methods.join(", "),
+            self.allowed_methods_header.clone(),
         );
 
         headers.insert(
             "access-control-allow-headers".to_string(),
-            self.allowed_headers.join(", "),
+            self.allowed_headers_header.clone(),
         );
 
         headers.insert(
@@ -350,9 +392,14 @@ impl Plugin for CorsPlugin {
                     "cors: preflight rejected method '{}' for origin '{}'",
                     requested_method, origin
                 );
+                let mut body = String::with_capacity(
+                    "CORS method not allowed: ".len() + requested_method.len(),
+                );
+                body.push_str("CORS method not allowed: ");
+                body.push_str(requested_method);
                 return PluginResult::Reject {
                     status_code: 403,
-                    body: format!("CORS method not allowed: {}", requested_method),
+                    body,
                     headers: HashMap::new(),
                 };
             }
@@ -380,9 +427,27 @@ impl Plugin for CorsPlugin {
             None => return PluginResult::Continue,
         };
 
-        let cors_headers = self.build_cors_headers(&origin);
-        for (k, v) in cors_headers {
-            response_headers.insert(k, v);
+        match &self.allowed_origins {
+            AllowedOrigins::Wildcard if !self.allow_credentials => {
+                response_headers.insert("access-control-allow-origin".to_string(), "*".to_string());
+            }
+            _ => {
+                response_headers.insert("access-control-allow-origin".to_string(), origin);
+            }
+        }
+
+        if self.allow_credentials {
+            response_headers.insert(
+                "access-control-allow-credentials".to_string(),
+                "true".to_string(),
+            );
+        }
+
+        if let Some(exposed_headers) = &self.exposed_headers_header {
+            response_headers.insert(
+                "access-control-expose-headers".to_string(),
+                exposed_headers.clone(),
+            );
         }
 
         // Merge Origin into Vary rather than overwriting it. The backend may have
@@ -398,4 +463,106 @@ impl Plugin for CorsPlugin {
     fn applies_after_proxy_on_reject(&self) -> bool {
         true
     }
+}
+
+fn validate_method(key: &str, value: &str) -> Result<(), String> {
+    Method::from_bytes(value.as_bytes())
+        .map(|_| ())
+        .map_err(|_| format!("cors: '{key}' contains an invalid HTTP method: {value}"))
+}
+
+fn validate_header_name(key: &str, value: &str) -> Result<(), String> {
+    HeaderName::from_bytes(value.as_bytes())
+        .map(|_| ())
+        .map_err(|_| format!("cors: '{key}' contains an invalid HTTP header name: {value}"))
+}
+
+fn validate_wildcard_origin(origin: &str) -> Result<String, String> {
+    let Some(suffix) = origin.strip_prefix("*.") else {
+        return Err(format!(
+            "cors: wildcard origins must use the '*.example.com' form, got: {origin}"
+        ));
+    };
+    if suffix.is_empty()
+        || suffix.contains('*')
+        || suffix.contains('/')
+        || suffix.contains(':')
+        || suffix.contains(char::is_whitespace)
+    {
+        return Err(format!(
+            "cors: wildcard origin must be a hostname suffix without scheme, port, path, or whitespace: {origin}"
+        ));
+    }
+    Ok(format!(".{}", suffix.to_ascii_lowercase()))
+}
+
+fn validate_exact_origin(origin: &str) -> Result<(), String> {
+    let url = Url::parse(origin).map_err(|e| format!("cors: invalid origin '{origin}': {e}"))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(format!(
+                "cors: origin scheme must be http or https, got: {scheme}"
+            ));
+        }
+    }
+    if url.host_str().is_none() {
+        return Err(format!("cors: origin must include a hostname: {origin}"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!(
+            "cors: origin must not include credentials: {origin}"
+        ));
+    }
+    if url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+        || origin.ends_with('/')
+    {
+        return Err(format!(
+            "cors: origin must be scheme://host[:port] without path, query, or fragment: {origin}"
+        ));
+    }
+    Ok(())
+}
+
+fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String> {
+    match config.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(other) => Err(format!("cors: '{key}' must be a boolean, got: {other}")),
+    }
+}
+
+fn u64_config(config: &Value, key: &str, default: u64) -> Result<u64, String> {
+    match config.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .ok_or_else(|| format!("cors: '{key}' must be a non-negative integer")),
+        Some(other) => Err(format!(
+            "cors: '{key}' must be a non-negative integer, got: {other}"
+        )),
+    }
+}
+
+fn origin_host(origin: &str) -> Option<&str> {
+    let (_, rest) = origin.split_once("://")?;
+    if rest.starts_with('[') {
+        return None;
+    }
+    let host_port = rest.split('/').next().unwrap_or(rest);
+    host_port.split(':').next().filter(|host| !host.is_empty())
+}
+
+fn ascii_ends_with_ignore_case(value: &str, suffix: &str) -> bool {
+    let value = value.as_bytes();
+    let suffix = suffix.as_bytes();
+    if suffix.len() > value.len() {
+        return false;
+    }
+    value[value.len() - suffix.len()..]
+        .iter()
+        .zip(suffix.iter())
+        .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }

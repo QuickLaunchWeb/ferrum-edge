@@ -87,17 +87,23 @@ impl Plugin for MeshAuthz {
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         let source_principal = source_principal_from_request(ctx);
-        let host = ctx
+        let mut host = ctx
             .raw_header_get("host")
             .or_else(|| ctx.raw_header_get(":authority"))
             .map(str::to_string);
         let headers = if self.has_header_rules {
             ctx.materialize_headers();
+            if host.is_none() {
+                host = ctx.headers.get("host").cloned();
+            }
             ctx.headers
                 .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
+                .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
                 .collect()
         } else {
+            if host.is_none() {
+                host = ctx.headers.get("host").cloned();
+            }
             BTreeMap::new()
         };
         let request = MeshAuthzRequest {
@@ -105,10 +111,11 @@ impl Plugin for MeshAuthz {
             method: Some(ctx.method.clone()),
             path: Some(ctx.path.clone()),
             host,
-            port: ctx
-                .matched_proxy
-                .as_ref()
-                .and_then(|proxy| proxy.listen_port),
+            port: ctx.frontend_listen_port.or_else(|| {
+                ctx.matched_proxy
+                    .as_ref()
+                    .and_then(|proxy| proxy.listen_port)
+            }),
             headers,
             attributes: BTreeMap::new(),
         };

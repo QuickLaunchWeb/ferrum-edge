@@ -4,7 +4,9 @@ use base64::Engine;
 use chrono::Utc;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::Consumer;
-use ferrum_edge::plugins::{Plugin, RequestContext, hmac_auth::HmacAuth};
+use ferrum_edge::plugins::{
+    HTTP_FAMILY_PROTOCOLS, Plugin, RequestContext, hmac_auth::HmacAuth, priority,
+};
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256, Sha512};
@@ -143,12 +145,38 @@ async fn test_hmac_auth_plugin_creation() {
     let plugin = HmacAuth::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "hmac_auth");
     assert!(plugin.is_auth_plugin());
+    assert_eq!(plugin.priority(), priority::HMAC_AUTH);
+    assert_eq!(plugin.priority(), 1400);
+    assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.requires_request_body_before_before_proxy());
+    assert!(!plugin.requires_response_body_buffering());
+    assert!(!plugin.applies_after_proxy_on_reject());
 }
 
 #[tokio::test]
 async fn test_hmac_auth_custom_clock_skew() {
     let plugin = HmacAuth::new(&json!({"clock_skew_seconds": 600})).unwrap();
     assert_eq!(plugin.name(), "hmac_auth");
+}
+
+#[test]
+fn test_hmac_auth_rejects_invalid_config() {
+    let invalid_configs = [
+        json!(null),
+        json!(""),
+        json!({"clock_skew_seconds": "300"}),
+        json!({"clock_skew_seconds": -1}),
+        json!({"require_digest": "true"}),
+    ];
+
+    for config in invalid_configs {
+        assert!(
+            HmacAuth::new(&config).is_err(),
+            "config should be rejected: {config}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -482,6 +510,24 @@ async fn test_invalid_signature() {
         ),
     );
     ctx.headers.insert("date".to_string(), date);
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_malformed_base64_signature_rejected() {
+    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let consumer = create_hmac_consumer();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let mut ctx = make_ctx("GET", "/test");
+    ctx.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header("hmacuser", Some("hmac-sha256"), "not base64!"),
+    );
+    ctx.headers.insert("date".to_string(), current_date());
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;

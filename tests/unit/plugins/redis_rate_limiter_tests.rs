@@ -1,4 +1,5 @@
 use ferrum_edge::_test_support::{RedisConfig, redis_client_credentials, redis_config_url_with_ip};
+use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 fn make_config(url: &str, tls: bool) -> RedisConfig {
@@ -129,4 +130,73 @@ fn test_no_credentials_means_unauthenticated() {
         redis_client_credentials(config, "redis://localhost:6379/0").expect("build_client");
     assert_eq!(user, None);
     assert_eq!(pass, None);
+}
+
+#[test]
+fn test_from_plugin_config_local_modes() {
+    assert!(
+        RedisConfig::from_plugin_config(&json!({}), "ferrum:test")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        RedisConfig::from_plugin_config(&json!({"sync_mode": "local"}), "ferrum:test")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn test_from_plugin_config_rejects_invalid_redis_mode() {
+    let cases = [
+        json!(null),
+        json!([]),
+        json!({"sync_mode": false}),
+        json!({"sync_mode": "redsi"}),
+        json!({"sync_mode": "redis"}),
+        json!({"sync_mode": "redis", "redis_url": ""}),
+        json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_tls": "true"}),
+        json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_key_prefix": ""}),
+        json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_pool_size": 0}),
+        json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_connect_timeout_seconds": 0}),
+        json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_health_check_interval_seconds": 0}),
+        json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_username": false}),
+        json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_password": []}),
+    ];
+
+    for config in cases {
+        assert!(
+            RedisConfig::from_plugin_config(&config, "ferrum:test").is_err(),
+            "config should fail validation: {config}"
+        );
+    }
+}
+
+#[test]
+fn test_from_plugin_config_parses_valid_redis_mode() {
+    let config = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379/0",
+            "redis_tls": true,
+            "redis_key_prefix": "tenant:rate",
+            "redis_pool_size": 8,
+            "redis_connect_timeout_seconds": 2,
+            "redis_health_check_interval_seconds": 3,
+            "redis_username": "svc",
+            "redis_password": "secret"
+        }),
+        "ferrum:test",
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(config.url, "redis://cache.internal:6379/0");
+    assert!(config.tls);
+    assert_eq!(config.key_prefix, "tenant:rate");
+    assert_eq!(config.pool_size, 8);
+    assert_eq!(config.connect_timeout_seconds, 2);
+    assert_eq!(config.health_check_interval_seconds, 3);
+    assert_eq!(config.username.as_deref(), Some("svc"));
+    assert_eq!(config.password.as_deref(), Some("secret"));
 }

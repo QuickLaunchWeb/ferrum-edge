@@ -14,6 +14,7 @@
 //! - Header keys are pre-lowercased.
 
 use async_trait::async_trait;
+use http::header::HeaderName;
 use serde_json::Value;
 use std::collections::HashMap;
 use tracing::debug;
@@ -61,10 +62,22 @@ fn contains_crlf(s: &str) -> bool {
 
 impl ResponseTransformer {
     pub fn new(config: &Value) -> Result<Self, String> {
+        if !config.is_object() {
+            return Err("response_transformer: config must be an object".to_string());
+        }
+
         let mut header_rules: Vec<HeaderRule> = Vec::new();
 
-        if let Some(arr) = config["rules"].as_array() {
+        if let Some(rules) = config.get("rules") {
+            let arr = rules
+                .as_array()
+                .ok_or("response_transformer: 'rules' must be an array")?;
             for (idx, r) in arr.iter().enumerate() {
+                if !r.is_object() {
+                    return Err(format!(
+                        "response_transformer: rule[{idx}]: rule must be an object"
+                    ));
+                }
                 // `target` defaults to "header" only when the field is
                 // ABSENT (backward compat for terse header-only configs).
                 // An explicit `"target": null` — or any non-string value —
@@ -125,6 +138,13 @@ impl ResponseTransformer {
                         ));
                     }
                 };
+                let key = HeaderName::from_bytes(raw_key.as_bytes())
+                    .map_err(|_| {
+                        format!(
+                            "response_transformer: rule[{idx}]: 'key' must be a valid HTTP header name"
+                        )
+                    })?
+                    .to_string();
                 let value = match r.get("value") {
                     Some(Value::String(s)) => Some(s.clone()),
                     Some(Value::Null) | None => None,
@@ -143,6 +163,18 @@ impl ResponseTransformer {
                         ));
                     }
                 };
+                let new_key = raw_new_key
+                    .as_deref()
+                    .map(|key| {
+                        HeaderName::from_bytes(key.as_bytes())
+                            .map_err(|_| {
+                                format!(
+                                    "response_transformer: rule[{idx}]: 'new_key' must be a valid HTTP header name"
+                                )
+                            })
+                            .map(|name| name.to_string())
+                    })
+                    .transpose()?;
 
                 // Per-operation required-field validation.
                 match operation {
@@ -173,9 +205,9 @@ impl ResponseTransformer {
 
                 header_rules.push(HeaderRule {
                     operation,
-                    key: raw_key.to_lowercase(),
+                    key,
                     value,
-                    new_key: raw_new_key.map(|k| k.to_lowercase()),
+                    new_key,
                 });
             }
         }

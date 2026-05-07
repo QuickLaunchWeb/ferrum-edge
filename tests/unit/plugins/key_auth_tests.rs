@@ -1,7 +1,7 @@
 //! Tests for key_auth plugin
 
 use ferrum_edge::ConsumerIndex;
-use ferrum_edge::plugins::{Plugin, key_auth::KeyAuth};
+use ferrum_edge::plugins::{HTTP_FAMILY_PROTOCOLS, Plugin, key_auth::KeyAuth, priority};
 use serde_json::json;
 
 use super::plugin_utils::{
@@ -22,6 +22,44 @@ async fn test_key_auth_plugin_default_config() {
     let config = json!({});
     let plugin = KeyAuth::new(&config).unwrap();
     assert_eq!(plugin.name(), "key_auth");
+}
+
+#[test]
+fn test_key_auth_plugin_contract() {
+    let plugin = KeyAuth::new(&json!({})).unwrap();
+
+    assert_eq!(plugin.priority(), priority::KEY_AUTH);
+    assert_eq!(plugin.priority(), 1200);
+    assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
+    assert!(plugin.is_auth_plugin());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.requires_request_body_before_before_proxy());
+    assert!(!plugin.requires_request_body_before_authenticate());
+    assert!(!plugin.needs_request_body_bytes());
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
+    assert!(!plugin.applies_after_proxy_on_reject());
+}
+
+#[test]
+fn test_key_auth_rejects_invalid_config() {
+    let invalid_configs = [
+        json!(null),
+        json!(""),
+        json!({"key_location": 123}),
+        json!({"key_location": ""}),
+        json!({"key_location": "cookie:token"}),
+        json!({"key_location": "header:"}),
+        json!({"key_location": "query:"}),
+    ];
+
+    for config in invalid_configs {
+        assert!(
+            KeyAuth::new(&config).is_err(),
+            "config should be rejected: {config}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -259,24 +297,16 @@ async fn test_key_auth_multiple_consumers_correct_match() {
     );
 }
 
-#[tokio::test]
-async fn test_key_auth_fallback_default_header() {
-    // When key_location has unknown prefix, falls back to x-api-key / X-API-Key
+#[test]
+fn test_key_auth_rejects_unknown_key_location_prefix() {
     let config = json!({
         "key_location": "cookie:token"
     });
-    let plugin = KeyAuth::new(&config).unwrap();
-
-    let consumer = create_test_consumer();
-    let consumer_index = ConsumerIndex::new(&[consumer]);
-
-    let mut ctx = create_test_context();
-    ctx.headers
-        .insert("x-api-key".to_string(), "test-api-key".to_string());
-    ctx.identified_consumer = None;
-
-    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_continue(result);
+    let err = match KeyAuth::new(&config) {
+        Ok(_) => panic!("cookie key location should be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.contains("header:<name>"));
 }
 
 #[tokio::test]

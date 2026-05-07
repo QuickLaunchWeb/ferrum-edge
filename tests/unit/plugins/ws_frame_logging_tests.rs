@@ -26,6 +26,13 @@ fn test_creation_rejects_unknown_log_level() {
 }
 
 #[test]
+fn test_creation_rejects_non_object_config() {
+    let result = WsFrameLogging::new(&json!("not-an-object"));
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("JSON object"));
+}
+
+#[test]
 fn test_creation_rejects_uppercase_log_level() {
     // Per plugin-validation rules, exact-match lowercase only.
     let result = WsFrameLogging::new(&json!({"log_level": "INFO"}));

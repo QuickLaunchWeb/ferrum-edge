@@ -1,7 +1,9 @@
 //! Tests for access_control plugin
 
 use ferrum_edge::config::types::{BackendScheme, Consumer};
-use ferrum_edge::plugins::{Plugin, access_control::AccessControl};
+use ferrum_edge::plugins::{
+    HTTP_FAMILY_AND_STREAM_PROTOCOLS, Plugin, access_control::AccessControl, priority,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -50,6 +52,17 @@ async fn test_access_control_plugin_creation() {
     });
     let plugin = AccessControl::new(&config).unwrap();
     assert_eq!(plugin.name(), "access_control");
+    assert_eq!(plugin.priority(), priority::ACCESS_CONTROL);
+    assert_eq!(
+        plugin.supported_protocols(),
+        HTTP_FAMILY_AND_STREAM_PROTOCOLS
+    );
+    assert!(!plugin.is_auth_plugin());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
+    assert!(!plugin.applies_after_proxy_on_reject());
 }
 
 #[tokio::test]
@@ -74,6 +87,28 @@ async fn test_access_control_plugin_no_rules() {
     let result = AccessControl::new(&config);
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("at least one"));
+}
+
+#[tokio::test]
+async fn test_access_control_rejects_invalid_config_types() {
+    let cases = [
+        json!(null),
+        json!([]),
+        json!({"allowed_consumers": "testuser"}),
+        json!({"allowed_consumers": [42]}),
+        json!({"allowed_consumers": [""]}),
+        json!({"disallowed_consumers": "testuser"}),
+        json!({"allowed_groups": "engineering"}),
+        json!({"disallowed_groups": ["banned", false]}),
+        json!({"allow_authenticated_identity": "true"}),
+    ];
+
+    for config in cases {
+        assert!(
+            AccessControl::new(&config).is_err(),
+            "config should fail validation: {config}"
+        );
+    }
 }
 
 #[tokio::test]
