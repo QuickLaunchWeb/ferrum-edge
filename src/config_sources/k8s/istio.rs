@@ -469,6 +469,16 @@ mod tests {
         }
     }
 
+    fn translated_authorization_policy(spec: Value) -> MeshPolicy {
+        let result = translate_k8s_objects(&[object("AuthorizationPolicy", spec)], options())
+            .expect("translation succeeds");
+        let mesh = result.config.mesh.expect("mesh config");
+        mesh.mesh_policies
+            .into_iter()
+            .next()
+            .expect("one translated mesh policy")
+    }
+
     #[test]
     fn translates_authorization_policy() {
         let result = translate_k8s_objects(
@@ -496,31 +506,25 @@ mod tests {
 
     #[test]
     fn translates_allow_authorization_policy_without_rules_to_allow_nothing() {
-        let result = translate_k8s_objects(
-            &[object(
-                "AuthorizationPolicy",
-                serde_json::json!({
-                    "action": "ALLOW",
-                    "selector": {"matchLabels": {"app": "api"}}
-                }),
-            )],
-            options(),
-        )
-        .expect("translation succeeds");
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "selector": {"matchLabels": {"app": "api"}}
+        }));
 
-        let mesh = result.config.mesh.expect("mesh config");
-        assert_eq!(mesh.mesh_policies[0].rules.len(), 1);
-        assert_eq!(mesh.mesh_policies[0].rules[0].action, PolicyAction::Allow);
+        assert!(matches!(
+            &policy.scope,
+            PolicyScope::WorkloadSelector { .. }
+        ));
+        assert_eq!(policy.rules.len(), 1);
+        assert_eq!(policy.rules[0].action, PolicyAction::Allow);
         assert_eq!(
-            mesh.mesh_policies[0].rules[0].from[0]
-                .spiffe_id_pattern
-                .as_deref(),
+            policy.rules[0].from[0].spiffe_id_pattern.as_deref(),
             Some(ALLOW_NOTHING_SPIFFE_PATTERN)
         );
 
         let decision = evaluate_mesh_authorization(
             &MeshSlice {
-                mesh_policies: mesh.mesh_policies,
+                mesh_policies: vec![policy],
                 ..MeshSlice::default()
             },
             &MeshAuthzRequest::default(),
@@ -531,6 +535,54 @@ mod tests {
                 policy: "implicit-deny".to_string()
             }
         );
+    }
+
+    #[test]
+    fn translates_namespace_allow_authorization_policy_without_rules_to_allow_nothing() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW"
+        }));
+
+        assert!(matches!(
+            &policy.scope,
+            PolicyScope::Namespace { namespace } if namespace == "default"
+        ));
+        assert_eq!(policy.rules.len(), 1);
+        assert_eq!(policy.rules[0].action, PolicyAction::Allow);
+        assert_eq!(
+            policy.rules[0].from[0].spiffe_id_pattern.as_deref(),
+            Some(ALLOW_NOTHING_SPIFFE_PATTERN)
+        );
+    }
+
+    #[test]
+    fn translates_missing_action_authorization_policy_without_rules_to_allow_nothing() {
+        let policy = translated_authorization_policy(serde_json::json!({}));
+
+        assert_eq!(policy.rules.len(), 1);
+        assert_eq!(policy.rules[0].action, PolicyAction::Allow);
+        assert_eq!(
+            policy.rules[0].from[0].spiffe_id_pattern.as_deref(),
+            Some(ALLOW_NOTHING_SPIFFE_PATTERN)
+        );
+    }
+
+    #[test]
+    fn translates_deny_authorization_policy_without_rules_to_noop() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "DENY"
+        }));
+
+        assert_eq!(policy.rules, Vec::new());
+    }
+
+    #[test]
+    fn translates_audit_authorization_policy_without_rules_to_noop() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "AUDIT"
+        }));
+
+        assert_eq!(policy.rules, Vec::new());
     }
 
     #[test]
