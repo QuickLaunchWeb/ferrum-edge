@@ -108,6 +108,64 @@ async fn test_creation_defaults() {
     assert!(plugin.requires_response_body_buffering());
 }
 
+#[test]
+fn test_non_object_config_rejected() {
+    let err = ResponseCaching::new(&json!("bad"))
+        .err()
+        .expect("non-object config must be rejected");
+    assert!(err.contains("config must be an object"), "got: {err}");
+}
+
+#[test]
+fn test_invalid_bool_config_rejected() {
+    let err = ResponseCaching::new(&json!({
+        "respect_cache_control": "true"
+    }))
+    .err()
+    .expect("bad bool config must be rejected");
+    assert!(err.contains("respect_cache_control"), "got: {err}");
+}
+
+#[test]
+fn test_invalid_cacheable_methods_config_rejected() {
+    let err = ResponseCaching::new(&json!({
+        "cacheable_methods": ["GET", 42]
+    }))
+    .err()
+    .expect("non-string method must be rejected");
+    assert!(err.contains("cacheable_methods[1]"), "got: {err}");
+}
+
+#[test]
+fn test_invalid_cacheable_status_codes_config_rejected() {
+    let err = ResponseCaching::new(&json!({
+        "cacheable_status_codes": [200, 700]
+    }))
+    .err()
+    .expect("invalid status code must be rejected");
+    assert!(err.contains("cacheable_status_codes[1]"), "got: {err}");
+}
+
+#[test]
+fn test_invalid_vary_header_config_rejected() {
+    let err = ResponseCaching::new(&json!({
+        "vary_by_headers": ["bad header"]
+    }))
+    .err()
+    .expect("invalid header name must be rejected");
+    assert!(err.contains("vary_by_headers[0]"), "got: {err}");
+}
+
+#[test]
+fn test_zero_cache_size_config_rejected() {
+    let err = ResponseCaching::new(&json!({
+        "max_entries": 0
+    }))
+    .err()
+    .expect("zero max_entries must be rejected");
+    assert!(err.contains("max_entries"), "got: {err}");
+}
+
 #[tokio::test]
 async fn test_supported_protocols() {
     let plugin = default_plugin();

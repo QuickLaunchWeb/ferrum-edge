@@ -1,6 +1,8 @@
 //! Tests for ai_token_metrics plugin
 
-use ferrum_edge::plugins::{Plugin, PluginResult, ai_token_metrics::AiTokenMetrics};
+use ferrum_edge::plugins::{
+    Plugin, PluginResult, ProxyProtocol, RequestContext, ai_token_metrics::AiTokenMetrics,
+};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -10,6 +12,25 @@ fn json_headers() -> HashMap<String, String> {
     let mut h = HashMap::new();
     h.insert("content-type".to_string(), "application/json".to_string());
     h
+}
+
+fn ctx_with_content_type(method: &str, content_type: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        method.to_string(),
+        "/chat".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), content_type.to_string());
+    ctx
+}
+
+fn ctx_without_content_type(method: &str) -> RequestContext {
+    RequestContext::new(
+        "127.0.0.1".to_string(),
+        method.to_string(),
+        "/chat".to_string(),
+    )
 }
 
 fn assert_continue(result: PluginResult) {
@@ -27,7 +48,19 @@ async fn test_plugin_name_and_priority() {
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "ai_token_metrics");
     assert_eq!(plugin.priority(), 4100);
+    assert_eq!(
+        plugin.supported_protocols(),
+        &[ProxyProtocol::Http, ProxyProtocol::Grpc]
+    );
     assert!(plugin.requires_response_body_buffering());
+    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "application/json")));
+    assert!(plugin.should_buffer_response_body(&ctx_with_content_type(
+        "POST",
+        "multipart/form-data; boundary=abc"
+    )));
+    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "text/plain")));
+    assert!(plugin.should_buffer_response_body(&ctx_without_content_type("POST")));
+    assert!(!plugin.should_buffer_response_body(&ctx_with_content_type("GET", "application/json")));
 }
 
 // ─── OpenAI format ──────────────────────────────────────────────────────
@@ -424,21 +457,12 @@ async fn test_zero_tokens() {
     assert_eq!(ctx.metadata.get("ai_completion_tokens").unwrap(), "0");
 }
 
-#[tokio::test]
-async fn test_unknown_configured_provider() {
-    let plugin = AiTokenMetrics::new(&json!({"provider": "unknown_provider"})).unwrap();
-    let mut ctx = create_test_context();
-    let headers = json_headers();
-    let body = serde_json::to_vec(&json!({
-        "usage": {"prompt_tokens": 10, "completion_tokens": 5}
-    }))
-    .unwrap();
-
-    let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
-        .await;
-    assert_continue(result);
-    assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+#[test]
+fn test_unknown_configured_provider_rejected() {
+    let err = AiTokenMetrics::new(&json!({"provider": "unknown_provider"}))
+        .err()
+        .unwrap();
+    assert!(err.contains("provider"), "got: {err}");
 }
 
 #[tokio::test]
@@ -566,4 +590,29 @@ fn test_zero_cost_accepted() {
         }))
         .is_ok()
     );
+}
+
+#[test]
+fn test_invalid_config_shapes_rejected() {
+    for (config, needle) in [
+        (json!(null), "config must be an object"),
+        (json!({"provider": ""}), "provider"),
+        (json!({"include_model": "yes"}), "include_model"),
+        (
+            json!({"include_token_details": "yes"}),
+            "include_token_details",
+        ),
+        (json!({"metadata_prefix": ""}), "metadata_prefix"),
+        (
+            json!({"cost_per_prompt_token": "free"}),
+            "cost_per_prompt_token",
+        ),
+        (
+            json!({"cost_per_completion_token": "free"}),
+            "cost_per_completion_token",
+        ),
+    ] {
+        let err = AiTokenMetrics::new(&config).err().unwrap();
+        assert!(err.contains(needle), "needle={needle}, got: {err}");
+    }
 }

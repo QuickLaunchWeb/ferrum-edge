@@ -1,7 +1,9 @@
 //! Tests for spec_expose plugin
 
 use ferrum_edge::plugins::spec_expose::SpecExpose;
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use ferrum_edge::plugins::{
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
+};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -34,10 +36,12 @@ fn test_creation_valid_config() {
     assert!(plugin.is_ok());
     let plugin = plugin.unwrap();
     assert_eq!(plugin.name(), "spec_expose");
-    assert_eq!(
-        plugin.priority(),
-        ferrum_edge::plugins::priority::SPEC_EXPOSE
-    );
+    assert_eq!(plugin.priority(), priority::SPEC_EXPOSE);
+    assert_eq!(plugin.priority(), 210);
+    assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.applies_after_proxy_on_reject());
+    assert!(!plugin.is_auth_plugin());
 }
 
 #[test]
@@ -268,6 +272,48 @@ fn test_creation_rejects_non_string_content_type() {
 }
 
 #[test]
+fn test_creation_rejects_empty_content_type_override() {
+    let err = SpecExpose::new(
+        &json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "content_type": "   "
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("empty content_type override must be rejected");
+    assert!(err.contains("content_type"), "got: {err}");
+}
+
+#[test]
+fn test_creation_rejects_invalid_content_type_header_value() {
+    let err = SpecExpose::new(
+        &json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "content_type": "application/yaml\r\nx-bad: yes"
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("invalid content_type header value must be rejected");
+    assert!(err.contains("content_type"), "got: {err}");
+}
+
+#[test]
+fn test_creation_rejects_non_bool_tls_no_verify() {
+    let err = SpecExpose::new(
+        &json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "tls_no_verify": "true"
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("tls_no_verify must be boolean");
+    assert!(err.contains("tls_no_verify"), "got: {err}");
+}
+
+#[test]
 fn test_creation_rejects_non_integer_cache_ttl() {
     let err = SpecExpose::new(
         &json!({
@@ -294,6 +340,48 @@ fn test_creation_accepts_zero_cache_ttl() {
     assert!(plugin.is_ok());
 }
 
+#[tokio::test]
+async fn test_specz_request_fetches_mocked_spec_and_preserves_content_type() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"openapi: 3.0.0\n".to_vec())
+                .insert_header("content-type", "application/yaml"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+            "cache_ttl_seconds": 60
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/specz", "/api");
+    let result = plugin.on_request_received(&mut ctx).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(body, bytes::Bytes::from_static(b"openapi: 3.0.0\n"));
+            assert_eq!(headers.get("content-type").unwrap(), "application/yaml");
+        }
+        other => panic!("expected RejectBinary, got {other:?}"),
+    }
+}
+
 // === Caching behavior ===
 
 #[tokio::test]
@@ -307,7 +395,7 @@ async fn test_cache_hits_avoid_repeat_fetches() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "application/yaml")
-                .set_body_string("openapi: 3.0.0\n"),
+                .set_body_bytes(b"openapi: 3.0.0\n".to_vec()),
         )
         .expect(1) // Critical: we expect EXACTLY 1 upstream fetch
         .mount(&mock_server)
@@ -356,7 +444,7 @@ async fn test_cache_disabled_when_ttl_zero() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "application/yaml")
-                .set_body_string("openapi: 3.0.0\n"),
+                .set_body_bytes(b"openapi: 3.0.0\n".to_vec()),
         )
         .expect(2) // ttl=0 means every request re-fetches
         .mount(&mock_server)
@@ -403,7 +491,7 @@ async fn test_cache_does_not_store_failed_fetches() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "application/yaml")
-                .set_body_string("openapi: 3.0.0\n"),
+                .set_body_bytes(b"openapi: 3.0.0\n".to_vec()),
         )
         .mount(&mock_server)
         .await;
@@ -452,7 +540,7 @@ async fn test_concurrent_cold_cache_fetches_deduplicated() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "application/yaml")
-                .set_body_string("openapi: 3.0.0\n")
+                .set_body_bytes(b"openapi: 3.0.0\n".to_vec())
                 // Slow the upstream so concurrent fetches actually race.
                 .set_delay(std::time::Duration::from_millis(150)),
         )
@@ -514,7 +602,7 @@ async fn test_ttl_zero_does_not_serialize_concurrent_fetches() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "application/yaml")
-                .set_body_string("openapi: 3.0.0\n")
+                .set_body_bytes(b"openapi: 3.0.0\n".to_vec())
                 .set_delay(std::time::Duration::from_millis(150)),
         )
         // TTL=0 means every request re-fetches — we expect ALL 6 hits.

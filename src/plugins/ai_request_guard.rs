@@ -13,6 +13,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
+use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -43,36 +44,30 @@ pub struct AiRequestGuard {
 
 impl AiRequestGuard {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let max_tokens_limit = config["max_tokens_limit"].as_u64();
-        let enforce_max_tokens =
-            if config["enforce_max_tokens"].as_str().unwrap_or("reject") == "clamp" {
-                MaxTokensAction::Clamp
-            } else {
-                MaxTokensAction::Reject
-            };
-        let default_max_tokens = config["default_max_tokens"].as_u64();
+        if !config.is_object() {
+            return Err("ai_request_guard: config must be an object".to_string());
+        }
 
-        let allowed_models: HashSet<String> = config["allowed_models"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let max_tokens_limit = optional_u64(config, "max_tokens_limit")?;
+        let enforce_max_tokens = match optional_string(config, "enforce_max_tokens")?
+            .unwrap_or("reject")
+        {
+            "reject" => MaxTokensAction::Reject,
+            "clamp" => MaxTokensAction::Clamp,
+            other => {
+                return Err(format!(
+                    "ai_request_guard: 'enforce_max_tokens' must be one of 'reject' or 'clamp', got: {other:?}"
+                ));
+            }
+        };
+        let default_max_tokens = optional_u64(config, "default_max_tokens")?;
 
-        let blocked_models: HashSet<String> = config["blocked_models"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let allowed_models = optional_lowercase_set(config, "allowed_models")?.unwrap_or_default();
+        let blocked_models = optional_lowercase_set(config, "blocked_models")?.unwrap_or_default();
 
-        let require_user_field = config["require_user_field"].as_bool().unwrap_or(false);
-        let max_messages = config["max_messages"].as_u64();
-        let max_prompt_characters = config["max_prompt_characters"].as_u64();
+        let require_user_field = optional_bool(config, "require_user_field")?.unwrap_or(false);
+        let max_messages = optional_u64(config, "max_messages")?;
+        let max_prompt_characters = optional_u64(config, "max_prompt_characters")?;
 
         // Parse temperature_range with strict validation. A misconfigured
         // `[max, min]` or `[NaN, x]` would silently reject every request or
@@ -113,16 +108,10 @@ impl AiRequestGuard {
             None
         };
 
-        let block_system_prompts = config["block_system_prompts"].as_bool().unwrap_or(false);
+        let block_system_prompts = optional_bool(config, "block_system_prompts")?.unwrap_or(false);
 
-        let required_metadata_fields: Vec<String> = config["required_metadata_fields"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let required_metadata_fields =
+            optional_string_vec(config, "required_metadata_fields")?.unwrap_or_default();
 
         let needs_body_transform = (max_tokens_limit.is_some()
             && enforce_max_tokens == MaxTokensAction::Clamp)
@@ -349,7 +338,7 @@ impl Plugin for AiRequestGuard {
             && ctx
                 .headers
                 .get("content-type")
-                .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
+                .is_some_and(|ct| is_json_content_type(ct))
     }
 
     async fn before_proxy(
@@ -367,18 +356,18 @@ impl Plugin for AiRequestGuard {
             .get("content-type")
             .map(|s| s.as_str())
             .unwrap_or("");
-        if !content_type.contains("json") {
+        if !is_json_content_type(content_type) {
             return PluginResult::Continue;
         }
 
         // Get request body from metadata
         let body = match ctx.metadata.get("request_body") {
-            Some(b) if !b.is_empty() => b.clone(),
+            Some(b) if !b.is_empty() => b.as_str(),
             _ => return PluginResult::Continue,
         };
 
         // Parse JSON
-        let json: Value = match serde_json::from_str(&body) {
+        let json: Value = match serde_json::from_str(body) {
             Ok(v) => v,
             Err(_) => {
                 // Let the backend handle malformed JSON
@@ -394,11 +383,11 @@ impl Plugin for AiRequestGuard {
             );
             return PluginResult::Reject {
                 status_code: 400,
-                body: format!(
-                    r#"{{"error":"{}","details":"{}"}}"#,
-                    escape_json_string(&error),
-                    escape_json_string(&details),
-                ),
+                body: serde_json::json!({
+                    "error": error,
+                    "details": details,
+                })
+                .to_string(),
                 headers: HashMap::new(),
             };
         }
@@ -414,7 +403,7 @@ impl Plugin for AiRequestGuard {
     ) -> Option<Vec<u8>> {
         // Only transform JSON
         if let Some(ct) = content_type
-            && !ct.contains("json")
+            && !is_json_content_type(ct)
         {
             return None;
         }
@@ -456,4 +445,61 @@ impl Plugin for AiRequestGuard {
             None
         }
     }
+}
+
+fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(Some)
+        .ok_or_else(|| format!("ai_request_guard: '{field}' must be a string"))
+}
+
+fn optional_u64(config: &Value, field: &'static str) -> Result<Option<u64>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .map(Some)
+        .ok_or_else(|| format!("ai_request_guard: '{field}' must be an unsigned integer"))
+}
+
+fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| format!("ai_request_guard: '{field}' must be a boolean"))
+}
+
+fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!("ai_request_guard: '{field}' must be an array"));
+    };
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(value) = value.as_str() else {
+            return Err(format!(
+                "ai_request_guard: '{field}' must contain only strings"
+            ));
+        };
+        out.push(value.to_string());
+    }
+    Ok(Some(out))
+}
+
+fn optional_lowercase_set(
+    config: &Value,
+    field: &'static str,
+) -> Result<Option<HashSet<String>>, String> {
+    optional_string_vec(config, field)
+        .map(|values| values.map(|values| values.into_iter().map(|s| s.to_lowercase()).collect()))
 }
