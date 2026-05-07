@@ -257,6 +257,13 @@ start_ferrum() {
                 -e "FERRUM_ENABLE_HTTP3=true"
             )
             ;;
+        tcp-tls)
+            extra_env+=(
+                -e "FERRUM_ADAPTIVE_BUFFER_DEFAULT_SIZE=16384"
+                -e "FERRUM_ADAPTIVE_BUFFER_MIN_SIZE=16384"
+                -e "FERRUM_ADAPTIVE_BUFFER_MAX_SIZE=16384"
+            )
+            ;;
     esac
     # Optional extra env var injection for per-experiment tuning. Set
     # FERRUM_EXTRA_ENV to a space-separated list of KEY=VALUE pairs, e.g.:
