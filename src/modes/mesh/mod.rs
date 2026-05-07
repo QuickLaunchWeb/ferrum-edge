@@ -29,7 +29,6 @@ use crate::config::types::{
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
-use crate::modes::mesh::config_consumer::xds_client::{XdsClientConfig, XdsConfigConsumer};
 use crate::modes::mesh::runtime::MeshRuntimeState;
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
@@ -153,10 +152,7 @@ impl MeshRuntimeConfig {
             .or_else(|| std::env::var("HOSTNAME").ok())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "ferrum-mesh-node".to_string());
-        let config_protocol = MeshConfigProtocol::parse(
-            &resolve_ferrum_var("FERRUM_MESH_CONFIG_PROTOCOL")
-                .unwrap_or_else(|| "native".to_string()),
-        )?;
+        let config_protocol = MeshConfigProtocol::parse(&env_config.mesh_config_protocol)?;
         let topology = MeshTopology::parse(
             &resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").unwrap_or_else(|| "sidecar".to_string()),
         )?;
@@ -208,14 +204,6 @@ impl MeshRuntimeConfig {
         }
     }
 
-    fn xds_client_config(&self) -> XdsClientConfig {
-        XdsClientConfig {
-            cp_url: self.cp_urls[0].clone(),
-            node_id: self.node_id.clone(),
-            namespace: self.namespace.clone(),
-        }
-    }
-
     pub fn listener_plan(&self) -> Vec<MeshListener> {
         let (inbound_kind, inbound_addr) = match self.topology {
             MeshTopology::Sidecar => (MeshListenerKind::MtlsTermination, self.inbound_listen_addr),
@@ -237,6 +225,7 @@ impl MeshRuntimeConfig {
         ]
     }
 
+    #[allow(dead_code)] // Used by tests and future xDS bootstrap wiring.
     pub fn mesh_slice_request(&self) -> MeshSliceRequest {
         MeshSliceRequest {
             node_id: self.node_id.clone(),
@@ -252,6 +241,7 @@ impl MeshRuntimeConfig {
 /// Mesh mode is the only caller. The mutation is cold-path: it runs before
 /// `ProxyState` builds router/plugin caches, so non-mesh modes and ordinary
 /// requests never pay for mesh plugin injection.
+#[allow(dead_code)] // Used by tests and future xDS bootstrap wiring.
 pub fn prepare_gateway_config_for_mesh(
     mut config: GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -538,6 +528,7 @@ pub async fn run(
     let runtime = MeshRuntimeConfig::from_env_config(&env_config)
         .map_err(|e| anyhow::anyhow!(e))
         .context("invalid mesh runtime configuration")?;
+    ensure_runtime_config_protocol_supported(&runtime)?;
 
     info!(
         node_id = %runtime.node_id,
@@ -563,60 +554,38 @@ pub async fn run(
     let grpc_tls = build_dp_grpc_tls_config(&env_config, &runtime.cp_urls, "Mesh")?;
     let mut background_handles = Vec::new();
 
-    let (bootstrap_config, initial_applied_mesh_slice) = match runtime.config_protocol {
-        MeshConfigProtocol::Native => {
-            let client_config = runtime.native_client_config();
-            let request = client_config.subscribe_request(crate::FERRUM_VERSION);
-            let cp_urls = runtime.cp_urls.clone();
-            let state = mesh_state.clone();
-            let shutdown_rx = shutdown_tx.subscribe();
-            let handle = tokio::spawn(
-                config_consumer::native_client::start_native_mesh_client_with_shutdown(
-                    cp_urls,
-                    jwt_secret.clone(),
-                    client_config,
-                    state,
-                    shutdown_rx,
-                    grpc_tls.clone(),
-                ),
-            );
-            background_handles.push(handle);
-            info!(
-                node_id = %request.node_id,
-                namespace = %request.namespace,
-                cp_urls = runtime.cp_urls.len(),
-                has_first_slice = mesh_state.has_first_slice(),
-                "Mesh mode initialized native MeshSubscribe consumer"
-            );
-            let (config, initial_slice) =
-                wait_for_initial_mesh_config(&mesh_state, &runtime, shutdown_tx.subscribe())
-                    .await
-                    .context("mesh runtime stopped before receiving a valid initial mesh slice")?;
-            info!(
-                mesh_global_plugins = config.plugin_configs.len(),
-                mesh_slice_version = %initial_slice.version,
-                "Mesh global plugin chain prepared from initial native slice"
-            );
-            (config, Some(initial_slice))
-        }
-        MeshConfigProtocol::Xds => {
-            let consumer = XdsConfigConsumer::new(runtime.xds_client_config(), mesh_state.clone());
-            info!(
-                node_id = %consumer.config().node_id,
-                namespace = %consumer.config().namespace,
-                cp_url = %consumer.config().cp_url,
-                has_first_slice = consumer.state().has_first_slice(),
-                "Mesh mode initialized xDS config consumer"
-            );
-            let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime)
-                .context("failed to prepare mesh plugin bootstrap config")?;
-            info!(
-                mesh_global_plugins = config.plugin_configs.len(),
-                "Mesh global plugin chain prepared for xDS bootstrap"
-            );
-            (config, None)
-        }
-    };
+    let client_config = runtime.native_client_config();
+    let request = client_config.subscribe_request(crate::FERRUM_VERSION);
+    let cp_urls = runtime.cp_urls.clone();
+    let state = mesh_state.clone();
+    let shutdown_rx = shutdown_tx.subscribe();
+    let handle = tokio::spawn(
+        config_consumer::native_client::start_native_mesh_client_with_shutdown(
+            cp_urls,
+            jwt_secret.clone(),
+            client_config,
+            state,
+            shutdown_rx,
+            grpc_tls.clone(),
+        ),
+    );
+    background_handles.push(handle);
+    info!(
+        node_id = %request.node_id,
+        namespace = %request.namespace,
+        cp_urls = runtime.cp_urls.len(),
+        has_first_slice = mesh_state.has_first_slice(),
+        "Mesh mode initialized native MeshSubscribe consumer"
+    );
+    let (bootstrap_config, initial_applied_mesh_slice) =
+        wait_for_initial_mesh_config(&mesh_state, &runtime, shutdown_tx.subscribe())
+            .await
+            .context("mesh runtime stopped before receiving a valid initial mesh slice")?;
+    info!(
+        mesh_global_plugins = bootstrap_config.plugin_configs.len(),
+        mesh_slice_version = %initial_applied_mesh_slice.version,
+        "Mesh global plugin chain prepared from initial native slice"
+    );
 
     serve_mesh_runtime(
         env_config,
@@ -624,10 +593,23 @@ pub async fn run(
         bootstrap_config,
         shutdown_tx,
         mesh_state,
-        initial_applied_mesh_slice,
+        Some(initial_applied_mesh_slice),
         background_handles,
     )
     .await
+}
+
+fn ensure_runtime_config_protocol_supported(
+    runtime: &MeshRuntimeConfig,
+) -> Result<(), anyhow::Error> {
+    match runtime.config_protocol {
+        MeshConfigProtocol::Native => Ok(()),
+        MeshConfigProtocol::Xds => Err(anyhow::anyhow!(
+            "FERRUM_MESH_CONFIG_PROTOCOL=xds is not supported by mesh runtime yet; \
+             use FERRUM_MESH_CONFIG_PROTOCOL=native for Ferrum MeshSubscribe. \
+             FERRUM_XDS_ENABLED only exposes CP ADS for Envoy-compatible clients."
+        )),
+    }
 }
 
 async fn serve_mesh_runtime(
@@ -1151,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn mesh_runtime_config_parses_xds_ambient_overrides() {
+    fn mesh_runtime_config_parses_native_ambient_overrides() {
         with_mesh_env(
             &[
                 ("FERRUM_MODE", "mesh"),
@@ -1164,7 +1146,7 @@ mod tests {
                     "secret-padding-for-32-char-min!!",
                 ),
                 ("FERRUM_MESH_NODE_ID", "node-b"),
-                ("FERRUM_MESH_CONFIG_PROTOCOL", "xds"),
+                ("FERRUM_MESH_CONFIG_PROTOCOL", "native"),
                 ("FERRUM_MESH_TOPOLOGY", "ambient"),
                 ("FERRUM_MESH_INBOUND_LISTEN_ADDR", "127.0.0.1:16006"),
                 ("FERRUM_MESH_OUTBOUND_LISTEN_ADDR", "127.0.0.1:16001"),
@@ -1181,7 +1163,7 @@ mod tests {
                 let runtime =
                     MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
 
-                assert_eq!(runtime.config_protocol, MeshConfigProtocol::Xds);
+                assert_eq!(runtime.config_protocol, MeshConfigProtocol::Native);
                 assert_eq!(runtime.topology, MeshTopology::Ambient);
                 assert_eq!(runtime.cp_urls.len(), 2);
                 assert_eq!(
@@ -1201,6 +1183,28 @@ mod tests {
                     "127.0.0.1:16008".parse::<SocketAddr>().unwrap()
                 );
                 assert_eq!(runtime.east_west_listen_port, 16443);
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_rejects_xds_protocol_until_client_is_wired() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_CONFIG_PROTOCOL", "xds"),
+            ],
+            || {
+                let err = EnvConfig::from_env().expect_err(
+                    "shared config validation should reject unsupported xDS mesh runtime",
+                );
+
+                assert!(err.contains("FERRUM_MESH_CONFIG_PROTOCOL=xds"));
             },
         );
     }
