@@ -691,6 +691,12 @@ impl XdsAdsServer {
         updates: &mut broadcast::Receiver<ConfigUpdate>,
         stream_config: &mut XdsStreamConfig,
     ) {
+        // Catch-up runs on the request path before a stream has emitted its
+        // first response. We intentionally do not invalidate the per-node
+        // snapshot cache here: the next snapshot lookup compares the updated
+        // XdsStreamConfig fingerprint and rebuilds on mismatch. The live
+        // update branches below still invalidate explicitly because they may
+        // already have sent a cached snapshot to this node.
         loop {
             match updates.try_recv() {
                 Ok(update) => {
@@ -712,6 +718,12 @@ impl XdsAdsServer {
 }
 
 fn config_fingerprint(config: &GatewayConfig) -> XdsConfigFingerprint {
+    // This serializes the full GatewayConfig, including HashMap fields whose
+    // iteration order is process-local. That is fine for the in-memory xDS
+    // snapshot cache: fingerprints only need to be stable within one process
+    // lifetime, and a restart starts with an empty cache anyway. Do not reuse
+    // this helper for persisted cross-process cache keys without canonicalizing
+    // map order first.
     match serde_json::to_vec(config) {
         Ok(bytes) => fingerprint_bytes([b"full-config".as_slice(), bytes.as_slice()]),
         Err(error) => {
