@@ -17,6 +17,7 @@
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use ring::rand::SecureRandom;
 use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -197,6 +198,8 @@ pub fn build_dp_grpc_tls_config(
 
 /// JWT token lifetime for DP-generated tokens (59 minutes, under the 1-hour ceiling).
 const DP_JWT_TTL_SECONDS: i64 = 3540;
+const BACKOFF_INITIAL_SECS: u64 = 1;
+const BACKOFF_MAX_SECS: u64 = 30;
 
 /// Generate a short-lived HS256 JWT for authenticating the DP to the CP using
 /// the default issuer (`DEFAULT_CP_DP_JWT_ISSUER`).
@@ -319,8 +322,6 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
         );
     }
 
-    const BACKOFF_INITIAL_SECS: u64 = 1;
-    const BACKOFF_MAX_SECS: u64 = 30;
     let mut current_cp_index: usize = 0;
     let mut backoff_secs = BACKOFF_INITIAL_SECS;
     let mut full_cycle_count: u32 = 0;
@@ -413,6 +414,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             .await
         };
 
+        let mut increase_backoff = true;
         match result {
             Ok(_) => {
                 warn!(
@@ -428,6 +430,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                     current_cp_index = 0;
                 }
                 backoff_secs = BACKOFF_INITIAL_SECS;
+                increase_backoff = false;
             }
             Err(e) => {
                 error!(
@@ -457,21 +460,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             }
         }
 
-        // Apply ±25% jitter to the backoff to desynchronize reconnection attempts.
-        let base_ms = backoff_secs * 1000;
-        let jitter_range_ms = base_ms / 4;
-        let jitter_ms = if jitter_range_ms > 0 {
-            let full_range = jitter_range_ms * 2;
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos() as u64;
-            (nanos % full_range) as i64 - jitter_range_ms as i64
-        } else {
-            0
-        };
-        let sleep_ms = base_ms as i64 + jitter_ms;
-        let sleep_duration = Duration::from_millis(sleep_ms.max(100) as u64);
+        let sleep_duration = jittered_backoff(backoff_secs);
 
         if let Some(ref rx) = shutdown_rx {
             let mut rx_clone = rx.clone();
@@ -490,7 +479,45 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             tokio::time::sleep(sleep_duration).await;
         }
 
-        backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_SECS);
+        backoff_secs = next_backoff_secs(backoff_secs, increase_backoff);
+    }
+}
+
+fn jittered_backoff(backoff_secs: u64) -> Duration {
+    jittered_backoff_with_entropy(backoff_secs, random_backoff_entropy())
+}
+
+fn random_backoff_entropy() -> u64 {
+    let rng = ring::rand::SystemRandom::new();
+    let mut bytes = [0u8; 8];
+    if rng.fill(&mut bytes).is_ok() {
+        return u64::from_ne_bytes(bytes);
+    }
+
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+fn jittered_backoff_with_entropy(backoff_secs: u64, entropy: u64) -> Duration {
+    let base_ms = backoff_secs.saturating_mul(1000);
+    let jitter_range_ms = base_ms / 4;
+    let jitter_ms = if jitter_range_ms > 0 {
+        let full_range = jitter_range_ms.saturating_mul(2);
+        (entropy % full_range) as i64 - jitter_range_ms as i64
+    } else {
+        0
+    };
+    let sleep_ms = (base_ms as i64 + jitter_ms).max(100) as u64;
+    Duration::from_millis(sleep_ms)
+}
+
+fn next_backoff_secs(current_secs: u64, increase: bool) -> u64 {
+    if increase {
+        current_secs.saturating_mul(2).min(BACKOFF_MAX_SECS)
+    } else {
+        BACKOFF_INITIAL_SECS
     }
 }
 
@@ -964,6 +991,41 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use serde_json::json;
+
+    #[test]
+    fn next_backoff_does_not_increase_after_clean_stream_end() {
+        assert_eq!(
+            next_backoff_secs(BACKOFF_INITIAL_SECS, false),
+            BACKOFF_INITIAL_SECS
+        );
+        assert_eq!(next_backoff_secs(16, false), BACKOFF_INITIAL_SECS);
+    }
+
+    #[test]
+    fn next_backoff_increases_after_connection_error_until_cap() {
+        assert_eq!(next_backoff_secs(1, true), 2);
+        assert_eq!(next_backoff_secs(16, true), 30);
+        assert_eq!(next_backoff_secs(30, true), 30);
+    }
+
+    #[test]
+    fn jittered_backoff_with_entropy_stays_within_expected_range() {
+        let samples = [0, 249, 250, 499, u64::MAX];
+
+        for entropy in samples {
+            let duration = jittered_backoff_with_entropy(1, entropy);
+            assert!(duration >= Duration::from_millis(750));
+            assert!(duration < Duration::from_millis(1250));
+        }
+    }
+
+    #[test]
+    fn jittered_backoff_never_sleeps_below_minimum() {
+        assert_eq!(
+            jittered_backoff_with_entropy(0, 0),
+            Duration::from_millis(100)
+        );
+    }
 
     fn proxy_in_namespace(id: &str, ns: &str) -> crate::config::types::Proxy {
         serde_json::from_value(json!({
