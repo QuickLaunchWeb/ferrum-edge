@@ -1,7 +1,8 @@
 //! Tests for ai_rate_limiter plugin
 
 use ferrum_edge::plugins::{
-    Plugin, PluginHttpClient, PluginResult, ai_rate_limiter::AiRateLimiter,
+    Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext,
+    ai_rate_limiter::AiRateLimiter,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -13,6 +14,25 @@ fn json_headers() -> HashMap<String, String> {
     let mut h = HashMap::new();
     h.insert("content-type".to_string(), "application/json".to_string());
     h
+}
+
+fn ctx_with_content_type(method: &str, content_type: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        method.to_string(),
+        "/chat".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), content_type.to_string());
+    ctx
+}
+
+fn ctx_without_content_type(method: &str) -> RequestContext {
+    RequestContext::new(
+        "127.0.0.1".to_string(),
+        method.to_string(),
+        "/chat".to_string(),
+    )
 }
 
 fn openai_response(prompt: u64, completion: u64) -> Vec<u8> {
@@ -34,7 +54,19 @@ async fn test_plugin_name_and_priority() {
         AiRateLimiter::new(&json!({"token_limit": 1000}), PluginHttpClient::default()).unwrap();
     assert_eq!(plugin.name(), "ai_rate_limiter");
     assert_eq!(plugin.priority(), 4200);
+    assert_eq!(
+        plugin.supported_protocols(),
+        &[ProxyProtocol::Http, ProxyProtocol::Grpc]
+    );
     assert!(plugin.requires_response_body_buffering());
+    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "application/json")));
+    assert!(plugin.should_buffer_response_body(&ctx_with_content_type(
+        "POST",
+        "multipart/form-data; boundary=abc"
+    )));
+    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "text/plain")));
+    assert!(plugin.should_buffer_response_body(&ctx_without_content_type("POST")));
+    assert!(!plugin.should_buffer_response_body(&ctx_with_content_type("GET", "application/json")));
 }
 
 // ─── Basic flow ─────────────────────────────────────────────────────────
@@ -656,6 +688,33 @@ fn test_valid_limit_by_accepted() {
             PluginHttpClient::default(),
         )
         .unwrap_or_else(|e| panic!("limit_by '{value}' should be valid: {e}"));
+    }
+}
+
+#[test]
+fn test_invalid_config_shapes_rejected() {
+    for (config, needle) in [
+        (json!(null), "config must be an object"),
+        (json!({}), "token_limit"),
+        (json!({"token_limit": "100"}), "token_limit"),
+        (
+            json!({"token_limit": 100, "window_seconds": "60"}),
+            "window_seconds",
+        ),
+        (
+            json!({"token_limit": 100, "expose_headers": "true"}),
+            "expose_headers",
+        ),
+        (json!({"token_limit": 100, "provider": ""}), "provider"),
+        (
+            json!({"token_limit": 100, "provider": "unknown"}),
+            "provider",
+        ),
+    ] {
+        let err = AiRateLimiter::new(&config, PluginHttpClient::default())
+            .err()
+            .unwrap();
+        assert!(err.contains(needle), "needle={needle}, got: {err}");
     }
 }
 

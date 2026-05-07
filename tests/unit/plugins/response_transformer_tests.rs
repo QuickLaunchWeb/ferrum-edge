@@ -24,6 +24,32 @@ async fn test_response_transformer_creation() {
 }
 
 #[tokio::test]
+async fn test_response_transformer_priority_protocols_and_reject_hook() {
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "key": "X-Test", "value": "test"}
+        ]
+    }))
+    .unwrap();
+
+    assert_eq!(
+        plugin.priority(),
+        ferrum_edge::plugins::priority::RESPONSE_TRANSFORMER
+    );
+    assert!(plugin.applies_after_proxy_on_reject());
+    assert!(
+        plugin
+            .supported_protocols()
+            .contains(&ferrum_edge::plugins::ProxyProtocol::Http)
+    );
+    assert!(
+        plugin
+            .supported_protocols()
+            .contains(&ferrum_edge::plugins::ProxyProtocol::Grpc)
+    );
+}
+
+#[tokio::test]
 async fn test_response_transformer_add_header() {
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
@@ -125,6 +151,34 @@ async fn test_response_transformer_no_config() {
     let result = ResponseTransformer::new(&json!({}));
     let err = result.err().expect("expected error for no config");
     assert!(err.contains("no 'rules' configured"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_non_object_config() {
+    let err = ResponseTransformer::new(&json!("bad"))
+        .err()
+        .expect("expected error for non-object config");
+    assert!(err.contains("config must be an object"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_non_array_rules() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": "not-an-array"
+    }))
+    .err()
+    .expect("expected error for non-array rules");
+    assert!(err.contains("'rules' must be an array"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_non_object_rule() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": ["bad"]
+    }))
+    .err()
+    .expect("expected error for non-object rule");
+    assert!(err.contains("rule must be an object"), "got: {err}");
 }
 
 #[tokio::test]
@@ -593,6 +647,18 @@ async fn test_response_transformer_rejects_non_string_key() {
 }
 
 #[tokio::test]
+async fn test_response_transformer_rejects_invalid_header_key() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "bad header", "value": "v"}
+        ]
+    }))
+    .err()
+    .expect("expected error for invalid header key");
+    assert!(err.contains("valid HTTP header name"), "got: {err}");
+}
+
+#[tokio::test]
 async fn test_response_transformer_rejects_non_string_value() {
     let err = ResponseTransformer::new(&json!({
         "rules": [
@@ -614,6 +680,18 @@ async fn test_response_transformer_rejects_non_string_new_key() {
     .err()
     .expect("expected error for non-string new_key");
     assert!(err.contains("'new_key' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_invalid_header_new_key() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "header", "key": "X-Old", "new_key": "bad header"}
+        ]
+    }))
+    .err()
+    .expect("expected error for invalid header new_key");
+    assert!(err.contains("valid HTTP header name"), "got: {err}");
 }
 
 // ── JSON null value preservation on body rules ───────────────────────────

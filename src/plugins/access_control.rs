@@ -40,53 +40,26 @@ pub struct AccessControl {
     /// When true, allow requests authenticated by an external auth plugin
     /// (for example `jwks_auth`) even if no gateway Consumer was mapped.
     allow_authenticated_identity: bool,
+    /// Precomputed allow-branch guard for the hot authorization path.
+    has_allow_rules: bool,
 }
 
 impl AccessControl {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let allowed: HashSet<String> = config["allowed_consumers"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let object = config
+            .as_object()
+            .ok_or_else(|| format!("access_control: config must be an object, got: {config}"))?;
 
-        let disallowed: HashSet<String> = config["disallowed_consumers"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let allowed = parse_string_set(object, "allowed_consumers")?;
+        let disallowed = parse_string_set(object, "disallowed_consumers")?;
+        let allowed_groups = parse_string_set(object, "allowed_groups")?;
+        let disallowed_groups = parse_string_set(object, "disallowed_groups")?;
+        let allow_authenticated_identity =
+            parse_bool(object, "allow_authenticated_identity")?.unwrap_or(false);
+        let has_allow_rules = !allowed.is_empty() || !allowed_groups.is_empty();
 
-        let allowed_groups: HashSet<String> = config["allowed_groups"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let disallowed_groups: HashSet<String> = config["disallowed_groups"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let allow_authenticated_identity = config["allow_authenticated_identity"]
-            .as_bool()
-            .unwrap_or(false);
-
-        if allowed.is_empty()
+        if !has_allow_rules
             && disallowed.is_empty()
-            && allowed_groups.is_empty()
             && disallowed_groups.is_empty()
             && !allow_authenticated_identity
         {
@@ -101,6 +74,7 @@ impl AccessControl {
             allowed_groups,
             disallowed_groups,
             allow_authenticated_identity,
+            has_allow_rules,
         })
     }
 
@@ -174,9 +148,7 @@ impl AccessControl {
 
         // --- Allow checks ---
 
-        let has_allow_rules = !self.allowed_consumers.is_empty() || !self.allowed_groups.is_empty();
-
-        if has_allow_rules {
+        if self.has_allow_rules {
             // Consumer username allow
             if self.allowed_consumers.contains(username) {
                 return PluginResult::Continue;
@@ -202,6 +174,48 @@ impl AccessControl {
 
         PluginResult::Continue
     }
+}
+
+fn parse_string_set(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<HashSet<String>, String> {
+    let Some(value) = object.get(field) else {
+        return Ok(HashSet::new());
+    };
+
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("access_control: '{field}' must be an array of strings"))?;
+
+    let mut parsed = HashSet::with_capacity(values.len());
+    for entry in values {
+        let Some(raw) = entry.as_str() else {
+            return Err(format!("access_control: '{field}' entries must be strings"));
+        };
+        if raw.is_empty() {
+            return Err(format!(
+                "access_control: '{field}' entries must be non-empty strings"
+            ));
+        }
+        parsed.insert(raw.to_string());
+    }
+
+    Ok(parsed)
+}
+
+fn parse_bool(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<bool>, String> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| format!("access_control: '{field}' must be a boolean"))
+        })
+        .transpose()
 }
 
 #[async_trait]

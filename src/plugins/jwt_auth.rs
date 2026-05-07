@@ -32,39 +32,56 @@ fn decode_claims_only(token: &str) -> Option<serde_json::Value> {
 }
 
 pub struct JwtAuth {
-    token_lookup: String,
+    token_lookup: TokenLookup,
     consumer_claim_field: String,
+    validation: Validation,
+}
+
+enum TokenLookup {
+    Header {
+        lower_name: String,
+        original_name: String,
+    },
+    Query(String),
 }
 
 impl JwtAuth {
     pub fn new(config: &Value) -> Result<Self, String> {
+        let config_obj = config
+            .as_object()
+            .ok_or_else(|| format!("jwt_auth: config must be an object, got: {config}"))?;
+        let token_lookup = parse_token_lookup(config_obj.get("token_lookup"))?;
+        let consumer_claim_field = parse_non_empty_string(
+            config_obj.get("consumer_claim_field"),
+            "consumer_claim_field",
+            "sub",
+        )?;
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_exp = true;
+        validation.required_spec_claims.clear();
+
         Ok(Self {
-            token_lookup: config["token_lookup"]
-                .as_str()
-                .unwrap_or("header:Authorization")
-                .to_string(),
-            consumer_claim_field: config["consumer_claim_field"]
-                .as_str()
-                .unwrap_or("sub")
-                .to_string(),
+            token_lookup,
+            consumer_claim_field,
+            validation,
         })
     }
 
     fn extract_token(&self, ctx: &RequestContext) -> Option<String> {
-        if self.token_lookup.starts_with("header:") {
-            let header_name = &self.token_lookup["header:".len()..];
-            ctx.headers.get(&header_name.to_lowercase()).map(|v| {
-                strip_auth_scheme(v, "Bearer")
-                    .unwrap_or(v.as_str())
-                    .to_string()
-            })
-        } else if self.token_lookup.starts_with("query:") {
-            let param_name = &self.token_lookup["query:".len()..];
-            ctx.query_params.get(param_name).cloned()
-        } else {
-            ctx.headers
-                .get("authorization")
-                .and_then(|v| strip_auth_scheme(v, "Bearer").map(str::to_string))
+        match &self.token_lookup {
+            TokenLookup::Header {
+                lower_name,
+                original_name,
+            } => ctx
+                .headers
+                .get(lower_name.as_str())
+                .or_else(|| ctx.headers.get(original_name.as_str()))
+                .map(|v| {
+                    strip_auth_scheme(v, "Bearer")
+                        .unwrap_or(v.as_str())
+                        .to_string()
+                }),
+            TokenLookup::Query(param_name) => ctx.query_params.get(param_name.as_str()).cloned(),
         }
     }
 }
@@ -132,14 +149,10 @@ impl AuthMechanism for JwtAuth {
             return VerifyOutcome::VerificationFailed(r#"{"error":"Invalid JWT token"}"#.into());
         }
 
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.validate_exp = true;
-        validation.required_spec_claims.clear();
-
         for jwt_cred in &jwt_entries {
             if let Some(secret) = jwt_cred.get("secret").and_then(|secret| secret.as_str()) {
                 let key = DecodingKey::from_secret(secret.as_bytes());
-                if decode::<serde_json::Value>(&token, &key, &validation).is_ok() {
+                if decode::<serde_json::Value>(&token, &key, &self.validation).is_ok() {
                     return VerifyOutcome::consumer(consumer);
                 }
             }
@@ -157,3 +170,43 @@ auth_flow::impl_auth_plugin!(
     crate::plugins::HTTP_FAMILY_PROTOCOLS,
     auth_flow::run_auth
 );
+
+fn parse_token_lookup(value: Option<&Value>) -> Result<TokenLookup, String> {
+    let raw = parse_non_empty_string(value, "token_lookup", "header:Authorization")?;
+    if let Some(name) = raw.strip_prefix("header:") {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("jwt_auth: 'token_lookup' header name must not be empty".to_string());
+        }
+        Ok(TokenLookup::Header {
+            lower_name: name.to_ascii_lowercase(),
+            original_name: name.to_string(),
+        })
+    } else if let Some(name) = raw.strip_prefix("query:") {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("jwt_auth: 'token_lookup' query name must not be empty".to_string());
+        }
+        Ok(TokenLookup::Query(name.to_string()))
+    } else {
+        Err("jwt_auth: 'token_lookup' must use 'header:<name>' or 'query:<name>'".to_string())
+    }
+}
+
+fn parse_non_empty_string(
+    value: Option<&Value>,
+    field: &str,
+    default_value: &str,
+) -> Result<String, String> {
+    let Some(value) = value else {
+        return Ok(default_value.to_string());
+    };
+    let raw = value
+        .as_str()
+        .ok_or_else(|| format!("jwt_auth: '{field}' must be a string, got: {value}"))?;
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(format!("jwt_auth: '{field}' must not be empty"));
+    }
+    Ok(value.to_string())
+}

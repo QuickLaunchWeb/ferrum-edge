@@ -170,6 +170,8 @@ Phase D adds Kubernetes source translation and sidecar-injector scaffolding. Kub
 
 Translation notes: Istio `AuthorizationPolicy` resources preserve Istio's action semantics. An `ALLOW` policy with no `rules` is treated as allow-nothing for the selected workload, so it creates a mesh authorization rule that never matches instead of accidentally broadening access. `DENY` and `AUDIT` policies with no `rules` remain no-ops.
 
+Kubernetes Gateway API and Istio mesh translators fail closed when a resource declares a port outside the Kubernetes service-port range (`1`-`65535`). Invalid ports are rejected during translation instead of wrapping into an unintended backend/listener port.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_INJECTOR_LISTEN_ADDR` | Injector mode | `0.0.0.0:9443` | Admission webhook bind address for `POST /mutate` |

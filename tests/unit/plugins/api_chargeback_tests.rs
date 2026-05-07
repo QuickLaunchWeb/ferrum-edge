@@ -1,7 +1,7 @@
 //! Tests for api_chargeback plugin
 
 use ferrum_edge::plugins::api_chargeback::{ApiChargeback, ChargebackRegistry};
-use ferrum_edge::plugins::{Plugin, TransactionSummary};
+use ferrum_edge::plugins::{HTTP_FAMILY_PROTOCOLS, Plugin, TransactionSummary};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -66,6 +66,28 @@ fn test_valid_config() {
     let plugin = ApiChargeback::new(&config, "ferrum").unwrap();
     assert_eq!(plugin.name(), "api_chargeback");
     assert_eq!(plugin.priority(), 9350);
+    assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
+}
+
+#[test]
+fn test_invalid_config_shapes_rejected() {
+    let cases = [
+        json!(null),
+        json!({"currency": 100, "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.001}]}),
+        json!({"currency": "  ", "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.001}]}),
+        json!({"render_cache_ttl_seconds": "5", "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.001}]}),
+        json!({"stale_entry_ttl_seconds": false, "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.001}]}),
+        json!({"cache_invalidation_min_age_ms": [], "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.001}]}),
+        json!({"cleanup_interval_seconds": "300", "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.001}]}),
+        json!({"pricing_tiers": [42]}),
+    ];
+
+    for config in cases {
+        assert!(
+            ApiChargeback::new(&config, "ferrum").is_err(),
+            "expected invalid config to be rejected: {config}"
+        );
+    }
 }
 
 #[test]
@@ -110,6 +132,22 @@ fn test_negative_price_rejected() {
     });
     let err = ApiChargeback::new(&config, "ferrum").err().unwrap();
     assert!(err.contains("non-negative"));
+}
+
+#[test]
+fn test_extreme_tunables_do_not_overflow() {
+    let config = json!({
+        "render_cache_ttl_seconds": u64::MAX,
+        "stale_entry_ttl_seconds": u64::MAX,
+        "cache_invalidation_min_age_ms": u64::MAX,
+        "pricing_tiers": [{
+            "status_codes": [200],
+            "price_per_call": 0.001
+        }]
+    });
+
+    let plugin = ApiChargeback::new(&config, "ferrum").unwrap();
+    assert_eq!(plugin.name(), "api_chargeback");
 }
 
 #[test]

@@ -19,6 +19,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -27,7 +28,7 @@ use tracing::warn;
 
 use super::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLogger, PluginHttpClient, RetryPolicy,
-    build_batch_config, handle_http_batch_response, parse_http_endpoint,
+    build_batch_config, handle_http_batch_response, parse_http_endpoint, validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
@@ -45,8 +46,8 @@ struct LokiEntry {
 #[derive(Clone)]
 struct LokiFlushConfig {
     endpoint_url: String,
-    authorization_header: Option<String>,
-    custom_headers: Vec<(String, String)>,
+    authorization_header: Option<HeaderValue>,
+    custom_headers: Vec<(HeaderName, HeaderValue)>,
     http_client: PluginHttpClient,
     gzip: bool,
     retry: RetryPolicy,
@@ -73,29 +74,39 @@ pub struct LokiLogging {
 
 impl LokiLogging {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        if !config.is_object() {
+            return Err("loki_logging: config must be an object".to_string());
+        }
+
         let (endpoint_url, endpoint_hostname) = parse_http_endpoint(config, "loki_logging")?;
-        let gzip = config["gzip"].as_bool().unwrap_or(true);
+        let gzip = optional_bool(config, "gzip")?.unwrap_or(true);
 
         // Parse static labels from config.
         let mut static_labels = BTreeMap::new();
-        if let Some(labels_obj) = config["labels"].as_object() {
+        if let Some(labels) = config.get("labels") {
+            let labels_obj = labels
+                .as_object()
+                .ok_or_else(|| "loki_logging: 'labels' must be an object".to_string())?;
             for (key, value) in labels_obj {
-                if let Some(label) = value.as_str() {
-                    static_labels.insert(key.clone(), label.to_string());
+                if !is_valid_loki_label_name(key) {
+                    return Err(format!("loki_logging: invalid label name '{key}'"));
                 }
+                let label = value
+                    .as_str()
+                    .ok_or_else(|| format!("loki_logging: 'labels.{key}' must be a string"))?;
+                static_labels.insert(key.clone(), label.to_string());
             }
         }
         if !static_labels.contains_key("service") {
             static_labels.insert("service".to_string(), "ferrum-edge".to_string());
         }
 
-        let include_proxy_id = config["include_proxy_id_label"]
-            .as_bool()
-            .or_else(|| config["include_listen_path_label"].as_bool())
-            .unwrap_or(true);
-        let include_status_class = config["include_status_class_label"]
-            .as_bool()
-            .unwrap_or(true);
+        let include_proxy_id = match optional_bool(config, "include_proxy_id_label")? {
+            Some(value) => value,
+            None => optional_bool(config, "include_listen_path_label")?.unwrap_or(true),
+        };
+        let include_status_class =
+            optional_bool(config, "include_status_class_label")?.unwrap_or(true);
 
         let label_config = LabelConfig {
             static_labels,
@@ -104,34 +115,49 @@ impl LokiLogging {
         };
 
         let mut custom_headers = Vec::new();
-        if let Some(headers_obj) = config["custom_headers"].as_object() {
+        if let Some(headers) = config.get("custom_headers") {
+            let headers_obj = headers
+                .as_object()
+                .ok_or_else(|| "loki_logging: 'custom_headers' must be an object".to_string())?;
             for (key, value) in headers_obj {
-                if let Some(header) = value.as_str() {
-                    custom_headers.push((key.clone(), header.to_string()));
-                }
+                let header = value.as_str().ok_or_else(|| {
+                    format!("loki_logging: custom_headers['{key}'] must be a string")
+                })?;
+                let header_name = HeaderName::from_bytes(key.as_bytes()).map_err(|error| {
+                    format!("loki_logging: invalid custom_headers name '{key}': {error}")
+                })?;
+                let header_value = HeaderValue::from_str(header).map_err(|error| {
+                    format!("loki_logging: invalid custom_headers value for '{key}': {error}")
+                })?;
+                custom_headers.retain(|(existing, _)| *existing != header_name);
+                custom_headers.push((header_name, header_value));
             }
         }
 
+        let authorization_header = match optional_non_empty_string(config, "authorization_header")?
+        {
+            Some(value) => Some(HeaderValue::from_str(&value).map_err(|error| {
+                format!("loki_logging: invalid authorization_header value: {error}")
+            })?),
+            None => None,
+        };
+
         // Config remains `max_retries`; the shared retry policy counts the
         // initial attempt plus those retries.
-        let batch_config = build_batch_config(
-            config,
-            "loki_logging",
-            BatchConfigDefaults {
-                batch_size_key: "batch_size",
-                batch_size: 100,
-                flush_interval_ms: 1000,
-                min_flush_interval_ms: 100,
-                buffer_capacity: 10000,
-                max_retries: 3,
-                retry_delay_ms: 1000,
-            },
-        );
+        let batch_defaults = BatchConfigDefaults {
+            batch_size_key: "batch_size",
+            batch_size: 100,
+            flush_interval_ms: 1000,
+            min_flush_interval_ms: 100,
+            buffer_capacity: 10000,
+            max_retries: 3,
+            retry_delay_ms: 1000,
+        };
+        validate_batch_config(config, "loki_logging", batch_defaults)?;
+        let batch_config = build_batch_config(config, "loki_logging", batch_defaults);
         let flush_config = LokiFlushConfig {
             endpoint_url,
-            authorization_header: config["authorization_header"]
-                .as_str()
-                .map(|value| value.to_string()),
+            authorization_header,
             custom_headers,
             http_client,
             gzip,
@@ -209,6 +235,41 @@ impl LokiLogging {
     }
 }
 
+fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
+    match config.get(key) {
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| format!("loki_logging: '{key}' must be a boolean")),
+        None => Ok(None),
+    }
+}
+
+fn optional_non_empty_string(config: &Value, key: &str) -> Result<Option<String>, String> {
+    match config.get(key) {
+        Some(value) => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("loki_logging: '{key}' must be a string"))?
+                .trim();
+            if value.is_empty() {
+                return Err(format!("loki_logging: '{key}' must not be empty"));
+            }
+            Ok(Some(value.to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+fn is_valid_loki_label_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first == '_' || first.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 /// Map an HTTP status code to its class string (low cardinality).
 fn status_class(status: u16) -> String {
     match status {
@@ -274,25 +335,17 @@ impl Plugin for LokiLogging {
     }
 }
 
-/// Labels + accumulated (timestamp, log-line) pairs for a single Loki stream.
-type LokiStream = (BTreeMap<String, String>, Vec<(String, String)>);
-
 /// Group entries by label set and build the Loki push payload.
 fn build_loki_payload(batch: &[LokiEntry]) -> Value {
-    let mut streams: HashMap<String, LokiStream> = HashMap::new();
+    let mut streams: HashMap<BTreeMap<String, String>, Vec<(String, String)>> = HashMap::new();
 
     for entry in batch {
-        let key = serde_json::to_string(&entry.labels).unwrap_or_default();
-        let stream = streams
-            .entry(key)
-            .or_insert_with(|| (entry.labels.clone(), Vec::new()));
-        stream
-            .1
-            .push((entry.timestamp_ns.clone(), entry.line.clone()));
+        let stream = streams.entry(entry.labels.clone()).or_default();
+        stream.push((entry.timestamp_ns.clone(), entry.line.clone()));
     }
 
     let streams_array: Vec<Value> = streams
-        .into_values()
+        .into_iter()
         .map(|(labels, values)| {
             let values_array: Vec<Value> = values
                 .into_iter()
@@ -351,13 +404,21 @@ fn build_loki_body(cfg: &LokiFlushConfig, batch: &[LokiEntry]) -> (Bytes, Option
             Ok(compressed) => (Bytes::from(compressed), Some("gzip")),
             Err(error) => {
                 warn!("Loki logging: gzip compression failed, sending uncompressed: {error}");
-                let raw = serde_json::to_vec(&payload).unwrap_or_default();
-                (Bytes::from(raw), None)
+                (Bytes::from(json_payload_bytes(&payload)), None)
             }
         }
     } else {
-        let raw = serde_json::to_vec(&payload).unwrap_or_default();
-        (Bytes::from(raw), None)
+        (Bytes::from(json_payload_bytes(&payload)), None)
+    }
+}
+
+fn json_payload_bytes(payload: &Value) -> Vec<u8> {
+    match serde_json::to_vec(payload) {
+        Ok(raw) => raw,
+        Err(error) => {
+            warn!("Loki logging: failed to serialize payload: {error}");
+            Vec::new()
+        }
     }
 }
 
@@ -378,10 +439,10 @@ async fn send_batch_once(
         req = req.header("Content-Encoding", encoding);
     }
     if let Some(auth) = &cfg.authorization_header {
-        req = req.header("Authorization", auth);
+        req = req.header("Authorization", auth.clone());
     }
     for (key, value) in &cfg.custom_headers {
-        req = req.header(key.as_str(), value.as_str());
+        req = req.header(key.clone(), value.clone());
     }
 
     handle_http_batch_response(
@@ -412,6 +473,13 @@ mod tests {
 
     fn client() -> PluginHttpClient {
         PluginHttpClient::default()
+    }
+
+    fn must<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error}"),
+        }
     }
 
     fn make_summary(status: u16, proxy_id: Option<&str>) -> TransactionSummary {
@@ -445,8 +513,8 @@ mod tests {
                 "include_status_class_label": false,
             }),
             client(),
-        )
-        .unwrap();
+        );
+        let plugin = must(plugin, "loki_logging config should be valid");
         let summary = make_summary(200, Some("p-1"));
         let labels = plugin.build_http_labels(&summary);
         assert!(!labels.contains_key("proxy_id"));
@@ -464,8 +532,8 @@ mod tests {
                 "include_listen_path_label": false,
             }),
             client(),
-        )
-        .unwrap();
+        );
+        let plugin = must(plugin, "loki_logging config should be valid");
         let summary = make_summary(500, Some("p-2"));
         let labels = plugin.build_http_labels(&summary);
         assert_eq!(labels.get("proxy_id").map(String::as_str), Some("p-2"));
@@ -476,11 +544,66 @@ mod tests {
         let plugin = LokiLogging::new(
             &json!({ "endpoint_url": "http://127.0.0.1:1/loki/api/v1/push" }),
             client(),
-        )
-        .unwrap();
+        );
+        let plugin = must(plugin, "loki_logging config should be valid");
         let summary = make_summary(200, Some("p-3"));
         let labels = plugin.build_http_labels(&summary);
         assert_eq!(labels.get("proxy_id").map(String::as_str), Some("p-3"));
         assert_eq!(labels.get("status_class").map(String::as_str), Some("2xx"));
+    }
+
+    #[test]
+    fn label_name_validation_matches_loki_shape() {
+        assert!(is_valid_loki_label_name("service"));
+        assert!(is_valid_loki_label_name("_tenant"));
+        assert!(is_valid_loki_label_name("env_1"));
+        assert!(!is_valid_loki_label_name(""));
+        assert!(!is_valid_loki_label_name("1env"));
+        assert!(!is_valid_loki_label_name("bad-label"));
+    }
+
+    #[test]
+    fn build_loki_payload_groups_entries_by_label_set() {
+        let mut labels_a = BTreeMap::new();
+        labels_a.insert("service".to_string(), "ferrum-edge".to_string());
+        labels_a.insert("proxy_id".to_string(), "p-1".to_string());
+
+        let mut labels_b = BTreeMap::new();
+        labels_b.insert("service".to_string(), "ferrum-edge".to_string());
+        labels_b.insert("proxy_id".to_string(), "p-2".to_string());
+
+        let payload = build_loki_payload(&[
+            LokiEntry {
+                labels: labels_a.clone(),
+                timestamp_ns: "1000".to_string(),
+                line: r#"{"a":1}"#.to_string(),
+            },
+            LokiEntry {
+                labels: labels_a,
+                timestamp_ns: "1001".to_string(),
+                line: r#"{"a":2}"#.to_string(),
+            },
+            LokiEntry {
+                labels: labels_b,
+                timestamp_ns: "2000".to_string(),
+                line: r#"{"b":1}"#.to_string(),
+            },
+        ]);
+
+        let Some(streams) = payload["streams"].as_array() else {
+            panic!("payload should include streams array");
+        };
+        assert_eq!(streams.len(), 2);
+        let value_counts: Vec<usize> = streams
+            .iter()
+            .map(|stream| {
+                let Some(values) = stream["values"].as_array() else {
+                    panic!("stream should include values array");
+                };
+                values.len()
+            })
+            .collect();
+        assert!(value_counts.contains(&2));
+        assert!(value_counts.contains(&1));
     }
 }
