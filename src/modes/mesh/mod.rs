@@ -152,10 +152,7 @@ impl MeshRuntimeConfig {
             .or_else(|| std::env::var("HOSTNAME").ok())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "ferrum-mesh-node".to_string());
-        let config_protocol = MeshConfigProtocol::parse(
-            &resolve_ferrum_var("FERRUM_MESH_CONFIG_PROTOCOL")
-                .unwrap_or_else(|| "native".to_string()),
-        )?;
+        let config_protocol = MeshConfigProtocol::parse(&env_config.mesh_config_protocol)?;
         let topology = MeshTopology::parse(
             &resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").unwrap_or_else(|| "sidecar".to_string()),
         )?;
@@ -942,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn mesh_runtime_config_parses_xds_ambient_overrides() {
+    fn mesh_runtime_config_parses_native_ambient_overrides() {
         with_mesh_env(
             &[
                 ("FERRUM_MODE", "mesh"),
@@ -955,7 +952,7 @@ mod tests {
                     "secret-padding-for-32-char-min!!",
                 ),
                 ("FERRUM_MESH_NODE_ID", "node-b"),
-                ("FERRUM_MESH_CONFIG_PROTOCOL", "xds"),
+                ("FERRUM_MESH_CONFIG_PROTOCOL", "native"),
                 ("FERRUM_MESH_TOPOLOGY", "ambient"),
                 ("FERRUM_MESH_INBOUND_LISTEN_ADDR", "127.0.0.1:16006"),
                 ("FERRUM_MESH_OUTBOUND_LISTEN_ADDR", "127.0.0.1:16001"),
@@ -972,7 +969,7 @@ mod tests {
                 let runtime =
                     MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
 
-                assert_eq!(runtime.config_protocol, MeshConfigProtocol::Xds);
+                assert_eq!(runtime.config_protocol, MeshConfigProtocol::Native);
                 assert_eq!(runtime.topology, MeshTopology::Ambient);
                 assert_eq!(runtime.cp_urls.len(), 2);
                 assert_eq!(
@@ -1009,13 +1006,11 @@ mod tests {
                 ("FERRUM_MESH_CONFIG_PROTOCOL", "xds"),
             ],
             || {
-                let env = EnvConfig::from_env().expect("mesh env config");
-                let runtime =
-                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
-                let err = ensure_runtime_config_protocol_supported(&runtime)
-                    .expect_err("xDS mesh runtime should fail fast");
+                let err = EnvConfig::from_env().expect_err(
+                    "shared config validation should reject unsupported xDS mesh runtime",
+                );
 
-                assert!(err.to_string().contains("FERRUM_MESH_CONFIG_PROTOCOL=xds"));
+                assert!(err.contains("FERRUM_MESH_CONFIG_PROTOCOL=xds"));
             },
         );
     }

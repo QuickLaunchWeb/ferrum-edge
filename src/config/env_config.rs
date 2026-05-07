@@ -508,6 +508,10 @@ pub struct EnvConfig {
     /// Capacity of the per-ADS-stream response queue between the request
     /// reader task and tonic response stream. Default: 32.
     pub xds_stream_channel_capacity: usize,
+    /// Mesh runtime config source. `native` consumes Ferrum MeshSubscribe.
+    /// `xds` is reserved for the future mesh DP xDS client and is rejected in
+    /// mesh mode until that client is wired.
+    pub mesh_config_protocol: String,
 
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
@@ -1188,6 +1192,7 @@ impl Default for EnvConfig {
             cp_broadcast_channel_capacity: 128,
             xds_enabled: false,
             xds_stream_channel_capacity: 32,
+            mesh_config_protocol: "native".to_string(),
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -1468,6 +1473,7 @@ impl EnvConfig {
             cp_broadcast_channel_capacity: usize = "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY" => 128usize;
             xds_enabled: bool = "FERRUM_XDS_ENABLED" => false;
             xds_stream_channel_capacity: usize = "FERRUM_XDS_STREAM_CHANNEL_CAPACITY" => 32usize;
+            mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
             dp_grpc_tls_ca_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CA_CERT_PATH";
             dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
@@ -1808,6 +1814,7 @@ impl EnvConfig {
             cp_broadcast_channel_capacity,
             xds_enabled,
             xds_stream_channel_capacity,
+            mesh_config_protocol,
             dp_grpc_tls_ca_cert_path,
             dp_grpc_tls_client_cert_path,
             dp_grpc_tls_client_key_path,
@@ -2429,6 +2436,27 @@ impl EnvConfig {
                         "FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS is required in mesh mode"
                             .into(),
                     );
+                }
+                match self
+                    .mesh_config_protocol
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "native" => {}
+                    "xds" => {
+                        return Err(
+                            "FERRUM_MESH_CONFIG_PROTOCOL=xds is not supported by mesh runtime yet; \
+                             use FERRUM_MESH_CONFIG_PROTOCOL=native for Ferrum MeshSubscribe. \
+                             FERRUM_XDS_ENABLED only exposes CP ADS for Envoy-compatible clients."
+                                .into(),
+                        );
+                    }
+                    other => {
+                        return Err(format!(
+                            "Invalid FERRUM_MESH_CONFIG_PROTOCOL '{other}'. Expected: native or xds"
+                        ));
+                    }
                 }
             }
             OperatingMode::Injector => {}
