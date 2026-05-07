@@ -127,7 +127,7 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 | Field | Limit | Description |
 |-------|-------|-------------|
 | `name` | 255 chars | Optional proxy name |
-| `listen_path` (non-regex) | 500 chars | Path prefix for route matching |
+| `listen_path` (non-regex) | 500 chars | Path prefix or `=/` exact path for route matching |
 | `listen_path` (regex) | 1024 chars | Maximum regex pattern length (e.g., `~^/api/v\d+`) |
 | `backend_host` | 255 chars | Backend hostname (matches DNS spec max of 253) |
 | `backend_path` | 2048 chars | Backend path prefix |
