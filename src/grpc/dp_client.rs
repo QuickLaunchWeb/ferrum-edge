@@ -30,6 +30,7 @@ use tracing::{error, info, warn};
 use super::proto::SubscribeRequest;
 use super::proto::config_sync_client::ConfigSyncClient;
 use crate::FERRUM_VERSION;
+use crate::config::EnvConfig;
 use crate::config::db_loader::IncrementalResult;
 use crate::config::types::GatewayConfig;
 use crate::proxy::{IncrementalApplyOutcome, ProxyState};
@@ -120,6 +121,78 @@ pub struct DpGrpcTlsConfig {
     /// When true and no `ca_cert_pem` is set, the client accepts any server cert.
     #[allow(dead_code)]
     pub no_verify: bool,
+}
+
+/// Build the DP/mesh gRPC TLS client config from shared env settings.
+pub fn build_dp_grpc_tls_config(
+    env_config: &EnvConfig,
+    cp_urls: &[String],
+    label: &str,
+) -> Result<Option<DpGrpcTlsConfig>, anyhow::Error> {
+    let has_tls = env_config.dp_grpc_tls_ca_cert_path.is_some()
+        || env_config.dp_grpc_tls_client_cert_path.is_some()
+        || env_config.dp_grpc_tls_no_verify
+        || cp_urls.iter().any(|u| u.starts_with("https://"));
+
+    if !has_tls {
+        return Ok(None);
+    }
+
+    if let Some(ref path) = env_config.dp_grpc_tls_ca_cert_path {
+        crate::tls::check_cert_expiry(
+            path,
+            &format!("{label} gRPC TLS CA cert"),
+            env_config.tls_cert_expiry_warning_days,
+        )?;
+    }
+    if let Some(ref path) = env_config.dp_grpc_tls_client_cert_path {
+        crate::tls::check_cert_expiry(
+            path,
+            &format!("{label} gRPC TLS client cert"),
+            env_config.tls_cert_expiry_warning_days,
+        )?;
+    }
+
+    let ca_cert_pem =
+        if let Some(ref path) = env_config.dp_grpc_tls_ca_cert_path {
+            Some(std::fs::read(path).map_err(|e| {
+                anyhow::anyhow!("Failed to read {label} gRPC TLS CA cert {path}: {e}")
+            })?)
+        } else {
+            None
+        };
+
+    let (client_cert_pem, client_key_pem) = if let (Some(cert_path), Some(key_path)) = (
+        &env_config.dp_grpc_tls_client_cert_path,
+        &env_config.dp_grpc_tls_client_key_path,
+    ) {
+        let cert = std::fs::read(cert_path).map_err(|e| {
+            anyhow::anyhow!("Failed to read {label} gRPC TLS client cert {cert_path}: {e}")
+        })?;
+        let key = std::fs::read(key_path).map_err(|e| {
+            anyhow::anyhow!("Failed to read {label} gRPC TLS client key {key_path}: {e}")
+        })?;
+        (Some(cert), Some(key))
+    } else {
+        (None, None)
+    };
+
+    if ca_cert_pem.is_some() && client_cert_pem.is_some() {
+        info!("{label} gRPC TLS configured with mTLS (CA cert + client cert)");
+    } else if ca_cert_pem.is_some() {
+        info!("{label} gRPC TLS configured with server verification (CA cert)");
+    } else if env_config.dp_grpc_tls_no_verify {
+        warn!("{label} gRPC TLS configured with server verification DISABLED (testing mode)");
+    } else {
+        info!("{label} gRPC TLS configured (https URL, system roots)");
+    }
+
+    Ok(Some(DpGrpcTlsConfig {
+        ca_cert_pem,
+        client_cert_pem,
+        client_key_pem,
+        no_verify: env_config.dp_grpc_tls_no_verify,
+    }))
 }
 
 /// JWT token lifetime for DP-generated tokens (59 minutes, under the 1-hour ceiling).
@@ -857,7 +930,7 @@ fn filter_incremental_to_namespace(result: &mut IncrementalResult, namespace: &s
 /// Check whether the CP's reported version is compatible with this DP.
 ///
 /// Major and minor versions must match. Patch-level differences are allowed.
-fn check_cp_version_compatibility(cp_version: &str) -> Result<(), String> {
+pub(crate) fn check_cp_version_compatibility(cp_version: &str) -> Result<(), String> {
     let dp_parts: Vec<&str> = FERRUM_VERSION.split('.').collect();
     let cp_parts: Vec<&str> = cp_version.split('.').collect();
 

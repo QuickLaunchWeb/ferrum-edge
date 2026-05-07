@@ -2,7 +2,9 @@
 
 use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::plugins::ws_rate_limiting::WsRateLimiting;
-use ferrum_edge::plugins::{Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
+use ferrum_edge::plugins::{
+    Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection, priority,
+};
 use serde_json::json;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -12,7 +14,12 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 fn test_creation_defaults() {
     let plugin = WsRateLimiting::new(&json!({}), PluginHttpClient::default()).unwrap();
     assert_eq!(plugin.name(), "ws_rate_limiting");
-    assert_eq!(plugin.priority(), 2910);
+    assert_eq!(plugin.priority(), priority::WS_RATE_LIMITING);
+    assert!(!plugin.is_auth_plugin());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
 }
 
 #[test]
@@ -465,25 +472,43 @@ async fn test_zero_fps_returns_error() {
     assert!(result.err().unwrap().contains("frames_per_second"));
 }
 
-#[tokio::test]
-async fn test_zero_burst_size_rejects_all_frames() {
-    let plugin = WsRateLimiting::new(
+#[test]
+fn test_zero_burst_size_returns_error() {
+    let result = WsRateLimiting::new(
         &json!({"frames_per_second": 100, "burst_size": 0}),
         PluginHttpClient::default(),
-    )
-    .unwrap();
-    let msg = Message::Text("hello".into());
+    );
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("burst_size"));
+}
 
-    // burst_size=0 means capacity=0 — bucket starts empty
-    let result = plugin
-        .on_ws_frame(
-            "test-proxy",
-            1,
-            WebSocketFrameDirection::ClientToBackend,
-            &msg,
-        )
-        .await;
-    assert!(result.is_some(), "Zero burst should reject all frames");
+#[test]
+fn test_non_object_config_returns_error() {
+    let result = WsRateLimiting::new(&json!("bad"), PluginHttpClient::default());
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("config must be an object"));
+}
+
+#[test]
+fn test_invalid_numeric_config_returns_error() {
+    for config in [
+        json!({"frames_per_second": "100"}),
+        json!({"burst_size": "10"}),
+        json!({"frames_per_second": -1}),
+    ] {
+        let result = WsRateLimiting::new(&config, PluginHttpClient::default());
+        assert!(result.is_err(), "config should be rejected: {config:?}");
+    }
+}
+
+#[test]
+fn test_invalid_close_reason_type_returns_error() {
+    let result = WsRateLimiting::new(
+        &json!({"frames_per_second": 100, "close_reason": true}),
+        PluginHttpClient::default(),
+    );
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("close_reason"));
 }
 
 // === Eviction logic ===
@@ -604,6 +629,24 @@ fn test_redis_connection_scope_key_is_namespaced_per_instance() {
     assert_ne!(key_a, key_b);
     assert!(key_a.ends_with(":proxy-a:7"));
     assert!(key_b.ends_with(":proxy-a:7"));
+}
+
+#[test]
+fn test_warmup_hostnames_for_redis() {
+    let plugin = WsRateLimiting::new(
+        &json!({
+            "frames_per_second": 100,
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        plugin.warmup_hostnames(),
+        vec!["cache.internal".to_string()]
+    );
 }
 
 // === Close-reason length cap (RFC 6455 §5.5 control-frame limit) ===

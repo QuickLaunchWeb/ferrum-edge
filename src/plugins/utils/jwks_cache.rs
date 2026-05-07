@@ -40,9 +40,8 @@ fn global_cache() -> &'static Arc<DashMap<String, JwksCacheEntry>> {
 /// or another provider), the existing store is returned — no duplicate fetch
 /// or background refresh task is spawned.
 ///
-/// On first creation the store is constructed but keys are **not** fetched
-/// eagerly here; the caller should call [`JwksKeyStore::fetch_keys`] or
-/// rely on the background refresh task.
+/// On first creation the store starts a single shared background refresh task.
+/// That task performs the initial fetch and then continues periodic refreshes.
 pub fn get_or_create_jwks_store(
     jwks_uri: &str,
     http_client: &PluginHttpClient,

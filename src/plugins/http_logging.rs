@@ -13,11 +13,10 @@
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
-use tracing::warn;
 
 use super::utils::{
     BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry, build_batch_config,
-    handle_http_batch_response, parse_http_endpoint,
+    handle_http_batch_response, parse_http_endpoint, validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
@@ -35,18 +34,24 @@ pub struct HttpLogging {
 
 impl HttpLogging {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        if !config.is_object() {
+            return Err("http_logging: config must be an object".to_string());
+        }
+
         let (endpoint_url, endpoint_hostname) = parse_http_endpoint(config, "http_logging")?;
 
         // Build custom headers list from the `custom_headers` object.
         // Header names are validated and normalized to lowercase per RFC 7230.
         // Duplicate header names (case-insensitive) are deduplicated — last value wins.
         let mut custom_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
-        if let Some(map) = config["custom_headers"].as_object() {
+        if let Some(custom_headers_value) = config.get("custom_headers") {
+            let map = custom_headers_value
+                .as_object()
+                .ok_or_else(|| "http_logging: 'custom_headers' must be an object".to_string())?;
             for (key, value) in map {
-                let Some(v) = value.as_str() else {
-                    warn!("http_logging: custom_headers['{key}'] has non-string value, skipping");
-                    continue;
-                };
+                let v = value.as_str().ok_or_else(|| {
+                    format!("http_logging: custom_headers['{key}'] must be a string")
+                })?;
                 let header_name = HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
                     format!("http_logging: invalid custom_headers name '{key}': {e}")
                 })?;
@@ -58,6 +63,17 @@ impl HttpLogging {
             }
         }
 
+        let batch_defaults = BatchConfigDefaults {
+            batch_size_key: "batch_size",
+            batch_size: 50,
+            flush_interval_ms: 1000,
+            min_flush_interval_ms: 100,
+            buffer_capacity: 10000,
+            max_retries: 3,
+            retry_delay_ms: 1000,
+        };
+        validate_batch_config(config, "http_logging", batch_defaults)?;
+
         let flush_config = HttpFlushConfig {
             endpoint_url,
             custom_headers,
@@ -66,19 +82,7 @@ impl HttpLogging {
         let logger = BatchingLogger::spawn(
             // Config remains `max_retries`; the shared retry policy counts the
             // initial attempt plus those retries.
-            build_batch_config(
-                config,
-                "http_logging",
-                BatchConfigDefaults {
-                    batch_size_key: "batch_size",
-                    batch_size: 50,
-                    flush_interval_ms: 1000,
-                    min_flush_interval_ms: 100,
-                    buffer_capacity: 10000,
-                    max_retries: 3,
-                    retry_delay_ms: 1000,
-                },
-            ),
+            build_batch_config(config, "http_logging", batch_defaults),
             move |batch| {
                 let flush_config = flush_config.clone();
                 async move { send_batch(&flush_config, batch).await }

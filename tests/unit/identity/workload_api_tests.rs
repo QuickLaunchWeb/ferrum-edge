@@ -79,6 +79,64 @@ impl CertificateAuthority for StubCa {
     }
 }
 
+struct FederatedStubCa {
+    trust_domain: TrustDomain,
+    federated_roots: HashMap<String, Vec<u8>>,
+    counter: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait]
+impl CertificateAuthority for FederatedStubCa {
+    async fn issue_svid(&self, req: IssuanceRequest) -> Result<SignedSvid, CaError> {
+        let n = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (id, ttl) = match req {
+            IssuanceRequest::Generate {
+                spiffe_id,
+                ttl_secs,
+            } => (spiffe_id, ttl_secs),
+            IssuanceRequest::Csr {
+                spiffe_id,
+                ttl_secs,
+                ..
+            } => (spiffe_id, ttl_secs),
+        };
+        Ok(SignedSvid {
+            spiffe_id: id,
+            cert_chain_der: vec![format!("stub-cert-{n}").into_bytes()],
+            private_key_pkcs8_der: b"stub-key".to_vec(),
+            not_after: chrono::Utc::now() + chrono::Duration::seconds(ttl as i64),
+        })
+    }
+
+    async fn trust_bundle(&self, td: &TrustDomain) -> Result<PublishedTrustBundle, CaError> {
+        if td == &self.trust_domain {
+            return Ok(PublishedTrustBundle {
+                trust_domain: self.trust_domain.clone(),
+                roots_der: vec![b"local-root".to_vec()],
+                refresh_hint_secs: Some(60),
+            });
+        }
+        let root = self
+            .federated_roots
+            .get(td.as_str())
+            .ok_or_else(|| CaError::UnknownTrustDomain(td.to_string()))?;
+        Ok(PublishedTrustBundle {
+            trust_domain: td.clone(),
+            roots_der: vec![root.clone()],
+            refresh_hint_secs: Some(60),
+        })
+    }
+
+    async fn jwt_authorities(
+        &self,
+        _td: &TrustDomain,
+    ) -> Result<Vec<PublishedJwtAuthority>, CaError> {
+        Ok(Vec::new())
+    }
+}
+
 // ── Stub attestor ────────────────────────────────────────────────────────
 
 struct StubAttestor {
@@ -142,6 +200,72 @@ async fn workload_api_service_constructs_with_attestor_and_ca() {
     assert_eq!(svc.trust_domain, trust_domain);
     assert_eq!(svc.svid_ttl_secs, 600);
     assert_eq!(svc.attestors.len(), 1);
+}
+
+#[tokio::test]
+async fn workload_api_streams_federated_x509_bundles() {
+    use ferrum_edge::identity::workload_api::proto::X509BundlesRequest;
+    use ferrum_edge::identity::workload_api::proto::X509svidRequest;
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+    use tokio_stream::StreamExt;
+
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    let partner_domain = TrustDomain::new("partner.test").unwrap();
+    let ca: Arc<dyn CertificateAuthority> = Arc::new(FederatedStubCa {
+        trust_domain: trust_domain.clone(),
+        federated_roots: HashMap::from([(
+            partner_domain.as_str().to_string(),
+            b"partner-root".to_vec(),
+        )]),
+        counter: std::sync::atomic::AtomicU64::new(0),
+    });
+    let id = SpiffeId::from_parts(&trust_domain, "ns/test/sa/foo").unwrap();
+    let attestor: Arc<dyn Attestor> = Arc::new(StubAttestor { id });
+    let svc = WorkloadApiService::new(vec![attestor], ca, trust_domain.clone(), 600)
+        .with_federated_trust_domains(vec![partner_domain.clone()]);
+
+    let svid_resp = svc
+        .fetch_x509svid(workload_request(X509svidRequest {}))
+        .await
+        .unwrap();
+    let svid_msg = svid_resp
+        .into_inner()
+        .next()
+        .await
+        .expect("x509 svid response")
+        .expect("x509 svid success");
+    assert_eq!(
+        svid_msg
+            .federated_bundles
+            .get(partner_domain.as_str())
+            .map(Vec::as_slice),
+        Some(&b"partner-root"[..])
+    );
+
+    let bundle_resp = svc
+        .fetch_x509_bundles(workload_request(X509BundlesRequest {}))
+        .await
+        .unwrap();
+    let bundle_msg = bundle_resp
+        .into_inner()
+        .next()
+        .await
+        .expect("x509 bundles response")
+        .expect("x509 bundles success");
+    assert_eq!(
+        bundle_msg
+            .bundles
+            .get(trust_domain.as_str())
+            .map(Vec::as_slice),
+        Some(&b"local-root"[..])
+    );
+    assert_eq!(
+        bundle_msg
+            .bundles
+            .get(partner_domain.as_str())
+            .map(Vec::as_slice),
+        Some(&b"partner-root"[..])
+    );
 }
 
 #[tokio::test]

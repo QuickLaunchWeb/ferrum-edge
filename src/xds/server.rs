@@ -1,8 +1,6 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -26,6 +24,7 @@ use super::translator::translate_mesh_slice_to_snapshot;
 use crate::FERRUM_VERSION;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::GatewayConfig;
+use crate::grpc::auth::verify_grpc_jwt_metadata;
 use crate::grpc::proto::ConfigUpdate;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +44,7 @@ pub struct XdsAdsServer {
     jwt_secret: String,
     expected_issuer: String,
     namespace: String,
+    stream_channel_capacity: usize,
     snapshot_cache: Arc<XdsSnapshotCache>,
     nonce_tracker: Arc<XdsNonceTracker>,
     active_streams: Arc<XdsStreamRegistry>,
@@ -143,6 +143,7 @@ impl XdsAdsServer {
         jwt_secret: String,
         expected_issuer: String,
         namespace: String,
+        stream_channel_capacity: usize,
     ) -> Self {
         Self {
             config,
@@ -150,6 +151,7 @@ impl XdsAdsServer {
             jwt_secret,
             expected_issuer,
             namespace,
+            stream_channel_capacity: stream_channel_capacity.max(1),
             snapshot_cache: Arc::new(XdsSnapshotCache::new()),
             nonce_tracker: Arc::new(XdsNonceTracker::new()),
             active_streams: Arc::new(XdsStreamRegistry::default()),
@@ -170,28 +172,7 @@ impl XdsAdsServer {
 
     #[allow(clippy::result_large_err)]
     fn verify_jwt_metadata(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), Status> {
-        let token = metadata
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.strip_prefix("Bearer ").unwrap_or(value))
-            .ok_or_else(|| Status::unauthenticated("Missing authorization token"))?;
-
-        let key = DecodingKey::from_secret(self.jwt_secret.as_bytes());
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.validate_exp = true;
-        validation.required_spec_claims = {
-            let mut claims = std::collections::HashSet::new();
-            claims.insert("exp".to_string());
-            claims.insert("iat".to_string());
-            claims.insert("sub".to_string());
-            claims.insert("iss".to_string());
-            claims
-        };
-        validation.set_issuer(&[self.expected_issuer.as_str()]);
-
-        decode::<Value>(token, &key, &validation)
-            .map_err(|err| Status::unauthenticated(format!("Invalid token: {err}")))?;
-        Ok(())
+        verify_grpc_jwt_metadata(metadata, &self.jwt_secret, &self.expected_issuer)
     }
 
     fn rebuild_snapshot(&self, node_id: &str) -> XdsSnapshot {
@@ -276,8 +257,8 @@ impl XdsAdsServer {
         );
         let current_names: HashSet<String> = snapshot
             .resources(&subscription.type_url)
-            .into_iter()
-            .map(|r| r.name)
+            .iter()
+            .map(|r| r.name.clone())
             .collect();
         let mut removed_resources = if initial_resource_versions.is_empty() {
             previous
@@ -589,7 +570,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         let mut requests = request.into_inner();
         let server = self.clone();
         let mut updates = server.update_tx.subscribe();
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
 
         tokio::spawn(async move {
             let mut stream_guard = server.stream_guard();
@@ -716,7 +697,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         let mut requests = request.into_inner();
         let server = self.clone();
         let mut updates = server.update_tx.subscribe();
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
 
         tokio::spawn(async move {
             let mut stream_guard = server.stream_guard();
@@ -1182,6 +1163,7 @@ mod tests {
             "x".repeat(32),
             "issuer".to_string(),
             "default".to_string(),
+            32,
         )
     }
 

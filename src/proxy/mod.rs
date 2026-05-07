@@ -54,11 +54,12 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, upgrade::OnUpgrade, upgrade::Upgraded};
 use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
@@ -68,11 +69,11 @@ use tokio_tungstenite::{
 use tracing::{debug, error, info, trace, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
-use crate::config::PoolConfig;
 use crate::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, HttpFlavor, Proxy, ResponseBodyMode,
     UpstreamTarget,
 };
+use crate::config::{EnvConfig, OperatingMode, PoolConfig};
 use crate::connection_pool::ConnectionPool;
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
@@ -105,6 +106,8 @@ use self::http2_pool::Http2ConnectionPool;
 /// `&HashMap::new()` — this eliminates those per-rejection allocations.
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
+
+const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 
 /// Capability probes run during startup and background refresh, so they should
 /// not inherit long per-request connect timeouts that could hold readiness.
@@ -585,6 +588,46 @@ pub fn is_h2_websocket_connect<B>(req: &Request<B>) -> bool {
             .is_some_and(|p| p.as_ref().eq_ignore_ascii_case(b"websocket"))
 }
 
+/// Check if this is an Istio-flavored HBONE CONNECT request admitted by mesh mode.
+///
+/// HBONE is ordinary HTTP/2 CONNECT over mTLS. Unlike RFC 8441 WebSocket
+/// Extended CONNECT, it does not use a `:protocol` value. Requiring the
+/// `Protocol` extension to be absent keeps other Extended CONNECT variants
+/// (for example `connect-udp`) on the existing fail-closed path.
+pub fn is_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> bool {
+    env_config.mode == OperatingMode::Mesh
+        && req.extensions().get::<hyper::ext::Protocol>().is_none()
+        && crate::modes::mesh::hbone::is_hbone_connect(req.method(), req.version(), req.headers())
+}
+
+fn hbone_relay_timeout(seconds: u64) -> Option<Duration> {
+    (seconds > 0).then(|| Duration::from_secs(seconds))
+}
+
+fn hbone_relay_timeout_millis(milliseconds: u64) -> Option<Duration> {
+    (milliseconds > 0).then(|| Duration::from_millis(milliseconds))
+}
+
+fn hbone_proxy_idle_timeout(proxy: &Proxy, env_config: &EnvConfig) -> Option<Duration> {
+    hbone_relay_timeout(
+        proxy
+            .tcp_idle_timeout_seconds
+            .unwrap_or(env_config.tcp_idle_timeout_seconds),
+    )
+}
+
+fn hbone_proxy_half_close_cap(env_config: &EnvConfig) -> Option<Duration> {
+    hbone_relay_timeout(env_config.tcp_half_close_max_wait_seconds)
+}
+
+fn hbone_backend_read_timeout(proxy: &Proxy) -> Option<Duration> {
+    hbone_relay_timeout_millis(proxy.backend_read_timeout_ms)
+}
+
+fn hbone_backend_write_timeout(proxy: &Proxy) -> Option<Duration> {
+    hbone_relay_timeout_millis(proxy.backend_write_timeout_ms)
+}
+
 #[allow(dead_code)]
 fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
     let headers = req.headers();
@@ -922,6 +965,132 @@ impl Drop for LoadBalancerConnectionGuard {
             balancer.record_connection_end(target);
         }
     }
+}
+
+struct HboneBackendConnection {
+    stream: TcpStream,
+    target_url: String,
+    resolved_ip: Option<String>,
+}
+
+struct HboneConnectError {
+    status: StatusCode,
+    body: &'static [u8],
+    phase: &'static str,
+    class: retry::ErrorClass,
+    message: String,
+    target_url: Option<String>,
+    resolved_ip: Option<String>,
+}
+
+fn classify_hbone_io_error(err: &io::Error) -> retry::ErrorClass {
+    if retry::is_port_exhaustion(err) {
+        return retry::ErrorClass::PortExhaustion;
+    }
+
+    match err.kind() {
+        io::ErrorKind::ConnectionRefused => retry::ErrorClass::ConnectionRefused,
+        io::ErrorKind::ConnectionReset => retry::ErrorClass::ConnectionReset,
+        io::ErrorKind::TimedOut => retry::ErrorClass::ConnectionTimeout,
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe => {
+            retry::ErrorClass::ConnectionClosed
+        }
+        _ => retry::ErrorClass::ConnectionRefused,
+    }
+}
+
+async fn connect_hbone_backend(
+    state: &ProxyState,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> Result<HboneBackendConnection, HboneConnectError> {
+    let (host, port) = upstream_target
+        .map(|target| (target.host.as_str(), target.port))
+        .unwrap_or((proxy.backend_host.as_str(), proxy.backend_port));
+    let target_url = format!("tcp://{host}:{port}");
+
+    let resolved_ip = state
+        .dns_cache
+        .resolve(
+            host,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        )
+        .await
+        .map_err(|err| HboneConnectError {
+            status: StatusCode::BAD_GATEWAY,
+            body: br#"{"error":"DNS resolution for backend failed"}"#,
+            phase: "hbone_dns",
+            class: retry::ErrorClass::DnsLookupError,
+            message: err.to_string(),
+            target_url: Some(target_url.clone()),
+            resolved_ip: None,
+        })?;
+    let addr = SocketAddr::new(resolved_ip, port);
+
+    let connect = crate::socket_opts::connect_with_socket_opts(addr);
+    let stream = if proxy.backend_connect_timeout_ms > 0 {
+        let timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+        match tokio::time::timeout(timeout, connect).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(err)) => {
+                let class = classify_hbone_io_error(&err);
+                if class == retry::ErrorClass::PortExhaustion {
+                    state.overload.record_port_exhaustion();
+                }
+                return Err(HboneConnectError {
+                    status: StatusCode::BAD_GATEWAY,
+                    body: br#"{"error":"Backend HBONE connection failed"}"#,
+                    phase: "hbone_connect",
+                    class,
+                    message: err.to_string(),
+                    target_url: Some(target_url),
+                    resolved_ip: Some(resolved_ip.to_string()),
+                });
+            }
+            Err(_) => {
+                return Err(HboneConnectError {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    body: br#"{"error":"Backend HBONE connection timed out"}"#,
+                    phase: "hbone_connect_timeout",
+                    class: retry::ErrorClass::ConnectionTimeout,
+                    message: format!(
+                        "backend connect timeout after {}ms",
+                        proxy.backend_connect_timeout_ms
+                    ),
+                    target_url: Some(target_url),
+                    resolved_ip: Some(resolved_ip.to_string()),
+                });
+            }
+        }
+    } else {
+        match connect.await {
+            Ok(stream) => stream,
+            Err(err) => {
+                let class = classify_hbone_io_error(&err);
+                if class == retry::ErrorClass::PortExhaustion {
+                    state.overload.record_port_exhaustion();
+                }
+                return Err(HboneConnectError {
+                    status: StatusCode::BAD_GATEWAY,
+                    body: br#"{"error":"Backend HBONE connection failed"}"#,
+                    phase: "hbone_connect",
+                    class,
+                    message: err.to_string(),
+                    target_url: Some(target_url),
+                    resolved_ip: Some(resolved_ip.to_string()),
+                });
+            }
+        }
+    };
+
+    let _ = stream.set_nodelay(true);
+
+    Ok(HboneBackendConnection {
+        stream,
+        target_url,
+        resolved_ip: Some(resolved_ip.to_string()),
+    })
 }
 
 /// Build RFC 7239 Forwarded header value.
@@ -5348,6 +5517,11 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
     status_code: u16,
     response_headers: &mut HashMap<String, String>,
 ) {
+    let previous_marker = ctx.metadata.insert(
+        REJECTION_RESPONSE_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+
     for plugin in plugins.iter().filter(|p| p.applies_after_proxy_on_reject()) {
         match plugin.after_proxy(ctx, status_code, response_headers).await {
             PluginResult::Reject {
@@ -5366,6 +5540,13 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
             }
             PluginResult::Continue => {}
         }
+    }
+
+    if let Some(previous_marker) = previous_marker {
+        ctx.metadata
+            .insert(REJECTION_RESPONSE_METADATA_KEY.to_string(), previous_marker);
+    } else {
+        ctx.metadata.remove(REJECTION_RESPONSE_METADATA_KEY);
     }
 }
 
@@ -5755,7 +5936,13 @@ async fn handle_proxy_request_inner(
     let start_time = Instant::now();
 
     let method = req.method().as_str().to_owned();
-    let path = req.uri().path().to_string();
+    let is_hbone_connect = is_hbone_connect_request(&req, &state.env_config);
+    let raw_path = req.uri().path();
+    let path = if is_hbone_connect && raw_path.is_empty() {
+        "/".to_string()
+    } else {
+        raw_path.to_string()
+    };
     let query_string = req.uri().query().unwrap_or("").to_string();
 
     let socket_ip = remote_addr.ip().to_string();
@@ -5764,6 +5951,11 @@ async fn handle_proxy_request_inner(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    ctx.frontend_listen_port = Some(if is_tls {
+        state.env_config.proxy_https_port
+    } else {
+        state.env_config.proxy_http_port
+    });
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     // Store raw query string on ctx for lazy parsing. The local `query_string`
@@ -5896,13 +6088,21 @@ async fn handle_proxy_request_inner(
     // Note: we enable_connect_protocol() on the h2 server to support WebSocket,
     // which means h2 will deliver Extended CONNECT requests to us — we must
     // filter non-WebSocket ones here before routing.
-    if method == "CONNECT" && !is_h2_websocket_connect(&req) {
+    if method == "CONNECT" && !is_h2_websocket_connect(&req) && !is_hbone_connect {
         warn!("Rejected non-WebSocket CONNECT request");
         record_request(&state, 405);
         return Ok(build_response(
             StatusCode::METHOD_NOT_ALLOWED,
             r#"{"error":"CONNECT method is not allowed"}"#,
         ));
+    }
+    if is_hbone_connect {
+        ctx.metadata
+            .insert("request_protocol".to_string(), "hbone".to_string());
+        ctx.metadata.insert(
+            "connection_security_policy".to_string(),
+            "hbone".to_string(),
+        );
     }
 
     // TLS 1.3 0-RTT early data enforcement (RFC 8470).
@@ -6346,6 +6546,286 @@ async fn handle_proxy_request_inner(
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
+    if is_hbone_connect {
+        let selection = backend_dispatch::select_upstream_target(
+            &proxy,
+            &state,
+            &epoch,
+            &ctx.client_ip,
+            &ctx.headers,
+        );
+        let upstream_target = selection.target;
+        let upstream_balancer = selection.balancer;
+
+        let (cb_target_key, cb_is_half_open_probe) = match backend_dispatch::check_circuit_breaker(
+            &proxy,
+            &state,
+            upstream_target.as_deref(),
+        ) {
+            Ok(result) => result,
+            Err(()) => {
+                let reject = finalize_reject_response_with_after_proxy_hooks(
+                    &plugins,
+                    &mut ctx,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                    HashMap::new(),
+                    false,
+                )
+                .await;
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "hbone_circuit_breaker_open",
+                    plugin_execution_ns,
+                )
+                .await;
+                record_request(&state, reject.http_status.as_u16());
+                return Ok(build_response_from_normalized_reject(reject));
+            }
+        };
+
+        let hbone_on_upgrade = match client_request_body {
+            ClientRequestBody::Streaming(request) => {
+                let (mut parts, _body) = (*request).into_parts();
+                match parts.extensions.remove::<OnUpgrade>() {
+                    Some(on_upgrade) => on_upgrade,
+                    None => {
+                        error!(
+                            proxy_id = %proxy.id,
+                            "HBONE CONNECT request reached relay without an upgrade handle"
+                        );
+                        let reject = finalize_reject_response_with_after_proxy_hooks(
+                            &plugins,
+                            &mut ctx,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            br#"{"error":"HBONE upgrade handle missing"}"#,
+                            HashMap::new(),
+                            false,
+                        )
+                        .await;
+                        log_rejected_request(
+                            &plugins,
+                            &ctx,
+                            reject.http_status.as_u16(),
+                            start_time,
+                            "hbone_upgrade_missing",
+                            plugin_execution_ns,
+                        )
+                        .await;
+                        record_request(&state, reject.http_status.as_u16());
+                        return Ok(build_response_from_normalized_reject(reject));
+                    }
+                }
+            }
+            ClientRequestBody::Buffered(_) => {
+                error!(
+                    proxy_id = %proxy.id,
+                    "HBONE CONNECT request was buffered before relay"
+                );
+                let reject = finalize_reject_response_with_after_proxy_hooks(
+                    &plugins,
+                    &mut ctx,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    br#"{"error":"HBONE request buffering invariant violated"}"#,
+                    HashMap::new(),
+                    false,
+                )
+                .await;
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "hbone_request_buffered",
+                    plugin_execution_ns,
+                )
+                .await;
+                record_request(&state, reject.http_status.as_u16());
+                return Ok(build_response_from_normalized_reject(reject));
+            }
+        };
+
+        let backend_start = Instant::now();
+        let backend = match connect_hbone_backend(&state, &proxy, upstream_target.as_deref()).await
+        {
+            Ok(backend) => backend,
+            Err(err) => {
+                error!(
+                    proxy_id = %proxy.id,
+                    backend_target_url = ?err.target_url,
+                    backend_resolved_ip = ?err.resolved_ip,
+                    error_kind = retry::error_class_log_kind(err.class),
+                    error_class = %err.class,
+                    error = %err.message,
+                    "HBONE backend connection failed"
+                );
+                if let Some(cb_config) = &proxy.circuit_breaker {
+                    let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.id,
+                        cb_target_key.as_deref(),
+                        cb_config,
+                    );
+                    cb.record_failure(err.status.as_u16(), true, cb_is_half_open_probe);
+                }
+                ctx.metadata
+                    .insert("error_class".to_string(), err.class.to_string());
+                let reject = finalize_reject_response_with_after_proxy_hooks(
+                    &plugins,
+                    &mut ctx,
+                    err.status,
+                    err.body,
+                    HashMap::new(),
+                    false,
+                )
+                .await;
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    err.phase,
+                    plugin_execution_ns,
+                )
+                .await;
+                record_request(&state, reject.http_status.as_u16());
+                return Ok(build_response_from_normalized_reject(reject));
+            }
+        };
+        let backend_elapsed = backend_start.elapsed();
+
+        if let Some(cb_config) = &proxy.circuit_breaker {
+            let cb = state.circuit_breaker_cache.get_or_create(
+                &proxy.id,
+                cb_target_key.as_deref(),
+                cb_config,
+            );
+            cb.record_success(cb_is_half_open_probe);
+        }
+        if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target.as_deref())
+            && let Some(upstream) =
+                LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id)
+            && let Some(hc) = &upstream.health_checks
+        {
+            state.health_checker.report_response(
+                &proxy.id,
+                target,
+                StatusCode::OK.as_u16(),
+                false,
+                hc.passive.as_ref(),
+            );
+        }
+
+        let backend_target_url = backend.target_url.clone();
+        let backend_resolved_ip = backend.resolved_ip.clone();
+        let request_bytes_observed = Arc::clone(&ctx.request_bytes_observed);
+        let relay_proxy_id = proxy.id.clone();
+        let relay_buffer_proxy_id = proxy.id.clone();
+        let adaptive_buffer = Arc::clone(&state.adaptive_buffer);
+        let relay_buffer_size = adaptive_buffer.get_buffer_size(&relay_buffer_proxy_id);
+        let relay_idle_timeout = hbone_proxy_idle_timeout(&proxy, &state.env_config);
+        let relay_half_close_cap = hbone_proxy_half_close_cap(&state.env_config);
+        let relay_read_timeout = hbone_backend_read_timeout(&proxy);
+        let relay_write_timeout = hbone_backend_write_timeout(&proxy);
+        let lb_guard =
+            LoadBalancerConnectionGuard::new(upstream_target.clone(), upstream_balancer.clone());
+        let backend_stream = backend.stream;
+        tokio::spawn(async move {
+            let _lb_guard = lb_guard;
+            match hbone_on_upgrade.await {
+                Ok(upgraded) => {
+                    let client_stream = TokioIo::new(upgraded);
+                    let result = crate::proxy::tcp_proxy::bidirectional_copy_for_relay(
+                        client_stream,
+                        backend_stream,
+                        relay_idle_timeout,
+                        relay_half_close_cap,
+                        relay_read_timeout,
+                        relay_write_timeout,
+                        relay_buffer_size,
+                    )
+                    .await;
+                    request_bytes_observed.fetch_add(
+                        result.bytes_client_to_backend,
+                        std::sync::atomic::Ordering::Release,
+                    );
+                    adaptive_buffer.record_connection(
+                        &relay_buffer_proxy_id,
+                        result
+                            .bytes_client_to_backend
+                            .saturating_add(result.bytes_backend_to_client),
+                    );
+                    if let Some((direction, class, side, message)) = result.first_failure {
+                        warn!(
+                            proxy_id = %relay_proxy_id,
+                            direction = ?direction,
+                            io_side = ?side,
+                            error_kind = retry::error_class_log_kind(class),
+                            error_class = %class,
+                            error = %message,
+                            "HBONE tunnel relay failed"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        proxy_id = %relay_proxy_id,
+                        error = %err,
+                        "HBONE client upgrade failed"
+                    );
+                }
+            }
+        });
+
+        record_request(&state, StatusCode::OK.as_u16());
+        if !plugins.is_empty() {
+            let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+            let backend_connect_ms = backend_elapsed.as_secs_f64() * 1000.0;
+            let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+            let plugin_external_io_ms =
+                ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+            let gateway_overhead_ms = (total_ms - plugin_execution_ms).max(0.0);
+            let summary = TransactionSummary {
+                namespace: proxy.namespace.clone(),
+                timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                client_ip: ctx.client_ip.clone(),
+                consumer_username: ctx.effective_identity().map(str::to_owned),
+                http_method: method.clone(),
+                request_path: ctx.path.clone(),
+                proxy_id: Some(proxy.id.clone()),
+                proxy_name: proxy.name.clone(),
+                backend_target_url: Some(backend_target_url),
+                backend_resolved_ip,
+                response_status_code: StatusCode::OK.as_u16(),
+                latency_total_ms: total_ms,
+                latency_gateway_processing_ms: total_ms,
+                latency_backend_ttfb_ms: backend_connect_ms,
+                latency_backend_total_ms: -1.0,
+                latency_plugin_execution_ms: plugin_execution_ms,
+                latency_plugin_external_io_ms: plugin_external_io_ms,
+                latency_gateway_overhead_ms: gateway_overhead_ms,
+                request_user_agent: ctx.headers.get("user-agent").cloned(),
+                metadata: ctx.metadata.clone(),
+                ..TransactionSummary::default()
+            };
+            crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+        }
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(ProxyBody::empty())
+            .unwrap_or_else(|err| {
+                error!(error = %err, "Failed to build HBONE CONNECT response");
+                build_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"error":"Internal server error"}"#,
+                )
+            });
+        return Ok(response);
     }
 
     let maybe_requires_request_body_buffering = plugin_cache_view.requires_request_body_buffering();

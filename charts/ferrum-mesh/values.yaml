@@ -1,0 +1,58 @@
+image:
+  repository: ferrumedge/ferrum-edge
+  tag: "0.9.0"
+  pullPolicy: IfNotPresent
+
+namespace: ferrum
+
+controlPlane:
+  enabled: true
+  replicas: 1
+  grpcPort: 50051
+  env:
+    FERRUM_MODE: cp
+    FERRUM_XDS_ENABLED: "true"
+
+injector:
+  enabled: true
+  replicas: 1
+  listenPort: 9443
+  requireAnnotation: true
+  failurePolicy: Fail
+  caBundle: ""
+  tls:
+    secretName: ferrum-mesh-injector-tls
+    certPath: /etc/ferrum/injector/tls/tls.crt
+    keyPath: /etc/ferrum/injector/tls/tls.key
+  env:
+    FERRUM_MODE: injector
+    FERRUM_INJECTOR_REQUIRE_ANNOTATION: "true"
+
+ambient:
+  enabled: false
+  inboundPort: 15006
+  outboundPort: 15001
+  hbonePort: 15008
+  captureMode: iptables
+  env:
+    FERRUM_MODE: mesh
+    FERRUM_MESH_TOPOLOGY: ambient
+    FERRUM_MESH_HBONE_LISTEN_ADDR: 0.0.0.0:15008
+
+eastWest:
+  enabled: false
+  replicas: 1
+  listenPort: 15443
+  env:
+    FERRUM_MODE: mesh
+    FERRUM_MESH_TOPOLOGY: east_west_gateway
+
+ca:
+  enabled: true
+  env:
+    FERRUM_MESH_PRODUCTION_MODE: "true"
+
+observability:
+  enabled: false
+  dashboards:
+    enabled: true

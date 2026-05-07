@@ -10,10 +10,12 @@ pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod adaptive_buffer;
 pub mod admin;
+pub mod capture;
 pub mod circuit_breaker;
 pub mod cli;
 pub mod config;
 pub mod config_delta;
+pub mod config_sources;
 pub mod connection_pool;
 pub mod consumer_index;
 #[path = "../custom_plugins/mod.rs"]

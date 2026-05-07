@@ -1,14 +1,11 @@
 //! WebSocket access logging plugin — batched async log shipping over ws/wss.
 //!
-//! Serializes `TransactionSummary` entries and sends them to a remote WebSocket
-//! endpoint in batches. Uses an mpsc channel to decouple the proxy hot path
-//! from network I/O: the `log()` hook enqueues the entry (non-blocking), and
-//! a background task drains the channel in configurable batch sizes with a
-//! flush interval timer. The WebSocket connection is maintained persistently
-//! with automatic reconnection on failure.
-//!
-//! Supports both HTTP and stream (TCP/UDP) transaction summaries via the
-//! `LogEntry` union type.
+//! Serializes `TransactionSummary`, `StreamTransactionSummary`, and WebSocket
+//! disconnect entries, then sends them to a remote WebSocket endpoint in batches.
+//! Uses an mpsc channel to decouple the proxy hot path from network I/O: hooks
+//! enqueue entries non-blocking, and a background task drains the channel in
+//! configurable batch sizes with a flush interval timer. The WebSocket
+//! connection is maintained persistently with automatic reconnection on failure.
 //!
 //! **TLS**: For `wss://` endpoints, the plugin builds a `rustls::ClientConfig`
 //! that follows the gateway's CA trust chain:
@@ -23,14 +20,18 @@
 use async_trait::async_trait;
 use futures_util::SinkExt;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::warn;
 use url::Url;
 
-use super::utils::PluginHttpClient;
-use super::{Plugin, StreamTransactionSummary, TransactionSummary};
+use super::utils::{BatchConfigDefaults, PluginHttpClient, validate_batch_config};
+use super::{
+    ALL_PROTOCOLS, Direction, Plugin, ProxyProtocol, StreamTransactionSummary, TransactionSummary,
+    WsDisconnectContext,
+};
 
 /// Union type for log entries sent through the batched channel.
 #[derive(Clone, serde::Serialize)]
@@ -38,6 +39,52 @@ use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 enum LogEntry {
     Http(TransactionSummary),
     Stream(StreamTransactionSummary),
+    WebSocket(WsDisconnectLogEntry),
+}
+
+#[derive(Clone, serde::Serialize)]
+struct WsDisconnectLogEntry {
+    event: &'static str,
+    namespace: String,
+    proxy_id: String,
+    proxy_name: Option<String>,
+    client_ip: String,
+    consumer_username: Option<String>,
+    backend_target: String,
+    protocol: &'static str,
+    listen_port: u16,
+    duration_ms: f64,
+    frames_client_to_backend: u64,
+    frames_backend_to_client: u64,
+    direction: Option<Direction>,
+    error_class: Option<crate::retry::ErrorClass>,
+    #[serde(
+        skip_serializing_if = "HashMap::is_empty",
+        serialize_with = "crate::plugins::utils::metadata_redaction::serialize_redacted_metadata"
+    )]
+    metadata: HashMap<String, String>,
+}
+
+impl From<&WsDisconnectContext> for WsDisconnectLogEntry {
+    fn from(ctx: &WsDisconnectContext) -> Self {
+        Self {
+            event: "websocket_disconnect",
+            namespace: ctx.namespace.clone(),
+            proxy_id: ctx.proxy_id.clone(),
+            proxy_name: ctx.proxy_name.clone(),
+            client_ip: ctx.client_ip.clone(),
+            consumer_username: ctx.consumer_username.clone(),
+            backend_target: ctx.backend_target.clone(),
+            protocol: "websocket",
+            listen_port: ctx.listen_port,
+            duration_ms: ctx.duration_ms,
+            frames_client_to_backend: ctx.frames_client_to_backend,
+            frames_backend_to_client: ctx.frames_backend_to_client,
+            direction: ctx.direction,
+            error_class: ctx.error_class,
+            metadata: ctx.metadata.clone(),
+        }
+    }
 }
 
 struct WsConfig {
@@ -57,8 +104,13 @@ pub struct WsLogging {
 
 impl WsLogging {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        let endpoint_url = config["endpoint_url"]
-            .as_str()
+        if !config.is_object() {
+            return Err("ws_logging: config must be a JSON object".to_string());
+        }
+
+        let endpoint_url = config
+            .get("endpoint_url")
+            .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 "ws_logging: 'endpoint_url' is required — logs will have nowhere to send"
@@ -88,23 +140,44 @@ impl WsLogging {
             None
         };
 
-        let batch_size = config["batch_size"].as_u64().unwrap_or(50).max(1) as usize;
-        let flush_interval_ms = config["flush_interval_ms"]
-            .as_u64()
-            .unwrap_or(1000)
-            .max(100);
-        let buffer_capacity = config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
+        let batch_defaults = BatchConfigDefaults {
+            batch_size_key: "batch_size",
+            batch_size: 50,
+            flush_interval_ms: 1000,
+            min_flush_interval_ms: 100,
+            buffer_capacity: 10_000,
+            max_retries: 3,
+            retry_delay_ms: 1000,
+        };
+        validate_batch_config(config, "ws_logging", batch_defaults)?;
+        if let Some(value) = config.get("reconnect_delay_ms")
+            && value.as_u64().is_none()
+        {
+            return Err("ws_logging: 'reconnect_delay_ms' must be an unsigned integer".to_string());
+        }
+
+        let batch_size = optional_usize(config, "batch_size", batch_defaults.batch_size)?.max(1);
+        let flush_interval_ms = optional_u64(
+            config,
+            "flush_interval_ms",
+            batch_defaults.flush_interval_ms,
+        )?
+        .max(batch_defaults.min_flush_interval_ms);
+        let buffer_capacity =
+            optional_usize(config, "buffer_capacity", batch_defaults.buffer_capacity)?.max(1);
+        let max_retries =
+            optional_u32_saturating(config, "max_retries", batch_defaults.max_retries)?;
+        let retry_delay_ms = optional_u64(config, "retry_delay_ms", batch_defaults.retry_delay_ms)?;
+        let reconnect_delay_ms = optional_u64(config, "reconnect_delay_ms", 5000)?;
 
         let ws_config = WsConfig {
             endpoint_url,
             connector,
             batch_size,
             flush_interval: Duration::from_millis(flush_interval_ms),
-            max_retries: config["max_retries"].as_u64().unwrap_or(3) as u32,
-            retry_delay: Duration::from_millis(config["retry_delay_ms"].as_u64().unwrap_or(1000)),
-            reconnect_delay: Duration::from_millis(
-                config["reconnect_delay_ms"].as_u64().unwrap_or(5000),
-            ),
+            max_retries,
+            retry_delay: Duration::from_millis(retry_delay_ms),
+            reconnect_delay: Duration::from_millis(reconnect_delay_ms),
         };
 
         let endpoint_hostname = parsed_url.host_str().map(|h| h.to_string());
@@ -117,6 +190,23 @@ impl WsLogging {
             endpoint_hostname,
         })
     }
+}
+
+fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> {
+    match config.get(key) {
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("ws_logging: '{key}' must be an unsigned integer")),
+        None => Ok(default),
+    }
+}
+
+fn optional_usize(config: &Value, key: &str, default: u64) -> Result<usize, String> {
+    Ok(optional_u64(config, key, default)?.min(usize::MAX as u64) as usize)
+}
+
+fn optional_u32_saturating(config: &Value, key: &str, default: u64) -> Result<u32, String> {
+    Ok(optional_u64(config, key, default)?.min(u64::from(u32::MAX)) as u32)
 }
 
 /// Build a `tokio_tungstenite::Connector::Rustls` that follows the gateway's
@@ -189,8 +279,12 @@ impl Plugin for WsLogging {
         super::priority::WS_LOGGING
     }
 
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::ALL_PROTOCOLS
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        ALL_PROTOCOLS
+    }
+
+    fn requires_ws_disconnect_hooks(&self) -> bool {
+        true
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
@@ -200,6 +294,16 @@ impl Plugin for WsLogging {
             .is_err()
         {
             warn!("WebSocket logging buffer full — dropping stream log entry");
+        }
+    }
+
+    async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
+        if self
+            .sender
+            .try_send(LogEntry::WebSocket(WsDisconnectLogEntry::from(ctx)))
+            .is_err()
+        {
+            warn!("WebSocket logging buffer full — dropping WebSocket disconnect log entry");
         }
     }
 
@@ -283,7 +387,7 @@ async fn send_batch(
     batch: Vec<LogEntry>,
     mut sink: Option<WsSink>,
 ) -> Option<WsSink> {
-    let total_attempts = cfg.max_retries + 1;
+    let total_attempts = cfg.max_retries.saturating_add(1);
     let entry_count = batch.len();
 
     let payload = match serde_json::to_string(&batch) {

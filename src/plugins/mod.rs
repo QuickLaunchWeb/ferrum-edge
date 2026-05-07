@@ -15,6 +15,7 @@
 //! Non-security plugins that fail validation are skipped with a warning.
 
 pub mod access_control;
+pub mod access_log;
 pub mod ai_federation;
 pub mod ai_prompt_shield;
 pub mod ai_rate_limiter;
@@ -44,6 +45,7 @@ pub mod key_auth;
 pub mod ldap_auth;
 pub mod load_testing;
 pub mod loki_logging;
+pub mod mesh_authz;
 pub mod mtls_auth;
 pub mod otel_tracing;
 pub mod prometheus_metrics;
@@ -70,6 +72,7 @@ pub mod transaction_debugger;
 pub mod udp_logging;
 pub mod udp_rate_limiting;
 pub mod utils;
+pub mod workload_metrics;
 pub mod ws_frame_logging;
 pub mod ws_logging;
 pub mod ws_message_size_limiting;
@@ -245,6 +248,10 @@ pub struct RequestContext {
     pub client_ip: String,
     pub method: String,
     pub path: String,
+    /// Frontend listener port that accepted this HTTP-family request.
+    /// HTTP proxy resources do not carry `listen_port`, so mesh authorization
+    /// uses this to evaluate Istio `to.ports` matches for HTTP traffic.
+    pub frontend_listen_port: Option<u16>,
     /// Raw HTTP headers from the request. Stored at init time and consumed by
     /// `materialize_headers()`. Core proxy lookups (IP resolution, host
     /// extraction) read from this directly via `raw_header_get()` to avoid
@@ -330,6 +337,7 @@ impl RequestContext {
             client_ip,
             method,
             path,
+            frontend_listen_port: None,
             raw_headers: None,
             headers: HashMap::new(),
             raw_query_string: None,
@@ -966,10 +974,10 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975), ai_federation (2985) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975), ai_federation (2985) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
-/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350) |
+/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), workload_metrics (9360), access_log (9375) |
 #[allow(dead_code)]
 pub mod priority {
     pub const OTEL_TRACING: u16 = 25;
@@ -994,6 +1002,7 @@ pub mod priority {
     pub const SOAP_WS_SECURITY: u16 = 1500;
     pub const ACCESS_CONTROL: u16 = 2000;
     pub const TCP_CONNECTION_THROTTLE: u16 = 2050;
+    pub const MESH_AUTHZ: u16 = 2075;
     pub const AI_SEMANTIC_CACHE: u16 = 2700;
     pub const REQUEST_DEDUPLICATION: u16 = 2750;
     pub const REQUEST_SIZE_LIMITING: u16 = 2800;
@@ -1026,6 +1035,8 @@ pub mod priority {
     pub const TRANSACTION_DEBUGGER: u16 = 9200;
     pub const PROMETHEUS_METRICS: u16 = 9300;
     pub const API_CHARGEBACK: u16 = 9350;
+    pub const WORKLOAD_METRICS: u16 = 9360;
+    pub const ACCESS_LOG: u16 = 9375;
     pub const WS_MESSAGE_SIZE_LIMITING: u16 = 2810;
     pub const WS_RATE_LIMITING: u16 = 2910;
     pub const WS_LOGGING: u16 = 9175;
@@ -1504,6 +1515,7 @@ pub fn create_plugin_with_http_client(
         "tcp_connection_throttle" => Ok(Some(Arc::new(
             tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
         ))),
+        "mesh_authz" => Ok(Some(Arc::new(mesh_authz::MeshAuthz::new(config)?))),
         "ip_restriction" => Ok(Some(Arc::new(ip_restriction::IpRestriction::new(config)?))),
         "geo_restriction" => Ok(Some(Arc::new(geo_restriction::GeoRestriction::new(
             config,
@@ -1610,6 +1622,10 @@ pub fn create_plugin_with_http_client(
             config,
             http_client,
         )?))),
+        "workload_metrics" => Ok(Some(Arc::new(workload_metrics::WorkloadMetrics::new(
+            config,
+        )?))),
+        "access_log" => Ok(Some(Arc::new(access_log::AccessLog::new(config)?))),
         _ => {
             // Fall through to custom plugins registry
             let result = crate::custom_plugins::create_custom_plugin(name, config, http_client)?;
@@ -1650,6 +1666,7 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "hmac_auth"
             | "jwks_auth"
             | "mtls_auth"
+            | "mesh_authz"
             | "access_control"
             | "tcp_connection_throttle"
             | "ip_restriction"
@@ -1672,6 +1689,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "hmac_auth",
         "mtls_auth",
         "spiffe_identity",
+        "mesh_authz",
         "compression",
         "cors",
         "access_control",
@@ -1717,6 +1735,8 @@ pub fn available_plugins() -> Vec<&'static str> {
         "soap_ws_security",
         "spec_expose",
         "api_chargeback",
+        "workload_metrics",
+        "access_log",
     ];
     plugins.extend(crate::custom_plugins::custom_plugin_names());
     plugins

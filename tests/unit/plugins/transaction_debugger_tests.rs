@@ -1,6 +1,9 @@
 //! Tests for transaction_debugger plugin
 
-use ferrum_edge::plugins::{Plugin, RequestContext, transaction_debugger::TransactionDebugger};
+use ferrum_edge::plugins::{
+    Plugin, ProxyProtocol, RequestContext, StreamTransactionSummary,
+    transaction_debugger::TransactionDebugger,
+};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -23,6 +26,20 @@ fn make_ctx() -> RequestContext {
 async fn test_transaction_debugger_creation() {
     let plugin = TransactionDebugger::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "transaction_debugger");
+    assert_eq!(plugin.priority(), 9200);
+    assert_eq!(
+        plugin.supported_protocols(),
+        &[
+            ProxyProtocol::Http,
+            ProxyProtocol::Grpc,
+            ProxyProtocol::WebSocket,
+            ProxyProtocol::Tcp,
+            ProxyProtocol::Udp,
+        ]
+    );
+    assert!(!plugin.is_auth_plugin());
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
 }
 
 #[tokio::test]
@@ -229,7 +246,7 @@ async fn test_transaction_debugger_redacts_sensitive_response_headers() {
 #[tokio::test]
 async fn test_transaction_debugger_custom_redacted_headers() {
     let plugin = TransactionDebugger::new(&json!({
-        "redacted_headers": ["x-custom-secret", "x-internal-token"]
+        "redacted_headers": ["X-Custom-Secret", "x-internal-token"]
     }))
     .unwrap();
     let mut ctx = RequestContext::new(
@@ -249,6 +266,57 @@ async fn test_transaction_debugger_custom_redacted_headers() {
         result,
         ferrum_edge::plugins::PluginResult::Continue
     ));
+}
+
+#[test]
+fn test_transaction_debugger_invalid_config_shapes_rejected() {
+    for (config, needle) in [
+        (json!(null), "config must be an object"),
+        (json!({"log_request_body": "yes"}), "log_request_body"),
+        (json!({"log_response_body": "yes"}), "log_response_body"),
+        (
+            json!({"redacted_headers": "authorization"}),
+            "redacted_headers",
+        ),
+        (json!({"redacted_headers": [42]}), "redacted_headers[0]"),
+        (json!({"redacted_headers": [""]}), "redacted_headers[0]"),
+        (
+            json!({"redacted_headers": ["bad header"]}),
+            "redacted_headers[0]",
+        ),
+    ] {
+        let err = TransactionDebugger::new(&config).err().unwrap();
+        assert!(err.contains(needle), "needle={needle}, got: {err}");
+    }
+}
+
+#[tokio::test]
+async fn test_transaction_debugger_stream_disconnect() {
+    let plugin = TransactionDebugger::new(&json!({})).unwrap();
+    let summary = StreamTransactionSummary {
+        namespace: "ferrum".to_string(),
+        proxy_id: "tcp-proxy-1".to_string(),
+        proxy_name: Some("TCP Test".to_string()),
+        client_ip: "127.0.0.1".to_string(),
+        consumer_username: None,
+        backend_target: "127.0.0.1:9000".to_string(),
+        backend_resolved_ip: None,
+        protocol: "tcp".to_string(),
+        listen_port: 8080,
+        duration_ms: 15.0,
+        bytes_sent: 128,
+        bytes_received: 256,
+        connection_error: Some("connection reset".to_string()),
+        error_class: None,
+        disconnect_direction: None,
+        disconnect_cause: None,
+        timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
+        timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
+        sni_hostname: None,
+        metadata: HashMap::new(),
+    };
+
+    plugin.on_stream_disconnect(&summary).await;
 }
 
 #[tokio::test]
