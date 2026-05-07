@@ -37,6 +37,7 @@
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
+use http::header::HeaderValue;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,6 +63,7 @@ struct CachedSpec {
 pub struct SpecExpose {
     spec_url: String,
     content_type_override: Option<String>,
+    warmup_hostname: Option<String>,
     cache_ttl: Duration,
     cache: ArcSwap<Option<CachedSpec>>,
     /// Single-flight lock around the upstream fetch. Concurrent cache-miss
@@ -81,14 +83,14 @@ impl SpecExpose {
     ) -> Result<Self, String> {
         let spec_url = config["spec_url"]
             .as_str()
+            .map(str::trim)
             .filter(|s| !s.is_empty() && *s != "default")
             .ok_or_else(|| {
                 "spec_expose: 'spec_url' is required and must be a non-empty URL string".to_string()
-            })?
-            .to_string();
+            })?;
 
         // Validate URL format and require a fetchable scheme.
-        let parsed = url::Url::parse(&spec_url)
+        let parsed = url::Url::parse(spec_url)
             .map_err(|e| format!("spec_expose: 'spec_url' is not a valid URL: {e}"))?;
         match parsed.scheme() {
             "http" | "https" => {}
@@ -98,16 +100,24 @@ impl SpecExpose {
                 ));
             }
         }
+        let warmup_hostname = parsed.host_str().map(str::to_string);
+        let spec_url = parsed.to_string();
 
         let content_type_override = match config.get("content_type") {
             None | Some(Value::Null) => None,
             Some(Value::String(s)) => {
                 let trimmed = s.trim();
                 if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
+                    return Err(
+                        "spec_expose: 'content_type' must be a non-empty string when set"
+                            .to_string(),
+                    );
                 }
+                HeaderValue::from_str(trimmed).map_err(|_| {
+                    "spec_expose: 'content_type' contains characters not permitted in HTTP header values"
+                        .to_string()
+                })?;
+                Some(trimmed.to_string())
             }
             Some(other) => {
                 return Err(format!(
@@ -116,9 +126,15 @@ impl SpecExpose {
             }
         };
 
-        let tls_no_verify = config["tls_no_verify"]
-            .as_bool()
-            .unwrap_or(plugin_http_client.tls_no_verify());
+        let tls_no_verify = match config.get("tls_no_verify") {
+            None | Some(Value::Null) => plugin_http_client.tls_no_verify(),
+            Some(Value::Bool(value)) => *value,
+            Some(other) => {
+                return Err(format!(
+                    "spec_expose: 'tls_no_verify' must be a boolean, got: {other}"
+                ));
+            }
+        };
 
         let cache_ttl_seconds = match config.get("cache_ttl_seconds") {
             None | Some(Value::Null) => DEFAULT_CACHE_TTL_SECONDS,
@@ -167,6 +183,7 @@ impl SpecExpose {
         Ok(Self {
             spec_url,
             content_type_override,
+            warmup_hostname,
             cache_ttl,
             cache: ArcSwap::from_pointee(None),
             fetch_lock: Mutex::new(()),
@@ -302,12 +319,7 @@ impl Plugin for SpecExpose {
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
-        if let Ok(url) = url::Url::parse(&self.spec_url)
-            && let Some(host) = url.host_str()
-        {
-            return vec![host.to_string()];
-        }
-        Vec::new()
+        self.warmup_hostname.iter().cloned().collect()
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
@@ -322,12 +334,12 @@ impl Plugin for SpecExpose {
             None => return PluginResult::Continue,
         };
 
-        // Host-only proxies (listen_path == None) and regex listen_paths
-        // don't expose a deterministic /specz path — skip them.
+        // Host-only proxies (listen_path == None), regex listen_paths, and
+        // exact listen_paths don't expose a deterministic /specz sub-path.
         let Some(listen_path) = proxy.listen_path.as_deref() else {
             return PluginResult::Continue;
         };
-        if listen_path.starts_with('~') {
+        if listen_path.starts_with('~') || listen_path.starts_with('=') {
             return PluginResult::Continue;
         }
 

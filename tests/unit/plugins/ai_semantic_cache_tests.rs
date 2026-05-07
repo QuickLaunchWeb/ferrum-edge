@@ -1,6 +1,8 @@
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::ai_semantic_cache::AiSemanticCache;
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use ferrum_edge::plugins::{
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -85,6 +87,13 @@ fn test_new_default_config() {
     let config = json!({});
     let plugin = make_plugin(config);
     assert_eq!(plugin.name(), "ai_semantic_cache");
+    assert_eq!(plugin.priority(), priority::AI_SEMANTIC_CACHE);
+    assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    assert!(plugin.requires_request_body_before_before_proxy());
+    assert!(plugin.requires_response_body_buffering());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.is_auth_plugin());
 }
 
 #[test]
@@ -108,6 +117,24 @@ fn test_new_zero_ttl_fails() {
     let result = AiSemanticCache::new(&config, PluginHttpClient::default());
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("ttl_seconds"));
+}
+
+#[test]
+fn test_new_invalid_config_shapes_fail() {
+    for config in [
+        json!("bad"),
+        json!({"ttl_seconds": "300"}),
+        json!({"max_entries": 0}),
+        json!({"max_entries": "100"}),
+        json!({"max_entry_size_bytes": 0}),
+        json!({"max_total_size_bytes": "1000"}),
+        json!({"include_model_in_key": "true"}),
+        json!({"include_params_in_key": "true"}),
+        json!({"scope_by_consumer": "false"}),
+    ] {
+        let result = AiSemanticCache::new(&config, PluginHttpClient::default());
+        assert!(result.is_err(), "config should be rejected: {config:?}");
+    }
 }
 
 #[test]

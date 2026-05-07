@@ -290,6 +290,31 @@ pub(crate) fn string_map(value: &Value) -> HashMap<String, String> {
         .collect()
 }
 
+pub(crate) fn port_from_u64(
+    object: &K8sObject,
+    raw: u64,
+    field: &str,
+) -> Result<u16, K8sTranslateError> {
+    if raw == 0 || raw > u16::MAX as u64 {
+        return Err(invalid_resource(
+            object,
+            format!("{field} must be between 1 and 65535 (got {raw})"),
+        ));
+    }
+    Ok(raw as u16)
+}
+
+pub(crate) fn optional_port_field(
+    object: &K8sObject,
+    value: Option<&Value>,
+    field: &str,
+) -> Result<Option<u16>, K8sTranslateError> {
+    value
+        .and_then(Value::as_u64)
+        .map(|raw| port_from_u64(object, raw, field))
+        .transpose()
+}
+
 pub(crate) fn selector_from_istio(value: Option<&Value>) -> HashMap<String, String> {
     value
         .and_then(|selector| selector.get("matchLabels"))
@@ -302,6 +327,7 @@ pub(crate) struct RouteProxySpec {
     pub namespace: String,
     pub hosts: Vec<String>,
     pub listen_path: Option<String>,
+    pub strip_listen_path: bool,
     pub backend_host: String,
     pub backend_port: u16,
     pub backend_scheme: BackendScheme,
@@ -321,7 +347,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         backend_host: spec.backend_host,
         backend_port: spec.backend_port,
         backend_path: None,
-        strip_listen_path: true,
+        strip_listen_path: spec.strip_listen_path,
         preserve_host_header: false,
         backend_connect_timeout_ms: 30_000,
         backend_read_timeout_ms: 30_000,
@@ -367,6 +393,10 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
 
 pub(crate) fn service_dns_name(name: &str, namespace: &str) -> String {
     format!("{name}.{namespace}.svc.cluster.local")
+}
+
+pub(crate) fn exact_path_listen_path(path: &str) -> String {
+    format!("={path}")
 }
 
 pub(crate) fn resource_id(prefix: &str, namespace: &str, name: &str, suffix: &str) -> String {
@@ -426,5 +456,16 @@ mod tests {
             translate_k8s_objects(&[ignored], options("prod")).expect("translation should succeed");
 
         assert!(result.config.mesh.is_none());
+    }
+
+    #[test]
+    fn port_from_u64_enforces_kubernetes_port_boundaries() {
+        let object = object("HTTPRoute", serde_json::json!({}));
+
+        assert!(port_from_u64(&object, 0, "port").is_err());
+        assert_eq!(port_from_u64(&object, 1, "port").unwrap(), 1);
+        assert_eq!(port_from_u64(&object, 65_535, "port").unwrap(), 65_535);
+        assert!(port_from_u64(&object, 65_536, "port").is_err());
+        assert!(port_from_u64(&object, u64::MAX, "port").is_err());
     }
 }

@@ -33,9 +33,24 @@ pub struct RequestSizeLimiting {
 
 impl RequestSizeLimiting {
     pub fn new(config: &Value) -> Result<Self, String> {
+        if !config.is_object() {
+            return Err("request_size_limiting: config must be an object".to_string());
+        }
+
         let max_bytes = required_positive_u64(config, "max_bytes", "request_size_limiting")?;
 
         Ok(Self { max_bytes })
+    }
+
+    fn buffered_request_body_len(ctx: &RequestContext) -> Option<u64> {
+        ctx.metadata
+            .get("request_body_size_bytes")
+            .and_then(|value| value.parse::<u64>().ok())
+            .or_else(|| {
+                ctx.metadata
+                    .get("request_body")
+                    .map(|body| body.len() as u64)
+            })
     }
 }
 
@@ -92,17 +107,16 @@ impl Plugin for RequestSizeLimiting {
         }
 
         // If another plugin caused the body to be buffered, check actual size
-        if let Some(body) = ctx.metadata.get("request_body") {
-            let len = body.len() as u64;
-            if self.exceeds_limit(len as u128) {
-                debug!(
-                    plugin = self.plugin_name(),
-                    body_len = len,
-                    max_bytes = self.max_size_bytes(),
-                    "Request rejected: buffered body exceeds limit"
-                );
-                return reject_with_limit(413, "Request body too large", self.max_size_bytes());
-            }
+        if let Some(len) = Self::buffered_request_body_len(ctx)
+            && self.exceeds_limit(len as u128)
+        {
+            debug!(
+                plugin = self.plugin_name(),
+                body_len = len,
+                max_bytes = self.max_size_bytes(),
+                "Request rejected: buffered body exceeds limit"
+            );
+            return reject_with_limit(413, "Request body too large", self.max_size_bytes());
         }
 
         PluginResult::Continue

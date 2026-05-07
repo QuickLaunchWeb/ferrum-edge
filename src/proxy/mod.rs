@@ -107,6 +107,8 @@ use self::http2_pool::Http2ConnectionPool;
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
+const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+
 /// Capability probes run during startup and background refresh, so they should
 /// not inherit long per-request connect timeouts that could hold readiness.
 const BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP: u64 = 5_000;
@@ -4161,10 +4163,14 @@ fn build_websocket_backend_url_with_target(
         _ => "wss",
     };
 
-    // Host-only proxies (listen_path == None) have no prefix to strip —
-    // strip_listen_path is a no-op in that case.
+    // Host-only proxies (listen_path == None) have no prefix to strip.
+    // Exact listen_paths carry a leading '=' marker for routing; strip only
+    // the literal path part so WebSocket forwarding matches HTTP forwarding.
     let remaining_path = match (proxy.strip_listen_path, proxy.listen_path.as_deref()) {
-        (true, Some(lp)) => incoming_path.strip_prefix(lp).unwrap_or(""),
+        (true, Some(lp)) if !lp.starts_with('~') => {
+            let literal = lp.strip_prefix('=').unwrap_or(lp);
+            incoming_path.strip_prefix(literal).unwrap_or("")
+        }
         _ => incoming_path,
     };
 
@@ -5515,6 +5521,11 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
     status_code: u16,
     response_headers: &mut HashMap<String, String>,
 ) {
+    let previous_marker = ctx.metadata.insert(
+        REJECTION_RESPONSE_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+
     for plugin in plugins.iter().filter(|p| p.applies_after_proxy_on_reject()) {
         match plugin.after_proxy(ctx, status_code, response_headers).await {
             PluginResult::Reject {
@@ -5533,6 +5544,13 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
             }
             PluginResult::Continue => {}
         }
+    }
+
+    if let Some(previous_marker) = previous_marker {
+        ctx.metadata
+            .insert(REJECTION_RESPONSE_METADATA_KEY.to_string(), previous_marker);
+    } else {
+        ctx.metadata.remove(REJECTION_RESPONSE_METADATA_KEY);
     }
 }
 
@@ -5937,6 +5955,11 @@ async fn handle_proxy_request_inner(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    ctx.frontend_listen_port = Some(if is_tls {
+        state.env_config.proxy_https_port
+    } else {
+        state.env_config.proxy_http_port
+    });
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     // Store raw query string on ctx for lazy parsing. The local `query_string`
@@ -11664,6 +11687,25 @@ mod tests {
             }
         }))
         .expect("test proxy should deserialize")
+    }
+
+    #[test]
+    fn websocket_backend_url_strips_exact_listen_path_literal() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.listen_path = Some("=/ws".to_string());
+        proxy.strip_listen_path = true;
+
+        let url = build_websocket_backend_url_with_target(
+            &proxy,
+            "/ws",
+            "token=1",
+            "backend.local",
+            8080,
+            None,
+        );
+
+        assert_eq!(url, "ws://backend.local:8080/?token=1");
     }
 
     fn route_delta_proxy(

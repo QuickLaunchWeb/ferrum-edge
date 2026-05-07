@@ -93,9 +93,10 @@ fn extra_redacted_keys() -> &'static [String] {
 /// Parse the comma-separated extras env var into a normalized list.
 /// Public for tests — production callers go through the `OnceLock`.
 pub fn parse_extras_from_env() -> Vec<String> {
-    std::env::var("FERRUM_LOG_REDACT_METADATA_KEYS")
-        .map(|raw| parse_extras_list(&raw))
-        .unwrap_or_default()
+    match std::env::var("FERRUM_LOG_REDACT_METADATA_KEYS") {
+        Ok(raw) => parse_extras_list(&raw),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Parse a comma-separated extras string into a normalized lowercase list.
@@ -106,60 +107,101 @@ pub fn parse_extras_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn metadata_key_segments(key: &str) -> Vec<String> {
-    let mut segments = Vec::new();
-    let mut current = String::new();
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn for_each_metadata_key_segment(mut key: &str, mut visit: impl FnMut(&str)) {
+    while let Some(first_non_ascii) = key.find(|ch: char| !ch.is_ascii()) {
+        visit_ascii_metadata_key_segments(&key[..first_non_ascii], &mut visit);
+        let Some(non_ascii_char) = key[first_non_ascii..].chars().next() else {
+            break;
+        };
+        key = &key[first_non_ascii + non_ascii_char.len_utf8()..];
+    }
+    visit_ascii_metadata_key_segments(key, &mut visit);
+}
+
+fn visit_ascii_metadata_key_segments(key: &str, visit: &mut impl FnMut(&str)) {
+    let mut start: Option<usize> = None;
     let mut previous_was_lower_or_digit = false;
 
     for ch in key.chars() {
+        debug_assert!(ch.is_ascii());
+    }
+
+    for (idx, ch) in key.char_indices() {
         if !ch.is_ascii_alphanumeric() {
-            if !current.is_empty() {
-                segments.push(std::mem::take(&mut current));
+            if let Some(segment_start) = start.take() {
+                visit(&key[segment_start..idx]);
             }
             previous_was_lower_or_digit = false;
             continue;
         }
 
-        if ch.is_ascii_uppercase() && previous_was_lower_or_digit && !current.is_empty() {
-            segments.push(std::mem::take(&mut current));
+        if ch.is_ascii_uppercase() && previous_was_lower_or_digit {
+            if let Some(segment_start) = start {
+                visit(&key[segment_start..idx]);
+            }
+            start = Some(idx);
+        } else if start.is_none() {
+            start = Some(idx);
         }
 
-        current.push(ch.to_ascii_lowercase());
         previous_was_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
     }
 
-    if !current.is_empty() {
-        segments.push(current);
+    if let Some(segment_start) = start {
+        visit(&key[segment_start..]);
     }
-
-    segments
 }
 
 fn segment_is_any(segment: &str, candidates: &[&str]) -> bool {
-    candidates.contains(&segment)
+    candidates
+        .iter()
+        .any(|candidate| segment.eq_ignore_ascii_case(candidate))
 }
 
 fn is_sensitive_token_metadata_key(key: &str) -> bool {
-    let segments = metadata_key_segments(key);
-    if !segments.iter().any(|segment| segment == "token") {
+    let mut segment_count = 0usize;
+    let mut has_token_segment = false;
+    let mut has_sensitive_context = false;
+    let mut all_non_token_segments_are_value_descriptors = true;
+
+    for_each_metadata_key_segment(key, |segment| {
+        segment_count += 1;
+        if segment.eq_ignore_ascii_case("token") {
+            has_token_segment = true;
+            return;
+        }
+        if segment_is_any(segment, SENSITIVE_TOKEN_CONTEXT_SEGMENTS) {
+            has_sensitive_context = true;
+        }
+        if !segment_is_any(segment, TOKEN_VALUE_SEGMENTS) {
+            all_non_token_segments_are_value_descriptors = false;
+        }
+    });
+
+    if !has_token_segment {
         return false;
     }
 
-    if segments.len() == 1 {
+    if segment_count == 1 {
         return true;
     }
 
-    let has_sensitive_context = segments
-        .iter()
-        .any(|segment| segment_is_any(segment, SENSITIVE_TOKEN_CONTEXT_SEGMENTS));
     if has_sensitive_context {
         return true;
     }
 
-    segments
-        .iter()
-        .filter(|segment| segment.as_str() != "token")
-        .all(|segment| segment_is_any(segment, TOKEN_VALUE_SEGMENTS))
+    all_non_token_segments_are_value_descriptors
 }
 
 /// Returns true when the given metadata key matches any sensitive substring
@@ -167,17 +209,16 @@ fn is_sensitive_token_metadata_key(key: &str) -> bool {
 /// (case-insensitive). The lower-level entry point used by tests; production
 /// callers should use [`is_sensitive_metadata_key`].
 pub fn is_sensitive_metadata_key_with_extras(key: &str, extras: &[String]) -> bool {
-    let lowered = key.to_ascii_lowercase();
     if DEFAULT_SENSITIVE_METADATA_KEYS
         .iter()
-        .any(|needle| lowered.contains(needle))
+        .any(|needle| contains_ascii_case_insensitive(key, needle))
         || is_sensitive_token_metadata_key(key)
     {
         return true;
     }
     extras
         .iter()
-        .any(|needle| lowered.contains(needle.as_str()))
+        .any(|needle| contains_ascii_case_insensitive(key, needle))
 }
 
 /// Returns true when the given metadata key is sensitive against the global
@@ -310,6 +351,20 @@ mod tests {
     }
 
     #[test]
+    fn token_segmentation_preserves_camel_case_and_non_ascii_boundaries() {
+        let extras: Vec<String> = Vec::new();
+        assert!(is_sensitive_metadata_key_with_extras(
+            "refreshToken",
+            &extras
+        ));
+        assert!(is_sensitive_metadata_key_with_extras(
+            "sessionétoken",
+            &extras
+        ));
+        assert!(!is_sensitive_metadata_key_with_extras("APIToken", &extras));
+    }
+
+    #[test]
     fn non_sensitive_keys_pass_through() {
         let extras: Vec<String> = Vec::new();
         assert!(!is_sensitive_metadata_key_with_extras(
@@ -378,7 +433,10 @@ mod tests {
         metadata.insert("authorization".to_string(), "Bearer secret".to_string());
         metadata.insert("trace_id".to_string(), "abc-123".to_string());
 
-        let json = serde_json::to_string(&MetadataWrapper(&metadata)).unwrap();
+        let json = match serde_json::to_string(&MetadataWrapper(&metadata)) {
+            Ok(json) => json,
+            Err(error) => panic!("metadata serialization failed: {error}"),
+        };
 
         assert!(
             json.contains(r#""authorization":"[REDACTED]""#),

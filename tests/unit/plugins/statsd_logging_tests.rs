@@ -1,7 +1,8 @@
 //! Tests for statsd_logging plugin
 
 use ferrum_edge::plugins::{
-    Plugin, PluginHttpClient, PluginResult, StreamTransactionSummary, statsd_logging::StatsdLogging,
+    ALL_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, StreamTransactionSummary,
+    statsd_logging::StatsdLogging,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -48,6 +49,8 @@ async fn test_statsd_logging_plugin_creation() {
     )
     .unwrap();
     assert_eq!(plugin.name(), "statsd_logging");
+    assert_eq!(plugin.priority(), 9075);
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
 }
 
 #[tokio::test]
@@ -86,6 +89,37 @@ async fn test_statsd_logging_invalid_port_too_high() {
     match result {
         Err(e) => assert!(e.contains("port")),
         Ok(_) => panic!("Expected Err for port > 65535"),
+    }
+}
+
+#[tokio::test]
+async fn test_statsd_logging_invalid_scalar_types() {
+    let cases = [
+        json!(null),
+        json!({"host": 127}),
+        json!({"host": "127.0.0.1", "port": "8125"}),
+        json!({"host": "127.0.0.1", "prefix": 42}),
+        json!({"host": "127.0.0.1", "global_tags": []}),
+        json!({"host": "127.0.0.1", "global_tags": {"env": true}}),
+    ];
+
+    for config in cases {
+        assert!(
+            StatsdLogging::new(&config, default_client()).is_err(),
+            "expected invalid config to be rejected: {config}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_statsd_logging_empty_prefix_rejected() {
+    let result = StatsdLogging::new(
+        &json!({"host": "127.0.0.1", "prefix": "   "}),
+        default_client(),
+    );
+    match result {
+        Err(e) => assert!(e.contains("prefix")),
+        Ok(_) => panic!("Expected Err for empty prefix"),
     }
 }
 

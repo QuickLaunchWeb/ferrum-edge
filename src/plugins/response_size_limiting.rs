@@ -33,8 +33,21 @@ pub struct ResponseSizeLimiting {
 
 impl ResponseSizeLimiting {
     pub fn new(config: &Value) -> Result<Self, String> {
+        if !config.is_object() {
+            return Err("response_size_limiting: config must be an object".to_string());
+        }
+
         let max_bytes = required_positive_u64(config, "max_bytes", "response_size_limiting")?;
-        let require_buffered_check = config["require_buffered_check"].as_bool().unwrap_or(false);
+        let require_buffered_check = match config.get("require_buffered_check") {
+            Some(Value::Bool(value)) => *value,
+            Some(Value::Null) | None => false,
+            Some(_) => {
+                return Err(
+                    "response_size_limiting: 'require_buffered_check' must be a boolean"
+                        .to_string(),
+                );
+            }
+        };
 
         Ok(Self {
             max_bytes,

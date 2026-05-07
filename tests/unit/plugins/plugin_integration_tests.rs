@@ -276,7 +276,7 @@ async fn test_plugin_creation_all_plugins() {
             "ws_logging" => json!({"endpoint_url": "ws://localhost:9300/logs"}),
             "otel_tracing" => json!({"endpoint": "http://localhost:4318/v1/traces"}),
             "jwks_auth" => {
-                json!({"providers": [{"jwks_uri": "https://example.com/.well-known/jwks.json"}]})
+                json!({"providers": [{"jwks_uri": "http://127.0.0.1:9/.well-known/jwks.json"}]})
             }
             "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
             "access_control" => json!({"allowed_consumers": ["testuser"]}),

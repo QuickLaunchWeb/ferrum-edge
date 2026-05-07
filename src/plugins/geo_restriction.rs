@@ -62,47 +62,9 @@ pub struct GeoRestriction {
 
 impl GeoRestriction {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let db_path = config["db_path"].as_str().ok_or_else(|| {
-            "geo_restriction: 'db_path' is required (path to .mmdb file)".to_string()
-        })?;
-
-        // Open the MaxMind database file. If the file is missing or unreadable,
-        // log a warning but allow the plugin to be created — the file may exist
-        // on data plane nodes but not on the control plane, or may be deployed
-        // after config is pushed. At request time, a missing reader falls back
-        // to the on_lookup_failure policy.
-        // SAFETY: The mmdb file is read-only after construction. The gateway only
-        // opens it once at plugin init and does not modify or truncate it.
-        let reader = match unsafe { Reader::open_mmap(db_path) } {
-            Ok(r) => Some(Arc::new(r)),
-            Err(e) => {
-                warn!(
-                    db_path = %db_path,
-                    error = %e,
-                    plugin = "geo_restriction",
-                    "MaxMind database file not available — plugin will use on_lookup_failure policy until file is present"
-                );
-                None
-            }
-        };
-
-        let allow_countries: HashSet<String> = config["allow_countries"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_ascii_uppercase()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let deny_countries: HashSet<String> = config["deny_countries"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_ascii_uppercase()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let db_path = string_config(config, "db_path")?;
+        let allow_countries = parse_country_set(config, "allow_countries")?;
+        let deny_countries = parse_country_set(config, "deny_countries")?;
 
         if allow_countries.is_empty() && deny_countries.is_empty() {
             return Err(
@@ -118,16 +80,32 @@ impl GeoRestriction {
             );
         }
 
-        let inject_headers = config["inject_headers"].as_bool().unwrap_or(false);
+        let inject_headers = bool_config(config, "inject_headers", false)?;
+        let on_lookup_failure = lookup_failure_action(config)?;
 
-        let on_lookup_failure = match config["on_lookup_failure"].as_str().unwrap_or("allow") {
-            "deny" => LookupFailureAction::Deny,
-            _ => LookupFailureAction::Allow,
+        // Open the MaxMind database file. If the file is missing or unreadable,
+        // log a warning but allow the plugin to be created — the file may exist
+        // on data plane nodes but not on the control plane, or may be deployed
+        // after config is pushed. At request time, a missing reader falls back
+        // to the on_lookup_failure policy.
+        // SAFETY: The mmdb file is read-only after construction. The gateway only
+        // opens it once at plugin init and does not modify or truncate it.
+        let reader = match unsafe { Reader::open_mmap(&db_path) } {
+            Ok(r) => Some(Arc::new(r)),
+            Err(e) => {
+                warn!(
+                    db_path = %db_path,
+                    error = %e,
+                    plugin = "geo_restriction",
+                    "MaxMind database file not available — plugin will use on_lookup_failure policy until file is present"
+                );
+                None
+            }
         };
 
         Ok(Self {
             reader,
-            db_path: db_path.to_string(),
+            db_path,
             allow_countries,
             deny_countries,
             inject_headers,
@@ -248,6 +226,77 @@ impl GeoRestriction {
         }
 
         (PluginResult::Continue, Some(country))
+    }
+}
+
+fn string_config(config: &Value, key: &str) -> Result<String, String> {
+    match config.get(key) {
+        Some(Value::String(value)) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Err(format!(
+                    "geo_restriction: '{key}' must be a non-empty string"
+                ))
+            } else {
+                Ok(trimmed.to_string())
+            }
+        }
+        None | Some(Value::Null) => Err(format!(
+            "geo_restriction: '{key}' is required (path to .mmdb file)"
+        )),
+        Some(other) => Err(format!(
+            "geo_restriction: '{key}' must be a string, got: {other}"
+        )),
+    }
+}
+
+fn parse_country_set(config: &Value, key: &str) -> Result<HashSet<String>, String> {
+    let Some(value) = config.get(key) else {
+        return Ok(HashSet::new());
+    };
+    if value.is_null() {
+        return Ok(HashSet::new());
+    }
+    let Value::Array(arr) = value else {
+        return Err(format!(
+            "geo_restriction: '{key}' must be an array of ISO country codes"
+        ));
+    };
+
+    let mut countries = HashSet::with_capacity(arr.len());
+    for value in arr {
+        let country = value.as_str().ok_or_else(|| {
+            format!("geo_restriction: '{key}' entries must be strings, got: {value}")
+        })?;
+        let country = country.trim();
+        if country.len() != 2 || !country.bytes().all(|b| b.is_ascii_alphabetic()) {
+            return Err(format!(
+                "geo_restriction: '{key}' contains invalid ISO 3166-1 alpha-2 country code: {country:?}"
+            ));
+        }
+        countries.insert(country.to_ascii_uppercase());
+    }
+    Ok(countries)
+}
+
+fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String> {
+    match config.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(other) => Err(format!(
+            "geo_restriction: '{key}' must be a boolean, got: {other}"
+        )),
+    }
+}
+
+fn lookup_failure_action(config: &Value) -> Result<LookupFailureAction, String> {
+    match config.get("on_lookup_failure") {
+        None | Some(Value::Null) => Ok(LookupFailureAction::Allow),
+        Some(Value::String(action)) if action == "allow" => Ok(LookupFailureAction::Allow),
+        Some(Value::String(action)) if action == "deny" => Ok(LookupFailureAction::Deny),
+        Some(other) => Err(format!(
+            "geo_restriction: 'on_lookup_failure' must be 'allow' or 'deny', got: {other}"
+        )),
     }
 }
 
