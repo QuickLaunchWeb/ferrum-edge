@@ -147,6 +147,8 @@ See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_
 
 Mesh mode consumes Layer 2 mesh slices from the control protocols and prepares the shared sidecar/ambient data-plane listeners. Non-mesh modes do not instantiate this runtime.
 
+With the native `MeshSubscribe` protocol, mesh mode waits for the first delivered mesh slice before serving, builds the proxy/plugin runtime from that slice, and hot-applies later valid slices atomically. Invalid slice updates are logged and ignored so the last accepted runtime config keeps serving.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_MESH_CONFIG_PROTOCOL` | No | `native` | Mesh config source: `native` for Ferrum `MeshSubscribe`, `xds` for ADS |
@@ -169,6 +171,8 @@ Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the can
 Phase D adds Kubernetes source translation and sidecar-injector scaffolding. Kubernetes resources translate into `GatewayConfig` / `MeshConfig`; no config source talks directly to the proxy runtime or xDS server.
 
 Translation notes: Istio `AuthorizationPolicy` resources preserve Istio's action semantics. An `ALLOW` policy with no `rules` is treated as allow-nothing for the selected workload, so it creates a mesh authorization rule that never matches instead of accidentally broadening access. `DENY` and `AUDIT` policies with no `rules` remain no-ops.
+
+Gateway API `HTTPRoute` path matches preserve Kubernetes semantics: `PathPrefix` stays a prefix route, `Exact` is translated to an exact-path route for whole-path matching, and `RegularExpression` is passed through as a Ferrum regex route. Istio `VirtualService` URI matches follow the same shape for `prefix`, `exact`, and `regex`. Translated mesh routes do not strip the listen path before forwarding, so upgrades from older mesh previews should expect backends to receive the original Kubernetes request path.
 
 Kubernetes Gateway API and Istio mesh translators fail closed when a resource declares a port outside the Kubernetes service-port range (`1`-`65535`). Invalid ports are rejected during translation instead of wrapping into an unintended backend/listener port.
 

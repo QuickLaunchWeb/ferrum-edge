@@ -129,18 +129,18 @@ At startup, before config load. Env var suffixes resolve the base name: `_VAULT`
 
 ### Route Matching
 
-Per host tier (exact host → wildcard → catch-all): prefix routes first (O(path_depth) via `IndexedPrefixRoutes` HashMap), regex routes second (O(path_length) via `IndexedRegexRoutes` `RegexSet` — single DFA pass regardless of pattern count), host-only fallback (`listen_path: None` + `hosts` set; never applies to catch-all tier).
+Per host tier (exact host → wildcard → catch-all): exact-path routes first (`=/path`, O(1) HashMap lookup), prefix routes second (O(path_depth) via `IndexedPrefixRoutes` HashMap), regex routes third (O(path_length) via `IndexedRegexRoutes` `RegexSet` — single DFA pass regardless of pattern count), host-only fallback (`listen_path: None` + `hosts` set; never applies to catch-all tier).
 
 **NEVER** replace prefix matching with O(n) linear scan; **NEVER** replace regex matching with sequential per-pattern — both caused 30-46% throughput degradation at scale. Router cache (`DashMap`) sized by `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (default auto = `max(10_000, proxies × 3)`). Negative lookups cached to repel scanners.
 
-Regex listen_paths (`~` prefix) auto-anchored full-path (`^...$`). For prefix-style, end with `.*`. Helper: `anchor_regex_pattern()` in `src/config/types.rs`.
+Exact listen_paths (`=` prefix) match the whole path after query stripping. Regex listen_paths (`~` prefix) auto-anchored full-path (`^...$`). For prefix-style regex, end with `.*`. Helper: `anchor_regex_pattern()` in `src/config/types.rs`.
 
 ### Proxy `hosts`/`listen_path`/`listen_port` contract
 
 - **HTTP-family** (`http`/`https`/`ws`/`wss`/`grpc`/`grpcs`/`h3`): route on hosts + listen_path. At least one of `hosts`/`listen_path` required. `listen_port` MUST be `None`.
 - **Stream-family** (`tcp`/`tcp_tls`/`udp`/`dtls`): route on `listen_port`. `listen_path` MUST be `None` (hard error).
 
-Host-only HTTP proxy matches all paths under its hosts; `strip_listen_path: true` is a no-op there. `hosts: []` + `listen_path: None` is rejected. Uniqueness: two HTTP proxies conflict iff same `listen_path` + overlapping `hosts` (empty hosts = catch-all, overlaps all). Host-only and path-carrying on same host coexist (different match tiers). See `DatabaseBackend::check_listen_path_unique()` in `src/config/db_backend.rs`.
+Host-only HTTP proxy matches all paths under its hosts; `strip_listen_path: true` is a no-op there. Exact listen_paths use `=/path`; prefix listen_paths use `/path`; regex listen_paths use `~pattern`. `hosts: []` + `listen_path: None` is rejected. Uniqueness: two HTTP proxies conflict iff same `listen_path` + overlapping `hosts` (empty hosts = catch-all, overlaps all). Host-only and path-carrying on same host coexist (different match tiers). See `DatabaseBackend::check_listen_path_unique()` in `src/config/db_backend.rs`.
 
 **`backend_scheme` + runtime flavor**: HTTP-family proxies accept `http`/`https` and `backend_scheme` is optional (defaults to `https`). Stream-family (`tcp`/`tcps`/`udp`/`dtls`) requires an explicit scheme. gRPC and WebSocket are NOT schemes — they are runtime flavors classified per-request via `backend_dispatch::detect_http_flavor()` (one header lookup, zero allocation). A single `https` proxy serves Plain/gRPC/WebSocket traffic uniformly. HTTPS backends are classified out of band into the usable plain-HTTP buckets (`h1`, `h2_tls`, `h3`) plus the gRPC transport buckets (`h2_tls`, `h2c`).
 
@@ -201,7 +201,7 @@ Priority order, lower = first. Multiple instances per proxy allowed. Each has `i
 
 **CRITICAL — `before_proxy(ctx, headers)`**: always read headers from the `headers` parameter, NEVER from `ctx.headers`. When no plugin sets `modifies_request_headers() == true`, the handler `std::mem::take()`s headers out of `ctx.headers` — `ctx.headers` is empty during this phase. Only this phase has this quirk.
 
-**External identity**: `ctx.authenticated_identity` is first-class across rate-limit/cache keys, log summaries, backend identity-header injection. **Response mock path scoping**: `response_mock` strips the proxy's `listen_path` prefix before rule matching (no stripping for root/regex listen_paths).
+**External identity**: `ctx.authenticated_identity` is first-class across rate-limit/cache keys, log summaries, backend identity-header injection. **Response mock path scoping**: `response_mock` strips the proxy's prefix `listen_path` before rule matching (no stripping for root/regex/exact listen_paths).
 
 ### Transaction Summary Fields
 

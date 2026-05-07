@@ -249,6 +249,29 @@ async fn test_regex_listen_path_uses_full_path() {
 }
 
 #[tokio::test]
+async fn test_exact_listen_path_uses_full_path() {
+    // Exact listen_paths (= prefix) are not prefix scopes for response_mock;
+    // mock rules match against the full incoming path.
+    let plugin = ResponseMock::new(&json!({
+        "rules": [{
+            "path": "/api/v1",
+            "body": "full path match"
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/v1", "=/api/v1");
+    let mut headers = HashMap::new();
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject { body, .. } => {
+            assert_eq!(body, "full path match");
+        }
+        _ => panic!("Expected Reject"),
+    }
+}
+
+#[tokio::test]
 async fn test_no_matched_proxy_uses_full_path() {
     // Edge case: if matched_proxy is None, use full path
     let plugin = ResponseMock::new(&json!({
