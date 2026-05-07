@@ -1557,6 +1557,34 @@ fn test_regex_listen_path_non_regex_not_checked() {
     assert!(config.validate_regex_listen_paths().is_ok());
 }
 
+#[test]
+fn test_exact_listen_path_validates() {
+    let p = make_proxy("exact-path", "=/api/v1");
+    assert!(p.validate_fields().is_ok());
+}
+
+#[test]
+fn test_exact_listen_path_rejects_missing_slash() {
+    let p = make_proxy("bad-exact-path", "=api/v1");
+    let errs = p.validate_fields().unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("exact listen_path")),
+        "expected exact listen_path error, got {:?}",
+        errs
+    );
+}
+
+#[test]
+fn test_exact_listen_path_rejects_empty_path() {
+    let p = make_proxy("empty-exact-path", "=");
+    let errs = p.validate_fields().unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("exact listen_path")),
+        "expected exact listen_path error, got {:?}",
+        errs
+    );
+}
+
 // ---- anchor_regex_pattern tests ----
 
 #[test]

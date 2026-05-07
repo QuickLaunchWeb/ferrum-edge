@@ -22,9 +22,10 @@ A comprehensive feature list for Ferrum Edge.
 
 ## Routing
 
-- Longest prefix match on `listen_path` with unique path enforcement
+- Exact-path routes (`=/path`) take priority, followed by longest prefix match
+  on `listen_path`, with unique path enforcement
 - Host-based routing with exact and wildcard prefix support (`*.example.com`)
-- **Host-only routing** — HTTP proxies can match purely on `hosts` with no `listen_path`. A host-only proxy serves any path under the configured host. Per-host matching order: exact path → regex path → host-only fallback.
+- **Host-only routing** — HTTP proxies can match purely on `hosts` with no `listen_path`. A host-only proxy serves any path under the configured host. Per-host matching order: exact path → prefix path → regex path → host-only fallback.
 - Pre-sorted route table with bounded O(1) path cache, rebuilt atomically on config changes
 - Configurable path stripping and backend path prefixing
 - Per-proxy HTTP method filtering (`allowed_methods`) with 405 Method Not Allowed responses

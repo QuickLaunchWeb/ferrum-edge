@@ -552,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn translates_virtual_service_exact_uri_to_anchored_regex_proxy() {
+    fn translates_virtual_service_exact_uri_to_exact_proxy() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",

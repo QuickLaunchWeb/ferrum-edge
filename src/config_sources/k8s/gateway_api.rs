@@ -338,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn translates_http_route_exact_path_to_anchored_regex_proxy() {
+    fn translates_http_route_exact_path_to_exact_proxy() {
         let result = translate_k8s_objects(
             &[object(
                 "HTTPRoute",
