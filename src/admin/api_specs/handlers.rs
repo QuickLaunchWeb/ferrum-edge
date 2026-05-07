@@ -1280,6 +1280,33 @@ async fn validate_bundle(
         }
     }
 
+    // Duplicate plugin IDs after handler-side ID assignment. The extractor
+    // rejects duplicate non-empty IDs in the submitted spec, but PUT can still
+    // produce duplicates when one empty-id plugin reuses an existing stored ID
+    // and another submitted plugin explicitly names that same ID.
+    {
+        let mut seen_plugin_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut dupe_plugin_ids: Vec<String> = Vec::new();
+        for plugin in &bundle.plugins {
+            if !plugin.id.is_empty()
+                && !seen_plugin_ids.insert(plugin.id.as_str())
+                && !dupe_plugin_ids.iter().any(|id| id == &plugin.id)
+            {
+                dupe_plugin_ids.push(plugin.id.clone());
+            }
+        }
+        if !dupe_plugin_ids.is_empty() {
+            failures.push(ValidationFailure {
+                resource_type: "plugin",
+                id: bundle.proxy.id.clone(),
+                errors: dupe_plugin_ids
+                    .iter()
+                    .map(|id| format!("duplicate plugin id '{id}' after API spec ID assignment"))
+                    .collect(),
+            });
+        }
+    }
+
     // Duplicate proxy plugin associations (Fix 4): detect operator-written
     // duplicate plugin_config_id entries in bundle.proxy.plugins.  SQL's
     // proxy_plugins(proxy_id, plugin_config_id) PK would conflict on insert;

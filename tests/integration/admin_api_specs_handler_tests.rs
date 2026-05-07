@@ -2496,6 +2496,95 @@ async fn put_with_explicit_plugin_id_overrides_match() {
     assert_eq!(plugin.plugin_name, "cors");
 }
 
+/// PUT can create duplicate final plugin IDs when one empty-id plugin reuses an
+/// existing spec-owned ID and another plugin explicitly names that same ID.
+/// This must be rejected before persistence rather than falling through to a
+/// database uniqueness error.
+#[tokio::test]
+async fn put_with_empty_plugin_reuse_and_explicit_duplicate_id_returns_422() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let listen_path = format!("/{proxy_id}");
+
+    let spec_v1 = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Final duplicate plugin ID test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": listen_path
+        },
+        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {}}]
+    });
+
+    let (post_status, post_body) = client.post_json("/api-specs", &spec_v1).await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "POST: {post_body}"
+    );
+    let spec_id = post_body["id"].as_str().unwrap().to_string();
+
+    let plugins = store
+        .list_spec_owned_plugin_configs("ferrum", &spec_id)
+        .await
+        .expect("list_spec_owned_plugin_configs");
+    assert_eq!(plugins.len(), 1, "POST should create one spec-owned plugin");
+    let reused_plugin_id = plugins[0].id.clone();
+
+    let spec_v2 = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Final duplicate plugin ID test v2", "version": "2.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": listen_path
+        },
+        "x-ferrum-plugins": [
+            {"id": "", "plugin_name": "cors", "config": {}},
+            {"id": reused_plugin_id, "plugin_name": "correlation_id", "config": {}}
+        ]
+    });
+
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec_v2)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "PUT with duplicate final plugin IDs must return 422; body: {put_body}"
+    );
+    let failures = put_body["failures"].as_array().expect("failures array");
+    let plugin_failure = failures
+        .iter()
+        .find(|f| f["resource_type"].as_str() == Some("plugin"))
+        .unwrap_or_else(|| panic!("expected plugin failure; body: {put_body}"));
+    let errors = plugin_failure["errors"].as_array().expect("errors array");
+    assert!(
+        errors.iter().any(|e| e
+            .as_str()
+            .is_some_and(|msg| msg.contains("duplicate plugin id"))),
+        "error must mention duplicate plugin id; body: {put_body}"
+    );
+
+    let plugins_after = store
+        .list_spec_owned_plugin_configs("ferrum", &spec_id)
+        .await
+        .expect("list_spec_owned_plugin_configs after failed PUT");
+    assert_eq!(
+        plugins_after.len(),
+        1,
+        "failed PUT must not replace the original plugin set"
+    );
+    assert_eq!(plugins_after[0].id, reused_plugin_id);
+}
+
 // ============================================================================
 // Fix 2 — Validate proxy.plugins associations
 // ============================================================================
