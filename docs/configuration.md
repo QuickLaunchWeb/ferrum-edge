@@ -151,7 +151,7 @@ With the native `MeshSubscribe` protocol, mesh mode waits for the first delivere
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_MESH_CONFIG_PROTOCOL` | No | `native` | Mesh config source: `native` for Ferrum `MeshSubscribe`, `xds` for ADS |
+| `FERRUM_MESH_CONFIG_PROTOCOL` | No | `native` | Mesh config source. Mesh runtime currently supports `native` Ferrum `MeshSubscribe`; `xds` is rejected during settings validation until the mesh DP xDS client is wired. `FERRUM_XDS_ENABLED` only exposes CP ADS for Envoy-compatible clients |
 | `FERRUM_MESH_NODE_ID` | No | `$HOSTNAME` or `ferrum-mesh-node` | Stable mesh data-plane node ID used for xDS/MeshSubscribe |
 | `FERRUM_MESH_TOPOLOGY` | No | `sidecar` | Mesh topology flag: `sidecar`, `ambient`, or `east_west_gateway`. All share the same data-plane path |
 | `FERRUM_MESH_INBOUND_LISTEN_ADDR` | No | `0.0.0.0:15006` | Sidecar inbound mTLS listener address |
