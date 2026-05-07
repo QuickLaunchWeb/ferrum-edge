@@ -922,7 +922,7 @@ pub struct Proxy {
     /// (both may be set together).
     #[serde(default)]
     pub hosts: Vec<String>,
-    /// Path prefix or `~regex` this proxy matches.
+    /// Path prefix, `~regex`, or `=/exact-path` this proxy matches.
     /// - HTTP-family proxies: required UNLESS `hosts` is non-empty. When both
     ///   `hosts` is empty and this is `None`, the config is rejected — that
     ///   would be "match literally everything" and collides with every
@@ -2451,8 +2451,18 @@ impl Proxy {
                         if pattern.is_empty() {
                             errors.push("regex listen_path '~' has empty pattern".to_string());
                         }
+                    } else if let Some(exact) = path.strip_prefix('=') {
+                        if !exact.starts_with('/') {
+                            errors.push(
+                                "exact listen_path must start with '=/' (for example, '=/api')"
+                                    .to_string(),
+                            );
+                        }
                     } else if !path.starts_with('/') {
-                        errors.push("listen_path must start with '/' or '~' (regex)".to_string());
+                        errors.push(
+                            "listen_path must start with '/', '~' (regex), or '=/' (exact)"
+                                .to_string(),
+                        );
                     }
                 }
             }

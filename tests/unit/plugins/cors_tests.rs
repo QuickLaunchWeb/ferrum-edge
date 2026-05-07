@@ -1,7 +1,7 @@
 //! Tests for the CORS plugin
 
 use ferrum_edge::plugins::cors::CorsPlugin;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -43,6 +43,133 @@ fn make_cors_ctx(method: &str, origin: &str) -> RequestContext {
 async fn test_cors_plugin_creation_defaults() {
     let plugin = CorsPlugin::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "cors");
+    assert_eq!(plugin.priority(), priority::CORS);
+    assert_eq!(plugin.priority(), 100);
+    assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    assert!(!plugin.modifies_request_headers());
+    assert!(plugin.applies_after_proxy_on_reject());
+    assert!(!plugin.is_auth_plugin());
+}
+
+#[test]
+fn test_constructor_rejects_non_array_allowed_origins() {
+    let err = CorsPlugin::new(&json!({
+        "allowed_origins": "https://example.com"
+    }))
+    .err()
+    .expect("allowed_origins must reject non-array values");
+
+    assert!(err.contains("allowed_origins"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_empty_allowed_origins() {
+    let err = CorsPlugin::new(&json!({
+        "allowed_origins": []
+    }))
+    .err()
+    .expect("empty allowed_origins must be rejected");
+
+    assert!(err.contains("at least one origin"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_non_string_origin_entry() {
+    let err = CorsPlugin::new(&json!({
+        "allowed_origins": [42]
+    }))
+    .err()
+    .expect("non-string origin entries must be rejected");
+
+    assert!(err.contains("entries must be strings"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_malformed_exact_origin() {
+    let err = CorsPlugin::new(&json!({
+        "allowed_origins": ["example.com"]
+    }))
+    .err()
+    .expect("exact origins without scheme must be rejected");
+
+    assert!(err.contains("invalid origin"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_exact_origin_with_path() {
+    let err = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://example.com/api"]
+    }))
+    .err()
+    .expect("origins with path must be rejected");
+
+    assert!(err.contains("without path"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_malformed_wildcard_origin() {
+    let err = CorsPlugin::new(&json!({
+        "allowed_origins": ["*example.com"]
+    }))
+    .err()
+    .expect("wildcard origins without dot must be rejected");
+
+    assert!(err.contains("*.example.com"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_invalid_method() {
+    let err = CorsPlugin::new(&json!({
+        "allowed_methods": ["GET", "BAD METHOD"]
+    }))
+    .err()
+    .expect("invalid method tokens must be rejected");
+
+    assert!(err.contains("invalid HTTP method"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_empty_allowed_methods() {
+    let err = CorsPlugin::new(&json!({
+        "allowed_methods": []
+    }))
+    .err()
+    .expect("empty allowed_methods must be rejected");
+
+    assert!(err.contains("allowed_methods"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_invalid_header_name() {
+    let err = CorsPlugin::new(&json!({
+        "allowed_headers": ["Content-Type", "Bad Header"]
+    }))
+    .err()
+    .expect("invalid allowed header names must be rejected");
+
+    assert!(err.contains("invalid HTTP header name"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_non_bool_allow_credentials() {
+    let err = CorsPlugin::new(&json!({
+        "allow_credentials": "true"
+    }))
+    .err()
+    .expect("non-bool allow_credentials must be rejected");
+
+    assert!(err.contains("allow_credentials"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_non_integer_max_age() {
+    let err = CorsPlugin::new(&json!({
+        "max_age": -1
+    }))
+    .err()
+    .expect("negative max_age must be rejected");
+
+    assert!(err.contains("max_age"), "got: {err}");
 }
 
 #[tokio::test]

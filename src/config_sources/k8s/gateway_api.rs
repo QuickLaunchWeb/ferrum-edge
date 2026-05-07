@@ -6,8 +6,9 @@ use crate::config::mesh::{AppProtocol, MeshService, ServicePort};
 use crate::config::types::BackendScheme;
 
 use super::{
-    K8sAccumulator, K8sObject, K8sTranslateError, RouteProxySpec, SourceKind, invalid_resource,
-    proxy_for_route, resource_id, service_dns_name, string_array, string_field,
+    K8sAccumulator, K8sObject, K8sTranslateError, RouteProxySpec, SourceKind,
+    exact_path_listen_path, invalid_resource, optional_port_field, port_from_u64, proxy_for_route,
+    resource_id, service_dns_name, string_array, string_field,
 };
 
 pub(super) fn translate(
@@ -16,7 +17,7 @@ pub(super) fn translate(
 ) -> Result<bool, K8sTranslateError> {
     match object.kind.as_str() {
         "Gateway" => {
-            for service in mesh_services_from_gateway(object) {
+            for service in mesh_services_from_gateway(object)? {
                 acc.mesh.services.push(service);
             }
             Ok(true)
@@ -83,17 +84,21 @@ pub(super) fn collect_reference_grant(
     Ok(())
 }
 
-fn mesh_services_from_gateway(object: &K8sObject) -> Vec<MeshService> {
+fn mesh_services_from_gateway(object: &K8sObject) -> Result<Vec<MeshService>, K8sTranslateError> {
+    let mut services = Vec::new();
     object
         .spec
         .get("listeners")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|listener| {
-            let port = listener.get("port").and_then(Value::as_u64)? as u16;
+        .try_for_each(|listener| {
+            let Some(raw_port) = listener.get("port").and_then(Value::as_u64) else {
+                return Ok(());
+            };
+            let port = port_from_u64(object, raw_port, "listeners[].port")?;
             let name = string_field(listener, "name").unwrap_or("listener");
-            Some(MeshService {
+            services.push(MeshService {
                 name: format!("{}-{name}", object.metadata.name),
                 namespace: object.metadata.namespace.clone(),
                 ports: vec![ServicePort {
@@ -103,9 +108,10 @@ fn mesh_services_from_gateway(object: &K8sObject) -> Vec<MeshService> {
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
-            })
-        })
-        .collect()
+            });
+            Ok::<(), K8sTranslateError>(())
+        })?;
+    Ok(services)
 }
 
 fn http_route_proxies(
@@ -130,13 +136,14 @@ fn http_route_proxies(
             .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
         let backend_namespace =
             checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
-        let backend_port = backend_ref.get("port").and_then(Value::as_u64).unwrap_or(
-            if object.kind == "GRPCRoute" {
-                50051
-            } else {
-                80
-            },
-        ) as u16;
+        let backend_port =
+            optional_port_field(object, backend_ref.get("port"), "backendRefs[].port")?.unwrap_or(
+                if object.kind == "GRPCRoute" {
+                    50051
+                } else {
+                    80
+                },
+            );
 
         let listen_path = rule
             .get("matches")
@@ -157,6 +164,7 @@ fn http_route_proxies(
             namespace: object.metadata.namespace.clone(),
             hosts: hostnames.clone(),
             listen_path,
+            strip_listen_path: false,
             backend_host: backend_host.clone(),
             backend_port,
             backend_scheme: BackendScheme::Http,
@@ -188,12 +196,18 @@ fn l4_route_proxies(
             .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
         let backend_namespace =
             checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
-        let backend_port = backend_ref
-            .get("port")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                invalid_resource(object, "TCPRoute/TLSRoute backendRefs[].port is required")
-            })? as u16;
+        let raw_backend_port =
+            backend_ref
+                .get("port")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    invalid_resource(object, "TCPRoute/TLSRoute backendRefs[].port is required")
+                })?;
+        let backend_port = port_from_u64(
+            object,
+            raw_backend_port,
+            "TCPRoute/TLSRoute backendRefs[].port",
+        )?;
 
         proxies.push(proxy_for_route(RouteProxySpec {
             id: resource_id(
@@ -205,6 +219,7 @@ fn l4_route_proxies(
             namespace: object.metadata.namespace.clone(),
             hosts: string_array(&object.spec, "hostnames"),
             listen_path: None,
+            strip_listen_path: false,
             backend_host: service_dns_name(backend_name, &backend_namespace),
             backend_port,
             backend_scheme: scheme,
@@ -254,6 +269,7 @@ fn first_backend_ref(rule: &Value) -> Option<&Value> {
 fn http_path_match(path: &Value) -> Option<String> {
     let value = string_field(path, "value")?;
     match string_field(path, "type").unwrap_or("PathPrefix") {
+        "Exact" => Some(exact_path_listen_path(value)),
         "RegularExpression" => Some(format!("~{value}")),
         _ => Some(value.to_string()),
     }
@@ -329,7 +345,54 @@ mod tests {
             result.config.proxies[0].listen_path.as_deref(),
             Some("/api")
         );
+        assert!(!result.config.proxies[0].strip_listen_path);
         assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn translates_http_route_exact_path_to_exact_proxy() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "Exact", "value": "/api.v1"}}],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("=/api.v1")
+        );
+        assert!(!result.config.proxies[0].strip_listen_path);
+    }
+
+    #[test]
+    fn translates_http_route_regular_expression_path_to_regex_proxy() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "RegularExpression", "value": "/v[0-9]+/items"}}],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("~/v[0-9]+/items")
+        );
+        assert!(!result.config.proxies[0].strip_listen_path);
     }
 
     #[test]
@@ -352,6 +415,64 @@ mod tests {
             result.config.proxies[0].backend_scheme,
             Some(BackendScheme::Tcp)
         );
+    }
+
+    #[test]
+    fn rejects_gateway_api_ports_outside_kubernetes_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [{"name": "api", "port": 70000}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid port must fail closed");
+
+        assert!(err.to_string().contains("backendRefs[].port"));
+        assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn rejects_gateway_listener_ports_outside_kubernetes_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Gateway",
+                serde_json::json!({
+                    "listeners": [{"name": "http", "port": 70000, "protocol": "HTTP"}]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid listener port must fail closed");
+
+        assert!(err.to_string().contains("listeners[].port"));
+        assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn rejects_l4_route_ports_outside_kubernetes_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "TCPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [{"name": "db", "port": 70000}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid L4 backend port must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("TCPRoute/TLSRoute backendRefs[].port")
+        );
+        assert!(err.to_string().contains("70000"));
     }
 
     #[test]

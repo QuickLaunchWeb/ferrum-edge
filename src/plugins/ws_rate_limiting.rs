@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -27,20 +28,17 @@ impl WsRateLimiting {
     const MAX_CLOSE_REASON_BYTES: usize = 123;
 
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        let frames_per_second = config["frames_per_second"].as_u64().unwrap_or(100) as f64;
-        if frames_per_second == 0.0 {
-            return Err(
-                "ws_rate_limiting: 'frames_per_second' must be greater than zero".to_string(),
-            );
+        if !config.is_object() {
+            return Err("ws_rate_limiting: config must be an object".to_string());
         }
 
-        let burst_size = config["burst_size"]
-            .as_u64()
-            .map(|value| value as f64)
-            .unwrap_or(frames_per_second);
+        let frames_per_second =
+            optional_positive_u64(config, "frames_per_second")?.unwrap_or(100) as f64;
 
-        let mut close_reason = config["close_reason"]
-            .as_str()
+        let burst_size = optional_positive_u64(config, "burst_size")?
+            .map_or(frames_per_second, |value| value as f64);
+
+        let mut close_reason = optional_string(config, "close_reason")?
             .unwrap_or("Frame rate exceeded")
             .to_string();
         if close_reason.len() > Self::MAX_CLOSE_REASON_BYTES {
@@ -63,12 +61,18 @@ impl WsRateLimiting {
                 config,
                 &http_client,
                 WsFrameRateAlgorithm::new(frames_per_second, burst_size),
-            ),
+            )?,
         })
     }
 
     pub(crate) fn redis_connection_scope_key(&self, proxy_id: &str, connection_id: u64) -> String {
-        format!("{}:{}:{}", self.redis_instance_id, proxy_id, connection_id)
+        let mut key = String::with_capacity(self.redis_instance_id.len() + proxy_id.len() + 22);
+        key.push_str(&self.redis_instance_id);
+        key.push(':');
+        key.push_str(proxy_id);
+        key.push(':');
+        let _ = write!(&mut key, "{connection_id}");
+        key
     }
 
     fn truncate_utf8_boundary(value: &str, max_bytes: usize) -> usize {
@@ -79,17 +83,46 @@ impl WsRateLimiting {
         end
     }
 
-    fn maybe_evict(&self) {
+    fn maybe_evict(&self) -> bool {
         let count = self.frame_counter.fetch_add(1, Ordering::Relaxed);
-        let over_capacity = self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES;
-        let periodic = count > 0
-            && count.is_multiple_of(EVICTION_CHECK_INTERVAL)
-            && self.limiter.tracked_keys_count() > 0;
+        let tracked_keys = self.limiter.tracked_keys_count();
+        let over_capacity = tracked_keys > MAX_STATE_ENTRIES;
+        let periodic =
+            count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && tracked_keys > 0;
 
         if over_capacity || periodic {
             self.limiter.retain_active_at(Instant::now());
         }
+
+        self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES
     }
+}
+
+fn optional_positive_u64(config: &Value, field: &'static str) -> Result<Option<u64>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_u64() else {
+        return Err(format!(
+            "ws_rate_limiting: '{field}' must be an integer greater than zero"
+        ));
+    };
+    if value == 0 {
+        return Err(format!(
+            "ws_rate_limiting: '{field}' must be greater than zero"
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(Some)
+        .ok_or_else(|| format!("ws_rate_limiting: '{field}' must be a string"))
 }
 
 #[async_trait]
@@ -125,12 +158,28 @@ impl Plugin for WsRateLimiting {
         direction: WebSocketFrameDirection,
         _message: &Message,
     ) -> Option<Message> {
-        self.maybe_evict();
+        let over_capacity = self.maybe_evict();
+        if over_capacity && !self.limiter.contains_local_key(&connection_id) {
+            warn!(
+                plugin = "ws_rate_limiting",
+                proxy_id = %proxy_id,
+                connection_id,
+                max_state_entries = MAX_STATE_ENTRIES,
+                "WebSocket rate-limit state capacity exceeded, closing new connection"
+            );
+            return Some(Message::Close(Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: self.close_reason.clone().into(),
+            })));
+        }
 
-        let redis_key = self.redis_connection_scope_key(proxy_id, connection_id);
         let outcome = self
             .limiter
-            .check(connection_id, &redis_key, &WsRateLimitOp)
+            .check_with_redis_key(
+                connection_id,
+                || self.redis_connection_scope_key(proxy_id, connection_id),
+                &WsRateLimitOp,
+            )
             .await;
 
         if outcome.allowed {
