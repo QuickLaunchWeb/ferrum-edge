@@ -110,7 +110,7 @@ fn mesh_services_from_gateway(object: &K8sObject) -> Vec<MeshService> {
 
 fn http_route_proxies(
     object: &K8sObject,
-    acc: &K8sAccumulator,
+    acc: &mut K8sAccumulator,
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
     let hostnames = string_array(&object.spec, "hostnames");
     let mut proxies = Vec::new();
@@ -123,7 +123,7 @@ fn http_route_proxies(
         .flatten()
         .enumerate()
     {
-        let Some(backend_ref) = first_backend_ref(rule) else {
+        let Some(backend_ref) = first_backend_ref(object, rule, acc)? else {
             continue;
         };
         let backend_name = string_field(backend_ref, "name")
@@ -169,7 +169,7 @@ fn http_route_proxies(
 
 fn l4_route_proxies(
     object: &K8sObject,
-    acc: &K8sAccumulator,
+    acc: &mut K8sAccumulator,
     scheme: BackendScheme,
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
     let mut proxies = Vec::new();
@@ -181,7 +181,7 @@ fn l4_route_proxies(
         .flatten()
         .enumerate()
     {
-        let Some(backend_ref) = first_backend_ref(rule) else {
+        let Some(backend_ref) = first_backend_ref(object, rule, acc)? else {
             continue;
         };
         let backend_name = string_field(backend_ref, "name")
@@ -245,21 +245,46 @@ fn checked_backend_namespace(
     }
 }
 
-fn first_backend_ref(rule: &Value) -> Option<&Value> {
-    rule.get("backendRefs")
-        .and_then(Value::as_array)
-        .and_then(|backend_refs| {
-            backend_refs
-                .iter()
-                .find(|backend_ref| backend_ref_weight(backend_ref) > 0)
-        })
+fn first_backend_ref<'a>(
+    object: &K8sObject,
+    rule: &'a Value,
+    acc: &mut K8sAccumulator,
+) -> Result<Option<&'a Value>, K8sTranslateError> {
+    let Some(backend_refs) = rule.get("backendRefs").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+
+    let mut skipped_zero = 0usize;
+    for backend_ref in backend_refs {
+        if backend_ref_weight(object, backend_ref)? > 0 {
+            if skipped_zero > 0 {
+                acc.warnings.push(format!(
+                    "{} skipped {} zero-weight backendRef(s)",
+                    object.kind, skipped_zero
+                ));
+            }
+            return Ok(Some(backend_ref));
+        }
+        skipped_zero += 1;
+    }
+
+    if skipped_zero > 0 {
+        acc.warnings.push(format!(
+            "{} rule has only zero-weight backendRefs; no proxy was materialized",
+            object.kind
+        ));
+    }
+    Ok(None)
 }
 
-fn backend_ref_weight(backend_ref: &Value) -> u64 {
-    backend_ref
-        .get("weight")
-        .and_then(Value::as_u64)
-        .unwrap_or(1)
+fn backend_ref_weight(object: &K8sObject, backend_ref: &Value) -> Result<u64, K8sTranslateError> {
+    match backend_ref.get("weight") {
+        Some(Value::Number(number)) if number.as_i64().is_some_and(|weight| weight < 0) => Err(
+            invalid_resource(object, "backendRefs[].weight must be zero or positive"),
+        ),
+        Some(value) => Ok(value.as_u64().unwrap_or(1)),
+        None => Ok(1),
+    }
 }
 
 fn http_path_match(path: &Value) -> Option<String> {
@@ -367,6 +392,12 @@ mod tests {
             "stable.default.svc.cluster.local"
         );
         assert_eq!(result.config.proxies[0].backend_port, 9090);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("zero-weight backendRef"))
+        );
     }
 
     #[test]
@@ -385,6 +416,111 @@ mod tests {
         .expect("translation succeeds");
 
         assert!(result.config.proxies.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("only zero-weight backendRefs"))
+        );
+    }
+
+    #[test]
+    fn grpc_route_skips_zero_weight_backend_refs() {
+        let result = translate_k8s_objects(
+            &[object(
+                "GRPCRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [
+                            {"name": "dark", "port": 50051, "weight": 0},
+                            {"name": "stable", "port": 50052, "weight": 100}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "stable.default.svc.cluster.local"
+        );
+        assert_eq!(result.config.proxies[0].backend_port, 50052);
+    }
+
+    #[test]
+    fn tcp_route_skips_zero_weight_backend_refs() {
+        let result = translate_k8s_objects(
+            &[object(
+                "TCPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [
+                            {"name": "dark", "port": 5432, "weight": 0},
+                            {"name": "stable", "port": 5433, "weight": 1}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "stable.default.svc.cluster.local"
+        );
+        assert_eq!(result.config.proxies[0].listen_port, Some(5433));
+        assert_eq!(
+            result.config.proxies[0].backend_scheme,
+            Some(BackendScheme::Tcp)
+        );
+    }
+
+    #[test]
+    fn tls_route_with_only_zero_weight_backend_refs_is_not_materialized() {
+        let result = translate_k8s_objects(
+            &[object(
+                "TLSRoute",
+                serde_json::json!({
+                    "hostnames": ["db.example.com"],
+                    "rules": [{
+                        "backendRefs": [{"name": "dark", "port": 15443, "weight": 0}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.proxies.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("only zero-weight backendRefs"))
+        );
+    }
+
+    #[test]
+    fn gateway_route_rejects_negative_backend_ref_weight() {
+        let err = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [{"name": "dark", "port": 8080, "weight": -1}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("negative backendRef weights are invalid");
+
+        assert!(err.to_string().contains("weight must be zero or positive"));
     }
 
     #[test]

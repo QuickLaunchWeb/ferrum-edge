@@ -39,7 +39,7 @@ pub(super) fn translate(
             Ok(true)
         }
         "VirtualService" => {
-            for proxy in virtual_service_routes(object)? {
+            for proxy in virtual_service_routes(object, acc)? {
                 acc.upsert_proxy(proxy, SourceKind::Istio);
             }
             Ok(true)
@@ -309,6 +309,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
 
 fn virtual_service_routes(
     object: &K8sObject,
+    acc: &mut K8sAccumulator,
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
     let hosts = string_array(&object.spec, "hosts");
     let mut proxies = Vec::new();
@@ -322,8 +323,18 @@ fn virtual_service_routes(
         .enumerate()
     {
         let Some(route) = first_positive_weighted_route(http) else {
+            acc.warnings.push(format!(
+                "VirtualService '{}' HTTP route {} has only zero-weight split destinations; no proxy was materialized",
+                object.metadata.name, index
+            ));
             continue;
         };
+        if http_has_skipped_zero_weight_split_destination(http) {
+            acc.warnings.push(format!(
+                "VirtualService '{}' HTTP route {} skipped zero-weight split destination(s)",
+                object.metadata.name, index
+            ));
+        }
         let Some(destination) = route.get("destination") else {
             continue;
         };
@@ -380,6 +391,14 @@ fn first_positive_weighted_route(http: &Value) -> Option<&Value> {
 
 fn route_weight(route: &Value) -> u64 {
     route.get("weight").and_then(Value::as_u64).unwrap_or(1)
+}
+
+fn http_has_skipped_zero_weight_split_destination(http: &Value) -> bool {
+    http.get("route")
+        .and_then(Value::as_array)
+        .is_some_and(|routes| {
+            routes.len() > 1 && routes.iter().any(|route| route_weight(route) == 0)
+        })
 }
 
 fn path_match(uri: &Value) -> Option<String> {
@@ -593,6 +612,12 @@ mod tests {
             "stable.default.svc.cluster.local"
         );
         assert_eq!(result.config.proxies[0].backend_port, 9090);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("skipped zero-weight"))
+        );
     }
 
     #[test]
@@ -657,5 +682,11 @@ mod tests {
         .expect("translation succeeds");
 
         assert!(result.config.proxies.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("only zero-weight"))
+        );
     }
 }

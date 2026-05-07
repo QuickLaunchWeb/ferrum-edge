@@ -168,7 +168,7 @@ Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the can
 
 Phase D adds Kubernetes source translation and sidecar-injector scaffolding. Kubernetes resources translate into `GatewayConfig` / `MeshConfig`; no config source talks directly to the proxy runtime or xDS server.
 
-Gateway API `backendRefs` with `weight: 0` are skipped during translation. Istio `VirtualService` destinations with `weight: 0` are skipped only when the HTTP route splits across multiple destinations; a single zero-weight destination is preserved because Istio sends all traffic to the lone destination.
+Gateway API `backendRefs` with `weight: 0` are skipped during translation and negative weights are rejected as invalid. Istio `VirtualService` destinations with `weight: 0` are skipped only when the HTTP route splits across multiple destinations; a single zero-weight destination is preserved because Istio sends all traffic to the lone destination. Skipped zero-weight entries are reported in translation warnings.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
