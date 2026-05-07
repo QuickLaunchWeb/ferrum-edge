@@ -2472,6 +2472,23 @@ fn phase1_watchdog_failure(
     None
 }
 
+fn poll_ready_watchdog_ticks(
+    watchdog: &mut tokio::time::Interval,
+    cx: &mut std::task::Context<'_>,
+    mut on_tick: impl FnMut() -> Option<StreamFirstFailure>,
+) -> Poll<Option<StreamFirstFailure>> {
+    loop {
+        match Pin::new(&mut *watchdog).poll_tick(cx) {
+            Poll::Ready(_) => {
+                if let Some(failure) = on_tick() {
+                    return Poll::Ready(Some(failure));
+                }
+            }
+            Poll::Pending => return Poll::Pending,
+        }
+    }
+}
+
 /// Bidirectional stream copy between client and backend.
 ///
 /// Polls both half-duplex copies from one task against pinned mutable stream
@@ -2671,18 +2688,20 @@ where
                 Poll::Pending => {}
             }
         }
-        if let Some(watchdog) = watchdog.as_mut()
-            && Pin::new(watchdog).poll_tick(cx).is_ready()
-            && let Some(failure) = phase1_watchdog_failure(
-                last_activity,
-                timeout_ms,
-                b2c_read_watermark,
-                backend_read_timeout_ms,
-                c2b_write_watermark,
-                backend_write_timeout_ms,
-            )
-        {
-            return Poll::Ready(Phase1Outcome::Watchdog(failure));
+        if let Some(watchdog) = watchdog.as_mut() {
+            match poll_ready_watchdog_ticks(watchdog, cx, || {
+                phase1_watchdog_failure(
+                    last_activity,
+                    timeout_ms,
+                    b2c_read_watermark,
+                    backend_read_timeout_ms,
+                    c2b_write_watermark,
+                    backend_write_timeout_ms,
+                )
+            }) {
+                Poll::Ready(Some(failure)) => return Poll::Ready(Phase1Outcome::Watchdog(failure)),
+                Poll::Ready(None) | Poll::Pending => {}
+            }
         }
         Poll::Pending
     })
@@ -2951,50 +2970,54 @@ where
             Poll::Pending => {}
         }
 
-        if let Some(watchdog) = watchdog.as_mut()
-            && Pin::new(watchdog).poll_tick(cx).is_ready()
-        {
-            let now = coarse_now_ms();
-            if let Some(wm) = direction_watermark
-                && now.saturating_sub(wm.load(Ordering::Relaxed)) >= direction_timeout_ms
-            {
-                let side = match direction {
-                    Direction::BackendToClient => Some(StreamIoSide::Read),
-                    Direction::ClientToBackend => Some(StreamIoSide::Write),
-                    Direction::Unknown => None,
-                };
-                let label = match direction {
-                    Direction::BackendToClient => "backend read inactivity timeout",
-                    Direction::ClientToBackend => "backend write inactivity timeout",
-                    Direction::Unknown => "backend inactivity timeout",
-                };
-                return Poll::Ready(Some((
-                    direction,
-                    ErrorClass::ReadWriteTimeout,
-                    side,
-                    label.to_string(),
-                )));
-            }
-            if let Some(la) = last_activity
-                && now.saturating_sub(la.load(Ordering::Relaxed)) >= timeout_ms
-            {
-                return Poll::Ready(Some((
-                    Direction::Unknown,
-                    ErrorClass::ReadWriteTimeout,
-                    None,
-                    "idle timeout".to_string(),
-                )));
-            }
-            if let Some(cap) = half_close_cap
-                && !cap.is_zero()
-                && phase2_start.elapsed() >= cap
-            {
-                return Poll::Ready(Some((
-                    Direction::Unknown,
-                    ErrorClass::ReadWriteTimeout,
-                    None,
-                    "tcp half-close max wait exceeded".to_string(),
-                )));
+        if let Some(watchdog) = watchdog.as_mut() {
+            match poll_ready_watchdog_ticks(watchdog, cx, || {
+                let now = coarse_now_ms();
+                if let Some(wm) = direction_watermark
+                    && now.saturating_sub(wm.load(Ordering::Relaxed)) >= direction_timeout_ms
+                {
+                    let side = match direction {
+                        Direction::BackendToClient => Some(StreamIoSide::Read),
+                        Direction::ClientToBackend => Some(StreamIoSide::Write),
+                        Direction::Unknown => None,
+                    };
+                    let label = match direction {
+                        Direction::BackendToClient => "backend read inactivity timeout",
+                        Direction::ClientToBackend => "backend write inactivity timeout",
+                        Direction::Unknown => "backend inactivity timeout",
+                    };
+                    return Some((
+                        direction,
+                        ErrorClass::ReadWriteTimeout,
+                        side,
+                        label.to_string(),
+                    ));
+                }
+                if let Some(la) = last_activity
+                    && now.saturating_sub(la.load(Ordering::Relaxed)) >= timeout_ms
+                {
+                    return Some((
+                        Direction::Unknown,
+                        ErrorClass::ReadWriteTimeout,
+                        None,
+                        "idle timeout".to_string(),
+                    ));
+                }
+                if let Some(cap) = half_close_cap
+                    && !cap.is_zero()
+                    && phase2_start.elapsed() >= cap
+                {
+                    return Some((
+                        Direction::Unknown,
+                        ErrorClass::ReadWriteTimeout,
+                        None,
+                        "tcp half-close max wait exceeded".to_string(),
+                    ));
+                }
+                None
+            }) {
+                Poll::Ready(Some(failure)) => return Poll::Ready(Some(failure)),
+                Poll::Ready(None) | Poll::Pending => {}
             }
         }
         Poll::Pending
