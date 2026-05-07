@@ -256,6 +256,10 @@ fn route_backends(
         .into_iter()
         .flatten()
     {
+        let weight = backend_weight(object, backend_ref)?;
+        if weight == 0 {
+            continue;
+        }
         let backend_name = string_field(backend_ref, "name")
             .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
         let backend_namespace =
@@ -267,10 +271,6 @@ fn route_backends(
                 80
             },
         ) as u16;
-        let weight = backend_weight(object, backend_ref)?;
-        if weight == 0 {
-            continue;
-        }
         backends.push(RouteBackend {
             host: service_dns_name(backend_name, &backend_namespace),
             port: backend_port,
@@ -861,6 +861,38 @@ mod tests {
             err.to_string()
                 .contains("requires a matching ReferenceGrant")
         );
+    }
+
+    #[test]
+    fn skips_zero_weight_cross_namespace_backend_ref_without_reference_grant() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [
+                            {"name": "api", "port": 8080},
+                            {
+                                "name": "staged-api",
+                                "namespace": "backend",
+                                "port": 8081,
+                                "weight": 0
+                            }
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("zero-weight cross-namespace backendRef should not require a ReferenceGrant");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "api.default.svc.cluster.local"
+        );
+        assert_eq!(result.config.proxies[0].backend_port, 8080);
+        assert!(result.config.upstreams.is_empty());
     }
 
     #[test]
