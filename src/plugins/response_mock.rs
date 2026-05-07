@@ -271,6 +271,7 @@ impl Plugin for ResponseMock {
         // the proxy scope. Several cases where no stripping applies:
         // - Host-only proxies (listen_path == None): no prefix to strip
         // - Regex listen_paths (`~` prefix): no literal prefix to strip
+        // - Exact listen_paths (`=` prefix): match the full request path
         // - Root listen_path (`/`): avoid turning "/users" into "users"
         //
         // Uses `strip_prefix` which is char-boundary-safe — byte-indexed
@@ -282,7 +283,11 @@ impl Plugin for ResponseMock {
             .as_ref()
             .and_then(|p| p.listen_path.as_deref())
         {
-            Some(listen_path) if !listen_path.starts_with('~') && listen_path != "/" => {
+            Some(listen_path)
+                if !listen_path.starts_with('~')
+                    && !listen_path.starts_with('=')
+                    && listen_path != "/" =>
+            {
                 match ctx.path.strip_prefix(listen_path) {
                     Some("") => "/",
                     Some(rest) => rest,

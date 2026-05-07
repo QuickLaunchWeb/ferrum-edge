@@ -4163,10 +4163,14 @@ fn build_websocket_backend_url_with_target(
         _ => "wss",
     };
 
-    // Host-only proxies (listen_path == None) have no prefix to strip —
-    // strip_listen_path is a no-op in that case.
+    // Host-only proxies (listen_path == None) have no prefix to strip.
+    // Exact listen_paths carry a leading '=' marker for routing; strip only
+    // the literal path part so WebSocket forwarding matches HTTP forwarding.
     let remaining_path = match (proxy.strip_listen_path, proxy.listen_path.as_deref()) {
-        (true, Some(lp)) => incoming_path.strip_prefix(lp).unwrap_or(""),
+        (true, Some(lp)) if !lp.starts_with('~') => {
+            let literal = lp.strip_prefix('=').unwrap_or(lp);
+            incoming_path.strip_prefix(literal).unwrap_or("")
+        }
         _ => incoming_path,
     };
 
@@ -11683,6 +11687,25 @@ mod tests {
             }
         }))
         .expect("test proxy should deserialize")
+    }
+
+    #[test]
+    fn websocket_backend_url_strips_exact_listen_path_literal() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.listen_path = Some("=/ws".to_string());
+        proxy.strip_listen_path = true;
+
+        let url = build_websocket_backend_url_with_target(
+            &proxy,
+            "/ws",
+            "token=1",
+            "backend.local",
+            8080,
+            None,
+        );
+
+        assert_eq!(url, "ws://backend.local:8080/?token=1");
     }
 
     fn route_delta_proxy(

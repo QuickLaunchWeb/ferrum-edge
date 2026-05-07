@@ -327,6 +327,7 @@ pub(crate) struct RouteProxySpec {
     pub namespace: String,
     pub hosts: Vec<String>,
     pub listen_path: Option<String>,
+    pub strip_listen_path: bool,
     pub backend_host: String,
     pub backend_port: u16,
     pub backend_scheme: BackendScheme,
@@ -346,7 +347,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         backend_host: spec.backend_host,
         backend_port: spec.backend_port,
         backend_path: None,
-        strip_listen_path: true,
+        strip_listen_path: spec.strip_listen_path,
         preserve_host_header: false,
         backend_connect_timeout_ms: 30_000,
         backend_read_timeout_ms: 30_000,
@@ -392,6 +393,10 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
 
 pub(crate) fn service_dns_name(name: &str, namespace: &str) -> String {
     format!("{name}.{namespace}.svc.cluster.local")
+}
+
+pub(crate) fn exact_path_listen_path(path: &str) -> String {
+    format!("={path}")
 }
 
 pub(crate) fn resource_id(prefix: &str, namespace: &str, name: &str, suffix: &str) -> String {
