@@ -11,6 +11,7 @@
 //! escape work.
 
 use async_trait::async_trait;
+use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -36,39 +37,19 @@ pub struct RequestTermination {
 
 impl RequestTermination {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let status_code = config["status_code"]
-            .as_u64()
-            .map(|c| c as u16)
-            .filter(|&c| (100..=599).contains(&c))
-            .unwrap_or(503);
-        let content_type = config["content_type"]
-            .as_str()
-            .unwrap_or("application/json")
-            .to_string();
-        let raw_body = config["body"].as_str().unwrap_or("");
-        let message = config["message"].as_str();
+        let status_code = parse_status_code(config)?;
+        let content_type = parse_content_type(config)?;
+        let raw_body = optional_string(config, "body")?;
+        let message = optional_string(config, "message")?;
 
         // Pre-render the response body so the hot path skips format!/replace.
-        let body = if !raw_body.is_empty() {
-            raw_body.to_string()
+        let body = if let Some(raw_body) = raw_body {
+            raw_body
         } else {
-            render_default_body(&content_type, status_code, message)
+            render_default_body(&content_type, status_code, message.as_deref())
         };
 
-        let trigger = if let Some(path) = config["trigger"]["path_prefix"].as_str() {
-            Trigger::PathPrefix(path.to_string())
-        } else if let Some(header) = config["trigger"]["header"].as_str() {
-            let value = config["trigger"]["header_value"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            Trigger::HeaderMatch {
-                header: header.to_lowercase(),
-                value,
-            }
-        } else {
-            Trigger::Always
-        };
+        let trigger = parse_trigger(config)?;
 
         Ok(Self {
             status_code,
@@ -77,6 +58,126 @@ impl RequestTermination {
             trigger,
         })
     }
+}
+
+fn parse_status_code(config: &Value) -> Result<u16, String> {
+    match config.get("status_code") {
+        None | Some(Value::Null) => Ok(503),
+        Some(Value::Number(value)) => {
+            let Some(code) = value.as_u64() else {
+                return Err(
+                    "request_termination: 'status_code' must be an integer from 100 to 599"
+                        .to_string(),
+                );
+            };
+            if !(100..=599).contains(&code) {
+                return Err(format!(
+                    "request_termination: 'status_code' must be from 100 to 599, got {code}"
+                ));
+            }
+            u16::try_from(code)
+                .map_err(|_| "request_termination: 'status_code' is too large".to_string())
+        }
+        Some(other) => Err(format!(
+            "request_termination: 'status_code' must be an integer from 100 to 599, got: {other}"
+        )),
+    }
+}
+
+fn parse_content_type(config: &Value) -> Result<String, String> {
+    match config.get("content_type") {
+        None | Some(Value::Null) => Ok("application/json".to_string()),
+        Some(Value::String(value)) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(
+                    "request_termination: 'content_type' must be a non-empty string".to_string(),
+                );
+            }
+            HeaderValue::from_str(trimmed).map_err(|_| {
+                "request_termination: 'content_type' contains characters not permitted in HTTP header values"
+                    .to_string()
+            })?;
+            Ok(trimmed.to_string())
+        }
+        Some(other) => Err(format!(
+            "request_termination: 'content_type' must be a string, got: {other}"
+        )),
+    }
+}
+
+fn optional_string(config: &Value, key: &str) -> Result<Option<String>, String> {
+    match config.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(other) => Err(format!(
+            "request_termination: '{key}' must be a string, got: {other}"
+        )),
+    }
+}
+
+fn parse_trigger(config: &Value) -> Result<Trigger, String> {
+    let Some(trigger) = config.get("trigger") else {
+        return Ok(Trigger::Always);
+    };
+    if trigger.is_null() {
+        return Ok(Trigger::Always);
+    }
+    let Value::Object(trigger) = trigger else {
+        return Err("request_termination: 'trigger' must be an object".to_string());
+    };
+
+    let has_path = trigger.contains_key("path_prefix");
+    let has_header = trigger.contains_key("header");
+    if has_path && has_header {
+        return Err(
+            "request_termination: 'trigger' must set only one of 'path_prefix' or 'header'"
+                .to_string(),
+        );
+    }
+
+    if let Some(value) = trigger.get("path_prefix") {
+        let path = value.as_str().ok_or_else(|| {
+            format!("request_termination: 'trigger.path_prefix' must be a string, got: {value}")
+        })?;
+        if path.is_empty() {
+            return Err(
+                "request_termination: 'trigger.path_prefix' must be a non-empty string".to_string(),
+            );
+        }
+        return Ok(Trigger::PathPrefix(path.to_string()));
+    }
+
+    if let Some(value) = trigger.get("header") {
+        let header = value.as_str().ok_or_else(|| {
+            format!("request_termination: 'trigger.header' must be a string, got: {value}")
+        })?;
+        let header = header.trim();
+        if header.is_empty() {
+            return Err(
+                "request_termination: 'trigger.header' must be a non-empty string".to_string(),
+            );
+        }
+        let header = HeaderName::from_bytes(header.as_bytes())
+            .map_err(|_| {
+                "request_termination: 'trigger.header' contains an invalid HTTP header name"
+                    .to_string()
+            })?
+            .as_str()
+            .to_string();
+        let value = match trigger.get("header_value") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(value)) => value.clone(),
+            Some(other) => {
+                return Err(format!(
+                    "request_termination: 'trigger.header_value' must be a string, got: {other}"
+                ));
+            }
+        };
+        return Ok(Trigger::HeaderMatch { header, value });
+    }
+
+    Err("request_termination: 'trigger' must set 'path_prefix' or 'header'".to_string())
 }
 
 /// Render the default response body for a given content type. Performed once

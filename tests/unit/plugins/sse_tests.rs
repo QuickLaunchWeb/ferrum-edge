@@ -1,5 +1,5 @@
 use ferrum_edge::plugins::sse::SsePlugin;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -54,15 +54,15 @@ fn assert_reject(result: &PluginResult, expected_status: u16) {
 fn test_name_and_priority() {
     let plugin = make_plugin(json!({}));
     assert_eq!(plugin.name(), "sse");
-    assert_eq!(plugin.priority(), 250);
+    assert_eq!(plugin.priority(), priority::SSE);
+    assert!(!plugin.is_auth_plugin());
 }
 
 #[test]
 fn test_supported_protocols_http_only() {
     let plugin = make_plugin(json!({}));
     let protocols = plugin.supported_protocols();
-    assert_eq!(protocols.len(), 1);
-    assert_eq!(protocols[0], ferrum_edge::plugins::ProxyProtocol::Http);
+    assert_eq!(protocols, HTTP_ONLY_PROTOCOLS);
 }
 
 #[test]
@@ -84,15 +84,39 @@ fn test_modifies_request_headers_default_true() {
 }
 
 #[test]
-fn test_modifies_request_headers_false_when_strip_disabled() {
+fn test_modifies_request_headers_true_when_strip_disabled() {
     let plugin = make_plugin(json!({"strip_accept_encoding": false}));
-    assert!(!plugin.modifies_request_headers());
+    assert!(plugin.modifies_request_headers());
 }
 
 #[test]
 fn test_applies_after_proxy_on_reject_is_false() {
     let plugin = make_plugin(json!({}));
     assert!(!plugin.applies_after_proxy_on_reject());
+}
+
+#[test]
+fn test_invalid_bool_config_rejected() {
+    let err = SsePlugin::new(&json!({"strip_accept_encoding": "yes"}))
+        .err()
+        .expect("invalid bool must be rejected");
+    assert!(err.contains("'strip_accept_encoding' must be a boolean"));
+}
+
+#[test]
+fn test_invalid_retry_ms_rejected() {
+    let err = SsePlugin::new(&json!({"retry_ms": "3000"}))
+        .err()
+        .expect("invalid retry_ms must be rejected");
+    assert!(err.contains("'retry_ms' must be an unsigned integer"));
+}
+
+#[test]
+fn test_zero_retry_ms_rejected() {
+    let err = SsePlugin::new(&json!({"retry_ms": 0}))
+        .err()
+        .expect("zero retry_ms must be rejected");
+    assert!(err.contains("'retry_ms' must be greater than zero"));
 }
 
 // ── on_request_received: method validation ────────────────────────────────────

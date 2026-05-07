@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use super::utils::ai_providers::{
     AiProvider, detect_response_provider, extract_response_usage, parse_ai_provider,
 };
+use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::rate_limit::{
     AiRateLimitOp, AiTokenRateAlgorithm, RateLimitBackend, RateLimitOutcome,
 };
@@ -28,20 +29,21 @@ pub struct AiRateLimiter {
 
 impl AiRateLimiter {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        let token_limit = config["token_limit"].as_u64().ok_or_else(|| {
-            "ai_rate_limiter: 'token_limit' is required (positive integer)".to_string()
-        })?;
+        if !config.is_object() {
+            return Err("ai_rate_limiter: config must be an object".to_string());
+        }
+
+        let token_limit = required_u64(config, "token_limit")?;
         if token_limit == 0 {
             return Err("ai_rate_limiter: 'token_limit' must be greater than zero".to_string());
         }
 
-        let window_seconds = config["window_seconds"].as_u64().unwrap_or(60);
+        let window_seconds = optional_u64(config, "window_seconds")?.unwrap_or(60);
         if window_seconds == 0 {
             return Err("ai_rate_limiter: 'window_seconds' must be greater than zero".to_string());
         }
 
-        let count_mode = config["count_mode"]
-            .as_str()
+        let count_mode = optional_string(config, "count_mode")?
             .unwrap_or("total_tokens")
             .to_string();
         if !matches!(
@@ -54,8 +56,7 @@ impl AiRateLimiter {
             ));
         }
 
-        let limit_by = config["limit_by"]
-            .as_str()
+        let limit_by = optional_string(config, "limit_by")?
             .unwrap_or("consumer")
             .to_string();
         if !matches!(limit_by.as_str(), "consumer" | "ip") {
@@ -65,13 +66,23 @@ impl AiRateLimiter {
             ));
         }
 
-        let expose_headers = config["expose_headers"].as_bool().unwrap_or(false);
-        let provider = config["provider"]
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("auto")
-            .to_ascii_lowercase();
+        let expose_headers = optional_bool(config, "expose_headers")?.unwrap_or(false);
+        let provider = match optional_string(config, "provider")? {
+            Some(raw) => {
+                let provider = raw.trim();
+                if provider.is_empty() {
+                    return Err("ai_rate_limiter: 'provider' must not be empty".to_string());
+                }
+                provider.to_ascii_lowercase()
+            }
+            None => "auto".to_string(),
+        };
+        if provider != "auto" && parse_ai_provider(&provider).is_none() {
+            return Err(format!(
+                "ai_rate_limiter: unknown 'provider' value '{}' (expected auto, openai, anthropic, google, cohere, mistral, or bedrock)",
+                provider
+            ));
+        }
 
         Ok(Self {
             token_limit,
@@ -85,7 +96,7 @@ impl AiRateLimiter {
                 config,
                 &http_client,
                 AiTokenRateAlgorithm::new(token_limit, window_seconds),
-            ),
+            )?,
         })
     }
 
@@ -262,6 +273,47 @@ impl AiRateLimiter {
     }
 }
 
+fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(Some)
+        .ok_or_else(|| format!("ai_rate_limiter: '{field}' must be a string"))
+}
+
+fn required_u64(config: &Value, field: &'static str) -> Result<u64, String> {
+    let Some(value) = config.get(field) else {
+        return Err(format!(
+            "ai_rate_limiter: '{field}' is required (positive integer)"
+        ));
+    };
+    value
+        .as_u64()
+        .ok_or_else(|| format!("ai_rate_limiter: '{field}' must be an unsigned integer"))
+}
+
+fn optional_u64(config: &Value, field: &'static str) -> Result<Option<u64>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .map(Some)
+        .ok_or_else(|| format!("ai_rate_limiter: '{field}' must be an unsigned integer"))
+}
+
+fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| format!("ai_rate_limiter: '{field}' must be a boolean"))
+}
+
 #[async_trait]
 impl Plugin for AiRateLimiter {
     fn name(&self) -> &str {
@@ -384,11 +436,11 @@ impl Plugin for AiRateLimiter {
                 return None;
             }
 
-            if content_type.contains("text/event-stream") || content_type.contains("event-stream") {
+            if is_event_stream_content_type(content_type) {
                 return self.extract_token_count_from_sse(body);
             }
 
-            if !content_type.contains("json") {
+            if !is_json_content_type(content_type) {
                 return None;
             }
 

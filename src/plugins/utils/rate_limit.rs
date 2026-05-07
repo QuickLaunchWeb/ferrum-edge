@@ -126,6 +126,33 @@ where
             .retain(|_, state| self.algorithm.is_state_active(state, now));
     }
 
+    pub fn enforce_capacity(&self, max_entries: usize, now: Instant) {
+        if self.state.len() <= max_entries {
+            return;
+        }
+
+        self.retain_active_at(now);
+
+        let len = self.state.len();
+        if len <= max_entries {
+            return;
+        }
+
+        let remove_count = len.saturating_sub(max_entries);
+        // DashMap iteration order is intentionally arbitrary here. Rate-limit
+        // state is already window-bounded, so after stale entries are retained
+        // away any remaining key can be evicted to enforce the hard cap.
+        let keys: Vec<K> = self
+            .state
+            .iter()
+            .take(remove_count)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in keys {
+            self.state.remove(&key);
+        }
+    }
+
     pub fn contains_key(&self, key: &K) -> bool {
         self.state.contains_key(key)
     }
@@ -145,14 +172,16 @@ impl<A: RateLimitAlgorithm> RedisLimiter<A> {
         config: &Value,
         http_client: &PluginHttpClient,
         algorithm: A,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, String> {
         let default_prefix = format!("{}:{plugin_name}", http_client.namespace());
-        let cfg = RedisConfig::from_plugin_config(config, &default_prefix)?;
+        let Some(cfg) = RedisConfig::from_plugin_config(config, &default_prefix)? else {
+            return Ok(None);
+        };
         let health_check_interval = Duration::from_secs(cfg.health_check_interval_seconds.max(1));
         #[cfg(test)]
         let key_prefix = cfg.key_prefix.clone();
 
-        Some(Self {
+        Ok(Some(Self {
             redis_client: Arc::new(RedisRateLimitClient::new(
                 cfg,
                 http_client.dns_cache().cloned(),
@@ -163,7 +192,7 @@ impl<A: RateLimitAlgorithm> RedisLimiter<A> {
             #[cfg(test)]
             key_prefix,
             health_check_interval,
-        })
+        }))
     }
 
     pub async fn check(&self, key: &str, op: &A::Op) -> Result<RateLimitOutcome, ()> {
@@ -258,6 +287,10 @@ where
         self.fallback.retain_active_at(now);
     }
 
+    pub fn enforce_local_capacity(&self, max_entries: usize, now: Instant) {
+        self.fallback.enforce_capacity(max_entries, now);
+    }
+
     pub fn contains_local_key(&self, key: &K) -> bool {
         self.fallback.contains_key(key)
     }
@@ -273,7 +306,15 @@ where
         let redis_client = Arc::clone(&self.primary.redis_client);
         let interval = self.primary.health_check_interval();
 
-        tokio::spawn(async move {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                plugin = plugin_name,
+                "Redis rate limiting health observer not started because no Tokio runtime is active"
+            );
+            return;
+        };
+
+        handle.spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
                 let available = redis_client.is_available();
@@ -309,11 +350,16 @@ where
         config: &Value,
         http_client: &PluginHttpClient,
         algorithm: A,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let local = LocalLimiter::new(algorithm.clone());
         match RedisLimiter::new(plugin_name, config, http_client, algorithm) {
-            Some(redis) => Self::Failover(FailoverLimiter::new(plugin_name, redis, local)),
-            None => Self::Local(local),
+            Ok(Some(redis)) => Ok(Self::Failover(FailoverLimiter::new(
+                plugin_name,
+                redis,
+                local,
+            ))),
+            Ok(None) => Ok(Self::Local(local)),
+            Err(err) => Err(err),
         }
     }
 
@@ -321,6 +367,24 @@ where
         match self {
             Self::Local(local) => local.check(local_key, op),
             Self::Failover(failover) => failover.check(local_key, redis_key, op).await,
+        }
+    }
+
+    pub async fn check_with_redis_key<F>(
+        &self,
+        local_key: K,
+        redis_key: F,
+        op: &A::Op,
+    ) -> RateLimitOutcome
+    where
+        F: FnOnce() -> String,
+    {
+        match self {
+            Self::Local(local) => local.check(local_key, op),
+            Self::Failover(failover) => {
+                let redis_key = redis_key();
+                failover.check(local_key, &redis_key, op).await
+            }
         }
     }
 
@@ -335,6 +399,13 @@ where
         match self {
             Self::Local(local) => local.retain_active_at(now),
             Self::Failover(failover) => failover.retain_local_active_at(now),
+        }
+    }
+
+    pub fn enforce_capacity(&self, max_entries: usize, now: Instant) {
+        match self {
+            Self::Local(local) => local.enforce_capacity(max_entries, now),
+            Self::Failover(failover) => failover.enforce_local_capacity(max_entries, now),
         }
     }
 
@@ -1136,6 +1207,26 @@ mod tests {
         )
     }
 
+    fn test_redis_limiter(
+        http_client: &PluginHttpClient,
+        algorithm: TestAlgorithm,
+    ) -> RedisLimiter<TestAlgorithm> {
+        match RedisLimiter::new(
+            "rate_limiting",
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379/0",
+                "redis_health_check_interval_seconds": 1
+            }),
+            http_client,
+            algorithm,
+        ) {
+            Ok(Some(limiter)) => limiter,
+            Ok(None) => panic!("redis limiter should be enabled by sync_mode=redis"),
+            Err(error) => panic!("redis limiter config should be valid: {error}"),
+        }
+    }
+
     #[test]
     fn fixed_window_weighted_math_matches_two_window_approximation() {
         let window = FixedWindow::new(10, 60);
@@ -1162,6 +1253,35 @@ mod tests {
         assert_eq!(denied.limit, Some(2));
     }
 
+    #[test]
+    fn local_limiter_enforce_capacity_removes_excess_entries() {
+        let limiter = LocalLimiter::new(TestAlgorithm {
+            redis_ok: Arc::new(AtomicBool::new(true)),
+        });
+        let op = TestOp;
+
+        for idx in 0..5 {
+            let key = format!("key:{idx}");
+            assert!(limiter.check(key, &op).allowed);
+        }
+        assert_eq!(limiter.tracked_keys_count(), 5);
+
+        limiter.enforce_capacity(3, Instant::now());
+        assert!(limiter.tracked_keys_count() <= 3);
+    }
+
+    #[test]
+    fn failover_limiter_new_without_runtime_does_not_panic() {
+        let http_client = namespaced_http_client("tenant-a");
+        let algorithm = TestAlgorithm {
+            redis_ok: Arc::new(AtomicBool::new(true)),
+        };
+        let local: LocalLimiter<String, TestAlgorithm> = LocalLimiter::new(algorithm.clone());
+        let redis = test_redis_limiter(&http_client, algorithm);
+
+        let _limiter = FailoverLimiter::new("rate_limiting", redis, local);
+    }
+
     #[tokio::test]
     async fn failover_limiter_falls_back_and_recovers() {
         let http_client = namespaced_http_client("tenant-a");
@@ -1170,17 +1290,7 @@ mod tests {
             redis_ok: Arc::clone(&redis_ok),
         };
         let local = LocalLimiter::new(algorithm.clone());
-        let redis = RedisLimiter::new(
-            "rate_limiting",
-            &json!({
-                "sync_mode": "redis",
-                "redis_url": "redis://127.0.0.1:6379/0",
-                "redis_health_check_interval_seconds": 1
-            }),
-            &http_client,
-            algorithm,
-        )
-        .unwrap();
+        let redis = test_redis_limiter(&http_client, algorithm);
         let limiter = FailoverLimiter::new("rate_limiting", redis, local);
         let op = TestOp;
 
@@ -1199,30 +1309,20 @@ mod tests {
 
     #[test]
     fn redis_limiter_centralizes_default_namespace_prefix() {
-        let default = RedisLimiter::new(
-            "rate_limiting",
-            &json!({
-                "sync_mode": "redis",
-                "redis_url": "redis://127.0.0.1:6379/0"
-            }),
-            &namespaced_http_client("ferrum"),
+        let default_client = namespaced_http_client("ferrum");
+        let default = test_redis_limiter(
+            &default_client,
             TestAlgorithm {
                 redis_ok: Arc::new(AtomicBool::new(true)),
             },
-        )
-        .unwrap();
-        let tenant = RedisLimiter::new(
-            "rate_limiting",
-            &json!({
-                "sync_mode": "redis",
-                "redis_url": "redis://127.0.0.1:6379/0"
-            }),
-            &namespaced_http_client("tenant-a"),
+        );
+        let tenant_client = namespaced_http_client("tenant-a");
+        let tenant = test_redis_limiter(
+            &tenant_client,
             TestAlgorithm {
                 redis_ok: Arc::new(AtomicBool::new(true)),
             },
-        )
-        .unwrap();
+        );
 
         assert_eq!(default.key_prefix(), "ferrum:rate_limiting");
         assert_eq!(tenant.key_prefix(), "tenant-a:rate_limiting");

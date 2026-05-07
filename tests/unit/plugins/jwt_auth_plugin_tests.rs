@@ -1,7 +1,9 @@
 //! Tests for jwt_auth plugin (proxy-side JWT authentication, not admin JWT)
 
 use ferrum_edge::ConsumerIndex;
-use ferrum_edge::plugins::{Plugin, RequestContext, jwt_auth::JwtAuth};
+use ferrum_edge::plugins::{
+    HTTP_FAMILY_PROTOCOLS, Plugin, RequestContext, jwt_auth::JwtAuth, priority,
+};
 use serde_json::json;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -36,6 +38,24 @@ async fn test_jwt_auth_plugin_creation() {
     assert_eq!(plugin.name(), "jwt_auth");
 }
 
+#[test]
+fn test_jwt_auth_plugin_contract() {
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+
+    assert_eq!(plugin.priority(), priority::JWT_AUTH);
+    assert_eq!(plugin.priority(), 1100);
+    assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
+    assert!(plugin.is_auth_plugin());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.requires_request_body_before_before_proxy());
+    assert!(!plugin.requires_request_body_before_authenticate());
+    assert!(!plugin.needs_request_body_bytes());
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
+    assert!(!plugin.applies_after_proxy_on_reject());
+}
+
 #[tokio::test]
 async fn test_jwt_auth_creation_with_config() {
     let plugin = JwtAuth::new(&json!({
@@ -44,6 +64,28 @@ async fn test_jwt_auth_creation_with_config() {
     }))
     .unwrap();
     assert_eq!(plugin.name(), "jwt_auth");
+}
+
+#[test]
+fn test_jwt_auth_rejects_invalid_config() {
+    let invalid_configs = [
+        json!(null),
+        json!(""),
+        json!({"token_lookup": 123}),
+        json!({"token_lookup": ""}),
+        json!({"token_lookup": "cookie:jwt"}),
+        json!({"token_lookup": "header:"}),
+        json!({"token_lookup": "query:"}),
+        json!({"consumer_claim_field": 123}),
+        json!({"consumer_claim_field": ""}),
+    ];
+
+    for config in invalid_configs {
+        assert!(
+            JwtAuth::new(&config).is_err(),
+            "config should be rejected: {config}"
+        );
+    }
 }
 
 #[tokio::test]

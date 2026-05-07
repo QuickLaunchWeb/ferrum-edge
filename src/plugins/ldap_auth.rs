@@ -38,7 +38,9 @@ use dashmap::DashMap;
 use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
 use rustls::ClientConfig;
 use rustls::pki_types::CertificateDer;
+use serde_json::Map;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
@@ -64,6 +66,7 @@ pub struct LdapAuth {
     group_base_dn: Option<String>,
     group_filter: Option<String>,
     required_groups: Vec<String>,
+    required_group_lookup: HashSet<String>,
     group_attribute: String,
     /// Use STARTTLS on ldap:// connections
     starttls: bool,
@@ -91,14 +94,11 @@ pub struct LdapAuth {
 
 impl LdapAuth {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        let ldap_url = config
-            .get("ldap_url")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                "ldap_auth: 'ldap_url' is required (e.g. \"ldap://ldap.example.com:389\" or \"ldaps://ldap.example.com:636\")".to_string()
-            })?
-            .to_string();
+        let config_obj = config
+            .as_object()
+            .ok_or_else(|| format!("ldap_auth: config must be an object, got: {config}"))?;
+
+        let ldap_url = parse_required_ldap_url(config_obj)?.to_owned();
 
         if !ldap_url.starts_with("ldap://") && !ldap_url.starts_with("ldaps://") {
             return Err(
@@ -106,35 +106,16 @@ impl LdapAuth {
             );
         }
 
-        let bind_dn_template = config
-            .get("bind_dn_template")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+        let bind_dn_template = parse_optional_string(config_obj, "bind_dn_template")?;
 
-        let search_base_dn = config
-            .get("search_base_dn")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+        let search_base_dn = parse_optional_string(config_obj, "search_base_dn")?;
 
-        let search_filter = config
-            .get("search_filter")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+        let search_filter = parse_optional_string(config_obj, "search_filter")?;
 
-        let service_account_dn = config
-            .get("service_account_dn")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+        let service_account_dn = parse_optional_string(config_obj, "service_account_dn")?;
 
-        let service_account_password = config
-            .get("service_account_password")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+        let service_account_password =
+            parse_optional_string(config_obj, "service_account_password")?;
 
         // Validate: must have either bind_dn_template or search-then-bind config
         let has_direct_bind = bind_dn_template.is_some();
@@ -173,29 +154,15 @@ impl LdapAuth {
         }
 
         // Group filtering config
-        let group_base_dn = config
-            .get("group_base_dn")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+        let group_base_dn = parse_optional_string(config_obj, "group_base_dn")?;
 
-        let group_filter = config
-            .get("group_filter")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+        let group_filter = parse_optional_string(config_obj, "group_filter")?;
 
-        let required_groups: Vec<String> = config
-            .get("required_groups")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let required_groups = parse_string_array(config_obj, "required_groups")?;
+        let required_group_lookup = required_groups
+            .iter()
+            .map(|group| group.to_lowercase())
+            .collect();
 
         if !required_groups.is_empty() && group_base_dn.is_none() {
             return Err(
@@ -203,16 +170,10 @@ impl LdapAuth {
             );
         }
 
-        let group_attribute = config
-            .get("group_attribute")
-            .and_then(|v| v.as_str())
-            .unwrap_or("cn")
-            .to_string();
+        let group_attribute =
+            parse_optional_string(config_obj, "group_attribute")?.unwrap_or_else(|| "cn".into());
 
-        let starttls = config
-            .get("starttls")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let starttls = parse_bool(config_obj, "starttls", false)?;
 
         if starttls && ldap_url.starts_with("ldaps://") {
             return Err(
@@ -221,25 +182,21 @@ impl LdapAuth {
             );
         }
 
-        let connect_timeout_secs = config
-            .get("connect_timeout_seconds")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(5);
+        let connect_timeout_secs = parse_u64(config_obj, "connect_timeout_seconds", 5)?;
+        if connect_timeout_secs == 0 {
+            return Err(
+                "ldap_auth: 'connect_timeout_seconds' must be greater than zero".to_string(),
+            );
+        }
 
-        let cache_ttl_secs = config
-            .get("cache_ttl_seconds")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let cache_ttl_secs = parse_u64(config_obj, "cache_ttl_seconds", 0)?;
 
-        let max_cache_entries = config
-            .get("max_cache_entries")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(10_000) as usize;
+        let max_cache_entries = parse_usize(config_obj, "max_cache_entries", 10_000)?;
+        if max_cache_entries == 0 {
+            return Err("ldap_auth: 'max_cache_entries' must be greater than zero".to_string());
+        }
 
-        let consumer_mapping = config
-            .get("consumer_mapping")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let consumer_mapping = parse_bool(config_obj, "consumer_mapping", true)?;
 
         let ldap_hostname = url::Url::parse(&ldap_url)
             .ok()
@@ -267,6 +224,7 @@ impl LdapAuth {
             group_base_dn,
             group_filter,
             required_groups,
+            required_group_lookup,
             group_attribute,
             starttls,
             connect_timeout: Duration::from_secs(connect_timeout_secs),
@@ -468,25 +426,18 @@ impl LdapAuth {
 
         let _ = ldap.unbind().await;
 
-        // Check if any returned group matches the required list
-        let required_lower: Vec<String> = self
-            .required_groups
-            .iter()
-            .map(|g| g.to_lowercase())
-            .collect();
-
         for result_entry in rs {
             let entry = SearchEntry::construct(result_entry);
             if let Some(group_names) = entry.attrs.get(&self.group_attribute) {
                 for name in group_names {
-                    if required_lower.contains(&name.to_lowercase()) {
+                    if self.required_group_lookup.contains(&name.to_lowercase()) {
                         return Ok(true);
                     }
                 }
             }
             // Also check the DN's CN component as a fallback
             if let Some(cn) = extract_cn_from_dn(&entry.dn)
-                && required_lower.contains(&cn.to_lowercase())
+                && self.required_group_lookup.contains(&cn.to_lowercase())
             {
                 return Ok(true);
             }
@@ -494,6 +445,92 @@ impl LdapAuth {
 
         Ok(false)
     }
+}
+
+fn parse_required_ldap_url(config: &Map<String, Value>) -> Result<&str, String> {
+    let Some(value) = config.get("ldap_url") else {
+        return Err(
+            "ldap_auth: 'ldap_url' is required (e.g. \"ldap://ldap.example.com:389\" or \"ldaps://ldap.example.com:636\")"
+                .to_string(),
+        );
+    };
+    let raw = value
+        .as_str()
+        .ok_or_else(|| format!("ldap_auth: 'ldap_url' must be a string, got: {value}"))?;
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err("ldap_auth: 'ldap_url' must not be empty".to_string());
+    }
+    Ok(value)
+}
+
+fn parse_optional_string(
+    config: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let raw = value
+        .as_str()
+        .ok_or_else(|| format!("ldap_auth: '{field}' must be a string, got: {value}"))?;
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(format!("ldap_auth: '{field}' must not be empty"));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn parse_bool(
+    config: &Map<String, Value>,
+    field: &str,
+    default_value: bool,
+) -> Result<bool, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(default_value);
+    };
+    value
+        .as_bool()
+        .ok_or_else(|| format!("ldap_auth: '{field}' must be a boolean, got: {value}"))
+}
+
+fn parse_u64(config: &Map<String, Value>, field: &str, default_value: u64) -> Result<u64, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(default_value);
+    };
+    value
+        .as_u64()
+        .ok_or_else(|| format!("ldap_auth: '{field}' must be an unsigned integer, got: {value}"))
+}
+
+fn parse_usize(
+    config: &Map<String, Value>,
+    field: &str,
+    default_value: usize,
+) -> Result<usize, String> {
+    let raw = parse_u64(config, field, default_value as u64)?;
+    usize::try_from(raw).map_err(|_| format!("ldap_auth: '{field}' is too large"))
+}
+
+fn parse_string_array(config: &Map<String, Value>, field: &str) -> Result<Vec<String>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(Vec::new());
+    };
+    let arr = value
+        .as_array()
+        .ok_or_else(|| format!("ldap_auth: '{field}' must be an array of strings, got: {value}"))?;
+    arr.iter()
+        .map(|item| {
+            let raw = item.as_str().ok_or_else(|| {
+                format!("ldap_auth: '{field}' entries must be strings, got: {item}")
+            })?;
+            let value = raw.trim();
+            if value.is_empty() {
+                return Err(format!("ldap_auth: '{field}' entries must not be empty"));
+            }
+            Ok(value.to_string())
+        })
+        .collect()
 }
 
 /// Build a rustls `ClientConfig` for LDAP connections.
@@ -705,28 +742,27 @@ impl AuthMechanism for LdapAuth {
             }
         };
 
-        let parts: Vec<&str> = credential_str.splitn(2, ':').collect();
-        if parts.len() != 2 {
+        let Some((username, password)) = credential_str.split_once(':') else {
             return ExtractedCredential::InvalidFormat(
                 r#"{"error":"Invalid Basic auth format"}"#.into(),
             );
-        }
+        };
 
-        if parts[0].is_empty() {
+        if username.is_empty() {
             return ExtractedCredential::InvalidFormat(
                 r#"{"error":"Username must not be empty"}"#.into(),
             );
         }
 
-        if parts[1].is_empty() {
+        if password.is_empty() {
             return ExtractedCredential::InvalidFormat(
                 r#"{"error":"Password must not be empty"}"#.into(),
             );
         }
 
         ExtractedCredential::BasicAuth {
-            username: parts[0].to_string(),
-            password: parts[1].to_string(),
+            username: username.to_string(),
+            password: password.to_string(),
         }
     }
 
@@ -846,22 +882,41 @@ mod tests {
         });
     }
 
+    fn must<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error}"),
+        }
+    }
+
+    fn must_some<T>(value: Option<T>, context: &str) -> T {
+        match value {
+            Some(value) => value,
+            None => panic!("{context}"),
+        }
+    }
+
     struct TestCa {
         cert_pem: String,
         issuer: Issuer<'static, KeyPair>,
     }
 
     fn generate_test_ca(cn: &str) -> TestCa {
-        let key_pair =
-            KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate CA key");
-        let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+        let key_pair = must(
+            KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256),
+            "generate CA key",
+        );
+        let mut params = must(
+            CertificateParams::new(Vec::<String>::new()),
+            "build CA params",
+        );
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, cn);
         params.key_usages.push(KeyUsagePurpose::KeyCertSign);
         params.key_usages.push(KeyUsagePurpose::DigitalSignature);
-        let cert = params.self_signed(&key_pair).expect("self-sign CA");
+        let cert = must(params.self_signed(&key_pair), "self-sign CA");
         TestCa {
             cert_pem: cert.pem(),
             issuer: Issuer::new(params, key_pair),
@@ -871,39 +926,50 @@ mod tests {
     /// Generate a leaf certificate (cert PEM + key PEM) signed by `ca` for the
     /// given SANs. Used to stand up a TLS listener in CA-exclusivity tests.
     fn generate_signed_leaf(ca: &TestCa, cn: &str, sans: &[&str]) -> (String, String) {
-        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
-        let mut params =
-            CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-                .expect("leaf params");
+        let key_pair = must(
+            KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256),
+            "generate leaf key",
+        );
+        let mut params = must(
+            CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+            "build leaf params",
+        );
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, cn);
-        let cert = params.signed_by(&key_pair, &ca.issuer).expect("sign leaf");
+        let cert = must(params.signed_by(&key_pair, &ca.issuer), "sign leaf");
         (cert.pem(), key_pair.serialize_pem())
     }
 
     fn write_pem_to_temp(pem: &str) -> NamedTempFile {
-        let mut f = NamedTempFile::new().expect("temp ca file");
-        f.write_all(pem.as_bytes()).expect("write ca pem");
+        let mut f = must(NamedTempFile::new(), "create temp CA file");
+        must(f.write_all(pem.as_bytes()), "write CA PEM");
         f
     }
 
     /// Build a rustls server `ServerConfig` from leaf PEM cert + PEM key.
     fn build_server_config(cert_pem: &str, key_pem: &str) -> Arc<rustls::ServerConfig> {
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
-            .collect::<Result<Vec<_>, _>>()
-            .expect("parse leaf cert");
-        let key: rustls::pki_types::PrivateKeyDer<'static> =
-            rustls_pemfile::private_key(&mut key_pem.as_bytes())
-                .expect("parse key")
-                .expect("present key");
+        let certs: Vec<CertificateDer<'static>> = must(
+            rustls_pemfile::certs(&mut cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>(),
+            "parse leaf cert",
+        );
+        let key: rustls::pki_types::PrivateKeyDer<'static> = must_some(
+            must(
+                rustls_pemfile::private_key(&mut key_pem.as_bytes()),
+                "parse private key",
+            ),
+            "private key should be present",
+        );
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let cfg = rustls::ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .expect("server protos")
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .expect("server cert");
+        let builder = must(
+            rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions(),
+            "configure TLS protocol versions",
+        );
+        let cfg = must(
+            builder.with_no_client_auth().with_single_cert(certs, key),
+            "build TLS server cert config",
+        );
         Arc::new(cfg)
     }
 
@@ -912,8 +978,8 @@ mod tests {
     async fn spawn_oneshot_tls_server(
         server_cfg: Arc<rustls::ServerConfig>,
     ) -> (u16, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let port = listener.local_addr().expect("addr").port();
+        let listener = must(TcpListener::bind("127.0.0.1:0").await, "bind TLS server");
+        let port = must(listener.local_addr(), "read TLS server local addr").port();
         let acceptor = TlsAcceptor::from(server_cfg);
         let task = tokio::spawn(async move {
             if let Ok((stream, _)) = listener.accept().await {
@@ -940,7 +1006,7 @@ mod tests {
     #[test]
     fn no_verify_returns_arc_clientconfig() {
         ensure_crypto_provider();
-        let cfg = build_ldap_tls_config(true, None).expect("config");
+        let cfg = must(build_ldap_tls_config(true, None), "build no-verify config");
         // Cheap structural smoke check: must be an Arc<ClientConfig>.
         let _: &ClientConfig = cfg.as_ref();
     }
@@ -948,14 +1014,14 @@ mod tests {
     #[test]
     fn missing_ca_bundle_path_falls_back_to_webpki() {
         ensure_crypto_provider();
-        let cfg = build_ldap_tls_config(false, None).expect("config");
+        let cfg = must(build_ldap_tls_config(false, None), "build webpki config");
         let _: &ClientConfig = cfg.as_ref();
     }
 
     #[test]
     fn empty_ca_bundle_rejected() {
         ensure_crypto_provider();
-        let f = NamedTempFile::new().expect("temp");
+        let f = must(NamedTempFile::new(), "create empty temp CA file");
         let err = build_ldap_tls_config(false, f.path().to_str()).unwrap_err();
         assert!(
             err.contains("no valid CA certificates"),
@@ -979,7 +1045,10 @@ mod tests {
         let (leaf_pem, leaf_key_pem) = generate_signed_leaf(&ca_a, "localhost", &["localhost"]);
 
         let ca_file = write_pem_to_temp(&ca_a.cert_pem);
-        let client_cfg = build_ldap_tls_config(false, ca_file.path().to_str()).expect("client cfg");
+        let client_cfg = must(
+            build_ldap_tls_config(false, ca_file.path().to_str()),
+            "build client config",
+        );
 
         let server_cfg = build_server_config(&leaf_pem, &leaf_key_pem);
         let (port, _task) = spawn_oneshot_tls_server(server_cfg).await;
@@ -1007,7 +1076,10 @@ mod tests {
 
         // Build config trusting only CA-A; server presents CA-B-signed cert.
         let ca_file = write_pem_to_temp(&ca_a.cert_pem);
-        let client_cfg = build_ldap_tls_config(false, ca_file.path().to_str()).expect("client cfg");
+        let client_cfg = must(
+            build_ldap_tls_config(false, ca_file.path().to_str()),
+            "build client config",
+        );
 
         let server_cfg = build_server_config(&leaf_pem_b, &leaf_key_pem_b);
         let (port, _task) = spawn_oneshot_tls_server(server_cfg).await;
@@ -1029,7 +1101,10 @@ mod tests {
         ensure_crypto_provider();
         let ca = generate_test_ca("Test CA Exclusive");
         let ca_file = write_pem_to_temp(&ca.cert_pem);
-        let store = build_ldap_root_store(ca_file.path().to_str()).expect("trust store");
+        let store = must(
+            build_ldap_root_store(ca_file.path().to_str()),
+            "build custom trust store",
+        );
         // Single CA in bundle → exactly 1 trust anchor.
         assert_eq!(
             store.len(),
@@ -1040,7 +1115,7 @@ mod tests {
 
         // Sanity: the no-CA path falls back to webpki bundled roots, which
         // is many anchors — proves our test setup wasn't trivially passing.
-        let webpki_store = build_ldap_root_store(None).expect("webpki store");
+        let webpki_store = must(build_ldap_root_store(None), "build webpki trust store");
         assert!(
             webpki_store.len() > 10,
             "webpki fallback should populate many trust anchors"
