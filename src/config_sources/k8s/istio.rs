@@ -446,14 +446,8 @@ fn select_weighted_route<'a>(
     };
 
     // Single destination: Istio sends all traffic to the lone destination.
-    if routes.len() == 1 {
-        let Some(route) = routes.first() else {
-            return Ok(RouteSelection {
-                route: None,
-                skipped_zero: 0,
-            });
-        };
-        let _ = route_weight(object, route, 1)?;
+    if let [route] = routes.as_slice() {
+        route_weight(object, route, 1)?;
         return Ok(RouteSelection {
             route: Some(route),
             skipped_zero: 0,
@@ -1156,6 +1150,36 @@ mod tests {
             options(),
         )
         .expect_err("negative VirtualService route weights are invalid");
+
+        assert!(
+            err.to_string()
+                .contains("route.weight must be zero or positive")
+        );
+    }
+
+    #[test]
+    fn virtual_service_rejects_negative_single_destination_weight() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "route": [{
+                            "destination": {
+                                "host": "stable.default.svc.cluster.local",
+                                "port": {"number": 8080}
+                            },
+                            "weight": -1
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err(
+            "negative VirtualService route weights are invalid even with a single destination",
+        );
 
         assert!(
             err.to_string()
