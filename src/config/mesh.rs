@@ -619,7 +619,7 @@ fn validate_mesh_config_internal(
                             "MeshPolicy '{}'.rules[{}].to[{}].hosts[{}] \
                              '{}' is not a valid host pattern \
                              (expected hostname, [ipv6], or host:port/host:* \
-                             with numeric or '*' port)",
+                             with u16 numeric or '*' port)",
                             policy.name, i, j, k, host
                         ));
                     }
@@ -976,5 +976,5 @@ fn is_request_match_host_port_token(token: &str) -> bool {
     if token == "*" {
         return true;
     }
-    !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_digit())
+    token.parse::<u16>().is_ok()
 }

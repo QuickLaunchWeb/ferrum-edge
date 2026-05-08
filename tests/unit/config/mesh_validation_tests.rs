@@ -218,6 +218,38 @@ fn mesh_policy_rejects_host_pattern_with_non_numeric_port() {
 }
 
 #[test]
+fn mesh_policy_rejects_host_pattern_with_out_of_range_port() {
+    let policy = policy_with_request_match(RequestMatch {
+        hosts: vec!["example.com:70000".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("not a valid host pattern")),
+        "expected host-pattern error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_bracketed_host_pattern_with_out_of_range_port() {
+    let policy = policy_with_request_match(RequestMatch {
+        hosts: vec!["[2001:db8::1]:70000".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("not a valid host pattern")),
+        "expected host-pattern error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
 fn mesh_policy_rejects_host_pattern_with_multiple_unbracketed_colons() {
     let policy = policy_with_request_match(RequestMatch {
         hosts: vec!["api.default:443:abc".into()],
