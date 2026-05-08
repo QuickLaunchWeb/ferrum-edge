@@ -147,6 +147,10 @@ See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_
 
 Mesh mode consumes Layer 2 mesh slices from the control protocols and prepares the shared sidecar/ambient data-plane listeners. Non-mesh modes do not instantiate this runtime.
 
+The native `MeshSubscribe` client reconnects with exponential backoff capped at 30 seconds and applies jitter to avoid synchronized reconnect storms. A clean stream end resets the next reconnect delay to the initial 1 second; connection errors increase the backoff.
+
+xDS snapshots are versioned from both the upstream slice/config version and a hash of translated resource content. This lets the xDS server rebuild and publish a new snapshot when resources change under the same source timestamp or base version.
+
 With the native `MeshSubscribe` protocol, mesh mode waits for the first delivered mesh slice before serving, builds the proxy/plugin runtime from that slice, and hot-applies later valid slices atomically. Invalid slice updates are logged and ignored so the last accepted runtime config keeps serving.
 
 | Variable | Required | Default | Description |
@@ -166,6 +170,8 @@ Capture plans reserve proxy UID `1337` by default so Ferrum's own outbound traff
 
 Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Prometheus plugin when mesh metadata is present. The added series are `ferrum_mesh_requests_total` and `ferrum_mesh_request_duration_ms`, labelled with source/destination workload, namespace, principal, app, service, request protocol, response code, response flags, and connection security policy.
 
+Mesh authorization normalizes policy header match names to lowercase at admission/plugin construction when doing so is unambiguous, so request-time checks use the already-lowercase header map without per-request key allocation. Case-variant duplicate header rules are preserved and evaluated together to avoid nondeterministic policy outcomes. Wildcard matches support `*` anywhere in the policy pattern while preserving anchored-prefix and anchored-suffix semantics.
+
 HBONE identity metadata is read from all `baggage` headers on authenticated HBONE requests where the peer already presented a SPIFFE identity. Baggage values may be percent-encoded, and Ferrum decodes them before extracting `source.principal` or `destination.principal`. Plain HTTP requests, or requests without an authenticated peer, cannot supply `source.principal` through baggage for `mesh_authz` or `workload_metrics`. Operators should treat trusted ztunnels/sidecars as the boundary that stamps workload baggage from accepted trust domains; Ferrum currently forwards baggage headers to backends rather than stripping them on egress.
 
 Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the canonical config. Remote clusters carry trust domains and federation endpoints, VM `WorkloadEntry` resources populate workload addresses/network/cluster metadata, and east-west gateway entries are materialized as SNI-routed passthrough stream proxies only in `east_west_gateway` topology.
@@ -173,6 +179,8 @@ Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the can
 ### Kubernetes Mesh Integration
 
 Phase D adds Kubernetes source translation and sidecar-injector scaffolding. Kubernetes resources translate into `GatewayConfig` / `MeshConfig`; no config source talks directly to the proxy runtime or xDS server.
+
+Gateway API `backendRefs` with `weight: 0` are skipped during translation and negative weights are rejected as invalid. Istio `VirtualService` destinations with `weight: 0` or an omitted split weight are skipped only when the HTTP route splits across multiple destinations; a single destination is preserved because Istio sends all traffic to the lone destination. Skipped zero-weight entries are reported in translation warnings.
 
 Translation notes: Istio `AuthorizationPolicy` resources preserve Istio's action semantics. An `ALLOW` policy with no `rules` is treated as allow-nothing for the selected workload, so it creates a mesh authorization rule that never matches instead of accidentally broadening access. `DENY` and `AUDIT` policies with no `rules` remain no-ops.
 
