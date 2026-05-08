@@ -876,6 +876,7 @@ async fn test_mtls_auth_stream_connect_identifies_consumer() {
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert_continue(result);
     assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "alice");
+    assert_eq!(ctx.auth_method, Some("mtls_auth"));
     assert_eq!(
         ctx.metadata
             .as_ref()
@@ -948,6 +949,7 @@ async fn test_mtls_auth_dtls_stream_connect_identifies_consumer() {
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert_continue(result);
     assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "bob");
+    assert_eq!(ctx.auth_method, Some("mtls_auth"));
 }
 
 #[tokio::test]

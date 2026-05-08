@@ -194,6 +194,25 @@ async fn test_ws_logging_ws_disconnect_does_not_panic() {
 }
 
 #[tokio::test]
+async fn test_ws_logging_ws_disconnect_with_auth_method() {
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://127.0.0.1:1/unreachable",
+            "batch_size": 1000,
+            "flush_interval_ms": 60000,
+            "max_retries": 0,
+            "buffer_capacity": 1
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = test_ws_disconnect_context();
+    ctx.auth_method = Some("jwt_auth");
+
+    plugin.on_ws_disconnect(&ctx).await;
+}
+
+#[tokio::test]
 async fn test_ws_logging_stream_disconnect_does_not_panic() {
     let plugin = WsLogging::new(
         &json!({
