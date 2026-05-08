@@ -117,9 +117,10 @@ struct RedisRateLimitHarness {
 
 impl RedisRateLimitHarness {
     async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let run_id = Uuid::new_v4().simple().to_string();
         let gw = TestGateway::builder()
-            .jwt_secret("test-redis-rl-jwt-secret-1234567890")
-            .jwt_issuer("ferrum-edge-redis-rl-test")
+            .jwt_secret(format!("test-redis-rl-jwt-secret-1234567890-{run_id}"))
+            .jwt_issuer(format!("ferrum-edge-redis-rl-test-{run_id}"))
             .log_level("debug")
             .env("FERRUM_TRUSTED_PROXIES", "127.0.0.1")
             .spawn()
