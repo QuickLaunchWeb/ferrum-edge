@@ -136,6 +136,12 @@ pub struct MeshRuntimeConfig {
     pub hbone_listen_addr: SocketAddr,
     pub east_west_listen_port: u16,
     pub workload_spiffe_id: Option<String>,
+    /// Operator-configured trust-domain aliases — additional SPIFFE trust
+    /// domains accepted as equivalent to the peer cert's trust domain when
+    /// validating HBONE baggage `source.principal`. Default empty: strict
+    /// same-trust-domain match. Mirror of Istio
+    /// `MeshConfig.trustDomainAliases`.
+    pub trust_domain_aliases: Vec<crate::identity::TrustDomain>,
 }
 
 impl MeshRuntimeConfig {
@@ -181,6 +187,13 @@ impl MeshRuntimeConfig {
         let workload_spiffe_id = resolve_ferrum_var("FERRUM_MESH_WORKLOAD_SPIFFE_ID")
             .filter(|value| !value.trim().is_empty());
 
+        let trust_domain_aliases = env_config
+            .mesh_trust_domain_aliases
+            .iter()
+            .map(|raw| crate::identity::TrustDomain::new(raw.as_str()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("FERRUM_MESH_TRUST_DOMAIN_ALIASES: {e}"))?;
+
         Ok(Self {
             node_id,
             namespace: env_config.namespace.clone(),
@@ -192,6 +205,7 @@ impl MeshRuntimeConfig {
             hbone_listen_addr,
             east_west_listen_port,
             workload_spiffe_id,
+            trust_domain_aliases,
         })
     }
 
@@ -453,11 +467,19 @@ fn inject_mesh_global_plugins(
         serde_json::json!({}),
         &runtime.namespace,
     );
+    let trust_domain_aliases: Vec<String> = runtime
+        .trust_domain_aliases
+        .iter()
+        .map(|td| td.as_str().to_string())
+        .collect();
     ensure_global_plugin(
         config,
         MESH_AUTHZ_PLUGIN_ID,
         "mesh_authz",
-        serde_json::json!({ "mesh_slice": mesh_slice }),
+        serde_json::json!({
+            "mesh_slice": mesh_slice,
+            "trust_domain_aliases": trust_domain_aliases,
+        }),
         &runtime.namespace,
     );
     ensure_global_plugin(
@@ -470,6 +492,7 @@ fn inject_mesh_global_plugins(
             "namespace": mesh_slice.namespace.clone(),
             "workload_spiffe_id": mesh_slice.workload_spiffe_id.clone(),
             "labels": mesh_slice.labels.clone(),
+            "trust_domain_aliases": trust_domain_aliases,
         }),
         &runtime.namespace,
     );
@@ -1274,6 +1297,7 @@ mod tests {
             hbone_listen_addr: "127.0.0.1:0".parse().unwrap(),
             east_west_listen_port: DEFAULT_EAST_WEST_LISTEN_PORT,
             workload_spiffe_id: None,
+            trust_domain_aliases: Vec::new(),
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
         let mesh_state = MeshRuntimeState::new();
@@ -1345,6 +1369,7 @@ mod tests {
             hbone_listen_addr: "127.0.0.1:0".parse().unwrap(),
             east_west_listen_port: DEFAULT_EAST_WEST_LISTEN_PORT,
             workload_spiffe_id: None,
+            trust_domain_aliases: Vec::new(),
         }
     }
 

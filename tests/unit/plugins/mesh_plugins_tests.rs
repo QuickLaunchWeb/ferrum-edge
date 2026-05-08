@@ -37,6 +37,27 @@ fn allow_client_policy(action: PolicyAction) -> MeshPolicy {
     }
 }
 
+fn allow_ztunnel_policy() -> MeshPolicy {
+    MeshPolicy {
+        name: "ztunnel-policy".to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector::default(),
+        },
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some("spiffe://cluster.local/ns/default/sa/ztunnel".to_string()),
+                namespace_pattern: None,
+                trust_domain: Some(TrustDomain::new("cluster.local").expect("trust domain")),
+            }],
+            to: Vec::new(),
+            when: Vec::new(),
+            never_matches: false,
+            action: PolicyAction::Allow,
+        }],
+    }
+}
+
 fn allow_host_policy(host: &str) -> MeshPolicy {
     MeshPolicy {
         name: "host-policy".to_string(),
@@ -632,6 +653,191 @@ async fn workload_metrics_uses_workload_hint_when_peer_identity_absent() {
             .get("mesh.request_protocol")
             .map(String::as_str),
         Some("grpc")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_drops_baggage_with_mismatched_trust_domain() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_ztunnel_policy()]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://attacker.local/ns/default/sa/client"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_baggage")
+            .map(String::as_str),
+        Some("trust_domain_mismatch")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_accepts_baggage_in_aliased_trust_domain() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trust_domain_aliases": ["cluster.local"]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://partner.local/ns/default/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("mesh_authz.ignored_baggage"));
+}
+
+#[tokio::test]
+async fn mesh_authz_rejected_baggage_mismatch_records_deny_policy() {
+    let plugin = MeshAuthz::new(&json!({
+        // Policy only allows the baggage workload identity. After we drop
+        // the cross-trust-domain baggage, the peer (ztunnel) identity
+        // doesn't match → reject.
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://attacker.local/ns/default/sa/client"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected reject, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_baggage")
+            .map(String::as_str),
+        Some("trust_domain_mismatch")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("trust_domain_mismatch")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_rejects_invalid_trust_domain_alias() {
+    let result = MeshAuthz::new(&json!({
+        "trust_domain_aliases": ["NotLowercase.Test"]
+    }));
+    let err = match result {
+        Ok(_) => panic!("invalid alias should fail construction"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("NotLowercase.Test"),
+        "error should mention bad alias, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_drops_baggage_with_mismatched_trust_domain() {
+    let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        "source.principal=spiffe://attacker.local/ns/default/sa/client".to_string(),
+    )]);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    // Baggage was dropped: source identity should be the ztunnel peer cert.
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/default/sa/ztunnel")
+    );
+    assert_eq!(
+        ctx.metadata.get("mesh.ignored_baggage").map(String::as_str),
+        Some("trust_domain_mismatch")
+    );
+    // Peer cert is real → mTLS reported even though baggage was rejected.
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.connection_security_policy")
+            .map(String::as_str),
+        Some("mutual_tls")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_accepts_baggage_in_aliased_trust_domain() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "trust_domain_aliases": ["cluster.local"]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://partner.local/ns/default/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/default/sa/client".to_string(),
+    )]);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/default/sa/client")
+    );
+    assert!(!ctx.metadata.contains_key("mesh.ignored_baggage"));
+}
+
+#[tokio::test]
+async fn workload_metrics_rejects_invalid_trust_domain_alias() {
+    let result = WorkloadMetrics::new(&json!({
+        "trust_domain_aliases": ["Bad.Trust"]
+    }));
+    let err = match result {
+        Ok(_) => panic!("invalid alias should fail construction"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("Bad.Trust"),
+        "error should mention bad alias, got: {err}"
     );
 }
 

@@ -154,6 +154,56 @@ fn parse_spiffe(value: &str) -> Option<SpiffeId> {
     SpiffeId::new(value).ok()
 }
 
+/// Filter a W3C `baggage` header value, removing any member whose key starts
+/// with one of the given prefixes. Member text — including any `;props`
+/// segment — is preserved verbatim for survivors so end-to-end tracing
+/// baggage round-trips unchanged.
+///
+/// Returns `Some(filtered)` when at least one member survives. Returns `None`
+/// when every member matched a prefix; the caller should remove the header
+/// entirely rather than send `baggage: ` with an empty value.
+///
+/// `key_prefixes` empty → input is returned unchanged with no parse cost
+/// (fast path for the default-disabled feature). Prefix matching is
+/// case-sensitive on the key, since W3C baggage keys use the `token`
+/// grammar (RFC 7230) which is also case-sensitive in baggage.
+///
+/// Limitation: members carrying commas inside quoted values (`a="x, y"`) are
+/// split incorrectly — this matches the existing baggage parser's behavior
+/// (it also splits unconditionally on `,`). Operators relying on quoted-comma
+/// values should not configure egress strip until both parsers gain quoted
+/// awareness.
+pub fn filter_baggage_header(raw: &str, key_prefixes: &[String]) -> Option<String> {
+    if key_prefixes.is_empty() {
+        return Some(raw.to_string());
+    }
+    let mut survivors: Vec<&str> = Vec::new();
+    for member in raw.split(',') {
+        let trimmed = member.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let key = match trimmed.split_once('=') {
+            Some((key, _)) => key.trim(),
+            None => {
+                // Malformed (no '='). Match the existing parser's
+                // pass-through behavior — keep the original member.
+                survivors.push(trimmed);
+                continue;
+            }
+        };
+        if key_prefixes.iter().any(|prefix| key.starts_with(prefix)) {
+            continue;
+        }
+        survivors.push(trimmed);
+    }
+    if survivors.is_empty() {
+        None
+    } else {
+        Some(survivors.join(","))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +262,76 @@ mod tests {
         assert_eq!(
             identity.baggage.get("source.principal").map(String::as_str),
             Some("spiffe://cluster.local/ns/default/sa/client")
+        );
+    }
+
+    #[test]
+    fn filter_baggage_header_empty_prefixes_returns_input_unchanged() {
+        let prefixes: Vec<String> = Vec::new();
+        assert_eq!(
+            filter_baggage_header("a=1,b=2", &prefixes),
+            Some("a=1,b=2".to_string())
+        );
+    }
+
+    #[test]
+    fn filter_baggage_header_strips_exact_prefix_and_keeps_others() {
+        let prefixes = vec!["source.".to_string()];
+        assert_eq!(
+            filter_baggage_header("source.principal=spiffe://x,userid=alice", &prefixes,),
+            Some("userid=alice".to_string())
+        );
+    }
+
+    #[test]
+    fn filter_baggage_header_drops_header_when_only_match_present() {
+        let prefixes = vec!["source.".to_string()];
+        assert_eq!(
+            filter_baggage_header("source.principal=spiffe://x", &prefixes),
+            None
+        );
+    }
+
+    #[test]
+    fn filter_baggage_header_preserves_props_on_survivors() {
+        let prefixes = vec!["source.".to_string()];
+        assert_eq!(
+            filter_baggage_header(
+                "userid=alice;ttl=300,source.principal=spiffe://x",
+                &prefixes,
+            ),
+            Some("userid=alice;ttl=300".to_string())
+        );
+    }
+
+    #[test]
+    fn filter_baggage_header_handles_whitespace_and_multiple_prefixes() {
+        let prefixes = vec!["source.".to_string(), "destination.".to_string()];
+        assert_eq!(
+            filter_baggage_header(
+                " source.principal=foo , destination.principal=bar , userid=alice ",
+                &prefixes,
+            ),
+            Some("userid=alice".to_string())
+        );
+    }
+
+    #[test]
+    fn filter_baggage_header_keeps_malformed_members() {
+        let prefixes = vec!["source.".to_string()];
+        assert_eq!(
+            filter_baggage_header("=novalue,a=1", &prefixes),
+            Some("=novalue,a=1".to_string())
+        );
+    }
+
+    #[test]
+    fn filter_baggage_header_skips_empty_members() {
+        let prefixes = vec!["source.".to_string()];
+        // Two adjacent commas produce an empty member — should not appear in output.
+        assert_eq!(
+            filter_baggage_header("userid=alice,,source.principal=foo", &prefixes),
+            Some("userid=alice".to_string())
         );
     }
 

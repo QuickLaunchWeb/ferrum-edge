@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
 use crate::config::mesh::MeshPolicy;
-use crate::identity::SpiffeId;
+use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
     MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
@@ -19,6 +19,10 @@ use crate::xds::slice::MeshSlice;
 
 pub struct MeshAuthz {
     slice: MeshSlice,
+    /// Additional SPIFFE trust domains accepted as equivalent to the peer
+    /// cert's trust domain when authorising HBONE baggage `source.principal`.
+    /// Default empty: strict same-trust-domain match.
+    trust_domain_aliases: Vec<TrustDomain>,
 }
 
 impl MeshAuthz {
@@ -36,7 +40,11 @@ impl MeshAuthz {
         } else {
             MeshSlice::default()
         };
-        Ok(Self { slice })
+        let trust_domain_aliases = parse_trust_domain_aliases(config)?;
+        Ok(Self {
+            slice,
+            trust_domain_aliases,
+        })
     }
 
     fn decision_to_result(
@@ -87,7 +95,13 @@ impl Plugin for MeshAuthz {
                 "unauthenticated_hbone".to_string(),
             );
         }
-        let source_principal = source_principal_from_request(ctx);
+        let (source_principal, trust_domain_mismatch) = self.resolve_source_principal(ctx);
+        if trust_domain_mismatch {
+            ctx.metadata.insert(
+                "mesh_authz.ignored_baggage".to_string(),
+                "trust_domain_mismatch".to_string(),
+            );
+        }
         // The proxy handler backfills HTTP/2/3 `:authority` into materialized
         // `host` before plugin phases run, so the materialized map is the
         // single source of truth here.
@@ -112,16 +126,21 @@ impl Plugin for MeshAuthz {
         };
         let decision = evaluate_mesh_authorization(&self.slice, &request);
         let result = self.decision_to_result(decision, &mut ctx.metadata);
-        if unauthenticated_hbone_baggage
-            && matches!(
-                result,
-                PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }
-            )
-        {
-            ctx.metadata.insert(
-                "mesh_authz.deny_policy".to_string(),
-                "unauthenticated_baggage".to_string(),
-            );
+        if matches!(
+            result,
+            PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }
+        ) {
+            if unauthenticated_hbone_baggage {
+                ctx.metadata.insert(
+                    "mesh_authz.deny_policy".to_string(),
+                    "unauthenticated_baggage".to_string(),
+                );
+            } else if trust_domain_mismatch {
+                ctx.metadata.insert(
+                    "mesh_authz.deny_policy".to_string(),
+                    "trust_domain_mismatch".to_string(),
+                );
+            }
         }
         result
     }
@@ -151,19 +170,59 @@ impl Plugin for MeshAuthz {
     }
 }
 
-fn source_principal_from_request(ctx: &RequestContext) -> Option<SpiffeId> {
-    if is_authenticated_hbone_request(ctx) {
-        // Ambient ztunnels authenticate the HBONE tunnel with their own SPIFFE
-        // cert, while baggage carries the originating workload identity. Trust
-        // baggage only after the peer is authenticated, and prefer that
-        // workload identity over the ztunnel's certificate identity.
-        return baggage_header_from_request(ctx)
+impl MeshAuthz {
+    /// Resolve the SPIFFE identity used for authz, applying the HBONE baggage
+    /// trust-domain check.
+    ///
+    /// Returns `(principal, trust_domain_mismatch)`. When the second tuple
+    /// element is `true`, baggage carried a `source.principal` whose trust
+    /// domain neither matched the peer cert's trust domain nor appeared in
+    /// the configured `trust_domain_aliases` — the baggage identity is
+    /// dropped and the peer cert (the ztunnel's own SPIFFE id) is used as
+    /// fallback. Caller stamps diagnostic metadata.
+    fn resolve_source_principal(&self, ctx: &RequestContext) -> (Option<SpiffeId>, bool) {
+        if !is_authenticated_hbone_request(ctx) {
+            return (ctx.peer_spiffe_id.clone(), false);
+        }
+        let Some(peer) = ctx.peer_spiffe_id.as_ref() else {
+            return (None, false);
+        };
+        let baggage_principal = baggage_header_from_request(ctx)
             .map(HboneIdentity::from_baggage_header)
-            .and_then(|identity| identity.source_principal)
-            .or_else(|| ctx.peer_spiffe_id.clone());
+            .and_then(|identity| identity.source_principal);
+        match baggage_principal {
+            Some(b) if self.trust_domain_allowed(peer.trust_domain(), b.trust_domain()) => {
+                (Some(b), false)
+            }
+            Some(_) => (Some(peer.clone()), true),
+            None => (Some(peer.clone()), false),
+        }
     }
 
-    ctx.peer_spiffe_id.clone()
+    fn trust_domain_allowed(&self, peer_td: &TrustDomain, baggage_td: &TrustDomain) -> bool {
+        peer_td == baggage_td
+            || self
+                .trust_domain_aliases
+                .iter()
+                .any(|alias| alias == baggage_td)
+    }
+}
+
+pub(crate) fn parse_trust_domain_aliases(config: &Value) -> Result<Vec<TrustDomain>, String> {
+    match config.get("trust_domain_aliases") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                let raw = item
+                    .as_str()
+                    .ok_or_else(|| "trust_domain_aliases entries must be strings".to_string())?;
+                TrustDomain::new(raw)
+                    .map_err(|e| format!("invalid trust_domain_aliases entry '{raw}': {e}"))
+            })
+            .collect(),
+        Some(_) => Err("trust_domain_aliases must be an array of strings".to_string()),
+    }
 }
 
 fn is_authenticated_hbone_request(ctx: &RequestContext) -> bool {
