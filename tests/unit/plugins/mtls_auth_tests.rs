@@ -127,6 +127,7 @@ fn create_stream_ctx_with_cert(
         consumer_index: Arc::new(ConsumerIndex::new(&consumers)),
         identified_consumer: None,
         authenticated_identity: None,
+        auth_method: None,
         metadata: None,
         tls_client_cert_der: Some(Arc::new(cert_der)),
         tls_client_cert_chain_der: None,
@@ -875,6 +876,7 @@ async fn test_mtls_auth_stream_connect_identifies_consumer() {
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert_continue(result);
     assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "alice");
+    assert_eq!(ctx.auth_method, Some("mtls_auth"));
     assert_eq!(
         ctx.metadata
             .as_ref()
@@ -882,6 +884,20 @@ async fn test_mtls_auth_stream_connect_identifies_consumer() {
             .map(String::as_str),
         Some("alice")
     );
+}
+
+#[tokio::test]
+async fn test_mtls_auth_stream_connect_does_not_overwrite_existing_auth_method() {
+    let cert_der = create_test_cert("client.example.com", None, None);
+    let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
+    let mut ctx = create_stream_ctx_with_cert(cert_der, vec![consumer]);
+    ctx.auth_method = Some("custom_stream_auth");
+
+    let result = plugin.on_stream_connect(&mut ctx).await;
+    assert_continue(result);
+    assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "alice");
+    assert_eq!(ctx.auth_method, Some("custom_stream_auth"));
 }
 
 #[tokio::test]
@@ -911,6 +927,7 @@ fn create_udp_stream_ctx_with_cert(
         consumer_index: Arc::new(ConsumerIndex::new(&consumers)),
         identified_consumer: None,
         authenticated_identity: None,
+        auth_method: None,
         metadata: None,
         tls_client_cert_der: Some(Arc::new(cert_der)),
         tls_client_cert_chain_der: None,
@@ -928,6 +945,7 @@ fn create_udp_stream_ctx_no_cert(consumers: Vec<Consumer>) -> StreamConnectionCo
         consumer_index: Arc::new(ConsumerIndex::new(&consumers)),
         identified_consumer: None,
         authenticated_identity: None,
+        auth_method: None,
         metadata: None,
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
@@ -945,6 +963,7 @@ async fn test_mtls_auth_dtls_stream_connect_identifies_consumer() {
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert_continue(result);
     assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "bob");
+    assert_eq!(ctx.auth_method, Some("mtls_auth"));
 }
 
 #[tokio::test]
@@ -989,6 +1008,7 @@ async fn test_mtls_auth_dtls_with_issuer_verification() {
         consumer_index: Arc::new(ConsumerIndex::new(&[consumer])),
         identified_consumer: None,
         authenticated_identity: None,
+        auth_method: None,
         metadata: None,
         tls_client_cert_der: Some(Arc::new(client_der)),
         tls_client_cert_chain_der: Some(Arc::new(vec![ca_der])),
@@ -1021,6 +1041,7 @@ async fn test_mtls_auth_dtls_issuer_verification_rejects_mismatch() {
         consumer_index: Arc::new(ConsumerIndex::new(&[consumer])),
         identified_consumer: None,
         authenticated_identity: None,
+        auth_method: None,
         metadata: None,
         tls_client_cert_der: Some(Arc::new(client_der)),
         tls_client_cert_chain_der: Some(Arc::new(vec![ca_der])),

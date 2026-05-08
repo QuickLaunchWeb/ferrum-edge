@@ -125,7 +125,7 @@ pub(crate) use impl_auth_plugin;
 
 #[async_trait]
 pub trait AuthMechanism: Send + Sync {
-    fn mechanism_name(&self) -> &str;
+    fn mechanism_name(&self) -> &'static str;
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential;
 
@@ -172,6 +172,10 @@ async fn run_auth_impl<M: AuthMechanism>(
                 external_identity,
                 external_identity_header,
             } => {
+                let consumer_identified = consumer.is_some();
+                let external_identity_identified =
+                    allow_external_identity && external_identity.is_some();
+
                 if let Some(consumer) = consumer
                     && ctx.identified_consumer.is_none()
                 {
@@ -192,6 +196,11 @@ async fn run_auth_impl<M: AuthMechanism>(
                     }
                 }
 
+                if ctx.auth_method.is_none()
+                    && (consumer_identified || external_identity_identified)
+                {
+                    ctx.auth_method = Some(mechanism.mechanism_name());
+                }
                 PluginResult::Continue
             }
             VerifyOutcome::NotApplicable => PluginResult::Continue,
@@ -249,7 +258,7 @@ mod tests {
 
     #[async_trait]
     impl AuthMechanism for FakeMechanism {
-        fn mechanism_name(&self) -> &str {
+        fn mechanism_name(&self) -> &'static str {
             "fake_auth"
         }
 
@@ -395,6 +404,90 @@ mod tests {
             ctx.authenticated_identity_header.as_deref(),
             Some("Alice Example")
         );
+    }
+
+    #[tokio::test]
+    async fn auth_method_set_on_consumer_success() {
+        let consumer = Arc::new(test_consumer());
+        let mechanism = FakeMechanism {
+            extracted: ExtractedCredential::ApiKey("key".to_string()),
+            outcome: VerifyOutcome::Success {
+                consumer: Some(Arc::clone(&consumer)),
+                external_identity: None,
+                external_identity_header: None,
+            },
+        };
+        let mut ctx = test_ctx();
+        let index = ConsumerIndex::new(&[]);
+
+        run_auth(&mechanism, &mut ctx, &index).await;
+
+        assert_eq!(ctx.auth_method, Some("fake_auth"));
+    }
+
+    #[tokio::test]
+    async fn auth_method_set_on_external_identity_success() {
+        let mechanism = FakeMechanism {
+            extracted: ExtractedCredential::BearerToken("token".to_string()),
+            outcome: VerifyOutcome::Success {
+                consumer: None,
+                external_identity: Some("alice@example.com".to_string()),
+                external_identity_header: None,
+            },
+        };
+        let mut ctx = test_ctx();
+        let index = ConsumerIndex::new(&[]);
+
+        run_auth_external_identity(&mechanism, &mut ctx, &index).await;
+
+        assert_eq!(ctx.auth_method, Some("fake_auth"));
+    }
+
+    #[tokio::test]
+    async fn auth_method_none_on_missing_credential() {
+        let mechanism = FakeMechanism {
+            extracted: ExtractedCredential::Missing,
+            outcome: VerifyOutcome::NotApplicable,
+        };
+        let mut ctx = test_ctx();
+        let index = ConsumerIndex::new(&[]);
+
+        run_auth(&mechanism, &mut ctx, &index).await;
+
+        assert!(ctx.auth_method.is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_method_none_on_rejection() {
+        let mechanism = FakeMechanism {
+            extracted: ExtractedCredential::ApiKey("bad".to_string()),
+            outcome: VerifyOutcome::Invalid(r#"{"error":"bad"}"#.to_string()),
+        };
+        let mut ctx = test_ctx();
+        let index = ConsumerIndex::new(&[]);
+
+        run_auth(&mechanism, &mut ctx, &index).await;
+
+        assert!(ctx.auth_method.is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_method_none_when_success_establishes_no_identity() {
+        let mechanism = FakeMechanism {
+            extracted: ExtractedCredential::BearerToken("token".to_string()),
+            outcome: VerifyOutcome::Success {
+                consumer: None,
+                external_identity: None,
+                external_identity_header: None,
+            },
+        };
+        let mut ctx = test_ctx();
+        let index = ConsumerIndex::new(&[]);
+
+        run_auth_external_identity(&mechanism, &mut ctx, &index).await;
+
+        assert!(ctx.effective_identity().is_none());
+        assert!(ctx.auth_method.is_none());
     }
 
     #[tokio::test]

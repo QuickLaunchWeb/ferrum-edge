@@ -91,6 +91,8 @@ struct UdpSession {
     /// Identified consumer username (gateway Consumer or external identity) resolved
     /// during `on_stream_connect`. Carried to `on_stream_disconnect` for logging.
     consumer_username: Option<String>,
+    /// Authentication mechanism that succeeded, carried to `on_stream_disconnect`.
+    auth_method: Option<&'static str>,
     /// Plugin metadata from on_stream_connect, carried to on_stream_disconnect.
     metadata: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// Plugins and proxy metadata resolved from the RequestEpoch used to create this session.
@@ -251,6 +253,7 @@ fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransact
         proxy_name: context.proxy_name.map(|name| name.to_string()),
         client_ip: context.client_addr.ip().to_string(),
         consumer_username: context.session.consumer_username.clone(),
+        auth_method: context.session.auth_method,
         backend_target: context.session.backend_target.clone(),
         backend_resolved_ip: Some(context.session.backend_resolved_ip.clone()),
         protocol: context.backend_scheme.to_string(),
@@ -289,6 +292,7 @@ struct DtlsDisconnectContext<'a> {
     proxy_name: Option<&'a str>,
     client_addr: SocketAddr,
     consumer_username: Option<String>,
+    auth_method: Option<&'static str>,
     backend_target: &'a str,
     backend_resolved_ip: Option<&'a str>,
     backend_scheme: BackendScheme,
@@ -311,6 +315,7 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
         proxy_name: context.proxy_name.map(|name| name.to_string()),
         client_ip: context.client_addr.ip().to_string(),
         consumer_username: context.consumer_username,
+        auth_method: context.auth_method,
         backend_target: context.backend_target.to_string(),
         backend_resolved_ip: context.backend_resolved_ip.map(str::to_string),
         protocol: context.backend_scheme.to_string(),
@@ -1452,6 +1457,7 @@ async fn start_dtls_frontend_listener(
                     consumer_index,
                     identified_consumer: None,
                     authenticated_identity: None,
+                    auth_method: None,
                     metadata: None,
                     tls_client_cert_der: client_conn.tls_client_cert_der.clone(),
                     tls_client_cert_chain_der: client_conn.tls_client_cert_chain_der.clone(),
@@ -1506,6 +1512,7 @@ async fn start_dtls_frontend_listener(
                 let handler_proxy_name = proxy_name.clone();
                 let handler_proxy_namespace = proxy_namespace.clone();
                 let handler_consumer_username = stream_ctx.effective_identity().map(str::to_owned);
+                let handler_auth_method = stream_ctx.auth_method;
                 let handler_metadata = stream_ctx.take_metadata();
                 let handler_cb_cache = circuit_breaker_cache.clone();
                 let connected_at = chrono::Utc::now();
@@ -1574,6 +1581,7 @@ async fn start_dtls_frontend_listener(
                             proxy_name: handler_proxy_name.as_deref(),
                             client_addr,
                             consumer_username: handler_consumer_username.clone(),
+                            auth_method: handler_auth_method,
                             backend_target: &result.backend.backend_target,
                             backend_resolved_ip: result.backend.backend_resolved_ip.as_deref(),
                             backend_scheme,
@@ -2220,6 +2228,7 @@ async fn create_session(
         consumer_index,
         identified_consumer: None,
         authenticated_identity: None,
+        auth_method: None,
         metadata: None,
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
@@ -2410,6 +2419,7 @@ async fn create_session(
 
     let now = coarse_epoch_millis();
     let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
+    let auth_method = stream_ctx.auth_method;
     let session = Arc::new(UdpSession {
         backend_socket: backend_socket.clone(),
         dtls_conn: dtls_conn.clone(),
@@ -2423,6 +2433,7 @@ async fn create_session(
         backend_resolved_ip: resolved_ip.to_string(),
         sni_hostname: stream_ctx.sni_hostname.clone(),
         consumer_username,
+        auth_method,
         metadata: std::sync::Mutex::new(stream_ctx.take_metadata()),
         local_addr: std::sync::OnceLock::new(),
         plugins: Arc::clone(&plugins),
@@ -3078,6 +3089,7 @@ mod tests {
             backend_resolved_ip: "10.0.0.50".to_string(),
             sni_hostname: None,
             consumer_username: None,
+            auth_method: None,
             metadata: std::sync::Mutex::new(HashMap::from([(
                 "request_id".to_string(),
                 "stream-123".to_string(),
@@ -3112,6 +3124,7 @@ mod tests {
             proxy_name: Some("DTLS Proxy"),
             client_addr,
             consumer_username: Some("alice".to_string()),
+            auth_method: None,
             backend_target: "10.0.0.60:7443",
             backend_resolved_ip: Some("10.0.0.60"),
             backend_scheme: BackendScheme::Dtls,
@@ -3350,6 +3363,7 @@ mod tests {
             backend_resolved_ip: "10.0.0.50".to_string(),
             sni_hostname: None,
             consumer_username: None,
+            auth_method: None,
             metadata: std::sync::Mutex::new(HashMap::new()),
             local_addr: std::sync::OnceLock::new(),
             plugins: Arc::new(Vec::new()),

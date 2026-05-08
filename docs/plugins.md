@@ -657,6 +657,7 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `timestamp_received` | String (RFC 3339) | Request arrival time (UTC) |
 | `client_ip` | String | Client IP after trusted-proxy resolution |
 | `consumer_username` | String or null | Authenticated identity used for policy/logging: mapped Consumer username when present, otherwise external `authenticated_identity`; null if unauthenticated |
+| `auth_method` | String or null | Authentication mechanism that succeeded (for example, `jwt_auth`, `key_auth`, `mtls_auth`, `basic_auth`, `hmac_auth`, `ldap_auth`, or `jwks_auth`); omitted from JSON when null |
 | `http_method` | String | HTTP method (e.g., `GET`, `POST`) |
 | `request_path` | String | Request path (query string stripped) |
 | `proxy_id` | String or null | Proxy ID that matched the route (null for unmatched) |
@@ -680,7 +681,7 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `bytes_streamed_to_client` | u64 | Actual bytes written to the client socket. May be less than the backend's advertised `Content-Length` when streaming was interrupted |
 | `metadata` | Object | Plugin-injected key-value pairs (correlation ID, trace ID, etc.) |
 
-**Notes on conditional fields:** `response_streamed`, `client_disconnected`, `backend_resolved_ip`, `error_class`, and `body_error_class` are omitted from the JSON output when false/null to keep log entries compact.
+**Notes on conditional fields:** `auth_method`, `response_streamed`, `client_disconnected`, `backend_resolved_ip`, `error_class`, and `body_error_class` are omitted from the JSON output when false/null to keep log entries compact.
 
 **`error_class` vs `body_error_class`:** `error_class` covers failures before or during the response header exchange (connect, TLS, DNS, pool, pre-header timeouts). `body_error_class` covers failures observed while streaming the response body after headers were sent. A transaction can have one, the other, both, or neither. A forthcoming `DeferredTransactionLogger` will move the `log` phase to body-completion so `body_error_class`, `body_completed`, and `bytes_streamed_to_client` reflect the full client-visible outcome.
 
@@ -711,6 +712,7 @@ Only set when the gateway itself could not communicate with the backend (or when
 | `proxy_name` | String or null | Proxy name |
 | `client_ip` | String | Client IP |
 | `consumer_username` | String or null | Identified consumer username (gateway Consumer) or external authenticated identity resolved during `on_stream_connect`. Omitted from JSON when null |
+| `auth_method` | String or null | Authentication mechanism that succeeded during `on_stream_connect`; omitted from JSON when null |
 | `backend_target` | String | Backend target (`host:port`); empty if target resolution failed before LB/config lookup |
 | `backend_resolved_ip` | String or null | DNS-resolved backend IP; omitted from JSON when null |
 | `protocol` | String | Protocol string: `tcp`, `tcps`, `udp`, or `dtls` |

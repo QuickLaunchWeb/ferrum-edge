@@ -34,6 +34,7 @@ fn test_ws_disconnect_context() -> WsDisconnectContext {
         direction: Some(Direction::ClientToBackend),
         error_class: None,
         consumer_username: Some("alice".to_string()),
+        auth_method: None,
         metadata,
     }
 }
@@ -189,6 +190,25 @@ async fn test_ws_logging_ws_disconnect_does_not_panic() {
     let ctx = test_ws_disconnect_context();
 
     plugin.on_ws_disconnect(&ctx).await;
+    plugin.on_ws_disconnect(&ctx).await;
+}
+
+#[tokio::test]
+async fn test_ws_logging_ws_disconnect_with_auth_method() {
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://127.0.0.1:1/unreachable",
+            "batch_size": 1000,
+            "flush_interval_ms": 60000,
+            "max_retries": 0,
+            "buffer_capacity": 1
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = test_ws_disconnect_context();
+    ctx.auth_method = Some("jwt_auth");
+
     plugin.on_ws_disconnect(&ctx).await;
 }
 

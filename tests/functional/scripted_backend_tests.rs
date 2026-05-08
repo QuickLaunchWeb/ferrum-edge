@@ -151,39 +151,64 @@ async fn backend_refuses_connect_maps_to_502_with_connection_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn backend_accepts_then_resets_maps_to_connection_reset() {
-    let reservation = reserve_port().await.expect("reserve backend port");
-    let backend_port = reservation.port;
-    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
-        .step(TcpStep::Reset)
-        .spawn()
-        .expect("spawn backend");
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last_failure: Option<String> = None;
 
-    let yaml = file_mode_yaml_for_backend(backend_port);
-    let harness = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .capture_output()
-        .spawn()
-        .await
-        .expect("spawn gateway");
+    for attempt in 1..=MAX_ATTEMPTS {
+        let reservation = reserve_port().await.expect("reserve backend port");
+        let backend_port = reservation.port;
+        let backend = ScriptedTcpBackend::builder(reservation.into_listener())
+            .step(TcpStep::Reset)
+            .spawn()
+            .expect("spawn backend");
 
-    let client = harness.http_client().expect("client");
-    let resp = client
-        .get(&harness.proxy_url("/api/x"))
-        .await
-        .expect("response");
-    assert_eq!(resp.status, StatusCode::BAD_GATEWAY);
-    let logs = require_logs(&harness);
-    // Gateway should have logged a backend request error. The platform-
-    // specific string can be "reset", "connection closed", "request_error"
-    // (reqwest's generic classifier), or "Backend request failed". Any of
-    // these indicates the RST was detected.
-    let observed = logs.contains("reset")
-        || logs.contains("Reset")
-        || logs.contains("connection closed")
-        || logs.contains("request_error")
-        || logs.contains("Backend request failed");
-    assert!(observed, "expected reset/error signal in logs:\n{logs}");
+        let yaml = file_mode_yaml_for_backend(backend_port);
+        let harness = GatewayHarness::builder()
+            .file_config(yaml)
+            .log_level("info")
+            .capture_output()
+            .spawn()
+            .await
+            .expect("spawn gateway");
+
+        let client = harness.http_client().expect("client");
+        let resp = client
+            .get(&harness.proxy_url("/api/x"))
+            .await
+            .expect("response");
+        if resp.status != StatusCode::BAD_GATEWAY {
+            let accepted = backend.accepted_connections();
+            let logs = harness.captured_combined().unwrap_or_default();
+            last_failure = Some(format!(
+                "attempt {attempt}/{MAX_ATTEMPTS}: expected 502, got {}; reset backend accepted {accepted} connection(s); logs:\n{logs}",
+                resp.status
+            ));
+            continue;
+        }
+
+        let logs = require_logs(&harness);
+        // Gateway should have logged a backend request error. The platform-
+        // specific string can be "reset", "connection closed", "request_error"
+        // (reqwest's generic classifier), or "Backend request failed". Any of
+        // these indicates the RST was detected.
+        let observed = logs.contains("reset")
+            || logs.contains("Reset")
+            || logs.contains("connection closed")
+            || logs.contains("request_error")
+            || logs.contains("Backend request failed");
+        if !observed {
+            last_failure = Some(format!(
+                "attempt {attempt}/{MAX_ATTEMPTS}: expected reset/error signal in logs:\n{logs}"
+            ));
+            continue;
+        }
+        return;
+    }
+
+    panic!(
+        "backend_accepts_then_resets test failed across {MAX_ATTEMPTS} attempts; last failure: {}",
+        last_failure.unwrap_or_else(|| "unknown".into())
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────

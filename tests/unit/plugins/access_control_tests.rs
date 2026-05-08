@@ -22,6 +22,7 @@ fn create_stream_context(
         consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
         identified_consumer: consumer,
         authenticated_identity: None,
+        auth_method: None,
         metadata: None,
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,

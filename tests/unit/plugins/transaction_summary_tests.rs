@@ -12,6 +12,7 @@ fn make_full_summary() -> TransactionSummary {
         timestamp_received: "2026-03-25T12:00:00Z".to_string(),
         client_ip: "10.0.0.1".to_string(),
         consumer_username: Some("alice".to_string()),
+        auth_method: None,
         http_method: "POST".to_string(),
         request_path: "/v1/users".to_string(),
         proxy_id: Some("proxy-users".to_string()),
@@ -410,6 +411,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
         proxy_name: Some("TCP Backend".to_string()),
         client_ip: "10.0.0.1".to_string(),
         consumer_username: None,
+        auth_method: None,
         backend_target: "10.0.0.50:5432".to_string(),
         backend_resolved_ip: Some("10.0.0.50".to_string()),
         protocol: "tcp".to_string(),
@@ -798,6 +800,54 @@ fn test_summary_omits_metadata_when_empty_for_stream_summary() {
     assert!(
         !json.contains("\"metadata\""),
         "Empty stream metadata should be skipped, got: {}",
+        json
+    );
+}
+
+// ── auth_method serialization ──────────────────────────────────────────
+
+#[test]
+fn test_auth_method_serialized_when_present() {
+    let mut summary = make_full_summary();
+    summary.auth_method = Some("jwt_auth");
+    let json = serde_json::to_string(&summary).unwrap();
+    assert!(
+        json.contains(r#""auth_method":"jwt_auth""#),
+        "auth_method should appear in JSON when set, got: {}",
+        json
+    );
+}
+
+#[test]
+fn test_auth_method_omitted_when_none() {
+    let summary = make_full_summary();
+    let json = serde_json::to_string(&summary).unwrap();
+    assert!(
+        !json.contains("auth_method"),
+        "auth_method should be omitted from JSON when None, got: {}",
+        json
+    );
+}
+
+#[test]
+fn test_stream_auth_method_serialized_when_present() {
+    let mut summary = make_stream_summary();
+    summary.auth_method = Some("mtls_auth");
+    let json = serde_json::to_string(&summary).unwrap();
+    assert!(
+        json.contains(r#""auth_method":"mtls_auth""#),
+        "stream auth_method should appear in JSON when set, got: {}",
+        json
+    );
+}
+
+#[test]
+fn test_stream_auth_method_omitted_when_none() {
+    let summary = make_stream_summary();
+    let json = serde_json::to_string(&summary).unwrap();
+    assert!(
+        !json.contains("auth_method"),
+        "stream auth_method should be omitted from JSON when None, got: {}",
         json
     );
 }

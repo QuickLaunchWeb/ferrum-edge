@@ -471,6 +471,7 @@ pub(super) async fn handle_hbone_request(
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
             client_ip: ctx.client_ip.clone(),
             consumer_username: ctx.effective_identity().map(str::to_owned),
+            auth_method: ctx.auth_method,
             http_method: method.to_string(),
             request_path: ctx.path.clone(),
             proxy_id: Some(proxy.id.clone()),

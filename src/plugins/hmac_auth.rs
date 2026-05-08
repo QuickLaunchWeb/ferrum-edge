@@ -184,7 +184,7 @@ impl HmacAuth {
 
 #[async_trait]
 impl AuthMechanism for HmacAuth {
-    fn mechanism_name(&self) -> &str {
+    fn mechanism_name(&self) -> &'static str {
         "hmac_auth"
     }
 

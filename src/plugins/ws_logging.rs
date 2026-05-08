@@ -50,6 +50,8 @@ struct WsDisconnectLogEntry {
     proxy_name: Option<String>,
     client_ip: String,
     consumer_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_method: Option<&'static str>,
     backend_target: String,
     protocol: &'static str,
     listen_port: u16,
@@ -74,6 +76,7 @@ impl From<&WsDisconnectContext> for WsDisconnectLogEntry {
             proxy_name: ctx.proxy_name.clone(),
             client_ip: ctx.client_ip.clone(),
             consumer_username: ctx.consumer_username.clone(),
+            auth_method: ctx.auth_method,
             backend_target: ctx.backend_target.clone(),
             protocol: "websocket",
             listen_port: ctx.listen_port,

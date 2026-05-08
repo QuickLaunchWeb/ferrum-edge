@@ -3718,6 +3718,7 @@ async fn handle_websocket_request_authenticated(
                             timestamp_received: ctx.timestamp_received.to_rfc3339(),
                             client_ip: ctx.client_ip.clone(),
                             consumer_username: ctx.effective_identity().map(str::to_owned),
+                            auth_method: ctx.auth_method,
                             http_method: ws_err_method.to_string(),
                             request_path: ctx.path.clone(),
                             proxy_id: Some(proxy.id.clone()),
@@ -3787,6 +3788,7 @@ async fn handle_websocket_request_authenticated(
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
         consumer_username: ctx.effective_identity().map(str::to_owned),
+        auth_method: ctx.auth_method,
         http_method: ws_method.to_string(),
         request_path: ctx.path.clone(),
         proxy_id: Some(proxy.id.clone()),
@@ -3924,6 +3926,7 @@ async fn handle_websocket_request_authenticated(
         backend_target: strip_query_params(&current_backend_url).to_string(),
         listen_port,
         consumer_username: ctx.effective_identity().map(str::to_owned),
+        auth_method: ctx.auth_method,
         metadata: ctx.metadata.clone(),
         session_start: chrono::Utc::now(),
     };
@@ -4302,6 +4305,7 @@ pub struct WsSessionMeta {
     pub backend_target: String,
     pub listen_port: u16,
     pub consumer_username: Option<String>,
+    pub auth_method: Option<&'static str>,
     pub metadata: HashMap<String, String>,
     pub session_start: chrono::DateTime<chrono::Utc>,
 }
@@ -4345,6 +4349,7 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
         direction: failure.as_ref().map(|(d, _)| *d),
         error_class: failure.map(|(_, c)| c),
         consumer_username: session_meta.consumer_username.clone(),
+        auth_method: session_meta.auth_method,
         metadata: session_meta.metadata.clone(),
     };
     for plugin in ws_disconnect_plugins {
@@ -4849,6 +4854,7 @@ async fn run_websocket_proxy(
             direction: failure.as_ref().map(|(d, _)| *d),
             error_class: failure.map(|(_, c)| c),
             consumer_username: session_meta.consumer_username,
+            auth_method: session_meta.auth_method,
             metadata: session_meta.metadata,
         };
         for plugin in &ws_disconnect_plugins {
@@ -5368,6 +5374,7 @@ pub async fn log_rejected_request(
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
         consumer_username: ctx.effective_identity().map(str::to_owned),
+        auth_method: ctx.auth_method,
         http_method: ctx.method.clone(),
         request_path: ctx.path.clone(),
         proxy_id: proxy.map(|p| p.id.clone()),
@@ -7179,6 +7186,7 @@ async fn handle_proxy_request_inner(
                         timestamp_received: ctx.timestamp_received.to_rfc3339(),
                         client_ip: ctx.client_ip.clone(),
                         consumer_username: ctx.effective_identity().map(str::to_owned),
+                        auth_method: ctx.auth_method,
                         http_method: method,
                         request_path: path,
                         proxy_id: Some(proxy.id.clone()),
@@ -7499,6 +7507,7 @@ async fn handle_proxy_request_inner(
                         timestamp_received: ctx.timestamp_received.to_rfc3339(),
                         client_ip: ctx.client_ip.clone(),
                         consumer_username: ctx.effective_identity().map(str::to_owned),
+                        auth_method: ctx.auth_method,
                         http_method: method,
                         request_path: path,
                         proxy_id: Some(proxy.id.clone()),
@@ -7634,6 +7643,7 @@ async fn handle_proxy_request_inner(
                             timestamp_received: ctx.timestamp_received.to_rfc3339(),
                             client_ip: ctx.client_ip.clone(),
                             consumer_username: ctx.effective_identity().map(str::to_owned),
+                            auth_method: ctx.auth_method,
                             http_method: ctx.method.clone(),
                             request_path: ctx.path.clone(),
                             proxy_id: proxy_ref.map(|p| p.id.clone()),
@@ -8133,6 +8143,7 @@ async fn handle_proxy_request_inner(
                 timestamp_received: ctx.timestamp_received.to_rfc3339(),
                 client_ip: ctx.client_ip.clone(),
                 consumer_username: ctx.effective_identity().map(str::to_owned),
+                auth_method: ctx.auth_method,
                 http_method: method,
                 request_path: path,
                 proxy_id: Some(proxy.id.clone()),
