@@ -86,6 +86,15 @@ impl Plugin for MeshAuthz {
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
+        let unauthenticated_hbone_baggage = is_hbone_request(ctx)
+            && has_baggage_header_from_request(ctx)
+            && !is_authenticated_hbone_request(ctx);
+        if unauthenticated_hbone_baggage {
+            ctx.metadata.insert(
+                "mesh_authz.ignored_baggage".to_string(),
+                "unauthenticated_hbone".to_string(),
+            );
+        }
         let source_principal = source_principal_from_request(ctx);
         let mut host = ctx
             .raw_header_get("host")
@@ -120,7 +129,19 @@ impl Plugin for MeshAuthz {
             attributes: BTreeMap::new(),
         };
         let decision = evaluate_mesh_authorization(&self.slice, &request);
-        self.decision_to_result(decision, &mut ctx.metadata)
+        let result = self.decision_to_result(decision, &mut ctx.metadata);
+        if unauthenticated_hbone_baggage
+            && matches!(
+                result,
+                PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }
+            )
+        {
+            ctx.metadata.insert(
+                "mesh_authz.deny_policy".to_string(),
+                "unauthenticated_baggage".to_string(),
+            );
+        }
+        result
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
@@ -149,7 +170,36 @@ impl Plugin for MeshAuthz {
 }
 
 fn source_principal_from_request(ctx: &RequestContext) -> Option<SpiffeId> {
-    ctx.peer_spiffe_id.clone().or_else(|| {
-        HboneIdentity::from_baggage_values(ctx.raw_header_values(BAGGAGE_HEADER)).source_principal
-    })
+    if is_authenticated_hbone_request(ctx) {
+        // Ambient ztunnels authenticate the HBONE tunnel with their own SPIFFE
+        // cert, while baggage carries the originating workload identity. Trust
+        // baggage only after the peer is authenticated, and prefer that
+        // workload identity over the ztunnel's certificate identity.
+        return HboneIdentity::from_baggage_values(
+            ctx.raw_header_values(BAGGAGE_HEADER).chain(
+                ctx.headers
+                    .get(BAGGAGE_HEADER)
+                    .map(String::as_str)
+                    .into_iter(),
+            ),
+        )
+        .source_principal
+        .or_else(|| ctx.peer_spiffe_id.clone());
+    }
+
+    ctx.peer_spiffe_id.clone()
+}
+
+fn is_authenticated_hbone_request(ctx: &RequestContext) -> bool {
+    ctx.peer_spiffe_id.is_some() && is_hbone_request(ctx)
+}
+
+fn is_hbone_request(ctx: &RequestContext) -> bool {
+    ctx.metadata
+        .get("request_protocol")
+        .is_some_and(|value| value == "hbone")
+}
+
+fn has_baggage_header_from_request(ctx: &RequestContext) -> bool {
+    ctx.raw_header_get(BAGGAGE_HEADER).is_some() || ctx.headers.contains_key(BAGGAGE_HEADER)
 }

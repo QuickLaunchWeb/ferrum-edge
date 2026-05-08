@@ -166,7 +166,7 @@ Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Pro
 
 Mesh authorization normalizes policy header match names to lowercase at admission/plugin construction when doing so is unambiguous, so request-time checks use the already-lowercase header map without per-request key allocation. Case-variant duplicate header rules are preserved and evaluated together to avoid nondeterministic policy outcomes. Wildcard matches support `*` anywhere in the policy pattern while preserving anchored-prefix and anchored-suffix semantics.
 
-HBONE identity metadata is read from all `baggage` headers on an HBONE request. Baggage values may be percent-encoded, and Ferrum decodes them before extracting `source.principal` or `destination.principal`.
+HBONE identity metadata is read from all `baggage` headers on authenticated HBONE requests where the peer already presented a SPIFFE identity. Baggage values may be percent-encoded, and Ferrum decodes them before extracting `source.principal` or `destination.principal`. Plain HTTP requests, or requests without an authenticated peer, cannot supply `source.principal` through baggage for `mesh_authz` or `workload_metrics`. Operators should treat trusted ztunnels/sidecars as the boundary that stamps workload baggage from accepted trust domains; Ferrum currently forwards baggage headers to backends rather than stripping them on egress.
 
 Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the canonical config. Remote clusters carry trust domains and federation endpoints, VM `WorkloadEntry` resources populate workload addresses/network/cluster metadata, and east-west gateway entries are materialized as SNI-routed passthrough stream proxies only in `east_west_gateway` topology.
 
