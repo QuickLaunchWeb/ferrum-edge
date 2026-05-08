@@ -10,9 +10,8 @@ inputs:
   shared-key:
     description: >-
       rust-cache shared key. Set per logical job (e.g. `ci-test`,
-      `ci-test-functional-${matrix.shard}`, `ci-lint`, `ci-perf`) so caches
-      don't trample each other. Required because the reused name is the
-      single biggest factor in cache hit rate.
+      `ci-test-functional`, `ci-lint`, `ci-perf`) so caches don't trample
+      each other. Jobs that compile the same artifacts should share a key.
     required: true
   components:
     description: >-
