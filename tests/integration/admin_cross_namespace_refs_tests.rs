@@ -102,6 +102,7 @@ async fn build_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDir) {
         admin_allowed_cidrs: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,

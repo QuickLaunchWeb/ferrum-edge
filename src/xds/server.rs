@@ -19,7 +19,6 @@ use super::proto::{
     ControlPlane, DeltaDiscoveryRequest, DeltaDiscoveryResponse, DiscoveryRequest,
     DiscoveryResponse,
 };
-use super::slice::{MeshSlice, MeshSliceRequest};
 use super::snapshot::{XdsConfigFingerprint, XdsSnapshot, XdsSnapshotCache};
 use super::translator::translate_mesh_slice_to_snapshot;
 use crate::FERRUM_VERSION;
@@ -27,6 +26,7 @@ use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::GatewayConfig;
 use crate::grpc::auth::verify_grpc_jwt_metadata;
 use crate::grpc::proto::ConfigUpdate;
+use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct XdsSubscription {
@@ -1228,7 +1228,7 @@ fn should_send_delta_response(
 mod tests {
     use super::*;
     use crate::config::db_loader::IncrementalResult;
-    use crate::config::mesh::{AppProtocol, MeshConfig, MeshService, ServicePort};
+    use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
     use chrono::{TimeZone, Utc};
     use prost::Message;
 

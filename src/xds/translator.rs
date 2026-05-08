@@ -3,8 +3,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 use super::proto;
-use super::slice::MeshSlice;
 use super::snapshot::{XdsResource, XdsSnapshot};
+use crate::modes::mesh::slice::MeshSlice;
 
 pub const LDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
 pub const RDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.route.v3.RouteConfiguration";

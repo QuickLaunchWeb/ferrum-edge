@@ -11,6 +11,8 @@
 //! mesh subsystem will share the same `FERRUM_NAMESPACE` mechanism so a
 //! single gateway instance only loads its own namespace's mesh resources.
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -210,7 +212,7 @@ pub struct ConditionMatch {
 /// Abstraction over per-workload label maps.
 ///
 /// `mesh_authz` carries labels in a `BTreeMap<String, String>` (the
-/// canonical [`crate::xds::slice::MeshSlice`] form), the Kubernetes injector
+/// canonical [`crate::modes::mesh::slice::MeshSlice`] form), the Kubernetes injector
 /// keeps them in a `HashMap`, and tests freely build either. This trait lets
 /// the scope-matching helpers below accept any of those without copying.
 pub trait WorkloadLabels {
@@ -235,7 +237,7 @@ impl WorkloadLabels for ::std::collections::BTreeMap<String, String> {
 /// `proxy_namespace` and whose labels are `proxy_labels`.
 ///
 /// This is the **single canonical scope-matching helper** used by both the
-/// xDS / native MeshSubscribe slice builder ([`crate::xds::slice::MeshSlice::from_gateway_config`])
+/// xDS / native MeshSubscribe slice builder ([`crate::modes::mesh::slice::MeshSlice::from_gateway_config`])
 /// and the `mesh_authz` plugin's per-policy filter so that scope semantics
 /// stay byte-identical across the two surfaces.
 ///
