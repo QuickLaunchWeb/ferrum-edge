@@ -349,6 +349,7 @@ impl Plugin for WsFrameLogging {
                 direction = direction_label,
                 error_class = %error_class_label,
                 consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
+                auth_method = ctx.auth_method.unwrap_or("-"),
                 correlation_id = ctx.metadata.get("correlation_id").map(String::as_str).unwrap_or("-"),
                 event = "disconnect",
                 "WebSocket session ended"
@@ -367,6 +368,7 @@ impl Plugin for WsFrameLogging {
                 direction = direction_label,
                 error_class = %error_class_label,
                 consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
+                auth_method = ctx.auth_method.unwrap_or("-"),
                 correlation_id = ctx.metadata.get("correlation_id").map(String::as_str).unwrap_or("-"),
                 event = "disconnect",
                 "WebSocket session ended"
@@ -385,6 +387,7 @@ impl Plugin for WsFrameLogging {
                 direction = direction_label,
                 error_class = %error_class_label,
                 consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
+                auth_method = ctx.auth_method.unwrap_or("-"),
                 correlation_id = ctx.metadata.get("correlation_id").map(String::as_str).unwrap_or("-"),
                 event = "disconnect",
                 "WebSocket session ended"

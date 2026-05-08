@@ -417,7 +417,7 @@ impl JwksAuth {
 
 #[async_trait]
 impl AuthMechanism for JwksAuth {
-    fn mechanism_name(&self) -> &str {
+    fn mechanism_name(&self) -> &'static str {
         "jwks_auth"
     }
 

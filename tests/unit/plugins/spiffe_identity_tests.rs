@@ -37,6 +37,7 @@ fn empty_stream_ctx(cert_der: Option<Vec<u8>>) -> StreamConnectionContext {
         consumer_index: Arc::new(ConsumerIndex::new(&[] as &[Consumer])),
         identified_consumer: None,
         authenticated_identity: None,
+        auth_method: None,
         metadata: None,
         tls_client_cert_der: cert_der.map(Arc::new),
         tls_client_cert_chain_der: None,

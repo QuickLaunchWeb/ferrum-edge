@@ -507,7 +507,7 @@ fn parse_allowed_ca_fingerprints(config: &Value) -> Result<HashSet<[u8; 32]>, St
 
 #[async_trait]
 impl AuthMechanism for MtlsAuth {
-    fn mechanism_name(&self) -> &str {
+    fn mechanism_name(&self) -> &'static str {
         "mtls_auth"
     }
 
@@ -576,6 +576,9 @@ auth_flow::impl_auth_plugin!(
                     );
                     ctx.insert_metadata("consumer_username".to_string(), consumer.username.clone());
                     ctx.identified_consumer = Some(consumer);
+                }
+                if ctx.auth_method.is_none() {
+                    ctx.auth_method = Some("mtls_auth");
                 }
                 PluginResult::Continue
             }

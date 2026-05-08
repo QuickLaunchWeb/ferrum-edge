@@ -374,6 +374,7 @@ pub mod _test_support {
             backend_target,
             listen_port,
             consumer_username,
+            auth_method: None,
             metadata,
             session_start,
         }

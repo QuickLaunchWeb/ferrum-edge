@@ -113,7 +113,7 @@ impl BasicAuth {
 
 #[async_trait]
 impl AuthMechanism for BasicAuth {
-    fn mechanism_name(&self) -> &str {
+    fn mechanism_name(&self) -> &'static str {
         "basic_auth"
     }
 

@@ -705,7 +705,7 @@ fn extract_cn_from_dn(dn: &str) -> Option<&str> {
 
 #[async_trait]
 impl AuthMechanism for LdapAuth {
-    fn mechanism_name(&self) -> &str {
+    fn mechanism_name(&self) -> &'static str {
         "ldap_auth"
     }
 

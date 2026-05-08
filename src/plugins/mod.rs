@@ -232,6 +232,8 @@ pub struct WsDisconnectContext {
     /// Consumer identity associated with the upgrade (copied from
     /// the originating `RequestContext`).
     pub consumer_username: Option<String>,
+    /// Authentication mechanism that succeeded for the upgrade request.
+    pub auth_method: Option<&'static str>,
     /// Correlation ID / tracing metadata inherited from the upgrade request.
     pub metadata: HashMap<String, String>,
 }
@@ -275,6 +277,10 @@ pub struct RequestContext {
     /// Human-readable identity for the `X-Consumer-Username` header sent to the
     /// backend. Falls back to `authenticated_identity` when not set separately.
     pub authenticated_identity_header: Option<String>,
+    /// Authentication mechanism that succeeded (e.g., `"jwt_auth"`, `"key_auth"`).
+    /// `&'static str` because every `AuthMechanism::mechanism_name()` returns a
+    /// compiled-in literal — zero allocation on the hot path.
+    pub auth_method: Option<&'static str>,
     pub timestamp_received: DateTime<Utc>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
@@ -346,6 +352,7 @@ impl RequestContext {
             identified_consumer: None,
             authenticated_identity: None,
             authenticated_identity_header: None,
+            auth_method: None,
             timestamp_received: Utc::now(),
             metadata: HashMap::new(),
             tls_client_cert_der: None,
@@ -655,6 +662,8 @@ pub struct TransactionSummary {
     pub timestamp_received: String,
     pub client_ip: String,
     pub consumer_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<&'static str>,
     pub http_method: String,
     pub request_path: String,
     /// ID of the proxy that matched this request, or `None` when the request
@@ -893,6 +902,9 @@ pub struct StreamConnectionContext {
     /// Identity string set by external stream auth plugins when no gateway
     /// Consumer was mapped. Mirrors `RequestContext::authenticated_identity`.
     pub authenticated_identity: Option<String>,
+    /// Authentication mechanism that succeeded for this stream connection.
+    /// Mirrors `RequestContext::auth_method`.
+    pub auth_method: Option<&'static str>,
     /// Plugin metadata. Lazily allocated on first write to avoid a HashMap allocation
     /// for stream connections that have no metadata-writing plugins configured.
     pub metadata: Option<HashMap<String, String>>,
@@ -946,6 +958,9 @@ pub struct StreamTransactionSummary {
     /// `None` when no authentication plugin identified the client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consumer_username: Option<String>,
+    /// Authentication mechanism that succeeded for this stream connection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<&'static str>,
     pub backend_target: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_resolved_ip: Option<String>,
