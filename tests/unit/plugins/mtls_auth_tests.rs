@@ -1,7 +1,9 @@
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::plugins::mtls_auth::MtlsAuth;
-use ferrum_edge::plugins::{Plugin, RequestContext, StreamConnectionContext};
+use ferrum_edge::plugins::{
+    HTTP_FAMILY_AND_STREAM_PROTOCOLS, Plugin, RequestContext, StreamConnectionContext, priority,
+};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -515,7 +517,7 @@ async fn test_mtls_auth_ca_fingerprint_rejects_no_chain() {
     // No chain provided — fingerprint check should fail
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
-        "allowed_ca_fingerprints_sha256": ["abcd1234"]
+        "allowed_ca_fingerprints_sha256": ["0000000000000000000000000000000000000000000000000000000000000000"]
     }))
     .unwrap();
     let mut ctx = create_ctx_with_cert(client_der);
@@ -651,19 +653,20 @@ fn test_mtls_auth_name() {
 #[test]
 fn test_mtls_auth_priority() {
     let plugin = MtlsAuth::new(&json!({})).unwrap();
-    assert_eq!(plugin.priority(), ferrum_edge::plugins::priority::MTLS_AUTH);
+    assert_eq!(plugin.priority(), priority::MTLS_AUTH);
 }
 
 #[test]
 fn test_mtls_auth_supported_protocols() {
     let plugin = MtlsAuth::new(&json!({})).unwrap();
-    let protocols = plugin.supported_protocols();
-    assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Http));
-    assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Grpc));
-    assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::WebSocket));
-    assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Tcp));
-    // UDP/DTLS is supported for mutual DTLS client cert authentication
-    assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Udp));
+    assert_eq!(
+        plugin.supported_protocols(),
+        HTTP_FAMILY_AND_STREAM_PROTOCOLS
+    );
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.applies_after_proxy_on_reject());
 }
 
 #[test]
@@ -671,6 +674,100 @@ fn test_mtls_auth_default_cert_field_is_subject_cn() {
     // When no cert_field is specified, defaults to subject_cn
     let plugin = MtlsAuth::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "mtls_auth"); // just verify it creates successfully
+}
+
+// --- Constructor validation tests ---
+
+#[test]
+fn test_mtls_auth_rejects_unknown_cert_field() {
+    let err = MtlsAuth::new(&json!({"cert_field": "subject_serial"}))
+        .err()
+        .expect("unknown cert_field must be rejected");
+    assert!(err.contains("'cert_field'"), "got: {err}");
+}
+
+#[test]
+fn test_mtls_auth_rejects_non_string_cert_field() {
+    let err = MtlsAuth::new(&json!({"cert_field": 42}))
+        .err()
+        .expect("non-string cert_field must be rejected");
+    assert!(err.contains("'cert_field' must be a string"), "got: {err}");
+}
+
+#[test]
+fn test_mtls_auth_rejects_non_array_allowed_issuers() {
+    let err = MtlsAuth::new(&json!({"allowed_issuers": {"cn": "CA"}}))
+        .err()
+        .expect("non-array allowed_issuers must be rejected");
+    assert!(
+        err.contains("'allowed_issuers' must be an array"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_mtls_auth_rejects_empty_allowed_issuer_filter() {
+    let err = MtlsAuth::new(&json!({"allowed_issuers": [{}]}))
+        .err()
+        .expect("empty issuer filter must be rejected");
+    assert!(
+        err.contains("must specify at least one field"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_mtls_auth_rejects_non_string_allowed_issuer_field() {
+    let err = MtlsAuth::new(&json!({"allowed_issuers": [{"cn": 42}]}))
+        .err()
+        .expect("non-string issuer field must be rejected");
+    assert!(err.contains("allowed_issuers[0].cn"), "got: {err}");
+}
+
+#[test]
+fn test_mtls_auth_rejects_unknown_allowed_issuer_field() {
+    let err = MtlsAuth::new(&json!({"allowed_issuers": [{"issuer_cn": "CA"}]}))
+        .err()
+        .expect("unknown issuer field must be rejected");
+    assert!(err.contains("unsupported issuer field"), "got: {err}");
+}
+
+#[test]
+fn test_mtls_auth_rejects_bad_legacy_issuer_verification() {
+    let err = MtlsAuth::new(&json!({"issuer_verification": {"cn": "CA"}}))
+        .err()
+        .expect("bad legacy issuer field must be rejected");
+    assert!(err.contains("unsupported issuer field"), "got: {err}");
+}
+
+#[test]
+fn test_mtls_auth_rejects_non_array_ca_fingerprints() {
+    let err = MtlsAuth::new(&json!({"allowed_ca_fingerprints_sha256": "abcd"}))
+        .err()
+        .expect("non-array CA fingerprints must be rejected");
+    assert!(
+        err.contains("'allowed_ca_fingerprints_sha256' must be an array"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_mtls_auth_rejects_non_string_ca_fingerprint() {
+    let err = MtlsAuth::new(&json!({"allowed_ca_fingerprints_sha256": [42]}))
+        .err()
+        .expect("non-string CA fingerprint must be rejected");
+    assert!(
+        err.contains("allowed_ca_fingerprints_sha256[0]"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_mtls_auth_rejects_malformed_ca_fingerprint() {
+    let err = MtlsAuth::new(&json!({"allowed_ca_fingerprints_sha256": ["abcd"]}))
+        .err()
+        .expect("short CA fingerprint must be rejected");
+    assert!(err.contains("64 hex characters"), "got: {err}");
 }
 
 // --- Consumer index tests ---
@@ -901,6 +998,37 @@ async fn test_mtls_auth_dtls_with_issuer_verification() {
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert_continue(result);
     assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "bob");
+}
+
+#[tokio::test]
+async fn test_mtls_auth_dtls_issuer_verification_rejects_mismatch() {
+    let (ca_der, client_der) =
+        create_ca_signed_cert("Test CA", Some("TestOrg"), None, "dtls-client.example.com");
+    let consumer = create_mtls_consumer("c1", "bob", "dtls-client.example.com");
+    let plugin = MtlsAuth::new(&json!({
+        "cert_field": "subject_cn",
+        "issuer_verification": {
+            "issuer_cn": "Other CA"
+        }
+    }))
+    .unwrap();
+    let mut ctx = StreamConnectionContext {
+        client_ip: "127.0.0.1".to_string(),
+        proxy_id: "udp-proxy".to_string(),
+        proxy_name: Some("UDP Proxy".to_string()),
+        listen_port: 5353,
+        backend_scheme: ferrum_edge::config::types::BackendScheme::Dtls,
+        consumer_index: Arc::new(ConsumerIndex::new(&[consumer])),
+        identified_consumer: None,
+        authenticated_identity: None,
+        metadata: None,
+        tls_client_cert_der: Some(Arc::new(client_der)),
+        tls_client_cert_chain_der: Some(Arc::new(vec![ca_der])),
+        sni_hostname: None,
+    };
+
+    let result = plugin.on_stream_connect(&mut ctx).await;
+    assert_reject(result, Some(403));
 }
 
 #[tokio::test]

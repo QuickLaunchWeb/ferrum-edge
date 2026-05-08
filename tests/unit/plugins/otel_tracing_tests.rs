@@ -1,8 +1,8 @@
 //! Tests for otel_tracing plugin
 
 use ferrum_edge::plugins::{
-    Plugin, PluginResult, RequestContext, TransactionSummary, otel_tracing::OtelTracing,
-    utils::PluginHttpClient,
+    ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, TransactionSummary,
+    otel_tracing::OtelTracing, utils::PluginHttpClient,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -99,6 +99,86 @@ async fn test_otel_tracing_plugin_creation() {
     let plugin = new_otel(&json!({}));
     assert_eq!(plugin.name(), "otel_tracing");
     assert_eq!(plugin.priority(), 25);
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
+    assert!(plugin.modifies_request_headers());
+    assert!(plugin.applies_after_proxy_on_reject());
+    assert!(!plugin.is_auth_plugin());
+}
+
+#[tokio::test]
+async fn test_otel_tracing_rejects_invalid_endpoint() {
+    let err = OtelTracing::new_with_http_client(
+        &json!({
+            "endpoint": "not a url"
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("invalid endpoint must be rejected");
+
+    assert!(err.contains("endpoint"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_otel_tracing_rejects_non_http_endpoint_scheme() {
+    let err = OtelTracing::new_with_http_client(
+        &json!({
+            "endpoint": "ftp://otel-collector.example.com/v1/traces"
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("non-http endpoint scheme must be rejected");
+
+    assert!(err.contains("http or https"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_otel_tracing_rejects_non_bool_generate_trace_id() {
+    let err = OtelTracing::new_with_http_client(
+        &json!({
+            "generate_trace_id": "true"
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("non-bool generate_trace_id must be rejected");
+
+    assert!(err.contains("generate_trace_id"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_otel_tracing_rejects_invalid_custom_header_name() {
+    let err = OtelTracing::new_with_http_client(
+        &json!({
+            "endpoint": "http://localhost:4318/v1/traces",
+            "headers": {
+                "bad header": "value"
+            }
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("invalid custom header name must be rejected");
+
+    assert!(err.contains("invalid HTTP header name"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_otel_tracing_rejects_non_string_custom_header_value() {
+    let err = OtelTracing::new_with_http_client(
+        &json!({
+            "endpoint": "http://localhost:4318/v1/traces",
+            "headers": {
+                "x-tenant-id": 42
+            }
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("non-string custom header value must be rejected");
+
+    assert!(err.contains("headers.x-tenant-id"), "got: {err}");
 }
 
 #[tokio::test]

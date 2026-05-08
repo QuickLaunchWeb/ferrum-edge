@@ -1,9 +1,11 @@
 //! Tests for udp_logging plugin
 
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, udp_logging::UdpLogging};
+use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginHttpClient, udp_logging::UdpLogging};
 use serde_json::json;
 
-use super::plugin_utils::create_test_transaction_summary;
+use super::plugin_utils::{
+    create_test_stream_transaction_summary, create_test_transaction_summary,
+};
 
 fn test_client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -20,6 +22,8 @@ async fn test_udp_logging_plugin_creation() {
     )
     .unwrap();
     assert_eq!(plugin.name(), "udp_logging");
+    assert_eq!(plugin.priority(), 9160);
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
 }
 
 #[tokio::test]
@@ -101,6 +105,29 @@ async fn test_udp_logging_invalid_port_too_large() {
 }
 
 #[tokio::test]
+async fn test_udp_logging_rejects_invalid_config_shapes() {
+    let cases = [
+        json!(null),
+        json!({"host": 123, "port": 9514}),
+        json!({"host": "127.0.0.1", "port": "9514"}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls": "true"}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls_no_verify": 1}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls_cert_path": ""}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls_key_path": false}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls_ca_cert_path": []}),
+        json!({"host": "127.0.0.1", "port": 9514, "batch_size": {}}),
+        json!({"host": "127.0.0.1", "port": 9514, "retry_delay_ms": "500"}),
+    ];
+
+    for config in cases {
+        assert!(
+            UdpLogging::new(&config, test_client()).is_err(),
+            "expected invalid config to be rejected: {config}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_udp_logging_log_does_not_panic() {
     // When the endpoint is unreachable, log() should still accept entries
     let plugin = UdpLogging::new(
@@ -116,6 +143,25 @@ async fn test_udp_logging_log_does_not_panic() {
 
     // Should not panic — entry is queued in the channel
     plugin.log(&summary).await;
+}
+
+#[tokio::test]
+async fn test_udp_logging_stream_disconnect_does_not_panic() {
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 1,
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0
+        }),
+        test_client(),
+    )
+    .unwrap();
+    let summary = create_test_stream_transaction_summary();
+
+    plugin.on_stream_disconnect(&summary).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 }
 
 #[tokio::test]
@@ -326,5 +372,5 @@ async fn test_udp_logging_supported_protocols() {
     )
     .unwrap();
     let protocols = plugin.supported_protocols();
-    assert_eq!(protocols.len(), 5); // Http, Grpc, WebSocket, Tcp, Udp
+    assert_eq!(protocols, ALL_PROTOCOLS);
 }

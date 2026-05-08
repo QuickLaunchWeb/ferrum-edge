@@ -12,9 +12,15 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use super::PluginHttpClient;
+
+const EMPTY_STORE_RETRY_1: Duration = Duration::from_secs(5);
+const EMPTY_STORE_RETRY_2: Duration = Duration::from_secs(15);
+const EMPTY_STORE_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// A cached JWKS key with its algorithm and decoding key.
 #[derive(Clone)]
@@ -32,6 +38,7 @@ pub struct JwksKeyStore {
     keys: Arc<ArcSwap<HashMap<String, CachedJwk>>>,
     jwks_uri: String,
     http_client: PluginHttpClient,
+    fetch_lock: Arc<Mutex<()>>,
 }
 
 /// Raw JWKS response from the endpoint.
@@ -78,6 +85,7 @@ impl JwksKeyStore {
             keys: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             jwks_uri,
             http_client,
+            fetch_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -104,6 +112,23 @@ impl JwksKeyStore {
 
     /// Fetch keys from the JWKS endpoint and update the cache.
     pub async fn fetch_keys(&self) -> Result<usize, String> {
+        let _fetch_guard = self.fetch_lock.lock().await;
+        self.fetch_keys_unlocked().await
+    }
+
+    /// Fetch keys only when the store is still empty.
+    ///
+    /// This lets an eager warmup share the store's immediate background refresh
+    /// without issuing a second successful JWKS request.
+    pub async fn fetch_keys_if_empty(&self) -> Result<usize, String> {
+        let _fetch_guard = self.fetch_lock.lock().await;
+        if self.has_keys() {
+            return Ok(self.keys.load().len());
+        }
+        self.fetch_keys_unlocked().await
+    }
+
+    async fn fetch_keys_unlocked(&self) -> Result<usize, String> {
         debug!("Fetching JWKS keys from {}", self.jwks_uri);
 
         let req = self.http_client.get().get(&self.jwks_uri);
@@ -122,6 +147,7 @@ impl JwksKeyStore {
             .await
             .map_err(|e| format!("JWKS parse failed: {}", e))?;
 
+        let total_keys = jwks.keys.len();
         let mut new_keys = HashMap::new();
 
         for (idx, jwk) in jwks.keys.iter().enumerate() {
@@ -147,6 +173,12 @@ impl JwksKeyStore {
         }
 
         let count = new_keys.len();
+        if count == 0 && total_keys > 0 {
+            return Err(
+                "JWKS response contained keys but no usable signing keys were parsed".to_string(),
+            );
+        }
+
         self.keys.store(Arc::new(new_keys));
         debug!("JWKS key store updated: {} keys cached", count);
         Ok(count)
@@ -155,17 +187,48 @@ impl JwksKeyStore {
     /// Start a background task that refreshes keys periodically.
     ///
     /// The task runs until the returned [`tokio::task::JoinHandle`] is aborted
-    /// or the process exits.
+    /// or the process exits. Populated stores keep the configured refresh cadence
+    /// based on fetch start time; empty stores retry on a short capped backoff.
     pub fn start_background_refresh(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
         let store = self.clone();
+        let interval = if interval.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            interval
+        };
         tokio::spawn(async move {
-            let mut timer = tokio::time::interval(interval);
-            // Skip the first tick (keys are fetched eagerly at startup)
-            timer.tick().await;
+            let mut empty_store_retry_attempt = 0;
+            let mut next_refresh_at = Instant::now();
+            let mut first_refresh = true;
             loop {
-                timer.tick().await;
-                if let Err(e) = store.fetch_keys().await {
+                tokio::time::sleep_until(next_refresh_at).await;
+                let fetch_started_at = Instant::now();
+
+                let fetch_result = if first_refresh {
+                    store.fetch_keys_if_empty().await
+                } else {
+                    store.fetch_keys().await
+                };
+                first_refresh = false;
+
+                if let Err(e) = fetch_result {
                     warn!("JWKS background refresh failed: {}", e);
+                }
+
+                let fetch_completed_at = Instant::now();
+                let has_keys = store.has_keys();
+                next_refresh_at = next_refresh_deadline(
+                    fetch_started_at,
+                    fetch_completed_at,
+                    has_keys,
+                    interval,
+                    empty_store_retry_attempt,
+                );
+
+                if has_keys {
+                    empty_store_retry_attempt = 0;
+                } else {
+                    empty_store_retry_attempt = empty_store_retry_attempt.saturating_add(1);
                 }
             }
         })
@@ -232,5 +295,118 @@ impl JwksKeyStore {
             algorithm,
             decoding_key,
         })
+    }
+}
+
+fn refresh_delay_after_attempt(
+    store_has_keys: bool,
+    interval: Duration,
+    empty_store_retry_attempt: u32,
+) -> Duration {
+    if store_has_keys {
+        interval
+    } else {
+        std::cmp::min(
+            interval,
+            empty_store_retry_interval(empty_store_retry_attempt),
+        )
+    }
+}
+
+fn empty_store_retry_interval(empty_store_retry_attempt: u32) -> Duration {
+    match empty_store_retry_attempt {
+        0 => EMPTY_STORE_RETRY_1,
+        1 => EMPTY_STORE_RETRY_2,
+        _ => EMPTY_STORE_RETRY_MAX,
+    }
+}
+
+fn next_refresh_deadline(
+    fetch_started_at: Instant,
+    fetch_completed_at: Instant,
+    store_has_keys: bool,
+    interval: Duration,
+    empty_store_retry_attempt: u32,
+) -> Instant {
+    if store_has_keys {
+        fetch_started_at + interval
+    } else {
+        fetch_completed_at + refresh_delay_after_attempt(false, interval, empty_store_retry_attempt)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        EMPTY_STORE_RETRY_1, EMPTY_STORE_RETRY_2, EMPTY_STORE_RETRY_MAX,
+        empty_store_retry_interval, next_refresh_deadline, refresh_delay_after_attempt,
+    };
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    #[test]
+    fn populated_store_uses_configured_refresh_interval() {
+        let interval = Duration::from_secs(900);
+        assert_eq!(refresh_delay_after_attempt(true, interval, 2), interval);
+    }
+
+    #[test]
+    fn empty_store_backs_off_until_capped_when_interval_is_longer() {
+        assert_eq!(
+            refresh_delay_after_attempt(false, Duration::from_secs(900), 0),
+            EMPTY_STORE_RETRY_1
+        );
+        assert_eq!(
+            refresh_delay_after_attempt(false, Duration::from_secs(900), 1),
+            EMPTY_STORE_RETRY_2
+        );
+        assert_eq!(
+            refresh_delay_after_attempt(false, Duration::from_secs(900), 2),
+            EMPTY_STORE_RETRY_MAX
+        );
+        assert_eq!(
+            refresh_delay_after_attempt(false, Duration::from_secs(900), 12),
+            EMPTY_STORE_RETRY_MAX
+        );
+    }
+
+    #[test]
+    fn empty_store_keeps_shorter_configured_interval() {
+        let interval = Duration::from_secs(2);
+        assert_eq!(refresh_delay_after_attempt(false, interval, 0), interval);
+        assert_eq!(refresh_delay_after_attempt(false, interval, 1), interval);
+        assert_eq!(refresh_delay_after_attempt(false, interval, 2), interval);
+    }
+
+    #[test]
+    fn empty_store_retry_interval_uses_five_fifteen_thirty_sequence() {
+        assert_eq!(empty_store_retry_interval(0), EMPTY_STORE_RETRY_1);
+        assert_eq!(empty_store_retry_interval(1), EMPTY_STORE_RETRY_2);
+        assert_eq!(empty_store_retry_interval(2), EMPTY_STORE_RETRY_MAX);
+        assert_eq!(empty_store_retry_interval(u32::MAX), EMPTY_STORE_RETRY_MAX);
+    }
+
+    #[test]
+    fn populated_store_next_refresh_is_based_on_fetch_start() {
+        let started = Instant::now();
+        let completed = started + Duration::from_secs(10);
+        let interval = Duration::from_secs(60);
+
+        assert_eq!(
+            next_refresh_deadline(started, completed, true, interval, 0),
+            started + interval
+        );
+    }
+
+    #[test]
+    fn empty_store_next_retry_is_based_on_fetch_completion() {
+        let started = Instant::now();
+        let completed = started + Duration::from_secs(10);
+        let interval = Duration::from_secs(900);
+
+        assert_eq!(
+            next_refresh_deadline(started, completed, false, interval, 1),
+            completed + EMPTY_STORE_RETRY_2
+        );
     }
 }

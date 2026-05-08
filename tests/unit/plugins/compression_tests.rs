@@ -35,10 +35,62 @@ fn test_default_config() {
 }
 
 #[test]
+fn test_null_config_uses_defaults() {
+    let plugin =
+        CompressionPlugin::new(&serde_json::Value::Null).expect("null config should use defaults");
+    assert_eq!(plugin.name(), "compression");
+    assert!(plugin.requires_response_body_buffering());
+    assert!(!plugin.modifies_request_body());
+}
+
+#[test]
 fn test_decompress_request_config() {
     let plugin = make_plugin(json!({"decompress_request": true}));
     assert!(plugin.modifies_request_body());
     assert!(plugin.modifies_request_headers());
+}
+
+#[test]
+fn test_applies_after_proxy_on_reject() {
+    let plugin = make_plugin(json!({}));
+    assert!(plugin.applies_after_proxy_on_reject());
+}
+
+#[test]
+fn test_non_object_config_rejected() {
+    let err = CompressionPlugin::new(&json!("bad"))
+        .err()
+        .expect("non-object config must be rejected");
+    assert!(err.contains("config must be an object"), "got: {}", err);
+}
+
+#[test]
+fn test_invalid_bool_config_rejected() {
+    let err = CompressionPlugin::new(&json!({"decompress_request": "true"}))
+        .err()
+        .expect("bad bool config must be rejected");
+    assert!(err.contains("decompress_request"), "got: {}", err);
+}
+
+#[test]
+fn test_invalid_content_types_config_rejected() {
+    let err = CompressionPlugin::new(&json!({"content_types": ["text/plain", 42]}))
+        .err()
+        .expect("non-string content type must be rejected");
+    assert!(err.contains("content_types[1]"), "got: {}", err);
+}
+
+#[test]
+fn test_invalid_levels_rejected() {
+    let gzip_err = CompressionPlugin::new(&json!({"gzip_level": 10}))
+        .err()
+        .expect("gzip levels above 9 must be rejected");
+    assert!(gzip_err.contains("gzip_level"), "got: {}", gzip_err);
+
+    let br_err = CompressionPlugin::new(&json!({"brotli_quality": 12}))
+        .err()
+        .expect("brotli qualities above 11 must be rejected");
+    assert!(br_err.contains("brotli_quality"), "got: {}", br_err);
 }
 
 #[test]
@@ -354,6 +406,41 @@ async fn test_vary_header_not_duplicated() {
 
     plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
     assert_eq!(resp_headers.get("vary").unwrap(), "Accept-Encoding");
+}
+
+#[tokio::test]
+async fn test_vary_header_token_match_does_not_false_positive() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    resp_headers.insert("vary".to_string(), "X-Accept-Encoding-Mode".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert_eq!(
+        resp_headers.get("vary").unwrap(),
+        "X-Accept-Encoding-Mode, Accept-Encoding"
+    );
+}
+
+#[tokio::test]
+async fn test_rejection_after_proxy_marker_does_not_commit_encoding() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    ctx.metadata
+        .insert("ferrum:rejection_response".to_string(), "true".to_string());
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    plugin.after_proxy(&mut ctx, 403, &mut resp_headers).await;
+
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("content-length").unwrap(), "1000");
 }
 
 // ────────────────────── Remove Accept-Encoding ──────────────────────

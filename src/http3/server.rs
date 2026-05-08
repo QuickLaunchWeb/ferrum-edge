@@ -124,8 +124,8 @@ pub async fn start_http3_listener_with_signal(
     // If user didn't configure any TLS 1.3 suites, use defaults
     let h3_suites = if tls13_suites.is_empty() {
         vec![
-            rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
             rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256,
+            rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
             rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
         ]
     } else {
@@ -590,6 +590,7 @@ async fn handle_h3_request(
 
     // Build request context (client_ip resolved below after headers are parsed)
     let mut ctx = RequestContext::new(socket_ip.to_owned(), method.clone(), path.clone());
+    ctx.frontend_listen_port = Some(state.env_config.proxy_https_port);
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
 

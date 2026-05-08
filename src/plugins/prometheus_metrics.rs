@@ -316,10 +316,14 @@ impl MetricsRegistry {
     ) {
         self.render_cache_ttl_secs
             .store(render_cache_ttl_secs, Ordering::Relaxed);
-        self.stale_entry_ttl_nanos
-            .store(stale_entry_ttl_secs * 1_000_000_000, Ordering::Relaxed);
-        self.cache_invalidation_min_age_nanos
-            .store(cache_invalidation_min_age_ms * 1_000_000, Ordering::Relaxed);
+        self.stale_entry_ttl_nanos.store(
+            stale_entry_ttl_secs.saturating_mul(1_000_000_000),
+            Ordering::Relaxed,
+        );
+        self.cache_invalidation_min_age_nanos.store(
+            cache_invalidation_min_age_ms.saturating_mul(1_000_000),
+            Ordering::Relaxed,
+        );
         // Set namespace label fragment for non-default namespaces.
         // Empty string for the default "ferrum" namespace (backward compatible).
         if let Ok(mut ns_label) = self.namespace_label.write() {
@@ -948,24 +952,38 @@ pub struct PrometheusMetrics {
     registry: Arc<MetricsRegistry>,
 }
 
+fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> {
+    match config.get(key) {
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("prometheus_metrics: '{key}' must be an unsigned integer")),
+        None => Ok(default),
+    }
+}
+
 impl PrometheusMetrics {
     pub fn new(config: &Value, namespace: &str) -> Result<Self, String> {
+        if !(config.is_object() || config.is_null()) {
+            return Err("prometheus_metrics: config must be an object".to_string());
+        }
+
         let registry = global_registry();
 
-        let render_cache_ttl_secs = config
-            .get("render_cache_ttl_seconds")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_RENDER_CACHE_TTL_SECS);
-
-        let stale_entry_ttl_secs = config
-            .get("stale_entry_ttl_seconds")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_STALE_TTL_NANOS / 1_000_000_000);
-
-        let cache_invalidation_min_age_ms = config
-            .get("cache_invalidation_min_age_ms")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS / 1_000_000);
+        let render_cache_ttl_secs = optional_u64(
+            config,
+            "render_cache_ttl_seconds",
+            DEFAULT_RENDER_CACHE_TTL_SECS,
+        )?;
+        let stale_entry_ttl_secs = optional_u64(
+            config,
+            "stale_entry_ttl_seconds",
+            DEFAULT_STALE_TTL_NANOS / 1_000_000_000,
+        )?;
+        let cache_invalidation_min_age_ms = optional_u64(
+            config,
+            "cache_invalidation_min_age_ms",
+            DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS / 1_000_000,
+        )?;
 
         registry.configure(
             render_cache_ttl_secs,

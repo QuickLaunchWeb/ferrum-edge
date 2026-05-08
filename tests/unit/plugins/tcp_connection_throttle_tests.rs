@@ -64,8 +64,25 @@ fn make_summary(metadata: HashMap<String, String>) -> StreamTransactionSummary {
 
 #[test]
 fn test_tcp_connection_throttle_requires_positive_limit() {
+    assert!(TcpConnectionThrottle::new(&json!(null)).is_err());
+    assert!(TcpConnectionThrottle::new(&json!([])).is_err());
     assert!(TcpConnectionThrottle::new(&json!({})).is_err());
+    assert!(TcpConnectionThrottle::new(&json!({"max_connections_per_key": "1"})).is_err());
     assert!(TcpConnectionThrottle::new(&json!({"max_connections_per_key": 0})).is_err());
+    assert!(
+        TcpConnectionThrottle::new(&json!({
+            "max_connections_per_key": 1,
+            "cleanup_interval_seconds": "60"
+        }))
+        .is_err()
+    );
+    assert!(
+        TcpConnectionThrottle::new(&json!({
+            "max_connections_per_key": 1,
+            "cleanup_interval_seconds": 0
+        }))
+        .is_ok()
+    );
 }
 
 #[test]
@@ -82,6 +99,12 @@ fn test_tcp_connection_throttle_protocol_and_priority() {
     );
     assert!(plugin.supported_protocols().contains(&ProxyProtocol::Tcp));
     assert!(!plugin.supported_protocols().contains(&ProxyProtocol::Udp));
+    assert!(!plugin.is_auth_plugin());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
 }
 
 #[tokio::test]
@@ -93,6 +116,7 @@ async fn test_tcp_connection_throttle_rejects_second_connection_for_same_ip() {
         plugin.on_stream_connect(&mut ctx1).await,
         PluginResult::Continue
     ));
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
 
     let mut ctx2 = make_ctx("tcp-proxy", "10.0.0.1", None);
     assert!(matches!(
@@ -102,6 +126,7 @@ async fn test_tcp_connection_throttle_rejects_second_connection_for_same_ip() {
             ..
         }
     ));
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
 }
 
 #[tokio::test]
@@ -117,6 +142,7 @@ async fn test_tcp_connection_throttle_releases_slot_on_disconnect() {
     plugin
         .on_stream_disconnect(&make_summary(ctx1.take_metadata()))
         .await;
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
 
     let mut ctx2 = make_ctx("tcp-proxy", "10.0.0.1", None);
     assert!(matches!(

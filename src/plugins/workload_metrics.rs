@@ -54,25 +54,16 @@ impl WorkloadMetrics {
 
     fn annotate_http_context(&self, ctx: &mut RequestContext, headers: &HashMap<String, String>) {
         self.insert_common_metadata(&mut ctx.metadata);
-        let hbone_identity = ctx
-            .raw_header_get(BAGGAGE_HEADER)
-            .map(HboneIdentity::from_baggage_header);
+        let hbone_identity =
+            HboneIdentity::from_baggage_values(ctx.raw_header_values(BAGGAGE_HEADER));
         let source_identity = ctx
             .peer_spiffe_id
             .clone()
-            .or_else(|| {
-                hbone_identity
-                    .as_ref()
-                    .and_then(|identity| identity.source_principal.clone())
-            })
+            .or_else(|| hbone_identity.source_principal.clone())
             .or_else(|| self.workload_spiffe_id.clone());
         ctx.metadata.insert(
             "mesh.connection_security_policy".to_string(),
-            if ctx.peer_spiffe_id.is_some()
-                || hbone_identity
-                    .as_ref()
-                    .is_some_and(|identity| identity.source_principal.is_some())
-            {
+            if ctx.peer_spiffe_id.is_some() || hbone_identity.source_principal.is_some() {
                 "mutual_tls"
             } else {
                 "none"
