@@ -61,15 +61,72 @@ impl AsyncWrite for ResetOnReadStream {
     }
 }
 
+/// Stream wrapper that returns queued read chunks, then fails reads with the
+/// configured error. Writes are accepted.
+struct ReadChunksThenErrorStream {
+    reads: VecDeque<Vec<u8>>,
+    error_kind: io::ErrorKind,
+    error_msg: &'static str,
+}
+
+impl ReadChunksThenErrorStream {
+    fn new(reads: Vec<Vec<u8>>, error_kind: io::ErrorKind, error_msg: &'static str) -> Self {
+        Self {
+            reads: reads.into(),
+            error_kind,
+            error_msg,
+        }
+    }
+}
+
+impl AsyncRead for ReadChunksThenErrorStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.reads.pop_front() {
+            Some(mut chunk) => {
+                let n = buf.remaining().min(chunk.len());
+                buf.put_slice(&chunk[..n]);
+                if n < chunk.len() {
+                    chunk.drain(..n);
+                    self.reads.push_front(chunk);
+                }
+                Poll::Ready(Ok(()))
+            }
+            None => Poll::Ready(Err(io::Error::new(self.error_kind, self.error_msg))),
+        }
+    }
+}
+
+impl AsyncWrite for ReadChunksThenErrorStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
 // ── bidirectional_copy direction tests ───────────────────────────────────────
 //
-// These tests exercise the **direction-tracking path** (idle_timeout = Some).
-// When BOTH `idle_timeout` and `half_close_cap` are `None`/zero, the relay
-// takes a zero-overhead fast path that delegates to
-// `tokio::io::copy_bidirectional_with_sizes` and cannot report
-// `first_failure` direction (see `bidirectional_copy` docs). These tests
-// are specifically verifying direction attribution, so they opt in via a
-// long idle_timeout that never actually fires.
+// These tests exercise the **direction-tracking path** by enabling at least one
+// relay bound. When `idle_timeout`, `half_close_cap`, `backend_read_timeout`,
+// and `backend_write_timeout` are all `None`/zero, the relay takes a
+// zero-overhead fast path that delegates to `copy_bidirectional_with_sizes`
+// and cannot report `first_failure` direction (see `bidirectional_copy` docs).
+// Most tests opt in via a long idle timeout that never actually fires; one
+// backend-timeout regression test opts in through `backend_read_timeout`.
 const TEST_IDLE_TIMEOUT: Option<Duration> = Some(Duration::from_secs(300));
 
 #[tokio::test]
@@ -216,6 +273,45 @@ async fn test_bidirectional_copy_c2b_bytes_preserved_on_clean_close() {
     );
     assert_eq!(result.bytes_client_to_backend, payload.len() as u64);
     assert_eq!(result.bytes_backend_to_client, 0);
+}
+
+#[tokio::test]
+async fn test_bidirectional_copy_backend_timeout_path_counts_bytes_and_attributes_direction() {
+    let request: &[u8] = b"REQUEST";
+    let response: &[u8] = b"RESPONSE";
+    let client = ScriptedStream::new(vec![request.to_vec()], Vec::new(), WriteOutcome::Accept);
+    let backend = ReadChunksThenErrorStream::new(
+        vec![response.to_vec()],
+        io::ErrorKind::ConnectionReset,
+        "backend reset after response",
+    );
+
+    let result = bidirectional_copy_for_test_with_timeouts(
+        client,
+        backend,
+        None,
+        None,
+        Some(Duration::from_secs(1)),
+        None,
+        8 * 1024,
+    )
+    .await;
+
+    assert_eq!(result.bytes_client_to_backend, request.len() as u64);
+    assert_eq!(result.bytes_backend_to_client, response.len() as u64);
+
+    let (dir, class, side, _msg) = result
+        .first_failure
+        .as_ref()
+        .expect("backend read reset should be attributed on the direction-tracking path");
+    assert_eq!(*dir, Direction::BackendToClient);
+    assert_eq!(*class, ErrorClass::ConnectionReset);
+    assert_eq!(*side, Some(StreamIoSide::Read));
+    assert_eq!(
+        disconnect_cause_for_failure(*dir, class, *side),
+        DisconnectCause::BackendError,
+        "reading from backend on the b2c half should classify as a backend-side disconnect"
+    );
 }
 
 /// Regression: request/response protocols where the client finishes sending

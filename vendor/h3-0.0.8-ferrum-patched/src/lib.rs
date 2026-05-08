@@ -1,5 +1,14 @@
 //! HTTP/3 client and server
 #![deny(missing_docs, clippy::self_named_module_files)]
+// This vendored upstream crate is patched in as a path dependency, so Cargo
+// surfaces its rustc warnings during Ferrum CI. Keep those upstream-maintenance
+// lints quiet here without weakening Ferrum's own `clippy -D warnings` gate.
+#![allow(
+    dead_code,
+    mismatched_lifetime_syntaxes,
+    unused_imports,
+    unused_variables
+)]
 #![allow(clippy::derive_partial_eq_without_eq)]
 
 pub mod client;

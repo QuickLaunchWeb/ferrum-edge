@@ -202,7 +202,7 @@ fn test_proxy_http_listen_path_must_start_with_slash_or_regex_prefix() {
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("listen_path must start with '/' or '~'"))
+            .any(|e| e.contains("listen_path must start with '/', '~' (regex), or '=/' (exact)"))
     );
 }
 

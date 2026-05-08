@@ -78,6 +78,9 @@ pub fn evaluate_mesh_authorization(
 }
 
 fn rule_matches(rule: &MeshRule, request: &MeshAuthzRequest) -> bool {
+    if rule.never_matches {
+        return false;
+    }
     matches_principals(&rule.from, request)
         && matches_requests(&rule.to, request)
         && matches_conditions(&rule.when, request)
@@ -283,6 +286,7 @@ mod tests {
                 from,
                 to: Vec::new(),
                 when: Vec::new(),
+                never_matches: false,
                 action,
             }],
         }
@@ -361,6 +365,7 @@ mod tests {
                         ports: vec![8080],
                     }],
                     when: Vec::new(),
+                    never_matches: false,
                     action: PolicyAction::Allow,
                 }],
             }],
@@ -397,6 +402,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    never_matches: false,
                     action: PolicyAction::Allow,
                 }],
             }],
@@ -427,6 +433,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    never_matches: false,
                     action: PolicyAction::Allow,
                 }],
             }],
@@ -440,6 +447,35 @@ mod tests {
         assert_eq!(
             evaluate_mesh_authorization(&slice, &request),
             MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn never_match_allow_rule_triggers_implicit_deny_without_matching() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-nothing".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: Vec::new(),
+                    when: Vec::new(),
+                    never_matches: true,
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
         );
     }
 }

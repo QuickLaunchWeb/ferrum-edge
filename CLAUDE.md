@@ -129,18 +129,18 @@ At startup, before config load. Env var suffixes resolve the base name: `_VAULT`
 
 ### Route Matching
 
-Per host tier (exact host → wildcard → catch-all): prefix routes first (O(path_depth) via `IndexedPrefixRoutes` HashMap), regex routes second (O(path_length) via `IndexedRegexRoutes` `RegexSet` — single DFA pass regardless of pattern count), host-only fallback (`listen_path: None` + `hosts` set; never applies to catch-all tier).
+Per host tier (exact host → wildcard → catch-all): exact-path routes first (`=/path`, O(1) HashMap lookup), prefix routes second (O(path_depth) via `IndexedPrefixRoutes` HashMap), regex routes third (O(path_length) via `IndexedRegexRoutes` `RegexSet` — single DFA pass regardless of pattern count), host-only fallback (`listen_path: None` + `hosts` set; never applies to catch-all tier).
 
 **NEVER** replace prefix matching with O(n) linear scan; **NEVER** replace regex matching with sequential per-pattern — both caused 30-46% throughput degradation at scale. Router cache (`DashMap`) sized by `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (default auto = `max(10_000, proxies × 3)`). Negative lookups cached to repel scanners.
 
-Regex listen_paths (`~` prefix) auto-anchored full-path (`^...$`). For prefix-style, end with `.*`. Helper: `anchor_regex_pattern()` in `src/config/types.rs`.
+Exact listen_paths (`=` prefix) match the whole path after query stripping. Regex listen_paths (`~` prefix) auto-anchored full-path (`^...$`). For prefix-style regex, end with `.*`. Helper: `anchor_regex_pattern()` in `src/config/types.rs`.
 
 ### Proxy `hosts`/`listen_path`/`listen_port` contract
 
 - **HTTP-family** (`http`/`https`/`ws`/`wss`/`grpc`/`grpcs`/`h3`): route on hosts + listen_path. At least one of `hosts`/`listen_path` required. `listen_port` MUST be `None`.
 - **Stream-family** (`tcp`/`tcp_tls`/`udp`/`dtls`): route on `listen_port`. `listen_path` MUST be `None` (hard error).
 
-Host-only HTTP proxy matches all paths under its hosts; `strip_listen_path: true` is a no-op there. `hosts: []` + `listen_path: None` is rejected. Uniqueness: two HTTP proxies conflict iff same `listen_path` + overlapping `hosts` (empty hosts = catch-all, overlaps all). Host-only and path-carrying on same host coexist (different match tiers). See `DatabaseBackend::check_listen_path_unique()` in `src/config/db_backend.rs`.
+Host-only HTTP proxy matches all paths under its hosts; `strip_listen_path: true` is a no-op there. Exact listen_paths use `=/path`; prefix listen_paths use `/path`; regex listen_paths use `~pattern`. `hosts: []` + `listen_path: None` is rejected. Uniqueness: two HTTP proxies conflict iff same `listen_path` + overlapping `hosts` (empty hosts = catch-all, overlaps all). Host-only and path-carrying on same host coexist (different match tiers). See `DatabaseBackend::check_listen_path_unique()` in `src/config/db_backend.rs`.
 
 **`backend_scheme` + runtime flavor**: HTTP-family proxies accept `http`/`https` and `backend_scheme` is optional (defaults to `https`). Stream-family (`tcp`/`tcps`/`udp`/`dtls`) requires an explicit scheme. gRPC and WebSocket are NOT schemes — they are runtime flavors classified per-request via `backend_dispatch::detect_http_flavor()` (one header lookup, zero allocation). A single `https` proxy serves Plain/gRPC/WebSocket traffic uniformly. HTTPS backends are classified out of band into the usable plain-HTTP buckets (`h1`, `h2_tls`, `h3`) plus the gRPC transport buckets (`h2_tls`, `h2c`).
 
@@ -154,17 +154,21 @@ CONNECT: H2 Extended CONNECT (RFC 8441) with `:protocol=websocket` is the only a
 
 Frontend TLS/DTLS handshakes are bounded by `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` (default 10s, 0 disables) before HTTP header timers can start. Backend TLS/H2/gRPC/H3 handshakes are bounded by the per-proxy `backend_connect_timeout_ms` budget; this is an end-to-end connect budget, not only the TCP SYN phase. Frontend DTLS demux state is capped before allocating per-peer channels/tasks and released on handshake timeout; `/overload.stream_listeners.dtls_demux_sessions` exposes an eventually consistent pre-handshake diagnostic count for triage.
 
+**Frontend TLS-before-backend invariant**: Every TLS/DTLS-terminating client-facing protocol completes frontend crypto/admission before backend dispatch: HTTPS/H2/gRPC/WSS complete TLS before request routing; normal H3 completes QUIC/TLS before request routing; TCP+TLS completes TLS and `on_stream_connect` before backend connect; UDP+DTLS completes DTLS and `on_stream_connect` before backend session creation. Frontend handshake failures and plugin rejects are frontend setup failures: do not dial backend and do not trip backend circuit breakers. The only deliberate exception is operator-enabled HTTP/3 0-RTT early data (`FERRUM_TLS_EARLY_DATA_METHODS`), which is disabled by default, method-gated, and forwarded with `Early-Data: 1` for backend replay policy.
+
 ### TLS/DTLS Passthrough
 
 `passthrough: true` on stream proxies forwards encrypted bytes to backend without TLS/DTLS termination. Peeks at ClientHello for SNI (`src/proxy/sni.rs`). TCP: `TcpStream::peek()` then `bidirectional_copy`. UDP: parse first DTLS ClientHello for SNI; backend is plain UDP. Validation: stream proxies only, mutually exclusive with `frontend_tls`, backend TLS fields rejected. `StreamConnectionContext.sni_hostname` + `consumer_username` (from `effective_identity()`) flow to stream lifecycle plugins.
+
+Plain TCP server-first protocols and passthrough may require different upstream timing; do not move terminating TLS/DTLS frontend paths to backend-first ordering without preserving the frontend-before-backend invariant and tests.
 
 ### TCP Bidirectional-Relay Modes (`src/proxy/tcp_proxy.rs`)
 
 Splice/kTLS-splice/io_uring paths use the syscall fast path; userspace runs only when splice unavailable (non-Linux, TLS w/o kTLS, backend TLS-terminated).
 
-Userspace modes: **fast path** (both `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0` AND `FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS=0`) delegates to `copy_bidirectional_with_sizes` — best throughput, no BiLock overhead, but no idle watchdog (OS keepalive ~2h), no half-close cap, `disconnect_direction: unknown` on error. **Direction-tracking** (default, either timeout non-zero) gives idle timeout + half-close cap + per-direction byte counters + first-failure attribution at ~5ns BiLock per r/w + two 4-64 KB buffers per conn. Pick fast path when upstream L4 LB enforces timeouts and throughput matters; stay on direction-tracking when self-hosted or dashboards consume `disconnect_direction`.
+Userspace modes: **fast path** (all relay bounds disabled: `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0`, `FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS=0`, and per-proxy `backend_read_timeout_ms=0` / `backend_write_timeout_ms=0`) delegates to `copy_bidirectional_with_sizes` — best throughput, no BiLock overhead, but no idle/per-direction watchdog, no half-close cap, `disconnect_direction: unknown` on error. **Direction-tracking** (default, any bound non-zero) gives idle timeout + half-close cap + per-direction byte counters + first-failure attribution at ~5ns BiLock per r/w + two 4-64 KB buffers per conn. Pick fast path when upstream L4 LB enforces timeouts and throughput matters; stay on direction-tracking when self-hosted, enforcing backend inactivity, or dashboards consume `disconnect_direction`.
 
-**`backend_read_timeout_ms` / `backend_write_timeout_ms`** on TCP relays: per-direction inactivity watermarks (`Arc<AtomicU64>`) refreshed on read progress (b2c) or partial-write progress (c2b). Phase 1 watchdog polls 1/sec. Chunked write loop refreshes on each partial progress — slow-but-progressing backends NOT misclassified. Schema allows `0` to disable for long-lived workloads (DB keepalives, SSH, IMAP). Splice/kTLS/io_uring paths rely only on `tcp_idle_timeout_seconds`.
+**`backend_read_timeout_ms` / `backend_write_timeout_ms`** on TCP relays: per-direction inactivity watermarks refreshed on read progress (b2c) or partial-write progress (c2b). The watchdog ticks every 1s when the shortest active timeout is below 30s, and every 5s when all active timeouts are 30s or longer, so the default 30,000 ms backend timeouts fire within ~35s. Chunked write loop refreshes on each partial progress — slow-but-progressing backends NOT misclassified. Schema allows `0` to disable for long-lived workloads (DB keepalives, SSH, IMAP). Splice/kTLS/io_uring paths rely only on `tcp_idle_timeout_seconds`.
 
 ### Stream Proxy Port Validation
 
@@ -189,6 +193,8 @@ Priority order, lower = first. Multiple instances per proxy allowed. Each has `i
 11. `on_stream_connect`/`on_stream_disconnect` — TCP+TLS runs after handshake (client cert available); UDP+DTLS after DTLS handshake; mesh_authz and workload_metrics use SPIFFE/HBONE identity metadata here
 12. `on_udp_datagram` — bidirectional hooks; zero overhead unless `requires_udp_datagram_hooks()`
 
+**Istio empty-rule semantics**: Kubernetes translation must preserve `AuthorizationPolicy` action semantics. `ALLOW` with no `rules` is allow-nothing (emit a never-matching rule so the authz engine's implicit deny applies); `DENY`/`AUDIT` with no `rules` are no-ops. Do not collapse all empty-rule policies to the same representation.
+
 **Multi-auth**: `AuthMode::Multi` accepts `ctx.identified_consumer` OR `ctx.authenticated_identity` (JWKS/OIDC). First-success-wins. Empty chain → reject.
 
 **Multi-credential rotation**: Each credential type can be single object or array. `Consumer::credential_entries(cred_type)` normalizes. Index-based (keyauth, mtls) inserts all in `ConsumerIndex` (O(1)); secret-based (jwt, basicauth, hmac) iterates (typically 1-2). `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default 2). Admin: `POST /consumers/:id/credentials/:type` + `DELETE .../:index`.
@@ -199,7 +205,7 @@ Priority order, lower = first. Multiple instances per proxy allowed. Each has `i
 
 **CRITICAL — `before_proxy(ctx, headers)`**: always read headers from the `headers` parameter, NEVER from `ctx.headers`. When no plugin sets `modifies_request_headers() == true`, the handler `std::mem::take()`s headers out of `ctx.headers` — `ctx.headers` is empty during this phase. Only this phase has this quirk.
 
-**External identity**: `ctx.authenticated_identity` is first-class across rate-limit/cache keys, log summaries, backend identity-header injection. **Response mock path scoping**: `response_mock` strips the proxy's `listen_path` prefix before rule matching (no stripping for root/regex listen_paths).
+**External identity**: `ctx.authenticated_identity` is first-class across rate-limit/cache keys, log summaries, backend identity-header injection. **Response mock path scoping**: `response_mock` strips the proxy's prefix `listen_path` before rule matching (no stripping for root/regex/exact listen_paths).
 
 ### Transaction Summary Fields
 
@@ -554,8 +560,8 @@ Full docs reference: `docs/configuration.md`. Runtime parsing/defaults: `src/con
 - `FERRUM_MAX_CONNECTIONS` (100000)/`MAX_REQUESTS` (0 = unlimited)
 - `FERRUM_SHUTDOWN_DRAIN_SECONDS` (30; `0` immediate)
 - `FERRUM_WORKER_THREADS` (CPU cores); `FERRUM_BLOCKING_THREADS` (512; **bump to ≥1024 with io_uring splice at scale**)
-- `FERRUM_ACCEPT_THREADS` (0 = CPU cores; SO_REUSEPORT)
-- `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`/`HALF_CLOSE_MAX_WAIT_SECONDS` (300/300; both `0` → TCP fast path)
+- `FERRUM_ACCEPT_THREADS` (0 = CPU cores; SO_REUSEPORT, Unix-only)
+- `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`/`HALF_CLOSE_MAX_WAIT_SECONDS` (300/300; TCP fast path also requires per-proxy backend read/write timeouts `0`)
 - `FERRUM_UDP_MAX_SESSIONS` (10000); `FERRUM_UDP_RECVMMSG_BATCH_SIZE` (64)
 - `FERRUM_WEBSOCKET_MAX_CONNECTIONS` (20000; 0 = disabled)
 - `FERRUM_WEBSOCKET_TUNNEL_MODE` (`false`) — raw TCP copy; **frame-loss risk for server-push** (stock tickers, Socket.IO) where backend writes in same TCP segment as 101

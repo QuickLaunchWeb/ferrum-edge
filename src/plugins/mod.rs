@@ -385,6 +385,17 @@ impl RequestContext {
             .and_then(|v| v.to_str().ok())
     }
 
+    /// Iterate all values for a raw header without materializing the full
+    /// header map. Returns an empty iterator if raw headers were already
+    /// consumed.
+    #[inline]
+    pub fn raw_header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.raw_headers
+            .iter()
+            .flat_map(move |headers| headers.get_all(name).iter())
+            .filter_map(|value| value.to_str().ok())
+    }
+
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
     /// String>`). This is a one-time operation — subsequent calls are no-ops.
     /// Non-UTF-8 header values are silently skipped (same as the previous eager
@@ -397,7 +408,21 @@ impl RequestContext {
                     // http::HeaderName stores names in lowercase already (HTTP/2+3
                     // spec), and hyper normalizes HTTP/1.1 header names to
                     // lowercase at parse time. No `to_lowercase()` needed.
-                    self.headers.insert(name.as_str().to_owned(), v.to_owned());
+                    let key = name.as_str();
+                    if key == "baggage" {
+                        // W3C baggage is a list header, so multiple field lines
+                        // are equivalent to one comma-separated value. Preserve
+                        // that before raw headers are consumed by materialization.
+                        self.headers
+                            .entry(key.to_owned())
+                            .and_modify(|existing| {
+                                existing.push(',');
+                                existing.push_str(v);
+                            })
+                            .or_insert_with(|| v.to_owned());
+                    } else {
+                        self.headers.insert(key.to_owned(), v.to_owned());
+                    }
                 }
             }
         }

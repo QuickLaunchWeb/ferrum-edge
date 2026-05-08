@@ -949,10 +949,11 @@ async fn test_plugin_soap_ws_security_username_token() {
         .await
         .expect("Request failed");
 
+    let status = resp.status().as_u16();
+    let response_body = resp.text().await.unwrap_or_default();
     assert_eq!(
-        resp.status().as_u16(),
-        200,
-        "Valid SOAP WS-Security request should be proxied to backend"
+        status, 200,
+        "Valid SOAP WS-Security request should be proxied to backend, got {status}: {response_body}"
     );
 }
 
