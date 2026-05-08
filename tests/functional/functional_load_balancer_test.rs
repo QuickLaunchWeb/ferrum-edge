@@ -13,7 +13,7 @@ use std::io::Write;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 
 // ============================================================================
@@ -184,20 +184,27 @@ fn start_gateway_in_file_mode(
     Ok(child)
 }
 
-/// Poll the admin /health endpoint until the gateway is ready or timeout.
-async fn wait_for_gateway(admin_port: u16) -> bool {
+/// Poll the admin /health endpoint and proxy listener until the gateway is ready.
+async fn wait_for_gateway(admin_port: u16, proxy_port: u16) -> bool {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
         .unwrap();
 
     for _ in 0..30 {
-        if let Ok(resp) = client
+        let admin_ready = if let Ok(resp) = client
             .get(format!("http://127.0.0.1:{}/health", admin_port))
             .send()
             .await
-            && resp.status().is_success()
         {
+            resp.status().is_success()
+        } else {
+            false
+        };
+
+        let proxy_ready = TcpStream::connect(("127.0.0.1", proxy_port)).await.is_ok();
+
+        if admin_ready && proxy_ready {
             return true;
         }
         sleep(Duration::from_millis(200)).await;
@@ -222,12 +229,12 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
 
         match start_gateway_in_file_mode(config_path, proxy_port, admin_port) {
             Ok(mut child) => {
-                if wait_for_gateway(admin_port).await {
+                if wait_for_gateway(admin_port, proxy_port).await {
                     return (child, proxy_port, admin_port);
                 }
                 eprintln!(
-                    "Gateway startup attempt {}/{} failed (health check timeout on admin port {})",
-                    attempt, MAX_ATTEMPTS, admin_port
+                    "Gateway startup attempt {}/{} failed (readiness timeout on admin port {} / proxy port {})",
+                    attempt, MAX_ATTEMPTS, admin_port, proxy_port
                 );
                 let _ = child.kill();
                 let _ = child.wait();

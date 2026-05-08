@@ -15,8 +15,8 @@ use crate::common::{DbType, TestGateway};
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -157,11 +157,36 @@ async fn start_echo_backend(
     Ok(handle)
 }
 
+fn command_output_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 /// Check if a Docker container is running and healthy.
 fn is_container_running(name: &str) -> bool {
-    Command::new("docker")
-        .args(["inspect", "--format", "{{.State.Running}}", name])
-        .output()
+    let mut command = Command::new("docker");
+    command.args(["inspect", "--format", "{{.State.Running}}", name]);
+
+    command_output_with_timeout(command, Duration::from_secs(2))
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
         .unwrap_or(false)
 }

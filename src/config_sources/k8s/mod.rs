@@ -137,14 +137,18 @@ impl K8sAccumulator {
     pub(crate) fn add_reference_grant(
         &mut self,
         from_namespace: String,
+        from_group: String,
         from_kind: String,
         to_namespace: String,
+        to_group: String,
         to_kind: String,
     ) {
         self.reference_grants.insert(ReferenceGrantPermission {
             from_namespace,
+            from_group,
             from_kind,
             to_namespace,
+            to_group,
             to_kind,
         });
     }
@@ -152,14 +156,18 @@ impl K8sAccumulator {
     pub(crate) fn reference_grant_allows(
         &self,
         from_namespace: &str,
+        from_group: &str,
         from_kind: &str,
         to_namespace: &str,
+        to_group: &str,
         to_kind: &str,
     ) -> bool {
         self.reference_grants.contains(&ReferenceGrantPermission {
             from_namespace: from_namespace.to_string(),
+            from_group: from_group.to_string(),
             from_kind: from_kind.to_string(),
             to_namespace: to_namespace.to_string(),
+            to_group: to_group.to_string(),
             to_kind: to_kind.to_string(),
         })
     }
@@ -223,8 +231,10 @@ impl K8sAccumulator {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReferenceGrantPermission {
     from_namespace: String,
+    from_group: String,
     from_kind: String,
     to_namespace: String,
+    to_group: String,
     to_kind: String,
 }
 
@@ -340,6 +350,7 @@ pub(crate) struct RouteProxySpec {
     pub namespace: String,
     pub hosts: Vec<String>,
     pub listen_path: Option<String>,
+    pub strip_listen_path: bool,
     pub backend_host: String,
     pub backend_port: u16,
     pub upstream_id: Option<String>,
@@ -360,7 +371,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         backend_host: spec.backend_host,
         backend_port: spec.backend_port,
         backend_path: None,
-        strip_listen_path: true,
+        strip_listen_path: spec.strip_listen_path,
         preserve_host_header: false,
         backend_connect_timeout_ms: 30_000,
         backend_read_timeout_ms: 30_000,
@@ -455,6 +466,10 @@ pub(crate) fn upstream_for_route(
 
 pub(crate) fn service_dns_name(name: &str, namespace: &str) -> String {
     format!("{name}.{namespace}.svc.cluster.local")
+}
+
+pub(crate) fn exact_path_listen_path(path: &str) -> String {
+    format!("={path}")
 }
 
 pub(crate) fn resource_id(prefix: &str, namespace: &str, name: &str, suffix: &str) -> String {

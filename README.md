@@ -21,7 +21,7 @@ Ferrum Edge is a lightweight, extensible edge proxy designed for modern microser
 
 - **Multi-protocol**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, raw TCP/UDP with TLS/DTLS
 - **58 built-in plugins**: Authentication, authorization, rate limiting, compression, SSE stream handling, transformation, response mocking, spec exposure, serverless functions, AI/LLM-specific plugins (including AI federation for multi-provider routing), load testing, API chargeback, and observability
-- **Four operating modes**: Database, File, Control Plane, Data Plane
+- **Seven operating modes**: Database, File, Control Plane, Data Plane, Mesh, Injector, and Migrate
 - **Lock-free hot path**: All request-path reads use `ArcSwap` or `DashMap` — no mutexes on the proxy path
 - **Zero-downtime config reloads**: Atomic config swap via DB polling, SIGHUP, or CP push
 - **Kubernetes mesh translation**: Gateway API and Istio VirtualService route splits, including Istio regex URI matches, translate into Ferrum proxy/upstream config
@@ -36,6 +36,8 @@ For the full feature list, see [FEATURES.md](FEATURES.md).
 | **File** | `FERRUM_MODE=file` | Single-instance, YAML/JSON config, SIGHUP reload | Read-only | Yes |
 | **Control Plane** | `FERRUM_MODE=cp` | Centralized config authority, gRPC distribution to DPs | Read/Write | No |
 | **Data Plane** | `FERRUM_MODE=dp` | Horizontally scalable traffic processing nodes | Read-only | Yes |
+| **Mesh** | `FERRUM_MODE=mesh` | Service-mesh data plane consuming native MeshSubscribe slices or future xDS feeds | Read-only | Yes |
+| **Injector** | `FERRUM_MODE=injector` | Kubernetes admission webhook that injects Ferrum mesh sidecars/init capture | No | No |
 | **Migrate** | `FERRUM_MODE=migrate` | Runs DB schema migrations then exits | No | No |
 
 See [docs/cp_dp_mode.md](docs/cp_dp_mode.md) for distributed deployment details.
@@ -196,7 +198,7 @@ Ferrum Edge is configured through environment variables, with an optional `ferru
 | `FERRUM_LOG_BUFFER_CAPACITY` | No | `128000` | Max buffered log lines in the non-blocking writer channel |
 | `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy port (`0` = disabled) |
 | `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy port |
-| `FERRUM_ACCEPT_THREADS` | No | `0` (auto-detect) | Parallel accept loops via SO_REUSEPORT (0 = CPU cores) |
+| `FERRUM_ACCEPT_THREADS` | No | `0` (auto-detect) | Parallel accept loops via SO_REUSEPORT (0 = CPU cores; Unix only, non-Unix falls back to one loop) |
 | `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port (`0` = disabled) |
 | `FERRUM_ADMIN_JWT_SECRET` | DB/CP | — | HS256 secret for Admin API (min 32 chars) |
 | `FERRUM_DB_TYPE` | DB/CP | — | `postgres`, `mysql`, `sqlite`, `mongodb` |

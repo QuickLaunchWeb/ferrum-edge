@@ -7,6 +7,7 @@
 //!
 //! Run with: cargo test --test functional_tests functional_grpc_plugins -- --ignored --nocapture
 
+use crate::scaffolding::ports::reserve_port;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -35,12 +36,14 @@ async fn free_port() -> u16 {
 
 /// Start a mock gRPC backend that echoes headers and body.
 /// Also echoes grpc-timeout back as x-echo-grpc-timeout for deadline verification.
-async fn start_grpc_echo_backend(port: u16) -> tokio::task::JoinHandle<()> {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+async fn start_grpc_echo_backend() -> (u16, tokio::task::JoinHandle<()>) {
+    let reservation = reserve_port()
         .await
-        .expect("Failed to bind gRPC echo backend");
+        .expect("Failed to reserve gRPC echo backend port");
+    let port = reservation.port;
+    let listener = reservation.into_listener();
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         loop {
             let (stream, _addr) = match listener.accept().await {
                 Ok(conn) => conn,
@@ -93,7 +96,9 @@ async fn start_grpc_echo_backend(port: u16) -> tokio::task::JoinHandle<()> {
                 }
             });
         }
-    })
+    });
+
+    (port, handle)
 }
 
 fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
@@ -434,9 +439,7 @@ plugin_configs:
 #[ignore]
 #[tokio::test]
 async fn test_grpc_method_router_allow_list() {
-    let backend_port = free_port().await;
-
-    let echo_handle = start_grpc_echo_backend(backend_port).await;
+    let (backend_port, echo_handle) = start_grpc_echo_backend().await;
     sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -495,9 +498,7 @@ async fn test_grpc_method_router_allow_list() {
 #[ignore]
 #[tokio::test]
 async fn test_grpc_method_router_deny_list() {
-    let backend_port = free_port().await;
-
-    let echo_handle = start_grpc_echo_backend(backend_port).await;
+    let (backend_port, echo_handle) = start_grpc_echo_backend().await;
     sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -556,9 +557,7 @@ async fn test_grpc_method_router_deny_list() {
 #[ignore]
 #[tokio::test]
 async fn test_grpc_method_router_rate_limiting() {
-    let backend_port = free_port().await;
-
-    let echo_handle = start_grpc_echo_backend(backend_port).await;
+    let (backend_port, echo_handle) = start_grpc_echo_backend().await;
     sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -636,9 +635,7 @@ async fn test_grpc_method_router_rate_limiting() {
 #[ignore]
 #[tokio::test]
 async fn test_grpc_response_size_limiting_returns_grpc_error() {
-    let backend_port = free_port().await;
-
-    let echo_handle = start_grpc_echo_backend(backend_port).await;
+    let (backend_port, echo_handle) = start_grpc_echo_backend().await;
     sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -689,9 +686,7 @@ async fn test_grpc_response_size_limiting_returns_grpc_error() {
 #[ignore]
 #[tokio::test]
 async fn test_grpc_deadline_default_injection() {
-    let backend_port = free_port().await;
-
-    let echo_handle = start_grpc_echo_backend(backend_port).await;
+    let (backend_port, echo_handle) = start_grpc_echo_backend().await;
     sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -739,9 +734,7 @@ async fn test_grpc_deadline_default_injection() {
 #[ignore]
 #[tokio::test]
 async fn test_grpc_deadline_passthrough() {
-    let backend_port = free_port().await;
-
-    let echo_handle = start_grpc_echo_backend(backend_port).await;
+    let (backend_port, echo_handle) = start_grpc_echo_backend().await;
     sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -783,9 +776,7 @@ async fn test_grpc_deadline_passthrough() {
 #[ignore]
 #[tokio::test]
 async fn test_grpc_deadline_clamped_to_max() {
-    let backend_port = free_port().await;
-
-    let echo_handle = start_grpc_echo_backend(backend_port).await;
+    let (backend_port, echo_handle) = start_grpc_echo_backend().await;
     sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -863,9 +854,7 @@ async fn test_grpc_deadline_clamped_to_max() {
 #[ignore]
 #[tokio::test]
 async fn test_grpc_plugins_skip_non_grpc_requests() {
-    let backend_port = free_port().await;
-
-    let echo_handle = start_grpc_echo_backend(backend_port).await;
+    let (backend_port, echo_handle) = start_grpc_echo_backend().await;
     sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");

@@ -99,8 +99,14 @@ pub struct StreamListenerManager {
     adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     /// Number of datagrams per `recvmmsg` syscall on Linux.
     udp_recvmmsg_batch_size: usize,
-    /// Whether TCP Fast Open is enabled for outbound stream proxy connections.
+    /// Whether TCP Fast Open is enabled for TCP stream proxy sockets.
     tcp_fastopen_enabled: bool,
+    /// Listen backlog for TCP stream proxy sockets.
+    tcp_listen_backlog: u32,
+    /// Number of SO_REUSEPORT TCP stream accept loops.
+    accept_threads: usize,
+    /// Server-side TCP Fast Open queue length for TCP stream proxy sockets.
+    tcp_fastopen_queue_len: u16,
     /// Shared overload state for connection accounting and load shedding.
     overload: Arc<crate::overload::OverloadState>,
     /// Enable kTLS for splice on TLS paths.
@@ -147,6 +153,9 @@ impl StreamListenerManager {
         adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
         udp_recvmmsg_batch_size: usize,
         tcp_fastopen_enabled: bool,
+        tcp_listen_backlog: u32,
+        accept_threads: usize,
+        tcp_fastopen_queue_len: u16,
         overload: Arc<crate::overload::OverloadState>,
         ktls_enabled: bool,
         io_uring_splice_enabled: bool,
@@ -174,6 +183,9 @@ impl StreamListenerManager {
             adaptive_buffer,
             udp_recvmmsg_batch_size,
             tcp_fastopen_enabled,
+            tcp_listen_backlog,
+            accept_threads,
+            tcp_fastopen_queue_len,
             overload,
             ktls_enabled,
             io_uring_splice_enabled,
@@ -204,6 +216,9 @@ impl StreamListenerManager {
         adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
         udp_recvmmsg_batch_size: usize,
         tcp_fastopen_enabled: bool,
+        tcp_listen_backlog: u32,
+        accept_threads: usize,
+        tcp_fastopen_queue_len: u16,
         overload: Arc<crate::overload::OverloadState>,
         ktls_enabled: bool,
         io_uring_splice_enabled: bool,
@@ -235,6 +250,9 @@ impl StreamListenerManager {
             adaptive_buffer,
             udp_recvmmsg_batch_size,
             tcp_fastopen_enabled,
+            tcp_listen_backlog,
+            accept_threads,
+            tcp_fastopen_queue_len,
             overload,
             ktls_enabled,
             io_uring_splice_enabled,
@@ -606,6 +624,9 @@ impl StreamListenerManager {
                 let sni_ids = sni_ids.clone();
                 let adaptive_buf = self.adaptive_buffer.clone();
                 let tcp_fastopen = self.tcp_fastopen_enabled;
+                let tcp_listen_backlog = self.tcp_listen_backlog;
+                let accept_threads = self.accept_threads;
+                let tcp_fastopen_queue_len = self.tcp_fastopen_queue_len;
                 let overload = self.overload.clone();
                 let ktls_enabled = self.ktls_enabled;
                 let io_uring_splice_enabled = self.io_uring_splice_enabled;
@@ -634,6 +655,9 @@ impl StreamListenerManager {
                         sni_proxy_ids: sni_ids,
                         adaptive_buffer: adaptive_buf,
                         tcp_fastopen_enabled: tcp_fastopen,
+                        tcp_listen_backlog,
+                        accept_threads,
+                        tcp_fastopen_queue_len,
                         overload,
                         ktls_enabled,
                         io_uring_splice_enabled,

@@ -175,6 +175,19 @@ async fn test_regex_listen_path_continues() {
 }
 
 #[tokio::test]
+async fn test_exact_listen_path_continues() {
+    let plugin = SpecExpose::new(
+        &json!({ "spec_url": "https://example.com/openapi.yaml" }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/specz", "=/api");
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
 async fn test_no_matched_proxy_continues() {
     let plugin = SpecExpose::new(
         &json!({ "spec_url": "https://example.com/openapi.yaml" }),
