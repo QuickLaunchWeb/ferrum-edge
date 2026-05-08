@@ -611,6 +611,9 @@ pub async fn run(
                                 // so that a DP calling GetFullConfig immediately after
                                 // receives the new version. Mesh streams render their
                                 // per-subscriber slices from the same delta payload.
+                                // DP and mesh broadcasts are intentionally coupled to the
+                                // same polling cycle so both subscriber types converge on
+                                // the same config version simultaneously.
                                 let version = poll_ts.to_rfc3339();
                                 CpGrpcServer::broadcast_delta_with_registry(&update_tx, &result, &version, &dp_registry_poll);
                                 MeshGrpcServer::broadcast_delta_with_registry(&mesh_update_tx, &result, &version, &mesh_registry_poll);
