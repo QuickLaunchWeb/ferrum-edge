@@ -13,6 +13,11 @@ use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::plugins::mesh_authz::parse_trust_domain_aliases;
 
+const MESH_SOURCE_PRINCIPAL: &str = "mesh.source.principal";
+const MESH_SOURCE_TRUST_DOMAIN: &str = "mesh.source.trust_domain";
+const MESH_SOURCE_NAMESPACE: &str = "mesh.source.namespace";
+const MESH_SOURCE_SERVICE_ACCOUNT: &str = "mesh.source.service_account";
+
 #[derive(Debug, Clone, Default)]
 pub struct WorkloadMetrics {
     node_id: Option<String>,
@@ -107,7 +112,7 @@ impl WorkloadMetrics {
             request_protocol(ctx, headers).to_string(),
         );
         if let Some(identity) = source_identity.as_ref() {
-            insert_spiffe_labels(&mut ctx.metadata, "mesh.source", identity);
+            insert_source_spiffe_labels(&mut ctx.metadata, identity);
         }
         self.insert_source_workload_labels(&mut ctx.metadata, source_identity.as_ref());
         if let Some(proxy) = ctx.matched_proxy.as_ref() {
@@ -229,7 +234,7 @@ impl Plugin for WorkloadMetrics {
             })
             .or_else(|| self.workload_spiffe_id.clone())
         {
-            insert_spiffe_labels(metadata, "mesh.source", &identity);
+            insert_source_spiffe_labels(metadata, &identity);
             self.insert_source_workload_labels(metadata, Some(&identity));
         } else {
             self.insert_source_workload_labels(metadata, None);
@@ -312,22 +317,18 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
     })
 }
 
-fn insert_spiffe_labels(
-    metadata: &mut std::collections::HashMap<String, String>,
-    prefix: &str,
-    identity: &SpiffeId,
-) {
-    metadata.insert(format!("{prefix}.principal"), identity.to_string());
+fn insert_source_spiffe_labels(metadata: &mut HashMap<String, String>, identity: &SpiffeId) {
+    metadata.insert(MESH_SOURCE_PRINCIPAL.to_string(), identity.to_string());
     metadata.insert(
-        format!("{prefix}.trust_domain"),
+        MESH_SOURCE_TRUST_DOMAIN.to_string(),
         identity.trust_domain().as_str().to_string(),
     );
     if let Some(namespace) = spiffe_path_value(identity, "ns") {
-        metadata.insert(format!("{prefix}.namespace"), namespace.to_string());
+        metadata.insert(MESH_SOURCE_NAMESPACE.to_string(), namespace.to_string());
     }
     if let Some(service_account) = spiffe_path_value(identity, "sa") {
         metadata.insert(
-            format!("{prefix}.service_account"),
+            MESH_SOURCE_SERVICE_ACCOUNT.to_string(),
             service_account.to_string(),
         );
     }

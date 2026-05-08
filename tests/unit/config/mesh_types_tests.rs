@@ -245,6 +245,84 @@ fn multi_cluster_config_round_trips_through_serde() {
 }
 
 #[test]
+fn mesh_normalize_strips_trailing_dot_from_request_match_hosts() {
+    let mut mesh = MeshConfig {
+        mesh_policies: vec![MeshPolicy {
+            name: "p".into(),
+            namespace: "default".into(),
+            scope: PolicyScope::MeshWide,
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: vec![RequestMatch {
+                    hosts: vec!["Example.COM.".to_string()],
+                    ..RequestMatch::default()
+                }],
+                when: Vec::new(),
+                never_matches: false,
+                action: PolicyAction::Allow,
+            }],
+        }],
+        ..MeshConfig::default()
+    };
+
+    mesh.normalize();
+    let request = &mesh.mesh_policies[0].rules[0].to[0];
+    assert_eq!(request.hosts, vec!["example.com"]);
+}
+
+#[test]
+fn mesh_normalize_preserves_request_match_host_port() {
+    let mut mesh = MeshConfig {
+        mesh_policies: vec![MeshPolicy {
+            name: "p".into(),
+            namespace: "default".into(),
+            scope: PolicyScope::MeshWide,
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: vec![RequestMatch {
+                    hosts: vec!["API.Default.:8443".to_string()],
+                    ..RequestMatch::default()
+                }],
+                when: Vec::new(),
+                never_matches: false,
+                action: PolicyAction::Allow,
+            }],
+        }],
+        ..MeshConfig::default()
+    };
+
+    mesh.normalize();
+    let request = &mesh.mesh_policies[0].rules[0].to[0];
+    assert_eq!(request.hosts, vec!["api.default:8443"]);
+}
+
+#[test]
+fn mesh_normalize_trims_request_match_port_pattern_whitespace() {
+    let mut mesh = MeshConfig {
+        mesh_policies: vec![MeshPolicy {
+            name: "p".into(),
+            namespace: "default".into(),
+            scope: PolicyScope::MeshWide,
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: vec![RequestMatch {
+                    port_patterns: vec![" 8* ".to_string()],
+                    ..RequestMatch::default()
+                }],
+                when: Vec::new(),
+                never_matches: false,
+                action: PolicyAction::Allow,
+            }],
+        }],
+        ..MeshConfig::default()
+    };
+
+    mesh.normalize();
+    let request = &mesh.mesh_policies[0].rules[0].to[0];
+    assert_eq!(request.port_patterns, vec!["8*"]);
+}
+
+#[test]
 fn mesh_normalize_lowercases_multi_cluster_sni_hosts() {
     let mut mesh = MeshConfig {
         multi_cluster: Some(MultiClusterConfig {
@@ -266,6 +344,65 @@ fn mesh_normalize_lowercases_multi_cluster_sni_hosts() {
     let gateway = &mesh.multi_cluster.as_ref().unwrap().east_west_gateways[0];
     assert_eq!(gateway.host, "eastwest-b.example");
     assert_eq!(gateway.sni_hosts, vec!["api.global"]);
+}
+
+#[test]
+fn mesh_normalize_lowercases_policy_header_names() {
+    let mut mesh = MeshConfig {
+        mesh_policies: vec![MeshPolicy {
+            name: "tenant".to_string(),
+            namespace: "default".to_string(),
+            scope: PolicyScope::MeshWide,
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: vec![RequestMatch {
+                    headers: HashMap::from([("X-Tenant".to_string(), "prod".to_string())]),
+                    ..RequestMatch::default()
+                }],
+                when: Vec::new(),
+                never_matches: false,
+                action: PolicyAction::Allow,
+            }],
+        }],
+        ..MeshConfig::default()
+    };
+
+    mesh.normalize();
+
+    let headers = &mesh.mesh_policies[0].rules[0].to[0].headers;
+    assert_eq!(headers.get("x-tenant").map(String::as_str), Some("prod"));
+    assert!(!headers.contains_key("X-Tenant"));
+}
+
+#[test]
+fn mesh_normalize_preserves_policy_header_case_collisions() {
+    let mut mesh = MeshConfig {
+        mesh_policies: vec![MeshPolicy {
+            name: "tenant".to_string(),
+            namespace: "default".to_string(),
+            scope: PolicyScope::MeshWide,
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: vec![RequestMatch {
+                    headers: HashMap::from([
+                        ("X-Tenant".to_string(), "prod".to_string()),
+                        ("x-tenant".to_string(), "dev".to_string()),
+                    ]),
+                    ..RequestMatch::default()
+                }],
+                when: Vec::new(),
+                never_matches: false,
+                action: PolicyAction::Allow,
+            }],
+        }],
+        ..MeshConfig::default()
+    };
+
+    mesh.normalize();
+
+    let headers = &mesh.mesh_policies[0].rules[0].to[0].headers;
+    assert_eq!(headers.get("X-Tenant").map(String::as_str), Some("prod"));
+    assert_eq!(headers.get("x-tenant").map(String::as_str), Some("dev"));
 }
 
 #[test]

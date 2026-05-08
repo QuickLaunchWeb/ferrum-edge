@@ -24,6 +24,7 @@ Ferrum Edge is a lightweight, extensible edge proxy designed for modern microser
 - **Seven operating modes**: Database, File, Control Plane, Data Plane, Mesh, Injector, and Migrate
 - **Lock-free hot path**: All request-path reads use `ArcSwap` or `DashMap` — no mutexes on the proxy path
 - **Zero-downtime config reloads**: Atomic config swap via DB polling, SIGHUP, or CP push
+- **Kubernetes mesh translation**: Gateway API and Istio VirtualService route splits, including Istio regex URI matches, translate into Ferrum proxy/upstream config
 
 For the full feature list, see [FEATURES.md](FEATURES.md).
 

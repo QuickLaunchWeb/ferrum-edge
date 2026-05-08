@@ -15,8 +15,8 @@ use serde_json::Value;
 
 use crate::config::mesh::MeshConfig;
 use crate::config::types::{
-    BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, PluginAssociation, Proxy,
-    ResponseBodyMode, default_namespace,
+    BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
+    PluginAssociation, Proxy, ResponseBodyMode, Upstream, UpstreamTarget, default_namespace,
 };
 use crate::identity::spiffe::TrustDomain;
 
@@ -202,6 +202,19 @@ impl K8sAccumulator {
         self.config.proxies.push(proxy);
     }
 
+    pub(crate) fn upsert_upstream(&mut self, upstream: Upstream) {
+        if let Some(existing) = self
+            .config
+            .upstreams
+            .iter_mut()
+            .find(|candidate| candidate.id == upstream.id)
+        {
+            *existing = upstream;
+        } else {
+            self.config.upstreams.push(upstream);
+        }
+    }
+
     fn finish(mut self) -> K8sTranslation {
         self.mesh.normalize();
         if self.mesh != MeshConfig::default() {
@@ -340,6 +353,7 @@ pub(crate) struct RouteProxySpec {
     pub strip_listen_path: bool,
     pub backend_host: String,
     pub backend_port: u16,
+    pub upstream_id: Option<String>,
     pub backend_scheme: BackendScheme,
     pub listen_port: Option<u16>,
 }
@@ -383,7 +397,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
-        upstream_id: None,
+        upstream_id: spec.upstream_id,
         api_spec_id: None,
         circuit_breaker: None,
         retry: None,
@@ -396,6 +410,55 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         tcp_idle_timeout_seconds: None,
         allowed_methods: None,
         allowed_ws_origins: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+pub(crate) struct RouteBackend {
+    pub host: String,
+    pub port: u16,
+    pub weight: u32,
+}
+
+pub(crate) fn upstream_for_route(
+    id: String,
+    namespace: String,
+    backends: Vec<RouteBackend>,
+) -> Upstream {
+    let now = Utc::now();
+    let first_weight = backends.first().map(|backend| backend.weight).unwrap_or(1);
+    let has_weighted_target = backends
+        .iter()
+        .any(|backend| backend.weight != first_weight);
+    Upstream {
+        id: id.clone(),
+        name: Some(id),
+        namespace,
+        targets: backends
+            .into_iter()
+            .map(|backend| UpstreamTarget {
+                host: backend.host,
+                port: backend.port,
+                weight: backend.weight,
+                tags: HashMap::new(),
+                path: None,
+            })
+            .collect(),
+        algorithm: if has_weighted_target {
+            LoadBalancerAlgorithm::WeightedRoundRobin
+        } else {
+            LoadBalancerAlgorithm::RoundRobin
+        },
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        api_spec_id: None,
         created_at: now,
         updated_at: now,
     }

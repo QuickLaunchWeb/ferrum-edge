@@ -38,6 +38,43 @@ fn require_logs(harness: &GatewayHarness) -> String {
     logs
 }
 
+fn has_body_error_signal(logs: &str) -> bool {
+    // The gateway logs body-read errors as either a structured
+    // `body_error_class` (via stdout_logging) or a proxy-level
+    // "Failed to read backend response body" / "error decoding response
+    // body" warning when hyper notices the truncated Content-Length. Any
+    // of these prove the gateway noticed the incomplete body.
+    logs.contains("body_error_class")
+        || logs.contains("IncompleteBody")
+        || logs.contains("unexpected end of file")
+        || logs.contains("Incomplete")
+        || logs.contains("ClientDisconnect")
+        || logs.contains("Failed to read backend response body")
+        || logs.contains("error decoding response body")
+}
+
+async fn collect_body_error_logs(harness: &GatewayHarness) -> String {
+    if let Ok(url) = harness.admin_url("/health").parse::<reqwest::Url>() {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .expect("reqwest client");
+        for _ in 0..2 {
+            let _ = client.get(url.clone()).send().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let logs = require_logs(harness);
+        if has_body_error_signal(&logs) || Instant::now() >= deadline {
+            return logs;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Test 1 — backend port with nothing listening → 502 + ConnectionRefused class.
 // ────────────────────────────────────────────────────────────────────────────
@@ -274,19 +311,8 @@ async fn backend_close_mid_body_populates_body_error_class() {
         }
     }
 
-    let logs = require_logs(&harness);
-    // The gateway logs body-read errors as either a structured
-    // `body_error_class` (via stdout_logging) or a proxy-level
-    // "Failed to read backend response body" / "error decoding response
-    // body" warning when hyper notices the truncated Content-Length. Any
-    // of these prove the gateway noticed the incomplete body.
-    let has_body_error = logs.contains("body_error_class")
-        || logs.contains("IncompleteBody")
-        || logs.contains("unexpected end of file")
-        || logs.contains("Incomplete")
-        || logs.contains("ClientDisconnect")
-        || logs.contains("Failed to read backend response body")
-        || logs.contains("error decoding response body");
+    let logs = collect_body_error_logs(&harness).await;
+    let has_body_error = has_body_error_signal(&logs);
     assert!(
         has_body_error,
         "expected body-error signal in logs; got:\n{logs}"

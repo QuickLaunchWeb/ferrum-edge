@@ -193,6 +193,9 @@ pub struct RequestMatch {
     pub headers: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<u16>,
+    /// Glob port patterns, used for Istio string-match ports such as "*".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub port_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -202,6 +205,82 @@ pub struct ConditionMatch {
     pub values: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_values: Vec<String>,
+}
+
+/// Abstraction over per-workload label maps.
+///
+/// `mesh_authz` carries labels in a `BTreeMap<String, String>` (the
+/// canonical [`crate::xds::slice::MeshSlice`] form), the Kubernetes injector
+/// keeps them in a `HashMap`, and tests freely build either. This trait lets
+/// the scope-matching helpers below accept any of those without copying.
+pub trait WorkloadLabels {
+    fn lookup(&self, key: &str) -> Option<&str>;
+}
+
+impl<S: ::std::hash::BuildHasher> WorkloadLabels for HashMap<String, String, S> {
+    #[inline]
+    fn lookup(&self, key: &str) -> Option<&str> {
+        self.get(key).map(String::as_str)
+    }
+}
+
+impl WorkloadLabels for ::std::collections::BTreeMap<String, String> {
+    #[inline]
+    fn lookup(&self, key: &str) -> Option<&str> {
+        self.get(key).map(String::as_str)
+    }
+}
+
+/// Returns `true` when `policy.scope` applies to a workload whose namespace is
+/// `proxy_namespace` and whose labels are `proxy_labels`.
+///
+/// This is the **single canonical scope-matching helper** used by both the
+/// xDS / native MeshSubscribe slice builder ([`crate::xds::slice::MeshSlice::from_gateway_config`])
+/// and the `mesh_authz` plugin's per-policy filter so that scope semantics
+/// stay byte-identical across the two surfaces.
+///
+/// Semantics:
+/// - [`PolicyScope::MeshWide`] — applies to every workload.
+/// - [`PolicyScope::Namespace`] — applies iff `proxy_namespace == policy.scope.namespace`.
+/// - [`PolicyScope::WorkloadSelector`] — applies iff (a) the selector's
+///   namespace is unset or equal to `proxy_namespace` AND (b) every
+///   `(key, value)` in `selector.labels` is present in `proxy_labels` with the
+///   same value (subset match — empty selector labels means "any workload in
+///   the optional namespace").
+pub fn policy_scope_applies_to_workload<L: WorkloadLabels + ?Sized>(
+    policy: &MeshPolicy,
+    proxy_namespace: &str,
+    proxy_labels: &L,
+) -> bool {
+    match &policy.scope {
+        PolicyScope::MeshWide => true,
+        PolicyScope::Namespace {
+            namespace: policy_namespace,
+        } => policy_namespace == proxy_namespace,
+        PolicyScope::WorkloadSelector { selector } => {
+            workload_selector_matches(selector, proxy_namespace, proxy_labels)
+        }
+    }
+}
+
+/// Returns `true` when a [`WorkloadSelector`] matches a workload whose
+/// namespace is `proxy_namespace` and whose labels are `proxy_labels`. Same
+/// shape as [`policy_scope_applies_to_workload`]; lifted so PeerAuthentication
+/// selector matching shares the same predicate.
+pub fn workload_selector_matches<L: WorkloadLabels + ?Sized>(
+    selector: &WorkloadSelector,
+    proxy_namespace: &str,
+    proxy_labels: &L,
+) -> bool {
+    if let Some(selector_namespace) = selector.namespace.as_ref()
+        && selector_namespace != proxy_namespace
+    {
+        return false;
+    }
+    selector
+        .labels
+        .iter()
+        .all(|(key, value)| proxy_labels.lookup(key) == Some(value.as_str()))
 }
 
 // ── PeerAuthentication ────────────────────────────────────────────────────
@@ -451,9 +530,9 @@ impl MeshConfig {
         normalize_mesh_fields_internal(
             &mut self.service_entries,
             &mut self.workloads,
+            &mut self.mesh_policies,
             self.multi_cluster.as_mut(),
         );
-        normalize_mesh_policy_fields(&mut self.mesh_policies);
     }
 }
 
@@ -602,13 +681,34 @@ fn validate_mesh_config_internal(
                 let any_path = !request.paths.is_empty();
                 let any_host = !request.hosts.is_empty();
                 let any_header = !request.headers.is_empty();
-                let any_port = !request.ports.is_empty();
+                let any_port = !request.ports.is_empty() || !request.port_patterns.is_empty();
                 if !(any_method || any_path || any_host || any_header || any_port) {
                     errors.push(format!(
                         "MeshPolicy '{}'.rules[{}].to[{}]: at least one of \
                          methods/paths/hosts/headers/ports must be non-empty",
                         policy.name, i, j
                     ));
+                }
+                for (k, host) in request.hosts.iter().enumerate() {
+                    if !is_valid_request_match_host_pattern(host) {
+                        errors.push(format!(
+                            "MeshPolicy '{}'.rules[{}].to[{}].hosts[{}] \
+                             '{}' is not a valid host pattern \
+                             (expected hostname, [ipv6], or host:port/host:* \
+                             with u16 numeric or '*' port)",
+                            policy.name, i, j, k, host
+                        ));
+                    }
+                }
+                for (k, pattern) in request.port_patterns.iter().enumerate() {
+                    if !is_valid_request_match_port_pattern(pattern) {
+                        errors.push(format!(
+                            "MeshPolicy '{}'.rules[{}].to[{}].port_patterns[{}] \
+                             '{}' is not a valid port pattern \
+                             (expected '*', '<digits>*', or '*<digits>')",
+                            policy.name, i, j, k, pattern
+                        ));
+                    }
                 }
             }
         }
@@ -821,12 +921,13 @@ fn validate_multi_cluster(
 /// the existing `normalize_fields()` pattern used elsewhere in
 /// [`crate::config::types`]. Idempotent.
 pub fn normalize_mesh_fields(service_entries: &mut [ServiceEntry], workloads: &mut [Workload]) {
-    normalize_mesh_fields_internal(service_entries, workloads, None);
+    normalize_mesh_fields_internal(service_entries, workloads, &mut [], None);
 }
 
 fn normalize_mesh_fields_internal(
     service_entries: &mut [ServiceEntry],
     workloads: &mut [Workload],
+    policies: &mut [MeshPolicy],
     multi_cluster: Option<&mut MultiClusterConfig>,
 ) {
     for se in service_entries {
@@ -842,6 +943,7 @@ fn normalize_mesh_fields_internal(
             address.make_ascii_lowercase();
         }
     }
+    normalize_mesh_policy_fields(policies);
     if let Some(multi_cluster) = multi_cluster {
         for gateway in &mut multi_cluster.east_west_gateways {
             gateway.host.make_ascii_lowercase();
@@ -857,9 +959,123 @@ fn normalize_mesh_policy_fields(policies: &mut [MeshPolicy]) {
         for rule in &mut policy.rules {
             for request in &mut rule.to {
                 for host in &mut request.hosts {
-                    host.make_ascii_lowercase();
+                    *host = normalize_request_match_host_pattern(host);
                 }
+                for pattern in &mut request.port_patterns {
+                    let trimmed = pattern.trim();
+                    if trimmed.len() != pattern.len() {
+                        *pattern = trimmed.to_string();
+                    }
+                }
+                normalize_mesh_policy_header_map(&mut request.headers);
             }
         }
     }
+}
+
+/// Normalise a `RequestMatch.hosts` glob pattern at config-load time so the
+/// authorization hot path never re-normalises on every request.
+///
+/// Mirrors `normalize_match_host` for inbound request authorities so a pattern
+/// `Example.COM:8443` and a request `example.com:8443` produce equal strings.
+/// Lower-cases ASCII, strips a trailing dot from the host portion, and
+/// preserves any explicit `:port` (or `:*`) suffix.
+pub(crate) fn normalize_request_match_host_pattern(pattern: &str) -> String {
+    let pattern = pattern.trim().to_ascii_lowercase();
+    if pattern.starts_with('[') {
+        return pattern;
+    }
+    if let Some((name, port)) = pattern.rsplit_once(':')
+        && !name.contains(':')
+    {
+        let name = name.strip_suffix('.').unwrap_or(name);
+        return format!("{name}:{port}");
+    }
+    pattern
+        .strip_suffix('.')
+        .map(ToOwned::to_owned)
+        .unwrap_or(pattern)
+}
+
+/// True when `pattern` is one of the three Istio-allowed port wildcard forms:
+/// `*`, `<digits>*`, or `*<digits>`. Mirrors `is_istio_port_pattern` in the
+/// Istio translator so direct-config and translated configs validate
+/// identically.
+pub(crate) fn is_valid_request_match_port_pattern(pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return !prefix.is_empty() && prefix.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    false
+}
+
+/// True when `pattern` is a syntactically valid `RequestMatch.hosts` entry.
+///
+/// Accepts:
+///   - bare hostname / glob (any chars except `:`, `@`)
+///   - bracketed IPv6 literal `[...]`, optionally followed by `:port` or `:*`
+///   - `host:port` or `host:*` where `host` has no other `:`
+///
+/// Rejects:
+///   - empty / `@`-bearing values
+///   - `host:abc` / `host:` (port is neither digits nor `*`)
+///   - multiple `:` outside an IPv6 bracket
+fn is_valid_request_match_host_pattern(pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() || pattern.contains('@') {
+        return false;
+    }
+    if let Some(rest) = pattern.strip_prefix('[') {
+        let Some(close) = rest.find(']') else {
+            return false;
+        };
+        if close == 0 {
+            return false;
+        }
+        let suffix = &rest[close + 1..];
+        return suffix.is_empty()
+            || suffix
+                .strip_prefix(':')
+                .is_some_and(is_request_match_host_port_token);
+    }
+    match pattern.rsplit_once(':') {
+        Some((name, port)) => {
+            !name.is_empty() && !name.contains(':') && is_request_match_host_port_token(port)
+        }
+        None => true,
+    }
+}
+
+fn is_request_match_host_port_token(token: &str) -> bool {
+    if token == "*" {
+        return true;
+    }
+    token.parse::<u16>().is_ok()
+}
+
+pub(crate) fn normalize_mesh_policy_header_map(headers: &mut HashMap<String, String>) {
+    if headers
+        .keys()
+        .all(|key| key.bytes().all(|byte| !byte.is_ascii_uppercase()))
+    {
+        return;
+    }
+
+    let mut lowered = HashSet::with_capacity(headers.len());
+    if headers
+        .keys()
+        .any(|key| !lowered.insert(key.to_ascii_lowercase()))
+    {
+        return;
+    }
+
+    *headers = headers
+        .drain()
+        .map(|(key, value)| (key.to_ascii_lowercase(), value))
+        .collect();
 }
