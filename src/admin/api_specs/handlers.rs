@@ -75,6 +75,14 @@ struct ValidationFailure {
 // ---------------------------------------------------------------------------
 
 fn classify_db_error(e: anyhow::Error) -> ApiSpecError {
+    if e.chain().any(|cause| {
+        cause
+            .downcast_ref::<sqlx::Error>()
+            .is_some_and(|err| matches!(err, sqlx::Error::RowNotFound))
+    }) {
+        return ApiSpecError::NotFound;
+    }
+
     let msg = e.to_string();
     classify_db_error_str(&msg)
 }
@@ -93,9 +101,19 @@ fn classify_db_error_str(msg: &str) -> ApiSpecError {
         || lower.contains("references a")
     {
         ApiSpecError::Unprocessable(msg.to_string())
+    } else if is_row_missing_error_message(&lower) {
+        ApiSpecError::NotFound
     } else {
         ApiSpecError::Internal(msg.to_string())
     }
+}
+
+fn is_row_missing_error_message(lower: &str) -> bool {
+    lower.contains("row not found")
+        || lower.contains("record not found")
+        || lower.contains("document not found")
+        || lower.contains("no rows returned")
+        || lower.contains("no row returned")
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +265,9 @@ pub(super) fn parse_content_type(headers: &hyper::HeaderMap) -> Option<SpecForma
         .unwrap_or("");
     // Strip parameters (e.g. `application/json; charset=utf-8`)
     let mime = ct.split(';').next().unwrap_or("").trim();
-    match mime {
+    // RFC 7231 §3.1.1.1: media type tokens are case-insensitive.
+    let mime_lower = mime.to_ascii_lowercase();
+    match mime_lower.as_str() {
         "application/json" => Some(SpecFormat::Json),
         "application/yaml" | "application/x-yaml" | "text/yaml" | "text/x-yaml" => {
             Some(SpecFormat::Yaml)
@@ -1259,6 +1279,33 @@ async fn validate_bundle(
         }
     }
 
+    // Duplicate plugin IDs after handler-side ID assignment. The extractor
+    // rejects duplicate non-empty IDs in the submitted spec, but PUT can still
+    // produce duplicates when one empty-id plugin reuses an existing stored ID
+    // and another submitted plugin explicitly names that same ID.
+    {
+        let mut seen_plugin_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut dupe_plugin_ids: Vec<String> = Vec::new();
+        for plugin in &bundle.plugins {
+            if !plugin.id.is_empty()
+                && !seen_plugin_ids.insert(plugin.id.as_str())
+                && !dupe_plugin_ids.iter().any(|id| id == &plugin.id)
+            {
+                dupe_plugin_ids.push(plugin.id.clone());
+            }
+        }
+        if !dupe_plugin_ids.is_empty() {
+            failures.push(ValidationFailure {
+                resource_type: "plugin",
+                id: bundle.proxy.id.clone(),
+                errors: dupe_plugin_ids
+                    .iter()
+                    .map(|id| format!("duplicate plugin id '{id}' after API spec ID assignment"))
+                    .collect(),
+            });
+        }
+    }
+
     // Duplicate proxy plugin associations (Fix 4): detect operator-written
     // duplicate plugin_config_id entries in bundle.proxy.plugins.  SQL's
     // proxy_plugins(proxy_id, plugin_config_id) PK would conflict on insert;
@@ -1668,7 +1715,7 @@ fn spec_content_response(
         match convert_format(&raw, spec.spec_format, target_fmt) {
             Ok(converted) => (converted, content_type_for_format(target_fmt)),
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     "format conversion ({:?} → {:?}) failed for spec {}: {}",
                     spec.spec_format,
                     target_fmt,
@@ -1678,12 +1725,13 @@ fn spec_content_response(
                 let stored_fmt_str = content_type_for_format(spec.spec_format);
                 let accepted_fmt_str = content_type_for_format(target_fmt);
                 return json_resp(
-                    StatusCode::NOT_ACCEPTABLE,
+                    StatusCode::INTERNAL_SERVER_ERROR,
                     &json!({
                         "error": format!(
                             "Cannot convert stored {} to requested {}; \
-                             accept the stored format or request raw bytes via Accept: */*",
-                            stored_fmt_str, accepted_fmt_str
+                             the stored document may be malformed — \
+                             try retrieving in the original format ({}) instead",
+                            stored_fmt_str, accepted_fmt_str, stored_fmt_str
                         )
                     }),
                 );
@@ -2349,6 +2397,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_content_type_case_insensitive_json() {
+        let h = headers_with_ct("Application/JSON");
+        assert_eq!(
+            parse_content_type(&h),
+            Some(SpecFormat::Json),
+            "Content-Type matching must be case-insensitive per RFC 7231"
+        );
+    }
+
+    #[test]
+    fn parse_content_type_case_insensitive_yaml() {
+        let h = headers_with_ct("APPLICATION/YAML");
+        assert_eq!(
+            parse_content_type(&h),
+            Some(SpecFormat::Yaml),
+            "Content-Type matching must be case-insensitive per RFC 7231"
+        );
+    }
+
+    #[test]
+    fn parse_content_type_case_insensitive_text_yaml() {
+        let h = headers_with_ct("Text/X-Yaml");
+        assert_eq!(
+            parse_content_type(&h),
+            Some(SpecFormat::Yaml),
+            "Content-Type matching must be case-insensitive per RFC 7231"
+        );
+    }
+
+    #[test]
     fn parse_content_type_unknown_returns_none() {
         let h = headers_with_ct("text/plain");
         assert_eq!(parse_content_type(&h), None);
@@ -2531,6 +2609,42 @@ mod tests {
         assert!(matches!(
             classify_db_error_str("MongoDB document limit exceeded for collection"),
             ApiSpecError::MongoDocTooLarge
+        ));
+    }
+
+    #[test]
+    fn classify_not_found_row_missing() {
+        assert!(matches!(
+            classify_db_error_str("RowNotFound: no rows returned"),
+            ApiSpecError::NotFound
+        ));
+    }
+
+    #[test]
+    fn classify_typed_sqlx_row_not_found() {
+        assert!(matches!(
+            classify_db_error(anyhow::Error::new(sqlx::Error::RowNotFound)),
+            ApiSpecError::NotFound
+        ));
+    }
+
+    #[test]
+    fn classify_schema_does_not_exist_as_internal() {
+        assert!(matches!(
+            classify_db_error_str(
+                r#"error returned from database: relation "api_specs" does not exist"#
+            ),
+            ApiSpecError::Internal(_)
+        ));
+    }
+
+    #[test]
+    fn classify_column_does_not_exist_as_internal() {
+        assert!(matches!(
+            classify_db_error_str(
+                r#"error returned from database: column "resource_hash" does not exist"#
+            ),
+            ApiSpecError::Internal(_)
         ));
     }
 

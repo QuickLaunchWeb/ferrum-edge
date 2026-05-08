@@ -40,15 +40,16 @@ On a cache miss, the router scans the pre-built route table. Routes are organize
 | **Wildcard host** | Proxy's `hosts` list contains `*.domain.tld` matching the request host | O(wildcard patterns) linear scan |
 | **Catch-all** | Proxy has empty `hosts` (matches any host) | Direct access |
 
-Within **each** host tier, three path matching strategies are tried in order:
+Within **each** host tier, four path matching strategies are tried in order:
 
 | Priority | Match Type | Description |
 |----------|-----------|-------------|
-| **1st** | Prefix | Longest-prefix match against `listen_path` (pre-sorted by length descending) |
-| **2nd** | Regex | First regex pattern match against `listen_path` starting with `~` (in config order) |
-| **3rd** | Host-only fallback | Proxies with `hosts` set AND `listen_path` omitted — match ANY path under the host when the prefix and regex tiers miss |
+| **1st** | Exact path | Exact whole-path match against `listen_path` starting with `=` |
+| **2nd** | Prefix | Longest-prefix match against `listen_path` (pre-sorted by length descending) |
+| **3rd** | Regex | First regex pattern match against `listen_path` starting with `~` (in config order) |
+| **4th** | Host-only fallback | Proxies with `hosts` set AND `listen_path` omitted — match ANY path under the host when the prefix and regex tiers miss |
 
-**Prefix routes always beat regex routes within the same host tier**, and both beat the host-only fallback. This ensures backward compatibility and optimal performance since prefix matching is cheaper than regex evaluation, and host-only is only consulted on a double-miss.
+**Exact path routes beat prefix routes, prefix routes beat regex routes, and all three beat the host-only fallback.** Exact paths are O(1) hash lookups and are used by Kubernetes `Exact` route translations so they cannot be shadowed by a broad prefix such as `/`.
 
 **The host-only tier never appears in the catch-all host bucket.** A proxy with `hosts: []` AND no `listen_path` is rejected at config validation — it would mean "match literally every request on every host" and conflicts with every other catch-all route.
 
@@ -67,7 +68,7 @@ After scanning, the result is cached for future O(1) lookups:
    exact host  >  wildcard host (*.domain)  >  catch-all (no hosts)
 
 2. Path match type (within the same host tier)
-   prefix route  >  regex route
+   exact path  >  prefix route  >  regex route
 
 3. Prefix tiebreaker
    longest prefix wins (pre-sorted at config load time)
@@ -152,6 +153,21 @@ proxies:
 - HTTP-family proxies MUST set at least one of `hosts` or `listen_path`. A proxy with neither is rejected at admission (400 from the admin API, config load failure in file mode).
 - Stream proxies (`tcp`/`tcps`/`udp`/`dtls`) MUST NOT set `listen_path` — they route on `listen_port` only. A populated `listen_path` is rejected.
 - Two host-only proxies whose `hosts` overlap are rejected (409 from admin API).
+
+## Exact Path Routing
+
+Prefix a `listen_path` with `=` to require a whole-path match:
+
+```yaml
+proxies:
+  - id: healthz
+    listen_path: "=/healthz"
+    backend_host: health-service
+    backend_port: 8080
+    strip_listen_path: false
+```
+
+Exact paths compare against the request path without the query string, so `=/healthz` matches `/healthz?ready=true` but not `/healthz/live`.
 
 ## Regex Path Routing
 

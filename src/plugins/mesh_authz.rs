@@ -77,12 +77,21 @@ impl Plugin for MeshAuthz {
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
-        let source_principal = source_principal_from_request(ctx);
-        let host = ctx
-            .raw_header_get("host")
-            .or_else(|| ctx.raw_header_get(":authority"))
-            .map(str::to_string);
         ctx.materialize_headers();
+        let unauthenticated_hbone_baggage = is_hbone_request(ctx)
+            && has_baggage_header_from_request(ctx)
+            && !is_authenticated_hbone_request(ctx);
+        if unauthenticated_hbone_baggage {
+            ctx.metadata.insert(
+                "mesh_authz.ignored_baggage".to_string(),
+                "unauthenticated_hbone".to_string(),
+            );
+        }
+        let source_principal = source_principal_from_request(ctx);
+        // The proxy handler backfills HTTP/2/3 `:authority` into materialized
+        // `host` before plugin phases run, so the materialized map is the
+        // single source of truth here.
+        let host = ctx.headers.get("host").cloned();
         let headers: BTreeMap<String, String> = ctx
             .headers
             .iter()
@@ -93,15 +102,28 @@ impl Plugin for MeshAuthz {
             method: Some(ctx.method.clone()),
             path: Some(ctx.path.clone()),
             host,
-            port: ctx
-                .matched_proxy
-                .as_ref()
-                .and_then(|proxy| proxy.listen_port),
+            port: ctx.frontend_listen_port.or_else(|| {
+                ctx.matched_proxy
+                    .as_ref()
+                    .and_then(|proxy| proxy.listen_port)
+            }),
             headers,
             attributes: BTreeMap::new(),
         };
         let decision = evaluate_mesh_authorization(&self.slice, &request);
-        self.decision_to_result(decision, &mut ctx.metadata)
+        let result = self.decision_to_result(decision, &mut ctx.metadata);
+        if unauthenticated_hbone_baggage
+            && matches!(
+                result,
+                PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }
+            )
+        {
+            ctx.metadata.insert(
+                "mesh_authz.deny_policy".to_string(),
+                "unauthenticated_baggage".to_string(),
+            );
+        }
+        result
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
@@ -130,9 +152,34 @@ impl Plugin for MeshAuthz {
 }
 
 fn source_principal_from_request(ctx: &RequestContext) -> Option<SpiffeId> {
-    ctx.peer_spiffe_id.clone().or_else(|| {
-        ctx.raw_header_get(BAGGAGE_HEADER)
+    if is_authenticated_hbone_request(ctx) {
+        // Ambient ztunnels authenticate the HBONE tunnel with their own SPIFFE
+        // cert, while baggage carries the originating workload identity. Trust
+        // baggage only after the peer is authenticated, and prefer that
+        // workload identity over the ztunnel's certificate identity.
+        return baggage_header_from_request(ctx)
             .map(HboneIdentity::from_baggage_header)
             .and_then(|identity| identity.source_principal)
-    })
+            .or_else(|| ctx.peer_spiffe_id.clone());
+    }
+
+    ctx.peer_spiffe_id.clone()
+}
+
+fn is_authenticated_hbone_request(ctx: &RequestContext) -> bool {
+    ctx.peer_spiffe_id.is_some() && is_hbone_request(ctx)
+}
+
+fn is_hbone_request(ctx: &RequestContext) -> bool {
+    ctx.metadata
+        .get("request_protocol")
+        .is_some_and(|value| value == "hbone")
+}
+
+fn baggage_header_from_request(ctx: &RequestContext) -> Option<&str> {
+    ctx.headers.get(BAGGAGE_HEADER).map(String::as_str)
+}
+
+fn has_baggage_header_from_request(ctx: &RequestContext) -> bool {
+    ctx.headers.contains_key(BAGGAGE_HEADER)
 }

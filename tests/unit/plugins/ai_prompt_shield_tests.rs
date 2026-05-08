@@ -1,6 +1,8 @@
 //! Tests for ai_prompt_shield plugin
 
-use ferrum_edge::plugins::{Plugin, PluginResult, ai_prompt_shield::AiPromptShield};
+use ferrum_edge::plugins::{
+    HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, ai_prompt_shield::AiPromptShield, priority,
+};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -37,9 +39,12 @@ fn ai_request(content: &str) -> serde_json::Value {
 async fn test_plugin_name_and_priority() {
     let plugin = AiPromptShield::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "ai_prompt_shield");
-    assert_eq!(plugin.priority(), 2925);
+    assert_eq!(plugin.priority(), priority::AI_PROMPT_SHIELD);
+    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
     assert!(!plugin.requires_response_body_buffering());
     assert!(plugin.requires_request_body_buffering());
+    assert!(plugin.requires_request_body_before_before_proxy());
+    assert!(!plugin.is_auth_plugin());
 }
 
 #[test]
@@ -74,6 +79,26 @@ fn test_invalid_custom_regex_returns_error() {
         ]
     }));
     assert!(result.is_err());
+}
+
+#[test]
+fn test_invalid_config_shapes_rejected() {
+    for config in [
+        json!("bad"),
+        json!({"action": "drop"}),
+        json!({"action": 123}),
+        json!({"scan_fields": "everything"}),
+        json!({"exclude_roles": "system"}),
+        json!({"patterns": ["ssn", 123]}),
+        json!({"custom_patterns": "bad"}),
+        json!({"patterns": [], "custom_patterns": [{"regex": "x"}]}),
+        json!({"patterns": [], "custom_patterns": [{"name": "x"}]}),
+        json!({"max_scan_bytes": 0}),
+        json!({"max_scan_bytes": "1024"}),
+    ] {
+        let result = AiPromptShield::new(&config);
+        assert!(result.is_err(), "config should be rejected: {config:?}");
+    }
 }
 
 // ─── SSN detection ──────────────────────────────────────────────────────

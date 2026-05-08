@@ -1,14 +1,24 @@
 //! Tests for jwks_auth plugin
 
 use ferrum_edge::ConsumerIndex;
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, RequestContext, jwks_auth::JwksAuth};
+use ferrum_edge::plugins::{
+    HTTP_FAMILY_PROTOCOLS, Plugin, PluginHttpClient, RequestContext, jwks_auth::JwksAuth, priority,
+};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::plugin_utils::{assert_continue, assert_reject};
 
+static JWKS_TEST_PATH_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
+}
+
+fn unique_jwks_path(prefix: &str) -> String {
+    let id = JWKS_TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("/{prefix}-{id}.json")
 }
 
 fn make_ctx() -> RequestContext {
@@ -179,13 +189,33 @@ fn parse_asn1_length(data: &[u8]) -> (usize, usize) {
 async fn start_jwks_server(public_key_pem: &[u8]) -> (wiremock::MockServer, String) {
     let mock_server = wiremock::MockServer::start().await;
     let jwks_json = build_rsa_jwks_from_pem(public_key_pem);
+    let jwks_path = unique_jwks_path("jwks");
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/.well-known/jwks.json"))
+        .and(wiremock::matchers::path(jwks_path.clone()))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks_json))
         .mount(&mock_server)
         .await;
-    let jwks_uri = format!("{}/.well-known/jwks.json", mock_server.uri());
+    let jwks_uri = format!("{}{}", mock_server.uri(), jwks_path);
     (mock_server, jwks_uri)
+}
+
+async fn wait_for_received_request_count(server: &wiremock::MockServer, at_least: usize) -> usize {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+    loop {
+        let count = server
+            .received_requests()
+            .await
+            .map(|requests| requests.len())
+            .unwrap_or(0);
+        if count >= at_least {
+            return count;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {at_least} JWKS request(s), observed {count}"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// Helper to make a single-provider config
@@ -202,9 +232,28 @@ fn single_provider_config(jwks_uri: &str) -> serde_json::Value {
 #[tokio::test]
 async fn test_jwks_auth_plugin_creation() {
     let mock_server = wiremock::MockServer::start().await;
-    let jwks_uri = format!("{}/.well-known/jwks.json", mock_server.uri());
+    let jwks_uri = format!("{}{}", mock_server.uri(), unique_jwks_path("jwks"));
     let plugin = JwksAuth::new(&single_provider_config(&jwks_uri), default_client()).unwrap();
     assert_eq!(plugin.name(), "jwks_auth");
+}
+
+#[tokio::test]
+async fn test_jwks_auth_plugin_contract_and_warmup_metadata() {
+    let mock_server = wiremock::MockServer::start().await;
+    let jwks_uri = format!("{}{}", mock_server.uri(), unique_jwks_path("jwks"));
+    let plugin = JwksAuth::new(&single_provider_config(&jwks_uri), default_client()).unwrap();
+
+    assert_eq!(plugin.name(), "jwks_auth");
+    assert_eq!(plugin.priority(), priority::JWKS_AUTH);
+    assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
+    assert!(plugin.is_auth_plugin());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
+    assert!(!plugin.applies_after_proxy_on_reject());
+    assert_eq!(plugin.active_jwks_uris(), vec![jwks_uri]);
+    assert_eq!(plugin.warmup_hostnames(), vec!["127.0.0.1".to_string()]);
 }
 
 #[tokio::test]
@@ -228,6 +277,211 @@ async fn test_jwks_auth_provider_requires_jwks_or_discovery() {
     );
     assert!(result.is_err());
     assert!(result.as_ref().err().unwrap().contains("jwks_uri"));
+}
+
+#[tokio::test]
+async fn test_jwks_auth_rejects_non_object_config() {
+    let result = JwksAuth::new(&json!(true), default_client());
+    assert!(result.is_err());
+    assert!(
+        result
+            .as_ref()
+            .err()
+            .unwrap()
+            .contains("config must be an object")
+    );
+}
+
+#[tokio::test]
+async fn test_jwks_auth_rejects_zero_refresh_interval() {
+    let mock_server = wiremock::MockServer::start().await;
+    let result = JwksAuth::new(
+        &json!({
+            "providers": [{"jwks_uri": format!("{}/jwks", mock_server.uri())}],
+            "jwks_refresh_interval_secs": 0
+        }),
+        default_client(),
+    );
+    assert!(result.is_err());
+    assert!(
+        result
+            .as_ref()
+            .err()
+            .unwrap()
+            .contains("jwks_refresh_interval_secs")
+    );
+}
+
+#[tokio::test]
+async fn test_jwks_auth_rejects_invalid_provider_entry() {
+    let result = JwksAuth::new(&json!({"providers": [42]}), default_client());
+    assert!(result.is_err());
+    assert!(result.as_ref().err().unwrap().contains("provider[0]"));
+}
+
+#[tokio::test]
+async fn test_jwks_auth_rejects_invalid_jwks_url() {
+    let result = JwksAuth::new(
+        &json!({"providers": [{"jwks_uri": "file:///tmp/jwks.json"}]}),
+        default_client(),
+    );
+    assert!(result.is_err());
+    assert!(result.as_ref().err().unwrap().contains("http or https"));
+}
+
+#[tokio::test]
+async fn test_jwks_auth_rejects_invalid_claim_path() {
+    let mock_server = wiremock::MockServer::start().await;
+    let result = JwksAuth::new(
+        &json!({
+            "providers": [{"jwks_uri": format!("{}/jwks", mock_server.uri())}],
+            "consumer_identity_claim": "realm..sub"
+        }),
+        default_client(),
+    );
+    assert!(result.is_err());
+    assert!(
+        result
+            .as_ref()
+            .err()
+            .unwrap()
+            .contains("without empty segments")
+    );
+}
+
+#[tokio::test]
+async fn test_jwks_auth_rejects_malformed_required_scopes() {
+    let mock_server = wiremock::MockServer::start().await;
+    let result = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks_uri": format!("{}/jwks", mock_server.uri()),
+                "required_scopes": "read"
+            }]
+        }),
+        default_client(),
+    );
+    assert!(result.is_err());
+    assert!(result.as_ref().err().unwrap().contains("required_scopes"));
+}
+
+#[tokio::test]
+async fn test_jwks_auth_rejects_empty_required_role() {
+    let mock_server = wiremock::MockServer::start().await;
+    let result = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks_uri": format!("{}/jwks", mock_server.uri()),
+                "required_roles": [""]
+            }]
+        }),
+        default_client(),
+    );
+    assert!(result.is_err());
+    assert!(result.as_ref().err().unwrap().contains("required_roles[0]"));
+}
+
+#[tokio::test]
+async fn test_jwks_auth_warmup_hostnames_includes_discovery_url_before_resolution() {
+    let mock_server = wiremock::MockServer::start().await;
+    let discovery_url = format!("{}/.well-known/openid-configuration", mock_server.uri());
+    let plugin = JwksAuth::new(
+        &json!({"providers": [{"discovery_url": discovery_url}]}),
+        default_client(),
+    )
+    .unwrap();
+
+    assert_eq!(plugin.warmup_hostnames(), vec!["127.0.0.1".to_string()]);
+    assert!(plugin.active_jwks_uris().is_empty());
+}
+
+#[tokio::test]
+async fn test_jwks_auth_oidc_discovery_eager_fetches_without_duplicate_jwks_call() {
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks_server = wiremock::MockServer::start().await;
+    let discovery_server = wiremock::MockServer::start().await;
+    let jwks_path = unique_jwks_path("oidc-jwks");
+    let jwks_uri = format!("{}{}", jwks_server.uri(), jwks_path);
+    let discovery_url = format!(
+        "{}/.well-known/openid-configuration",
+        discovery_server.uri()
+    );
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(jwks_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(build_rsa_jwks_from_pem(public_key_pem)),
+        )
+        .mount(&jwks_server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/.well-known/openid-configuration",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "jwks_uri": jwks_uri
+        })))
+        .mount(&discovery_server)
+        .await;
+
+    let _plugin = JwksAuth::new(
+        &json!({
+            "providers": [{"discovery_url": discovery_url}],
+            "jwks_refresh_interval_secs": 3600
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let initial_count = wait_for_received_request_count(&jwks_server, 1).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let final_count = jwks_server
+        .received_requests()
+        .await
+        .map(|requests| requests.len())
+        .unwrap_or(0);
+    assert_eq!(initial_count, 1);
+    assert_eq!(final_count, 1);
+}
+
+#[tokio::test]
+async fn test_jwks_auth_does_not_fetch_jwks_on_auth_hot_path_when_cache_empty() {
+    let mock_server = wiremock::MockServer::start().await;
+    let jwks_path = unique_jwks_path("jwks");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(jwks_path.clone()))
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .mount(&mock_server)
+        .await;
+
+    let jwks_uri = format!("{}{}", mock_server.uri(), jwks_path);
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{"jwks_uri": jwks_uri}],
+            "jwks_refresh_interval_secs": 3600
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let initial_count = wait_for_received_request_count(&mock_server, 1).await;
+
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), "Bearer not.a.jwt".to_string());
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let final_count = mock_server
+        .received_requests()
+        .await
+        .map(|requests| requests.len())
+        .unwrap_or(0);
+    assert_eq!(final_count, initial_count);
 }
 
 #[tokio::test]
@@ -750,15 +1004,17 @@ async fn test_jwks_auth_multi_provider_routes_by_issuer() {
     // Both providers use the same key for simplicity, but have different issuers
     let server1 = wiremock::MockServer::start().await;
     let jwks_json = build_rsa_jwks_from_pem(public_key_pem);
+    let jwks_path1 = unique_jwks_path("jwks1");
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/jwks1"))
+        .and(wiremock::matchers::path(jwks_path1.clone()))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks_json))
         .mount(&server1)
         .await;
 
     let server2 = wiremock::MockServer::start().await;
+    let jwks_path2 = unique_jwks_path("jwks2");
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/jwks2"))
+        .and(wiremock::matchers::path(jwks_path2.clone()))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks_json))
         .mount(&server2)
         .await;
@@ -768,12 +1024,12 @@ async fn test_jwks_auth_multi_provider_routes_by_issuer() {
             "providers": [
                 {
                     "issuer": "https://idp-one.example.com",
-                    "jwks_uri": format!("{}/jwks1", server1.uri()),
+                    "jwks_uri": format!("{}{}", server1.uri(), jwks_path1),
                     "required_roles": ["admin"]
                 },
                 {
                     "issuer": "https://idp-two.example.com",
-                    "jwks_uri": format!("{}/jwks2", server2.uri()),
+                    "jwks_uri": format!("{}{}", server2.uri(), jwks_path2),
                     "required_roles": ["partner"]
                 }
             ],
@@ -811,13 +1067,14 @@ async fn test_jwks_auth_multi_provider_wrong_role_rejected() {
 
     let server = wiremock::MockServer::start().await;
     let jwks_json = build_rsa_jwks_from_pem(public_key_pem);
+    let jwks_path = unique_jwks_path("jwks");
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/jwks"))
+        .and(wiremock::matchers::path(jwks_path.clone()))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks_json))
         .mount(&server)
         .await;
 
-    let jwks_uri = format!("{}/jwks", server.uri());
+    let jwks_uri = format!("{}{}", server.uri(), jwks_path);
     let plugin = JwksAuth::new(
         &json!({
             "providers": [{
@@ -1045,15 +1302,17 @@ async fn test_jwks_auth_multi_provider_different_identity_claims() {
     // Two providers with different JWKS endpoints and different identity claims
     let server1 = wiremock::MockServer::start().await;
     let jwks_json = build_rsa_jwks_from_pem(public_key_pem);
+    let jwks_path1 = unique_jwks_path("jwks1");
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/jwks1"))
+        .and(wiremock::matchers::path(jwks_path1.clone()))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks_json))
         .mount(&server1)
         .await;
 
     let server2 = wiremock::MockServer::start().await;
+    let jwks_path2 = unique_jwks_path("jwks2");
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/jwks2"))
+        .and(wiremock::matchers::path(jwks_path2.clone()))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks_json))
         .mount(&server2)
         .await;
@@ -1063,13 +1322,13 @@ async fn test_jwks_auth_multi_provider_different_identity_claims() {
             "providers": [
                 {
                     "issuer": "https://google.com",
-                    "jwks_uri": format!("{}/jwks1", server1.uri()),
+                    "jwks_uri": format!("{}{}", server1.uri(), jwks_path1),
                     "consumer_identity_claim": "email",
                     "consumer_header_claim": "email"
                 },
                 {
                     "issuer": "https://keycloak.internal",
-                    "jwks_uri": format!("{}/jwks2", server2.uri()),
+                    "jwks_uri": format!("{}{}", server2.uri(), jwks_path2),
                     "consumer_identity_claim": "preferred_username",
                     "consumer_header_claim": "preferred_username"
                 }

@@ -107,6 +107,8 @@ use self::http2_pool::Http2ConnectionPool;
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
+const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+
 /// Capability probes run during startup and background refresh, so they should
 /// not inherit long per-request connect timeouts that could hold readiness.
 const BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP: u64 = 5_000;
@@ -1567,6 +1569,9 @@ impl ProxyState {
                     tracing::info!(enabled = v, config = %env_config_arc.tcp_fastopen_enabled, "TCP_FASTOPEN auto-detection");
                     v
                 },
+                env_config_arc.tcp_listen_backlog,
+                env_config_arc.accept_threads,
+                env_config_arc.tcp_fastopen_queue_len,
                 overload.clone(),
                 {
                     let v = env_config_arc
@@ -4161,10 +4166,14 @@ fn build_websocket_backend_url_with_target(
         _ => "wss",
     };
 
-    // Host-only proxies (listen_path == None) have no prefix to strip —
-    // strip_listen_path is a no-op in that case.
+    // Host-only proxies (listen_path == None) have no prefix to strip.
+    // Exact listen_paths carry a leading '=' marker for routing; strip only
+    // the literal path part so WebSocket forwarding matches HTTP forwarding.
     let remaining_path = match (proxy.strip_listen_path, proxy.listen_path.as_deref()) {
-        (true, Some(lp)) => incoming_path.strip_prefix(lp).unwrap_or(""),
+        (true, Some(lp)) if !lp.starts_with('~') => {
+            let literal = lp.strip_prefix('=').unwrap_or(lp);
+            incoming_path.strip_prefix(literal).unwrap_or("")
+        }
         _ => incoming_path,
     };
 
@@ -5050,17 +5059,20 @@ pub async fn start_proxy_listener_with_bound_listener(
     Ok(())
 }
 
-/// Create a bound TCP socket with SO_REUSEADDR and SO_REUSEPORT enabled.
+/// Create a bound TCP socket with SO_REUSEADDR and optional SO_REUSEPORT.
 /// Used by the multi-listener accept architecture where N sockets are bound
 /// to the same address, each with its own accept loop.
+/// `SO_REUSEPORT` is enabled only when `reuse_port` is true, which keeps
+/// single-listener sockets from being co-bound unnecessarily.
 ///
 /// When `tcp_fastopen_queue_len` is `Some(n)`, enables TCP Fast Open on the
 /// listening socket (Linux only), allowing repeat clients with a cached TFO
 /// cookie to send data in the SYN packet (saves 1 RTT).
-fn create_proxy_socket(
+pub(crate) fn create_proxy_socket(
     addr: SocketAddr,
     backlog: i32,
     tcp_fastopen_queue_len: Option<u16>,
+    reuse_port: bool,
 ) -> Result<TcpListener, anyhow::Error> {
     let socket = socket2::Socket::new(
         if addr.is_ipv6() {
@@ -5077,9 +5089,11 @@ fn create_proxy_socket(
 
     // SO_REUSEPORT: let the kernel distribute incoming connections across
     // multiple listener tasks (Linux 3.9+, macOS, BSDs). This eliminates
-    // the single-thread accept() bottleneck at 50k+ connections/sec.
+    // the single-thread accept() bottleneck at high connection rates.
     #[cfg(unix)]
-    socket.set_reuse_port(true)?;
+    if reuse_port {
+        socket.set_reuse_port(true)?;
+    }
 
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
@@ -5118,7 +5132,20 @@ pub async fn start_proxy_listener_with_tls_and_signal(
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     let backlog = state.env_config.tcp_listen_backlog as i32;
-    let accept_threads = state.env_config.accept_threads.max(1);
+    let configured_accept_threads = state.env_config.accept_threads.max(1);
+    #[cfg(unix)]
+    let accept_threads = configured_accept_threads;
+    #[cfg(not(unix))]
+    let accept_threads = {
+        if configured_accept_threads > 1 {
+            tracing::warn!(
+                configured_accept_threads,
+                "FERRUM_ACCEPT_THREADS > 1 requires SO_REUSEPORT; using one accept loop on this platform"
+            );
+        }
+        1
+    };
+    let reuse_port = accept_threads > 1;
     let tfo_enabled = state
         .env_config
         .tcp_fastopen_enabled
@@ -5130,7 +5157,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
     };
 
     // Create the first listener — this one validates that the port is available.
-    let first_listener = create_proxy_socket(addr, backlog, tfo_queue)?;
+    let first_listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
 
     // Optional connection limit. Shared across all accept threads so the global
     // max_connections limit is enforced regardless of which thread accepted.
@@ -5155,7 +5182,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
 
         // Spawn additional listeners (threads 1..N-1)
         for i in 1..accept_threads {
-            let listener = create_proxy_socket(addr, backlog, tfo_queue)?;
+            let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
             let state = state.clone();
             let tls_config = tls_config.clone();
             let semaphore = conn_semaphore.clone();
@@ -5515,6 +5542,11 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
     status_code: u16,
     response_headers: &mut HashMap<String, String>,
 ) {
+    let previous_marker = ctx.metadata.insert(
+        REJECTION_RESPONSE_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+
     for plugin in plugins.iter().filter(|p| p.applies_after_proxy_on_reject()) {
         match plugin.after_proxy(ctx, status_code, response_headers).await {
             PluginResult::Reject {
@@ -5533,6 +5565,13 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
             }
             PluginResult::Continue => {}
         }
+    }
+
+    if let Some(previous_marker) = previous_marker {
+        ctx.metadata
+            .insert(REJECTION_RESPONSE_METADATA_KEY.to_string(), previous_marker);
+    } else {
+        ctx.metadata.remove(REJECTION_RESPONSE_METADATA_KEY);
     }
 }
 
@@ -5937,6 +5976,11 @@ async fn handle_proxy_request_inner(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    ctx.frontend_listen_port = Some(if is_tls {
+        state.env_config.proxy_https_port
+    } else {
+        state.env_config.proxy_http_port
+    });
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     // Store raw query string on ctx for lazy parsing. The local `query_string`
@@ -11664,6 +11708,25 @@ mod tests {
             }
         }))
         .expect("test proxy should deserialize")
+    }
+
+    #[test]
+    fn websocket_backend_url_strips_exact_listen_path_literal() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.listen_path = Some("=/ws".to_string());
+        proxy.strip_listen_path = true;
+
+        let url = build_websocket_backend_url_with_target(
+            &proxy,
+            "/ws",
+            "token=1",
+            "backend.local",
+            8080,
+            None,
+        );
+
+        assert_eq!(url, "ws://backend.local:8080/?token=1");
     }
 
     fn route_delta_proxy(

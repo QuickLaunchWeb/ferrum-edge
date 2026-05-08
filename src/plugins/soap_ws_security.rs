@@ -102,15 +102,19 @@ pub struct SoapWsSecurity {
 
 impl SoapWsSecurity {
     pub fn new(config: &Value) -> Result<Self, String> {
+        let config_obj = config
+            .as_object()
+            .ok_or_else(|| format!("soap_ws_security: config must be an object, got: {config}"))?;
+
         // ── Timestamp config ────────────────────────────────────────────
-        let ts_cfg = &config["timestamp"];
+        let ts_cfg = config_obj.get("timestamp").unwrap_or(&Value::Null);
         let require_timestamp = ts_cfg["require"].as_bool().unwrap_or(true);
         let timestamp_max_age_seconds = ts_cfg["max_age_seconds"].as_u64().unwrap_or(300);
         let timestamp_require_expires = ts_cfg["require_expires"].as_bool().unwrap_or(false);
         let clock_skew_seconds = ts_cfg["clock_skew_seconds"].as_u64().unwrap_or(300);
 
         // ── UsernameToken config ────────────────────────────────────────
-        let ut_cfg = &config["username_token"];
+        let ut_cfg = config_obj.get("username_token").unwrap_or(&Value::Null);
         let username_token_enabled = ut_cfg["enabled"].as_bool().unwrap_or(false);
         let password_type = match ut_cfg["password_type"].as_str().unwrap_or("PasswordDigest") {
             "PasswordText" => PasswordType::PasswordText,
@@ -144,7 +148,7 @@ impl SoapWsSecurity {
         }
 
         // ── X.509 signature config ──────────────────────────────────────
-        let x509_cfg = &config["x509_signature"];
+        let x509_cfg = config_obj.get("x509_signature").unwrap_or(&Value::Null);
         let x509_enabled = x509_cfg["enabled"].as_bool().unwrap_or(false);
 
         let trusted_cert_paths: Vec<String> = x509_cfg["trusted_certs"]
@@ -218,7 +222,7 @@ impl SoapWsSecurity {
             .unwrap_or(true);
 
         // ── SAML config ─────────────────────────────────────────────────
-        let saml_cfg = &config["saml"];
+        let saml_cfg = config_obj.get("saml").unwrap_or(&Value::Null);
         let saml_enabled = saml_cfg["enabled"].as_bool().unwrap_or(false);
 
         let saml_trusted_issuers: Vec<String> = saml_cfg["trusted_issuers"]
@@ -241,13 +245,14 @@ impl SoapWsSecurity {
         let saml_clock_skew_seconds = saml_cfg["clock_skew_seconds"].as_u64().unwrap_or(300);
 
         // ── Nonce / replay config ───────────────────────────────────────
-        let nonce_cfg = &config["nonce"];
+        let nonce_cfg = config_obj.get("nonce").unwrap_or(&Value::Null);
         let nonce_cache_ttl_seconds = nonce_cfg["cache_ttl_seconds"].as_u64().unwrap_or(300);
         let max_nonce_cache_size = nonce_cfg["max_cache_size"].as_u64().unwrap_or(10_000) as usize;
 
         // ── General ─────────────────────────────────────────────────────
-        let reject_missing_security_header = config["reject_missing_security_header"]
-            .as_bool()
+        let reject_missing_security_header = config_obj
+            .get("reject_missing_security_header")
+            .and_then(Value::as_bool)
             .unwrap_or(true);
 
         // Must have at least one security feature enabled
@@ -795,10 +800,9 @@ impl SoapWsSecurity {
     // ── Content-type check ──────────────────────────────────────────────
 
     fn is_soap_content_type(content_type: &str) -> bool {
-        let ct = content_type.to_lowercase();
-        ct.contains("text/xml")
-            || ct.contains("application/soap+xml")
-            || ct.contains("application/xml")
+        contains_ascii_case_insensitive(content_type, "text/xml")
+            || contains_ascii_case_insensitive(content_type, "application/soap+xml")
+            || contains_ascii_case_insensitive(content_type, "application/xml")
     }
 }
 
@@ -858,6 +862,13 @@ impl Plugin for SoapWsSecurity {
 
         // Find the SOAP envelope
         let envelope = body.trim();
+        if contains_forbidden_xml_declaration(envelope) {
+            return PluginResult::Reject {
+                status_code: 400,
+                body: r#"{"error":"SOAP request contains forbidden XML declaration"}"#.to_string(),
+                headers: HashMap::new(),
+            };
+        }
         if !envelope.contains("Envelope") {
             if self.reject_missing_security_header {
                 return PluginResult::Reject {
@@ -1201,6 +1212,19 @@ fn extract_pem_der(pem: &str) -> Option<Vec<u8>> {
     BASE64.decode(b64.as_bytes()).ok()
 }
 
+fn contains_forbidden_xml_declaration(xml: &str) -> bool {
+    contains_ascii_case_insensitive(xml, "<!doctype")
+        || contains_ascii_case_insensitive(xml, "<!entity")
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 /// Parse WS-Security datetime formats (ISO 8601 variants).
 fn parse_ws_datetime(s: &str) -> Option<DateTime<Utc>> {
     let s = s.trim();
@@ -1293,8 +1317,10 @@ mod tests {
     #[test]
     fn end_offset_points_past_closing_tag() {
         let xml = "prefix<Reference URI=\"#a\"></Reference>middle<Reference URI=\"#b\"></Reference>suffix";
-        let (first_block, end1) =
-            find_element_block_from_with_end(xml, "Reference", 0).expect("first match");
+        let Some((first_block, end1)) = find_element_block_from_with_end(xml, "Reference", 0)
+        else {
+            panic!("first Reference match should be present");
+        };
         assert!(first_block.contains("#a"));
         // The remainder should still contain the second Reference.
         let remainder = &xml[end1..];
@@ -1307,8 +1333,9 @@ mod tests {
     #[test]
     fn self_closing_tag_returns_correct_end() {
         let xml = "before<Foo/>after";
-        let (block, end) =
-            find_element_block_from_with_end(xml, "Foo", 0).expect("self-closing match");
+        let Some((block, end)) = find_element_block_from_with_end(xml, "Foo", 0) else {
+            panic!("self-closing Foo match should be present");
+        };
         assert_eq!(block, "<Foo/>");
         assert_eq!(&xml[end..], "after");
     }

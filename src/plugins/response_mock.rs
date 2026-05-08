@@ -55,6 +55,7 @@
 //!   continue to the backend. If false (default), unmatched requests get 404.
 
 use async_trait::async_trait;
+use http::header::{HeaderName, HeaderValue};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -82,11 +83,17 @@ pub struct ResponseMock {
 
 impl ResponseMock {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let passthrough_on_no_match = config["passthrough_on_no_match"].as_bool().unwrap_or(false);
+        if !config.is_object() {
+            return Err("response_mock: config must be an object".to_string());
+        }
 
-        let rules_val = config["rules"]
-            .as_array()
-            .ok_or("response_mock: 'rules' must be a JSON array")?;
+        let passthrough_on_no_match =
+            optional_bool(config, "passthrough_on_no_match")?.unwrap_or(false);
+
+        let rules_val = match config.get("rules") {
+            Some(Value::Array(rules)) => rules,
+            _ => return Err("response_mock: 'rules' must be a JSON array".to_string()),
+        };
 
         if rules_val.is_empty() {
             return Err("response_mock: 'rules' array must not be empty".to_string());
@@ -95,13 +102,40 @@ impl ResponseMock {
         let mut rules = Vec::with_capacity(rules_val.len());
 
         for (i, rule_val) in rules_val.iter().enumerate() {
-            let method = rule_val["method"].as_str().map(|m| m.to_uppercase());
+            if !rule_val.is_object() {
+                return Err(format!("response_mock: rule[{i}] must be an object"));
+            }
+
+            let method = match rule_val.get("method") {
+                Some(Value::String(method)) if !method.is_empty() => {
+                    Some(method.to_ascii_uppercase())
+                }
+                Some(Value::String(_)) => {
+                    return Err(format!(
+                        "response_mock: rule[{i}] 'method' must not be empty"
+                    ));
+                }
+                Some(Value::Null) | None => None,
+                Some(_) => {
+                    return Err(format!(
+                        "response_mock: rule[{i}] 'method' must be a string"
+                    ));
+                }
+            };
 
             let path_str = rule_val["path"]
                 .as_str()
                 .ok_or_else(|| format!("response_mock: rule[{i}] missing 'path'"))?;
+            if path_str.is_empty() {
+                return Err(format!("response_mock: rule[{i}] 'path' must not be empty"));
+            }
 
             let path = if let Some(pattern) = path_str.strip_prefix('~') {
+                if pattern.is_empty() {
+                    return Err(format!(
+                        "response_mock: rule[{i}] regex path must not be empty"
+                    ));
+                }
                 let anchored = crate::config::types::anchor_regex_pattern(pattern);
                 let re = Regex::new(&anchored).map_err(|e| {
                     format!("response_mock: rule[{i}] invalid regex '{pattern}': {e}")
@@ -111,27 +145,44 @@ impl ResponseMock {
                 PathMatcher::Exact(path_str.to_string())
             };
 
-            let status_code = rule_val["status_code"]
-                .as_u64()
-                .map(|c| c as u16)
-                .filter(|&c| (100..=599).contains(&c))
-                .unwrap_or(200);
+            let status_code = optional_status_code(rule_val, i)?;
 
             let mut headers = HashMap::new();
-            if let Some(obj) = rule_val["headers"].as_object() {
-                for (k, v) in obj {
-                    if let Some(s) = v.as_str() {
-                        headers.insert(k.to_lowercase(), s.to_string());
+            match rule_val.get("headers") {
+                Some(Value::Object(obj)) => {
+                    for (k, v) in obj {
+                        HeaderName::from_bytes(k.as_bytes()).map_err(|_| {
+                            format!("response_mock: rule[{i}] header '{k}' is not a valid name")
+                        })?;
+                        let s = v.as_str().ok_or_else(|| {
+                            format!("response_mock: rule[{i}] header '{k}' value must be a string")
+                        })?;
+                        HeaderValue::from_str(s).map_err(|_| {
+                            format!("response_mock: rule[{i}] header '{k}' value is invalid")
+                        })?;
+                        headers.insert(k.to_ascii_lowercase(), s.to_string());
                     }
+                }
+                Some(Value::Null) | None => {}
+                Some(_) => {
+                    return Err(format!(
+                        "response_mock: rule[{i}] 'headers' must be an object"
+                    ));
                 }
             }
             if !headers.contains_key("content-type") {
                 headers.insert("content-type".to_string(), "application/json".to_string());
             }
 
-            let body = rule_val["body"].as_str().unwrap_or("").to_string();
+            let body = match rule_val.get("body") {
+                Some(Value::String(body)) => body.clone(),
+                Some(Value::Null) | None => String::new(),
+                Some(_) => {
+                    return Err(format!("response_mock: rule[{i}] 'body' must be a string"));
+                }
+            };
 
-            let delay_ms = rule_val["delay_ms"].as_u64().unwrap_or(0);
+            let delay_ms = optional_u64(rule_val, "delay_ms", i)?.unwrap_or(0);
 
             rules.push(MockRule {
                 method,
@@ -163,6 +214,40 @@ impl ResponseMock {
     }
 }
 
+fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
+    match config.get(key) {
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("response_mock: '{key}' must be a boolean")),
+    }
+}
+
+fn optional_u64(config: &Value, key: &str, rule_idx: usize) -> Result<Option<u64>, String> {
+    match config.get(key) {
+        Some(Value::Number(value)) => value.as_u64().map(Some).ok_or_else(|| {
+            format!("response_mock: rule[{rule_idx}] '{key}' must be an unsigned integer")
+        }),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!(
+            "response_mock: rule[{rule_idx}] '{key}' must be an unsigned integer"
+        )),
+    }
+}
+
+fn optional_status_code(rule_val: &Value, rule_idx: usize) -> Result<u16, String> {
+    let Some(raw) = optional_u64(rule_val, "status_code", rule_idx)? else {
+        return Ok(200);
+    };
+
+    if !(100..=599).contains(&raw) {
+        return Err(format!(
+            "response_mock: rule[{rule_idx}] 'status_code' must be in range 100-599"
+        ));
+    }
+
+    Ok(raw as u16)
+}
+
 #[async_trait]
 impl Plugin for ResponseMock {
     fn name(&self) -> &str {
@@ -186,6 +271,7 @@ impl Plugin for ResponseMock {
         // the proxy scope. Several cases where no stripping applies:
         // - Host-only proxies (listen_path == None): no prefix to strip
         // - Regex listen_paths (`~` prefix): no literal prefix to strip
+        // - Exact listen_paths (`=` prefix): match the full request path
         // - Root listen_path (`/`): avoid turning "/users" into "users"
         //
         // Uses `strip_prefix` which is char-boundary-safe — byte-indexed
@@ -197,7 +283,11 @@ impl Plugin for ResponseMock {
             .as_ref()
             .and_then(|p| p.listen_path.as_deref())
         {
-            Some(listen_path) if !listen_path.starts_with('~') && listen_path != "/" => {
+            Some(listen_path)
+                if !listen_path.starts_with('~')
+                    && !listen_path.starts_with('=')
+                    && listen_path != "/" =>
+            {
                 match ctx.path.strip_prefix(listen_path) {
                     Some("") => "/",
                     Some(rest) => rest,

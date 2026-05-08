@@ -81,28 +81,8 @@ pub struct GrpcMethodRouter {
 
 impl GrpcMethodRouter {
     pub fn new(config: &Value) -> Result<Self, String> {
-        // Normalize method paths: strip leading '/' for consistent matching.
-        // Users can configure either "/pkg.Svc/Method" or "pkg.Svc/Method".
-        let allow_methods = config["allow_methods"].as_array().map(|arr| {
-            arr.iter()
-                .filter_map(|v| {
-                    v.as_str()
-                        .map(|s| s.strip_prefix('/').unwrap_or(s).to_string())
-                })
-                .collect::<HashSet<_>>()
-        });
-
-        let deny_methods = config["deny_methods"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| {
-                        v.as_str()
-                            .map(|s| s.strip_prefix('/').unwrap_or(s).to_string())
-                    })
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
+        let allow_methods = parse_optional_method_set(config, "allow_methods")?;
+        let deny_methods = parse_optional_method_set(config, "deny_methods")?.unwrap_or_default();
 
         // limit_by must be a recognized policy — silently treating "user" as "ip"
         // would be a security misconfiguration footgun.
@@ -125,18 +105,32 @@ impl GrpcMethodRouter {
         };
 
         let mut method_rate_limits = HashMap::new();
-        if let Some(obj) = config["method_rate_limits"].as_object() {
+        if let Some(value) = config.get("method_rate_limits")
+            && !value.is_null()
+        {
+            let obj = value.as_object().ok_or_else(|| {
+                format!("grpc_method_router: 'method_rate_limits' must be an object, got: {value}")
+            })?;
             for (method, spec) in obj {
-                let max_requests = spec["max_requests"].as_u64().ok_or_else(|| {
-                    format!(
-                        "grpc_method_router: method_rate_limits['{method}']: 'max_requests' is required and must be a positive integer"
-                    )
+                let spec_obj = spec.as_object().ok_or_else(|| {
+                    format!("grpc_method_router: method_rate_limits['{method}'] must be an object")
                 })?;
-                let window_seconds = spec["window_seconds"].as_u64().ok_or_else(|| {
-                    format!(
-                        "grpc_method_router: method_rate_limits['{method}']: 'window_seconds' is required and must be a positive integer"
-                    )
-                })?;
+                let max_requests = spec_obj
+                    .get("max_requests")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        format!(
+                            "grpc_method_router: method_rate_limits['{method}']: 'max_requests' is required and must be a positive integer"
+                        )
+                    })?;
+                let window_seconds = spec_obj
+                    .get("window_seconds")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        format!(
+                            "grpc_method_router: method_rate_limits['{method}']: 'window_seconds' is required and must be a positive integer"
+                        )
+                    })?;
                 if max_requests == 0 {
                     return Err(format!(
                         "grpc_method_router: method_rate_limits['{method}']: 'max_requests' must be greater than zero"
@@ -147,14 +141,21 @@ impl GrpcMethodRouter {
                         "grpc_method_router: method_rate_limits['{method}']: 'window_seconds' must be greater than zero"
                     ));
                 }
-                let normalized = method.strip_prefix('/').unwrap_or(method).to_string();
-                method_rate_limits.insert(
-                    normalized,
-                    RateSpec {
-                        max_requests,
-                        window: Duration::from_secs(window_seconds),
-                    },
-                );
+                let normalized = normalize_config_method_path(method, "method_rate_limits")?;
+                if method_rate_limits
+                    .insert(
+                        normalized,
+                        RateSpec {
+                            max_requests,
+                            window: Duration::from_secs(window_seconds),
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(format!(
+                        "grpc_method_router: duplicate method_rate_limits entry after normalization: {method:?}"
+                    ));
+                }
             }
         }
 
@@ -191,6 +192,9 @@ impl GrpcMethodRouter {
     /// Check a rate limit by key, creating a bucket if needed.
     fn check_rate(&self, key: &str, spec: &RateSpec) -> bool {
         self.evict_stale_entries();
+        if let Some(mut bucket) = self.state.get_mut(key) {
+            return bucket.check_and_consume();
+        }
         let mut entry = self
             .state
             .entry(key.to_string())
@@ -214,8 +218,83 @@ impl GrpcMethodRouter {
         } else {
             ctx.client_ip.as_str()
         };
-        format!("grpc_method:{}:{}", identity, method_path)
+        let mut key =
+            String::with_capacity("grpc_method::".len() + identity.len() + method_path.len());
+        key.push_str("grpc_method:");
+        key.push_str(identity);
+        key.push(':');
+        key.push_str(method_path);
+        key
     }
+}
+
+fn parse_optional_method_set(config: &Value, key: &str) -> Result<Option<HashSet<String>>, String> {
+    let Some(value) = config.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    let entries = value
+        .as_array()
+        .ok_or_else(|| format!("grpc_method_router: '{key}' must be an array, got: {value}"))?;
+    let mut methods = HashSet::with_capacity(entries.len());
+    for (idx, entry) in entries.iter().enumerate() {
+        let method = entry.as_str().ok_or_else(|| {
+            format!("grpc_method_router: '{key}[{idx}]' must be a string, got: {entry}")
+        })?;
+        let normalized = normalize_config_method_path(method, key)?;
+        if !methods.insert(normalized.clone()) {
+            return Err(format!(
+                "grpc_method_router: duplicate method in '{key}' after normalization: {normalized:?}"
+            ));
+        }
+    }
+    Ok(Some(methods))
+}
+
+fn normalize_config_method_path(method: &str, field: &str) -> Result<String, String> {
+    let trimmed = method.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "grpc_method_router: '{field}' entries must not be empty"
+        ));
+    }
+    let normalized = trimmed.strip_prefix('/').unwrap_or(trimmed);
+    let Some((service, method_name)) = normalized.split_once('/') else {
+        return Err(format!(
+            "grpc_method_router: '{field}' entry must use 'package.Service/Method': {method:?}"
+        ));
+    };
+    if service.is_empty() || method_name.is_empty() || method_name.contains('/') {
+        return Err(format!(
+            "grpc_method_router: invalid gRPC method path in '{field}': {method:?}"
+        ));
+    }
+    if !is_valid_grpc_service(service) || !is_valid_grpc_identifier(method_name) {
+        return Err(format!(
+            "grpc_method_router: invalid gRPC method path in '{field}': {method:?}"
+        ));
+    }
+    Ok(normalized.to_string())
+}
+
+fn is_valid_grpc_service(service: &str) -> bool {
+    service
+        .split('.')
+        .all(|segment| !segment.is_empty() && is_valid_grpc_identifier(segment))
+}
+
+fn is_valid_grpc_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 /// Parse a gRPC path into (service, method).
@@ -242,9 +321,8 @@ fn grpc_content_type_header() -> HashMap<String, String> {
     h
 }
 
-/// Escape special characters for safe JSON string interpolation.
-fn escape_json_string(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+fn grpc_json_error_body(message: String) -> String {
+    serde_json::json!({ "error": message }).to_string()
 }
 
 #[async_trait]
@@ -268,7 +346,10 @@ impl Plugin for GrpcMethodRouter {
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         // Parse the gRPC path and populate metadata
         if let Some((service, method)) = parse_grpc_path(&ctx.path) {
-            let full_method = format!("{}/{}", service, method);
+            let mut full_method = String::with_capacity(service.len() + 1 + method.len());
+            full_method.push_str(service);
+            full_method.push('/');
+            full_method.push_str(method);
             ctx.metadata
                 .insert("grpc_service".to_string(), service.to_string());
             ctx.metadata
@@ -309,10 +390,7 @@ impl Plugin for GrpcMethodRouter {
             );
             return PluginResult::Reject {
                 status_code: 403,
-                body: format!(
-                    r#"{{"error":"gRPC method '{}' is not permitted"}}"#,
-                    escape_json_string(full_method)
-                ),
+                body: grpc_json_error_body(format!("gRPC method '{full_method}' is not permitted")),
                 headers: grpc_content_type_header(),
             };
         }
@@ -328,10 +406,7 @@ impl Plugin for GrpcMethodRouter {
             );
             return PluginResult::Reject {
                 status_code: 403,
-                body: format!(
-                    r#"{{"error":"gRPC method '{}' is not permitted"}}"#,
-                    escape_json_string(full_method)
-                ),
+                body: grpc_json_error_body(format!("gRPC method '{full_method}' is not permitted")),
                 headers: grpc_content_type_header(),
             };
         }
@@ -361,10 +436,9 @@ impl Plugin for GrpcMethodRouter {
                 );
                 return PluginResult::Reject {
                     status_code: 429,
-                    body: format!(
-                        r#"{{"error":"Rate limit exceeded for gRPC method '{}'"}}"#,
-                        escape_json_string(full_method)
-                    ),
+                    body: grpc_json_error_body(format!(
+                        "Rate limit exceeded for gRPC method '{full_method}'"
+                    )),
                     headers,
                 };
             }

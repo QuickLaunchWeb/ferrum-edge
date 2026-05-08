@@ -27,7 +27,7 @@ use tokio::time::Duration;
 
 use super::utils::{
     BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry, build_batch_config,
-    resolve_tcp_endpoint,
+    resolve_tcp_endpoint, validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
@@ -60,17 +60,24 @@ pub struct TcpLogging {
 
 impl TcpLogging {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        let host = config["host"]
-            .as_str()
+        if !config.is_object() {
+            return Err("tcp_logging: config must be an object".to_string());
+        }
+
+        let host = config
+            .get("host")
+            .and_then(Value::as_str)
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 "tcp_logging: 'host' is required — logs will have nowhere to send".to_string()
             })?
             .to_string();
 
-        let port = config["port"]
-            .as_u64()
-            .ok_or_else(|| "tcp_logging: 'port' is required".to_string())?;
+        let port = config
+            .get("port")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "tcp_logging: 'port' is required and must be an integer".to_string())?;
         if port == 0 || port > 65535 {
             return Err(format!(
                 "tcp_logging: 'port' must be between 1 and 65535 (got {port})"
@@ -78,16 +85,23 @@ impl TcpLogging {
         }
         let port = port as u16;
 
-        let tls_enabled = config["tls"].as_bool().unwrap_or(false);
-        let tls_server_name = config["tls_server_name"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+        let tls_enabled = optional_bool(config, "tls")?.unwrap_or(false);
+        let tls_server_name = optional_non_empty_string(config, "tls_server_name")?;
 
-        let connect_timeout_ms = config["connect_timeout_ms"]
-            .as_u64()
+        let connect_timeout_ms = optional_u64(config, "connect_timeout_ms")?
             .unwrap_or(5000)
             .max(100);
+
+        let batch_defaults = BatchConfigDefaults {
+            batch_size_key: "batch_size",
+            batch_size: 50,
+            flush_interval_ms: 1000,
+            min_flush_interval_ms: 100,
+            buffer_capacity: 10000,
+            max_retries: 3,
+            retry_delay_ms: 1000,
+        };
+        validate_batch_config(config, "tcp_logging", batch_defaults)?;
 
         let flush_config = TcpFlushConfig {
             host: host.clone(),
@@ -104,19 +118,7 @@ impl TcpLogging {
         let logger = BatchingLogger::spawn(
             // Config remains `max_retries`; the shared retry policy counts the
             // initial attempt plus those retries.
-            build_batch_config(
-                config,
-                "tcp_logging",
-                BatchConfigDefaults {
-                    batch_size_key: "batch_size",
-                    batch_size: 50,
-                    flush_interval_ms: 1000,
-                    min_flush_interval_ms: 100,
-                    buffer_capacity: 10000,
-                    max_retries: 3,
-                    retry_delay_ms: 1000,
-                },
-            ),
+            build_batch_config(config, "tcp_logging", batch_defaults),
             move |batch| {
                 let flush_config = flush_config.clone();
                 let writer = Arc::clone(&writer);
@@ -128,6 +130,42 @@ impl TcpLogging {
             logger,
             endpoint_hostname: host,
         })
+    }
+}
+
+fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
+    match config.get(key) {
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| format!("tcp_logging: '{key}' must be a boolean")),
+        None => Ok(None),
+    }
+}
+
+fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
+    match config.get(key) {
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("tcp_logging: '{key}' must be an unsigned integer")),
+        None => Ok(None),
+    }
+}
+
+fn optional_non_empty_string(config: &Value, key: &str) -> Result<Option<String>, String> {
+    match config.get(key) {
+        Some(value) => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("tcp_logging: '{key}' must be a string"))?
+                .trim();
+            if value.is_empty() {
+                return Err(format!("tcp_logging: '{key}' must not be empty"));
+            }
+            Ok(Some(value.to_string()))
+        }
+        None => Ok(None),
     }
 }
 
@@ -401,9 +439,36 @@ mod tests {
         });
     }
 
+    fn must<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error}"),
+        }
+    }
+
+    fn must_some<T>(value: Option<T>, context: &str) -> T {
+        match value {
+            Some(value) => value,
+            None => panic!("{context}"),
+        }
+    }
+
+    fn path_str(path: &std::path::Path) -> &str {
+        match path.to_str() {
+            Some(value) => value,
+            None => panic!("test path should be valid UTF-8: {path:?}"),
+        }
+    }
+
     fn generate_ca() -> (Issuer<'static, KeyPair>, String) {
-        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        let key_pair = must(
+            KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256),
+            "generate CA key",
+        );
+        let mut params = must(
+            CertificateParams::new(Vec::<String>::new()),
+            "build CA params",
+        );
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params
             .distinguished_name
@@ -411,7 +476,7 @@ mod tests {
         params.key_usages.push(KeyUsagePurpose::KeyCertSign);
         params.key_usages.push(KeyUsagePurpose::CrlSign);
         params.key_usages.push(KeyUsagePurpose::DigitalSignature);
-        let cert = params.self_signed(&key_pair).unwrap();
+        let cert = must(params.self_signed(&key_pair), "self-sign CA");
         let cert_pem = cert.pem();
         (Issuer::new(params, key_pair), cert_pem)
     }
@@ -420,16 +485,19 @@ mod tests {
         ca: &Issuer<'static, KeyPair>,
         sans: &[&str],
     ) -> (String, String, SerialNumber) {
-        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let key_pair = must(
+            KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256),
+            "generate leaf key",
+        );
         let san_strings: Vec<String> = sans.iter().map(|s| s.to_string()).collect();
-        let mut params = CertificateParams::new(san_strings).unwrap();
+        let mut params = must(CertificateParams::new(san_strings), "build leaf params");
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "Test Leaf");
         let serial_bytes: Vec<u8> = (1..=20).collect();
         let serial = SerialNumber::from_slice(&serial_bytes);
         params.serial_number = Some(serial.clone());
-        let cert = params.signed_by(&key_pair, ca).unwrap();
+        let cert = must(params.signed_by(&key_pair, ca), "sign leaf cert");
         (cert.pem(), key_pair.serialize_pem(), serial)
     }
 
@@ -452,7 +520,8 @@ mod tests {
             revoked_certs,
             key_identifier_method: rcgen::KeyIdMethod::Sha256,
         };
-        params.signed_by(ca).unwrap().pem().unwrap()
+        let crl = must(params.signed_by(ca), "sign CRL");
+        must(crl.pem(), "serialize CRL PEM")
     }
 
     /// Spawn a one-shot TLS server that completes the handshake (or fails) and
@@ -461,16 +530,22 @@ mod tests {
         let cert_chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
             .filter_map(|c| c.ok())
             .collect();
-        let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-            .unwrap()
-            .unwrap();
-        let server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
-            .unwrap();
+        let key = must_some(
+            must(
+                rustls_pemfile::private_key(&mut key_pem.as_bytes()),
+                "parse private key",
+            ),
+            "private key should be present",
+        );
+        let server_config = must(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(cert_chain, key),
+            "build TLS server config",
+        );
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = must(TcpListener::bind("127.0.0.1:0").await, "bind TLS server");
+        let port = must(listener.local_addr(), "read TLS server local addr").port();
 
         tokio::spawn(async move {
             // Accept up to two connections then exit; keeps the test free of
@@ -509,9 +584,9 @@ mod tests {
         let crl_pem = generate_crl_pem(&ca_issuer, std::slice::from_ref(&leaf_serial));
 
         // Write CA to a tempfile — `PluginHttpClient` consumes the bundle by path.
-        let td = tempfile::tempdir().unwrap();
+        let td = must(tempfile::tempdir(), "create tempdir");
         let ca_path = td.path().join("ca.pem");
-        std::fs::write(&ca_path, &ca_pem).unwrap();
+        must(std::fs::write(&ca_path, &ca_pem), "write CA PEM");
 
         // Parse CRL into the in-memory `CrlList` form `PluginHttpClient` expects.
         let crls: Vec<_> =
@@ -532,7 +607,7 @@ mod tests {
             0,
             100,
             false,
-            Some(ca_path.to_str().unwrap()),
+            Some(path_str(&ca_path)),
             crl_list.clone(),
             "ferrum",
             crate::config::BackendAllowIps::Both,
@@ -547,8 +622,8 @@ mod tests {
                 "connect_timeout_ms": 2000,
             }),
             http_client,
-        )
-        .unwrap();
+        );
+        let plugin = must(plugin, "tcp_logging config should be valid");
         assert_eq!(plugin.name(), "tcp_logging");
 
         // Reach into `connect_tcp` directly so the handshake error surfaces
@@ -559,7 +634,7 @@ mod tests {
             tls_enabled: true,
             tls_server_name: Some("localhost".to_string()),
             tls_no_verify: false,
-            tls_ca_bundle_path: Some(ca_path.to_str().unwrap().to_string()),
+            tls_ca_bundle_path: Some(path_str(&ca_path).to_string()),
             tls_crls: (*crl_list).clone(),
             connect_timeout: Duration::from_secs(2),
             dns_cache: None,
@@ -588,9 +663,9 @@ mod tests {
         let (leaf_pem, leaf_key_pem, _) =
             generate_signed_leaf(&ca_issuer, &["localhost", "127.0.0.1"]);
 
-        let td = tempfile::tempdir().unwrap();
+        let td = must(tempfile::tempdir(), "create tempdir");
         let ca_path = td.path().join("ca.pem");
-        std::fs::write(&ca_path, &ca_pem).unwrap();
+        must(std::fs::write(&ca_path, &ca_pem), "write CA PEM");
 
         let port = spawn_tls_server(&leaf_pem, &leaf_key_pem).await;
 
@@ -600,7 +675,7 @@ mod tests {
             tls_enabled: true,
             tls_server_name: Some("localhost".to_string()),
             tls_no_verify: false,
-            tls_ca_bundle_path: Some(ca_path.to_str().unwrap().to_string()),
+            tls_ca_bundle_path: Some(path_str(&ca_path).to_string()),
             tls_crls: Vec::new(),
             connect_timeout: Duration::from_secs(2),
             dns_cache: None,
