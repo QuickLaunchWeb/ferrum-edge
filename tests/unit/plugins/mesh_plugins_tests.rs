@@ -1,18 +1,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::mesh::{
     MeshConfig, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
     WorkloadSelector,
 };
-use ferrum_edge::config::types::Proxy;
+use ferrum_edge::config::types::{BackendScheme, Proxy};
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::plugins::access_log::AccessLog;
 use ferrum_edge::plugins::mesh_authz::MeshAuthz;
 use ferrum_edge::plugins::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, TransactionSummary, available_plugins,
-    create_plugin, is_security_plugin, priority,
+    ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, StreamConnectionContext,
+    TransactionSummary, available_plugins, create_plugin, is_security_plugin, priority,
 };
 use serde_json::json;
 
@@ -697,6 +698,65 @@ async fn workload_metrics_uses_workload_hint_when_peer_identity_absent() {
             .get("mesh.request_protocol")
             .map(String::as_str),
         Some("grpc")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_on_stream_connect_adds_source_identity_metadata() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "node_id": "node-a",
+        "topology": "sidecar",
+        "labels": {
+            "service.istio.io/canonical-name": "client-svc"
+        }
+    }))
+    .expect("plugin config");
+    let mut ctx = StreamConnectionContext {
+        client_ip: "127.0.0.1".to_string(),
+        proxy_id: "tcp-proxy".to_string(),
+        proxy_name: Some("payments-tcp".to_string()),
+        listen_port: 15432,
+        backend_scheme: BackendScheme::Tcp,
+        consumer_index: Arc::new(ConsumerIndex::new(&[])),
+        identified_consumer: None,
+        authenticated_identity: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
+        metadata: None,
+        tls_client_cert_der: Some(Arc::new(vec![1, 2, 3])),
+        tls_client_cert_chain_der: None,
+        sni_hostname: None,
+    };
+
+    let result = plugin.on_stream_connect(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    let metadata = ctx.metadata.expect("stream metadata");
+    assert_eq!(
+        metadata.get("mesh.source.principal").map(String::as_str),
+        Some("spiffe://cluster.local/ns/default/sa/client")
+    );
+    assert_eq!(
+        metadata.get("mesh.source.namespace").map(String::as_str),
+        Some("default")
+    );
+    assert_eq!(
+        metadata
+            .get("mesh.source.service_account")
+            .map(String::as_str),
+        Some("client")
+    );
+    assert_eq!(
+        metadata.get("mesh.source.workload").map(String::as_str),
+        Some("client-svc")
+    );
+    assert_eq!(
+        metadata
+            .get("mesh.connection_security_policy")
+            .map(String::as_str),
+        Some("mutual_tls")
+    );
+    assert_eq!(
+        metadata.get("mesh.topology").map(String::as_str),
+        Some("sidecar")
     );
 }
 

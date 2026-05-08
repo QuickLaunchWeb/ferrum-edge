@@ -166,6 +166,8 @@ With the native `MeshSubscribe` protocol, mesh mode waits for the first delivere
 | `FERRUM_MESH_CAPTURE_MODE` | No | `explicit` | Traffic capture mode used by injector/capture planning: `explicit`, `iptables`, or `ebpf`. eBPF always falls back to iptables when unsupported |
 | `FERRUM_MESH_PROXY_UID` | No | `1337` in injector patches | UID used to exempt Ferrum's own outbound traffic from iptables capture |
 
+Capture plans reserve proxy UID `1337` by default so Ferrum's own outbound traffic is excluded from redirect rules even when the operator does not set `FERRUM_MESH_PROXY_UID`. The eBPF capture plan carries an iptables fallback with the same UID exclusion and redirect ports.
+
 Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Prometheus plugin when mesh metadata is present. The added series are `ferrum_mesh_requests_total` and `ferrum_mesh_request_duration_ms`, labelled with source/destination workload, namespace, principal, app, service, request protocol, response code, response flags, and connection security policy.
 
 Mesh authorization normalizes policy header match names to lowercase at admission/plugin construction when doing so is unambiguous, so request-time checks use the already-lowercase header map without per-request key allocation. Case-variant duplicate header rules are preserved and evaluated together to avoid nondeterministic policy outcomes. Wildcard matches support `*` anywhere in the policy pattern while preserving anchored-prefix and anchored-suffix semantics.
