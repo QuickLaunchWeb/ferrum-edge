@@ -476,16 +476,15 @@ fn route_weight(
     default_weight: u64,
 ) -> Result<u64, K8sTranslateError> {
     match route.get("weight") {
-        Some(Value::Number(number)) if number.as_i64().is_some_and(|weight| weight < 0) => {
-            Err(invalid_resource(
+        Some(Value::Number(number)) => number.as_u64().ok_or_else(|| {
+            invalid_resource(
                 object,
-                "VirtualService route.weight must be zero or positive",
-            ))
-        }
-        Some(Value::Number(number)) => Ok(number.as_u64().unwrap_or(default_weight)),
+                "VirtualService route.weight must be a zero or positive integer",
+            )
+        }),
         Some(_) => Err(invalid_resource(
             object,
-            "VirtualService route.weight must be a number",
+            "VirtualService route.weight must be a zero or positive integer",
         )),
         None => Ok(default_weight),
     }
@@ -1153,7 +1152,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("route.weight must be zero or positive")
+                .contains("route.weight must be a zero or positive integer")
         );
     }
 
@@ -1183,7 +1182,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("route.weight must be zero or positive")
+                .contains("route.weight must be a zero or positive integer")
         );
     }
 
@@ -1209,6 +1208,37 @@ mod tests {
         )
         .expect_err("non-numeric VirtualService route weights are invalid");
 
-        assert!(err.to_string().contains("route.weight must be a number"));
+        assert!(
+            err.to_string()
+                .contains("route.weight must be a zero or positive integer")
+        );
+    }
+
+    #[test]
+    fn virtual_service_rejects_fractional_split_weight() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "route": [{
+                            "destination": {
+                                "host": "stable.default.svc.cluster.local",
+                                "port": {"number": 8080}
+                            },
+                            "weight": 0.5
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("fractional VirtualService route weights are invalid");
+
+        assert!(
+            err.to_string()
+                .contains("route.weight must be a zero or positive integer")
+        );
     }
 }

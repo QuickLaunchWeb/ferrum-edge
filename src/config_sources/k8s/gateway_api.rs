@@ -337,13 +337,15 @@ fn first_backend_ref<'a>(
 
 fn backend_ref_weight(object: &K8sObject, backend_ref: &Value) -> Result<u64, K8sTranslateError> {
     match backend_ref.get("weight") {
-        Some(Value::Number(number)) if number.as_i64().is_some_and(|weight| weight < 0) => Err(
-            invalid_resource(object, "backendRefs[].weight must be zero or positive"),
-        ),
-        Some(Value::Number(number)) => Ok(number.as_u64().unwrap_or(1)),
+        Some(Value::Number(number)) => number.as_u64().ok_or_else(|| {
+            invalid_resource(
+                object,
+                "backendRefs[].weight must be a zero or positive integer",
+            )
+        }),
         Some(_) => Err(invalid_resource(
             object,
-            "backendRefs[].weight must be a number",
+            "backendRefs[].weight must be a zero or positive integer",
         )),
         None => Ok(1),
     }
@@ -662,7 +664,10 @@ mod tests {
         )
         .expect_err("negative backendRef weights are invalid");
 
-        assert!(err.to_string().contains("weight must be zero or positive"));
+        assert!(
+            err.to_string()
+                .contains("weight must be a zero or positive integer")
+        );
     }
 
     #[test]
@@ -683,7 +688,10 @@ mod tests {
         )
         .expect_err("negative backendRef weights are invalid even after a target is selected");
 
-        assert!(err.to_string().contains("weight must be zero or positive"));
+        assert!(
+            err.to_string()
+                .contains("weight must be a zero or positive integer")
+        );
     }
 
     #[test]
@@ -701,7 +709,31 @@ mod tests {
         )
         .expect_err("non-numeric backendRef weights are invalid");
 
-        assert!(err.to_string().contains("weight must be a number"));
+        assert!(
+            err.to_string()
+                .contains("weight must be a zero or positive integer")
+        );
+    }
+
+    #[test]
+    fn gateway_route_rejects_fractional_backend_ref_weight() {
+        let err = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [{"name": "dark", "port": 8080, "weight": 0.5}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("fractional backendRef weights are invalid");
+
+        assert!(
+            err.to_string()
+                .contains("weight must be a zero or positive integer")
+        );
     }
 
     #[test]
