@@ -78,10 +78,10 @@ impl Plugin for MeshAuthz {
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         ctx.materialize_headers();
-        if is_hbone_request(ctx)
+        let unauthenticated_hbone_baggage = is_hbone_request(ctx)
             && has_baggage_header_from_request(ctx)
-            && !is_authenticated_hbone_request(ctx)
-        {
+            && !is_authenticated_hbone_request(ctx);
+        if unauthenticated_hbone_baggage {
             ctx.metadata.insert(
                 "mesh_authz.ignored_baggage".to_string(),
                 "unauthenticated_hbone".to_string(),
@@ -111,7 +111,19 @@ impl Plugin for MeshAuthz {
             attributes: BTreeMap::new(),
         };
         let decision = evaluate_mesh_authorization(&self.slice, &request);
-        self.decision_to_result(decision, &mut ctx.metadata)
+        let result = self.decision_to_result(decision, &mut ctx.metadata);
+        if unauthenticated_hbone_baggage
+            && matches!(
+                result,
+                PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }
+            )
+        {
+            ctx.metadata.insert(
+                "mesh_authz.deny_policy".to_string(),
+                "unauthenticated_baggage".to_string(),
+            );
+        }
+        result
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {

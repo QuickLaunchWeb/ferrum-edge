@@ -151,7 +151,6 @@ async fn mesh_authz_reads_hbone_baggage_source_identity() {
             .expect("header value"),
     );
     ctx.set_raw_headers(headers);
-    ctx.materialize_headers();
 
     let result = plugin.authorize(&mut ctx).await;
 
@@ -211,6 +210,12 @@ async fn mesh_authz_ignores_hbone_baggage_without_authenticated_peer() {
             .get("mesh_authz.ignored_baggage")
             .map(String::as_str),
         Some("unauthenticated_hbone")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("unauthenticated_baggage")
     );
 }
 
