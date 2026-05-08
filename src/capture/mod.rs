@@ -6,6 +6,8 @@
 
 use std::net::IpAddr;
 
+pub const DEFAULT_PROXY_UID: u32 = 1337;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureMode {
     Explicit,
@@ -41,7 +43,7 @@ impl CaptureConfig {
     pub fn explicit(inbound_port: u16, outbound_port: u16) -> Self {
         Self {
             mode: CaptureMode::Explicit,
-            proxy_uid: None,
+            proxy_uid: Some(DEFAULT_PROXY_UID),
             inbound_port,
             outbound_port,
             include_cidrs: vec!["0.0.0.0/0".to_string()],
@@ -189,7 +191,7 @@ mod tests {
     fn iptables_plan_is_idempotent() {
         let mut config = CaptureConfig::explicit(15006, 15001);
         config.mode = CaptureMode::Iptables;
-        config.proxy_uid = Some(1337);
+        config.proxy_uid = Some(DEFAULT_PROXY_UID);
         config.exclude_cidrs.push("10.0.0.0/8".to_string());
         config.exclude_ports.push(15020);
 
@@ -209,10 +211,46 @@ mod tests {
     }
 
     #[test]
+    fn explicit_capture_defaults_to_proxy_uid_exclusion() {
+        let config = CaptureConfig::explicit(15006, 15001);
+
+        assert_eq!(config.proxy_uid, Some(DEFAULT_PROXY_UID));
+        assert!(
+            IptablesPlan::for_config(&config)
+                .commands
+                .iter()
+                .any(|cmd| cmd.contains("--uid-owner 1337"))
+        );
+    }
+
+    #[test]
     fn ebpf_falls_back_on_old_kernel() {
         assert!(should_fallback_to_iptables("5.4.0"));
         assert!(!should_fallback_to_iptables("5.7.0"));
         assert!(!should_fallback_to_iptables("6.6.12"));
+    }
+
+    #[test]
+    fn ebpf_plan_carries_iptables_fallback() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Ebpf;
+
+        let plan = EbpfPlan::for_config(&config);
+
+        assert!(plan.enabled);
+        assert_eq!(plan.required_kernel, "5.7");
+        assert!(
+            plan.fallback
+                .commands
+                .iter()
+                .any(|cmd| cmd.contains("--uid-owner 1337"))
+        );
+        assert!(
+            plan.fallback
+                .commands
+                .iter()
+                .any(|cmd| cmd.contains("--to-ports 15001"))
+        );
     }
 
     #[test]

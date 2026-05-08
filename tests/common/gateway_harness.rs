@@ -154,6 +154,16 @@ impl TestGateway {
         wait_for_health_inner(self.admin_port, timeout).await
     }
 
+    /// Poll an authenticated admin endpoint until the configured JWT is
+    /// accepted. This keeps parallel functional tests from mistaking another
+    /// gateway's unauthenticated `/health` response for this child process.
+    pub async fn wait_for_admin_auth(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        wait_for_admin_auth_inner(self.admin_port, &self.auth_header(), timeout).await
+    }
+
     /// Explicit shutdown. Safe to call multiple times; subsequent calls are
     /// no-ops. Drop also kills the child if this was not called.
     pub fn shutdown(&mut self) {
@@ -550,6 +560,16 @@ impl TestGatewayBuilder {
         let effective_proxy_port = parse_port_override(&env, "FERRUM_PROXY_HTTP_PORT", proxy_port)?;
         let effective_admin_port = parse_port_override(&env, "FERRUM_ADMIN_HTTP_PORT", admin_port)?;
 
+        let effective_jwt_secret = env
+            .get("FERRUM_ADMIN_JWT_SECRET")
+            .cloned()
+            .unwrap_or_else(|| self.jwt_secret.clone());
+        let effective_jwt_issuer = env
+            .get("FERRUM_ADMIN_JWT_ISSUER")
+            .cloned()
+            .unwrap_or_else(|| self.jwt_issuer.clone());
+        let should_verify_admin_auth = env.contains_key("FERRUM_ADMIN_JWT_SECRET");
+
         let mut gw = TestGateway {
             temp_dir,
             child: Some(child),
@@ -557,8 +577,8 @@ impl TestGatewayBuilder {
             admin_port: effective_admin_port,
             proxy_base_url: format!("http://127.0.0.1:{}", effective_proxy_port),
             admin_base_url: format!("http://127.0.0.1:{}", effective_admin_port),
-            jwt_secret: self.jwt_secret.clone(),
-            jwt_issuer: self.jwt_issuer.clone(),
+            jwt_secret: effective_jwt_secret,
+            jwt_issuer: effective_jwt_issuer,
             basic_auth_hmac_secret: self.basic_auth_hmac_secret.clone(),
             db_url,
             config_path,
@@ -567,7 +587,21 @@ impl TestGatewayBuilder {
         };
 
         match gw.wait_for_health(self.health_timeout).await {
-            Ok(()) => Ok(gw),
+            Ok(()) => {
+                if should_verify_admin_auth
+                    && let Err(e) = gw.wait_for_admin_auth(self.health_timeout).await
+                {
+                    let combined_logs = gw.read_combined_captured_output().unwrap_or_default();
+                    gw.shutdown();
+                    if combined_logs.is_empty() {
+                        return Err(e);
+                    }
+                    return Err(
+                        format!("{e}\n--- captured gateway output ---\n{combined_logs}").into(),
+                    );
+                }
+                Ok(gw)
+            }
             Err(e) => {
                 let combined_logs = gw.read_combined_captured_output().unwrap_or_default();
                 // Clean up the failed child so the retry loop starts fresh.
@@ -876,6 +910,44 @@ async fn wait_for_health_inner(
             Ok(r) if r.status().is_success() => return Ok(()),
             Ok(r) => {
                 last_observation = format!("HTTP {}", r.status());
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(err) => {
+                last_observation = err.to_string();
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+}
+
+async fn wait_for_admin_auth_inner(
+    admin_port: u16,
+    auth_header: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let auth_url = format!("http://127.0.0.1:{}/proxies", admin_port);
+    let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
+    let deadline = Instant::now() + timeout;
+    let mut last_observation = String::from("no response yet");
+    loop {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "gateway admin JWT did not validate on port {} within {:?} (last observation: {})",
+                admin_port, timeout, last_observation
+            )
+            .into());
+        }
+        match client
+            .get(&auth_url)
+            .header("Authorization", auth_header)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().as_u16() != 401 => return Ok(()),
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                last_observation = format!("HTTP {}: {}", status, body);
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
             Err(err) => {

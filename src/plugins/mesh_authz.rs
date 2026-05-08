@@ -32,11 +32,13 @@ use crate::identity::SpiffeId;
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
     MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
+    mesh_policies_have_header_rules, normalize_mesh_policy_header_names,
 };
 use crate::xds::slice::MeshSlice;
 
 pub struct MeshAuthz {
     slice: MeshSlice,
+    has_header_rules: bool,
 }
 
 impl MeshAuthz {
@@ -81,7 +83,14 @@ impl MeshAuthz {
             policy_scope_applies_to_workload(policy, &proxy_namespace, &proxy_labels)
         });
 
-        Ok(Self { slice })
+        for policy in &mut slice.mesh_policies {
+            normalize_mesh_policy_header_names(policy);
+        }
+        let has_header_rules = mesh_policies_have_header_rules(&slice.mesh_policies);
+        Ok(Self {
+            slice,
+            has_header_rules,
+        })
     }
 
     fn decision_to_result(
@@ -163,7 +172,6 @@ impl Plugin for MeshAuthz {
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
-        ctx.materialize_headers();
         let unauthenticated_hbone_baggage = is_hbone_request(ctx)
             && has_baggage_header_from_request(ctx)
             && !is_authenticated_hbone_request(ctx);
@@ -174,15 +182,25 @@ impl Plugin for MeshAuthz {
             );
         }
         let source_principal = source_principal_from_request(ctx);
-        // The proxy handler backfills HTTP/2/3 `:authority` into materialized
-        // `host` before plugin phases run, so the materialized map is the
-        // single source of truth here.
-        let host = ctx.headers.get("host").cloned();
-        let headers: BTreeMap<String, String> = ctx
-            .headers
-            .iter()
-            .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
-            .collect();
+        let mut host = ctx
+            .raw_header_get("host")
+            .or_else(|| ctx.raw_header_get(":authority"))
+            .map(str::to_string);
+        let headers = if self.has_header_rules {
+            ctx.materialize_headers();
+            if host.is_none() {
+                host = ctx.headers.get("host").cloned();
+            }
+            ctx.headers
+                .iter()
+                .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
+                .collect()
+        } else {
+            if host.is_none() {
+                host = ctx.headers.get("host").cloned();
+            }
+            BTreeMap::new()
+        };
         let request = MeshAuthzRequest {
             source_principal,
             method: Some(ctx.method.clone()),
@@ -243,10 +261,12 @@ fn source_principal_from_request(ctx: &RequestContext) -> Option<SpiffeId> {
         // cert, while baggage carries the originating workload identity. Trust
         // baggage only after the peer is authenticated, and prefer that
         // workload identity over the ztunnel's certificate identity.
-        return baggage_header_from_request(ctx)
-            .map(HboneIdentity::from_baggage_header)
-            .and_then(|identity| identity.source_principal)
-            .or_else(|| ctx.peer_spiffe_id.clone());
+        return HboneIdentity::from_baggage_values(
+            ctx.raw_header_values(BAGGAGE_HEADER)
+                .chain(ctx.headers.get(BAGGAGE_HEADER).map(String::as_str)),
+        )
+        .source_principal
+        .or_else(|| ctx.peer_spiffe_id.clone());
     }
 
     ctx.peer_spiffe_id.clone()
@@ -262,10 +282,6 @@ fn is_hbone_request(ctx: &RequestContext) -> bool {
         .is_some_and(|value| value == "hbone")
 }
 
-fn baggage_header_from_request(ctx: &RequestContext) -> Option<&str> {
-    ctx.headers.get(BAGGAGE_HEADER).map(String::as_str)
-}
-
 fn has_baggage_header_from_request(ctx: &RequestContext) -> bool {
-    ctx.headers.contains_key(BAGGAGE_HEADER)
+    ctx.raw_header_get(BAGGAGE_HEADER).is_some() || ctx.headers.contains_key(BAGGAGE_HEADER)
 }

@@ -58,6 +58,11 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **Resilience** — if a provider becomes unreachable (DNS timeout, Kubernetes API error, Consul agent down), the upstream retains its last-known target list and continues routing normally. A warning is logged on each failed poll. Normal updates resume automatically when the provider recovers.
 - **Per-target path override** — each upstream target may specify an optional `path` field that overrides the proxy's `backend_path` when that target is selected by the load balancer, enabling different backend path prefixes per target.
 
+## Kubernetes Mesh Translation
+
+- **Gateway API route splits** — translates `HTTPRoute.backendRefs` and `GRPCRoute.backendRefs` into direct backends or generated weighted upstreams while preserving zero-weight rule capture semantics.
+- **Istio VirtualService route splits** — translates `VirtualService.http[].route` into direct backends or generated upstreams, including prefix, exact, and regex URI matches.
+
 ## Plugin System
 
 - 58 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
