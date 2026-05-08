@@ -554,7 +554,7 @@ Full docs reference: `docs/configuration.md`. Runtime parsing/defaults: `src/con
 - `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS` (`false`; opt-in auto-apply of pending custom-plugin SQL migrations at startup in `database`/`cp`. Default off — gateway warns but does not auto-mutate schema; operators run `FERRUM_MODE=migrate` explicitly. Enable for embedded SQLite deployments)
 - `FERRUM_CP_GRPC_LISTEN_ADDR` (`0.0.0.0:50051`; port `0` disables)
 - `FERRUM_CP_DP_GRPC_JWT_SECRET` (required cp/dp, ≥32 chars)
-- `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` (128; lagging DPs auto-snapshot)
+- `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` (128; per-channel — DP `ConfigSync.Subscribe` and mesh `MeshConfigSync.MeshSubscribe` are independent broadcast channels; lagging subscribers on either auto-snapshot)
 - `FERRUM_XDS_ENABLED` (`false`); `FERRUM_XDS_STREAM_CHANNEL_CAPACITY` (32; per-ADS-stream response queue)
 - `FERRUM_DP_CP_GRPC_URL`/`URLS` (required dp); `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` (300)
 - `FERRUM_MESH_CAPTURE_MODE` (`explicit`; `iptables` or `ebpf` for mesh capture planning, with eBPF fallback to iptables); `FERRUM_MESH_PROXY_UID` (1337 in injected sidecars)
