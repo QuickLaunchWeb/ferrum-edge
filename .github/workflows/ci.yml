@@ -195,7 +195,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-test-functional-${{ matrix.shard }}"
+          shared-key: "ci-test-functional"
 
       - name: Build gateway binary for end-to-end tests
         run: cargo build --bin ferrum-edge
