@@ -231,13 +231,13 @@ async fn mesh_authz_reads_split_hbone_baggage_headers() {
     let mut headers = http::HeaderMap::new();
     headers.append(
         "baggage",
-        "destination.principal=spiffe://cluster.local/ns/default/sa/server"
+        "source.principal=spiffe://cluster.local/ns/default/sa/client"
             .parse()
             .expect("header value"),
     );
     headers.append(
         "baggage",
-        "source.principal=spiffe://cluster.local/ns/default/sa/client"
+        "destination.principal=spiffe://cluster.local/ns/default/sa/server"
             .parse()
             .expect("header value"),
     );
@@ -491,13 +491,13 @@ async fn workload_metrics_reads_split_hbone_baggage_headers() {
     let mut raw_headers = http::HeaderMap::new();
     raw_headers.append(
         "baggage",
-        "destination.principal=spiffe://cluster.local/ns/default/sa/server"
+        "source.principal=spiffe://cluster.local/ns/default/sa/client"
             .parse()
             .expect("header value"),
     );
     raw_headers.append(
         "baggage",
-        "source.principal=spiffe://cluster.local/ns/default/sa/client"
+        "destination.principal=spiffe://cluster.local/ns/default/sa/server"
             .parse()
             .expect("header value"),
     );
