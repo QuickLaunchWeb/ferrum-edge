@@ -103,7 +103,7 @@ This is a hard requirement, not a warning:
 
 The CP/DP architecture is designed so that data source outages are invisible to API consumers:
 
-- **Auto-reconnect**: If the CP connection drops, the DP retries every 5 seconds
+- **Auto-reconnect**: If the CP connection drops, the DP reconnects with jittered exponential backoff from 1 second to a 30-second cap. A clean stream end resets the next delay to 1 second; connection errors increase it.
 - **Cached config**: DPs continue serving traffic with their last known config indefinitely during CP outages
 - **Connect timeout**: DP uses a 10-second connect timeout per attempt
 - **CP database outage**: If the CP's database goes offline, the CP continues serving its cached config to DPs via gRPC. It does not broadcast stale updates — DPs simply retain their last known config. When the database recovers, the next poll picks up any changes and broadcasts them.

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use ring::rand::SecureRandom;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Certificate, Channel, Identity};
 use tracing::{error, info, warn};
@@ -12,6 +13,9 @@ use crate::grpc::proto::config_sync_client::ConfigSyncClient;
 use crate::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
 use crate::modes::mesh::runtime::MeshRuntimeState;
 use crate::xds::slice::MeshSlice;
+
+const BACKOFF_INITIAL_SECS: u64 = 1;
+const BACKOFF_MAX_SECS: u64 = 30;
 
 /// Phase B shell for Ferrum-native MeshSubscribe consumers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,8 +52,6 @@ pub async fn start_native_mesh_client_with_shutdown(
         return;
     }
 
-    const BACKOFF_INITIAL_SECS: u64 = 1;
-    const BACKOFF_MAX_SECS: u64 = 30;
     let mut current_cp_index = 0usize;
     let mut backoff_secs = BACKOFF_INITIAL_SECS;
 
@@ -83,7 +85,7 @@ pub async fn start_native_mesh_client_with_shutdown(
             }
         };
 
-        match result {
+        let increase_backoff = match result {
             Ok(()) => {
                 warn!(
                     cp_url = %cp_url,
@@ -91,6 +93,7 @@ pub async fn start_native_mesh_client_with_shutdown(
                 );
                 current_cp_index = 0;
                 backoff_secs = BACKOFF_INITIAL_SECS;
+                false
             }
             Err(e) => {
                 error!(
@@ -99,15 +102,16 @@ pub async fn start_native_mesh_client_with_shutdown(
                     "Native MeshSubscribe connection failed"
                 );
                 current_cp_index = (current_cp_index + 1) % cp_urls.len();
+                true
             }
-        }
+        };
 
         let sleep_duration = jittered_backoff(backoff_secs);
         if sleep_or_shutdown(sleep_duration, shutdown_rx.clone()).await {
             info!("Native mesh client shutting down");
             return;
         }
-        backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_SECS);
+        backoff_secs = next_backoff_secs(backoff_secs, increase_backoff);
     }
 }
 
@@ -198,20 +202,41 @@ fn tonic_tls_config(tls: &DpGrpcTlsConfig) -> tonic::transport::ClientTlsConfig 
 }
 
 fn jittered_backoff(backoff_secs: u64) -> Duration {
+    jittered_backoff_with_entropy(backoff_secs, random_backoff_entropy())
+}
+
+fn random_backoff_entropy() -> u64 {
+    let rng = ring::rand::SystemRandom::new();
+    let mut bytes = [0u8; 8];
+    if rng.fill(&mut bytes).is_ok() {
+        return u64::from_ne_bytes(bytes);
+    }
+
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+fn jittered_backoff_with_entropy(backoff_secs: u64, entropy: u64) -> Duration {
     let base_ms = backoff_secs.saturating_mul(1000);
     let jitter_range_ms = base_ms / 4;
     let jitter_ms = if jitter_range_ms > 0 {
         let full_range = jitter_range_ms.saturating_mul(2);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as u64;
-        (nanos % full_range) as i64 - jitter_range_ms as i64
+        (entropy % full_range) as i64 - jitter_range_ms as i64
     } else {
         0
     };
     let sleep_ms = (base_ms as i64 + jitter_ms).max(100) as u64;
     Duration::from_millis(sleep_ms)
+}
+
+fn next_backoff_secs(current_secs: u64, increase: bool) -> u64 {
+    if increase {
+        current_secs.saturating_mul(2).min(BACKOFF_MAX_SECS)
+    } else {
+        BACKOFF_INITIAL_SECS
+    }
 }
 
 async fn sleep_or_shutdown(
@@ -286,6 +311,41 @@ mod tests {
                 .as_ref()
                 .map(|slice| slice.version.as_str()),
             Some("v1")
+        );
+    }
+
+    #[test]
+    fn next_backoff_does_not_increase_after_clean_stream_end() {
+        assert_eq!(
+            next_backoff_secs(BACKOFF_INITIAL_SECS, false),
+            BACKOFF_INITIAL_SECS
+        );
+        assert_eq!(next_backoff_secs(16, false), BACKOFF_INITIAL_SECS);
+    }
+
+    #[test]
+    fn next_backoff_increases_after_connection_error_until_cap() {
+        assert_eq!(next_backoff_secs(1, true), 2);
+        assert_eq!(next_backoff_secs(16, true), 30);
+        assert_eq!(next_backoff_secs(30, true), 30);
+    }
+
+    #[test]
+    fn jittered_backoff_with_entropy_stays_within_expected_range() {
+        let samples = [0, 249, 250, 499, u64::MAX];
+
+        for entropy in samples {
+            let duration = jittered_backoff_with_entropy(1, entropy);
+            assert!(duration >= Duration::from_millis(750));
+            assert!(duration < Duration::from_millis(1250));
+        }
+    }
+
+    #[test]
+    fn jittered_backoff_never_sleeps_below_minimum() {
+        assert_eq!(
+            jittered_backoff_with_entropy(0, 0),
+            Duration::from_millis(100)
         );
     }
 }

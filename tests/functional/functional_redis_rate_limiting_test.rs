@@ -117,9 +117,10 @@ struct RedisRateLimitHarness {
 
 impl RedisRateLimitHarness {
     async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let run_id = Uuid::new_v4().simple().to_string();
         let gw = TestGateway::builder()
-            .jwt_secret("test-redis-rl-jwt-secret-1234567890")
-            .jwt_issuer("ferrum-edge-redis-rl-test")
+            .jwt_secret(format!("test-redis-rl-jwt-secret-1234567890-{run_id}"))
+            .jwt_issuer(format!("ferrum-edge-redis-rl-test-{run_id}"))
             .log_level("debug")
             .env("FERRUM_TRUSTED_PROXIES", "127.0.0.1")
             .spawn()
@@ -137,18 +138,22 @@ impl RedisRateLimitHarness {
         sleep(Duration::from_secs(5)).await;
     }
 
-    /// Actively wait for a specific route to become available (non-404).
-    /// More reliable than a fixed sleep, especially under CI load.
-    async fn wait_for_route(&self, path: &str) {
+    /// Wait until a route is served by the expected plugin configuration.
+    /// A DB poll can observe the proxy row before a later proxy update attaches
+    /// plugins, so route readiness alone is not enough for plugin assertions.
+    async fn wait_for_response_header(&self, path: &str, header_name: &str) {
         let url = format!("{}{}", self.proxy_base_url, path);
         let client = reqwest::Client::new();
-        let deadline = SystemTime::now() + Duration::from_secs(15);
+        let deadline = SystemTime::now() + Duration::from_secs(30);
         loop {
             if SystemTime::now() >= deadline {
-                panic!("Route {} did not become available within 15 seconds", path);
+                panic!(
+                    "Route {} did not expose response header {} within 30 seconds",
+                    path, header_name
+                );
             }
             match client.get(&url).send().await {
-                Ok(r) if r.status().as_u16() != 404 => return,
+                Ok(r) if r.headers().contains_key(header_name) => return,
                 _ => sleep(Duration::from_millis(500)).await,
             }
         }
@@ -507,8 +512,11 @@ async fn test_rate_limiting_redis_centralized() {
     .await
     .unwrap();
 
-    // Actively wait for the route to be loaded (more reliable than fixed sleep)
-    harness.wait_for_route("/redis-rl/test").await;
+    // Actively wait for the route plus plugin update to be loaded (more
+    // reliable than fixed sleep or route-only readiness under CI load).
+    harness
+        .wait_for_response_header("/redis-rl/test", "x-ratelimit-limit")
+        .await;
 
     // Clear only this test's rate limit keys (probe requests consumed quota).
     // Uses targeted key deletion instead of FLUSHDB to avoid interfering with
