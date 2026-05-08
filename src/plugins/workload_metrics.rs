@@ -54,16 +54,17 @@ impl WorkloadMetrics {
 
     fn annotate_http_context(&self, ctx: &mut RequestContext, headers: &HashMap<String, String>) {
         self.insert_common_metadata(&mut ctx.metadata);
-        let hbone_identity =
-            HboneIdentity::from_baggage_values(ctx.raw_header_values(BAGGAGE_HEADER));
-        let source_identity = ctx
-            .peer_spiffe_id
-            .clone()
-            .or_else(|| hbone_identity.source_principal.clone())
+        let hbone_identity = authenticated_hbone_identity(ctx, headers);
+        // For authenticated ambient HBONE, the peer cert identifies the
+        // ztunnel, while baggage identifies the originating workload.
+        let source_identity = hbone_identity
+            .as_ref()
+            .and_then(|identity| identity.source_principal.clone())
+            .or_else(|| ctx.peer_spiffe_id.clone())
             .or_else(|| self.workload_spiffe_id.clone());
         ctx.metadata.insert(
             "mesh.connection_security_policy".to_string(),
-            if ctx.peer_spiffe_id.is_some() || hbone_identity.source_principal.is_some() {
+            if ctx.peer_spiffe_id.is_some() || ctx.tls_client_cert_der.is_some() {
                 "mutual_tls"
             } else {
                 "none"
@@ -235,6 +236,25 @@ fn request_protocol(ctx: &RequestContext, headers: &HashMap<String, String>) -> 
     } else {
         "http"
     }
+}
+
+fn authenticated_hbone_identity(
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+) -> Option<HboneIdentity> {
+    if ctx.peer_spiffe_id.is_none()
+        || ctx
+            .metadata
+            .get("request_protocol")
+            .is_none_or(|value| value != "hbone")
+    {
+        return None;
+    }
+
+    headers
+        .get(BAGGAGE_HEADER)
+        .map(String::as_str)
+        .map(HboneIdentity::from_baggage_header)
 }
 
 fn is_grpc_content_type(value: &str) -> bool {
