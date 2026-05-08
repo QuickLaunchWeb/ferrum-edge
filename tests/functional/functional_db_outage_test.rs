@@ -139,10 +139,11 @@ impl DbOutageTestHarness {
 // on drop.
 
 /// Echo backend that returns request headers as JSON response body.
-async fn start_header_echo_backend(
-    port: u16,
-) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+type HeaderEchoBackend = (u16, tokio::task::JoinHandle<()>);
+
+async fn start_header_echo_backend() -> Result<HeaderEchoBackend, Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
     let handle = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             tokio::spawn(async move {
@@ -207,7 +208,7 @@ async fn start_header_echo_backend(
             });
         }
     });
-    Ok(handle)
+    Ok((port, handle))
 }
 
 // ============================================================================
@@ -224,12 +225,7 @@ async fn test_db_outage_proxy_continues_with_plugins() {
         .expect("Failed to create test harness");
 
     // Start echo backend
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind backend");
-    let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
-    let _backend = start_header_echo_backend(backend_port)
+    let (backend_port, _backend) = start_header_echo_backend()
         .await
         .expect("Failed to start backend");
 
@@ -495,12 +491,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
         .expect("Failed to create test harness");
 
     // Start echo backend
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind backend");
-    let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
-    let _backend = start_header_echo_backend(backend_port)
+    let (backend_port, _backend) = start_header_echo_backend()
         .await
         .expect("Failed to start backend");
 
@@ -1037,12 +1028,7 @@ async fn test_db_outage_key_auth_continues() {
         .expect("Failed to create test harness");
 
     // Start echo backend
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind backend");
-    let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
-    let _backend = start_header_echo_backend(backend_port)
+    let (backend_port, _backend) = start_header_echo_backend()
         .await
         .expect("Failed to start backend");
 
@@ -1253,12 +1239,7 @@ async fn test_db_outage_rate_limiting_continues() {
         .expect("Failed to create test harness");
 
     // Start echo backend
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind backend");
-    let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
-    let _backend = start_header_echo_backend(backend_port)
+    let (backend_port, _backend) = start_header_echo_backend()
         .await
         .expect("Failed to start backend");
 
