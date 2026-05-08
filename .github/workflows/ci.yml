@@ -32,11 +32,145 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-  test:
-    name: Tests
+  test-unit:
+    name: Unit Tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-test"
+
+      - name: Run unit tests
+        run: cargo test --test unit_tests
+        env:
+          RUST_BACKTRACE: 1
+
+  test-lib:
+    name: Inline Lib Tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-test"
+
+      - name: Run inline lib tests
+        # Covers `#[cfg(test)] mod tests` blocks inline in `src/` (used for
+        # private fns/structs that the separate tests/ binaries can't see).
+        # CLAUDE.md lists them as required pre-commit checks; CI now runs them
+        # too so a regression in an inline test fails the PR instead of
+        # waiting until someone runs the lib suite locally.
+        run: cargo test --lib
+        env:
+          RUST_BACKTRACE: 1
+
+  test-integration:
+    name: Integration Tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-test"
+
+      - name: Run integration tests
+        run: cargo test --test integration_tests
+        env:
+          RUST_BACKTRACE: 1
+
+  test-functional:
+    name: Functional Tests (${{ matrix.shard }})
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     environment: ci-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: harness
+            filters: |
+              common::
+              scaffolding::
+              scenarios::
+              functional_shared_harness_smoke_test
+              functional_cli_test
+              functional_ci_shard_coverage_test
+          - shard: admin-routing
+            filters: |
+              functional_admin_observability_test
+              functional_admin_operations_test
+              functional_auth_acl_test
+              functional_credential_rotation_test
+              functional_file_mode_test
+              functional_host_only_routing_test
+              functional_migrate_mode_test
+              functional_protocol_validation_test
+              functional_regex_routing_test
+              functional_router_cache_test
+              functional_secrets_test
+          - shard: plugins
+            filters: |
+              functional_ai_plugins_test
+              functional_grpc_plugins_test
+              functional_logging_plugins_test
+              functional_logging_test
+              functional_otel_ldap_test
+              functional_plugin_extended_test
+              functional_plugin_test
+              functional_plugins_network_test
+              functional_prometheus_test
+              functional_serverless_mirror_test
+              functional_ws_plugins_test
+          - shard: protocols
+            filters: |
+              functional_grpc_test
+              functional_passthrough_test
+              functional_sse_test
+              functional_stream_listener_failure_test
+              functional_tcp_proxy_test
+              functional_udp_proxy_test
+              functional_websocket_test
+              scripted_backend_h2_tests
+              scripted_backend_h3_tests
+              scripted_backend_matrix_tests
+              scripted_backend_network_sim_tests
+              scripted_backend_tests
+              scripted_backend_udp_tests
+          - shard: data-plane
+            filters: |
+              functional_capability_registry_test
+              functional_cp_dp_resilience_test
+              functional_cp_dp_test
+              functional_database_test
+              functional_db_failover_test
+              functional_db_outage_test
+              functional_db_tls_test
+              functional_db_upstream_test
+              functional_mongodb_test
+              functional_namespace_test
+              functional_redis_rate_limiting_test
+          - shard: resilience
+            filters: |
+              functional_circuit_breaker_retry_test
+              functional_dns_cache_test
+              functional_graceful_shutdown_test
+              functional_load_balancer_test
+              functional_load_stress_test
+              functional_mtls_acl_test
+              functional_mtls_test
+              functional_overload_test
+              functional_retry_test
+              functional_scale_perf_test
+              functional_service_discovery_test
+              functional_tls_lifecycle_test
+              functional_tls_only_test
     services:
       redis:
         image: redis:7-alpine
@@ -59,59 +193,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust-ci
         with:
-          toolchain: stable
-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-        continue-on-error: true
-
-      - name: Configure sccache
-        run: |
-          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-            echo "sccache enabled"
-          else
-            echo "sccache unavailable, building without cache"
-          fi
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "ci-test"
-
-      - name: Install protoc and libcurl headers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
-
-      - name: Run unit tests
-        run: cargo test --test unit_tests
-        env:
-          RUST_BACKTRACE: 1
-
-      - name: Run inline lib tests
-        # Covers `#[cfg(test)] mod tests` blocks inline in `src/` (used for
-        # private fns/structs that the separate tests/ binaries can't see).
-        # CLAUDE.md lists them as required pre-commit checks; CI now runs them
-        # too so a regression in an inline test fails the PR instead of
-        # waiting until someone runs the lib suite locally.
-        run: cargo test --lib
-        env:
-          RUST_BACKTRACE: 1
-
-      - name: Run integration tests
-        run: cargo test --test integration_tests
-        env:
-          RUST_BACKTRACE: 1
+          shared-key: "ci-test-functional-${{ matrix.shard }}"
 
       - name: Build gateway binary for end-to-end tests
         run: cargo build --bin ferrum-edge
 
-      - name: Run end-to-end tests (gRPC, WebSocket, file mode, database, CP/DP)
+      - name: Run functional test shard
         # `--include-ignored` runs BOTH the ignored E2E tests and the
         # non-ignored unit tests bundled into the functional_tests binary
         # (e.g. the `common::config_builder::tests::*` module that
@@ -119,21 +208,71 @@ jobs:
         # `--include-ignored` those 10 tests would be silently filtered out
         # (the functional-tests binary is the only place they're compiled —
         # `tests/unit/` is a separate binary that cannot import tests/common).
-        # The two `--skip` filters drop only the two explicitly-named long
-        # stress suites; everything else runs.
-        run: cargo test --test functional_tests -- --include-ignored --skip test_scale_perf_30k_proxies --skip test_load_stress
+        #
+        # `--skip` uses substring matching against the full test path, so the
+        # two skip terms must be specific enough to drop ONLY the long stress
+        # suites and not future lighter additions:
+        #   - `test_scale_perf_30k_proxies` — matches both
+        #     `test_scale_perf_30k_proxies` and `test_scale_perf_30k_proxies_postgres`
+        #     (both 30k-proxy variants are intentionally skipped here; they
+        #     run locally via the resilience suite).
+        #   - `test_load_stress_10k_proxies` — the single ignored test in
+        #     functional_load_stress_test today. Specific so any new lighter
+        #     test added to that file (e.g. a smoke check) actually runs.
+        run: |
+          exit_code=0
+          while IFS= read -r filter; do
+            if [ -z "$filter" ]; then
+              continue
+            fi
+            echo "::group::functional_tests filter: ${filter}"
+            cargo test --test functional_tests "$filter" -- --include-ignored --skip test_scale_perf_30k_proxies --skip test_load_stress_10k_proxies || exit_code=$?
+            echo "::endgroup::"
+          done <<< "$FUNCTIONAL_FILTERS"
+          exit $exit_code
         env:
+          FUNCTIONAL_FILTERS: ${{ matrix.filters }}
           RUST_BACKTRACE: 1
         timeout-minutes: 15
 
-      - name: Summarize test results
+      - name: Summarize functional shard
         if: always()
+        run: |
+          echo "## Functional Test Shard: ${{ matrix.shard }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          printf '%s\n' "$FUNCTIONAL_FILTERS" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        env:
+          FUNCTIONAL_FILTERS: ${{ matrix.filters }}
+
+  test:
+    name: Tests
+    if: always() && github.event_name == 'pull_request'
+    needs:
+      - test-unit
+      - test-lib
+      - test-integration
+      - test-functional
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarize test results
         run: |
           echo "## Test Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "All unit, integration, functional, and end-to-end tests executed." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Includes \`--ignored\` tests: gRPC proxying, WebSocket proxying, TCP/UDP/DTLS stream proxying, file mode reload, database mode, and CP/DP sync." >> $GITHUB_STEP_SUMMARY
+          echo "| Suite | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| Unit | ${{ needs.test-unit.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Inline lib | ${{ needs.test-lib.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Integration | ${{ needs.test-integration.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Functional shards | ${{ needs.test-functional.result }} |" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.test-unit.result }}" != "success" ] ||
+             [ "${{ needs.test-lib.result }}" != "success" ] ||
+             [ "${{ needs.test-integration.result }}" != "success" ] ||
+             [ "${{ needs.test-functional.result }}" != "success" ]; then
+            exit 1
+          fi
 
   lint:
     name: Lint
@@ -142,35 +281,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          components: clippy
-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-        continue-on-error: true
-
-      - name: Configure sccache
-        run: |
-          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-            echo "sccache enabled"
-          else
-            echo "sccache unavailable, building without cache"
-          fi
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-lint"
-
-      - name: Install protoc and libcurl headers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
+          components: clippy
 
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -183,34 +297,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-        continue-on-error: true
-
-      - name: Configure sccache
-        run: |
-          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-            echo "sccache enabled"
-          else
-            echo "sccache unavailable, building without cache"
-          fi
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-perf"
-
-      - name: Install protoc and libcurl headers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
 
       - name: Build release binaries
         run: |
