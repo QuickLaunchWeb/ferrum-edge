@@ -31,6 +31,7 @@ fn allow_client_policy(action: PolicyAction) -> MeshPolicy {
             }],
             to: Vec::new(),
             when: Vec::new(),
+            never_matches: false,
             action,
         }],
     }
@@ -50,6 +51,7 @@ fn allow_host_policy(host: &str) -> MeshPolicy {
                 ..RequestMatch::default()
             }],
             when: Vec::new(),
+            never_matches: false,
             action: PolicyAction::Allow,
         }],
     }
@@ -151,6 +153,74 @@ async fn mesh_authz_reads_hbone_baggage_source_identity() {
     let result = plugin.authorize(&mut ctx).await;
 
     assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn mesh_authz_reads_split_hbone_baggage_headers() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(None);
+    let mut headers = http::HeaderMap::new();
+    headers.append(
+        "baggage",
+        "destination.principal=spiffe://cluster.local/ns/default/sa/server"
+            .parse()
+            .expect("header value"),
+    );
+    headers.append(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn mesh_authz_denies_percent_encoded_hbone_baggage_mismatch() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(None);
+    let mut headers = http::HeaderMap::new();
+    headers.append(
+        "baggage",
+        "destination.principal=spiffe://cluster.local/ns/default/sa/server"
+            .parse()
+            .expect("header value"),
+    );
+    headers.append(
+        "baggage",
+        "source.principal=spiffe%3A%2F%2Fcluster.local%2Fns%2Fdefault%2Fsa%2Fother"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert!(body.contains("Mesh authorization denied"));
+        }
+        other => panic!("expected reject, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("implicit-deny")
+    );
 }
 
 #[tokio::test]
@@ -366,6 +436,43 @@ async fn workload_metrics_reads_hbone_baggage_source_identity() {
     let mut ctx = request_context(None);
     let mut raw_headers = http::HeaderMap::new();
     raw_headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(raw_headers);
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.service_account")
+            .map(String::as_str),
+        Some("client")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.connection_security_policy")
+            .map(String::as_str),
+        Some("mutual_tls")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_reads_split_hbone_baggage_headers() {
+    let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
+    let mut ctx = request_context(None);
+    let mut raw_headers = http::HeaderMap::new();
+    raw_headers.append(
+        "baggage",
+        "destination.principal=spiffe://cluster.local/ns/default/sa/server"
+            .parse()
+            .expect("header value"),
+    );
+    raw_headers.append(
         "baggage",
         "source.principal=spiffe://cluster.local/ns/default/sa/client"
             .parse()

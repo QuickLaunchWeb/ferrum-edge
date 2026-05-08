@@ -508,6 +508,10 @@ pub struct EnvConfig {
     /// Capacity of the per-ADS-stream response queue between the request
     /// reader task and tonic response stream. Default: 32.
     pub xds_stream_channel_capacity: usize,
+    /// Mesh runtime config source. `native` consumes Ferrum MeshSubscribe.
+    /// `xds` is reserved for the future mesh DP xDS client and is rejected in
+    /// mesh mode until that client is wired.
+    pub mesh_config_protocol: String,
 
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
@@ -771,14 +775,16 @@ pub struct EnvConfig {
     /// # Bidirectional-relay performance modes
     ///
     /// When **both** `tcp_idle_timeout_seconds` and
-    /// `tcp_half_close_max_wait_seconds` are `0`, the relay selects a
-    /// **fast path** that delegates to `tokio::io::copy_bidirectional_with_sizes`
-    /// directly. Any other combination selects the **direction-tracking path**:
+    /// `tcp_half_close_max_wait_seconds` are `0` and the selected proxy's
+    /// `backend_read_timeout_ms` / `backend_write_timeout_ms` are also `0`,
+    /// the relay selects a **fast path** that delegates to
+    /// `tokio::io::copy_bidirectional_with_sizes` directly. Any non-zero
+    /// relay timeout selects the **direction-tracking path**:
     ///
     /// | Mode | Trigger | Benefits | Downsides |
     /// |------|---------|----------|-----------|
-    /// | Fast path | both vars == 0 | no `io::split`/BiLock, no Phase 1/2 loop, max TCP throughput, per-direction bytes preserved on clean completion | no idle watchdog (OS TCP timers only), no half-close hard cap, `disconnect_direction` reported as `unknown` on error |
-    /// | Direction-tracking | either var != 0 (default) | idle timeout, half-close cap, per-direction byte counts, first-failure direction attribution in logs/metrics | one BiLock access per read/write, 2× `Vec<u8>` alloc per connection, Phase 1/2 scheduling overhead |
+    /// | Fast path | all four relay timeouts == 0 | no Phase 1/2 loop, max TCP throughput, per-direction bytes preserved on clean completion | no idle watchdog (OS TCP timers only), no half-close hard cap, `disconnect_direction` reported as `unknown` on error |
+    /// | Direction-tracking | any relay timeout != 0 (default) | idle timeout, half-close cap, per-direction byte counts, first-failure direction attribution in logs/metrics | manual relay state machine plus watchdog timer work |
     ///
     /// Pick the fast path only when an external L4 load balancer already
     /// enforces per-connection timeouts and per-direction failure attribution
@@ -818,10 +824,10 @@ pub struct EnvConfig {
     /// Maximum TLS version: "1.2" or "1.3" (default: "1.3")
     pub tls_max_version: String,
     /// Comma-separated cipher suites (OpenSSL names). If empty, uses secure defaults.
-    /// TLS 1.3: TLS_AES_256_GCM_SHA384, TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256
-    /// TLS 1.2: ECDHE-ECDSA-AES256-GCM-SHA384, ECDHE-RSA-AES256-GCM-SHA384,
-    ///          ECDHE-ECDSA-AES128-GCM-SHA256, ECDHE-RSA-AES128-GCM-SHA256,
-    ///          ECDHE-ECDSA-CHACHA20-POLY1305, ECDHE-RSA-CHACHA20-POLY1305
+    /// TLS 1.3: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256
+    /// TLS 1.2: ECDHE-ECDSA-AES128-GCM-SHA256, ECDHE-RSA-AES128-GCM-SHA256,
+    ///          ECDHE-ECDSA-CHACHA20-POLY1305, ECDHE-RSA-CHACHA20-POLY1305,
+    ///          ECDHE-ECDSA-AES256-GCM-SHA384, ECDHE-RSA-AES256-GCM-SHA384
     pub tls_cipher_suites: Option<String>,
     /// Prefer server cipher order for TLS 1.2 (default: true)
     pub tls_prefer_server_cipher_order: bool,
@@ -1188,6 +1194,7 @@ impl Default for EnvConfig {
             cp_broadcast_channel_capacity: 128,
             xds_enabled: false,
             xds_stream_channel_capacity: 32,
+            mesh_config_protocol: "native".to_string(),
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -1468,6 +1475,7 @@ impl EnvConfig {
             cp_broadcast_channel_capacity: usize = "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY" => 128usize;
             xds_enabled: bool = "FERRUM_XDS_ENABLED" => false;
             xds_stream_channel_capacity: usize = "FERRUM_XDS_STREAM_CHANNEL_CAPACITY" => 32usize;
+            mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
             dp_grpc_tls_ca_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CA_CERT_PATH";
             dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
@@ -1808,6 +1816,7 @@ impl EnvConfig {
             cp_broadcast_channel_capacity,
             xds_enabled,
             xds_stream_channel_capacity,
+            mesh_config_protocol,
             dp_grpc_tls_ca_cert_path,
             dp_grpc_tls_client_cert_path,
             dp_grpc_tls_client_key_path,
@@ -2429,6 +2438,27 @@ impl EnvConfig {
                         "FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS is required in mesh mode"
                             .into(),
                     );
+                }
+                match self
+                    .mesh_config_protocol
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "native" => {}
+                    "xds" => {
+                        return Err(
+                            "FERRUM_MESH_CONFIG_PROTOCOL=xds is not supported by mesh runtime yet; \
+                             use FERRUM_MESH_CONFIG_PROTOCOL=native for Ferrum MeshSubscribe. \
+                             FERRUM_XDS_ENABLED only exposes CP ADS for Envoy-compatible clients."
+                                .into(),
+                        );
+                    }
+                    other => {
+                        return Err(format!(
+                            "Invalid FERRUM_MESH_CONFIG_PROTOCOL '{other}'. Expected: native or xds"
+                        ));
+                    }
                 }
             }
             OperatingMode::Injector => {}

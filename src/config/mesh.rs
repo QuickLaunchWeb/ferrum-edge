@@ -144,8 +144,16 @@ pub struct MeshRule {
     pub to: Vec<RequestMatch>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub when: Vec<ConditionMatch>,
+    /// Synthetic marker for rules that should affect policy accounting but
+    /// never match traffic, e.g. Istio ALLOW-without-rules allow-nothing.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub never_matches: bool,
     #[serde(default)]
     pub action: PolicyAction,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

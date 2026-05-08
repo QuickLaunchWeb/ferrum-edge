@@ -10,9 +10,9 @@ use crate::config::mesh::{
 use crate::identity::spiffe::SpiffeId;
 
 use super::{
-    K8sAccumulator, K8sObject, K8sTranslateError, RouteProxySpec, SourceKind, invalid_resource,
-    optional_port_field, port_from_u64, proxy_for_route, resource_id, selector_from_istio,
-    string_array, string_field, string_map,
+    K8sAccumulator, K8sObject, K8sTranslateError, RouteProxySpec, SourceKind,
+    exact_path_listen_path, invalid_resource, optional_port_field, port_from_u64, proxy_for_route,
+    resource_id, selector_from_istio, string_array, string_field, string_map,
 };
 use crate::config::types::BackendScheme;
 
@@ -102,7 +102,7 @@ fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateEr
         },
     };
 
-    let rules = object
+    let mut rules: Vec<MeshRule> = object
         .spec
         .get("rules")
         .and_then(Value::as_array)
@@ -110,6 +110,14 @@ fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateEr
         .flatten()
         .map(|rule| mesh_rule(object, rule, action))
         .collect::<Result<Vec<_>, _>>()?;
+    if rules.is_empty() && action == PolicyAction::Allow {
+        tracing::warn!(
+            namespace = %object.metadata.namespace,
+            policy = %object.metadata.name,
+            "Istio ALLOW AuthorizationPolicy has no rules; emitting synthetic never-match allow rule to preserve allow-nothing semantics",
+        );
+        rules.push(allow_nothing_rule());
+    }
 
     Ok(MeshPolicy {
         name: object.metadata.name.clone(),
@@ -117,6 +125,16 @@ fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateEr
         scope,
         rules,
     })
+}
+
+fn allow_nothing_rule() -> MeshRule {
+    MeshRule {
+        from: Vec::new(),
+        to: Vec::new(),
+        when: Vec::new(),
+        never_matches: true,
+        action: PolicyAction::Allow,
+    }
 }
 
 fn mesh_rule(
@@ -150,6 +168,7 @@ fn mesh_rule(
         from,
         to,
         when,
+        never_matches: false,
         action,
     })
 }
@@ -389,6 +408,7 @@ fn virtual_service_routes(
             namespace: object.metadata.namespace.clone(),
             hosts: hosts.clone(),
             listen_path: listen_path.or_else(|| Some("/".to_string())),
+            strip_listen_path: false,
             backend_host: host.to_string(),
             backend_port: port,
             backend_scheme: BackendScheme::Http,
@@ -400,9 +420,13 @@ fn virtual_service_routes(
 }
 
 fn path_match(uri: &Value) -> Option<String> {
-    string_field(uri, "prefix")
-        .or_else(|| string_field(uri, "exact"))
-        .map(ToOwned::to_owned)
+    if let Some(prefix) = string_field(uri, "prefix") {
+        return Some(prefix.to_string());
+    }
+    if let Some(exact) = string_field(uri, "exact") {
+        return Some(exact_path_listen_path(exact));
+    }
+    string_field(uri, "regex").map(|pattern| format!("~{pattern}"))
 }
 
 fn service_ports(object: &K8sObject) -> Result<Vec<ServicePort>, K8sTranslateError> {
@@ -469,6 +493,10 @@ mod tests {
     use super::*;
     use crate::config_sources::k8s::{K8sMetadata, K8sTranslationOptions, translate_k8s_objects};
     use crate::identity::spiffe::TrustDomain;
+    use crate::modes::mesh::policy::{
+        MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
+    };
+    use crate::xds::slice::MeshSlice;
 
     fn options() -> K8sTranslationOptions {
         K8sTranslationOptions::new(
@@ -488,6 +516,16 @@ mod tests {
             },
             spec,
         }
+    }
+
+    fn translated_authorization_policy(spec: Value) -> MeshPolicy {
+        let result = translate_k8s_objects(&[object("AuthorizationPolicy", spec)], options())
+            .expect("translation succeeds");
+        let mesh = result.config.mesh.expect("mesh config");
+        mesh.mesh_policies
+            .into_iter()
+            .next()
+            .expect("one translated mesh policy")
     }
 
     #[test]
@@ -513,6 +551,79 @@ mod tests {
         assert_eq!(mesh.mesh_policies.len(), 1);
         assert_eq!(mesh.mesh_policies[0].rules[0].action, PolicyAction::Deny);
         assert_eq!(mesh.mesh_policies[0].rules[0].to[0].ports, vec![8080]);
+    }
+
+    #[test]
+    fn translates_allow_authorization_policy_without_rules_to_allow_nothing() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "selector": {"matchLabels": {"app": "api"}}
+        }));
+
+        assert!(matches!(
+            &policy.scope,
+            PolicyScope::WorkloadSelector { .. }
+        ));
+        assert_eq!(policy.rules.len(), 1);
+        assert_eq!(policy.rules[0].action, PolicyAction::Allow);
+        assert!(policy.rules[0].never_matches);
+        assert!(policy.rules[0].from.is_empty());
+
+        let decision = evaluate_mesh_authorization(
+            &MeshSlice {
+                mesh_policies: vec![policy],
+                ..MeshSlice::default()
+            },
+            &MeshAuthzRequest::default(),
+        );
+        assert_eq!(
+            decision,
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn translates_namespace_allow_authorization_policy_without_rules_to_allow_nothing() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW"
+        }));
+
+        assert!(matches!(
+            &policy.scope,
+            PolicyScope::Namespace { namespace } if namespace == "default"
+        ));
+        assert_eq!(policy.rules.len(), 1);
+        assert_eq!(policy.rules[0].action, PolicyAction::Allow);
+        assert!(policy.rules[0].never_matches);
+    }
+
+    #[test]
+    fn translates_missing_action_authorization_policy_without_rules_to_allow_nothing() {
+        let policy = translated_authorization_policy(serde_json::json!({}));
+
+        assert_eq!(policy.rules.len(), 1);
+        assert_eq!(policy.rules[0].action, PolicyAction::Allow);
+        assert!(policy.rules[0].never_matches);
+    }
+
+    #[test]
+    fn translates_deny_authorization_policy_without_rules_to_noop() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "DENY"
+        }));
+
+        assert_eq!(policy.rules, Vec::new());
+    }
+
+    #[test]
+    fn translates_audit_authorization_policy_without_rules_to_noop() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "AUDIT"
+        }));
+
+        assert_eq!(policy.rules, Vec::new());
     }
 
     #[test]
@@ -662,6 +773,55 @@ mod tests {
 
         assert_eq!(result.config.proxies.len(), 1);
         assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/v1"));
+        assert!(!result.config.proxies[0].strip_listen_path);
         assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn translates_virtual_service_exact_uri_to_exact_proxy() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"exact": "/v1.items"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("=/v1.items")
+        );
+        assert!(!result.config.proxies[0].strip_listen_path);
+    }
+
+    #[test]
+    fn translates_virtual_service_regex_uri_to_regex_proxy() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"regex": "/v[0-9]+/items"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("~/v[0-9]+/items")
+        );
+        assert!(!result.config.proxies[0].strip_listen_path);
     }
 }

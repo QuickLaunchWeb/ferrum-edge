@@ -150,8 +150,6 @@ impl Plugin for MeshAuthz {
 
 fn source_principal_from_request(ctx: &RequestContext) -> Option<SpiffeId> {
     ctx.peer_spiffe_id.clone().or_else(|| {
-        ctx.raw_header_get(BAGGAGE_HEADER)
-            .map(HboneIdentity::from_baggage_header)
-            .and_then(|identity| identity.source_principal)
+        HboneIdentity::from_baggage_values(ctx.raw_header_values(BAGGAGE_HEADER)).source_principal
     })
 }
