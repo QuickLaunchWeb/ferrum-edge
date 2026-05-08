@@ -1204,6 +1204,7 @@ mod tests {
             std::sync::Arc::new(Vec::new()),
             namespace,
             crate::config::BackendAllowIps::Both,
+            std::sync::Arc::new(Vec::new()),
         )
     }
 

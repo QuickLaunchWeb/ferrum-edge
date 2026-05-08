@@ -611,6 +611,7 @@ mod tests {
             crl_list.clone(),
             "ferrum",
             crate::config::BackendAllowIps::Both,
+            std::sync::Arc::new(Vec::new()),
         );
 
         let plugin = TcpLogging::new(

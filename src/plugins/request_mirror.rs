@@ -319,10 +319,18 @@ impl Plugin for RequestMirror {
 
         // Collect headers for the mirror request. Use the proxy headers (post-transform)
         // which reflect any modifications from upstream plugins like request_transformer.
-        let mirror_headers: Vec<(String, String)> = headers
+        let mut mirror_headers: Vec<(String, String)> = headers
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+
+        // Mirror destinations are an egress boundary just like the primary
+        // backend. Apply the operator-configured baggage strip
+        // (`FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`) so mesh-internal identity
+        // claims like `source.principal` don't leak to mirror analytics /
+        // auditing services that the operator considers off-mesh.
+        self.http_client
+            .strip_egress_baggage_in_vec(&mut mirror_headers);
 
         // Capture request body if configured and available.
         // Uses the binary-safe `request_body_bytes` field (preserves non-UTF-8

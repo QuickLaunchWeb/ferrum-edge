@@ -154,6 +154,67 @@ fn parse_spiffe(value: &str) -> Option<SpiffeId> {
     SpiffeId::new(value).ok()
 }
 
+/// Apply [`filter_baggage_header`] in place to a `HashMap<String, String>` of
+/// outbound headers. Removes the `baggage` key entirely when no members
+/// survive. No-op when `key_prefixes` is empty or the map has no `baggage`
+/// header.
+///
+/// This is the canonical entry point shared by every egress site
+/// (HTTP/1.1+H2 dispatch in `proxy/mod.rs`, native HTTP/3 frontend in
+/// `http3/server.rs`, WebSocket handshake header collection). Keep all
+/// future egress points using this helper rather than re-implementing the
+/// strip — divergent implementations are how reviewer P1/P2 issues happen.
+pub fn strip_egress_baggage_in_map(
+    headers: &mut std::collections::HashMap<String, String>,
+    key_prefixes: &[String],
+) {
+    if key_prefixes.is_empty() {
+        return;
+    }
+    let Some(raw) = headers.get(BAGGAGE_HEADER) else {
+        return;
+    };
+    let raw_owned = raw.clone();
+    match filter_baggage_header(&raw_owned, key_prefixes) {
+        Some(filtered) if filtered != raw_owned => {
+            headers.insert(BAGGAGE_HEADER.to_string(), filtered);
+        }
+        None => {
+            headers.remove(BAGGAGE_HEADER);
+        }
+        Some(_) => {}
+    }
+}
+
+/// Apply [`filter_baggage_header`] in place to a `Vec<(String, String)>` of
+/// outbound headers. WebSocket and other code paths that build header
+/// collections as ordered Vecs use this helper. Removes any `baggage`
+/// entries entirely when no members survive.
+pub fn strip_egress_baggage_in_vec(headers: &mut Vec<(String, String)>, key_prefixes: &[String]) {
+    if key_prefixes.is_empty() {
+        return;
+    }
+    // WebSocket handshake collects via `collect_forwardable_headers` which
+    // lowercases keys; match against the canonical lowercase header name.
+    let mut idx = 0;
+    while idx < headers.len() {
+        if headers[idx].0.eq_ignore_ascii_case(BAGGAGE_HEADER) {
+            let raw = std::mem::take(&mut headers[idx].1);
+            match filter_baggage_header(&raw, key_prefixes) {
+                Some(filtered) => {
+                    headers[idx].1 = filtered;
+                    idx += 1;
+                }
+                None => {
+                    headers.remove(idx);
+                }
+            }
+        } else {
+            idx += 1;
+        }
+    }
+}
+
 /// Filter a W3C `baggage` header value, removing any member whose key starts
 /// with one of the given prefixes. Member text — including any `;props`
 /// segment — is preserved verbatim for survivors so end-to-end tracing
@@ -333,6 +394,112 @@ mod tests {
             filter_baggage_header("userid=alice,,source.principal=foo", &prefixes),
             Some("userid=alice".to_string())
         );
+    }
+
+    #[test]
+    fn strip_egress_baggage_in_map_removes_matching_member() {
+        let mut headers = std::collections::HashMap::from([
+            (
+                "baggage".to_string(),
+                "source.principal=spiffe://x,userid=alice".to_string(),
+            ),
+            ("host".to_string(), "example.com".to_string()),
+        ]);
+        strip_egress_baggage_in_map(&mut headers, &["source.".to_string()]);
+        assert_eq!(
+            headers.get("baggage").map(String::as_str),
+            Some("userid=alice")
+        );
+        assert_eq!(headers.get("host").map(String::as_str), Some("example.com"));
+    }
+
+    #[test]
+    fn strip_egress_baggage_in_map_drops_header_when_only_match() {
+        let mut headers = std::collections::HashMap::from([(
+            "baggage".to_string(),
+            "source.principal=spiffe://x".to_string(),
+        )]);
+        strip_egress_baggage_in_map(&mut headers, &["source.".to_string()]);
+        assert!(!headers.contains_key("baggage"));
+    }
+
+    #[test]
+    fn strip_egress_baggage_in_map_no_op_when_prefixes_empty() {
+        let mut headers = std::collections::HashMap::from([(
+            "baggage".to_string(),
+            "source.principal=spiffe://x".to_string(),
+        )]);
+        let prefixes: Vec<String> = Vec::new();
+        strip_egress_baggage_in_map(&mut headers, &prefixes);
+        assert_eq!(
+            headers.get("baggage").map(String::as_str),
+            Some("source.principal=spiffe://x")
+        );
+    }
+
+    #[test]
+    fn strip_egress_baggage_in_vec_removes_matching_member() {
+        let mut headers = vec![
+            ("host".to_string(), "example.com".to_string()),
+            (
+                "baggage".to_string(),
+                "source.principal=spiffe://x,userid=alice".to_string(),
+            ),
+        ];
+        strip_egress_baggage_in_vec(&mut headers, &["source.".to_string()]);
+        assert_eq!(
+            headers,
+            vec![
+                ("host".to_string(), "example.com".to_string()),
+                ("baggage".to_string(), "userid=alice".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn strip_egress_baggage_in_vec_drops_entry_when_no_member_survives() {
+        let mut headers = vec![
+            ("host".to_string(), "example.com".to_string()),
+            (
+                "baggage".to_string(),
+                "source.principal=spiffe://x".to_string(),
+            ),
+        ];
+        strip_egress_baggage_in_vec(&mut headers, &["source.".to_string()]);
+        assert_eq!(
+            headers,
+            vec![("host".to_string(), "example.com".to_string())]
+        );
+    }
+
+    #[test]
+    fn strip_egress_baggage_in_vec_handles_case_insensitive_header_name() {
+        // collect_forwardable_headers may emit lowercased keys; mixed case
+        // shouldn't matter for the strip lookup.
+        let mut headers = vec![
+            ("Host".to_string(), "example.com".to_string()),
+            (
+                "Baggage".to_string(),
+                "source.principal=spiffe://x".to_string(),
+            ),
+        ];
+        strip_egress_baggage_in_vec(&mut headers, &["source.".to_string()]);
+        assert_eq!(
+            headers,
+            vec![("Host".to_string(), "example.com".to_string())]
+        );
+    }
+
+    #[test]
+    fn strip_egress_baggage_in_vec_no_op_when_prefixes_empty() {
+        let mut headers = vec![(
+            "baggage".to_string(),
+            "source.principal=spiffe://x".to_string(),
+        )];
+        let prefixes: Vec<String> = Vec::new();
+        strip_egress_baggage_in_vec(&mut headers, &prefixes);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].1, "source.principal=spiffe://x");
     }
 
     #[test]

@@ -1466,6 +1466,7 @@ impl ProxyState {
             crls.clone(),
             &env_config_arc.namespace,
             env_config_arc.backend_allow_ips.clone(),
+            mesh_egress_strip_baggage_keys.clone(),
         );
         let plugin_cache = Arc::new(
             PluginCache::with_http_client(&config, plugin_http_client.clone())
@@ -3682,6 +3683,16 @@ async fn handle_websocket_request_authenticated(
     if let Some(custom_id) = ctx.backend_consumer_custom_id() {
         client_headers.push(("x-consumer-custom-id".to_string(), custom_id.to_string()));
     }
+
+    // Egress baggage strip — see `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`.
+    // The WebSocket handshake builds its own header collection from
+    // `parts.headers`, so the central strip in `handle_proxy_request_inner`
+    // doesn't reach here. Apply the same shared helper to keep mesh-internal
+    // identity claims out of WS upgrade requests.
+    crate::modes::mesh::hbone::strip_egress_baggage_in_vec(
+        &mut client_headers,
+        &state.mesh_egress_strip_baggage_keys,
+    );
 
     // Connect to backend BEFORE sending 101 to client.
     // If the backend is unreachable, we return 502 instead of a premature 101.
@@ -7028,39 +7039,27 @@ async fn handle_proxy_request_inner(
     }
     // Egress baggage strip — operator-configured key prefixes are removed
     // from the outbound `baggage` header. Default empty list is a no-op.
-    // Controlled by `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`. Stripping at
-    // this boundary covers every dispatch path (reqwest / direct H2 / native
-    // H3 / cross-protocol H3 / gRPC) without per-path edits because they
-    // all consume `proxy_headers` from this map.
-    if !state.mesh_egress_strip_baggage_keys.is_empty() {
-        let baggage_present = owned_proxy_headers
+    // Controlled by `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`. This handles the
+    // reqwest / direct-H2 / cross-protocol-H3 / gRPC dispatch paths that
+    // consume `proxy_headers`. The native HTTP/3 frontend
+    // (`src/http3/server.rs`) and WebSocket handshake (`src/proxy/mod.rs`
+    // `handle_websocket_request_authenticated`) build their backend headers
+    // from independent sources and call the same helper at their own egress
+    // boundaries — keep all three call sites in sync.
+    if !state.mesh_egress_strip_baggage_keys.is_empty()
+        && (owned_proxy_headers
             .as_ref()
             .map(|h| h.contains_key(crate::modes::mesh::hbone::BAGGAGE_HEADER))
             .unwrap_or_else(|| {
                 ctx.headers
                     .contains_key(crate::modes::mesh::hbone::BAGGAGE_HEADER)
-            });
-        if baggage_present {
-            let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-            if let Some(raw) = headers.get(crate::modes::mesh::hbone::BAGGAGE_HEADER) {
-                let raw_owned = raw.clone();
-                match crate::modes::mesh::hbone::filter_baggage_header(
-                    &raw_owned,
-                    &state.mesh_egress_strip_baggage_keys,
-                ) {
-                    Some(filtered) if filtered != raw_owned => {
-                        headers.insert(
-                            crate::modes::mesh::hbone::BAGGAGE_HEADER.to_string(),
-                            filtered,
-                        );
-                    }
-                    None => {
-                        headers.remove(crate::modes::mesh::hbone::BAGGAGE_HEADER);
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
+            }))
+    {
+        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
+        crate::modes::mesh::hbone::strip_egress_baggage_in_map(
+            headers,
+            &state.mesh_egress_strip_baggage_keys,
+        );
     }
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
