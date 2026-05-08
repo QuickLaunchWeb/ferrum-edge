@@ -97,6 +97,14 @@ pub struct PluginHttpClient {
     /// precedence). Used by plugins that validate outbound endpoints outside the
     /// proxy backend path.
     backend_allow_ips: BackendAllowIps,
+    /// W3C `baggage` key prefixes stripped from outbound requests built by
+    /// plugins (e.g., `request_mirror`'s mirror destination). Mirrors the
+    /// proxy-path strip controlled by `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`
+    /// — a plugin that reaches a non-mesh destination on its own should
+    /// apply the same operator policy via
+    /// [`Self::strip_egress_baggage_in_vec`] /
+    /// [`Self::strip_egress_baggage_in_map`]. Empty by default.
+    mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
 }
 
 impl std::fmt::Debug for PluginHttpClient {
@@ -168,6 +176,7 @@ impl PluginHttpClient {
         tls_crls: CrlList,
         namespace: &str,
         backend_allow_ips: BackendAllowIps,
+        mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
     ) -> Self {
         let dns_cache_clone = dns_cache.clone();
         let resolver = DnsCacheResolver::new(dns_cache);
@@ -251,6 +260,7 @@ impl PluginHttpClient {
             tls_crls,
             namespace: namespace.to_string(),
             backend_allow_ips,
+            mesh_egress_strip_baggage_keys,
         }
     }
 
@@ -303,6 +313,7 @@ impl PluginHttpClient {
             tls_crls: Arc::new(Vec::new()),
             namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
             backend_allow_ips: BackendAllowIps::Both,
+            mesh_egress_strip_baggage_keys: Arc::new(Vec::new()),
         }
     }
 
@@ -390,6 +401,31 @@ impl PluginHttpClient {
     /// normal CLI/env/conf/default precedence has been applied.
     pub fn backend_allow_ips(&self) -> &BackendAllowIps {
         &self.backend_allow_ips
+    }
+
+    /// Apply the gateway's egress baggage strip policy to a Vec of outbound
+    /// headers. Plugins that build their own outbound HTTP requests
+    /// (`request_mirror`, etc.) should call this before sending so the
+    /// `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS` policy applies uniformly to
+    /// every egress destination — not just the proxy backend.
+    pub fn strip_egress_baggage_in_vec(&self, headers: &mut Vec<(String, String)>) {
+        crate::modes::mesh::hbone::strip_egress_baggage_in_vec(
+            headers,
+            &self.mesh_egress_strip_baggage_keys,
+        );
+    }
+
+    /// Apply the gateway's egress baggage strip policy to a HashMap of
+    /// outbound headers. Mirror of [`Self::strip_egress_baggage_in_vec`] for
+    /// HashMap-shaped header collections.
+    pub fn strip_egress_baggage_in_map(
+        &self,
+        headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        crate::modes::mesh::hbone::strip_egress_baggage_in_map(
+            headers,
+            &self.mesh_egress_strip_baggage_keys,
+        );
     }
 
     /// Get the underlying `reqwest::Client` for building requests.
@@ -545,6 +581,59 @@ impl Default for PluginHttpClient {
     /// tuned settings and DNS cache. This default is provided for tests and fallback.
     fn default() -> Self {
         Self::from_pool_config(&PoolConfig::default())
+    }
+}
+
+#[cfg(test)]
+mod egress_strip_tests {
+    //! Tests for `PluginHttpClient`'s egress baggage strip delegation. The
+    //! helpers in `modes::mesh::hbone` are tested in isolation; these tests
+    //! confirm `PluginHttpClient` plumbs the configured prefix list through
+    //! correctly so plugins like `request_mirror` get the gateway's policy
+    //! applied for free.
+    use super::*;
+
+    fn client_with_strip_prefixes(prefixes: Vec<String>) -> PluginHttpClient {
+        PluginHttpClient {
+            mesh_egress_strip_baggage_keys: Arc::new(prefixes),
+            ..PluginHttpClient::default()
+        }
+    }
+
+    #[test]
+    fn strip_egress_baggage_in_vec_applies_configured_prefixes() {
+        let client = client_with_strip_prefixes(vec!["source.".to_string()]);
+        let mut headers = vec![
+            ("host".to_string(), "example.com".to_string()),
+            (
+                "baggage".to_string(),
+                "source.principal=spiffe://x,userid=alice".to_string(),
+            ),
+        ];
+        client.strip_egress_baggage_in_vec(&mut headers);
+        assert_eq!(headers[1].1, "userid=alice");
+    }
+
+    #[test]
+    fn strip_egress_baggage_in_map_applies_configured_prefixes() {
+        let client = client_with_strip_prefixes(vec!["source.".to_string()]);
+        let mut headers = std::collections::HashMap::from([(
+            "baggage".to_string(),
+            "source.principal=spiffe://x".to_string(),
+        )]);
+        client.strip_egress_baggage_in_map(&mut headers);
+        assert!(!headers.contains_key("baggage"));
+    }
+
+    #[test]
+    fn strip_egress_baggage_in_vec_no_op_with_default_client() {
+        let client = PluginHttpClient::default();
+        let mut headers = vec![(
+            "baggage".to_string(),
+            "source.principal=spiffe://x".to_string(),
+        )];
+        client.strip_egress_baggage_in_vec(&mut headers);
+        assert_eq!(headers[0].1, "source.principal=spiffe://x");
     }
 }
 

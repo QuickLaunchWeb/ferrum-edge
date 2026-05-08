@@ -1326,6 +1326,12 @@ pub struct ProxyState {
     /// and requests arriving via early data are rejected with 425 Too Early if
     /// their method is not in this set. Pre-computed at config load time.
     pub early_data_methods: Arc<std::collections::HashSet<String>>,
+    /// W3C `baggage` key prefixes stripped from outbound requests at the
+    /// dispatch boundary. Empty = no-op (default). Set via
+    /// `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`. Operators set this to keep
+    /// mesh-internal identity claims (e.g. `source.principal`) from leaking
+    /// to non-mesh upstream services.
+    pub mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
 }
 
 impl ProxyState {
@@ -1384,6 +1390,8 @@ impl ProxyState {
         let websocket_write_buffer_size = env_config.websocket_write_buffer_size;
         let websocket_tunnel_mode = env_config.websocket_tunnel_mode;
         let max_concurrent_requests_per_ip = env_config.max_concurrent_requests_per_ip;
+        let mesh_egress_strip_baggage_keys =
+            Arc::new(env_config.mesh_egress_strip_baggage_keys.clone());
         let pool_shard_amount =
             crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount);
         let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(
@@ -1458,6 +1466,7 @@ impl ProxyState {
             crls.clone(),
             &env_config_arc.namespace,
             env_config_arc.backend_allow_ips.clone(),
+            mesh_egress_strip_baggage_keys.clone(),
         );
         let plugin_cache = Arc::new(
             PluginCache::with_http_client(&config, plugin_http_client.clone())
@@ -1726,6 +1735,7 @@ impl ProxyState {
             crls,
             overload,
             adaptive_buffer,
+            mesh_egress_strip_baggage_keys,
         };
         Ok((state, health_check_handles))
     }
@@ -3673,6 +3683,16 @@ async fn handle_websocket_request_authenticated(
     if let Some(custom_id) = ctx.backend_consumer_custom_id() {
         client_headers.push(("x-consumer-custom-id".to_string(), custom_id.to_string()));
     }
+
+    // Egress baggage strip — see `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`.
+    // The WebSocket handshake builds its own header collection from
+    // `parts.headers`, so the central strip in `handle_proxy_request_inner`
+    // doesn't reach here. Apply the same shared helper to keep mesh-internal
+    // identity claims out of WS upgrade requests.
+    crate::modes::mesh::hbone::strip_egress_baggage_in_vec(
+        &mut client_headers,
+        &state.mesh_egress_strip_baggage_keys,
+    );
 
     // Connect to backend BEFORE sending 101 to client.
     // If the backend is unreachable, we return 502 instead of a premature 101.
@@ -7024,6 +7044,27 @@ async fn handle_proxy_request_inner(
         if let Some(custom_id) = ctx.backend_consumer_custom_id() {
             headers.insert("X-Consumer-Custom-Id".to_string(), custom_id.to_string());
         }
+    }
+    // Egress baggage strip — operator-configured key prefixes are removed
+    // from the outbound `baggage` header. Default empty list is a no-op.
+    // Controlled by `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`. This handles the
+    // reqwest / direct-H2 / cross-protocol-H3 / gRPC dispatch paths that
+    // consume `proxy_headers`. The native HTTP/3 frontend
+    // (`src/http3/server.rs`) and WebSocket handshake (`src/proxy/mod.rs`
+    // `handle_websocket_request_authenticated`) build their backend headers
+    // from independent sources and call the same helper at their own egress
+    // boundaries — keep all three call sites in sync.
+    if !state.mesh_egress_strip_baggage_keys.is_empty()
+        && (owned_proxy_headers
+            .as_ref()
+            .map(crate::modes::mesh::hbone::has_baggage_header_in_map)
+            .unwrap_or_else(|| crate::modes::mesh::hbone::has_baggage_header_in_map(&ctx.headers)))
+    {
+        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
+        crate::modes::mesh::hbone::strip_egress_baggage_in_map(
+            headers,
+            &state.mesh_egress_strip_baggage_keys,
+        );
     }
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
