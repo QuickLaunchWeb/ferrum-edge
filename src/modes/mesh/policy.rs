@@ -498,6 +498,7 @@ mod tests {
                 }],
                 when: Vec::new(),
                 action: PolicyAction::Allow,
+                never_matches: false,
             }],
         };
 
@@ -527,6 +528,7 @@ mod tests {
                 }],
                 when: Vec::new(),
                 action: PolicyAction::Allow,
+                never_matches: false,
             }],
         };
 
