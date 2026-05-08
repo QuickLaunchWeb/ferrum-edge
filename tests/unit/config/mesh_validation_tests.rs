@@ -166,6 +166,151 @@ fn mesh_policy_glob_pattern_must_be_valid() {
     );
 }
 
+fn policy_with_request_match(request: RequestMatch) -> MeshPolicy {
+    MeshPolicy {
+        name: "p".into(),
+        namespace: "default".into(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some("spiffe://td/*".into()),
+                namespace_pattern: None,
+                trust_domain: None,
+            }],
+            to: vec![request],
+            when: Vec::new(),
+            never_matches: false,
+            action: PolicyAction::Allow,
+        }],
+    }
+}
+
+#[test]
+fn mesh_policy_rejects_host_pattern_with_empty_port() {
+    let policy = policy_with_request_match(RequestMatch {
+        hosts: vec!["example.com:".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("not a valid host pattern")),
+        "expected host-pattern error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_host_pattern_with_non_numeric_port() {
+    let policy = policy_with_request_match(RequestMatch {
+        hosts: vec!["example.com:abc".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("not a valid host pattern")),
+        "expected host-pattern error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_host_pattern_with_out_of_range_port() {
+    let policy = policy_with_request_match(RequestMatch {
+        hosts: vec!["example.com:70000".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("not a valid host pattern")),
+        "expected host-pattern error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_bracketed_host_pattern_with_out_of_range_port() {
+    let policy = policy_with_request_match(RequestMatch {
+        hosts: vec!["[2001:db8::1]:70000".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("not a valid host pattern")),
+        "expected host-pattern error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_host_pattern_with_multiple_unbracketed_colons() {
+    let policy = policy_with_request_match(RequestMatch {
+        hosts: vec!["api.default:443:abc".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("not a valid host pattern")),
+        "expected host-pattern error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_accepts_wildcard_host_port_pattern() {
+    let policy = policy_with_request_match(RequestMatch {
+        hosts: vec!["api.default:*".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    assert!(
+        errors.is_empty(),
+        "expected no errors for `host:*`, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_mid_string_port_pattern() {
+    let policy = policy_with_request_match(RequestMatch {
+        port_patterns: vec!["8*9".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("not a valid port pattern")),
+        "expected port-pattern error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_named_port_pattern() {
+    let policy = policy_with_request_match(RequestMatch {
+        port_patterns: vec!["http".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("not a valid port pattern")),
+        "expected port-pattern error, got: {:?}",
+        errors
+    );
+}
+
 #[test]
 fn peer_authentication_requires_namespace() {
     let pa = PeerAuthentication {

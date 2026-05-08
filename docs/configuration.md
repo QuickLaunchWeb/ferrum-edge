@@ -180,7 +180,9 @@ Gateway API `HTTPRoute` path matches preserve Kubernetes semantics: `PathPrefix`
 
 Gateway API cross-namespace `backendRefs` require an exact matching `ReferenceGrant`, including the source API group/kind and target group/kind. Ferrum currently supports core Kubernetes `Service` backend references and fails closed for other backend target kinds in both same-namespace and cross-namespace routes.
 
-Kubernetes Gateway API and Istio mesh translators fail closed when a resource declares a port outside the Kubernetes service-port range (`1`-`65535`). Invalid ports are rejected during translation instead of wrapping into an unintended backend/listener port.
+Kubernetes Gateway API and Istio mesh translators fail closed when a resource declares a port outside the Kubernetes service-port range (`1`-`65535`). Invalid ports are rejected during translation instead of wrapping into an unintended backend/listener port. Istio `AuthorizationPolicy.rules[].to[].operation.ports` also preserves wildcard string matches such as `"*"` and `"8*"` through Ferrum mesh policy `port_patterns`; non-numeric, non-pattern port strings still fail closed.
+
+The Istio `AuthorizationPolicy` translator only consumes the four positive-match operation fields Ferrum can enforce: `methods`, `paths`, `hosts`, and `ports`. Any other field on `rules[].to[].operation` — including the negative-match siblings `notMethods`, `notPaths`, `notHosts`, and `notPorts` — is rejected at translation time so policies do not silently weaken authorization. Operators who relied on those fields being silently dropped by older Ferrum builds must drop them from the AuthorizationPolicy (or split the policy) before upgrading; otherwise the entire mesh translation fails closed and the gateway keeps its previous cached config. `RequestMatch.hosts` host patterns submitted directly to mesh config are likewise validated at config-load — bare hostnames, bracketed IPv6 literals, and `host:port` / `host:*` are accepted, while `host:`, `host:abc`, or values with multiple unbracketed colons are rejected.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
