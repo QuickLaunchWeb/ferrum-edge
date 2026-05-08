@@ -147,10 +147,6 @@ See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_
 
 Mesh mode consumes Layer 2 mesh slices from the control protocols and prepares the shared sidecar/ambient data-plane listeners. Non-mesh modes do not instantiate this runtime.
 
-The native `MeshSubscribe` client reconnects with exponential backoff capped at 30 seconds and applies jitter to avoid synchronized reconnect storms. A clean stream end resets the next reconnect delay to the initial 1 second; connection errors increase the backoff.
-
-xDS snapshots are versioned from both the upstream slice/config version and a hash of translated resource content. This lets the xDS server rebuild and publish a new snapshot when resources change under the same source timestamp or base version.
-
 With the native `MeshSubscribe` protocol, mesh mode waits for the first delivered mesh slice before serving, builds the proxy/plugin runtime from that slice, and hot-applies later valid slices atomically. Invalid slice updates are logged and ignored so the last accepted runtime config keeps serving.
 
 | Variable | Required | Default | Description |
@@ -166,11 +162,7 @@ With the native `MeshSubscribe` protocol, mesh mode waits for the first delivere
 | `FERRUM_MESH_CAPTURE_MODE` | No | `explicit` | Traffic capture mode used by injector/capture planning: `explicit`, `iptables`, or `ebpf`. eBPF always falls back to iptables when unsupported |
 | `FERRUM_MESH_PROXY_UID` | No | `1337` in injector patches | UID used to exempt Ferrum's own outbound traffic from iptables capture |
 
-Capture plans reserve proxy UID `1337` by default so Ferrum's own outbound traffic is excluded from redirect rules even when the operator does not set `FERRUM_MESH_PROXY_UID`. The eBPF capture plan carries an iptables fallback with the same UID exclusion and redirect ports.
-
 Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Prometheus plugin when mesh metadata is present. The added series are `ferrum_mesh_requests_total` and `ferrum_mesh_request_duration_ms`, labelled with source/destination workload, namespace, principal, app, service, request protocol, response code, response flags, and connection security policy.
-
-Mesh authorization normalizes policy header match names to lowercase at admission/plugin construction when doing so is unambiguous, so request-time checks use the already-lowercase header map without per-request key allocation. Case-variant duplicate header rules are preserved and evaluated together to avoid nondeterministic policy outcomes. Wildcard matches support `*` anywhere in the policy pattern while preserving anchored-prefix and anchored-suffix semantics.
 
 HBONE identity metadata is read from all `baggage` headers on authenticated HBONE requests where the peer already presented a SPIFFE identity. Baggage values may be percent-encoded, and Ferrum decodes them before extracting `source.principal` or `destination.principal`. Plain HTTP requests, or requests without an authenticated peer, cannot supply `source.principal` through baggage for `mesh_authz` or `workload_metrics`. Operators should treat trusted ztunnels/sidecars as the boundary that stamps workload baggage from accepted trust domains; Ferrum currently forwards baggage headers to backends rather than stripping them on egress.
 
@@ -180,7 +172,7 @@ Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the can
 
 Phase D adds Kubernetes source translation and sidecar-injector scaffolding. Kubernetes resources translate into `GatewayConfig` / `MeshConfig`; no config source talks directly to the proxy runtime or xDS server.
 
-Gateway API `backendRefs` with `weight: 0` are skipped during translation and negative weights are rejected as invalid. Istio `VirtualService` destinations with `weight: 0` or an omitted split weight are skipped only when the HTTP route splits across multiple destinations; a single destination is preserved because Istio sends all traffic to the lone destination. Skipped zero-weight entries are reported in translation warnings.
+Gateway API `HTTPRoute.backendRefs` and Istio `VirtualService.http[].route` splits are preserved during translation. A single backend becomes a direct Ferrum proxy backend; multiple non-zero backends create a generated `Upstream` and the proxy references it through `upstream_id`. Generated upstreams use `weighted_round_robin` only when backend weights differ, otherwise `round_robin`. Each HTTPRoute `matches[]` path and each VirtualService `match[]` URI, including regex URI matches, becomes its own proxy, so path alternatives are not collapsed into the first match. Empty HTTPRoute match entries and omitted `matches` / `match` fields create the route's default catch-all `/` proxy. Explicit HTTPRoute header/method-only and VirtualService header/method-only match entries are skipped because Ferrum route proxies do not encode those predicates yet. GRPCRoute method/service matches continue to translate to a deduplicated catch-all `/` proxy because gRPC method selection is encoded in the HTTP path at request time. Gateway API `weight: 0` backendRefs are skipped; if every backendRef in a matched rule has `weight: 0`, Ferrum emits a generated `ferrum-zero-weight.invalid:65535` blackhole backend so the rule still captures traffic instead of falling through to a later route. That blackhole currently fails as a backend/DNS resolution failure, typically a 502, rather than a synthesized 503. In Istio multi-destination splits, omitted weights and `weight: 0` destinations are inactive; a lone Istio destination still receives all traffic. Malformed or out-of-range route weights are rejected during translation. Kubernetes route translation currently supports numeric backend ports only; resolving `Service.spec.ports[].name` from a backendRef or VirtualService destination is not implemented.
 
 Translation notes: Istio `AuthorizationPolicy` resources preserve Istio's action semantics. An `ALLOW` policy with no `rules` is treated as allow-nothing for the selected workload, so it creates a mesh authorization rule that never matches instead of accidentally broadening access. `DENY` and `AUDIT` policies with no `rules` remain no-ops.
 
