@@ -220,14 +220,16 @@ jobs:
         #     functional_load_stress_test today. Specific so any new lighter
         #     test added to that file (e.g. a smoke check) actually runs.
         run: |
+          exit_code=0
           while IFS= read -r filter; do
             if [ -z "$filter" ]; then
               continue
             fi
             echo "::group::functional_tests filter: ${filter}"
-            cargo test --test functional_tests "$filter" -- --include-ignored --skip test_scale_perf_30k_proxies --skip test_load_stress_10k_proxies
+            cargo test --test functional_tests "$filter" -- --include-ignored --skip test_scale_perf_30k_proxies --skip test_load_stress_10k_proxies || exit_code=$?
             echo "::endgroup::"
           done <<< "$FUNCTIONAL_FILTERS"
+          exit $exit_code
         env:
           FUNCTIONAL_FILTERS: ${{ matrix.filters }}
           RUST_BACKTRACE: 1
@@ -271,8 +273,6 @@ jobs:
              [ "${{ needs.test-functional.result }}" != "success" ]; then
             exit 1
           fi
-        env:
-          RUST_BACKTRACE: 1
 
   lint:
     name: Lint
