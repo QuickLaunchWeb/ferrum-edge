@@ -941,6 +941,7 @@ async fn workload_metrics_on_stream_connect_adds_source_identity_metadata() {
         consumer_index: Arc::new(ConsumerIndex::new(&[])),
         identified_consumer: None,
         authenticated_identity: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
+        auth_method: None,
         metadata: None,
         tls_client_cert_der: Some(Arc::new(vec![1, 2, 3])),
         tls_client_cert_chain_der: None,

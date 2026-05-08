@@ -577,7 +577,9 @@ auth_flow::impl_auth_plugin!(
                     ctx.insert_metadata("consumer_username".to_string(), consumer.username.clone());
                     ctx.identified_consumer = Some(consumer);
                 }
-                ctx.auth_method = Some("mtls_auth");
+                if ctx.auth_method.is_none() {
+                    ctx.auth_method = Some("mtls_auth");
+                }
                 PluginResult::Continue
             }
             VerifyOutcome::NotApplicable => PluginResult::Continue,
