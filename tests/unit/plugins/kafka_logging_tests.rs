@@ -1,10 +1,12 @@
 //! Tests for kafka_logging plugin
 
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
-use ferrum_edge::plugins::{Plugin, kafka_logging::KafkaLogging};
+use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, kafka_logging::KafkaLogging};
 use serde_json::json;
 
-use super::plugin_utils::create_test_transaction_summary;
+use super::plugin_utils::{
+    create_test_stream_transaction_summary, create_test_transaction_summary,
+};
 
 fn default_http_client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -21,6 +23,8 @@ async fn test_kafka_logging_plugin_creation() {
     )
     .unwrap();
     assert_eq!(plugin.name(), "kafka_logging");
+    assert_eq!(plugin.priority(), 9150);
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
 }
 
 #[tokio::test]
@@ -63,6 +67,41 @@ async fn test_kafka_logging_empty_topic() {
         &default_http_client(),
     );
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_kafka_logging_invalid_config_shapes() {
+    let cases = [
+        json!(null),
+        json!({"broker_list": 9092, "topic": "test"}),
+        json!({"broker_list": "localhost:9092", "topic": 123}),
+        json!({"broker_list": ", ,", "topic": "test"}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "buffer_capacity": "100"}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "flush_timeout_seconds": false}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "message_timeout_ms": []}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "key_field": ""}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "compression": 1}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "acks": true}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "security_protocol": ""}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "sasl_mechanism": []}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "sasl_username": ""}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "sasl_password": {}}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "ssl_no_verify": "false"}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "ssl_ca_location": ""}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "ssl_certificate_location": "/cert.pem"}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "ssl_key_location": "/key.pem"}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "producer_config": []}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "producer_config": {"": "value"}}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "producer_config": {"linger.ms": 10}}),
+        json!({"broker_list": "localhost:9092", "topic": "test", "producer_config": {"linger.ms": ""}}),
+    ];
+
+    for config in cases {
+        assert!(
+            KafkaLogging::new(&config, &default_http_client()).is_err(),
+            "expected invalid config to be rejected: {config}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -143,6 +182,20 @@ async fn test_kafka_logging_log_does_not_panic() {
     .unwrap();
     let summary = create_test_transaction_summary();
     plugin.log(&summary).await;
+}
+
+#[tokio::test]
+async fn test_kafka_logging_stream_disconnect_does_not_panic() {
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:19092",
+            "topic": "test-logs"
+        }),
+        &default_http_client(),
+    )
+    .unwrap();
+    let summary = create_test_stream_transaction_summary();
+    plugin.on_stream_disconnect(&summary).await;
 }
 
 #[tokio::test]
@@ -370,9 +423,5 @@ async fn test_kafka_logging_supported_protocols() {
     )
     .unwrap();
 
-    // Should support all protocols (HTTP, gRPC, WebSocket, TCP, UDP)
-    assert_eq!(
-        plugin.supported_protocols(),
-        ferrum_edge::plugins::ALL_PROTOCOLS
-    );
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
 }

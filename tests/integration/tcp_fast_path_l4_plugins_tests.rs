@@ -69,7 +69,7 @@ const PER_ATTEMPT_STARTED_TIMEOUT: Duration = Duration::from_secs(2);
 /// is 0, which is what `bidirectional_copy()` checks before delegating
 /// to `tokio::io::copy_bidirectional_with_sizes` (the zero-overhead
 /// path that has no plugin loop of its own).
-fn fast_path_tcp_proxy(listen_port: u16, backend_port: u16) -> Proxy {
+fn fast_path_tcp_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &[String]) -> Proxy {
     Proxy {
         id: PROXY_ID.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -103,9 +103,12 @@ fn fast_path_tcp_proxy(listen_port: u16, backend_port: u16) -> Proxy {
         // The proxy must explicitly reference any proxy-scoped plugin
         // by its PluginConfig.id; the cache only attaches plugins that
         // appear in this association list (see `PluginCache::build_cache`).
-        plugins: vec![PluginAssociation {
-            plugin_config_id: PLUGIN_CONFIG_ID.to_string(),
-        }],
+        plugins: plugin_config_ids
+            .iter()
+            .map(|id| PluginAssociation {
+                plugin_config_id: id.clone(),
+            })
+            .collect(),
         pool_idle_timeout_seconds: None,
         pool_enable_http_keep_alive: None,
         pool_enable_http2: None,
@@ -205,12 +208,32 @@ async fn spawn_fast_path_gateway_with_retry(
     tokio::task::JoinHandle<()>,
     Arc<TcpProxyMetrics>,
 ) {
+    spawn_fast_path_gateway_with_options(backend_port, vec![throttle_plugin_config()], 1).await
+}
+
+async fn spawn_fast_path_gateway_with_options(
+    backend_port: u16,
+    plugin_configs: Vec<PluginConfig>,
+    accept_threads: usize,
+) -> (
+    u16,
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+    Arc<TcpProxyMetrics>,
+) {
     let mut last_port: u16 = 0;
     for attempt in 1..=MAX_GATEWAY_ATTEMPTS {
         let frontend = reserve_port().await.expect("reserve frontend port");
         let frontend_port = frontend.drop_and_take_port();
         last_port = frontend_port;
-        if let Some(handles) = try_spawn_fast_path_gateway(backend_port, frontend_port).await {
+        if let Some(handles) = try_spawn_fast_path_gateway(
+            backend_port,
+            frontend_port,
+            plugin_configs.clone(),
+            accept_threads,
+        )
+        .await
+        {
             return handles;
         }
         eprintln!(
@@ -236,19 +259,24 @@ async fn spawn_fast_path_gateway_with_retry(
 async fn try_spawn_fast_path_gateway(
     backend_port: u16,
     listen_port: u16,
+    plugin_configs: Vec<PluginConfig>,
+    accept_threads: usize,
 ) -> Option<(
     u16,
     watch::Sender<bool>,
     tokio::task::JoinHandle<()>,
     Arc<TcpProxyMetrics>,
 )> {
-    let proxy = fast_path_tcp_proxy(listen_port, backend_port);
-    let plugin_cfg = throttle_plugin_config();
+    let plugin_config_ids: Vec<String> = plugin_configs
+        .iter()
+        .map(|plugin_config| plugin_config.id.clone())
+        .collect();
+    let proxy = fast_path_tcp_proxy(listen_port, backend_port, &plugin_config_ids);
     let gateway_config = GatewayConfig {
         version: "1".to_string(),
         proxies: vec![proxy],
         consumers: vec![],
-        plugin_configs: vec![plugin_cfg],
+        plugin_configs,
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
@@ -256,21 +284,23 @@ async fn try_spawn_fast_path_gateway(
     };
     let plugin_cache = Arc::new(
         PluginCache::new(&gateway_config)
-            .expect("PluginCache should build with valid throttle config"),
+            .expect("PluginCache should build with valid stream plugin config"),
     );
-    // Sanity check: throttle must actually be wired to the proxy. If
-    // PluginScope / proxy_id wiring drifts, both tests below would
-    // pass vacuously (no rejection ever happens because no plugin is
-    // attached) — defeating the regression-guard intent.
-    let attached = plugin_cache.get_plugins_for_protocol(PROXY_ID, ProxyProtocol::Tcp);
-    assert!(
-        attached
-            .iter()
-            .any(|p| p.name() == "tcp_connection_throttle"),
-        "tcp_connection_throttle should be attached to the test proxy via the cache; \
-         got {:?}",
-        attached.iter().map(|p| p.name()).collect::<Vec<_>>()
-    );
+    if !gateway_config.plugin_configs.is_empty() {
+        // Sanity check: configured plugins must actually be wired to the proxy.
+        // If PluginScope / proxy_id wiring drifts, lifecycle tests below could
+        // pass vacuously because no plugin is attached.
+        let attached = plugin_cache.get_plugins_for_protocol(PROXY_ID, ProxyProtocol::Tcp);
+        let attached_names: Vec<&str> = attached.iter().map(|p| p.name()).collect();
+        for plugin_config in &gateway_config.plugin_configs {
+            assert!(
+                attached_names.contains(&plugin_config.plugin_name.as_str()),
+                "{} should be attached to the test proxy via the cache; got {:?}",
+                plugin_config.plugin_name,
+                attached_names
+            );
+        }
+    }
     let consumer_index = Arc::new(ConsumerIndex::new(&gateway_config.consumers));
     let load_balancer_cache = Arc::new(LoadBalancerCache::new(&gateway_config));
     let request_epoch = Arc::new(RequestEpochStore::from_runtime_parts(
@@ -321,6 +351,9 @@ async fn try_spawn_fast_path_gateway(
             sni_proxy_ids: None,
             adaptive_buffer,
             tcp_fastopen_enabled: false,
+            tcp_listen_backlog: 2048,
+            accept_threads,
+            tcp_fastopen_queue_len: 256,
             overload,
             ktls_enabled: false,
             io_uring_splice_enabled: false,
@@ -413,6 +446,35 @@ async fn is_closed_by_peer(stream: &mut TcpStream) -> bool {
         tokio::time::timeout(Duration::from_secs(2), stream.read(&mut probe)).await,
         Ok(Ok(0)) | Ok(Err(_))
     )
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn tcp_stream_accept_threads_two_binds_and_relays_connections() {
+    // Backend echo server.
+    let backend = reserve_port().await.expect("reserve backend port");
+    let backend_port = backend.local_addr().expect("backend addr").port();
+    let _backend_task = spawn_echo_backend(backend.into_listener()).await;
+
+    // This exercises the real `start_tcp_listener` path where the first
+    // listener and one extra SO_REUSEPORT listener both bind before started=true.
+    // If the extra bind fails, the helper never observes started=true and retries
+    // until it panics with the attempted port.
+    let (listen_port, shutdown_tx, join, metrics) =
+        spawn_fast_path_gateway_with_options(backend_port, Vec::new(), 2).await;
+    let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
+
+    for payload in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
+        let conn = round_trip_through_gateway(gateway_addr, payload).await;
+        drop(conn);
+    }
+
+    assert!(
+        metrics.total_connections.load(Ordering::Relaxed) >= 3,
+        "multi-accept TCP listener should accept and proxy all test connections"
+    );
+
+    shutdown_gateway_or_panic(shutdown_tx, join).await;
 }
 
 #[tokio::test]

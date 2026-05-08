@@ -1,7 +1,7 @@
 //! Tests for request_size_limiting plugin
 
 use ferrum_edge::plugins::request_size_limiting::RequestSizeLimiting;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -19,7 +19,13 @@ fn make_ctx(method: &str, path: &str) -> RequestContext {
 async fn test_creation_defaults() {
     let plugin = RequestSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
     assert_eq!(plugin.name(), "request_size_limiting");
-    assert_eq!(plugin.priority(), 2800);
+    assert_eq!(plugin.priority(), priority::REQUEST_SIZE_LIMITING);
+    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
+    assert!(!plugin.is_auth_plugin());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
 }
 
 #[tokio::test]
@@ -30,6 +36,20 @@ async fn test_zero_max_bytes_returns_error() {
         result.is_err(),
         "Expected error when max_bytes is zero/missing"
     );
+}
+
+#[test]
+fn test_non_object_config_returns_error() {
+    let result = RequestSizeLimiting::new(&json!("bad"));
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("config must be an object"));
+}
+
+#[test]
+fn test_invalid_max_bytes_type_returns_error() {
+    let result = RequestSizeLimiting::new(&json!({"max_bytes": "1024"}));
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("max_bytes"));
 }
 
 // === Content-Length fast path ===
@@ -141,6 +161,22 @@ async fn test_buffered_body_over_limit_rejects() {
         } => {
             assert_eq!(status_code, 413);
             assert!(body.contains("Request body too large"));
+        }
+        _ => panic!("Expected Reject"),
+    }
+}
+
+#[tokio::test]
+async fn test_buffered_binary_body_size_metadata_over_limit_rejects() {
+    let plugin = RequestSizeLimiting::new(&json!({"max_bytes": 10})).unwrap();
+    let mut ctx = make_ctx("POST", "/api");
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "11".to_string());
+
+    let mut headers = HashMap::new();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject { status_code, .. } => {
+            assert_eq!(status_code, 413);
         }
         _ => panic!("Expected Reject"),
     }

@@ -2168,8 +2168,9 @@ components:
         listen_path:
           type: [string, "null"]
           description: >-
-            URL path prefix or `~regex` this proxy matches. Must start with `/`
-            for literal path matching, or `~` for regex matching
+            URL path prefix, `=/exact-path`, or `~regex` this proxy matches.
+            Must start with `/` for literal prefix matching, `=/` for exact
+            whole-path matching, or `~` for regex matching
             (e.g., `~^/api/v[0-9]+$`). Regex patterns are compiled at creation
             time and auto-anchored with `^` and `$` for full-path matching if
             not already present. To allow sub-path matching, end the pattern
@@ -2196,6 +2197,7 @@ components:
             HTTP proxies in the same namespace.
           examples:
             - /api/v1
+            - =/healthz
             - /users
             - "~/api/v[0-9]+/users/[^/]+"
         hosts:

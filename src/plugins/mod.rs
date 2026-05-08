@@ -248,6 +248,10 @@ pub struct RequestContext {
     pub client_ip: String,
     pub method: String,
     pub path: String,
+    /// Frontend listener port that accepted this HTTP-family request.
+    /// HTTP proxy resources do not carry `listen_port`, so mesh authorization
+    /// uses this to evaluate Istio `to.ports` matches for HTTP traffic.
+    pub frontend_listen_port: Option<u16>,
     /// Raw HTTP headers from the request. Stored at init time and consumed by
     /// `materialize_headers()`. Core proxy lookups (IP resolution, host
     /// extraction) read from this directly via `raw_header_get()` to avoid
@@ -333,6 +337,7 @@ impl RequestContext {
             client_ip,
             method,
             path,
+            frontend_listen_port: None,
             raw_headers: None,
             headers: HashMap::new(),
             raw_query_string: None,
@@ -378,6 +383,17 @@ impl RequestContext {
             .as_ref()
             .and_then(|h| h.get(name))
             .and_then(|v| v.to_str().ok())
+    }
+
+    /// Iterate all values for a raw header without materializing the full
+    /// header map. Returns an empty iterator if raw headers were already
+    /// consumed.
+    #[inline]
+    pub fn raw_header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.raw_headers
+            .iter()
+            .flat_map(move |headers| headers.get_all(name).iter())
+            .filter_map(|value| value.to_str().ok())
     }
 
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,

@@ -1,7 +1,9 @@
 //! Tests for ws_message_size_limiting plugin
 
 use ferrum_edge::plugins::ws_message_size_limiting::WsMessageSizeLimiting;
-use ferrum_edge::plugins::{Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
+use ferrum_edge::plugins::{
+    Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection, priority,
+};
 use serde_json::json;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -11,7 +13,12 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 fn test_creation_defaults() {
     let plugin = WsMessageSizeLimiting::new(&json!({"max_frame_bytes": 1024})).unwrap();
     assert_eq!(plugin.name(), "ws_message_size_limiting");
-    assert_eq!(plugin.priority(), 2810);
+    assert_eq!(plugin.priority(), priority::WS_MESSAGE_SIZE_LIMITING);
+    assert!(!plugin.is_auth_plugin());
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
 }
 
 #[test]
@@ -41,11 +48,25 @@ async fn test_missing_max_frame_bytes_returns_error() {
     assert!(result.err().unwrap().contains("max_frame_bytes"));
 }
 
+#[test]
+fn test_non_object_config_returns_error() {
+    let result = WsMessageSizeLimiting::new(&json!("bad"));
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("config must be an object"));
+}
+
 #[tokio::test]
 async fn test_zero_max_frame_bytes_returns_error() {
     let result = WsMessageSizeLimiting::new(&json!({"max_frame_bytes": 0}));
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("max_frame_bytes"));
+}
+
+#[test]
+fn test_invalid_close_reason_type_returns_error() {
+    let result = WsMessageSizeLimiting::new(&json!({"max_frame_bytes": 1024, "close_reason": 123}));
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("close_reason"));
 }
 
 // === Text frame checks ===

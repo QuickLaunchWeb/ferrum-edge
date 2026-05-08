@@ -144,8 +144,16 @@ pub struct MeshRule {
     pub to: Vec<RequestMatch>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub when: Vec<ConditionMatch>,
+    /// Synthetic marker for rules that should affect policy accounting but
+    /// never match traffic, e.g. Istio ALLOW-without-rules allow-nothing.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub never_matches: bool,
     #[serde(default)]
     pub action: PolicyAction,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -445,6 +453,7 @@ impl MeshConfig {
             &mut self.workloads,
             self.multi_cluster.as_mut(),
         );
+        normalize_mesh_policy_fields(&mut self.mesh_policies);
     }
 }
 
@@ -838,6 +847,18 @@ fn normalize_mesh_fields_internal(
             gateway.host.make_ascii_lowercase();
             for sni in &mut gateway.sni_hosts {
                 sni.make_ascii_lowercase();
+            }
+        }
+    }
+}
+
+fn normalize_mesh_policy_fields(policies: &mut [MeshPolicy]) {
+    for policy in policies {
+        for rule in &mut policy.rules {
+            for request in &mut rule.to {
+                for host in &mut request.hosts {
+                    host.make_ascii_lowercase();
+                }
             }
         }
     }

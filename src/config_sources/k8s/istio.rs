@@ -10,8 +10,9 @@ use crate::config::mesh::{
 use crate::identity::spiffe::SpiffeId;
 
 use super::{
-    K8sAccumulator, K8sObject, K8sTranslateError, RouteProxySpec, SourceKind, invalid_resource,
-    proxy_for_route, resource_id, selector_from_istio, string_array, string_field, string_map,
+    K8sAccumulator, K8sObject, K8sTranslateError, RouteProxySpec, SourceKind,
+    exact_path_listen_path, invalid_resource, optional_port_field, port_from_u64, proxy_for_route,
+    resource_id, selector_from_istio, string_array, string_field, string_map,
 };
 use crate::config::types::BackendScheme;
 
@@ -27,7 +28,7 @@ pub(super) fn translate(
         "PeerAuthentication" => {
             acc.mesh
                 .peer_authentications
-                .push(peer_authentication(object));
+                .push(peer_authentication(object)?);
             Ok(true)
         }
         "ServiceEntry" => {
@@ -101,14 +102,22 @@ fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateEr
         },
     };
 
-    let rules = object
+    let mut rules: Vec<MeshRule> = object
         .spec
         .get("rules")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|rule| mesh_rule(rule, action))
-        .collect();
+        .map(|rule| mesh_rule(object, rule, action))
+        .collect::<Result<Vec<_>, _>>()?;
+    if rules.is_empty() && action == PolicyAction::Allow {
+        tracing::warn!(
+            namespace = %object.metadata.namespace,
+            policy = %object.metadata.name,
+            "Istio ALLOW AuthorizationPolicy has no rules; emitting synthetic never-match allow rule to preserve allow-nothing semantics",
+        );
+        rules.push(allow_nothing_rule());
+    }
 
     Ok(MeshPolicy {
         name: object.metadata.name.clone(),
@@ -118,7 +127,21 @@ fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateEr
     })
 }
 
-fn mesh_rule(rule: &Value, action: PolicyAction) -> MeshRule {
+fn allow_nothing_rule() -> MeshRule {
+    MeshRule {
+        from: Vec::new(),
+        to: Vec::new(),
+        when: Vec::new(),
+        never_matches: true,
+        action: PolicyAction::Allow,
+    }
+}
+
+fn mesh_rule(
+    object: &K8sObject,
+    rule: &Value,
+    action: PolicyAction,
+) -> Result<MeshRule, K8sTranslateError> {
     let from = rule
         .get("from")
         .and_then(Value::as_array)
@@ -131,8 +154,8 @@ fn mesh_rule(rule: &Value, action: PolicyAction) -> MeshRule {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|to| request_match(to.get("operation").unwrap_or(&Value::Null)))
-        .collect();
+        .map(|to| request_match(object, to.get("operation").unwrap_or(&Value::Null)))
+        .collect::<Result<Vec<_>, _>>()?;
     let when = rule
         .get("when")
         .and_then(Value::as_array)
@@ -141,12 +164,13 @@ fn mesh_rule(rule: &Value, action: PolicyAction) -> MeshRule {
         .filter_map(condition_match)
         .collect();
 
-    MeshRule {
+    Ok(MeshRule {
         from,
         to,
         when,
+        never_matches: false,
         action,
-    }
+    })
 }
 
 fn principal_matches(source: &Value) -> Vec<PrincipalMatch> {
@@ -168,17 +192,19 @@ fn principal_matches(source: &Value) -> Vec<PrincipalMatch> {
     matches
 }
 
-fn request_match(operation: &Value) -> RequestMatch {
-    RequestMatch {
+fn request_match(object: &K8sObject, operation: &Value) -> Result<RequestMatch, K8sTranslateError> {
+    let ports = string_array(operation, "ports")
+        .into_iter()
+        .map(|port| port_from_string(object, &port, "rules[].to[].operation.ports"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(RequestMatch {
         methods: string_array(operation, "methods"),
         paths: string_array(operation, "paths"),
         hosts: string_array(operation, "hosts"),
         headers: HashMap::new(),
-        ports: string_array(operation, "ports")
-            .into_iter()
-            .filter_map(|port| port.parse::<u16>().ok())
-            .collect(),
-    }
+        ports,
+    })
 }
 
 fn condition_match(value: &Value) -> Option<ConditionMatch> {
@@ -189,23 +215,23 @@ fn condition_match(value: &Value) -> Option<ConditionMatch> {
     })
 }
 
-fn peer_authentication(object: &K8sObject) -> PeerAuthentication {
+fn peer_authentication(object: &K8sObject) -> Result<PeerAuthentication, K8sTranslateError> {
     let mtls = object.spec.get("mtls").unwrap_or(&Value::Null);
     let effective_mtls_mode = mtls_mode(string_field(mtls, "mode").unwrap_or("PERMISSIVE"));
-    let port_overrides = object
+    let mut port_overrides = HashMap::new();
+    for (port, value) in object
         .spec
         .get("portLevelMtls")
         .and_then(Value::as_object)
         .into_iter()
         .flat_map(|ports| ports.iter())
-        .filter_map(|(port, value)| {
-            let port = port.parse::<u16>().ok()?;
-            let mode = mtls_mode(string_field(value, "mode").unwrap_or("PERMISSIVE"));
-            Some((port, mode))
-        })
-        .collect();
+    {
+        let port = port_from_string(object, port, "portLevelMtls")?;
+        let mode = mtls_mode(string_field(value, "mode").unwrap_or("PERMISSIVE"));
+        port_overrides.insert(port, mode);
+    }
 
-    PeerAuthentication {
+    Ok(PeerAuthentication {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
         selector: object
@@ -217,7 +243,17 @@ fn peer_authentication(object: &K8sObject) -> PeerAuthentication {
             }),
         mtls_mode: effective_mtls_mode,
         port_overrides,
-    }
+    })
+}
+
+fn port_from_string(object: &K8sObject, raw: &str, field: &str) -> Result<u16, K8sTranslateError> {
+    let parsed = raw.parse::<u64>().map_err(|_| {
+        invalid_resource(
+            object,
+            format!("{field} must be a numeric port between 1 and 65535 (got {raw})"),
+        )
+    })?;
+    port_from_u64(object, parsed, field)
 }
 
 fn mtls_mode(value: &str) -> MtlsMode {
@@ -234,27 +270,38 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
         return Err(invalid_resource(object, "ServiceEntry requires spec.hosts"));
     }
 
-    let endpoints = object
+    let mut endpoints = Vec::new();
+    for endpoint in object
         .spec
         .get("endpoints")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|endpoint| {
-            Some(MeshEndpoint {
-                address: string_field(endpoint, "address")?.to_string(),
-                ports: endpoint
-                    .get("ports")
-                    .and_then(Value::as_object)
-                    .into_iter()
-                    .flat_map(|ports| ports.iter())
-                    .filter_map(|(name, port)| port.as_u64().map(|p| (name.clone(), p as u16)))
-                    .collect(),
-                labels: endpoint.get("labels").map(string_map).unwrap_or_default(),
-                network: string_field(endpoint, "network").map(ToOwned::to_owned),
-            })
-        })
-        .collect();
+    {
+        let Some(address) = string_field(endpoint, "address") else {
+            continue;
+        };
+        let mut ports = HashMap::new();
+        for (name, port) in endpoint
+            .get("ports")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|ports| ports.iter())
+        {
+            if let Some(raw_port) = port.as_u64() {
+                ports.insert(
+                    name.clone(),
+                    port_from_u64(object, raw_port, "endpoints[].ports")?,
+                );
+            }
+        }
+        endpoints.push(MeshEndpoint {
+            address: address.to_string(),
+            ports,
+            labels: endpoint.get("labels").map(string_map).unwrap_or_default(),
+            network: string_field(endpoint, "network").map(ToOwned::to_owned),
+        });
+    }
 
     Ok(ServiceEntry {
         name: object.metadata.name.clone(),
@@ -270,7 +317,7 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
             "MESH_INTERNAL" => ServiceEntryLocation::MeshInternal,
             _ => ServiceEntryLocation::MeshExternal,
         },
-        ports: service_ports(&object.spec),
+        ports: service_ports(object)?,
     })
 }
 
@@ -299,7 +346,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         addresses: string_field(&object.spec, "address")
             .map(|address| vec![address.to_string()])
             .unwrap_or_default(),
-        ports: workload_ports(&object.spec),
+        ports: workload_ports(object)?,
         trust_domain: acc.options.trust_domain.clone(),
         namespace: object.metadata.namespace.clone(),
         network: string_field(&object.spec, "network").map(ToOwned::to_owned),
@@ -337,11 +384,12 @@ fn virtual_service_routes(
                 "VirtualService route.destination.host is required",
             ));
         };
-        let port = destination
-            .get("port")
-            .and_then(|p| p.get("number"))
-            .and_then(Value::as_u64)
-            .unwrap_or(80) as u16;
+        let port = optional_port_field(
+            object,
+            destination.get("port").and_then(|p| p.get("number")),
+            "route.destination.port.number",
+        )?
+        .unwrap_or(80);
 
         let listen_path = http
             .get("match")
@@ -360,6 +408,7 @@ fn virtual_service_routes(
             namespace: object.metadata.namespace.clone(),
             hosts: hosts.clone(),
             listen_path: listen_path.or_else(|| Some("/".to_string())),
+            strip_listen_path: false,
             backend_host: host.to_string(),
             backend_port: port,
             backend_scheme: BackendScheme::Http,
@@ -371,39 +420,57 @@ fn virtual_service_routes(
 }
 
 fn path_match(uri: &Value) -> Option<String> {
-    string_field(uri, "prefix")
-        .or_else(|| string_field(uri, "exact"))
-        .map(ToOwned::to_owned)
+    if let Some(prefix) = string_field(uri, "prefix") {
+        return Some(prefix.to_string());
+    }
+    if let Some(exact) = string_field(uri, "exact") {
+        return Some(exact_path_listen_path(exact));
+    }
+    string_field(uri, "regex").map(|pattern| format!("~{pattern}"))
 }
 
-fn service_ports(spec: &Value) -> Vec<ServicePort> {
-    spec.get("ports")
+fn service_ports(object: &K8sObject) -> Result<Vec<ServicePort>, K8sTranslateError> {
+    let mut ports = Vec::new();
+    object
+        .spec
+        .get("ports")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|port| {
-            Some(ServicePort {
-                port: port.get("number").and_then(Value::as_u64)? as u16,
+        .try_for_each(|port| {
+            let Some(raw_port) = port.get("number").and_then(Value::as_u64) else {
+                return Ok(());
+            };
+            ports.push(ServicePort {
+                port: port_from_u64(object, raw_port, "ports[].number")?,
                 protocol: app_protocol(string_field(port, "protocol")),
                 name: string_field(port, "name").map(ToOwned::to_owned),
-            })
-        })
-        .collect()
+            });
+            Ok::<(), K8sTranslateError>(())
+        })?;
+    Ok(ports)
 }
 
-fn workload_ports(spec: &Value) -> Vec<WorkloadPort> {
-    spec.get("ports")
+fn workload_ports(object: &K8sObject) -> Result<Vec<WorkloadPort>, K8sTranslateError> {
+    let mut workload_ports = Vec::new();
+    object
+        .spec
+        .get("ports")
         .and_then(Value::as_object)
         .into_iter()
         .flat_map(|ports| ports.iter())
-        .filter_map(|(name, port)| {
-            Some(WorkloadPort {
-                port: port.as_u64()? as u16,
+        .try_for_each(|(name, port)| {
+            let Some(raw_port) = port.as_u64() else {
+                return Ok(());
+            };
+            workload_ports.push(WorkloadPort {
+                port: port_from_u64(object, raw_port, "ports")?,
                 protocol: AppProtocol::Unknown,
                 name: Some(name.clone()),
-            })
-        })
-        .collect()
+            });
+            Ok::<(), K8sTranslateError>(())
+        })?;
+    Ok(workload_ports)
 }
 
 fn app_protocol(value: Option<&str>) -> AppProtocol {
@@ -426,6 +493,10 @@ mod tests {
     use super::*;
     use crate::config_sources::k8s::{K8sMetadata, K8sTranslationOptions, translate_k8s_objects};
     use crate::identity::spiffe::TrustDomain;
+    use crate::modes::mesh::policy::{
+        MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
+    };
+    use crate::xds::slice::MeshSlice;
 
     fn options() -> K8sTranslationOptions {
         K8sTranslationOptions::new(
@@ -445,6 +516,16 @@ mod tests {
             },
             spec,
         }
+    }
+
+    fn translated_authorization_policy(spec: Value) -> MeshPolicy {
+        let result = translate_k8s_objects(&[object("AuthorizationPolicy", spec)], options())
+            .expect("translation succeeds");
+        let mesh = result.config.mesh.expect("mesh config");
+        mesh.mesh_policies
+            .into_iter()
+            .next()
+            .expect("one translated mesh policy")
     }
 
     #[test]
@@ -473,6 +554,79 @@ mod tests {
     }
 
     #[test]
+    fn translates_allow_authorization_policy_without_rules_to_allow_nothing() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "selector": {"matchLabels": {"app": "api"}}
+        }));
+
+        assert!(matches!(
+            &policy.scope,
+            PolicyScope::WorkloadSelector { .. }
+        ));
+        assert_eq!(policy.rules.len(), 1);
+        assert_eq!(policy.rules[0].action, PolicyAction::Allow);
+        assert!(policy.rules[0].never_matches);
+        assert!(policy.rules[0].from.is_empty());
+
+        let decision = evaluate_mesh_authorization(
+            &MeshSlice {
+                mesh_policies: vec![policy],
+                ..MeshSlice::default()
+            },
+            &MeshAuthzRequest::default(),
+        );
+        assert_eq!(
+            decision,
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn translates_namespace_allow_authorization_policy_without_rules_to_allow_nothing() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW"
+        }));
+
+        assert!(matches!(
+            &policy.scope,
+            PolicyScope::Namespace { namespace } if namespace == "default"
+        ));
+        assert_eq!(policy.rules.len(), 1);
+        assert_eq!(policy.rules[0].action, PolicyAction::Allow);
+        assert!(policy.rules[0].never_matches);
+    }
+
+    #[test]
+    fn translates_missing_action_authorization_policy_without_rules_to_allow_nothing() {
+        let policy = translated_authorization_policy(serde_json::json!({}));
+
+        assert_eq!(policy.rules.len(), 1);
+        assert_eq!(policy.rules[0].action, PolicyAction::Allow);
+        assert!(policy.rules[0].never_matches);
+    }
+
+    #[test]
+    fn translates_deny_authorization_policy_without_rules_to_noop() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "DENY"
+        }));
+
+        assert_eq!(policy.rules, Vec::new());
+    }
+
+    #[test]
+    fn translates_audit_authorization_policy_without_rules_to_noop() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "AUDIT"
+        }));
+
+        assert_eq!(policy.rules, Vec::new());
+    }
+
+    #[test]
     fn translates_service_entry() {
         let result = translate_k8s_objects(
             &[object(
@@ -490,6 +644,84 @@ mod tests {
         let mesh = result.config.mesh.expect("mesh config");
         assert_eq!(mesh.service_entries[0].hosts, vec!["api.example.com"]);
         assert_eq!(mesh.service_entries[0].ports[0].protocol, AppProtocol::Tls);
+    }
+
+    #[test]
+    fn rejects_istio_ports_outside_kubernetes_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "ServiceEntry",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "ports": [{"number": 70000, "name": "http", "protocol": "HTTP"}]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid port must fail closed");
+
+        assert!(err.to_string().contains("ports[].number"));
+        assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn rejects_authorization_policy_ports_outside_kubernetes_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [{"operation": {"ports": ["70000"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid AuthorizationPolicy port must fail closed");
+
+        assert!(err.to_string().contains("rules[].to[].operation.ports"));
+        assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn rejects_peer_authentication_port_level_mtls_outside_kubernetes_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "PeerAuthentication",
+                serde_json::json!({
+                    "mtls": {"mode": "PERMISSIVE"},
+                    "portLevelMtls": {
+                        "70000": {"mode": "STRICT"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid PeerAuthentication port must fail closed");
+
+        assert!(err.to_string().contains("portLevelMtls"));
+        assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn rejects_virtual_service_destination_ports_outside_kubernetes_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 70000}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid VirtualService destination port must fail closed");
+
+        assert!(err.to_string().contains("route.destination.port.number"));
+        assert!(err.to_string().contains("70000"));
     }
 
     #[test]
@@ -541,6 +773,55 @@ mod tests {
 
         assert_eq!(result.config.proxies.len(), 1);
         assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/v1"));
+        assert!(!result.config.proxies[0].strip_listen_path);
         assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn translates_virtual_service_exact_uri_to_exact_proxy() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"exact": "/v1.items"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("=/v1.items")
+        );
+        assert!(!result.config.proxies[0].strip_listen_path);
+    }
+
+    #[test]
+    fn translates_virtual_service_regex_uri_to_regex_proxy() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"regex": "/v[0-9]+/items"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("~/v[0-9]+/items")
+        );
+        assert!(!result.config.proxies[0].strip_listen_path);
     }
 }

@@ -44,6 +44,10 @@ pub struct WsFrameLogging {
 
 impl WsFrameLogging {
     pub fn new(config: &Value) -> Result<Self, String> {
+        if !config.is_object() {
+            return Err("ws_frame_logging: config must be a JSON object".to_string());
+        }
+
         // Validate log_level explicitly — unknown values are rejected per the
         // plugin-validation rules so misspellings (e.g. "info " or "warn") are
         // caught at config-load time rather than silently downgraded to "info".
@@ -81,10 +85,10 @@ impl WsFrameLogging {
             Some(v) => v.as_u64().ok_or_else(|| {
                 "ws_frame_logging: 'payload_preview_bytes' must be a non-negative integer"
                     .to_string()
-            })? as usize,
+            })?,
             None => 128,
         }
-        .min(MAX_PREVIEW_BYTES);
+        .min(MAX_PREVIEW_BYTES as u64) as usize;
 
         let log_ping_pong = match config.get("log_ping_pong") {
             Some(v) => v
@@ -178,10 +182,11 @@ impl std::fmt::Display for PreviewStr<'_> {
 
 /// Simple hex encoding for binary payload previews.
 fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        let _ = write!(s, "{:02x}", b);
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
     }
     s
 }

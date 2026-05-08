@@ -81,7 +81,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::info;
-use url::form_urlencoded;
+use url::{Url, form_urlencoded};
 
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::dns::DnsCacheResolver;
@@ -109,16 +109,17 @@ pub struct LoadTesting {
 
 impl LoadTesting {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        let key = config["key"]
-            .as_str()
+        if !config.is_object() {
+            return Err("load_testing: config must be an object".to_string());
+        }
+
+        let key = optional_string(config, "key")?
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 "load_testing: 'key' is required and must be a non-empty string".to_string()
-            })?
-            .to_string();
+            })?;
 
-        let concurrent_clients = config["concurrent_clients"]
-            .as_u64()
+        let concurrent_clients = optional_u64(config, "concurrent_clients")?
             .ok_or_else(|| "load_testing: 'concurrent_clients' is required".to_string())?;
         if concurrent_clients == 0 || concurrent_clients > 10_000 {
             return Err(format!(
@@ -127,8 +128,7 @@ impl LoadTesting {
             ));
         }
 
-        let duration_seconds = config["duration_seconds"]
-            .as_u64()
+        let duration_seconds = optional_u64(config, "duration_seconds")?
             .ok_or_else(|| "load_testing: 'duration_seconds' is required".to_string())?;
         if duration_seconds == 0 || duration_seconds > 3600 {
             return Err(format!(
@@ -137,19 +137,18 @@ impl LoadTesting {
             ));
         }
 
-        let ramp = config["ramp"].as_bool().unwrap_or(false);
+        let ramp = optional_bool(config, "ramp")?.unwrap_or(false);
 
-        let request_timeout_ms = config["request_timeout_ms"].as_u64().unwrap_or(30_000);
+        let request_timeout_ms = optional_u64(config, "request_timeout_ms")?.unwrap_or(30_000);
         if request_timeout_ms == 0 {
             return Err("load_testing: 'request_timeout_ms' must be greater than 0".to_string());
         }
 
-        let gateway_tls = config["gateway_tls"].as_bool().unwrap_or(false);
+        let gateway_tls = optional_bool(config, "gateway_tls")?.unwrap_or(false);
 
         // Default to true when TLS is enabled — the gateway cert won't match 127.0.0.1
-        let gateway_tls_no_verify = config["gateway_tls_no_verify"]
-            .as_bool()
-            .unwrap_or(gateway_tls);
+        let gateway_tls_no_verify =
+            optional_bool(config, "gateway_tls_no_verify")?.unwrap_or(gateway_tls);
 
         // Determine local gateway port with smart env-var defaults
         let default_env_var = if gateway_tls {
@@ -159,8 +158,7 @@ impl LoadTesting {
         };
         let default_port: u16 = if gateway_tls { 8443 } else { 8000 };
 
-        let gateway_port = config["gateway_port"]
-            .as_u64()
+        let gateway_port = optional_u64(config, "gateway_port")?
             .map(|p| {
                 if p == 0 || p > 65535 {
                     Err(format!(
@@ -206,27 +204,41 @@ impl LoadTesting {
             .map_err(|e| format!("load_testing: failed to build HTTP client: {}", e))?;
 
         // Parse optional remote gateway addresses for multi-node fan-out
-        let gateway_addresses = if let Some(addresses) = config["gateway_addresses"].as_array() {
-            if addresses.is_empty() {
-                return Err(
-                    "load_testing: 'gateway_addresses' must not be empty when provided".to_string(),
-                );
-            }
-            let mut urls = Vec::with_capacity(addresses.len());
-            for addr in addresses {
-                let url = addr.as_str().ok_or_else(|| {
-                    "load_testing: each 'gateway_addresses' entry must be a string".to_string()
-                })?;
-                if url.is_empty() {
+        let gateway_addresses = match config.get("gateway_addresses") {
+            Some(Value::Array(addresses)) => {
+                if addresses.is_empty() {
                     return Err(
-                        "load_testing: 'gateway_addresses' entries must not be empty".to_string(),
+                        "load_testing: 'gateway_addresses' must not be empty when provided"
+                            .to_string(),
                     );
                 }
-                urls.push(url.trim_end_matches('/').to_string());
+                let mut urls = Vec::with_capacity(addresses.len());
+                for addr in addresses {
+                    let url = addr.as_str().ok_or_else(|| {
+                        "load_testing: each 'gateway_addresses' entry must be a string".to_string()
+                    })?;
+                    if url.is_empty() {
+                        return Err(
+                            "load_testing: 'gateway_addresses' entries must not be empty"
+                                .to_string(),
+                        );
+                    }
+                    let parsed = Url::parse(url).map_err(|e| {
+                        format!("load_testing: invalid gateway address '{url}': {e}")
+                    })?;
+                    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                        return Err(format!(
+                            "load_testing: gateway address '{url}' must be an http(s) URL with a host"
+                        ));
+                    }
+                    urls.push(url.trim_end_matches('/').to_string());
+                }
+                urls
             }
-            urls
-        } else {
-            Vec::new()
+            Some(Value::Null) | None => Vec::new(),
+            Some(_) => {
+                return Err("load_testing: 'gateway_addresses' must be an array".to_string());
+            }
         };
 
         Ok(Self {
@@ -240,6 +252,33 @@ impl LoadTesting {
             gateway_addresses,
             is_running: Arc::new(AtomicBool::new(false)),
         })
+    }
+}
+
+fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
+    match config.get(key) {
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("load_testing: '{key}' must be a boolean")),
+    }
+}
+
+fn optional_string(config: &Value, key: &str) -> Result<Option<String>, String> {
+    match config.get(key) {
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("load_testing: '{key}' must be a string")),
+    }
+}
+
+fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
+    match config.get(key) {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("load_testing: '{key}' must be an unsigned integer")),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("load_testing: '{key}' must be an unsigned integer")),
     }
 }
 
@@ -455,7 +494,9 @@ impl Plugin for LoadTesting {
 
 /// Build a full URL from a base URL, path, and query parameters.
 fn build_url(base: &str, path: &str, query_params: &HashMap<String, String>) -> String {
-    let mut url = format!("{}{}", base, path);
+    let mut url = String::with_capacity(base.len() + path.len());
+    url.push_str(base);
+    url.push_str(path);
     if !query_params.is_empty() {
         url.push('?');
         let encoded: String = form_urlencoded::Serializer::new(String::new())
