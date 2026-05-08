@@ -164,7 +164,7 @@ With the native `MeshSubscribe` protocol, mesh mode waits for the first delivere
 
 Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Prometheus plugin when mesh metadata is present. The added series are `ferrum_mesh_requests_total` and `ferrum_mesh_request_duration_ms`, labelled with source/destination workload, namespace, principal, app, service, request protocol, response code, response flags, and connection security policy.
 
-HBONE identity metadata is read from all `baggage` headers on an HBONE request. Baggage values may be percent-encoded, and Ferrum decodes them before extracting `source.principal` or `destination.principal`.
+HBONE identity metadata is read from all `baggage` headers on authenticated HBONE requests where the peer already presented a SPIFFE identity. Baggage values may be percent-encoded, and Ferrum decodes them before extracting `source.principal` or `destination.principal`. Plain HTTP requests, or requests without an authenticated peer, cannot supply `source.principal` through baggage for `mesh_authz` or `workload_metrics`. Operators should treat trusted ztunnels/sidecars as the boundary that stamps workload baggage from accepted trust domains; Ferrum currently forwards baggage headers to backends rather than stripping them on egress.
 
 Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the canonical config. Remote clusters carry trust domains and federation endpoints, VM `WorkloadEntry` resources populate workload addresses/network/cluster metadata, and east-west gateway entries are materialized as SNI-routed passthrough stream proxies only in `east_west_gateway` topology.
 

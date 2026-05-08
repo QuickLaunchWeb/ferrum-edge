@@ -408,7 +408,21 @@ impl RequestContext {
                     // http::HeaderName stores names in lowercase already (HTTP/2+3
                     // spec), and hyper normalizes HTTP/1.1 header names to
                     // lowercase at parse time. No `to_lowercase()` needed.
-                    self.headers.insert(name.as_str().to_owned(), v.to_owned());
+                    let key = name.as_str();
+                    if key == "baggage" {
+                        // W3C baggage is a list header, so multiple field lines
+                        // are equivalent to one comma-separated value. Preserve
+                        // that before raw headers are consumed by materialization.
+                        self.headers
+                            .entry(key.to_owned())
+                            .and_modify(|existing| {
+                                existing.push(',');
+                                existing.push_str(v);
+                            })
+                            .or_insert_with(|| v.to_owned());
+                    } else {
+                        self.headers.insert(key.to_owned(), v.to_owned());
+                    }
                 }
             }
         }
