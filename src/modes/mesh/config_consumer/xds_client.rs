@@ -4,6 +4,10 @@ use crate::modes::mesh::runtime::MeshRuntimeState;
 use crate::xds::slice::MeshSlice;
 
 /// Phase B shell for an xDS-backed mesh config consumer.
+///
+/// Not wired into the mesh runtime yet; retained for the Phase B/C xDS data
+/// plane client implementation once `FERRUM_MESH_CONFIG_PROTOCOL=xds` is
+/// enabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XdsClientConfig {
     pub cp_url: String,

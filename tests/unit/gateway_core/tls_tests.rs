@@ -329,6 +329,34 @@ fn test_tls_policy_custom_cipher_suites() {
 }
 
 #[test]
+fn test_tls_policy_defaults_prefer_aes128_gcm() {
+    let env = default_env_config();
+
+    let policy = TlsPolicy::from_env_config(&env).unwrap();
+    let suites: Vec<_> = policy
+        .crypto_provider
+        .cipher_suites
+        .iter()
+        .map(|suite| suite.suite())
+        .collect();
+
+    assert_eq!(
+        suites,
+        vec![
+            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+            rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+            rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        ]
+    );
+}
+
+#[test]
 fn test_tls_policy_unknown_cipher_suite_fails() {
     let mut env = default_env_config();
     env.tls_cipher_suites = Some("INVALID_SUITE".to_string());

@@ -26,19 +26,40 @@ use tracing::{debug, error, info};
 use crate::capture::{CaptureConfig, CaptureMode, IptablesPlan};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
+use crate::identity::spiffe::TrustDomain;
 use crate::tls::{self, TlsPolicy};
 
 const DEFAULT_INJECTOR_LISTEN_ADDR: &str = "0.0.0.0:9443";
 const DEFAULT_SIDECAR_IMAGE: &str = "ferrum-edge:latest";
+const DEFAULT_INJECTOR_TRUST_DOMAIN: &str = "cluster.local";
+const SIDECAR_ENV_KEYS: &[&str] = &[
+    "FERRUM_DP_CP_GRPC_URL",
+    "FERRUM_DP_CP_GRPC_URLS",
+    "FERRUM_CP_DP_GRPC_JWT_ISSUER",
+    "FERRUM_DP_GRPC_TLS_CA_CERT_PATH",
+    "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH",
+    "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH",
+    "FERRUM_DP_GRPC_TLS_NO_VERIFY",
+    "FERRUM_MESH_CONFIG_PROTOCOL",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretKeyRef {
+    pub name: String,
+    pub key: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InjectorConfig {
     pub listen_addr: SocketAddr,
     pub namespace: String,
     pub sidecar_image: String,
+    pub sidecar_env: Vec<(String, String)>,
+    pub jwt_secret_ref: Option<SecretKeyRef>,
     pub require_annotation: bool,
     pub capture_mode: CaptureMode,
     pub proxy_uid: Option<u32>,
+    pub trust_domain: String,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
     pub tls_handshake_timeout_seconds: u64,
@@ -52,6 +73,8 @@ impl InjectorConfig {
             .map_err(|e| format!("Invalid FERRUM_INJECTOR_LISTEN_ADDR: {e}"))?;
         let sidecar_image = resolve_ferrum_var("FERRUM_INJECTOR_SIDECAR_IMAGE")
             .unwrap_or_else(|| DEFAULT_SIDECAR_IMAGE.to_string());
+        let sidecar_env = sidecar_env_from_runtime();
+        let jwt_secret_ref = jwt_secret_ref_from_runtime()?;
         let require_annotation = resolve_ferrum_var("FERRUM_INJECTOR_REQUIRE_ANNOTATION")
             .and_then(|value| value.parse::<bool>().ok())
             .unwrap_or(true);
@@ -61,6 +84,10 @@ impl InjectorConfig {
         )?;
         let proxy_uid =
             resolve_ferrum_var("FERRUM_MESH_PROXY_UID").and_then(|value| value.parse::<u32>().ok());
+        let trust_domain = resolve_ferrum_var("FERRUM_INJECTOR_TRUST_DOMAIN")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_INJECTOR_TRUST_DOMAIN.to_string());
+        validate_injector_trust_domain(&trust_domain)?;
         let tls_cert_path = resolve_ferrum_var("FERRUM_INJECTOR_TLS_CERT_PATH");
         let tls_key_path = resolve_ferrum_var("FERRUM_INJECTOR_TLS_KEY_PATH");
         match (&tls_cert_path, &tls_key_path) {
@@ -83,14 +110,54 @@ impl InjectorConfig {
             listen_addr,
             namespace: env_config.namespace.clone(),
             sidecar_image,
+            sidecar_env,
+            jwt_secret_ref,
             require_annotation,
             capture_mode,
             proxy_uid,
+            trust_domain,
             tls_cert_path,
             tls_key_path,
             tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
         })
     }
+}
+
+fn validate_injector_trust_domain(value: &str) -> Result<(), String> {
+    TrustDomain::new(value.to_string())
+        .map(|_| ())
+        .map_err(|e| format!("Invalid FERRUM_INJECTOR_TRUST_DOMAIN: {e}"))
+}
+
+fn jwt_secret_ref_from_runtime() -> Result<Option<SecretKeyRef>, String> {
+    let name = resolve_ferrum_var("FERRUM_INJECTOR_JWT_SECRET_REF_NAME")
+        .filter(|value| !value.trim().is_empty());
+    let key = resolve_ferrum_var("FERRUM_INJECTOR_JWT_SECRET_REF_KEY")
+        .filter(|value| !value.trim().is_empty());
+
+    match (name, key) {
+        (Some(name), Some(key)) => Ok(Some(SecretKeyRef { name, key })),
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(
+            "FERRUM_INJECTOR_JWT_SECRET_REF_NAME requires FERRUM_INJECTOR_JWT_SECRET_REF_KEY"
+                .to_string(),
+        ),
+        (None, Some(_)) => Err(
+            "FERRUM_INJECTOR_JWT_SECRET_REF_KEY requires FERRUM_INJECTOR_JWT_SECRET_REF_NAME"
+                .to_string(),
+        ),
+    }
+}
+
+fn sidecar_env_from_runtime() -> Vec<(String, String)> {
+    SIDECAR_ENV_KEYS
+        .iter()
+        .filter_map(|key| {
+            resolve_ferrum_var(key)
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -112,6 +179,7 @@ struct AdmissionReview {
 #[derive(Debug, Deserialize)]
 struct AdmissionRequest {
     uid: String,
+    namespace: Option<String>,
     object: Value,
 }
 
@@ -248,7 +316,8 @@ pub fn admission_response(body: &[u8], config: &InjectorConfig) -> Result<Value,
     let Some(request) = review.request else {
         return Err("AdmissionReview.request is required".to_string());
     };
-    let patches = build_sidecar_patch(&request.object, config);
+    let patches =
+        build_sidecar_patch_for_namespace(&request.object, config, request.namespace.as_deref());
 
     let mut response = json!({
         "apiVersion": api_version,
@@ -275,12 +344,17 @@ pub fn admission_response(body: &[u8], config: &InjectorConfig) -> Result<Value,
     Ok(response)
 }
 
-pub fn build_sidecar_patch(pod: &Value, config: &InjectorConfig) -> Vec<JsonPatchOperation> {
+fn build_sidecar_patch_for_namespace(
+    pod: &Value,
+    config: &InjectorConfig,
+    admission_namespace: Option<&str>,
+) -> Vec<JsonPatchOperation> {
     if !should_inject(pod, config) {
         return Vec::new();
     }
 
     let mut patch = Vec::new();
+    let pod_namespace = pod_namespace(pod, admission_namespace, config);
     ensure_metadata_annotations(pod, &mut patch);
     patch.push(JsonPatchOperation {
         op: "add",
@@ -290,7 +364,7 @@ pub fn build_sidecar_patch(pod: &Value, config: &InjectorConfig) -> Vec<JsonPatc
     patch.push(JsonPatchOperation {
         op: "add",
         path: "/spec/containers/-".to_string(),
-        value: Some(sidecar_container(config)),
+        value: Some(sidecar_container(config, pod, &pod_namespace)),
     });
 
     if config.capture_mode == CaptureMode::Iptables {
@@ -314,6 +388,9 @@ fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
     if value_is_false(annotations.and_then(|m| m.get("sidecar.istio.io/inject")))
         || value_is_false(annotations.and_then(|m| m.get("ferrum.io/inject")))
         || value_is_false(labels.and_then(|m| m.get("ferrum.io/mesh")))
+        || annotations
+            .and_then(|m| m.get("ferrum.io/injected"))
+            .is_some()
     {
         return false;
     }
@@ -361,7 +438,66 @@ fn ensure_init_containers(pod: &Value, patch: &mut Vec<JsonPatchOperation>) {
     }
 }
 
-fn sidecar_container(config: &InjectorConfig) -> Value {
+fn pod_namespace(
+    pod: &Value,
+    admission_namespace: Option<&str>,
+    config: &InjectorConfig,
+) -> String {
+    admission_namespace
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            pod.pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or(&config.namespace)
+        .to_string()
+}
+
+fn pod_service_account(pod: &Value) -> &str {
+    pod.pointer("/spec/serviceAccountName")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("default")
+}
+
+fn workload_spiffe_id(config: &InjectorConfig, pod: &Value, namespace: &str) -> String {
+    format!(
+        "spiffe://{}/ns/{namespace}/sa/{}",
+        config.trust_domain,
+        pod_service_account(pod)
+    )
+}
+
+fn sidecar_env(config: &InjectorConfig, pod: &Value, namespace: &str) -> Vec<Value> {
+    let mut env = vec![
+        json!({"name": "FERRUM_MODE", "value": "mesh"}),
+        json!({"name": "FERRUM_NAMESPACE", "value": namespace}),
+        json!({"name": "FERRUM_MESH_TOPOLOGY", "value": "sidecar"}),
+        json!({"name": "FERRUM_MESH_CAPTURE_MODE", "value": format!("{:?}", config.capture_mode).to_ascii_lowercase()}),
+        json!({"name": "FERRUM_MESH_WORKLOAD_SPIFFE_ID", "value": workload_spiffe_id(config, pod, namespace)}),
+    ];
+    env.extend(
+        config
+            .sidecar_env
+            .iter()
+            .map(|(name, value)| json!({"name": name, "value": value})),
+    );
+    if let Some(secret_ref) = &config.jwt_secret_ref {
+        env.push(json!({
+            "name": "FERRUM_CP_DP_GRPC_JWT_SECRET",
+            "valueFrom": {
+                "secretKeyRef": {
+                    "name": secret_ref.name,
+                    "key": secret_ref.key
+                }
+            }
+        }));
+    }
+    env
+}
+
+fn sidecar_container(config: &InjectorConfig, pod: &Value, namespace: &str) -> Value {
     json!({
         "name": "ferrum-edge",
         "image": config.sidecar_image,
@@ -374,11 +510,7 @@ fn sidecar_container(config: &InjectorConfig) -> Value {
             {"containerPort": 15001, "name": "outbound"},
             {"containerPort": 15006, "name": "inbound"}
         ],
-        "env": [
-            {"name": "FERRUM_MODE", "value": "mesh"},
-            {"name": "FERRUM_MESH_TOPOLOGY", "value": "sidecar"},
-            {"name": "FERRUM_MESH_CAPTURE_MODE", "value": format!("{:?}", config.capture_mode).to_ascii_lowercase()}
-        ]
+        "env": sidecar_env(config, pod, namespace)
     })
 }
 
@@ -434,9 +566,18 @@ mod tests {
             listen_addr: "127.0.0.1:9443".parse().expect("test addr"),
             namespace: "default".to_string(),
             sidecar_image: "ferrum-edge:test".to_string(),
+            sidecar_env: vec![(
+                "FERRUM_DP_CP_GRPC_URL".to_string(),
+                "http://cp:50051".to_string(),
+            )],
+            jwt_secret_ref: Some(SecretKeyRef {
+                name: "ferrum-edge-secrets".to_string(),
+                key: "cp-dp-grpc-jwt-secret".to_string(),
+            }),
             require_annotation,
             capture_mode,
             proxy_uid: Some(1337),
+            trust_domain: "cluster.local".to_string(),
             tls_cert_path: None,
             tls_key_path: None,
             tls_handshake_timeout_seconds: 10,
@@ -446,7 +587,28 @@ mod tests {
     #[test]
     fn patch_requires_opt_in_by_default() {
         let pod = json!({"metadata": {"labels": {}}, "spec": {"containers": []}});
-        let patch = build_sidecar_patch(&pod, &test_config(true, CaptureMode::Explicit));
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Explicit),
+            None,
+        );
+        assert!(patch.is_empty());
+    }
+
+    #[test]
+    fn patch_skips_already_injected_pod() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {"ferrum.io/injected": "true"}
+            },
+            "spec": {"containers": []}
+        });
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Explicit),
+            None,
+        );
         assert!(patch.is_empty());
     }
 
@@ -454,12 +616,52 @@ mod tests {
     fn patch_injects_sidecar_when_enabled() {
         let pod = json!({
             "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
-            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+            "spec": {
+                "serviceAccountName": "api",
+                "containers": [{"name": "app", "image": "app:test"}]
+            }
         });
-        let patch = build_sidecar_patch(&pod, &test_config(true, CaptureMode::Iptables));
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Iptables),
+            None,
+        );
 
         assert!(patch.iter().any(|op| op.path == "/spec/containers/-"));
         assert!(patch.iter().any(|op| op.path == "/spec/initContainers/-"));
+        let sidecar = patch
+            .iter()
+            .find(|op| op.path == "/spec/containers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("sidecar container");
+        let env = sidecar
+            .get("env")
+            .and_then(Value::as_array)
+            .expect("sidecar env");
+        assert!(env.iter().any(|entry| {
+            entry.get("name").and_then(Value::as_str) == Some("FERRUM_DP_CP_GRPC_URL")
+                && entry.get("value").and_then(Value::as_str) == Some("http://cp:50051")
+        }));
+        assert!(env.iter().any(|entry| {
+            entry.get("name").and_then(Value::as_str) == Some("FERRUM_MESH_WORKLOAD_SPIFFE_ID")
+                && entry.get("value").and_then(Value::as_str)
+                    == Some("spiffe://cluster.local/ns/default/sa/api")
+        }));
+        let jwt_secret = env
+            .iter()
+            .find(|entry| {
+                entry.get("name").and_then(Value::as_str) == Some("FERRUM_CP_DP_GRPC_JWT_SECRET")
+            })
+            .expect("jwt secret env");
+        assert!(jwt_secret.get("value").is_none());
+        assert_eq!(
+            jwt_secret.pointer("/valueFrom/secretKeyRef/name"),
+            Some(&Value::String("ferrum-edge-secrets".to_string()))
+        );
+        assert_eq!(
+            jwt_secret.pointer("/valueFrom/secretKeyRef/key"),
+            Some(&Value::String("cp-dp-grpc-jwt-secret".to_string()))
+        );
     }
 
     #[test]
@@ -469,6 +671,7 @@ mod tests {
             "kind": "AdmissionReview",
             "request": {
                 "uid": "abc",
+                "namespace": "payments",
                 "object": {
                     "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
                     "spec": {"containers": []}
@@ -489,6 +692,32 @@ mod tests {
             response.pointer("/response/patchType"),
             Some(&Value::String("JSONPatch".to_string()))
         );
+        let patch = response
+            .pointer("/response/patch")
+            .and_then(Value::as_str)
+            .expect("encoded patch");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(patch)
+            .expect("valid base64 patch");
+        let operations: Vec<Value> = serde_json::from_slice(&decoded).expect("json patch");
+        let sidecar = operations
+            .iter()
+            .find(|op| op.get("path").and_then(Value::as_str) == Some("/spec/containers/-"))
+            .and_then(|op| op.get("value"))
+            .expect("sidecar patch");
+        let env = sidecar
+            .get("env")
+            .and_then(Value::as_array)
+            .expect("sidecar env");
+        assert!(env.iter().any(|entry| {
+            entry.get("name").and_then(Value::as_str) == Some("FERRUM_NAMESPACE")
+                && entry.get("value").and_then(Value::as_str) == Some("payments")
+        }));
+        assert!(env.iter().any(|entry| {
+            entry.get("name").and_then(Value::as_str) == Some("FERRUM_MESH_WORKLOAD_SPIFFE_ID")
+                && entry.get("value").and_then(Value::as_str)
+                    == Some("spiffe://cluster.local/ns/payments/sa/default")
+        }));
     }
 
     #[test]
@@ -497,6 +726,14 @@ mod tests {
         let config = InjectorConfig::from_env_config(&env).expect("injector config");
         assert_eq!(config.listen_addr.port(), 9443);
         assert_eq!(config.capture_mode, CaptureMode::Explicit);
+        assert_eq!(config.trust_domain, DEFAULT_INJECTOR_TRUST_DOMAIN);
         assert!(config.tls_cert_path.is_none());
+    }
+
+    #[test]
+    fn injector_config_rejects_invalid_trust_domain() {
+        let err =
+            validate_injector_trust_domain("CLUSTER.LOCAL").expect_err("invalid trust domain");
+        assert!(err.contains("FERRUM_INJECTOR_TRUST_DOMAIN"));
     }
 }

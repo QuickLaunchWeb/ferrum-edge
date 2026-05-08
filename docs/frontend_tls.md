@@ -47,6 +47,28 @@ WSS, gRPC-over-TLS, TCP+TLS stream listeners, and UDP+DTLS listeners from slow
 or stalled handshakes. After TLS completes, HTTP requests are governed by
 `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS`.
 
+### Frontend Before Backend
+
+For TLS/DTLS-terminating client-facing protocols, Ferrum completes frontend
+crypto and admission before backend dispatch:
+
+- HTTPS, HTTP/2-over-TLS, WSS, and gRPC-over-TLS complete the frontend TLS
+  handshake before HTTP request routing or backend connection selection.
+- Normal HTTP/3 completes the QUIC/TLS handshake before request routing.
+- TCP+TLS stream proxies complete the frontend TLS handshake, then run
+  `on_stream_connect`, before opening the backend TCP or TLS connection.
+- UDP+DTLS stream proxies complete the frontend DTLS handshake, then run
+  `on_stream_connect`, before creating the backend UDP or DTLS session.
+
+Frontend handshake failures and stream plugin rejections are frontend setup
+failures. They close the client side without dialing the backend or recording a
+backend circuit-breaker failure.
+
+The deliberate exception is operator-enabled HTTP/3 0-RTT early data
+(`FERRUM_TLS_EARLY_DATA_METHODS`), which is disabled by default. When enabled,
+Ferrum permits only configured replay-safe methods and forwards `Early-Data: 1`
+so backends can apply their own replay policy.
+
 ## Configuration Scenarios
 
 ### 1. HTTP Only (Default)
@@ -541,22 +563,24 @@ export FERRUM_TLS_MAX_VERSION="1.2"
 
 When `FERRUM_TLS_CIPHER_SUITES` is not set, the gateway uses secure AEAD-only defaults:
 
+The default preference starts with AES-128-GCM. Operators that set `FERRUM_TLS_CIPHER_SUITES` keep their explicit order, so pinned cipher configurations are not affected by default-order changes.
+
 **TLS 1.3 (always AEAD):**
 | Name | Description |
 |------|-------------|
-| `TLS_AES_256_GCM_SHA384` | AES-256-GCM (strongest) |
-| `TLS_AES_128_GCM_SHA256` | AES-128-GCM |
+| `TLS_AES_128_GCM_SHA256` | AES-128-GCM (default preference; secure and cheaper on the record path) |
+| `TLS_AES_256_GCM_SHA384` | AES-256-GCM |
 | `TLS_CHACHA20_POLY1305_SHA256` | ChaCha20-Poly1305 (fast on non-AES-NI hardware) |
 
 **TLS 1.2 (ECDHE + AEAD only):**
 | Name | Description |
 |------|-------------|
-| `ECDHE-ECDSA-AES256-GCM-SHA384` | ECDSA key exchange, AES-256-GCM |
-| `ECDHE-RSA-AES256-GCM-SHA384` | RSA key exchange, AES-256-GCM |
-| `ECDHE-ECDSA-AES128-GCM-SHA256` | ECDSA key exchange, AES-128-GCM |
-| `ECDHE-RSA-AES128-GCM-SHA256` | RSA key exchange, AES-128-GCM |
+| `ECDHE-ECDSA-AES128-GCM-SHA256` | ECDSA key exchange, AES-128-GCM (default preference) |
+| `ECDHE-RSA-AES128-GCM-SHA256` | RSA key exchange, AES-128-GCM (default preference) |
 | `ECDHE-ECDSA-CHACHA20-POLY1305` | ECDSA key exchange, ChaCha20-Poly1305 |
 | `ECDHE-RSA-CHACHA20-POLY1305` | RSA key exchange, ChaCha20-Poly1305 |
+| `ECDHE-ECDSA-AES256-GCM-SHA384` | ECDSA key exchange, AES-256-GCM |
+| `ECDHE-RSA-AES256-GCM-SHA384` | RSA key exchange, AES-256-GCM |
 
 No CBC or non-AEAD cipher suites are supported.
 
@@ -589,7 +613,7 @@ export FERRUM_TLS_CURVES="X25519,secp256r1,secp384r1"
 
 ### Server Cipher Order
 
-When `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` is `true` (the default), the server's cipher suite preference takes priority over the client's during TLS 1.2 negotiation. This ensures the strongest cipher is selected regardless of client ordering. TLS 1.3 does not use this setting (server always selects).
+When `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` is `true` (the default), the server's cipher suite preference takes priority over the client's during TLS 1.2 negotiation. This ensures the gateway's configured preference is selected regardless of client ordering. TLS 1.3 does not use this setting (server always selects).
 
 ```bash
 # Let server choose (recommended, default)
@@ -604,7 +628,7 @@ export FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER="false"
 The gateway logs the active TLS policy at startup:
 
 ```
-TLS policy: versions=["TLS 1.2", "TLS 1.3"], cipher_suites=["TLS13_AES_256_GCM_SHA384", ...], curves=["X25519", "SECP256R1"], prefer_server_order=true
+TLS policy: versions=["TLS 1.2", "TLS 1.3"], cipher_suites=["TLS13_AES_128_GCM_SHA256", ...], curves=["X25519", "SECP256R1"], prefer_server_order=true
 ```
 
 You can also verify externally:
