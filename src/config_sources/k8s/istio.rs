@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -10,11 +10,11 @@ use crate::config::mesh::{
 use crate::identity::spiffe::SpiffeId;
 
 use super::{
-    K8sAccumulator, K8sObject, K8sTranslateError, RouteProxySpec, SourceKind,
+    K8sAccumulator, K8sObject, K8sTranslateError, RouteBackend, RouteProxySpec, SourceKind,
     exact_path_listen_path, invalid_resource, optional_port_field, port_from_u64, proxy_for_route,
-    resource_id, selector_from_istio, string_array, string_field, string_map,
+    resource_id, selector_from_istio, string_array, string_field, string_map, upstream_for_route,
 };
-use crate::config::types::BackendScheme;
+use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT};
 
 pub(super) fn translate(
     acc: &mut K8sAccumulator,
@@ -40,7 +40,11 @@ pub(super) fn translate(
             Ok(true)
         }
         "VirtualService" => {
-            for proxy in virtual_service_routes(object)? {
+            let (proxies, upstreams) = virtual_service_routes(object, acc)?;
+            for upstream in upstreams {
+                acc.upsert_upstream(upstream);
+            }
+            for proxy in proxies {
                 acc.upsert_proxy(proxy, SourceKind::Istio);
             }
             Ok(true)
@@ -431,9 +435,17 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
 
 fn virtual_service_routes(
     object: &K8sObject,
-) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
+    acc: &mut K8sAccumulator,
+) -> Result<
+    (
+        Vec<crate::config::types::Proxy>,
+        Vec<crate::config::types::Upstream>,
+    ),
+    K8sTranslateError,
+> {
     let hosts = string_array(&object.spec, "hosts");
     let mut proxies = Vec::new();
+    let mut upstreams = Vec::new();
 
     for (index, http) in object
         .spec
@@ -443,14 +455,109 @@ fn virtual_service_routes(
         .flatten()
         .enumerate()
     {
-        let Some(route) = http
-            .get("route")
-            .and_then(Value::as_array)
-            .and_then(|routes| routes.first())
-        else {
+        let match_paths = match_paths(http);
+        if match_paths.is_empty() {
+            continue;
+        }
+
+        let backends = route_backends(object, http, acc, index)?;
+        if backends.is_empty() {
             continue;
         };
+
+        let (backend_host, backend_port, upstream_id) = if backends.len() == 1 {
+            let Some(backend) = backends.into_iter().next() else {
+                continue;
+            };
+            (backend.host, backend.port, None)
+        } else {
+            let upstream_id = resource_id(
+                "istio-vs-upstream",
+                &object.metadata.namespace,
+                &object.metadata.name,
+                &index.to_string(),
+            );
+            upstreams.push(upstream_for_route(
+                upstream_id.clone(),
+                object.metadata.namespace.clone(),
+                backends,
+            ));
+            (String::new(), 0, Some(upstream_id))
+        };
+
+        let match_count = match_paths.len();
+        for (match_index, listen_path) in match_paths.into_iter().enumerate() {
+            let suffix = if match_count == 1 {
+                index.to_string()
+            } else {
+                format!("{index}-{match_index}")
+            };
+            proxies.push(proxy_for_route(RouteProxySpec {
+                id: resource_id(
+                    "istio-vs",
+                    &object.metadata.namespace,
+                    &object.metadata.name,
+                    &suffix,
+                ),
+                namespace: object.metadata.namespace.clone(),
+                hosts: hosts.clone(),
+                listen_path,
+                strip_listen_path: false,
+                backend_host: backend_host.clone(),
+                backend_port,
+                upstream_id: upstream_id.clone(),
+                backend_scheme: BackendScheme::Http,
+                listen_port: None,
+            }));
+        }
+    }
+
+    Ok((proxies, upstreams))
+}
+
+fn match_paths(http: &Value) -> Vec<Option<String>> {
+    let Some(matches) = http.get("match").and_then(Value::as_array) else {
+        return vec![Some("/".to_string())];
+    };
+    if matches.is_empty() {
+        return vec![Some("/".to_string())];
+    }
+
+    let mut seen_paths = HashSet::new();
+    matches
+        .iter()
+        // Istio forbids empty HTTPMatchRequest blocks; URI-less entries depend on
+        // unsupported predicates such as headers/method/queryParams, so do not
+        // broaden them into Ferrum catch-all routes.
+        .filter_map(|m| m.get("uri").and_then(path_match).map(Some))
+        .filter(|listen_path| seen_paths.insert(listen_path.clone()))
+        .collect()
+}
+
+fn route_backends(
+    object: &K8sObject,
+    http: &Value,
+    acc: &mut K8sAccumulator,
+    route_index: usize,
+) -> Result<Vec<RouteBackend>, K8sTranslateError> {
+    let mut backends = Vec::new();
+    let routes: Vec<_> = http
+        .get("route")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect();
+    let preserve_single_destination = routes.len() == 1;
+    let mut skipped_zero = 0usize;
+    let mut active_route_without_backend = false;
+    for route in routes {
+        let weight = route_weight(object, route)?;
+        if weight == 0 && !preserve_single_destination {
+            skipped_zero += 1;
+            continue;
+        }
         let Some(destination) = route.get("destination") else {
+            active_route_without_backend = true;
             continue;
         };
         let Some(host) = string_field(destination, "host") else {
@@ -465,33 +572,49 @@ fn virtual_service_routes(
             "route.destination.port.number",
         )?
         .unwrap_or(80);
-
-        let listen_path = http
-            .get("match")
-            .and_then(Value::as_array)
-            .and_then(|matches| matches.first())
-            .and_then(|m| m.get("uri"))
-            .and_then(path_match);
-
-        proxies.push(proxy_for_route(RouteProxySpec {
-            id: resource_id(
-                "istio-vs",
-                &object.metadata.namespace,
-                &object.metadata.name,
-                &index.to_string(),
-            ),
-            namespace: object.metadata.namespace.clone(),
-            hosts: hosts.clone(),
-            listen_path: listen_path.or_else(|| Some("/".to_string())),
-            strip_listen_path: false,
-            backend_host: host.to_string(),
-            backend_port: port,
-            backend_scheme: BackendScheme::Http,
-            listen_port: None,
-        }));
+        backends.push(RouteBackend {
+            host: host.to_string(),
+            port,
+            weight,
+        });
     }
+    if skipped_zero > 0 {
+        if backends.is_empty() && !active_route_without_backend {
+            acc.warnings.push(format!(
+                "VirtualService '{}' HTTP route {} has only zero-weight split destinations; no proxy was materialized",
+                object.metadata.name, route_index
+            ));
+        } else {
+            acc.warnings.push(format!(
+                "VirtualService '{}' HTTP route {} skipped {} zero-weight split destination(s)",
+                object.metadata.name, route_index, skipped_zero
+            ));
+        }
+    }
+    Ok(backends)
+}
 
-    Ok(proxies)
+fn route_weight(object: &K8sObject, route: &Value) -> Result<u32, K8sTranslateError> {
+    let Some(weight_value) = route.get("weight") else {
+        return Ok(0);
+    };
+    let Some(weight) = weight_value.as_u64() else {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService route.weight must be between 0 and {MAX_TARGET_WEIGHT} (got {weight_value})"
+            ),
+        ));
+    };
+    if weight > u64::from(MAX_TARGET_WEIGHT) {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService route.weight must be between 0 and {MAX_TARGET_WEIGHT} (got {weight})"
+            ),
+        ));
+    }
+    Ok(weight as u32)
 }
 
 fn path_match(uri: &Value) -> Option<String> {
@@ -1047,5 +1170,377 @@ mod tests {
             Some("~/v[0-9]+/items")
         );
         assert!(!result.config.proxies[0].strip_listen_path);
+    }
+
+    #[test]
+    fn virtual_service_without_match_defaults_to_catch_all() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn virtual_service_without_route_does_not_emit_zero_weight_warning() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/old"}}],
+                        "redirect": {"uri": "/new"}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.proxies.is_empty());
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("only zero-weight"))
+        );
+    }
+
+    #[test]
+    fn virtual_service_preserves_weighted_destinations() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [
+                            {"destination": {"host": "api-v1.default.svc.cluster.local", "port": {"number": 8080}}, "weight": 80},
+                            {"destination": {"host": "api-v2.default.svc.cluster.local", "port": {"number": 8081}}, "weight": 20}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.upstreams.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].upstream_id.as_deref(),
+            Some(result.config.upstreams[0].id.as_str())
+        );
+        assert_eq!(result.config.upstreams[0].targets.len(), 2);
+        assert_eq!(result.config.upstreams[0].targets[0].weight, 80);
+        assert_eq!(
+            result.config.upstreams[0].targets[1].host,
+            "api-v2.default.svc.cluster.local"
+        );
+    }
+
+    #[test]
+    fn virtual_service_skips_zero_weight_destination_in_multi_destination_split() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [
+                            {"destination": {"host": "dark.default.svc.cluster.local", "port": {"number": 8080}}, "weight": 0},
+                            {"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 9090}}, "weight": 100}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "stable.default.svc.cluster.local"
+        );
+        assert_eq!(result.config.proxies[0].backend_port, 9090);
+        assert!(result.config.upstreams.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("zero-weight split destination"))
+        );
+    }
+
+    #[test]
+    fn virtual_service_skips_all_omitted_weights_in_multi_destination_split() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [
+                            {"destination": {"host": "api-v1.default.svc.cluster.local", "port": {"number": 8080}}},
+                            {"destination": {"host": "api-v2.default.svc.cluster.local", "port": {"number": 8081}}}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.proxies.is_empty());
+        assert!(result.config.upstreams.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("only zero-weight"))
+        );
+    }
+
+    #[test]
+    fn virtual_service_skips_omitted_weight_in_multi_destination_split() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [
+                            {"destination": {"host": "api-v1.default.svc.cluster.local", "port": {"number": 8080}}, "weight": 100},
+                            {"destination": {"host": "api-v2.default.svc.cluster.local", "port": {"number": 8081}}}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "api-v1.default.svc.cluster.local"
+        );
+        assert_eq!(result.config.proxies[0].backend_port, 8080);
+        assert!(result.config.upstreams.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("zero-weight split destination"))
+        );
+    }
+
+    #[test]
+    fn virtual_service_skips_all_zero_weight_destinations_in_multi_destination_split() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [
+                            {"destination": {"host": "api-v1.default.svc.cluster.local", "port": {"number": 8080}}, "weight": 0},
+                            {"destination": {"host": "api-v2.default.svc.cluster.local", "port": {"number": 8081}}, "weight": 0}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.proxies.is_empty());
+        assert!(result.config.upstreams.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("only zero-weight"))
+        );
+    }
+
+    #[test]
+    fn virtual_service_keeps_single_zero_weight_destination() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [
+                            {"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}, "weight": 0}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "api.default.svc.cluster.local"
+        );
+        assert_eq!(result.config.proxies[0].backend_port, 8080);
+        assert!(result.config.upstreams.is_empty());
+    }
+
+    #[test]
+    fn virtual_service_creates_proxy_per_uri_match() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/v1"}},
+                            {"uri": {"prefix": "/v2"}}
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let paths: Vec<_> = result
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.listen_path.as_deref())
+            .collect();
+        assert_eq!(paths, vec![Some("/v1"), Some("/v2")]);
+        assert!(
+            result
+                .config
+                .proxies
+                .iter()
+                .all(|proxy| proxy.backend_port == 8080)
+        );
+    }
+
+    #[test]
+    fn virtual_service_skips_explicit_pathless_matches() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"headers": {"x-tenant": {"exact": "a"}}},
+                            {"method": {"exact": "GET"}}
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.proxies.is_empty());
+        assert!(result.config.upstreams.is_empty());
+    }
+
+    #[test]
+    fn virtual_service_ignores_pathless_match_in_mixed_rule() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/v1"}},
+                            {"headers": {"x-tenant": {"exact": "a"}}}
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/v1"));
+    }
+
+    #[test]
+    fn virtual_service_rejects_route_weight_above_ferrum_limit() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "route": [
+                            {"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}, "weight": 65536}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("oversized route weight should fail translation");
+
+        assert!(
+            err.to_string()
+                .contains("weight must be between 0 and 65535")
+        );
+    }
+
+    #[test]
+    fn virtual_service_rejects_malformed_route_weights() {
+        for weight in [serde_json::json!(-1), serde_json::json!(1.5)] {
+            let err = translate_k8s_objects(
+                &[object(
+                    "VirtualService",
+                    serde_json::json!({
+                        "hosts": ["api.example.com"],
+                        "http": [{
+                            "route": [
+                                {"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}, "weight": weight}
+                            ]
+                        }]
+                    }),
+                )],
+                options(),
+            )
+            .expect_err("malformed route weight should fail translation");
+
+            assert!(
+                err.to_string()
+                    .contains("weight must be between 0 and 65535")
+            );
+        }
     }
 }

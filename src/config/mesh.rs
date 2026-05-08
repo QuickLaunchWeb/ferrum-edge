@@ -454,9 +454,9 @@ impl MeshConfig {
         normalize_mesh_fields_internal(
             &mut self.service_entries,
             &mut self.workloads,
+            &mut self.mesh_policies,
             self.multi_cluster.as_mut(),
         );
-        normalize_mesh_policy_fields(&mut self.mesh_policies);
     }
 }
 
@@ -845,12 +845,13 @@ fn validate_multi_cluster(
 /// the existing `normalize_fields()` pattern used elsewhere in
 /// [`crate::config::types`]. Idempotent.
 pub fn normalize_mesh_fields(service_entries: &mut [ServiceEntry], workloads: &mut [Workload]) {
-    normalize_mesh_fields_internal(service_entries, workloads, None);
+    normalize_mesh_fields_internal(service_entries, workloads, &mut [], None);
 }
 
 fn normalize_mesh_fields_internal(
     service_entries: &mut [ServiceEntry],
     workloads: &mut [Workload],
+    policies: &mut [MeshPolicy],
     multi_cluster: Option<&mut MultiClusterConfig>,
 ) {
     for se in service_entries {
@@ -866,6 +867,7 @@ fn normalize_mesh_fields_internal(
             address.make_ascii_lowercase();
         }
     }
+    normalize_mesh_policy_fields(policies);
     if let Some(multi_cluster) = multi_cluster {
         for gateway in &mut multi_cluster.east_west_gateways {
             gateway.host.make_ascii_lowercase();
@@ -889,6 +891,7 @@ fn normalize_mesh_policy_fields(policies: &mut [MeshPolicy]) {
                         *pattern = trimmed.to_string();
                     }
                 }
+                normalize_mesh_policy_header_map(&mut request.headers);
             }
         }
     }
@@ -977,4 +980,26 @@ fn is_request_match_host_port_token(token: &str) -> bool {
         return true;
     }
     token.parse::<u16>().is_ok()
+}
+
+pub(crate) fn normalize_mesh_policy_header_map(headers: &mut HashMap<String, String>) {
+    if headers
+        .keys()
+        .all(|key| key.bytes().all(|byte| !byte.is_ascii_uppercase()))
+    {
+        return;
+    }
+
+    let mut lowered = HashSet::with_capacity(headers.len());
+    if headers
+        .keys()
+        .any(|key| !lowered.insert(key.to_ascii_lowercase()))
+    {
+        return;
+    }
+
+    *headers = headers
+        .drain()
+        .map(|(key, value)| (key.to_ascii_lowercase(), value))
+        .collect();
 }
