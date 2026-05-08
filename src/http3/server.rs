@@ -1305,8 +1305,18 @@ async fn handle_h3_request(
     }
     // Resolve proxy_headers into an owned HashMap to avoid borrowing ctx.headers
     // while ctx is passed as &mut to proxy functions downstream.
-    let proxy_headers: HashMap<String, String> =
+    let mut proxy_headers: HashMap<String, String> =
         owned_proxy_headers.unwrap_or_else(|| std::mem::take(&mut ctx.headers));
+
+    // Egress baggage strip — see `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`. The
+    // native HTTP/3 frontend builds its own `proxy_headers` map separately
+    // from the H1/H2 dispatch path in `proxy/mod.rs`, so the strip must be
+    // applied here too. Keep this call in sync with the H1/H2 site and the
+    // WebSocket handshake collector.
+    crate::modes::mesh::hbone::strip_egress_baggage_in_map(
+        &mut proxy_headers,
+        &state.mesh_egress_strip_baggage_keys,
+    );
 
     // Enforce request body size limit via Content-Length fast path. Apply
     // the gRPC-specific ceiling to gRPC requests so H3 matches H1/H2.

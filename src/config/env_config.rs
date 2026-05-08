@@ -512,6 +512,16 @@ pub struct EnvConfig {
     /// `xds` is reserved for the future mesh DP xDS client and is rejected in
     /// mesh mode until that client is wired.
     pub mesh_config_protocol: String,
+    /// Additional SPIFFE trust domains accepted as equivalent to the peer
+    /// cert's trust domain when validating HBONE baggage `source.principal`.
+    /// Default empty: strict same-trust-domain match. Each entry must parse
+    /// as a valid `TrustDomain` (lowercase host-form, no path).
+    pub mesh_trust_domain_aliases: Vec<String>,
+    /// Comma-separated W3C `baggage` key prefixes stripped from outbound
+    /// requests at dispatch. Default empty: forward unchanged. Operators set
+    /// this to keep mesh-internal identity claims (e.g. `source.`) from
+    /// leaking to non-mesh upstream services.
+    pub mesh_egress_strip_baggage_keys: Vec<String>,
 
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
@@ -1195,6 +1205,8 @@ impl Default for EnvConfig {
             xds_enabled: false,
             xds_stream_channel_capacity: 32,
             mesh_config_protocol: "native".to_string(),
+            mesh_trust_domain_aliases: Vec::new(),
+            mesh_egress_strip_baggage_keys: Vec::new(),
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -1476,6 +1488,8 @@ impl EnvConfig {
             xds_enabled: bool = "FERRUM_XDS_ENABLED" => false;
             xds_stream_channel_capacity: usize = "FERRUM_XDS_STREAM_CHANNEL_CAPACITY" => 32usize;
             mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
+            mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
+            mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
             dp_grpc_tls_ca_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CA_CERT_PATH";
             dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
@@ -1817,6 +1831,8 @@ impl EnvConfig {
             xds_enabled,
             xds_stream_channel_capacity,
             mesh_config_protocol,
+            mesh_trust_domain_aliases,
+            mesh_egress_strip_baggage_keys,
             dp_grpc_tls_ca_cert_path,
             dp_grpc_tls_client_cert_path,
             dp_grpc_tls_client_key_path,

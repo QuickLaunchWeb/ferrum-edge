@@ -136,6 +136,12 @@ pub struct MeshRuntimeConfig {
     pub hbone_listen_addr: SocketAddr,
     pub east_west_listen_port: u16,
     pub workload_spiffe_id: Option<String>,
+    /// Operator-configured trust-domain aliases — additional SPIFFE trust
+    /// domains accepted as equivalent to the peer cert's trust domain when
+    /// validating HBONE baggage `source.principal`. Default empty: strict
+    /// same-trust-domain match. Mirror of Istio
+    /// `MeshConfig.trustDomainAliases`.
+    pub trust_domain_aliases: Vec<crate::identity::TrustDomain>,
     /// Workload labels for this mesh data plane. Used by `mesh_authz`'s
     /// PolicyScope filter (and by `MeshSlice::from_gateway_config`'s
     /// WorkloadSelector matching) to decide which policies apply to this
@@ -190,6 +196,13 @@ impl MeshRuntimeConfig {
         let workload_labels =
             parse_workload_labels(resolve_ferrum_var("FERRUM_MESH_WORKLOAD_LABELS").as_deref())?;
 
+        let trust_domain_aliases = env_config
+            .mesh_trust_domain_aliases
+            .iter()
+            .map(|raw| crate::identity::TrustDomain::new(raw.as_str()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("FERRUM_MESH_TRUST_DOMAIN_ALIASES: {e}"))?;
+
         Ok(Self {
             node_id,
             namespace: env_config.namespace.clone(),
@@ -201,6 +214,7 @@ impl MeshRuntimeConfig {
             hbone_listen_addr,
             east_west_listen_port,
             workload_spiffe_id,
+            trust_domain_aliases,
             workload_labels,
         })
     }
@@ -467,11 +481,19 @@ fn inject_mesh_global_plugins(
         serde_json::json!({}),
         &runtime.namespace,
     );
+    let trust_domain_aliases: Vec<String> = runtime
+        .trust_domain_aliases
+        .iter()
+        .map(|td| td.as_str().to_string())
+        .collect();
     ensure_global_plugin(
         config,
         MESH_AUTHZ_PLUGIN_ID,
         "mesh_authz",
-        serde_json::json!({ "mesh_slice": mesh_slice }),
+        serde_json::json!({
+            "mesh_slice": mesh_slice,
+            "trust_domain_aliases": trust_domain_aliases,
+        }),
         &runtime.namespace,
     );
     ensure_global_plugin(
@@ -484,6 +506,7 @@ fn inject_mesh_global_plugins(
             "namespace": mesh_slice.namespace.clone(),
             "workload_spiffe_id": mesh_slice.workload_spiffe_id.clone(),
             "labels": mesh_slice.labels.clone(),
+            "trust_domain_aliases": trust_domain_aliases,
         }),
         &runtime.namespace,
     );
@@ -1125,6 +1148,8 @@ mod tests {
             "FERRUM_MESH_EAST_WEST_LISTEN_PORT",
             "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
             "FERRUM_MESH_WORKLOAD_LABELS",
+            "FERRUM_MESH_TRUST_DOMAIN_ALIASES",
+            "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS",
             "FERRUM_POOL_WARMUP_ENABLED",
             "FERRUM_SHUTDOWN_DRAIN_SECONDS",
         ];
@@ -1321,6 +1346,65 @@ mod tests {
     }
 
     #[test]
+    fn mesh_runtime_config_parses_trust_domain_aliases_and_egress_strip_keys() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                (
+                    "FERRUM_MESH_TRUST_DOMAIN_ALIASES",
+                    " partner.local , legacy.cluster.local ,",
+                ),
+                (
+                    "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS",
+                    " source. , mesh. ,",
+                ),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                let aliases: Vec<_> = runtime
+                    .trust_domain_aliases
+                    .iter()
+                    .map(|alias| alias.as_str())
+                    .collect();
+                assert_eq!(aliases, vec!["partner.local", "legacy.cluster.local"]);
+                assert_eq!(
+                    env.mesh_egress_strip_baggage_keys,
+                    vec!["source.".to_string(), "mesh.".to_string()]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_config_rejects_invalid_trust_domain_alias() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TRUST_DOMAIN_ALIASES", "Bad.Trust"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let err = MeshRuntimeConfig::from_env_config(&env).unwrap_err();
+                assert!(err.contains("FERRUM_MESH_TRUST_DOMAIN_ALIASES"));
+                assert!(err.contains("Bad.Trust"));
+            },
+        );
+    }
+
+    #[test]
     fn mesh_runtime_config_rejects_workload_label_without_equals() {
         with_mesh_env(
             &[
@@ -1401,6 +1485,7 @@ mod tests {
             hbone_listen_addr: "127.0.0.1:0".parse().unwrap(),
             east_west_listen_port: DEFAULT_EAST_WEST_LISTEN_PORT,
             workload_spiffe_id: None,
+            trust_domain_aliases: Vec::new(),
             workload_labels: HashMap::new(),
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
@@ -1473,6 +1558,7 @@ mod tests {
             hbone_listen_addr: "127.0.0.1:0".parse().unwrap(),
             east_west_listen_port: DEFAULT_EAST_WEST_LISTEN_PORT,
             workload_spiffe_id: None,
+            trust_domain_aliases: Vec::new(),
             workload_labels: HashMap::new(),
         }
     }

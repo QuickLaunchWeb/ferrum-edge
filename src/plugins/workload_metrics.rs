@@ -9,8 +9,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
-use crate::identity::SpiffeId;
+use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
+use crate::plugins::mesh_authz::parse_trust_domain_aliases;
 
 const MESH_SOURCE_PRINCIPAL: &str = "mesh.source.principal";
 const MESH_SOURCE_TRUST_DOMAIN: &str = "mesh.source.trust_domain";
@@ -24,6 +25,7 @@ pub struct WorkloadMetrics {
     namespace: Option<String>,
     workload_spiffe_id: Option<SpiffeId>,
     labels: HashMap<String, String>,
+    trust_domain_aliases: Vec<TrustDomain>,
 }
 
 impl WorkloadMetrics {
@@ -47,6 +49,8 @@ impl WorkloadMetrics {
                     .collect()
             })
             .unwrap_or_default();
+        let trust_domain_aliases =
+            parse_trust_domain_aliases(config).map_err(|e| format!("workload_metrics: {e}"))?;
 
         Ok(Self {
             node_id: string_config(config, "node_id"),
@@ -54,6 +58,7 @@ impl WorkloadMetrics {
             namespace: string_config(config, "namespace"),
             workload_spiffe_id,
             labels,
+            trust_domain_aliases,
         })
     }
 
@@ -61,12 +66,38 @@ impl WorkloadMetrics {
         self.insert_common_metadata(&mut ctx.metadata);
         let hbone_identity = authenticated_hbone_identity(ctx, headers);
         // For authenticated ambient HBONE, the peer cert identifies the
-        // ztunnel, while baggage identifies the originating workload.
-        let source_identity = hbone_identity
+        // ztunnel, while baggage identifies the originating workload. If the
+        // baggage identity's trust domain neither matches the peer cert's
+        // trust domain nor appears in `trust_domain_aliases`, drop it and
+        // fall back to the ztunnel's cert identity. Mirror of the gate
+        // applied by `mesh_authz`.
+        let baggage_source_principal = hbone_identity
             .as_ref()
-            .and_then(|identity| identity.source_principal.clone())
-            .or_else(|| ctx.peer_spiffe_id.clone())
-            .or_else(|| self.workload_spiffe_id.clone());
+            .and_then(|identity| identity.source_principal.clone());
+        let trust_domain_mismatch = match (
+            ctx.peer_spiffe_id.as_ref(),
+            baggage_source_principal.as_ref(),
+        ) {
+            (Some(peer), Some(baggage)) => {
+                !self.trust_domain_allowed(peer.trust_domain(), baggage.trust_domain())
+            }
+            _ => false,
+        };
+        if trust_domain_mismatch {
+            ctx.metadata.insert(
+                "mesh.ignored_baggage".to_string(),
+                "trust_domain_mismatch".to_string(),
+            );
+        }
+        let source_identity = if trust_domain_mismatch {
+            ctx.peer_spiffe_id
+                .clone()
+                .or_else(|| self.workload_spiffe_id.clone())
+        } else {
+            baggage_source_principal
+                .or_else(|| ctx.peer_spiffe_id.clone())
+                .or_else(|| self.workload_spiffe_id.clone())
+        };
         ctx.metadata.insert(
             "mesh.connection_security_policy".to_string(),
             if ctx.peer_spiffe_id.is_some() || ctx.tls_client_cert_der.is_some() {
@@ -97,6 +128,14 @@ impl WorkloadMetrics {
             ctx.metadata
                 .insert("mesh.destination.service".to_string(), destination);
         }
+    }
+
+    fn trust_domain_allowed(&self, peer_td: &TrustDomain, baggage_td: &TrustDomain) -> bool {
+        peer_td == baggage_td
+            || self
+                .trust_domain_aliases
+                .iter()
+                .any(|alias| alias == baggage_td)
     }
 
     fn insert_common_metadata(&self, metadata: &mut HashMap<String, String>) {
