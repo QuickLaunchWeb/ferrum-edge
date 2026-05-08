@@ -34,6 +34,7 @@ use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
@@ -85,6 +86,34 @@ async fn ephemeral_port() -> u16 {
     let p = listener.local_addr().unwrap().port();
     drop(listener);
     p
+}
+
+struct BoundTcpPortReservation {
+    port: u16,
+    _socket: socket2::Socket,
+}
+
+/// Reserve a TCP port without listening on it.
+///
+/// `port_is_bound()` stays false, but another process cannot bind the port
+/// before we drop the socket immediately before triggering a reload.
+fn reserve_unlistened_tcp_port() -> std::io::Result<BoundTcpPortReservation> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    socket.bind(&addr.into())?;
+    let port = socket
+        .local_addr()?
+        .as_socket()
+        .ok_or_else(|| std::io::Error::other("reserved address was not a socket address"))?
+        .port();
+    Ok(BoundTcpPortReservation {
+        port,
+        _socket: socket,
+    })
 }
 
 /// Minimal TCP stream proxy definition for the admin API.
@@ -589,10 +618,13 @@ async fn functional_stream_listener_reload_remove_and_add() {
     const MAX_ATTEMPTS: u32 = 3;
     let mut started: Option<(Child, u16, u16, u16, TempDir)> = None;
     let mut last_err = String::new();
+    let mut stream_b_reservation = None;
 
     for attempt in 1..=MAX_ATTEMPTS {
         let stream_port_a = ephemeral_port().await;
-        let stream_port_b = ephemeral_port().await;
+        let reserved_b =
+            reserve_unlistened_tcp_port().expect("reserve future stream listener port");
+        let stream_port_b = reserved_b.port;
         // Sanity: ensure they don't collide
         if stream_port_a == stream_port_b {
             continue;
@@ -633,6 +665,7 @@ plugin_configs: []
 
         if wait_for_health(admin_port).await {
             started = Some((child, stream_port_a, stream_port_b, admin_port, dir));
+            stream_b_reservation = Some(reserved_b);
             break;
         }
 
@@ -651,6 +684,8 @@ plugin_configs: []
 
     let (mut child, stream_port_a, stream_port_b, _admin_port, dir) =
         started.unwrap_or_else(|| panic!("gateway did not start: {}", last_err));
+    let stream_b_reservation =
+        stream_b_reservation.expect("stream port B reservation should accompany started gateway");
     let config_path = dir.path().join("config.yaml");
 
     // Poll until stream listener A is actually bound.
@@ -688,7 +723,9 @@ plugin_configs: []
     );
     let mut f = std::fs::File::create(&config_path).unwrap();
     f.write_all(updated.as_bytes()).unwrap();
+    f.sync_all().unwrap();
     drop(f);
+    drop(stream_b_reservation);
 
     // SIGHUP to reload.
     #[cfg(unix)]
