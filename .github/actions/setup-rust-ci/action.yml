@@ -1,0 +1,56 @@
+name: Setup Rust CI environment
+description: >-
+  Installs the stable Rust toolchain (optional components), sccache with the
+  Mozilla GHA cache, Swatinem/rust-cache, and the protoc + libcurl native
+  deps required by every Linux test/lint/perf job. Centralizes the setup
+  block so individual jobs only declare their cache key and any extra rustup
+  components.
+
+inputs:
+  shared-key:
+    description: >-
+      rust-cache shared key. Set per logical job (e.g. `ci-test`,
+      `ci-test-functional`, `ci-lint`, `ci-perf`) so caches don't trample
+      each other. Jobs that compile the same artifacts should share a key.
+    required: true
+  components:
+    description: >-
+      Comma-separated rustup components (e.g. `clippy`, `rustfmt`). Empty
+      string skips component install — most jobs don't need extras.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+        components: ${{ inputs.components }}
+
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@v0.0.10
+      continue-on-error: true
+
+    - name: Configure sccache
+      shell: bash
+      run: |
+        if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
+          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          echo "sccache enabled"
+        else
+          echo "sccache unavailable, building without cache"
+        fi
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.shared-key }}
+
+    - name: Install protoc and libcurl headers
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
