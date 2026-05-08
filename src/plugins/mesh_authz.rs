@@ -3,13 +3,31 @@
 //! Evaluates Layer 2 `MeshPolicy` rules against the SPIFFE identity extracted
 //! by `spiffe_identity` or, for ambient HBONE streams, the identity carried in
 //! the HBONE baggage metadata.
+//!
+//! ## PolicyScope enforcement
+//!
+//! Each [`crate::config::mesh::MeshPolicy`] carries a [`crate::config::mesh::PolicyScope`]
+//! that determines which workloads it applies to. Applying every policy to
+//! every workload is a security correctness gap — a namespace-scoped DENY in
+//! namespace `A` would deny traffic for workloads in namespace `B`, and a
+//! namespace-scoped ALLOW in `A` would raise the implicit-deny floor for
+//! unrelated namespaces.
+//!
+//! The plugin pre-filters `slice.mesh_policies` at construction time using
+//! [`crate::config::mesh::policy_scope_applies_to_workload`]. The hot path
+//! ([`evaluate_mesh_authorization`]) then sees only the policies that apply
+//! to **this** proxy's workload, so the per-request cost stays at the same
+//! O(policies × rules) it was before — minus any policies the scope filter
+//! discarded. Filtering is keyed on `(proxy_namespace, proxy_labels)`
+//! supplied either by the embedded `mesh_slice` (mesh mode injection) or by
+//! explicit `namespace` / `labels` config fields (direct-config / test).
 
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
 use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
-use crate::config::mesh::MeshPolicy;
+use crate::config::mesh::{MeshPolicy, PolicyScope, policy_scope_applies_to_workload};
 use crate::identity::SpiffeId;
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
@@ -38,6 +56,33 @@ impl MeshAuthz {
         } else {
             MeshSlice::default()
         };
+
+        // Allow explicit identity overrides on top of the slice-embedded
+        // namespace/labels — useful when `mesh_policies` is supplied directly
+        // (no slice context) or to override what the slice carried.
+        if let Some(value) = config.get("namespace") {
+            let namespace = value
+                .as_str()
+                .ok_or_else(|| "mesh_authz: namespace must be a string".to_string())?;
+            slice.namespace = namespace.to_string();
+        }
+        if let Some(value) = config.get("labels") {
+            let labels = serde_json::from_value::<BTreeMap<String, String>>(value.clone())
+                .map_err(|e| format!("mesh_authz: invalid labels: {e}"))?;
+            slice.labels = labels;
+        }
+
+        validate_scope_filter_identity(&slice)?;
+
+        // Pre-filter the slice's mesh_policies down to those whose `scope`
+        // applies to this proxy's workload identity. Done once at construction
+        // (cold path); the request hot path then iterates a smaller list.
+        let proxy_namespace = slice.namespace.clone();
+        let proxy_labels = slice.labels.clone();
+        slice.mesh_policies.retain(|policy| {
+            policy_scope_applies_to_workload(policy, &proxy_namespace, &proxy_labels)
+        });
+
         for policy in &mut slice.mesh_policies {
             normalize_mesh_policy_header_names(policy);
         }
@@ -69,6 +114,47 @@ impl MeshAuthz {
             }
         }
     }
+}
+
+fn validate_scope_filter_identity(slice: &MeshSlice) -> Result<(), String> {
+    let has_proxy_namespace = !slice.namespace.trim().is_empty();
+    let has_proxy_labels = !slice.labels.is_empty();
+
+    for policy in &slice.mesh_policies {
+        match &policy.scope {
+            PolicyScope::MeshWide => {}
+            PolicyScope::Namespace { .. } => {
+                if !has_proxy_namespace {
+                    return Err(format!(
+                        "mesh_authz: policy '{}' uses namespace scope but no proxy namespace is configured; set mesh_slice.namespace or namespace",
+                        policy.name
+                    ));
+                }
+            }
+            PolicyScope::WorkloadSelector { selector } => {
+                if let Some(selector_namespace) = selector.namespace.as_ref() {
+                    if !has_proxy_namespace {
+                        return Err(format!(
+                            "mesh_authz: policy '{}' uses workload selector namespace '{}' but no proxy namespace is configured; set mesh_slice.namespace or namespace",
+                            policy.name, selector_namespace
+                        ));
+                    }
+                    if selector_namespace != &slice.namespace {
+                        continue;
+                    }
+                }
+
+                if !selector.labels.is_empty() && !has_proxy_labels {
+                    return Err(format!(
+                        "mesh_authz: policy '{}' uses workload selector labels but no proxy labels are configured; set mesh_slice.labels or labels",
+                        policy.name
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[async_trait]

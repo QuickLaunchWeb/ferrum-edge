@@ -95,6 +95,45 @@ fn mesh_plugins_are_registered() {
     assert!(create_plugin("access_log", &json!({})).unwrap().is_some());
 }
 
+#[test]
+fn mesh_authz_rejects_namespace_scoped_direct_policy_without_namespace() {
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "ns-deny",
+            PolicyScope::Namespace { namespace: "default".to_string() },
+            PolicyAction::Deny,
+        )]
+    })) {
+        Ok(_) => panic!("namespace-scoped direct policy without proxy namespace must fail closed"),
+        Err(err) => err,
+    };
+
+    assert!(err.contains("namespace scope"));
+    assert!(err.contains("proxy namespace"));
+}
+
+#[test]
+fn mesh_authz_rejects_label_selector_direct_policy_without_labels() {
+    let selector = WorkloadSelector {
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+        namespace: None,
+    };
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "app-deny",
+            PolicyScope::WorkloadSelector { selector },
+            PolicyAction::Deny,
+        )],
+        "namespace": "default",
+    })) {
+        Ok(_) => panic!("label-scoped direct policy without proxy labels must fail closed"),
+        Err(err) => err,
+    };
+
+    assert!(err.contains("workload selector labels"));
+    assert!(err.contains("proxy labels"));
+}
+
 #[tokio::test]
 async fn mesh_authz_allows_matching_spiffe_identity() {
     let plugin = MeshAuthz::new(&json!({
@@ -787,4 +826,318 @@ async fn access_log_is_all_protocol_logging_plugin() {
     assert_eq!(plugin.priority(), priority::ACCESS_LOG);
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
     plugin.log(&TransactionSummary::default()).await;
+}
+
+// ── PolicyScope enforcement tests ────────────────────────────────────────────
+//
+// These tests pin the security-correctness contract that `mesh_authz`
+// honors `PolicyScope`. Before this fix, every policy in `slice.mesh_policies`
+// applied to every workload regardless of scope, which let a namespace-scoped
+// DENY in namespace `A` reject traffic in namespace `B`, and a namespace- /
+// workload-scoped ALLOW raise the implicit-deny floor for unrelated proxies.
+
+fn policy_with_scope(name: &str, scope: PolicyScope, action: PolicyAction) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: "default".to_string(),
+        scope,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: Vec::new(),
+            never_matches: false,
+            action,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn mesh_authz_mesh_wide_allow_applies_to_any_workload() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "mesh-wide-allow",
+            PolicyScope::MeshWide,
+            PolicyAction::Allow,
+        )],
+        "namespace": "billing",
+        "labels": {"app": "api"},
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(None);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn mesh_authz_namespace_scoped_allow_does_not_affect_other_namespaces() {
+    // Cross-namespace ALLOW must NOT raise `saw_allow` for an unrelated proxy.
+    // Pre-fix: this returned Reject{implicit-deny}.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "ns-a-allow",
+            PolicyScope::Namespace { namespace: "team-a".to_string() },
+            PolicyAction::Allow,
+        )],
+        "namespace": "team-b",
+        "labels": {},
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/team-b/sa/client"));
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "namespace-scoped ALLOW in team-a must not implicit-deny team-b traffic, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_namespace_scoped_allow_applies_in_matching_namespace() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "ns-a-allow",
+            PolicyScope::Namespace { namespace: "team-a".to_string() },
+            PolicyAction::Allow,
+        )],
+        "namespace": "team-a",
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/team-a/sa/client"));
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    // Allow rule has no `from` — empty principals match anything → matched_allow.
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn mesh_authz_namespace_scoped_deny_only_denies_in_matching_namespace() {
+    // DENY in team-a must not deny team-b.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "ns-a-deny",
+            PolicyScope::Namespace { namespace: "team-a".to_string() },
+            PolicyAction::Deny,
+        )],
+        "namespace": "team-b",
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/team-b/sa/client"));
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "namespace-scoped DENY in team-a must not deny team-b traffic, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_namespace_scoped_deny_denies_in_matching_namespace() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "ns-a-deny",
+            PolicyScope::Namespace { namespace: "team-a".to_string() },
+            PolicyAction::Deny,
+        )],
+        "namespace": "team-a",
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/team-a/sa/client"));
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected reject, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("ns-a-deny")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_workload_selector_subset_match_applies() {
+    let selector = WorkloadSelector {
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+        namespace: None,
+    };
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "wl-allow",
+            PolicyScope::WorkloadSelector { selector },
+            PolicyAction::Allow,
+        )],
+        "labels": {"app": "api", "tier": "frontend"},
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/api"));
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn mesh_authz_workload_selector_missing_label_does_not_affect_unrelated_workloads() {
+    // Selector requires `app=api`; this workload has `app=worker` → policy must
+    // NOT apply, so the unrelated proxy continues as if the policy were absent.
+    let selector = WorkloadSelector {
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+        namespace: None,
+    };
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "wl-allow",
+            PolicyScope::WorkloadSelector { selector },
+            PolicyAction::Allow,
+        )],
+        "labels": {"app": "worker"},
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/worker"));
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "WorkloadSelector ALLOW for app=api must not implicit-deny app=worker, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_workload_selector_empty_labels_matches_any_workload() {
+    // Empty labels + no namespace → applies to any workload (legacy behavior
+    // preserved). Existing tests rely on this; this test pins the contract.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "wl-any-allow",
+            PolicyScope::WorkloadSelector { selector: WorkloadSelector::default() },
+            PolicyAction::Allow,
+        )],
+        "namespace": "anything",
+        "labels": {"role": "backend"},
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/anything/sa/anyone"));
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn mesh_authz_workload_selector_namespace_and_labels_combined() {
+    // Selector requires both namespace=team-a AND app=api. Proxy is namespace
+    // team-a but app=worker → policy must NOT apply.
+    let selector = WorkloadSelector {
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+        namespace: Some("team-a".to_string()),
+    };
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "wl-team-a-api-allow",
+            PolicyScope::WorkloadSelector { selector },
+            PolicyAction::Allow,
+        )],
+        "namespace": "team-a",
+        "labels": {"app": "worker"},
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/team-a/sa/worker"));
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn mesh_authz_workload_selector_namespace_mismatch_does_not_apply() {
+    // Selector requires namespace=team-a (with empty labels = any workload in
+    // team-a). Proxy is in team-b → policy must NOT apply.
+    let selector = WorkloadSelector {
+        labels: HashMap::new(),
+        namespace: Some("team-a".to_string()),
+    };
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "wl-team-a-allow",
+            PolicyScope::WorkloadSelector { selector },
+            PolicyAction::Allow,
+        )],
+        "namespace": "team-b",
+        "labels": {},
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/team-b/sa/anyone"));
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn mesh_authz_cross_namespace_deny_and_in_namespace_allow_compose_correctly() {
+    // The original bug surfaces here: a Namespace{team-a} DENY plus a
+    // MeshWide ALLOW. Pre-fix: the team-a DENY would return Reject regardless
+    // of which namespace the proxy lived in. Post-fix: in team-b only the
+    // MeshWide ALLOW applies → Continue.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [
+            policy_with_scope(
+                "team-a-deny",
+                PolicyScope::Namespace { namespace: "team-a".to_string() },
+                PolicyAction::Deny,
+            ),
+            policy_with_scope(
+                "mesh-wide-allow",
+                PolicyScope::MeshWide,
+                PolicyAction::Allow,
+            ),
+        ],
+        "namespace": "team-b",
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/team-b/sa/client"));
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn mesh_authz_slice_embedded_identity_drives_scope_filter() {
+    // mesh-mode injection passes a full `mesh_slice` whose `namespace` and
+    // `labels` describe the proxy's own workload. The plugin must use those
+    // when filtering policies — explicit namespace/labels override is not
+    // required when the slice already carries the identity.
+    use ferrum_edge::xds::slice::MeshSlice;
+
+    let slice = MeshSlice {
+        namespace: "team-b".to_string(),
+        labels: [("app".to_string(), "worker".to_string())]
+            .into_iter()
+            .collect(),
+        mesh_policies: vec![policy_with_scope(
+            "team-a-deny",
+            PolicyScope::Namespace {
+                namespace: "team-a".to_string(),
+            },
+            PolicyAction::Deny,
+        )],
+        ..MeshSlice::default()
+    };
+    let plugin = MeshAuthz::new(&json!({"mesh_slice": slice})).expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/team-b/sa/worker"));
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    // Pre-fix: team-a-deny would deny team-b traffic. Post-fix: filtered out.
+    assert!(matches!(result, PluginResult::Continue));
 }

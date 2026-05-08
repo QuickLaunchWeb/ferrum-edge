@@ -136,6 +136,13 @@ pub struct MeshRuntimeConfig {
     pub hbone_listen_addr: SocketAddr,
     pub east_west_listen_port: u16,
     pub workload_spiffe_id: Option<String>,
+    /// Workload labels for this mesh data plane. Used by `mesh_authz`'s
+    /// PolicyScope filter (and by `MeshSlice::from_gateway_config`'s
+    /// WorkloadSelector matching) to decide which policies apply to this
+    /// proxy's workload. Sourced from `FERRUM_MESH_WORKLOAD_LABELS`
+    /// (`key1=val1,key2=val2`); empty when unset. The Kubernetes injector
+    /// (Phase D) can populate this from pod labels via the downward API.
+    pub workload_labels: std::collections::HashMap<String, String>,
 }
 
 impl MeshRuntimeConfig {
@@ -180,6 +187,8 @@ impl MeshRuntimeConfig {
             parse_port("FERRUM_MESH_EAST_WEST_LISTEN_PORT", &east_west_port_raw)?;
         let workload_spiffe_id = resolve_ferrum_var("FERRUM_MESH_WORKLOAD_SPIFFE_ID")
             .filter(|value| !value.trim().is_empty());
+        let workload_labels =
+            parse_workload_labels(resolve_ferrum_var("FERRUM_MESH_WORKLOAD_LABELS").as_deref())?;
 
         Ok(Self {
             node_id,
@@ -192,6 +201,7 @@ impl MeshRuntimeConfig {
             hbone_listen_addr,
             east_west_listen_port,
             workload_spiffe_id,
+            workload_labels,
         })
     }
 
@@ -200,7 +210,7 @@ impl MeshRuntimeConfig {
             node_id: self.node_id.clone(),
             namespace: self.namespace.clone(),
             workload_spiffe_id: self.workload_spiffe_id.clone(),
-            labels: Default::default(),
+            labels: self.workload_labels.clone(),
         }
     }
 
@@ -231,7 +241,11 @@ impl MeshRuntimeConfig {
             node_id: self.node_id.clone(),
             namespace: self.namespace.clone(),
             workload_spiffe_id: self.workload_spiffe_id.clone(),
-            labels: Default::default(),
+            labels: self
+                .workload_labels
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         }
     }
 }
@@ -1031,6 +1045,41 @@ fn parse_socket_addr(key: &str, raw: &str) -> Result<SocketAddr, String> {
         .map_err(|e| format!("{key} must be a socket address (got '{raw}'): {e}"))
 }
 
+/// Parse `FERRUM_MESH_WORKLOAD_LABELS` (`k1=v1,k2=v2`). Empty / `None` returns
+/// an empty map. Whitespace around keys/values is trimmed; empty entries are
+/// skipped (so a trailing `,` is harmless). Duplicate keys are rejected so the
+/// operator catches a typo immediately.
+fn parse_workload_labels(
+    raw: Option<&str>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut labels = std::collections::HashMap::new();
+    let Some(raw) = raw else {
+        return Ok(labels);
+    };
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (key, value) = entry.split_once('=').ok_or_else(|| {
+            format!("FERRUM_MESH_WORKLOAD_LABELS entry '{entry}' must be in 'key=value' form")
+        })?;
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() {
+            return Err(format!(
+                "FERRUM_MESH_WORKLOAD_LABELS entry '{entry}' has an empty key"
+            ));
+        }
+        if labels.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(format!(
+                "FERRUM_MESH_WORKLOAD_LABELS contains duplicate key '{key}'"
+            ));
+        }
+    }
+    Ok(labels)
+}
+
 fn parse_port(key: &str, raw: &str) -> Result<u16, String> {
     let port = raw
         .parse::<u16>()
@@ -1075,6 +1124,7 @@ mod tests {
             "FERRUM_MESH_HBONE_LISTEN_ADDR",
             "FERRUM_MESH_EAST_WEST_LISTEN_PORT",
             "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+            "FERRUM_MESH_WORKLOAD_LABELS",
             "FERRUM_POOL_WARMUP_ENABLED",
             "FERRUM_SHUTDOWN_DRAIN_SECONDS",
         ];
@@ -1235,6 +1285,83 @@ mod tests {
     }
 
     #[test]
+    fn mesh_runtime_config_parses_workload_labels() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_WORKLOAD_LABELS", " app = api , version=v1 , ,"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                assert_eq!(runtime.workload_labels.len(), 2);
+                assert_eq!(
+                    runtime.workload_labels.get("app").map(String::as_str),
+                    Some("api")
+                );
+                assert_eq!(
+                    runtime.workload_labels.get("version").map(String::as_str),
+                    Some("v1")
+                );
+                let request = runtime.mesh_slice_request();
+                assert_eq!(request.labels.get("app").map(String::as_str), Some("api"));
+                assert_eq!(
+                    request.labels.get("version").map(String::as_str),
+                    Some("v1")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_config_rejects_workload_label_without_equals() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_WORKLOAD_LABELS", "appapi"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let err = MeshRuntimeConfig::from_env_config(&env).unwrap_err();
+                assert!(err.contains("FERRUM_MESH_WORKLOAD_LABELS"));
+                assert!(err.contains("key=value"));
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_config_rejects_duplicate_workload_label_key() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_WORKLOAD_LABELS", "app=api,app=worker"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let err = MeshRuntimeConfig::from_env_config(&env).unwrap_err();
+                assert!(err.contains("duplicate key"));
+            },
+        );
+    }
+
+    #[test]
     fn mesh_runtime_config_rejects_bad_topology() {
         with_mesh_env(
             &[
@@ -1274,6 +1401,7 @@ mod tests {
             hbone_listen_addr: "127.0.0.1:0".parse().unwrap(),
             east_west_listen_port: DEFAULT_EAST_WEST_LISTEN_PORT,
             workload_spiffe_id: None,
+            workload_labels: HashMap::new(),
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
         let mesh_state = MeshRuntimeState::new();
@@ -1345,6 +1473,7 @@ mod tests {
             hbone_listen_addr: "127.0.0.1:0".parse().unwrap(),
             east_west_listen_port: DEFAULT_EAST_WEST_LISTEN_PORT,
             workload_spiffe_id: None,
+            workload_labels: HashMap::new(),
         }
     }
 

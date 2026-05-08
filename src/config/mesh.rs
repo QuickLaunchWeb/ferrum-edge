@@ -207,6 +207,82 @@ pub struct ConditionMatch {
     pub not_values: Vec<String>,
 }
 
+/// Abstraction over per-workload label maps.
+///
+/// `mesh_authz` carries labels in a `BTreeMap<String, String>` (the
+/// canonical [`crate::xds::slice::MeshSlice`] form), the Kubernetes injector
+/// keeps them in a `HashMap`, and tests freely build either. This trait lets
+/// the scope-matching helpers below accept any of those without copying.
+pub trait WorkloadLabels {
+    fn lookup(&self, key: &str) -> Option<&str>;
+}
+
+impl<S: ::std::hash::BuildHasher> WorkloadLabels for HashMap<String, String, S> {
+    #[inline]
+    fn lookup(&self, key: &str) -> Option<&str> {
+        self.get(key).map(String::as_str)
+    }
+}
+
+impl WorkloadLabels for ::std::collections::BTreeMap<String, String> {
+    #[inline]
+    fn lookup(&self, key: &str) -> Option<&str> {
+        self.get(key).map(String::as_str)
+    }
+}
+
+/// Returns `true` when `policy.scope` applies to a workload whose namespace is
+/// `proxy_namespace` and whose labels are `proxy_labels`.
+///
+/// This is the **single canonical scope-matching helper** used by both the
+/// xDS / native MeshSubscribe slice builder ([`crate::xds::slice::MeshSlice::from_gateway_config`])
+/// and the `mesh_authz` plugin's per-policy filter so that scope semantics
+/// stay byte-identical across the two surfaces.
+///
+/// Semantics:
+/// - [`PolicyScope::MeshWide`] — applies to every workload.
+/// - [`PolicyScope::Namespace`] — applies iff `proxy_namespace == policy.scope.namespace`.
+/// - [`PolicyScope::WorkloadSelector`] — applies iff (a) the selector's
+///   namespace is unset or equal to `proxy_namespace` AND (b) every
+///   `(key, value)` in `selector.labels` is present in `proxy_labels` with the
+///   same value (subset match — empty selector labels means "any workload in
+///   the optional namespace").
+pub fn policy_scope_applies_to_workload<L: WorkloadLabels + ?Sized>(
+    policy: &MeshPolicy,
+    proxy_namespace: &str,
+    proxy_labels: &L,
+) -> bool {
+    match &policy.scope {
+        PolicyScope::MeshWide => true,
+        PolicyScope::Namespace {
+            namespace: policy_namespace,
+        } => policy_namespace == proxy_namespace,
+        PolicyScope::WorkloadSelector { selector } => {
+            workload_selector_matches(selector, proxy_namespace, proxy_labels)
+        }
+    }
+}
+
+/// Returns `true` when a [`WorkloadSelector`] matches a workload whose
+/// namespace is `proxy_namespace` and whose labels are `proxy_labels`. Same
+/// shape as [`policy_scope_applies_to_workload`]; lifted so PeerAuthentication
+/// selector matching shares the same predicate.
+pub fn workload_selector_matches<L: WorkloadLabels + ?Sized>(
+    selector: &WorkloadSelector,
+    proxy_namespace: &str,
+    proxy_labels: &L,
+) -> bool {
+    if let Some(selector_namespace) = selector.namespace.as_ref()
+        && selector_namespace != proxy_namespace
+    {
+        return false;
+    }
+    selector
+        .labels
+        .iter()
+        .all(|(key, value)| proxy_labels.lookup(key) == Some(value.as_str()))
+}
+
 // ── PeerAuthentication ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
