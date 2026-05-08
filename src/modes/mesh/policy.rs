@@ -3,11 +3,16 @@
 //! This is the Layer 5 policy core used by the future `mesh_authz` plugin.
 //! It evaluates the Layer 2 `MeshPolicy` model without changing the plugin
 //! trait or proxy hot path.
+//! Path matching is intentionally literal; callers must pass already-normalized
+//! request paths when they want dot-segment, slash, or percent-decoding policy.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
 
-use crate::config::mesh::{ConditionMatch, MeshRule, PolicyAction, PrincipalMatch, RequestMatch};
+use crate::config::mesh::{
+    ConditionMatch, MeshRule, PolicyAction, PrincipalMatch, RequestMatch,
+    normalize_mesh_policy_header_map,
+};
 use crate::identity::SpiffeId;
 use crate::xds::slice::MeshSlice;
 
@@ -164,8 +169,7 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
         return false;
     }
     for (name, pattern) in &match_.headers {
-        let key = name.to_ascii_lowercase();
-        let Some(value) = request.headers.get(&key).map(String::as_str) else {
+        let Some(value) = request_header_value(&request.headers, name) else {
             return false;
         };
         if !wildcard_match(pattern, value) {
@@ -173,6 +177,16 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
         }
     }
     true
+}
+
+fn request_header_value<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'a str> {
+    headers.get(name).map(String::as_str).or_else(|| {
+        if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            headers.get(&name.to_ascii_lowercase()).map(String::as_str)
+        } else {
+            None
+        }
+    })
 }
 
 fn normalize_match_host(host: &str) -> Option<String> {
@@ -244,27 +258,81 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
     if pattern == "*" {
         return true;
     }
-    let mut remaining = value;
-    let mut parts = pattern.split('*').peekable();
-    let first = parts.next().unwrap_or_default();
-    if !remaining.starts_with(first) {
-        return false;
+
+    if !pattern.contains('*') {
+        return pattern == value;
     }
-    remaining = &remaining[first.len()..];
+
+    let anchored_start = !pattern.starts_with('*');
+    let anchored_end = !pattern.ends_with('*');
+    let mut parts = pattern
+        .split('*')
+        .filter(|part| !part.is_empty())
+        .peekable();
+    if parts.peek().is_none() {
+        return true;
+    }
+
+    let mut value_pos = 0usize;
+    let mut value_limit = value.len();
+
+    if anchored_start {
+        let Some(first) = parts.next() else {
+            return true;
+        };
+        if !value.starts_with(first) {
+            return false;
+        }
+        value_pos = first.len();
+    }
+
+    if anchored_end {
+        let Some(last) = pattern.rsplit('*').find(|part| !part.is_empty()) else {
+            return true;
+        };
+        if !value.ends_with(last) {
+            return false;
+        }
+        let suffix_start = value.len() - last.len();
+        if suffix_start < value_pos {
+            return false;
+        }
+        value_limit = suffix_start;
+    }
 
     while let Some(part) = parts.next() {
-        if part.is_empty() {
-            continue;
+        if anchored_end && parts.peek().is_none() {
+            break;
         }
-        let Some(index) = remaining.find(part) else {
+        let Some(index) = value[value_pos..value_limit].find(part) else {
             return false;
         };
-        remaining = &remaining[index + part.len()..];
-        if parts.peek().is_none() && !pattern.ends_with('*') && !remaining.is_empty() {
-            return false;
+        value_pos += index + part.len();
+    }
+
+    true
+}
+
+pub(crate) fn normalize_mesh_policy_header_names(policy: &mut crate::config::mesh::MeshPolicy) {
+    for rule in &mut policy.rules {
+        for request in &mut rule.to {
+            normalize_mesh_policy_header_map(&mut request.headers);
         }
     }
-    pattern.ends_with('*') || remaining.is_empty()
+}
+
+pub(crate) fn mesh_policy_has_header_rules(policy: &crate::config::mesh::MeshPolicy) -> bool {
+    policy
+        .rules
+        .iter()
+        .flat_map(|rule| &rule.to)
+        .any(|request| !request.headers.is_empty())
+}
+
+pub(crate) fn mesh_policies_have_header_rules(
+    policies: &[crate::config::mesh::MeshPolicy],
+) -> bool {
+    policies.iter().any(mesh_policy_has_header_rules)
 }
 
 #[cfg(test)]
@@ -386,6 +454,88 @@ mod tests {
             evaluate_mesh_authorization(&slice, &request),
             MeshAuthzDecision::Allow
         );
+    }
+
+    #[test]
+    fn wildcard_match_respects_suffix_anchor_with_repeated_literals() {
+        assert!(wildcard_match("*foo", "barfoofoo"));
+        assert!(wildcard_match(
+            "spiffe://*/sa/admin",
+            "spiffe://cluster.local/ns/sa/sa/admin"
+        ));
+        assert!(!wildcard_match("*foo", "barfoobar"));
+        assert!(!wildcard_match("foo*foo", "foo"));
+    }
+
+    #[test]
+    fn wildcard_match_handles_degenerate_patterns_without_panics() {
+        assert!(wildcard_match("exact", "exact"));
+        assert!(!wildcard_match("exact", "other"));
+        assert!(wildcard_match("*", ""));
+        assert!(wildcard_match("**", ""));
+        assert!(wildcard_match("***", "anything"));
+        assert!(wildcard_match("a**b", "ab"));
+        assert!(wildcard_match("a**b", "axxb"));
+        assert!(!wildcard_match("a**b", "ac"));
+        assert!(wildcard_match("", ""));
+        assert!(!wildcard_match("", "anything"));
+        assert!(!wildcard_match("*suffix", ""));
+    }
+
+    #[test]
+    fn normalize_mesh_policy_header_names_lowercases_keys_once() {
+        let mut policy = MeshPolicy {
+            name: "headers".to_string(),
+            namespace: "default".to_string(),
+            scope: PolicyScope::MeshWide,
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: vec![RequestMatch {
+                    headers: BTreeMap::from([("X-Tenant".to_string(), "prod".to_string())])
+                        .into_iter()
+                        .collect(),
+                    ..RequestMatch::default()
+                }],
+                when: Vec::new(),
+                action: PolicyAction::Allow,
+                never_matches: false,
+            }],
+        };
+
+        normalize_mesh_policy_header_names(&mut policy);
+
+        assert!(mesh_policy_has_header_rules(&policy));
+        assert!(policy.rules[0].to[0].headers.contains_key("x-tenant"));
+        assert!(!policy.rules[0].to[0].headers.contains_key("X-Tenant"));
+    }
+
+    #[test]
+    fn normalize_mesh_policy_header_names_preserves_case_collisions() {
+        let mut policy = MeshPolicy {
+            name: "headers".to_string(),
+            namespace: "default".to_string(),
+            scope: PolicyScope::MeshWide,
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: vec![RequestMatch {
+                    headers: BTreeMap::from([
+                        ("X-Tenant".to_string(), "prod".to_string()),
+                        ("x-tenant".to_string(), "dev".to_string()),
+                    ])
+                    .into_iter()
+                    .collect(),
+                    ..RequestMatch::default()
+                }],
+                when: Vec::new(),
+                action: PolicyAction::Allow,
+                never_matches: false,
+            }],
+        };
+
+        normalize_mesh_policy_header_names(&mut policy);
+
+        assert!(policy.rules[0].to[0].headers.contains_key("X-Tenant"));
+        assert!(policy.rules[0].to[0].headers.contains_key("x-tenant"));
     }
 
     #[test]
