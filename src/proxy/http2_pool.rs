@@ -1121,39 +1121,27 @@ mod tests {
 
     /// Fix 2: even when `shard_count` is small (e.g., 4), the seeded RR
     /// counter should cover all shards within a few draws — not get stuck
-    /// on one position. This validates that the modulo distribution is
-    /// not degenerate on common shard counts.
+    /// on one position. Once a host's RR counter is initialized from any
+    /// seed, `fetch_add(1) % shard_count` must visit every shard in exactly
+    /// `shard_count` picks.
     #[test]
     fn rr_seed_spans_all_shards_for_small_shard_counts() {
         for &shard_count in &[2usize, 4, 8, 16] {
-            let mut visited = vec![false; shard_count];
-            // 64 draws is ~16x the shard count — coupon-collector
-            // expectation says every shard is hit with overwhelming
-            // probability. If the seed is deterministic and modular bias
-            // is pathological we would miss a shard.
-            let mut rr = AtomicUsize::new(rr_seed());
-            for _ in 0..64 {
-                let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
-                visited[start] = true;
-                // Recreate the counter occasionally so we emulate the
-                // cold-start seed path on many distinct hosts.
-                if rand_lite().is_multiple_of(8) {
-                    rr = AtomicUsize::new(rr_seed());
+            for _ in 0..32 {
+                let rr = AtomicUsize::new(rr_seed());
+                let mut visited = vec![false; shard_count];
+                for _ in 0..shard_count {
+                    let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
+                    visited[start] = true;
                 }
+                assert!(
+                    visited.iter().all(|v| *v),
+                    "shard_count={} should have visited all shards, got {:?}",
+                    shard_count,
+                    visited
+                );
             }
-            assert!(
-                visited.iter().all(|v| *v),
-                "shard_count={} should have visited all shards, got {:?}",
-                shard_count,
-                visited
-            );
         }
-    }
-
-    /// Bare-bones pseudo-random helper for the test above. Reads from the
-    /// thread-local state directly by re-calling `rr_seed`.
-    fn rand_lite() -> usize {
-        rr_seed()
     }
 
     /// Fix 1: source-level assertion that the 5 ms timeout branch has
