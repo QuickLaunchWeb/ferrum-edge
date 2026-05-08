@@ -172,6 +172,10 @@ async fn run_auth_impl<M: AuthMechanism>(
                 external_identity,
                 external_identity_header,
             } => {
+                let consumer_identified = consumer.is_some();
+                let external_identity_identified =
+                    allow_external_identity && external_identity.is_some();
+
                 if let Some(consumer) = consumer
                     && ctx.identified_consumer.is_none()
                 {
@@ -192,7 +196,11 @@ async fn run_auth_impl<M: AuthMechanism>(
                     }
                 }
 
-                ctx.auth_method = Some(mechanism.mechanism_name());
+                if ctx.auth_method.is_none()
+                    && (consumer_identified || external_identity_identified)
+                {
+                    ctx.auth_method = Some(mechanism.mechanism_name());
+                }
                 PluginResult::Continue
             }
             VerifyOutcome::NotApplicable => PluginResult::Continue,
@@ -460,6 +468,25 @@ mod tests {
 
         run_auth(&mechanism, &mut ctx, &index).await;
 
+        assert!(ctx.auth_method.is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_method_none_when_success_establishes_no_identity() {
+        let mechanism = FakeMechanism {
+            extracted: ExtractedCredential::BearerToken("token".to_string()),
+            outcome: VerifyOutcome::Success {
+                consumer: None,
+                external_identity: None,
+                external_identity_header: None,
+            },
+        };
+        let mut ctx = test_ctx();
+        let index = ConsumerIndex::new(&[]);
+
+        run_auth_external_identity(&mechanism, &mut ctx, &index).await;
+
+        assert!(ctx.effective_identity().is_none());
         assert!(ctx.auth_method.is_none());
     }
 
