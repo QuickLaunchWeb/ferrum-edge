@@ -221,8 +221,7 @@ fn test_grpc_error_response_resource_exhausted() {
 // Post-refactor, gRPC is no longer a backend_scheme — it is detected
 // per-request via the content-type header. A gRPC proxy is configured with
 // scheme `http` (plaintext) or `https` (TLS) and content-type routing picks
-// the gRPC dispatch path. The old `grpc`/`grpcs` scheme strings are only
-// accepted by the DB loader's `parse_scheme` for legacy DB migration.
+// the gRPC dispatch path.
 
 #[test]
 fn test_backend_scheme_display() {

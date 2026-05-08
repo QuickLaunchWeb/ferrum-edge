@@ -910,7 +910,8 @@ mod inner {
     }
 
     /// Convert a BSON `Document` back into a domain `Proxy`.
-    fn doc_to_proxy(doc: Document) -> Result<Proxy, anyhow::Error> {
+    fn doc_to_proxy(mut doc: Document) -> Result<Proxy, anyhow::Error> {
+        doc.remove("_id");
         let proxy: Proxy = mongodb::bson::from_document(doc)?;
         Ok(proxy)
     }

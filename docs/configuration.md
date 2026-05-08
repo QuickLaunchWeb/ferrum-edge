@@ -82,8 +82,6 @@ This page is the canonical human-readable reference for `FERRUM_*` variables and
 | `FERRUM_DB_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for database mTLS. SQL requires pairing with `FERRUM_DB_TLS_CLIENT_KEY_PATH`; MongoDB may use this alone as an already-combined cert+key PEM |
 | `FERRUM_DB_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for database mTLS; must be paired with `FERRUM_DB_TLS_CLIENT_CERT_PATH` |
 
-Deprecated aliases `FERRUM_DB_SSL_MODE`, `FERRUM_DB_SSL_ROOT_CERT`, `FERRUM_DB_SSL_CLIENT_CERT`, `FERRUM_DB_SSL_CLIENT_KEY`, `FERRUM_DB_TLS_ENABLED`, and `FERRUM_DB_TLS_INSECURE` are accepted for compatibility and emit startup warnings. Prefer the canonical variables above.
-
 See [database_tls.md](database_tls.md) for detailed configuration examples and TLS mode descriptions.
 
 ### Database Pool

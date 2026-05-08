@@ -240,9 +240,8 @@ fn test_load_shared_example_config_fixture() {
 // accepts canonical schemes (http, https, tcp, tcps, udp, dtls). Former
 // protocol values (ws, wss, grpc, grpcs) are detected per-request from the
 // incoming traffic (`HttpFlavor`). Backend H3 selection is runtime capability-
-// driven for HTTPS backends. Serde rejects unknown enum values, so legacy
-// aliases are no longer accepted via file loading (the db_loader `parse_scheme`
-// still tolerates them).
+// driven for HTTPS backends. Serde rejects unknown enum values, so old
+// protocol spellings are not accepted via file loading.
 
 #[test]
 fn test_all_backend_schemes() {
@@ -312,10 +311,10 @@ plugin_configs: []
 }
 
 #[test]
-fn test_legacy_h3_alias_rejected_by_file_loader() {
+fn test_h3_scheme_rejected_by_file_loader() {
     let yaml = r#"
 proxies:
-  - id: "legacy-h3-alias"
+  - id: "h3-scheme"
     listen_path: "/v1"
     backend_scheme: h3
     backend_host: "localhost"
@@ -332,10 +331,10 @@ plugin_configs: []
         &ferrum_edge::config::BackendAllowIps::Both,
         "ferrum",
     );
-    let err = config.expect_err("legacy h3 alias should be rejected by serde file loading");
+    let err = config.expect_err("h3 scheme should be rejected by serde file loading");
     assert!(
         err.to_string().contains("unknown variant") || err.to_string().contains("h3"),
-        "error should mention the unsupported legacy alias: {}",
+        "error should mention the unsupported scheme: {}",
         err
     );
 }

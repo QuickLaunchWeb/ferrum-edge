@@ -401,7 +401,7 @@ FERRUM_MODE=file \
 
 ### Environment Variable Changes
 
-New Ferrum versions may introduce new `FERRUM_*` environment variables. Review `ferrum.conf` in the release for new defaults. Deprecated database TLS aliases (`FERRUM_DB_SSL_MODE`, `FERRUM_DB_SSL_ROOT_CERT`, `FERRUM_DB_SSL_CLIENT_CERT`, `FERRUM_DB_SSL_CLIENT_KEY`, `FERRUM_DB_TLS_ENABLED`, `FERRUM_DB_TLS_INSECURE`) are still accepted with startup warnings; rename them to the canonical `FERRUM_DB_TLS_*` variables before a future major release.
+New Ferrum versions may introduce new `FERRUM_*` environment variables. Review `ferrum.conf` in the release for new defaults.
 
 ### Logging Metadata Redaction
 

@@ -697,10 +697,8 @@ fn default_retry_on_connect_failure() -> bool {
 ///   by `listen_port`.
 ///
 /// `Tcps` follows the `http`/`https`, `ws`/`wss`, pattern (serde name `"tcps"`).
-/// Only the canonical six scheme names are accepted on the serde boundary.
-/// Legacy `BackendProtocol` field names and variant spellings are not
-/// supported for file-mode compatibility; operators should migrate configs
-/// to `backend_scheme` before loading them.
+/// Only the canonical six scheme names are accepted on the serde and database
+/// boundaries.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendScheme {
@@ -905,6 +903,7 @@ pub enum PluginScope {
 /// proxies (`tcp`/`tcp_tls`/`udp`/`dtls`) route on `listen_port` and MUST NOT
 /// set `listen_path`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Proxy {
     #[serde(default)]
     pub id: String,

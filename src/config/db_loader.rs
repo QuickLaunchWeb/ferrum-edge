@@ -4885,29 +4885,18 @@ pub(crate) fn diff_removed(known: &HashSet<String>, current: &HashSet<String>) -
 }
 
 /// Parse a stored backend scheme string into the canonical 6-variant
-/// `BackendScheme`. Legacy 11-variant `BackendProtocol` values from older
-/// schema versions are accepted as aliases and canonicalized on load:
-///
-/// - `http`, `ws`, `grpc`   → `Http`
-/// - `https`, `wss`, `grpcs`, `h3` → `Https`
-/// - `tcp`                  → `Tcp`
-/// - `tcp_tls`, `tcps`      → `Tcps`
-/// - `udp`                  → `Udp`
-/// - `dtls`                 → `Dtls`
-///
-/// Unrecognized values fall back to `Http` (the safest plaintext default).
-/// The `h3` legacy alias now canonicalizes directly to `Https`; backend H3
-/// selection is handled by the runtime capability registry instead of a
-/// separate config flag.
-pub(crate) fn parse_scheme(s: &str) -> BackendScheme {
+/// `BackendScheme`.
+pub(crate) fn parse_scheme(s: &str) -> Result<BackendScheme, String> {
     match s.to_lowercase().as_str() {
-        "https" | "wss" | "grpcs" | "h3" => BackendScheme::Https,
-        "http" | "ws" | "grpc" => BackendScheme::Http,
-        "tcp" => BackendScheme::Tcp,
-        "tcps" | "tcp_tls" => BackendScheme::Tcps,
-        "udp" => BackendScheme::Udp,
-        "dtls" => BackendScheme::Dtls,
-        _ => BackendScheme::Http,
+        "http" => Ok(BackendScheme::Http),
+        "https" => Ok(BackendScheme::Https),
+        "tcp" => Ok(BackendScheme::Tcp),
+        "tcps" => Ok(BackendScheme::Tcps),
+        "udp" => Ok(BackendScheme::Udp),
+        "dtls" => Ok(BackendScheme::Dtls),
+        _ => Err(format!(
+            "unsupported backend_scheme '{s}' (expected one of: http, https, tcp, tcps, udp, dtls)"
+        )),
     }
 }
 
@@ -4926,20 +4915,11 @@ fn row_to_proxy(
 ) -> Result<Proxy, anyhow::Error> {
     // Clone id for use in error messages (the original is moved into the Proxy struct).
     let pid = id.clone();
-    // Prefer the new `backend_scheme` column; fall back to the legacy
-    // `backend_protocol` column for dev databases carried over from the
-    // 11-variant era. `parse_scheme` accepts both vocabularies.
-    let scheme_str: String = match row.try_get::<String, _>("backend_scheme") {
-        Ok(s) => s,
-        Err(_) => row.try_get::<String, _>("backend_protocol").map_err(|e| {
-            anyhow::anyhow!(
-                "Proxy {}: failed to read backend_scheme/backend_protocol: {}",
-                pid,
-                e
-            )
-        })?,
-    };
-    let backend_scheme = parse_scheme(&scheme_str);
+    let scheme_str: String = row
+        .try_get::<String, _>("backend_scheme")
+        .map_err(|e| anyhow::anyhow!("Proxy {}: failed to read backend_scheme: {}", pid, e))?;
+    let backend_scheme =
+        parse_scheme(&scheme_str).map_err(|e| anyhow::anyhow!("Proxy {}: {}", pid, e))?;
     let auth_mode_str: String = row
         .try_get("auth_mode")
         .map_err(|e| anyhow::anyhow!("Proxy {}: failed to read auth_mode: {}", pid, e))?;

@@ -259,10 +259,9 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 
 ## CLI
 
-- Four subcommands: `run` (foreground gateway), `validate` (config check), `reload` (SIGHUP), `version`
+- Five subcommands: `run` (foreground gateway), `validate` (config check), `reload` (SIGHUP), `health`, `version`
 - Smart path defaults — `ferrum-edge run` works zero-config when `./ferrum.conf` and `./resources.yaml` exist
 - Mode inference — `--spec` auto-sets file mode when no mode is configured
-- Full backwards compatibility — no-args invocation uses legacy env-var-only startup
 - Configuration precedence: CLI flag > env var > conf file > smart defaults > hardcoded defaults
 - See [docs/cli.md](docs/cli.md) for the full reference
 

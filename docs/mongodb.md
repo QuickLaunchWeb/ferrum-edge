@@ -25,7 +25,7 @@ FERRUM_DB_URL="mongodb://localhost:27017" \
 FERRUM_MONGO_DATABASE=ferrum \
 FERRUM_ADMIN_JWT_SECRET="change-me-in-production" \
 FERRUM_LOG_LEVEL=info \
-cargo run --release
+cargo run --release -- run
 ```
 
 ## URL Path vs FERRUM_MONGO_DATABASE

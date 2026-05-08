@@ -451,8 +451,7 @@ async fn test_http3_environment_variables() {
 /// Post-refactor, H3 is not a scheme — backend H3 selection is runtime
 /// capability-driven and `BackendScheme::Https` always maps to
 /// `DispatchKind::HttpsPool`. The wire format for the scheme field is plain
-/// "https"; the legacy "h3" string is only accepted by the DB loader's
-/// `parse_scheme()` for backward-compatible row parsing.
+/// "https"; the old "h3" spelling is rejected.
 #[tokio::test]
 async fn test_http3_scheme_enum() {
     let scheme = BackendScheme::Https;

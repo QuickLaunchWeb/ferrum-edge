@@ -24,8 +24,8 @@ use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
 use crate::admin::backup::{
-    BackupCounts, BackupPayload, RestorePayload, check_legacy_proxy_fields,
-    filter_config_by_namespace, parse_backup_resources, parse_restore_confirm,
+    BackupCounts, BackupPayload, RestorePayload, filter_config_by_namespace,
+    parse_backup_resources, parse_restore_confirm,
 };
 use crate::admin::jwt_auth::{JwtError, JwtManager};
 use crate::config::db_backend::DatabaseBackend;
@@ -1621,13 +1621,6 @@ async fn handle_batch_create(
         Err(resp) => return Ok(*resp),
     };
 
-    if let Err(message) = check_legacy_proxy_fields(body) {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": message}),
-        ));
-    }
-
     let mut batch: RestorePayload = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
@@ -2018,18 +2011,6 @@ async fn handle_restore(
             &json!({
                 "error": "Restore is a destructive operation that replaces all existing configuration. Pass ?confirm=true to proceed."
             }),
-        ));
-    }
-
-    // Pre-check: reject legacy `backend_protocol` keys before we touch any
-    // existing config. `/restore` is destructive (deletes before re-inserting)
-    // and the scheme refactor makes `backend_protocol` a silent default
-    // otherwise — operators restoring an old backup would get a different
-    // config shape than the one they exported.
-    if let Err(message) = check_legacy_proxy_fields(body) {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": message}),
         ));
     }
 

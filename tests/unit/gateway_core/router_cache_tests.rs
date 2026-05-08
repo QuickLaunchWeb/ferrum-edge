@@ -305,7 +305,7 @@ fn test_e2e_multiple_proxies_different_backends() {
 }
 
 #[test]
-fn test_e2e_https_backend_protocol() {
+fn test_e2e_https_backend_scheme() {
     let mut proxy = test_proxy("secure", "/api");
     proxy.backend_scheme = Some(BackendScheme::Https);
     proxy.dispatch_kind = DispatchKind::from(BackendScheme::Https);

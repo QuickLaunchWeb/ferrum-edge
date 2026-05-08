@@ -14,7 +14,6 @@ ferrum-edge validate [OPTIONS]  # Validate config without starting
 ferrum-edge reload [--pid PID]  # SIGHUP to running instance (Unix)
 ferrum-edge version [--json]
 ferrum-edge health [-p PORT] [--host H] [--tls] [--tls-no-verify]
-ferrum-edge                     # No args = legacy env-var-only mode (backcompat)
 ```
 
 `run`/`validate` flags: `-s/--settings <PATH>`, `-c/--spec <PATH>`, `-m/--mode <MODE>`, `-v/--verbose`. **Precedence**: CLI > env > conf file > smart defaults > hardcoded. Smart defaults search `./ferrum.conf`, `./config/ferrum.conf`, `/etc/ferrum/ferrum.conf` and `./resources.{yaml,json}`, `./config/resources.{yaml,json}`, `/etc/ferrum/config.{yaml,json}`. CLI flags translate to env vars via `apply_run_overrides()` **before** `CONF_FILE_CACHE` reads — see `main.rs`.

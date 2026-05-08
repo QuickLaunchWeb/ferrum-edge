@@ -2134,7 +2134,7 @@ fn test_env_config_db_tls_mode_parsed() {
 }
 
 #[test]
-fn test_env_config_accepts_legacy_db_tls_aliases() {
+fn test_env_config_ignores_removed_db_tls_aliases() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
@@ -2156,19 +2156,13 @@ fn test_env_config_accepts_legacy_db_tls_aliases() {
             remove_var("FERRUM_DB_TLS_CLIENT_KEY_PATH");
 
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.db_tls_mode, Some(DbTlsMode::VerifyFull));
-            assert_eq!(config.db_tls_ca_cert_path.as_deref(), Some("/certs/ca.pem"));
-            assert_eq!(
-                config.db_tls_client_cert_path.as_deref(),
-                Some("/certs/client.pem")
-            );
-            assert_eq!(
-                config.db_tls_client_key_path.as_deref(),
-                Some("/certs/client-key.pem")
-            );
+            assert!(config.db_tls_mode.is_none());
+            assert!(config.db_tls_ca_cert_path.is_none());
+            assert!(config.db_tls_client_cert_path.is_none());
+            assert!(config.db_tls_client_key_path.is_none());
             assert_eq!(
                 config.effective_db_url().unwrap().unwrap(),
-                "postgres://localhost/ferrum?sslmode=verify-full&sslrootcert=/certs/ca.pem&sslcert=/certs/client.pem&sslkey=/certs/client-key.pem"
+                "postgres://localhost/ferrum"
             );
         },
     );

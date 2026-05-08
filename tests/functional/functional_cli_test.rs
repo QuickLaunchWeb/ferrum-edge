@@ -445,52 +445,6 @@ async fn functional_cli_reload_sends_sighup() {
     let _ = child.wait();
 }
 
-// ── backwards compatibility ─────────────────────────────────────────────────
-
-#[ignore]
-#[tokio::test]
-async fn functional_cli_no_args_legacy_mode() {
-    let temp_dir = TempDir::new().unwrap();
-    let spec_path = temp_dir.path().join("config.yaml");
-    std::fs::write(
-        &spec_path,
-        "proxies: []\nconsumers: []\nplugin_configs: []\n",
-    )
-    .unwrap();
-
-    // No subcommand — legacy env-var-only mode
-    let mut child = Command::new(binary_path())
-        .env("FERRUM_MODE", "file")
-        .env("FERRUM_FILE_CONFIG_PATH", spec_path.to_str().unwrap())
-        .env("FERRUM_PROXY_HTTP_PORT", "18996")
-        .env("FERRUM_ADMIN_HTTP_PORT", "18997")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("Failed to start ferrum-edge in legacy mode");
-
-    sleep(Duration::from_secs(2)).await;
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "Legacy mode gateway exited prematurely"
-    );
-
-    #[cfg(unix)]
-    {
-        let pid = child.id();
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-    }
-    let status = child.wait().expect("Failed to wait");
-    assert!(status.success());
-}
-
 // ── smart path defaults ─────────────────────────────────────────────────────
 
 /// Smart-path discovery: with no `--settings`/`--spec` flags and no env vars
