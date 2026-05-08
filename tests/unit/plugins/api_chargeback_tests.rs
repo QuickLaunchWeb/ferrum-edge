@@ -17,6 +17,7 @@ fn make_summary(
         timestamp_received: "2025-01-01T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: consumer.map(|c| c.to_string()),
+        auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/test".to_string(),
         proxy_id: Some(proxy_id.to_string()),

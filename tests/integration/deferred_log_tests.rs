@@ -70,6 +70,7 @@ fn make_summary_with_status(status: u16) -> TransactionSummary {
         timestamp_received: "2026-04-16T00:00:00Z".to_string(),
         client_ip: "10.0.0.1".to_string(),
         consumer_username: None,
+        auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/things/42".to_string(),
         proxy_id: Some("proxy-1".to_string()),

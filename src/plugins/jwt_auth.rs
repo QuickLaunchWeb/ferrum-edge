@@ -88,7 +88,7 @@ impl JwtAuth {
 
 #[async_trait]
 impl AuthMechanism for JwtAuth {
-    fn mechanism_name(&self) -> &str {
+    fn mechanism_name(&self) -> &'static str {
         "jwt_auth"
     }
 

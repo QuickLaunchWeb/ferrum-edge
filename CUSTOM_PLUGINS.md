@@ -643,6 +643,9 @@ pub struct RequestContext {
     /// Display name for the X-Consumer-Username backend header.
     /// Falls back to authenticated_identity when not set.
     pub authenticated_identity_header: Option<String>,
+    /// Authentication mechanism that succeeded (e.g., "jwt_auth", "key_auth").
+    /// None when no auth plugin identified the client.
+    pub auth_method: Option<&'static str>,
     pub timestamp_received: DateTime<Utc>,
     /// Extra metadata plugins can attach (inter-plugin communication)
     pub metadata: HashMap<String, String>,
@@ -689,6 +692,8 @@ pub struct StreamConnectionContext {
     pub consumer_index: Arc<ConsumerIndex>,
     pub identified_consumer: Option<Consumer>,
     pub authenticated_identity: Option<String>,
+    /// Authentication mechanism that succeeded (e.g., "mtls_auth").
+    pub auth_method: Option<&'static str>,
     pub metadata: HashMap<String, String>,
     /// DER-encoded client cert from frontend TLS handshake (TCP+TLS only).
     pub tls_client_cert_der: Option<Arc<Vec<u8>>>,
@@ -707,6 +712,7 @@ pub struct TransactionSummary {
     pub timestamp_received: String,
     pub client_ip: String,
     pub consumer_username: Option<String>,
+    pub auth_method: Option<&'static str>,
     pub http_method: String,
     pub request_path: String,
     pub proxy_id: Option<String>,
@@ -744,6 +750,8 @@ pub struct StreamTransactionSummary {
     pub proxy_id: String,
     pub proxy_name: Option<String>,
     pub client_ip: String,
+    pub consumer_username: Option<String>,
+    pub auth_method: Option<&'static str>,
     pub backend_target: String,
     pub backend_resolved_ip: Option<String>,
     pub protocol: String,

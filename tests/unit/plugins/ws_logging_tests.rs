@@ -34,6 +34,7 @@ fn test_ws_disconnect_context() -> WsDisconnectContext {
         direction: Some(Direction::ClientToBackend),
         error_class: None,
         consumer_username: Some("alice".to_string()),
+        auth_method: None,
         metadata,
     }
 }
