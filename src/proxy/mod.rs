@@ -7049,11 +7049,8 @@ async fn handle_proxy_request_inner(
     if !state.mesh_egress_strip_baggage_keys.is_empty()
         && (owned_proxy_headers
             .as_ref()
-            .map(|h| h.contains_key(crate::modes::mesh::hbone::BAGGAGE_HEADER))
-            .unwrap_or_else(|| {
-                ctx.headers
-                    .contains_key(crate::modes::mesh::hbone::BAGGAGE_HEADER)
-            }))
+            .map(crate::modes::mesh::hbone::has_baggage_header_in_map)
+            .unwrap_or_else(|| crate::modes::mesh::hbone::has_baggage_header_in_map(&ctx.headers)))
     {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
         crate::modes::mesh::hbone::strip_egress_baggage_in_map(

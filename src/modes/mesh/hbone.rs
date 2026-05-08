@@ -171,19 +171,46 @@ pub fn strip_egress_baggage_in_map(
     if key_prefixes.is_empty() {
         return;
     }
-    let Some(raw) = headers.get(BAGGAGE_HEADER) else {
+    let Some(key) = baggage_header_key_in_map(headers) else {
+        return;
+    };
+    let Some(raw) = headers.get(&key) else {
         return;
     };
     let raw_owned = raw.clone();
     match filter_baggage_header(&raw_owned, key_prefixes) {
         Some(filtered) if filtered != raw_owned => {
-            headers.insert(BAGGAGE_HEADER.to_string(), filtered);
+            headers.insert(key, filtered);
         }
         None => {
-            headers.remove(BAGGAGE_HEADER);
+            headers.remove(&key);
         }
         Some(_) => {}
     }
+}
+
+/// Case-insensitive baggage-header presence check for HashMap-shaped header
+/// collections. Materialized request headers normally use lowercase keys, but
+/// request-transforming plugins can add mixed-case header names; egress
+/// stripping must still honor HTTP's case-insensitive header-name semantics.
+#[inline]
+pub fn has_baggage_header_in_map(headers: &std::collections::HashMap<String, String>) -> bool {
+    headers.contains_key(BAGGAGE_HEADER)
+        || headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case(BAGGAGE_HEADER))
+}
+
+fn baggage_header_key_in_map(
+    headers: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if headers.contains_key(BAGGAGE_HEADER) {
+        return Some(BAGGAGE_HEADER.to_string());
+    }
+    headers
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case(BAGGAGE_HEADER))
+        .cloned()
 }
 
 /// Apply [`filter_baggage_header`] in place to a `Vec<(String, String)>` of
@@ -421,6 +448,35 @@ mod tests {
         )]);
         strip_egress_baggage_in_map(&mut headers, &["source.".to_string()]);
         assert!(!headers.contains_key("baggage"));
+    }
+
+    #[test]
+    fn strip_egress_baggage_in_map_handles_case_insensitive_header_name() {
+        let mut headers = std::collections::HashMap::from([(
+            "Baggage".to_string(),
+            "source.principal=spiffe://x,userid=alice".to_string(),
+        )]);
+        assert!(has_baggage_header_in_map(&headers));
+
+        strip_egress_baggage_in_map(&mut headers, &["source.".to_string()]);
+
+        assert_eq!(
+            headers.get("Baggage").map(String::as_str),
+            Some("userid=alice")
+        );
+        assert!(!headers.contains_key("baggage"));
+    }
+
+    #[test]
+    fn strip_egress_baggage_in_map_drops_mixed_case_header_when_only_match() {
+        let mut headers = std::collections::HashMap::from([(
+            "Baggage".to_string(),
+            "source.principal=spiffe://x".to_string(),
+        )]);
+
+        strip_egress_baggage_in_map(&mut headers, &["source.".to_string()]);
+
+        assert!(!has_baggage_header_in_map(&headers));
     }
 
     #[test]
