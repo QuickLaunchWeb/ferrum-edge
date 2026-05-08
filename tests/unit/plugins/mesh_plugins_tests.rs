@@ -31,6 +31,7 @@ fn allow_client_policy(action: PolicyAction) -> MeshPolicy {
             }],
             to: Vec::new(),
             when: Vec::new(),
+            never_matches: false,
             action,
         }],
     }
@@ -50,6 +51,7 @@ fn allow_host_policy(host: &str) -> MeshPolicy {
                 ..RequestMatch::default()
             }],
             when: Vec::new(),
+            never_matches: false,
             action: PolicyAction::Allow,
         }],
     }

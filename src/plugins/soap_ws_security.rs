@@ -822,10 +822,6 @@ impl Plugin for SoapWsSecurity {
         super::HTTP_ONLY_PROTOCOLS
     }
 
-    fn is_auth_plugin(&self) -> bool {
-        true
-    }
-
     fn requires_request_body_before_before_proxy(&self) -> bool {
         true
     }

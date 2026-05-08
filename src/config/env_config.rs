@@ -775,14 +775,16 @@ pub struct EnvConfig {
     /// # Bidirectional-relay performance modes
     ///
     /// When **both** `tcp_idle_timeout_seconds` and
-    /// `tcp_half_close_max_wait_seconds` are `0`, the relay selects a
-    /// **fast path** that delegates to `tokio::io::copy_bidirectional_with_sizes`
-    /// directly. Any other combination selects the **direction-tracking path**:
+    /// `tcp_half_close_max_wait_seconds` are `0` and the selected proxy's
+    /// `backend_read_timeout_ms` / `backend_write_timeout_ms` are also `0`,
+    /// the relay selects a **fast path** that delegates to
+    /// `tokio::io::copy_bidirectional_with_sizes` directly. Any non-zero
+    /// relay timeout selects the **direction-tracking path**:
     ///
     /// | Mode | Trigger | Benefits | Downsides |
     /// |------|---------|----------|-----------|
-    /// | Fast path | both vars == 0 | no `io::split`/BiLock, no Phase 1/2 loop, max TCP throughput, per-direction bytes preserved on clean completion | no idle watchdog (OS TCP timers only), no half-close hard cap, `disconnect_direction` reported as `unknown` on error |
-    /// | Direction-tracking | either var != 0 (default) | idle timeout, half-close cap, per-direction byte counts, first-failure direction attribution in logs/metrics | one BiLock access per read/write, 2× `Vec<u8>` alloc per connection, Phase 1/2 scheduling overhead |
+    /// | Fast path | all four relay timeouts == 0 | no Phase 1/2 loop, max TCP throughput, per-direction bytes preserved on clean completion | no idle watchdog (OS TCP timers only), no half-close hard cap, `disconnect_direction` reported as `unknown` on error |
+    /// | Direction-tracking | any relay timeout != 0 (default) | idle timeout, half-close cap, per-direction byte counts, first-failure direction attribution in logs/metrics | manual relay state machine plus watchdog timer work |
     ///
     /// Pick the fast path only when an external L4 load balancer already
     /// enforces per-connection timeouts and per-direction failure attribution
@@ -822,10 +824,10 @@ pub struct EnvConfig {
     /// Maximum TLS version: "1.2" or "1.3" (default: "1.3")
     pub tls_max_version: String,
     /// Comma-separated cipher suites (OpenSSL names). If empty, uses secure defaults.
-    /// TLS 1.3: TLS_AES_256_GCM_SHA384, TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256
-    /// TLS 1.2: ECDHE-ECDSA-AES256-GCM-SHA384, ECDHE-RSA-AES256-GCM-SHA384,
-    ///          ECDHE-ECDSA-AES128-GCM-SHA256, ECDHE-RSA-AES128-GCM-SHA256,
-    ///          ECDHE-ECDSA-CHACHA20-POLY1305, ECDHE-RSA-CHACHA20-POLY1305
+    /// TLS 1.3: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256
+    /// TLS 1.2: ECDHE-ECDSA-AES128-GCM-SHA256, ECDHE-RSA-AES128-GCM-SHA256,
+    ///          ECDHE-ECDSA-CHACHA20-POLY1305, ECDHE-RSA-CHACHA20-POLY1305,
+    ///          ECDHE-ECDSA-AES256-GCM-SHA384, ECDHE-RSA-AES256-GCM-SHA384
     pub tls_cipher_suites: Option<String>,
     /// Prefer server cipher order for TLS 1.2 (default: true)
     pub tls_prefer_server_cipher_order: bool,
