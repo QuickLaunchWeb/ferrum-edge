@@ -627,11 +627,11 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let backlog = tcp_listen_backlog as i32;
-    let configured_accept_threads = accept_threads.max(1);
+    let configured_accept_threads: usize = accept_threads.max(1);
     #[cfg(unix)]
-    let actual_accept_threads = configured_accept_threads;
+    let actual_accept_threads: usize = configured_accept_threads;
     #[cfg(not(unix))]
-    let actual_accept_threads = {
+    let actual_accept_threads: usize = {
         if configured_accept_threads > 1 {
             warn!(
                 configured_accept_threads,

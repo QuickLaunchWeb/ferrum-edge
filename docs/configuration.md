@@ -172,6 +172,8 @@ Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the can
 
 Phase D adds Kubernetes source translation and sidecar-injector scaffolding. Kubernetes resources translate into `GatewayConfig` / `MeshConfig`; no config source talks directly to the proxy runtime or xDS server.
 
+Gateway API `backendRefs` with `weight: 0` are skipped during translation and negative weights are rejected as invalid. Istio `VirtualService` destinations with `weight: 0` or an omitted split weight are skipped only when the HTTP route splits across multiple destinations; a single destination is preserved because Istio sends all traffic to the lone destination. Skipped zero-weight entries are reported in translation warnings.
+
 Translation notes: Istio `AuthorizationPolicy` resources preserve Istio's action semantics. An `ALLOW` policy with no `rules` is treated as allow-nothing for the selected workload, so it creates a mesh authorization rule that never matches instead of accidentally broadening access. `DENY` and `AUDIT` policies with no `rules` remain no-ops.
 
 Gateway API `HTTPRoute` path matches preserve Kubernetes semantics: `PathPrefix` stays a prefix route, `Exact` is translated to an exact-path route for whole-path matching, and `RegularExpression` is passed through as a Ferrum regex route. Istio `VirtualService` URI matches follow the same shape for `prefix`, `exact`, and `regex`. Translated mesh routes do not strip the listen path before forwarding, so upgrades from older mesh previews should expect backends to receive the original Kubernetes request path.
