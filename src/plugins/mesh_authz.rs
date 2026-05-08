@@ -176,12 +176,8 @@ fn source_principal_from_request(ctx: &RequestContext) -> Option<SpiffeId> {
         // baggage only after the peer is authenticated, and prefer that
         // workload identity over the ztunnel's certificate identity.
         return HboneIdentity::from_baggage_values(
-            ctx.raw_header_values(BAGGAGE_HEADER).chain(
-                ctx.headers
-                    .get(BAGGAGE_HEADER)
-                    .map(String::as_str)
-                    .into_iter(),
-            ),
+            ctx.raw_header_values(BAGGAGE_HEADER)
+                .chain(ctx.headers.get(BAGGAGE_HEADER).map(String::as_str)),
         )
         .source_principal
         .or_else(|| ctx.peer_spiffe_id.clone());
