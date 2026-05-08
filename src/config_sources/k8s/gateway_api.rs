@@ -340,7 +340,11 @@ fn backend_ref_weight(object: &K8sObject, backend_ref: &Value) -> Result<u64, K8
         Some(Value::Number(number)) if number.as_i64().is_some_and(|weight| weight < 0) => Err(
             invalid_resource(object, "backendRefs[].weight must be zero or positive"),
         ),
-        Some(value) => Ok(value.as_u64().unwrap_or(1)),
+        Some(Value::Number(number)) => Ok(number.as_u64().unwrap_or(1)),
+        Some(_) => Err(invalid_resource(
+            object,
+            "backendRefs[].weight must be a number",
+        )),
         None => Ok(1),
     }
 }
@@ -507,6 +511,38 @@ mod tests {
     }
 
     #[test]
+    fn http_route_omitted_weight_defaults_to_one_and_skips_zero_sibling() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [
+                            {"name": "dark", "port": 8080, "weight": 0},
+                            {"name": "stable", "port": 9090}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "stable.default.svc.cluster.local"
+        );
+        assert_eq!(result.config.proxies[0].backend_port, 9090);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("zero-weight backendRef"))
+        );
+    }
+
+    #[test]
     fn http_route_with_only_zero_weight_backend_refs_is_not_materialized() {
         let result = translate_k8s_objects(
             &[object(
@@ -648,6 +684,24 @@ mod tests {
         .expect_err("negative backendRef weights are invalid even after a target is selected");
 
         assert!(err.to_string().contains("weight must be zero or positive"));
+    }
+
+    #[test]
+    fn gateway_route_rejects_non_numeric_backend_ref_weight() {
+        let err = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "backendRefs": [{"name": "dark", "port": 8080, "weight": "high"}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("non-numeric backendRef weights are invalid");
+
+        assert!(err.to_string().contains("weight must be a number"));
     }
 
     #[test]

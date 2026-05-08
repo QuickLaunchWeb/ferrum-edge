@@ -369,8 +369,9 @@ fn virtual_service_routes(
         .flatten()
         .enumerate()
     {
-        let Some(route) = first_positive_weighted_route(object, http)? else {
-            if http_has_only_zero_weight_split_destinations(object, http)? {
+        let selection = select_weighted_route(object, http)?;
+        let Some(route) = selection.route else {
+            if selection.skipped_zero > 0 {
                 acc.warnings.push(format!(
                     "VirtualService '{}' HTTP route {} has only zero-weight split destinations; no proxy was materialized",
                     object.metadata.name, index
@@ -378,10 +379,10 @@ fn virtual_service_routes(
             }
             continue;
         };
-        if http_has_skipped_zero_weight_split_destination(object, http)? {
+        if selection.skipped_zero > 0 {
             acc.warnings.push(format!(
-                "VirtualService '{}' HTTP route {} skipped zero-weight split destination(s)",
-                object.metadata.name, index
+                "VirtualService '{}' HTTP route {} skipped {} zero-weight split destination(s)",
+                object.metadata.name, index, selection.skipped_zero
             ));
         }
         let Some(destination) = route.get("destination") else {
@@ -428,30 +429,51 @@ fn virtual_service_routes(
     Ok(proxies)
 }
 
-fn first_positive_weighted_route<'a>(
+struct RouteSelection<'a> {
+    route: Option<&'a Value>,
+    skipped_zero: usize,
+}
+
+fn select_weighted_route<'a>(
     object: &K8sObject,
     http: &'a Value,
-) -> Result<Option<&'a Value>, K8sTranslateError> {
+) -> Result<RouteSelection<'a>, K8sTranslateError> {
     let Some(routes) = http.get("route").and_then(Value::as_array) else {
-        return Ok(None);
+        return Ok(RouteSelection {
+            route: None,
+            skipped_zero: 0,
+        });
     };
 
+    // Single destination: Istio sends all traffic to the lone destination.
     if routes.len() == 1 {
         let Some(route) = routes.first() else {
-            return Ok(None);
+            return Ok(RouteSelection {
+                route: None,
+                skipped_zero: 0,
+            });
         };
-        route_weight(object, route, 1)?;
-        return Ok(Some(route));
+        let _ = route_weight(object, route, 1)?;
+        return Ok(RouteSelection {
+            route: Some(route),
+            skipped_zero: 0,
+        });
     }
 
     let mut selected_route = None;
+    let mut skipped_zero = 0usize;
     for route in routes {
         if route_weight(object, route, 0)? > 0 {
             selected_route.get_or_insert(route);
+        } else {
+            skipped_zero += 1;
         }
     }
 
-    Ok(selected_route)
+    Ok(RouteSelection {
+        route: selected_route,
+        skipped_zero,
+    })
 }
 
 fn route_weight(
@@ -466,49 +488,13 @@ fn route_weight(
                 "VirtualService route.weight must be zero or positive",
             ))
         }
-        Some(value) => Ok(value.as_u64().unwrap_or(default_weight)),
+        Some(Value::Number(number)) => Ok(number.as_u64().unwrap_or(default_weight)),
+        Some(_) => Err(invalid_resource(
+            object,
+            "VirtualService route.weight must be a number",
+        )),
         None => Ok(default_weight),
     }
-}
-
-fn http_has_skipped_zero_weight_split_destination(
-    object: &K8sObject,
-    http: &Value,
-) -> Result<bool, K8sTranslateError> {
-    let Some(routes) = http.get("route").and_then(Value::as_array) else {
-        return Ok(false);
-    };
-    if routes.len() <= 1 {
-        return Ok(false);
-    }
-
-    for route in routes {
-        if route_weight(object, route, 0)? == 0 {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
-}
-
-fn http_has_only_zero_weight_split_destinations(
-    object: &K8sObject,
-    http: &Value,
-) -> Result<bool, K8sTranslateError> {
-    let Some(routes) = http.get("route").and_then(Value::as_array) else {
-        return Ok(false);
-    };
-    if routes.len() <= 1 {
-        return Ok(false);
-    }
-
-    for route in routes {
-        if route_weight(object, route, 0)? > 0 {
-            return Ok(false);
-        }
-    }
-
-    Ok(true)
 }
 
 fn path_match(uri: &Value) -> Option<String> {
@@ -984,7 +970,7 @@ mod tests {
             result
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("skipped zero-weight"))
+                .any(|warning| warning.contains("zero-weight split destination"))
         );
     }
 
@@ -1028,7 +1014,7 @@ mod tests {
             result
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("skipped zero-weight"))
+                .any(|warning| warning.contains("zero-weight split destination"))
         );
     }
 
@@ -1175,5 +1161,30 @@ mod tests {
             err.to_string()
                 .contains("route.weight must be zero or positive")
         );
+    }
+
+    #[test]
+    fn virtual_service_rejects_non_numeric_split_weight() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "route": [{
+                            "destination": {
+                                "host": "stable.default.svc.cluster.local",
+                                "port": {"number": 8080}
+                            },
+                            "weight": "high"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("non-numeric VirtualService route weights are invalid");
+
+        assert!(err.to_string().contains("route.weight must be a number"));
     }
 }
