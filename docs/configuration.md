@@ -147,6 +147,8 @@ See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_
 
 Mesh mode consumes Layer 2 mesh slices from the control protocols and prepares the shared sidecar/ambient data-plane listeners. Non-mesh modes do not instantiate this runtime.
 
+The native `MeshSubscribe` client reconnects with exponential backoff capped at 30 seconds and applies jitter to avoid synchronized reconnect storms. A clean stream end resets the next reconnect delay to the initial 1 second; connection errors increase the backoff.
+
 xDS snapshots are versioned from both the upstream slice/config version and a hash of translated resource content. This lets the xDS server rebuild and publish a new snapshot when resources change under the same source timestamp or base version.
 
 With the native `MeshSubscribe` protocol, mesh mode waits for the first delivered mesh slice before serving, builds the proxy/plugin runtime from that slice, and hot-applies later valid slices atomically. Invalid slice updates are logged and ignored so the last accepted runtime config keeps serving.
