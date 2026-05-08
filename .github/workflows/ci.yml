@@ -39,34 +39,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-        continue-on-error: true
-
-      - name: Configure sccache
-        run: |
-          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-            echo "sccache enabled"
-          else
-            echo "sccache unavailable, building without cache"
-          fi
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-test"
-
-      - name: Install protoc and libcurl headers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
 
       - name: Run unit tests
         run: cargo test --test unit_tests
@@ -80,34 +55,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-        continue-on-error: true
-
-      - name: Configure sccache
-        run: |
-          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-            echo "sccache enabled"
-          else
-            echo "sccache unavailable, building without cache"
-          fi
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-test"
-
-      - name: Install protoc and libcurl headers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
 
       - name: Run inline lib tests
         # Covers `#[cfg(test)] mod tests` blocks inline in `src/` (used for
@@ -126,34 +76,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-        continue-on-error: true
-
-      - name: Configure sccache
-        run: |
-          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-            echo "sccache enabled"
-          else
-            echo "sccache unavailable, building without cache"
-          fi
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-test"
-
-      - name: Install protoc and libcurl headers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
 
       - name: Run integration tests
         run: cargo test --test integration_tests
@@ -176,6 +101,7 @@ jobs:
               scenarios::
               functional_shared_harness_smoke_test
               functional_cli_test
+              functional_ci_shard_coverage_test
           - shard: admin-routing
             filters: |
               functional_admin_observability_test
@@ -267,34 +193,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-        continue-on-error: true
-
-      - name: Configure sccache
-        run: |
-          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-            echo "sccache enabled"
-          else
-            echo "sccache unavailable, building without cache"
-          fi
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-test-functional-${{ matrix.shard }}"
-
-      - name: Install protoc and libcurl headers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
 
       - name: Build gateway binary for end-to-end tests
         run: cargo build --bin ferrum-edge
@@ -307,15 +208,24 @@ jobs:
         # `--include-ignored` those 10 tests would be silently filtered out
         # (the functional-tests binary is the only place they're compiled —
         # `tests/unit/` is a separate binary that cannot import tests/common).
-        # The two `--skip` filters drop only the two explicitly-named long
-        # stress suites; everything else runs.
+        #
+        # `--skip` uses substring matching against the full test path, so the
+        # two skip terms must be specific enough to drop ONLY the long stress
+        # suites and not future lighter additions:
+        #   - `test_scale_perf_30k_proxies` — matches both
+        #     `test_scale_perf_30k_proxies` and `test_scale_perf_30k_proxies_postgres`
+        #     (both 30k-proxy variants are intentionally skipped here; they
+        #     run locally via the resilience suite).
+        #   - `test_load_stress_10k_proxies` — the single ignored test in
+        #     functional_load_stress_test today. Specific so any new lighter
+        #     test added to that file (e.g. a smoke check) actually runs.
         run: |
           while IFS= read -r filter; do
             if [ -z "$filter" ]; then
               continue
             fi
             echo "::group::functional_tests filter: ${filter}"
-            cargo test --test functional_tests "$filter" -- --include-ignored --skip test_scale_perf_30k_proxies --skip test_load_stress
+            cargo test --test functional_tests "$filter" -- --include-ignored --skip test_scale_perf_30k_proxies --skip test_load_stress_10k_proxies
             echo "::endgroup::"
           done <<< "$FUNCTIONAL_FILTERS"
         env:
@@ -371,35 +281,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          components: clippy
-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-        continue-on-error: true
-
-      - name: Configure sccache
-        run: |
-          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-            echo "sccache enabled"
-          else
-            echo "sccache unavailable, building without cache"
-          fi
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-lint"
-
-      - name: Install protoc and libcurl headers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
+          components: clippy
 
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -412,34 +297,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-        continue-on-error: true
-
-      - name: Configure sccache
-        run: |
-          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-            echo "sccache enabled"
-          else
-            echo "sccache unavailable, building without cache"
-          fi
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-perf"
-
-      - name: Install protoc and libcurl headers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
 
       - name: Build release binaries
         run: |
