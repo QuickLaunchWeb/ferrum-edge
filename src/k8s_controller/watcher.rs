@@ -1,8 +1,9 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
-use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
+use kube::api::{ApiResource, DynamicObject};
 use kube::discovery;
 use kube::runtime::reflector;
 use kube::runtime::watcher;
@@ -114,39 +115,30 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
     },
 ];
 
-async fn is_crd_group_installed(client: &Client, group: &str) -> bool {
-    match discovery::oneshot::group(client, group).await {
-        Ok(_) => true,
-        Err(e) => {
-            debug!(
-                group,
-                error = %e,
-                "CRD group not installed, skipping"
-            );
-            false
-        }
-    }
-}
-
-fn build_api_for_crd(
+fn build_api_for_resource(
     client: &Client,
-    crd: &CrdSpec,
+    ar: &ApiResource,
     namespaces: &[String],
 ) -> (Api<DynamicObject>, ApiResource) {
-    let gvk = GroupVersionKind::gvk(crd.group, crd.version, crd.kind);
-    let ar = ApiResource::from_gvk_with_plural(&gvk, crd.plural);
-
     let api = if namespaces.is_empty() {
-        Api::all_with(client.clone(), &ar)
+        Api::all_with(client.clone(), ar)
     } else if namespaces.len() == 1 {
-        Api::namespaced_with(client.clone(), &namespaces[0], &ar)
+        Api::namespaced_with(client.clone(), &namespaces[0], ar)
     } else {
         // kube-rs doesn't support multi-namespace in a single Api;
         // use all-namespace watch and filter in the reconciler.
-        Api::all_with(client.clone(), &ar)
+        Api::all_with(client.clone(), ar)
     };
 
-    (api, ar)
+    (api, ar.clone())
+}
+
+fn find_crd_resource(api_group: &discovery::ApiGroup, crd: &CrdSpec) -> Option<ApiResource> {
+    api_group
+        .versioned_resources(crd.version)
+        .into_iter()
+        .map(|(ar, _caps)| ar)
+        .find(|ar| ar.kind == crd.kind && ar.plural == crd.plural)
 }
 
 pub async fn start_crd_watchers(
@@ -167,34 +159,59 @@ pub async fn start_crd_watchers(
         crd_specs.extend(GATEWAY_API_CRDS);
     }
 
-    // Deduplicate by group to check installation once per API group.
-    let mut checked_groups = std::collections::HashSet::new();
-    let mut installed_groups = std::collections::HashSet::new();
+    // Deduplicate discovery by group, but gate watcher registration by the
+    // exact served kind/version below. A cluster can expose a group without
+    // serving every optional CRD version Ferrum knows about.
+    let mut checked_groups = HashSet::new();
+    let mut installed_groups: HashMap<&'static str, discovery::ApiGroup> = HashMap::new();
 
     for crd in &crd_specs {
         if !checked_groups.insert(crd.group) {
             continue;
         }
-        if is_crd_group_installed(&client, crd.group).await {
-            installed_groups.insert(crd.group);
-            info!(group = crd.group, "CRD group detected");
-        } else {
-            warn!(
-                group = crd.group,
-                "CRD group not installed, its resources will not be watched. \
-                 Install the CRDs and restart the controller to enable."
-            );
+        match discovery::oneshot::group(&client, crd.group).await {
+            Ok(api_group) => {
+                installed_groups.insert(crd.group, api_group);
+                info!(group = crd.group, "CRD group detected");
+            }
+            Err(e) => {
+                warn!(
+                    group = crd.group,
+                    error = %e,
+                    "CRD group not installed, its resources will not be watched. \
+                     Install the CRDs and restart the controller to enable."
+                );
+            }
         }
     }
 
     for crd in crd_specs {
-        if !installed_groups.contains(crd.group) {
+        let Some(api_group) = installed_groups.get(crd.group) else {
+            continue;
+        };
+        let api_version = format!("{}/{}", crd.group, crd.version);
+        let kind = crd.kind.to_string();
+
+        if store_set.lock().await.has_store(&api_version, &kind) {
+            debug!(
+                kind = %kind,
+                api_version = %api_version,
+                "CRD watcher already running, skipping duplicate start"
+            );
             continue;
         }
 
-        let (api, ar) = build_api_for_crd(&client, crd, &namespaces);
-        let api_version = format!("{}/{}", crd.group, crd.version);
-        let kind = crd.kind.to_string();
+        let Some(ar) = find_crd_resource(api_group, crd) else {
+            debug!(
+                group = crd.group,
+                version = crd.version,
+                kind = crd.kind,
+                "CRD kind/version not served, skipping watcher registration"
+            );
+            continue;
+        };
+
+        let (api, ar) = build_api_for_resource(&client, &ar, &namespaces);
 
         let writer = reflector::store::Writer::new(ar.clone());
         let store = writer.as_reader();

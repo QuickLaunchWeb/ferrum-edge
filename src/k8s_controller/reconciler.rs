@@ -41,7 +41,13 @@ pub fn spawn_reconcile_loop(
         };
 
         let debounce = Duration::from_millis(reconciler_config.debounce_ms);
-        let full_sync_interval = Duration::from_secs(reconciler_config.full_sync_interval_secs);
+        let full_sync_interval =
+            full_sync_interval_duration(reconciler_config.full_sync_interval_secs);
+        if reconciler_config.full_sync_interval_secs == 0 {
+            warn!(
+                "FERRUM_K8S_FULL_SYNC_INTERVAL_SECS=0 is invalid, clamping K8s full-sync interval to 1s"
+            );
+        }
         let mut full_sync_timer = tokio::time::interval(full_sync_interval);
         full_sync_timer.tick().await; // skip first immediate tick
 
@@ -146,6 +152,10 @@ async fn debounce_events(change_rx: &mut watch::Receiver<u64>, window: Duration)
             }
         }
     }
+}
+
+fn full_sync_interval_duration(configured_secs: u64) -> Duration {
+    Duration::from_secs(configured_secs.max(1))
 }
 
 async fn wait_for_initial_store_readiness(
@@ -395,6 +405,12 @@ mod tests {
         new_config.plugin_configs.reverse();
 
         assert!(!gateway_config_content_changed(&new_config, &old_config));
+    }
+
+    #[test]
+    fn full_sync_interval_zero_is_clamped_before_timer_creation() {
+        assert_eq!(full_sync_interval_duration(0), Duration::from_secs(1));
+        assert_eq!(full_sync_interval_duration(300), Duration::from_secs(300));
     }
 }
 
