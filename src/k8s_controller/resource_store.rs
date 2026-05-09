@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use kube::api::DynamicObject;
 use kube::runtime::reflector;
@@ -41,9 +42,20 @@ impl CrdResourceStore {
 
 pub struct ResourceStoreSet {
     stores: Vec<Arc<CrdResourceStore>>,
-    change_tx: watch::Sender<u64>,
-    change_rx: watch::Receiver<u64>,
-    revision: std::sync::atomic::AtomicU64,
+    notifier: ResourceChangeNotifier,
+}
+
+#[derive(Clone)]
+pub struct ResourceChangeNotifier {
+    change_tx: Arc<watch::Sender<u64>>,
+    revision: Arc<AtomicU64>,
+}
+
+impl ResourceChangeNotifier {
+    pub fn notify_change(&self) {
+        let rev = self.revision.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.change_tx.send(rev);
+    }
 }
 
 impl Default for ResourceStoreSet {
@@ -54,12 +66,13 @@ impl Default for ResourceStoreSet {
 
 impl ResourceStoreSet {
     pub fn new() -> Self {
-        let (change_tx, change_rx) = watch::channel(0);
+        let (change_tx, _change_rx) = watch::channel(0);
         Self {
             stores: Vec::new(),
-            change_tx,
-            change_rx,
-            revision: std::sync::atomic::AtomicU64::new(0),
+            notifier: ResourceChangeNotifier {
+                change_tx: Arc::new(change_tx),
+                revision: Arc::new(AtomicU64::new(0)),
+            },
         }
     }
 
@@ -76,15 +89,15 @@ impl ResourceStoreSet {
     }
 
     pub fn notify_change(&self) {
-        let rev = self
-            .revision
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
-        let _ = self.change_tx.send(rev);
+        self.notifier.notify_change();
+    }
+
+    pub fn change_notifier(&self) -> ResourceChangeNotifier {
+        self.notifier.clone()
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
-        self.change_rx.clone()
+        self.notifier.change_tx.subscribe()
     }
 
     pub fn total_resources(&self) -> usize {

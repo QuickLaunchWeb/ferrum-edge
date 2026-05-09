@@ -204,12 +204,12 @@ pub async fn start_crd_watchers(
             store,
         ));
 
-        {
+        let change_notifier = {
             let mut set = store_set.lock().await;
             set.add_store(crd_store);
-        }
+            set.change_notifier()
+        };
 
-        let store_set_ref = store_set.clone();
         let mut watcher_shutdown = shutdown.clone();
         let watcher_config = watcher::Config::default();
 
@@ -230,8 +230,7 @@ pub async fn start_crd_watchers(
                     item = stream.try_next() => {
                         match item {
                             Ok(Some(_event)) => {
-                                let set = store_set_ref.lock().await;
-                                set.notify_change();
+                                change_notifier.notify_change();
                             }
                             Ok(None) => {
                                 info!(kind, "Watch stream ended");

@@ -46,15 +46,33 @@ pub struct K8sTranslationOptions {
     pub namespace: String,
     pub trust_domain: TrustDomain,
     pub prefer_istio_on_overlap: bool,
+    source_namespaces: Option<HashSet<String>>,
 }
 
 impl K8sTranslationOptions {
     pub fn new(namespace: String, trust_domain: TrustDomain) -> Self {
+        let source_namespaces = HashSet::from([namespace.clone()]);
         Self {
             namespace,
             trust_domain,
             prefer_istio_on_overlap: true,
+            source_namespaces: Some(source_namespaces),
         }
+    }
+
+    pub fn with_source_namespaces(mut self, namespaces: Vec<String>) -> Self {
+        self.source_namespaces = if namespaces.is_empty() {
+            None
+        } else {
+            Some(namespaces.into_iter().collect())
+        };
+        self
+    }
+
+    fn includes_namespace(&self, namespace: &str) -> bool {
+        self.source_namespaces
+            .as_ref()
+            .is_none_or(|namespaces| namespaces.contains(namespace))
     }
 }
 
@@ -242,16 +260,27 @@ pub fn translate_k8s_objects(
     objects: &[K8sObject],
     options: K8sTranslationOptions,
 ) -> Result<K8sTranslation, K8sTranslateError> {
+    translate_k8s_objects_with_filter(objects, options, |_| true)
+}
+
+pub(crate) fn translate_k8s_objects_with_filter<F>(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+    include: F,
+) -> Result<K8sTranslation, K8sTranslateError>
+where
+    F: Fn(&K8sObject) -> bool,
+{
     let mut acc = K8sAccumulator::new(options);
 
-    for object in objects {
+    for object in objects.iter().filter(|object| include(object)) {
         if object.kind == "ReferenceGrant" {
             gateway_api::collect_reference_grant(&mut acc, object)?;
         }
     }
 
-    for object in objects {
-        if object.metadata.namespace != acc.options.namespace {
+    for object in objects.iter().filter(|object| include(object)) {
+        if !acc.options.includes_namespace(&object.metadata.namespace) {
             continue;
         }
 
@@ -529,6 +558,33 @@ mod tests {
             translate_k8s_objects(&[ignored], options("prod")).expect("translation should succeed");
 
         assert!(result.config.mesh.is_none());
+    }
+
+    #[test]
+    fn controller_can_disable_source_namespace_filter() {
+        let object = object(
+            "PeerAuthentication",
+            serde_json::json!({"mtls": {"mode": "STRICT"}}),
+        );
+        let options = options("ferrum").with_source_namespaces(Vec::new());
+
+        let result = translate_k8s_objects(&[object], options).expect("translation should succeed");
+
+        assert!(result.config.mesh.is_some());
+    }
+
+    #[test]
+    fn controller_source_namespace_filter_uses_watch_namespaces() {
+        let object = object(
+            "PeerAuthentication",
+            serde_json::json!({"mtls": {"mode": "STRICT"}}),
+        );
+        let options = options("ferrum")
+            .with_source_namespaces(vec!["default".to_string(), "prod".to_string()]);
+
+        let result = translate_k8s_objects(&[object], options).expect("translation should succeed");
+
+        assert!(result.config.mesh.is_some());
     }
 
     #[test]

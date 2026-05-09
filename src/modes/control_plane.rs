@@ -432,7 +432,6 @@ pub async fn run(
     // When enabled, watches Istio + Gateway API CRDs and reconciles them into
     // Ferrum config via translate_k8s_objects(). Runs alongside DB polling.
     let _k8s_controller_handle = if env_config.k8s_controller_enabled {
-        let k8s_update_tx = tokio::sync::broadcast::channel(16).0;
         let controller_config = crate::k8s_controller::K8sControllerConfig {
             namespace: env_config.namespace.clone(),
             trust_domain: env_config.k8s_trust_domain.clone(),
@@ -446,7 +445,8 @@ pub async fn run(
         match crate::k8s_controller::start_k8s_controller(
             controller_config,
             config_arc.clone(),
-            k8s_update_tx,
+            update_tx.clone(),
+            dp_registry.clone(),
             shutdown_tx.subscribe(),
         )
         .await

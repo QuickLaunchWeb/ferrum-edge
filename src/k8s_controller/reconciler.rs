@@ -6,7 +6,12 @@ use tokio::sync::{broadcast, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::config::types::GatewayConfig;
-use crate::config_sources::k8s::{K8sTranslateError, K8sTranslationOptions, translate_k8s_objects};
+use crate::config_sources::k8s::{
+    K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
+    translate_k8s_objects_with_filter,
+};
+use crate::grpc::cp_server::{CpGrpcServer, DpNodeRegistry};
+use crate::grpc::proto::ConfigUpdate;
 use crate::identity::spiffe::TrustDomain;
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::resource_store::ResourceStoreSet;
@@ -14,6 +19,7 @@ use crate::k8s_controller::resource_store::ResourceStoreSet;
 pub struct ReconcilerConfig {
     pub namespace: String,
     pub trust_domain: String,
+    pub watch_namespaces: Vec<String>,
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
 }
@@ -21,7 +27,8 @@ pub struct ReconcilerConfig {
 pub fn spawn_reconcile_loop(
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     config_arc: Arc<ArcSwap<GatewayConfig>>,
-    update_tx: broadcast::Sender<()>,
+    update_tx: broadcast::Sender<ConfigUpdate>,
+    dp_registry: Arc<DpNodeRegistry>,
     reconciler_config: ReconcilerConfig,
     metrics: Arc<ControllerMetrics>,
     mut shutdown: watch::Receiver<bool>,
@@ -52,11 +59,15 @@ pub fn spawn_reconcile_loop(
         // Initial reconciliation — block until first success.
         do_reconcile(
             &store_set,
-            &config_arc,
-            &update_tx,
-            &reconciler_config.namespace,
-            &trust_domain,
-            &metrics,
+            ReconcileContext {
+                config_arc: &config_arc,
+                update_tx: &update_tx,
+                dp_registry: &dp_registry,
+                namespace: &reconciler_config.namespace,
+                watch_namespaces: &reconciler_config.watch_namespaces,
+                trust_domain: &trust_domain,
+                metrics: &metrics,
+            },
         )
         .await;
 
@@ -74,11 +85,15 @@ pub fn spawn_reconcile_loop(
                     metrics.full_syncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     do_reconcile(
                         &store_set,
-                        &config_arc,
-                        &update_tx,
-                        &reconciler_config.namespace,
-                        &trust_domain,
-                        &metrics,
+                        ReconcileContext {
+                            config_arc: &config_arc,
+                            update_tx: &update_tx,
+                            dp_registry: &dp_registry,
+                            namespace: &reconciler_config.namespace,
+                            watch_namespaces: &reconciler_config.watch_namespaces,
+                            trust_domain: &trust_domain,
+                            metrics: &metrics,
+                        },
                     ).await;
                 }
                 result = change_rx.changed() => {
@@ -90,11 +105,15 @@ pub fn spawn_reconcile_loop(
                     debounce_events(&mut change_rx, debounce).await;
                     do_reconcile(
                         &store_set,
-                        &config_arc,
-                        &update_tx,
-                        &reconciler_config.namespace,
-                        &trust_domain,
-                        &metrics,
+                        ReconcileContext {
+                            config_arc: &config_arc,
+                            update_tx: &update_tx,
+                            dp_registry: &dp_registry,
+                            namespace: &reconciler_config.namespace,
+                            watch_namespaces: &reconciler_config.watch_namespaces,
+                            trust_domain: &trust_domain,
+                            metrics: &metrics,
+                        },
                     ).await;
                 }
             }
@@ -124,16 +143,22 @@ async fn debounce_events(change_rx: &mut watch::Receiver<u64>, window: Duration)
     }
 }
 
+struct ReconcileContext<'a> {
+    config_arc: &'a Arc<ArcSwap<GatewayConfig>>,
+    update_tx: &'a broadcast::Sender<ConfigUpdate>,
+    dp_registry: &'a Arc<DpNodeRegistry>,
+    namespace: &'a str,
+    watch_namespaces: &'a [String],
+    trust_domain: &'a TrustDomain,
+    metrics: &'a ControllerMetrics,
+}
+
 async fn do_reconcile(
     store_set: &Arc<tokio::sync::Mutex<ResourceStoreSet>>,
-    config_arc: &Arc<ArcSwap<GatewayConfig>>,
-    update_tx: &broadcast::Sender<()>,
-    namespace: &str,
-    trust_domain: &TrustDomain,
-    metrics: &ControllerMetrics,
+    ctx: ReconcileContext<'_>,
 ) {
     let start = std::time::Instant::now();
-    metrics
+    ctx.metrics
         .reconciliations
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -145,77 +170,10 @@ async fn do_reconcile(
     let resource_count = objects.len();
     debug!(resource_count, "Starting reconciliation");
 
-    let options = K8sTranslationOptions::new(namespace.to_string(), trust_domain.clone());
-
-    let translation = match translate_k8s_objects(&objects, options) {
-        Ok(t) => t,
-        Err(K8sTranslateError::Unsupported(ref resource)) => {
-            warn!(
-                kind = resource.kind,
-                namespace = resource.namespace,
-                name = resource.name,
-                reason = resource.reason,
-                "Unsupported K8s resource skipped"
-            );
-            metrics
-                .errors
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // Retry without the offending resource.
-            let filtered: Vec<_> = objects
-                .into_iter()
-                .filter(|obj| {
-                    !(obj.kind == resource.kind
-                        && obj.metadata.namespace == resource.namespace
-                        && obj.metadata.name == resource.name)
-                })
-                .collect();
-            let retry_options =
-                K8sTranslationOptions::new(namespace.to_string(), trust_domain.clone());
-            match translate_k8s_objects(&filtered, retry_options) {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(error = %e, "K8s translation failed after filtering unsupported resource");
-                    metrics
-                        .errors
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return;
-                }
-            }
-        }
-        Err(K8sTranslateError::InvalidResource {
-            ref kind,
-            ref namespace,
-            ref name,
-            ref message,
-        }) => {
-            warn!(
-                kind,
-                namespace, name, message, "Invalid K8s resource, skipping"
-            );
-            metrics
-                .errors
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let filtered: Vec<_> = objects
-                .into_iter()
-                .filter(|obj| {
-                    !(obj.kind == *kind
-                        && obj.metadata.namespace == *namespace
-                        && obj.metadata.name == *name)
-                })
-                .collect();
-            let retry_options =
-                K8sTranslationOptions::new(namespace.to_string(), trust_domain.clone());
-            match translate_k8s_objects(&filtered, retry_options) {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(error = %e, "K8s translation failed after filtering invalid resource");
-                    metrics
-                        .errors
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return;
-                }
-            }
-        }
+    let options = K8sTranslationOptions::new(ctx.namespace.to_string(), ctx.trust_domain.clone())
+        .with_source_namespaces(ctx.watch_namespaces.to_vec());
+    let Some(translation) = translate_with_skip_retries(&objects, options, ctx.metrics) else {
+        return;
     };
 
     for warning in &translation.warnings {
@@ -226,7 +184,7 @@ async fn do_reconcile(
     // fully owns the GatewayConfig when enabled — DB-sourced config is managed
     // by the polling loop separately.
     let new_config = translation.config;
-    let old_config = config_arc.load();
+    let old_config = ctx.config_arc.load();
 
     let changed = new_config.proxies.len() != old_config.proxies.len()
         || new_config.upstreams.len() != old_config.upstreams.len()
@@ -241,29 +199,121 @@ async fn do_reconcile(
     if !changed {
         debug!("No config changes detected, skipping swap");
         let elapsed = start.elapsed();
-        metrics.last_reconcile_duration_ms.store(
+        ctx.metrics.last_reconcile_duration_ms.store(
             elapsed.as_millis() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
         return;
     }
 
-    config_arc.store(Arc::new(new_config));
+    ctx.config_arc.store(Arc::new(new_config.clone()));
 
     // Notify DPs of the config change.
-    let _ = update_tx.send(());
+    CpGrpcServer::broadcast_update_with_registry(ctx.update_tx, &new_config, ctx.dp_registry);
 
     let elapsed = start.elapsed();
-    metrics.last_reconcile_duration_ms.store(
+    ctx.metrics.last_reconcile_duration_ms.store(
         elapsed.as_millis() as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
 
     info!(
         resource_count,
-        proxies = config_arc.load().proxies.len(),
-        upstreams = config_arc.load().upstreams.len(),
+        proxies = ctx.config_arc.load().proxies.len(),
+        upstreams = ctx.config_arc.load().upstreams.len(),
         elapsed_ms = elapsed.as_millis() as u64,
         "Reconciliation complete"
     );
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct K8sResourceKey {
+    kind: String,
+    namespace: String,
+    name: String,
+}
+
+impl K8sResourceKey {
+    fn from_object(object: &K8sObject) -> Self {
+        Self {
+            kind: object.kind.clone(),
+            namespace: object.metadata.namespace.clone(),
+            name: object.metadata.name.clone(),
+        }
+    }
+
+    fn from_error(error: &K8sTranslateError) -> Self {
+        match error {
+            K8sTranslateError::Unsupported(resource) => Self {
+                kind: resource.kind.clone(),
+                namespace: resource.namespace.clone(),
+                name: resource.name.clone(),
+            },
+            K8sTranslateError::InvalidResource {
+                kind,
+                namespace,
+                name,
+                ..
+            } => Self {
+                kind: kind.clone(),
+                namespace: namespace.clone(),
+                name: name.clone(),
+            },
+        }
+    }
+}
+
+fn translate_with_skip_retries(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+    metrics: &ControllerMetrics,
+) -> Option<K8sTranslation> {
+    let mut skipped = std::collections::HashSet::new();
+
+    loop {
+        let translation = translate_k8s_objects_with_filter(objects, options.clone(), |object| {
+            !skipped.contains(&K8sResourceKey::from_object(object))
+        });
+
+        match translation {
+            Ok(translation) => return Some(translation),
+            Err(error) => {
+                metrics
+                    .errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log_skipped_resource(&error);
+
+                let key = K8sResourceKey::from_error(&error);
+                if !skipped.insert(key) {
+                    error!(error = %error, "K8s translation failed repeatedly on the same resource");
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+fn log_skipped_resource(error: &K8sTranslateError) {
+    match error {
+        K8sTranslateError::Unsupported(resource) => {
+            warn!(
+                kind = resource.kind,
+                namespace = resource.namespace,
+                name = resource.name,
+                reason = resource.reason,
+                "Unsupported K8s resource skipped"
+            );
+        }
+        K8sTranslateError::InvalidResource {
+            kind,
+            namespace,
+            name,
+            message,
+        } => {
+            warn!(
+                kind,
+                namespace, name, message, "Invalid K8s resource, skipping"
+            );
+        }
+    }
 }

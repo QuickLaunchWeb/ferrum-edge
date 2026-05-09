@@ -18,6 +18,8 @@ use tokio::sync::{broadcast, watch};
 use tracing::{error, info};
 
 use crate::config::types::GatewayConfig;
+use crate::grpc::cp_server::DpNodeRegistry;
+use crate::grpc::proto::ConfigUpdate;
 use metrics::ControllerMetrics;
 use reconciler::{ReconcilerConfig, spawn_reconcile_loop};
 use resource_store::ResourceStoreSet;
@@ -54,7 +56,8 @@ impl K8sControllerHandle {
 pub async fn start_k8s_controller(
     controller_config: K8sControllerConfig,
     config_arc: Arc<ArcSwap<GatewayConfig>>,
-    update_tx: broadcast::Sender<()>,
+    update_tx: broadcast::Sender<ConfigUpdate>,
+    dp_registry: Arc<DpNodeRegistry>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<K8sControllerHandle, anyhow::Error> {
     info!(
@@ -85,6 +88,7 @@ pub async fn start_k8s_controller(
     let reconciler_config = ReconcilerConfig {
         namespace: controller_config.namespace,
         trust_domain: controller_config.trust_domain,
+        watch_namespaces: controller_config.watch_namespaces.clone(),
         debounce_ms: controller_config.debounce_ms,
         full_sync_interval_secs: controller_config.full_sync_interval_secs,
     };
@@ -93,6 +97,7 @@ pub async fn start_k8s_controller(
         store_set.clone(),
         config_arc,
         update_tx,
+        dp_registry,
         reconciler_config,
         metrics.clone(),
         shutdown.clone(),
