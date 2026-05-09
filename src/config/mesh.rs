@@ -263,6 +263,28 @@ pub fn policy_scope_applies_to_workload<L: WorkloadLabels + ?Sized>(
     }
 }
 
+/// Returns `true` when a [`PolicyScope`] applies to a workload whose
+/// namespace is `proxy_namespace` and whose labels are `proxy_labels`.
+///
+/// Same semantics as [`policy_scope_applies_to_workload`] but accepts a
+/// bare `PolicyScope` instead of a full `MeshPolicy`, making it reusable
+/// for `MeshRequestAuthentication` scope filtering.
+pub fn scope_applies_to_workload<L: WorkloadLabels + ?Sized>(
+    scope: &PolicyScope,
+    proxy_namespace: &str,
+    proxy_labels: &L,
+) -> bool {
+    match scope {
+        PolicyScope::MeshWide => true,
+        PolicyScope::Namespace {
+            namespace: policy_namespace,
+        } => policy_namespace == proxy_namespace,
+        PolicyScope::WorkloadSelector { selector } => {
+            workload_selector_matches(selector, proxy_namespace, proxy_labels)
+        }
+    }
+}
+
 /// Returns `true` when a [`WorkloadSelector`] matches a workload whose
 /// namespace is `proxy_namespace` and whose labels are `proxy_labels`. Same
 /// shape as [`policy_scope_applies_to_workload`]; lifted so PeerAuthentication
@@ -281,6 +303,53 @@ pub fn workload_selector_matches<L: WorkloadLabels + ?Sized>(
         .labels
         .iter()
         .all(|(key, value)| proxy_labels.lookup(key) == Some(value.as_str()))
+}
+
+// ── RequestAuthentication ─────────────────────────────────────────────────
+
+/// Represents an Istio `RequestAuthentication` resource translated into
+/// Ferrum's model. Declares which JWTs are accepted for a workload.
+///
+/// Semantics mirror Istio: RequestAuthentication is **permissive** by
+/// default — it only declares which JWTs are *valid*, not which are
+/// *required*. A request with no JWT passes through. An invalid JWT is
+/// rejected. A valid JWT has its claims extracted and identity propagated.
+/// Enforcement (requiring a JWT) comes from `AuthorizationPolicy`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshRequestAuthentication {
+    pub name: String,
+    pub namespace: String,
+    pub scope: PolicyScope,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jwt_rules: Vec<MeshJwtRule>,
+}
+
+/// A single JWT validation rule within a [`MeshRequestAuthentication`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshJwtRule {
+    pub issuer: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audiences: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_uri: Option<String>,
+    /// Inline JWKS JSON (alternative to `jwks_uri`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub from_headers: Vec<JwtHeader>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub from_params: Vec<String>,
+    #[serde(default)]
+    pub forward_original_token: bool,
+}
+
+/// A header location from which to extract a JWT.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JwtHeader {
+    pub name: String,
+    /// Prefix stripped before validation (e.g., `"Bearer "`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
 }
 
 // ── PeerAuthentication ────────────────────────────────────────────────────
@@ -507,6 +576,8 @@ pub struct MeshConfig {
     pub peer_authentications: Vec<PeerAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_entries: Vec<ServiceEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_authentications: Vec<MeshRequestAuthentication>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -521,6 +592,7 @@ impl MeshConfig {
             &self.mesh_policies,
             &self.peer_authentications,
             &self.service_entries,
+            &self.request_authentications,
             self.trust_bundles.as_ref(),
             self.multi_cluster.as_ref(),
         )
@@ -557,17 +629,20 @@ pub fn validate_mesh_config(
         policies,
         peer_auths,
         service_entries,
+        &[],
         trust_bundles,
         None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_mesh_config_internal(
     workloads: &[Workload],
     services: &[MeshService],
     policies: &[MeshPolicy],
     peer_auths: &[PeerAuthentication],
     service_entries: &[ServiceEntry],
+    request_authentications: &[MeshRequestAuthentication],
     trust_bundles: Option<&TrustBundleSet>,
     multi_cluster: Option<&MultiClusterConfig>,
 ) -> Vec<String> {
@@ -724,6 +799,33 @@ fn validate_mesh_config_internal(
                 "PeerAuthentication '{}': namespace must not be empty",
                 pa.name
             ));
+        }
+    }
+
+    // RequestAuthentications
+    for ra in request_authentications {
+        if ra.name.is_empty() {
+            errors.push("MeshRequestAuthentication: name must not be empty".to_string());
+        }
+        if ra.namespace.is_empty() {
+            errors.push(format!(
+                "MeshRequestAuthentication '{}': namespace must not be empty",
+                ra.name
+            ));
+        }
+        for (i, rule) in ra.jwt_rules.iter().enumerate() {
+            if rule.issuer.trim().is_empty() {
+                errors.push(format!(
+                    "MeshRequestAuthentication '{}' jwt_rules[{}]: issuer must not be empty",
+                    ra.name, i
+                ));
+            }
+            if rule.jwks_uri.is_none() && rule.jwks.is_none() {
+                errors.push(format!(
+                    "MeshRequestAuthentication '{}' jwt_rules[{}]: one of jwks_uri or jwks is required",
+                    ra.name, i
+                ));
+            }
         }
     }
 
