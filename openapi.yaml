@@ -1140,6 +1140,7 @@ paths:
                 - rate_limiting
                 - request_size_limiting
                 - response_size_limiting
+                - fault_injection
                 - body_validator
                 - request_termination
                 - response_mock
@@ -5481,6 +5482,57 @@ components:
           type: boolean
           default: false
           description: Force response body buffering so this plugin can enforce the size limit on chunked/streaming responses without Content-Length.
+
+    FaultInjectionConfig:
+      type: object
+      additionalProperties: false
+      description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; stream faults run on stream connect."
+      properties:
+        abort:
+          type: object
+          additionalProperties: false
+          properties:
+            status_code:
+              type: integer
+              minimum: 200
+              maximum: 599
+              description: Final HTTP status returned when the abort fault triggers
+            percentage:
+              type: number
+              minimum: 0
+              exclusiveMinimum: true
+              maximum: 100
+              description: Abort probability as a percentage
+            grpc_status:
+              type: integer
+              minimum: 0
+              maximum: 16
+              description: Optional gRPC status trailer emitted for gRPC rejects
+            body:
+              type: string
+              default: ""
+              description: HTTP response body returned with the abort
+          required: [status_code, percentage]
+        delay:
+          type: object
+          additionalProperties: false
+          properties:
+            duration_ms:
+              type: integer
+              format: uint64
+              minimum: 1
+              maximum: 3600000
+              description: Delay duration before continuing or aborting
+            percentage:
+              type: number
+              minimum: 0
+              exclusiveMinimum: true
+              maximum: 100
+              description: Delay probability as a percentage
+          required: [duration_ms, percentage]
+      anyOf:
+        - required: [abort]
+        - required: [delay]
 
     BodyValidatorConfig:
       type: object

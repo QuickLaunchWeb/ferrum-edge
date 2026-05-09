@@ -3,6 +3,7 @@
 use ferrum_edge::plugins::fault_injection::FaultInjectionPlugin;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::json;
+use std::collections::HashMap;
 
 fn make_ctx() -> RequestContext {
     RequestContext::new(
@@ -10,6 +11,11 @@ fn make_ctx() -> RequestContext {
         "GET".to_string(),
         "/test".to_string(),
     )
+}
+
+async fn run_before_proxy(plugin: &FaultInjectionPlugin, ctx: &mut RequestContext) -> PluginResult {
+    let mut headers = HashMap::new();
+    plugin.before_proxy(ctx, &mut headers).await
 }
 
 // === Config validation ===
@@ -85,6 +91,26 @@ fn test_reject_non_object_config() {
 }
 
 #[test]
+fn test_reject_unknown_top_level_field() {
+    let err = FaultInjectionPlugin::new(&json!({
+        "deplay": { "duration_ms": 10, "percentage": 50.0 }
+    }))
+    .err()
+    .unwrap();
+    assert!(err.contains("unknown config field"));
+}
+
+#[test]
+fn test_reject_unknown_abort_field() {
+    let err = FaultInjectionPlugin::new(&json!({
+        "abort": { "status_code": 503, "percentage": 50.0, "why": "test" }
+    }))
+    .err()
+    .unwrap();
+    assert!(err.contains("unknown abort field"));
+}
+
+#[test]
 fn test_reject_percentage_over_100() {
     let err = FaultInjectionPlugin::new(&json!({
         "abort": { "status_code": 500, "percentage": 101.0 }
@@ -111,7 +137,17 @@ fn test_reject_status_code_zero() {
     }))
     .err()
     .unwrap();
-    assert!(err.contains("must be 100-599"));
+    assert!(err.contains("must be 200-599"));
+}
+
+#[test]
+fn test_reject_status_code_100() {
+    let err = FaultInjectionPlugin::new(&json!({
+        "abort": { "status_code": 100, "percentage": 50.0 }
+    }))
+    .err()
+    .unwrap();
+    assert!(err.contains("must be 200-599"));
 }
 
 #[test]
@@ -121,7 +157,7 @@ fn test_reject_status_code_600() {
     }))
     .err()
     .unwrap();
-    assert!(err.contains("must be 100-599"));
+    assert!(err.contains("must be 200-599"));
 }
 
 #[test]
@@ -132,6 +168,36 @@ fn test_reject_duration_ms_zero() {
     .err()
     .unwrap();
     assert!(err.contains("must be greater than 0"));
+}
+
+#[test]
+fn test_reject_duration_ms_above_cap() {
+    let err = FaultInjectionPlugin::new(&json!({
+        "delay": { "duration_ms": 3_600_001_u64, "percentage": 50.0 }
+    }))
+    .err()
+    .unwrap();
+    assert!(err.contains("duration_ms must be <="));
+}
+
+#[test]
+fn test_reject_zero_abort_percentage() {
+    let err = FaultInjectionPlugin::new(&json!({
+        "abort": { "status_code": 503, "percentage": 0.0 }
+    }))
+    .err()
+    .unwrap();
+    assert!(err.contains("must be greater than 0.0"));
+}
+
+#[test]
+fn test_reject_zero_delay_percentage() {
+    let err = FaultInjectionPlugin::new(&json!({
+        "delay": { "duration_ms": 100, "percentage": 0.0 }
+    }))
+    .err()
+    .unwrap();
+    assert!(err.contains("must be greater than 0.0"));
 }
 
 #[test]
@@ -225,7 +291,7 @@ async fn test_100_percent_abort_always_triggers() {
 
     for _ in 0..20 {
         let mut ctx = make_ctx();
-        let result = plugin.authorize(&mut ctx).await;
+        let result = run_before_proxy(&plugin, &mut ctx).await;
         match result {
             PluginResult::Reject { status_code, .. } => {
                 assert_eq!(status_code, 503);
@@ -239,21 +305,6 @@ async fn test_100_percent_abort_always_triggers() {
 }
 
 #[tokio::test]
-async fn test_0_percent_abort_never_triggers() {
-    let plugin = FaultInjectionPlugin::new(&json!({
-        "abort": { "status_code": 503, "percentage": 0.0 }
-    }))
-    .unwrap();
-
-    for _ in 0..100 {
-        let mut ctx = make_ctx();
-        let result = plugin.authorize(&mut ctx).await;
-        assert!(matches!(result, PluginResult::Continue));
-        assert!(!ctx.metadata.contains_key("fault_injected"));
-    }
-}
-
-#[tokio::test]
 async fn test_100_percent_delay_always_triggers() {
     let plugin = FaultInjectionPlugin::new(&json!({
         "delay": { "duration_ms": 1, "percentage": 100.0 }
@@ -262,7 +313,7 @@ async fn test_100_percent_delay_always_triggers() {
 
     let mut ctx = make_ctx();
     let start = std::time::Instant::now();
-    let result = plugin.authorize(&mut ctx).await;
+    let result = run_before_proxy(&plugin, &mut ctx).await;
     let elapsed = start.elapsed();
 
     assert!(matches!(result, PluginResult::Continue));
@@ -270,25 +321,6 @@ async fn test_100_percent_delay_always_triggers() {
     assert_eq!(ctx.metadata.get("fault_injected").unwrap(), "true");
     assert_eq!(ctx.metadata.get("fault_type").unwrap(), "delay");
     assert_eq!(ctx.metadata.get("fault_delay_ms").unwrap(), "1");
-}
-
-#[tokio::test]
-async fn test_0_percent_delay_never_triggers() {
-    let plugin = FaultInjectionPlugin::new(&json!({
-        "delay": { "duration_ms": 5000, "percentage": 0.0 }
-    }))
-    .unwrap();
-
-    for _ in 0..100 {
-        let mut ctx = make_ctx();
-        let start = std::time::Instant::now();
-        let result = plugin.authorize(&mut ctx).await;
-        let elapsed = start.elapsed();
-
-        assert!(matches!(result, PluginResult::Continue));
-        assert!(elapsed.as_millis() < 100);
-        assert!(!ctx.metadata.contains_key("fault_injected"));
-    }
 }
 
 #[tokio::test]
@@ -301,7 +333,7 @@ async fn test_delay_then_abort_both_100_percent() {
 
     let mut ctx = make_ctx();
     let start = std::time::Instant::now();
-    let result = plugin.authorize(&mut ctx).await;
+    let result = run_before_proxy(&plugin, &mut ctx).await;
     let elapsed = start.elapsed();
 
     assert!(elapsed.as_millis() >= 1);
@@ -330,7 +362,7 @@ async fn test_abort_with_empty_body() {
     .unwrap();
 
     let mut ctx = make_ctx();
-    let result = plugin.authorize(&mut ctx).await;
+    let result = run_before_proxy(&plugin, &mut ctx).await;
 
     match result {
         PluginResult::Reject { body, .. } => {
@@ -361,27 +393,29 @@ fn test_boundary_percentage_100() {
 }
 
 #[test]
-fn test_boundary_percentage_0() {
-    let plugin = FaultInjectionPlugin::new(&json!({
-        "abort": { "status_code": 503, "percentage": 0.0 }
-    }));
-    assert!(plugin.is_ok());
-}
-
-#[test]
-fn test_boundary_status_code_100() {
-    let plugin = FaultInjectionPlugin::new(&json!({
-        "abort": { "status_code": 100, "percentage": 50.0 }
-    }));
-    assert!(plugin.is_ok());
-}
-
-#[test]
 fn test_boundary_status_code_599() {
     let plugin = FaultInjectionPlugin::new(&json!({
         "abort": { "status_code": 599, "percentage": 50.0 }
     }));
     assert!(plugin.is_ok());
+}
+
+#[tokio::test]
+async fn test_abort_injects_grpc_status_header() {
+    let plugin = FaultInjectionPlugin::new(&json!({
+        "abort": { "status_code": 503, "percentage": 100.0, "grpc_status": 2 }
+    }))
+    .unwrap();
+
+    let mut ctx = make_ctx();
+    let result = run_before_proxy(&plugin, &mut ctx).await;
+
+    match result {
+        PluginResult::Reject { headers, .. } => {
+            assert_eq!(headers.get("grpc-status").unwrap(), "2");
+        }
+        _ => panic!("expected Reject"),
+    }
 }
 
 #[test]
@@ -435,7 +469,7 @@ async fn test_stream_connect_abort_100_percent() {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 503);
-            assert_eq!(body, "stream fault");
+            assert!(body.is_empty());
         }
         _ => panic!("expected Reject for stream connect"),
     }

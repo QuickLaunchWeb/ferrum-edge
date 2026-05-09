@@ -1050,7 +1050,7 @@ pub mod priority {
     pub const GRAPHQL: u16 = 2850;
     pub const RATE_LIMITING: u16 = 2900;
     pub const AI_PROMPT_SHIELD: u16 = 2925;
-    pub const FAULT_INJECTION: u16 = 2950;
+    pub const FAULT_INJECTION: u16 = 2940;
     pub const BODY_VALIDATOR: u16 = 2950;
     pub const AI_REQUEST_GUARD: u16 = 2975;
     pub const AI_FEDERATION: u16 = 2985;
