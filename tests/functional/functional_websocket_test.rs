@@ -135,6 +135,7 @@ fn start_gateway(
 fn write_ws_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "ws-echo-proxy"
     listen_path: "/ws-echo"

@@ -758,6 +758,7 @@ async fn test_ai_rate_limiter_redis_shared_across_instances() {
     let config = |prefix: &str| {
         format!(
             r#"
+version: "1"
 proxies:
   - id: "shared-ai-proxy"
     listen_path: "/shared-ai"
@@ -903,6 +904,7 @@ async fn test_ws_rate_limiting_redis_centralized() {
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "ws-redis-proxy"
     listen_path: "/ws-redis"
@@ -1034,6 +1036,7 @@ async fn test_ws_rate_limiting_redis_namespaces_instance_connections() {
     let config = |prefix: &str| {
         format!(
             r#"
+version: "1"
 proxies:
   - id: "ws-shared-redis-proxy"
     listen_path: "/ws-shared"
@@ -1148,6 +1151,7 @@ async fn test_rate_limiting_redis_shared_across_instances() {
     let config = |prefix: &str| {
         format!(
             r#"
+version: "1"
 proxies:
   - id: "shared-rl-proxy"
     listen_path: "/shared-rl"
@@ -1299,6 +1303,7 @@ async fn test_rate_limiting_redis_namespace_key_prefix_isolation() {
     let config = |namespace: &str| {
         format!(
             r#"
+version: "1"
 proxies:
   - id: "ns-iso-proxy"
     namespace: "{namespace}"

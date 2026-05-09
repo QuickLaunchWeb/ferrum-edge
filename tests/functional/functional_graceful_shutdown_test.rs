@@ -207,6 +207,7 @@ fn write_config(dir: &TempDir, backend_port: u16) -> std::path::PathBuf {
     let config_path = dir.path().join("config.yaml");
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "slow-proxy"
     listen_path: "/slow"
@@ -698,6 +699,7 @@ fn write_tcp_stream_config(
     let config_path = dir.path().join("config.yaml");
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "tcp-echo"
     listen_port: {tcp_listen_port}
@@ -725,6 +727,7 @@ fn write_udp_stream_config(
     let config_path = dir.path().join("config.yaml");
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "udp-echo"
     listen_port: {udp_listen_port}

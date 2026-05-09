@@ -274,6 +274,7 @@ fn write_config(temp_dir: &TempDir, backend_port: u16) -> std::path::PathBuf {
     let config_path = temp_dir.path().join("config.yaml");
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "slow-proxy"
     listen_path: "/slow"
@@ -303,6 +304,7 @@ fn write_grpc_config(temp_dir: &TempDir, backend_port: u16) -> std::path::PathBu
     let config_path = temp_dir.path().join("grpc_config.yaml");
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "grpc-proxy"
     listen_path: "/grpc.svc"

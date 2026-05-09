@@ -307,6 +307,7 @@ async fn test_http_mtls_auth_with_acl() {
         |_ports| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "mtls-acl-http"
     listen_path: "/api"
@@ -491,6 +492,7 @@ async fn test_tcp_mtls_auth_with_acl() {
             let pp = ports.proxy_https;
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "mtls-acl-tcp"
     listen_port: {pp}
@@ -671,6 +673,7 @@ async fn test_udp_dtls_mtls_auth_with_acl() {
             let pp = ports.stream_udp;
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "mtls-acl-dtls"
     listen_port: {pp}

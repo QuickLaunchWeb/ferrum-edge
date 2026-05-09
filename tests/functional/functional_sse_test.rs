@@ -110,6 +110,7 @@ async fn setup_sse_config() -> (TempDir, String, u16) {
 
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "sse-proxy"
     listen_path: "/sse"

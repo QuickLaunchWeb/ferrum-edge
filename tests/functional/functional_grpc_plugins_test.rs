@@ -250,6 +250,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
 fn write_method_router_allow_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "grpc-router-proxy"
     listen_path: "/"
@@ -285,6 +286,7 @@ plugin_configs:
 fn write_method_router_deny_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "grpc-router-proxy"
     listen_path: "/"
@@ -319,6 +321,7 @@ plugin_configs:
 fn write_method_router_ratelimit_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "grpc-router-proxy"
     listen_path: "/"
@@ -367,6 +370,7 @@ fn write_deadline_config(
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "grpc-deadline-proxy"
     listen_path: "/"
@@ -401,6 +405,7 @@ plugin_configs:
 fn write_response_size_limit_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "grpc-size-limit-proxy"
     listen_path: "/"
@@ -863,6 +868,7 @@ async fn test_grpc_plugins_skip_non_grpc_requests() {
     // Config with method_router allow_methods — but the request is HTTP, not gRPC
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "http-proxy"
     listen_path: "/api"

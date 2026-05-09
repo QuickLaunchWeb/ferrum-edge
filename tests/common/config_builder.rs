@@ -418,7 +418,8 @@ impl PluginConfigBuilder {
 
 // ────── GatewayConfig ─────────────────────────────────────────────────────
 
-/// Builder for a file-mode YAML config shape: `{proxies, consumers, upstreams, plugin_configs}`.
+/// Builder for a file-mode YAML config shape:
+/// `{version, proxies, consumers, upstreams, plugin_configs}`.
 pub struct GatewayConfigBuilder {
     proxies: Vec<Value>,
     consumers: Vec<Value>,
@@ -462,10 +463,12 @@ impl GatewayConfigBuilder {
         self
     }
 
-    /// Produce the `{proxies: [...], consumers: [...], upstreams: [...],
-    /// plugin_configs: [...]}` JSON value suitable for file-mode YAML.
+    /// Produce the `{version: "1", proxies: [...], consumers: [...],
+    /// upstreams: [...], plugin_configs: [...]}` JSON value suitable for
+    /// file-mode YAML.
     pub fn build(self) -> Value {
         json!({
+            "version": "1",
             "proxies": self.proxies,
             "consumers": self.consumers,
             "upstreams": self.upstreams,
@@ -605,6 +608,7 @@ mod tests {
             )
             .plugin_config(PluginConfigBuilder::new("pc1", "cors").build())
             .build();
+        assert_eq!(cfg["version"], "1");
         assert_eq!(cfg["proxies"].as_array().unwrap().len(), 1);
         assert_eq!(cfg["consumers"].as_array().unwrap().len(), 1);
         assert_eq!(cfg["upstreams"].as_array().unwrap().len(), 1);

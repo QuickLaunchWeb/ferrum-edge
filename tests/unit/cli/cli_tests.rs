@@ -45,7 +45,8 @@ fn without_env_vars<F: FnOnce()>(vars: &[&str], f: F) {
 
 #[test]
 fn test_parse_no_args() {
-    assert!(Cli::try_parse_from(["ferrum-edge"]).is_err());
+    let cli = Cli::try_parse_from(["ferrum-edge"]).unwrap();
+    assert!(cli.command.is_none());
 }
 
 #[test]

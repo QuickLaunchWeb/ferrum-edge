@@ -79,6 +79,7 @@ async fn functional_dns_cache_localhost_hostname() {
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "localhost-proxy"
     listen_path: "/api"
@@ -129,6 +130,7 @@ async fn functional_dns_cache_unresolvable_hostname_is_isolated() {
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "broken-dns-proxy"
     listen_path: "/broken"
@@ -202,6 +204,7 @@ async fn functional_dns_cache_per_proxy_ttl_override_accepted() {
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "ttl-override-proxy"
     listen_path: "/ttl"
@@ -257,6 +260,7 @@ async fn functional_dns_cache_env_vars_accepted() {
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "env-tuned-proxy"
     listen_path: "/env"
