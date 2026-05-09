@@ -508,9 +508,8 @@ pub struct EnvConfig {
     /// Capacity of the per-ADS-stream response queue between the request
     /// reader task and tonic response stream. Default: 32.
     pub xds_stream_channel_capacity: usize,
-    /// Mesh runtime config source. `native` consumes Ferrum MeshSubscribe.
-    /// `xds` is reserved for the future mesh DP xDS client and is rejected in
-    /// mesh mode until that client is wired.
+    /// Mesh runtime config source. `native` consumes Ferrum MeshSubscribe;
+    /// `xds` consumes Envoy-compatible ADS.
     pub mesh_config_protocol: String,
     /// Additional SPIFFE trust domains accepted as equivalent to the peer
     /// cert's trust domain when validating HBONE baggage `source.principal`.
@@ -2461,15 +2460,7 @@ impl EnvConfig {
                     .to_ascii_lowercase()
                     .as_str()
                 {
-                    "native" => {}
-                    "xds" => {
-                        return Err(
-                            "FERRUM_MESH_CONFIG_PROTOCOL=xds is not supported by mesh runtime yet; \
-                             use FERRUM_MESH_CONFIG_PROTOCOL=native for Ferrum MeshSubscribe. \
-                             FERRUM_XDS_ENABLED only exposes CP ADS for Envoy-compatible clients."
-                                .into(),
-                        );
-                    }
+                    "native" | "xds" => {}
                     other => {
                         return Err(format!(
                             "Invalid FERRUM_MESH_CONFIG_PROTOCOL '{other}'. Expected: native or xds"
