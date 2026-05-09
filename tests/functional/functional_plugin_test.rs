@@ -1162,7 +1162,7 @@ async fn test_plugin_response_size_limiting_fast_path() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/response-sizelimit").await;
 
     let small = client
         .get(format!("{}/response-sizelimit/ok", harness.proxy_base_url))
@@ -1602,7 +1602,7 @@ async fn test_plugin_response_transformer() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/resptransform").await;
 
     let resp = client
         .get(format!("{}/resptransform/test", harness.proxy_base_url))
