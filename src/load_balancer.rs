@@ -594,7 +594,8 @@ impl LoadBalancerCache {
     }
 
     /// Select a target from a named subset within an upstream.
-    /// Falls through to all targets if the subset is not defined or empty.
+    /// Unknown subset names return `None`; defined but empty or unhealthy
+    /// subsets fall back to the upstream's full target set.
     #[inline]
     pub fn select_target_subset_from(
         snapshot: &LoadBalancerCacheInner,
