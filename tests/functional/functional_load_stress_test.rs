@@ -770,7 +770,7 @@ async fn provision_resources(
                         admin_url, consumer_id
                     ))
                     .header("Authorization", &auth_header)
-                    .json(&json!({ "key": api_key }))
+                    .json(&json!([{ "key": api_key }]))
                     .send()
                     .await;
                 match resp {
@@ -797,7 +797,7 @@ async fn provision_resources(
                         admin_url, consumer_id
                     ))
                     .header("Authorization", &auth_header)
-                    .json(&json!({ "password": password }))
+                    .json(&json!([{ "password": password }]))
                     .send()
                     .await;
                 match resp {
@@ -830,7 +830,7 @@ async fn provision_resources(
                         admin_url, consumer_id
                     ))
                     .header("Authorization", &auth_header)
-                    .json(&json!({ "secret": jwt_secret }))
+                    .json(&json!([{ "secret": jwt_secret }]))
                     .send()
                     .await;
                 match resp {

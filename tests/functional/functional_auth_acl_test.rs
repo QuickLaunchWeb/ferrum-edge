@@ -282,13 +282,14 @@ async fn add_credential(
     cred_type: &str,
     cred_data: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let credential_set = serde_json::Value::Array(vec![cred_data.clone()]);
     let resp = client
         .put(format!(
             "{}/consumers/{}/credentials/{}",
             admin_url, consumer_id, cred_type
         ))
         .header("Authorization", auth_header)
-        .json(cred_data)
+        .json(&credential_set)
         .send()
         .await?;
     assert!(
@@ -1621,7 +1622,10 @@ async fn test_auth_acl_comprehensive() {
     let consumer_json: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(consumer_json["username"], "alice");
     // Verify password_hash is redacted
-    if let Some(basicauth) = consumer_json["credentials"]["basicauth"].as_object()
+    if let Some(basicauth) = consumer_json["credentials"]["basicauth"]
+        .as_array()
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry.as_object())
         && let Some(hash) = basicauth.get("password_hash")
     {
         assert_eq!(
@@ -1642,8 +1646,9 @@ async fn test_auth_acl_comprehensive() {
         .expect("Request failed");
     assert!(resp.status().is_success());
     let consumers: serde_json::Value = resp.json().await.unwrap();
-    assert!(consumers.is_array());
-    let consumers_arr = consumers.as_array().unwrap();
+    let consumers_arr = consumers["data"]
+        .as_array()
+        .expect("consumer list response should include data array");
     assert!(
         consumers_arr.len() >= 3,
         "Should have at least 3 consumers (alice, bob, charlie)"

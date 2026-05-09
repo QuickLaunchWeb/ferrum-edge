@@ -135,13 +135,14 @@ async fn put_credential(
     cred_type: &str,
     cred: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let credential_set = serde_json::Value::Array(vec![cred.clone()]);
     let resp = client
         .put(format!(
             "{}/consumers/{}/credentials/{}",
             admin_url, consumer_id, cred_type
         ))
         .header("Authorization", auth)
-        .json(cred)
+        .json(&credential_set)
         .send()
         .await?;
     if !resp.status().is_success() {

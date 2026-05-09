@@ -290,7 +290,7 @@ async fn test_db_outage_proxy_continues_with_plugins() {
             "enabled": true,
             "config": {
                 "rules": [
-                    {"operation": "add", "key": "X-Response-Plugin", "value": "active"}
+                    {"operation": "add", "target": "header", "key": "X-Response-Plugin", "value": "active"}
                 ]
             }
         }),
@@ -607,13 +607,16 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
         "List proxies should indicate cached data source"
     );
     let proxies: serde_json::Value = resp.json().await.unwrap();
+    let proxy_items = proxies["data"]
+        .as_array()
+        .expect("cached proxy list response should include data array");
     assert!(
-        !proxies.as_array().unwrap().is_empty(),
+        !proxy_items.is_empty(),
         "Should have at least 1 cached proxy"
     );
     println!(
         "    GET /proxies: OK (cached, {} proxies)",
-        proxies.as_array().unwrap().len()
+        proxy_items.len()
     );
 
     // GET /proxies/:id — single proxy from cache
@@ -1074,7 +1077,7 @@ async fn test_db_outage_key_auth_continues() {
             harness.admin_base_url
         ))
         .header("Authorization", &auth)
-        .json(&json!({"key": "my-secret-api-key-12345"}))
+        .json(&json!([{"key": "my-secret-api-key-12345"}]))
         .send()
         .await
         .unwrap();

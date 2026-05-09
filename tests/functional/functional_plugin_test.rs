@@ -1585,11 +1585,13 @@ async fn test_plugin_response_transformer() {
                 "rules": [
                     {
                         "operation": "add",
+                        "target": "header",
                         "key": "X-Gateway-Version",
                         "value": "ferrum-1.0"
                     },
                     {
                         "operation": "add",
+                        "target": "header",
                         "key": "X-Powered-By",
                         "value": "ferrum-edge"
                     }
@@ -1774,7 +1776,7 @@ async fn test_plugin_chain_multiple_plugins() {
             "proxy_id": proxy_id,
             "enabled": true,
             "config": {
-                "rules": [{"operation": "add", "key": "X-Served-By", "value": "ferrum"}]
+                "rules": [{"operation": "add", "target": "header", "key": "X-Served-By", "value": "ferrum"}]
             }
         }),
     ];
