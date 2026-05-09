@@ -274,6 +274,9 @@ where
     let mut acc = K8sAccumulator::new(options);
 
     for object in objects.iter().filter(|object| include(object)) {
+        if !acc.options.includes_namespace(&object.metadata.namespace) {
+            continue;
+        }
         if object.kind == "ReferenceGrant" {
             gateway_api::collect_reference_grant(&mut acc, object)?;
         }

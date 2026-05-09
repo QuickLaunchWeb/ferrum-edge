@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -243,11 +244,8 @@ async fn do_reconcile(
         warn!(warning, "K8s translation warning");
     }
 
-    // Merge with existing non-K8s-sourced config. For now, the K8s controller
-    // fully owns the GatewayConfig when enabled — DB-sourced config is managed
-    // by the polling loop separately.
-    let new_config = translation.config;
     let old_config = ctx.config_arc.load();
+    let new_config = merge_k8s_translation(old_config.as_ref(), translation.config);
 
     let changed = gateway_config_content_changed(&new_config, old_config.as_ref());
 
@@ -283,6 +281,38 @@ async fn do_reconcile(
 
 fn gateway_config_content_changed(new_config: &GatewayConfig, old_config: &GatewayConfig) -> bool {
     stable_config_value(new_config) != stable_config_value(old_config)
+}
+
+const K8S_MANAGED_PROXY_ID_PREFIXES: &[&str] = &["gwapi-route-", "gwapi-l4-", "istio-vs-"];
+const K8S_MANAGED_UPSTREAM_ID_PREFIXES: &[&str] = &["gwapi-route-upstream-", "istio-vs-upstream-"];
+
+fn merge_k8s_translation(active: &GatewayConfig, mut k8s_config: GatewayConfig) -> GatewayConfig {
+    let mut merged = active.clone();
+
+    merged
+        .proxies
+        .retain(|proxy| !has_any_prefix(&proxy.id, K8S_MANAGED_PROXY_ID_PREFIXES));
+    merged
+        .upstreams
+        .retain(|upstream| !has_any_prefix(&upstream.id, K8S_MANAGED_UPSTREAM_ID_PREFIXES));
+
+    merged.proxies.append(&mut k8s_config.proxies);
+    merged.upstreams.append(&mut k8s_config.upstreams);
+
+    let mut namespaces: BTreeSet<String> = merged.known_namespaces.iter().cloned().collect();
+    namespaces.extend(k8s_config.known_namespaces);
+    merged.known_namespaces = namespaces.into_iter().collect();
+
+    if k8s_config.mesh.is_some() {
+        merged.mesh = k8s_config.mesh;
+    }
+
+    merged.normalize_fields();
+    merged
+}
+
+fn has_any_prefix(id: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|prefix| id.starts_with(prefix))
 }
 
 fn stable_config_value(config: &GatewayConfig) -> Value {
@@ -346,7 +376,7 @@ fn sort_string_array(value: &mut Value, field: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::types::{PluginConfig, PluginScope};
+    use crate::config::types::{PluginConfig, PluginScope, Proxy, Upstream};
     use chrono::{Duration as ChronoDuration, Utc};
     use serde_json::json;
 
@@ -364,6 +394,33 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    fn proxy(id: &str, backend_host: &str) -> Proxy {
+        serde_json::from_value(json!({
+            "id": id,
+            "namespace": "ferrum",
+            "hosts": ["example.com"],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": backend_host,
+            "backend_port": 80
+        }))
+        .expect("test proxy should deserialize")
+    }
+
+    fn upstream(id: &str, host: &str) -> Upstream {
+        serde_json::from_value(json!({
+            "id": id,
+            "namespace": "ferrum",
+            "name": id,
+            "targets": [{
+                "host": host,
+                "port": 80,
+                "weight": 1
+            }]
+        }))
+        .expect("test upstream should deserialize")
     }
 
     #[test]
@@ -405,6 +462,53 @@ mod tests {
         new_config.plugin_configs.reverse();
 
         assert!(!gateway_config_content_changed(&new_config, &old_config));
+    }
+
+    #[test]
+    fn merge_k8s_translation_preserves_db_resources_and_replaces_k8s_overlay() {
+        let mut active = GatewayConfig::default();
+        active.proxies.push(proxy("db-proxy", "db.internal"));
+        active
+            .proxies
+            .push(proxy("gwapi-route-ferrum-old-0", "old.internal"));
+        active.upstreams.push(upstream(
+            "gwapi-route-upstream-ferrum-old-0",
+            "old.internal",
+        ));
+        active.known_namespaces.push("db".to_string());
+
+        let mut k8s = GatewayConfig::default();
+        k8s.proxies
+            .push(proxy("gwapi-route-ferrum-new-0", "new.internal"));
+        k8s.upstreams.push(upstream(
+            "gwapi-route-upstream-ferrum-new-0",
+            "new.internal",
+        ));
+        k8s.known_namespaces.push("k8s".to_string());
+
+        let merged = merge_k8s_translation(&active, k8s);
+
+        assert!(merged.proxies.iter().any(|proxy| proxy.id == "db-proxy"));
+        assert!(
+            merged
+                .proxies
+                .iter()
+                .any(|proxy| proxy.id == "gwapi-route-ferrum-new-0")
+        );
+        assert!(
+            merged
+                .proxies
+                .iter()
+                .all(|proxy| proxy.id != "gwapi-route-ferrum-old-0")
+        );
+        assert!(
+            merged
+                .upstreams
+                .iter()
+                .all(|upstream| upstream.id != "gwapi-route-upstream-ferrum-old-0")
+        );
+        assert!(merged.known_namespaces.contains(&"db".to_string()));
+        assert!(merged.known_namespaces.contains(&"k8s".to_string()));
     }
 
     #[test]
