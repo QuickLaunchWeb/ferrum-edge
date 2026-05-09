@@ -19,6 +19,7 @@ use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
+use super::mesh::mesh_trace_attributes;
 use super::utils::PluginHttpClient;
 use super::{Plugin, PluginResult, RequestContext, StreamTransactionSummary, TransactionSummary};
 
@@ -855,16 +856,6 @@ fn otlp_attribute_bool(key: &str, value: bool) -> Value {
         "key": key,
         "value": { "boolValue": value }
     })
-}
-
-fn mesh_trace_attributes(metadata: &HashMap<String, String>) -> Vec<(String, String)> {
-    let mut attributes: Vec<_> = metadata
-        .iter()
-        .filter(|(key, _)| key.starts_with("mesh."))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    attributes.sort_by(|left, right| left.0.cmp(&right.0));
-    attributes
 }
 
 /// Convert a hex string to base64-encoded bytes (OTLP/HTTP JSON encoding).

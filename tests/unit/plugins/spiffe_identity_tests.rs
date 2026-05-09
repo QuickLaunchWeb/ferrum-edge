@@ -1,7 +1,7 @@
 use ferrum_edge::config::types::{BackendScheme, Consumer};
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::identity::spiffe::{SpiffeId, spiffe_id_to_san};
-use ferrum_edge::plugins::spiffe_identity::SpiffeIdentity;
+use ferrum_edge::plugins::mesh::spiffe_identity::SpiffeIdentity;
 use ferrum_edge::plugins::{
     HTTP_FAMILY_AND_STREAM_PROTOCOLS, Plugin, RequestContext, StreamConnectionContext, priority,
 };

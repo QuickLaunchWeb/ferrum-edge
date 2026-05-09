@@ -2,15 +2,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ferrum_edge::ConsumerIndex;
-use ferrum_edge::config::mesh::{
+use ferrum_edge::config::types::{BackendScheme, Proxy};
+use ferrum_edge::identity::{SpiffeId, TrustDomain};
+use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
     WorkloadSelector,
 };
-use ferrum_edge::config::types::{BackendScheme, Proxy};
-use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::plugins::access_log::AccessLog;
-use ferrum_edge::plugins::mesh_authz::MeshAuthz;
-use ferrum_edge::plugins::workload_metrics::WorkloadMetrics;
+use ferrum_edge::plugins::mesh::authz::MeshAuthz;
+use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, StreamConnectionContext,
     TransactionSummary, available_plugins, create_plugin, is_security_plugin, priority,
@@ -1322,7 +1322,7 @@ async fn mesh_authz_slice_embedded_identity_drives_scope_filter() {
     // `labels` describe the proxy's own workload. The plugin must use those
     // when filtering policies — explicit namespace/labels override is not
     // required when the slice already carries the identity.
-    use ferrum_edge::xds::slice::MeshSlice;
+    use ferrum_edge::modes::mesh::slice::MeshSlice;
 
     let slice = MeshSlice {
         namespace: "team-b".to_string(),

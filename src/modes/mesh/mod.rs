@@ -6,10 +6,12 @@
 //! boundary. It deliberately keeps the generic proxy/plugin chain unchanged so
 //! existing plugins work in mesh context.
 
+pub mod config;
 pub mod config_consumer;
 pub mod hbone;
 pub mod policy;
 pub mod runtime;
+pub mod slice;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,19 +23,19 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
-use crate::config::mesh::{EastWestGateway, MeshConfig};
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, GatewayConfig, PluginAssociation, PluginConfig, PluginScope,
     Proxy, ResponseBodyMode,
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
+use crate::modes::mesh::config::{EastWestGateway, MeshConfig};
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::runtime::MeshRuntimeState;
+use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
-use crate::xds::slice::{MeshSlice, MeshSliceRequest};
 
 const DEFAULT_INBOUND_LISTEN_ADDR: &str = "0.0.0.0:15006";
 const DEFAULT_OUTBOUND_LISTEN_ADDR: &str = "127.0.0.1:15001";
@@ -1116,14 +1118,14 @@ fn parse_port(key: &str, raw: &str) -> Result<u16, String> {
 mod tests {
     use super::*;
     use crate::config::EnvConfig;
-    use crate::config::mesh::{
+    use crate::config::types::PluginScope;
+    use crate::dns::{DnsCache, DnsConfig};
+    use crate::identity::{SpiffeId, TrustDomain};
+    use crate::modes::mesh::config::{
         AppProtocol, EastWestGateway, MeshConfig, MeshPolicy, MeshRule, MeshService,
         MultiClusterConfig, PolicyAction, PolicyScope, PrincipalMatch, Workload, WorkloadPort,
         WorkloadSelector,
     };
-    use crate::config::types::PluginScope;
-    use crate::dns::{DnsCache, DnsConfig};
-    use crate::identity::{SpiffeId, TrustDomain};
     use std::collections::HashMap;
     use std::sync::Mutex;
 

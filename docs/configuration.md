@@ -128,7 +128,7 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | If CP gRPC TLS | — | CP gRPC server TLS certificate |
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | If CP gRPC TLS | — | CP gRPC server TLS private key |
 | `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | No | — | CA bundle for verifying DP client certificates (mTLS) |
-| `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` | No | `128` | CP broadcast channel capacity before lagging DPs receive a full snapshot |
+| `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` | No | `128` | Per-channel capacity for the CP's two independent broadcast channels (one for DP `ConfigSync.Subscribe`, one for mesh `MeshConfigSync.MeshSubscribe`). Lagging subscribers on either channel auto-recover with a full snapshot |
 | `FERRUM_XDS_ENABLED` | No | `false` | Enable Phase B xDS ADS (`StreamAggregatedResources` and `DeltaAggregatedResources`) on the CP gRPC listener |
 | `FERRUM_XDS_STREAM_CHANNEL_CAPACITY` | No | `32` | Per-ADS-stream response queue capacity before slow xDS readers apply backpressure to their own stream task |
 | `FERRUM_DP_CP_GRPC_URLS` | DP/mesh mode | — | Comma-separated priority-ordered CP URLs for DP/mesh failover |

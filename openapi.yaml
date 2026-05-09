@@ -277,9 +277,10 @@ paths:
       description: |
         Returns live connection state for CP/DP deployments.
 
-        **CP mode**: Lists all currently connected Data Plane nodes with
-        `node_id`, `version`, `namespace`, `status`, `connected_at`, and
-        `last_sync_at`. Disconnected DPs are automatically removed.
+        **CP mode**: Lists all currently connected Data Plane nodes and
+        Mesh nodes. Each entry includes `node_id`, `version`, `namespace`,
+        `status`, `connected_at`, and `last_sync_at`. Disconnected nodes
+        are automatically removed from their respective registries.
 
         **DP mode**: Shows the connection to the Control Plane — `url`,
         `status` (online/offline), `is_primary` (primary vs fallback CP),
@@ -302,7 +303,7 @@ paths:
                   - $ref: "#/components/schemas/ClusterStatusOther"
               examples:
                 cp_mode:
-                  summary: CP mode with two connected DPs
+                  summary: CP mode with two connected DPs and one mesh node
                   value:
                     mode: cp
                     connected_data_planes: 2
@@ -318,6 +319,14 @@ paths:
                         namespace: staging
                         status: online
                         connected_at: "2025-01-15T10:31:00Z"
+                        last_sync_at: "2025-01-15T10:35:00Z"
+                    connected_mesh_nodes: 1
+                    mesh_nodes:
+                      - node_id: "mesh-789"
+                        version: "0.9.0"
+                        namespace: ferrum
+                        status: online
+                        connected_at: "2025-01-15T10:32:00Z"
                         last_sync_at: "2025-01-15T10:35:00Z"
                 dp_mode_online:
                   summary: DP connected to primary CP
@@ -6742,7 +6751,7 @@ components:
 
     ClusterStatusCp:
       type: object
-      required: [mode, connected_data_planes, data_planes]
+      required: [mode, connected_data_planes, data_planes, connected_mesh_nodes, mesh_nodes]
       properties:
         mode:
           type: string
@@ -6754,6 +6763,39 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ConnectedDpNode"
+        connected_mesh_nodes:
+          type: integer
+          description: Number of currently connected Mesh nodes
+        mesh_nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConnectedMeshNode"
+
+    ConnectedMeshNode:
+      type: object
+      required: [node_id, version, namespace, status, connected_at, last_sync_at]
+      properties:
+        node_id:
+          type: string
+          description: Unique identifier for the mesh node
+        version:
+          type: string
+          description: Ferrum Edge version reported by the mesh node
+        namespace:
+          type: string
+          description: Namespace the mesh node is subscribed to
+        status:
+          type: string
+          enum: [online]
+          description: Always "online" — disconnected mesh nodes are removed from the registry
+        connected_at:
+          type: string
+          format: date-time
+          description: When the mesh node's gRPC stream was established
+        last_sync_at:
+          type: string
+          format: date-time
+          description: When the last config update was broadcast to this mesh node
 
     ConnectedDpNode:
       type: object

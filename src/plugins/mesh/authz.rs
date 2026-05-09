@@ -6,7 +6,7 @@
 //!
 //! ## PolicyScope enforcement
 //!
-//! Each [`crate::config::mesh::MeshPolicy`] carries a [`crate::config::mesh::PolicyScope`]
+//! Each [`crate::modes::mesh::config::MeshPolicy`] carries a [`crate::modes::mesh::config::PolicyScope`]
 //! that determines which workloads it applies to. Applying every policy to
 //! every workload is a security correctness gap — a namespace-scoped DENY in
 //! namespace `A` would deny traffic for workloads in namespace `B`, and a
@@ -14,7 +14,7 @@
 //! unrelated namespaces.
 //!
 //! The plugin pre-filters `slice.mesh_policies` at construction time using
-//! [`crate::config::mesh::policy_scope_applies_to_workload`]. The hot path
+//! [`crate::modes::mesh::config::policy_scope_applies_to_workload`]. The hot path
 //! ([`evaluate_mesh_authorization`]) then sees only the policies that apply
 //! to **this** proxy's workload, so the per-request cost stays at the same
 //! O(policies × rules) it was before — minus any policies the scope filter
@@ -26,15 +26,18 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
-use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
-use crate::config::mesh::{MeshPolicy, PolicyScope, policy_scope_applies_to_workload};
 use crate::identity::{SpiffeId, TrustDomain};
+use crate::modes::mesh::config::{MeshPolicy, PolicyScope, policy_scope_applies_to_workload};
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
     MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
     mesh_policies_have_header_rules, normalize_mesh_policy_header_names,
 };
-use crate::xds::slice::MeshSlice;
+use crate::modes::mesh::slice::MeshSlice;
+use crate::plugins::{
+    ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
+    priority,
+};
 
 pub struct MeshAuthz {
     slice: MeshSlice,
@@ -170,11 +173,11 @@ impl Plugin for MeshAuthz {
     }
 
     fn priority(&self) -> u16 {
-        super::priority::MESH_AUTHZ
+        priority::MESH_AUTHZ
     }
 
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::ALL_PROTOCOLS
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        ALL_PROTOCOLS
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {

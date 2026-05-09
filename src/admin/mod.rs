@@ -35,6 +35,7 @@ use crate::config::types::{
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
 use crate::grpc::cp_server::DpNodeRegistry;
 use crate::grpc::dp_client::DpCpConnectionState;
+use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::plugins;
 use crate::proxy::ProxyState;
 use arc_swap::ArcSwap;
@@ -113,6 +114,8 @@ pub struct AdminState {
     pub cached_db_health: Arc<ArcSwap<Option<CachedDbHealthResult>>>,
     /// Registry of connected DP nodes (CP mode only).
     pub dp_registry: Option<Arc<DpNodeRegistry>>,
+    /// Registry of connected mesh config-stream nodes (CP mode only).
+    pub mesh_registry: Option<Arc<MeshNodeRegistry>>,
     /// Connection state to the CP (DP mode only).
     pub cp_connection_state: Option<Arc<ArcSwap<DpCpConnectionState>>>,
     /// Admin HTTP header read timeout (seconds). 0 disables.
@@ -2253,40 +2256,52 @@ async fn check_port_available(port: u16, bind_address: &str, udp: bool) -> Resul
 async fn handle_cluster_status(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
     match state.mode.as_str() {
         "cp" => {
-            if let Some(ref registry) = state.dp_registry {
-                let nodes = registry.snapshot();
-                let connected_count = nodes.len();
-                let node_details: Vec<serde_json::Value> = nodes
-                    .iter()
-                    .map(|n| {
-                        json!({
-                            "node_id": n.node_id,
-                            "version": n.version,
-                            "namespace": n.namespace,
-                            "status": "online",
-                            "connected_at": n.connected_at.to_rfc3339(),
-                            "last_sync_at": n.last_update_at.to_rfc3339(),
-                        })
+            let data_planes = state
+                .dp_registry
+                .as_ref()
+                .map(|registry| registry.snapshot())
+                .unwrap_or_default();
+            let data_plane_details: Vec<serde_json::Value> = data_planes
+                .iter()
+                .map(|n| {
+                    json!({
+                        "node_id": n.node_id,
+                        "version": n.version,
+                        "namespace": n.namespace,
+                        "status": "online",
+                        "connected_at": n.connected_at.to_rfc3339(),
+                        "last_sync_at": n.last_update_at.to_rfc3339(),
                     })
-                    .collect();
-                Ok(json_response(
-                    StatusCode::OK,
-                    &json!({
-                        "mode": "cp",
-                        "connected_data_planes": connected_count,
-                        "data_planes": node_details,
-                    }),
-                ))
-            } else {
-                Ok(json_response(
-                    StatusCode::OK,
-                    &json!({
-                        "mode": "cp",
-                        "connected_data_planes": 0,
-                        "data_planes": [],
-                    }),
-                ))
-            }
+                })
+                .collect();
+            let mesh_nodes = state
+                .mesh_registry
+                .as_ref()
+                .map(|registry| registry.snapshot())
+                .unwrap_or_default();
+            let mesh_node_details: Vec<serde_json::Value> = mesh_nodes
+                .iter()
+                .map(|n| {
+                    json!({
+                        "node_id": n.node_id,
+                        "version": n.version,
+                        "namespace": n.namespace,
+                        "status": "online",
+                        "connected_at": n.connected_at.to_rfc3339(),
+                        "last_sync_at": n.last_update_at.to_rfc3339(),
+                    })
+                })
+                .collect();
+            Ok(json_response(
+                StatusCode::OK,
+                &json!({
+                    "mode": "cp",
+                    "connected_data_planes": data_planes.len(),
+                    "data_planes": data_plane_details,
+                    "connected_mesh_nodes": mesh_nodes.len(),
+                    "mesh_nodes": mesh_node_details,
+                }),
+            ))
         }
         "dp" => {
             if let Some(ref cs) = state.cp_connection_state {

@@ -45,7 +45,7 @@ pub mod key_auth;
 pub mod ldap_auth;
 pub mod load_testing;
 pub mod loki_logging;
-pub mod mesh_authz;
+pub mod mesh;
 pub mod mtls_auth;
 pub mod otel_tracing;
 pub mod prometheus_metrics;
@@ -62,7 +62,6 @@ pub mod response_transformer;
 pub mod serverless_function;
 pub mod soap_ws_security;
 pub mod spec_expose;
-pub mod spiffe_identity;
 pub mod sse;
 pub mod statsd_logging;
 pub mod stdout_logging;
@@ -72,7 +71,6 @@ pub mod transaction_debugger;
 pub mod udp_logging;
 pub mod udp_rate_limiting;
 pub mod utils;
-pub mod workload_metrics;
 pub mod ws_frame_logging;
 pub mod ws_logging;
 pub mod ws_message_size_limiting;
@@ -1521,7 +1519,7 @@ pub fn create_plugin_with_http_client(
         )?))),
         "hmac_auth" => Ok(Some(Arc::new(hmac_auth::HmacAuth::new(config)?))),
         "mtls_auth" => Ok(Some(Arc::new(mtls_auth::MtlsAuth::new(config)?))),
-        "spiffe_identity" => Ok(Some(Arc::new(spiffe_identity::SpiffeIdentity::new(
+        "spiffe_identity" => Ok(Some(Arc::new(mesh::spiffe_identity::SpiffeIdentity::new(
             config,
         )?))),
         "compression" => Ok(Some(Arc::new(compression::CompressionPlugin::new(config)?))),
@@ -1530,7 +1528,7 @@ pub fn create_plugin_with_http_client(
         "tcp_connection_throttle" => Ok(Some(Arc::new(
             tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
         ))),
-        "mesh_authz" => Ok(Some(Arc::new(mesh_authz::MeshAuthz::new(config)?))),
+        "mesh_authz" => Ok(Some(Arc::new(mesh::authz::MeshAuthz::new(config)?))),
         "ip_restriction" => Ok(Some(Arc::new(ip_restriction::IpRestriction::new(config)?))),
         "geo_restriction" => Ok(Some(Arc::new(geo_restriction::GeoRestriction::new(
             config,
@@ -1637,9 +1635,9 @@ pub fn create_plugin_with_http_client(
             config,
             http_client,
         )?))),
-        "workload_metrics" => Ok(Some(Arc::new(workload_metrics::WorkloadMetrics::new(
-            config,
-        )?))),
+        "workload_metrics" => Ok(Some(Arc::new(
+            mesh::workload_metrics::WorkloadMetrics::new(config)?,
+        ))),
         "access_log" => Ok(Some(Arc::new(access_log::AccessLog::new(config)?))),
         _ => {
             // Fall through to custom plugins registry
