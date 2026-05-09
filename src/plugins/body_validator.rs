@@ -657,6 +657,11 @@ impl BodyValidator {
 /// When the compressed flag is set (byte 0 == 1), the payload is decompressed using
 /// gzip (deflate), which is the standard gRPC compression algorithm. Other compression
 /// algorithms (e.g., zstd, snappy) are not supported and will return an error.
+/// Maximum decompressed size for a gRPC frame (10 MB). Prevents compression-bomb
+/// DoS — without a cap, a tiny compressed payload can inflate into gigabytes and OOM
+/// the process.
+const MAX_GRPC_DECOMPRESSED_SIZE: usize = 10 * 1024 * 1024;
+
 fn parse_grpc_frame(body: &[u8]) -> Result<Cow<'_, [u8]>, String> {
     if body.len() < 5 {
         return Err(format!(
@@ -676,11 +681,24 @@ fn parse_grpc_frame(body: &[u8]) -> Result<Cow<'_, [u8]>, String> {
     }
     if compressed != 0 {
         // gRPC compression uses gzip (deflate) by default per the gRPC spec.
+        // Bounded read to prevent compression-bomb DoS.
         let mut decoder = GzDecoder::new(payload);
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .map_err(|e| format!("Failed to decompress gRPC frame (gzip): {}", e))?;
+        let mut decompressed = Vec::with_capacity(payload.len().min(MAX_GRPC_DECOMPRESSED_SIZE));
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = decoder
+                .read(&mut buf)
+                .map_err(|e| format!("Failed to decompress gRPC frame (gzip): {e}"))?;
+            if n == 0 {
+                break;
+            }
+            if decompressed.len() + n > MAX_GRPC_DECOMPRESSED_SIZE {
+                return Err(format!(
+                    "gRPC decompressed body exceeds max size of {MAX_GRPC_DECOMPRESSED_SIZE} bytes"
+                ));
+            }
+            decompressed.extend_from_slice(&buf[..n]);
+        }
         Ok(Cow::Owned(decompressed))
     } else {
         Ok(Cow::Borrowed(payload))

@@ -809,7 +809,7 @@ impl DnsCache {
             };
             let target = srv.target.to_string();
             let target = target.trim_end_matches('.').to_string();
-            results.push((target, srv.port, srv.priority));
+            results.push((target, srv.port, srv.weight));
         }
 
         Ok(results)

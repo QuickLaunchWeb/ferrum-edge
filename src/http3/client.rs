@@ -1735,11 +1735,21 @@ impl Http3ConnectionPool {
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
+        // RFC 9110 §7.6.1: snapshot the Connection-listed names before
+        // iterating so any header NAMED in `Connection` is also skipped
+        // during collection. Hyper rejects `Connection` on H2/H3 frames
+        // (RFC 9114 §4.2), so this is typically empty for native H3
+        // backends — the snapshot exists for defence in depth.
+        let connection_listed = parse_connection_listed_headers(response.headers());
         for (name, value) in response.headers() {
             match name.as_str() {
                 "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
                 | "trailer" | "transfer-encoding" | "upgrade" => continue,
                 _ => {}
+            }
+            // RFC 9110 §7.6.1: also skip every header NAMED in `Connection`.
+            if connection_listed.iter().any(|n| n == name) {
+                continue;
             }
             if let Ok(value_str) = value.to_str() {
                 response_headers.insert(name.as_str().to_string(), value_str.to_string());

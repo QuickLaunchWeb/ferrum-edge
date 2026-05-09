@@ -13,6 +13,8 @@
 //! Token location is configurable via `token_lookup` (default `"header:Authorization"`).
 //! Supports `"header:<name>"` and `"query:<name>"` extraction modes.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, dangerous::insecure_decode, decode};
 use serde_json::Value;
@@ -58,7 +60,7 @@ impl JwtAuth {
         )?;
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
-        validation.required_spec_claims.clear();
+        validation.required_spec_claims = HashSet::from(["exp".to_string()]);
 
         Ok(Self {
             token_lookup,

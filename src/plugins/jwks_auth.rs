@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, Validation, decode, decode_header};
@@ -519,7 +521,7 @@ async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Opt
     let build_validation = |algorithm: Algorithm| -> Validation {
         let mut validation = Validation::new(algorithm);
         validation.validate_exp = true;
-        validation.required_spec_claims.clear();
+        validation.required_spec_claims = HashSet::from(["exp".to_string()]);
         if let Some(ref iss) = provider.issuer {
             validation.set_issuer(&[iss]);
         }

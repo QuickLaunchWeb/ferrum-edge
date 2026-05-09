@@ -128,6 +128,7 @@ pub fn build_backend_dtls_config(
     backend_host: &str,
     tls_no_verify: bool,
     crls: &crate::tls::CrlList,
+    global_ca_bundle_path: Option<&str>,
 ) -> Result<BackendDtlsParams, anyhow::Error> {
     let skip_verify = !proxy.resolved_tls.verify_server_cert || tls_no_verify;
 
@@ -145,7 +146,7 @@ pub fn build_backend_dtls_config(
     let (server_name, server_cert_verifier) = if skip_verify {
         (None, None)
     } else {
-        let root_store = load_backend_root_store(proxy)?;
+        let root_store = load_backend_root_store(proxy, global_ca_bundle_path)?;
         let server_name = rustls::pki_types::ServerName::try_from(backend_host.to_string())
             .map_err(|_| {
                 anyhow::anyhow!(
@@ -733,11 +734,16 @@ impl DtlsServer {
 
             let data = buf[..len].to_vec();
 
-            if let Some(session) = self.sessions.get(&peer_addr) {
+            // Clone the sender out of the DashMap guard before awaiting.
+            // The `Ref` from `sessions.get()` holds a read lock on the shard;
+            // holding it across `.send().await` would deadlock if the channel
+            // is full and a `SessionGuard::Drop` on the same shard needs a
+            // write lock to call `sessions.remove()`.
+            let incoming_tx = self.sessions.get(&peer_addr).map(|s| s.incoming_tx.clone());
+            if let Some(tx) = incoming_tx {
                 // Existing session — forward packet to its driver
-                if session.incoming_tx.send(data).await.is_err() {
+                if tx.send(data).await.is_err() {
                     // Driver task exited — remove stale session
-                    drop(session);
                     remove_session(
                         &self.sessions,
                         &self.active_sessions,
@@ -1121,8 +1127,14 @@ pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore,
     let pem_data = std::fs::read(pem_path)
         .map_err(|e| anyhow::anyhow!("Failed to read PEM file {}: {}", pem_path, e))?;
     let certs: Vec<_> = rustls_pemfile::certs(&mut &pem_data[..])
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse PEM certificate in DTLS CA file {}: {}",
+                pem_path,
+                e
+            )
+        })?;
     let mut roots = rustls::RootCertStore::empty();
     let (added, ignored) = roots.add_parsable_certificates(certs);
     if added == 0 {
@@ -1135,9 +1147,14 @@ pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore,
     Ok(roots)
 }
 
-fn load_backend_root_store(proxy: &Proxy) -> Result<rustls::RootCertStore, anyhow::Error> {
+fn load_backend_root_store(
+    proxy: &Proxy,
+    global_ca_bundle_path: Option<&str>,
+) -> Result<rustls::RootCertStore, anyhow::Error> {
     if let Some(ca_path) = &proxy.resolved_tls.server_ca_cert_path {
         load_root_store_from_pem(ca_path)
+    } else if let Some(global_ca) = global_ca_bundle_path {
+        load_root_store_from_pem(global_ca)
     } else {
         Ok(rustls::RootCertStore::from_iter(
             webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),

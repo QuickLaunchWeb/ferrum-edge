@@ -225,10 +225,26 @@ impl CircuitBreaker {
     ) {
         if connection_error {
             if !self.config.trip_on_connection_errors {
+                // Filtered failure — release the probe slot without state transition
+                if is_half_open_probe {
+                    let _ = self.half_open_in_flight.fetch_update(
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                        |v| v.checked_sub(1),
+                    );
+                }
                 return;
             }
         } else if !self.config.failure_status_codes.contains(&status_code) {
-            // Non-failure status codes are neutral — don't treat as success or failure
+            // Non-failure status codes are neutral — release probe slot without
+            // state transition
+            if is_half_open_probe {
+                let _ = self.half_open_in_flight.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |v| v.checked_sub(1),
+                );
+            }
             return;
         }
 

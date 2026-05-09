@@ -1442,25 +1442,21 @@ pub mod ktls {
 /// resolves to true (auto-detected at startup via `check_io_uring_available()`).
 #[cfg(target_os = "linux")]
 pub mod io_uring_splice {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
 
-    static IO_URING_AVAILABLE: AtomicBool = AtomicBool::new(false);
-    static IO_URING_CHECKED: AtomicBool = AtomicBool::new(false);
+    static IO_URING_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
     /// Check if io_uring is available on this kernel (Linux 5.6+).
     ///
-    /// Probes the `io_uring_setup` syscall. Returns `true` if the syscall
-    /// exists (even if params are invalid — EINVAL still means io_uring is present).
-    /// ENOSYS means the kernel doesn't support io_uring.
+    /// Probes by submitting an `IORING_OP_SPLICE` on a pipe pair. Ring creation
+    /// alone is insufficient — seccomp or kernel config may allow ring setup but
+    /// reject specific opcodes like SPLICE. Uses `OnceLock` for thread-safe
+    /// one-shot initialization without TOCTOU races.
     pub fn check_io_uring_available() -> bool {
-        if IO_URING_CHECKED.load(Ordering::Relaxed) {
-            return IO_URING_AVAILABLE.load(Ordering::Relaxed);
-        }
-
-        // Probe by actually submitting an IORING_OP_SPLICE on a pipe pair.
-        // Ring creation alone is insufficient — seccomp or kernel config may
-        // allow ring setup but reject specific opcodes like SPLICE.
-        let available = (|| -> bool {
+        *IO_URING_AVAILABLE.get_or_init(|| {
+            // Probe by actually submitting an IORING_OP_SPLICE on a pipe pair.
+            // Ring creation alone is insufficient — seccomp or kernel config may
+            // allow ring setup but reject specific opcodes like SPLICE.
             let mut ring = match io_uring::IoUring::new(2) {
                 Ok(r) => r,
                 Err(_) => return false,
@@ -1505,11 +1501,7 @@ pub mod io_uring_splice {
                 libc::close(fds[1]);
             }
             result
-        })();
-
-        IO_URING_AVAILABLE.store(available, Ordering::Relaxed);
-        IO_URING_CHECKED.store(true, Ordering::Relaxed);
-        available
+        })
     }
 
     /// Errors from an io_uring splice call tagged with the side of the relay

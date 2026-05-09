@@ -558,28 +558,37 @@ impl HealthChecker {
     /// dynamically removed. This runs in a background task, NOT on the
     /// proxy hot path.
     pub fn remove_stale_targets(&self, upstream_id: &str, current_targets: &[UpstreamTarget]) {
-        // Active: exact key match on "upstream_id::host:port"
+        // Active: exact key match on "upstream_id::host:port".
+        // Only filter entries belonging to THIS upstream (prefix match) —
+        // other upstreams' entries must be preserved.
         let active_keys: std::collections::HashSet<String> = current_targets
             .iter()
             .map(|t| active_target_key(upstream_id, t))
             .collect();
-        self.active_unhealthy_targets
-            .retain(|key, _| active_keys.contains(key));
-        self.active_target_states
-            .retain(|key, _| active_keys.contains(key));
+        let prefix = format!("{}::", upstream_id);
+        self.active_unhealthy_targets.retain(|key, _| {
+            if key.starts_with(&prefix) {
+                active_keys.contains(key)
+            } else {
+                true // preserve other upstreams' entries
+            }
+        });
+        self.active_target_states.retain(|key, _| {
+            if key.starts_with(&prefix) {
+                active_keys.contains(key)
+            } else {
+                true // preserve other upstreams' entries
+            }
+        });
 
-        // Passive: for each proxy's inner map, retain only current host:port targets
-        let hp_set: std::collections::HashSet<String> =
-            current_targets.iter().map(host_port_key).collect();
-        for entry in self.passive_health.iter() {
-            let proxy_state = entry.value();
-            proxy_state
-                .unhealthy
-                .retain(|hp, _| hp_set.contains(hp.as_str()));
-            proxy_state
-                .states
-                .retain(|hp, _| hp_set.contains(hp.as_str()));
-        }
+        // Passive health is NOT cleaned here. Passive state is keyed by
+        // proxy_id → host:port, and this method only knows about a single
+        // upstream — it cannot determine which proxies reference this
+        // upstream, so filtering all proxies' inner maps against this
+        // upstream's target set would incorrectly delete passive health
+        // entries for targets belonging to other upstreams. Passive health
+        // is cleaned by `prune_removed_proxies()` when proxies are deleted,
+        // and by the passive recovery timer for individual target entries.
     }
 
     /// Remove passive health state for proxies that have been deleted from

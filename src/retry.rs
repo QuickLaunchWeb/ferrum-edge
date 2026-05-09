@@ -753,13 +753,19 @@ pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass
     if error_str.contains("response body exceeds maximum size") {
         return (ErrorClass::ResponseBodyTooLarge, false);
     }
+    // "canceled" in the string fallback indicates a client-side cancellation
+    // (e.g. the client dropped the connection mid-stream). The typed walk
+    // above correctly identifies `hyper::Error::is_canceled()` as
+    // `(ClientDisconnect, true)` — the string fallback must agree.
+    if error_str.contains("canceled") {
+        return (ErrorClass::ClientDisconnect, true);
+    }
     if error_str.contains("broken pipe")
         || debug_str.contains("BrokenPipe")
         || error_str.contains("connection reset")
         || debug_str.contains("ConnectionReset")
         || error_str.contains("connection aborted")
         || debug_str.contains("ConnectionAborted")
-        || error_str.contains("canceled")
         || error_str.contains("closed before")
     {
         // Backend-side close during body streaming — keep client_disconnected

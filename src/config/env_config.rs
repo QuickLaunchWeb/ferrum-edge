@@ -1412,7 +1412,7 @@ impl EnvConfig {
             [database]
             db_type: Option<String> = "FERRUM_DB_TYPE";
             db_url: Option<String> = "FERRUM_DB_URL";
-            db_poll_interval: u64 = "FERRUM_DB_POLL_INTERVAL" => 30u64;
+            db_poll_interval: u64 = "FERRUM_DB_POLL_INTERVAL" => 30u64, max(1u64);
             db_tls_mode: Option<DbTlsMode> = "FERRUM_DB_TLS_MODE";
             db_tls_ca_cert_path: Option<String> = "FERRUM_DB_TLS_CA_CERT_PATH";
             db_tls_client_cert_path: Option<String> = "FERRUM_DB_TLS_CLIENT_CERT_PATH";
@@ -2651,6 +2651,15 @@ impl EnvConfig {
             }
         }
 
+        // Non-fatal configuration warnings
+        if self.db_pool_min_connections > self.db_pool_max_connections {
+            eprintln!(
+                "WARNING: FERRUM_DB_POOL_MIN_CONNECTIONS ({}) exceeds FERRUM_DB_POOL_MAX_CONNECTIONS ({}). \
+                 The pool will clamp min to max, wasting the higher setting.",
+                self.db_pool_min_connections, self.db_pool_max_connections
+            );
+        }
+
         // Non-fatal security warnings
         if self.tls_no_verify {
             eprintln!(
@@ -2788,5 +2797,26 @@ mod tests {
             err.contains("FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD"),
             "error should name request critical env var: {err}"
         );
+    }
+
+    #[test]
+    fn validate_warns_db_pool_min_above_max() {
+        let mut config = file_mode_config();
+        config.db_pool_min_connections = 10;
+        config.db_pool_max_connections = 5;
+        // validate() should still succeed (warning, not error)
+        config
+            .validate()
+            .expect("db_pool_min > max is a warning, not a fatal error");
+    }
+
+    #[test]
+    fn validate_accepts_db_pool_min_equal_max() {
+        let mut config = file_mode_config();
+        config.db_pool_min_connections = 5;
+        config.db_pool_max_connections = 5;
+        config
+            .validate()
+            .expect("db_pool_min == max should be valid");
     }
 }
