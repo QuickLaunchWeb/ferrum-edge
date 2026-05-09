@@ -610,6 +610,10 @@ pub async fn run(
                                 // Apply to CP's own in-memory config before broadcasting so
                                 // subscribers that connect during this poll either receive the
                                 // queued delta or load a snapshot that already contains it.
+                                // The local apply needs to consume an `IncrementalResult`, so
+                                // we clone exactly once for it; the CP broadcast borrows
+                                // (serializes to JSON), and the mesh broadcast consumes the
+                                // original — keeping the per-poll clone count to one.
                                 let version = poll_ts.to_rfc3339();
                                 let mut new_config = (*config_poll.load_full()).clone();
                                 apply_incremental_to_config(&mut new_config, result.clone());
@@ -621,7 +625,7 @@ pub async fn run(
                                 // coupled to the same polling cycle so both subscriber types
                                 // converge on the same config version simultaneously.
                                 CpGrpcServer::broadcast_delta_with_registry(&update_tx, &result, &version, &dp_registry_poll);
-                                MeshGrpcServer::broadcast_delta_with_registry(&mesh_update_tx, &result, &version, &mesh_registry_poll);
+                                MeshGrpcServer::broadcast_delta_with_registry(&mesh_update_tx, result, &version, &mesh_registry_poll);
 
                                 info!("Incremental config update pushed to DPs and mesh nodes");
                                 last_poll_at = Some(poll_ts);

@@ -19,7 +19,7 @@ use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
-use super::mesh::otel_helpers::mesh_trace_attributes;
+use super::mesh::mesh_trace_attributes;
 use super::utils::PluginHttpClient;
 use super::{Plugin, PluginResult, RequestContext, StreamTransactionSummary, TransactionSummary};
 

@@ -190,12 +190,12 @@ impl MeshGrpcServer {
 
     pub fn broadcast_delta_with_registry(
         tx: &broadcast::Sender<MeshConfigBroadcast>,
-        result: &crate::config::db_loader::IncrementalResult,
+        result: crate::config::db_loader::IncrementalResult,
         version: &str,
         registry: &MeshNodeRegistry,
     ) {
         let _ = tx.send(MeshConfigBroadcast::Delta {
-            result: Box::new(result.clone()),
+            result: Box::new(result),
             version: version.to_string(),
         });
         registry.touch_all();
