@@ -7,11 +7,16 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::plugins::mesh_authz::parse_trust_domain_aliases;
+
+/// Golden-ratio hash counter for tracing sampling decisions.
+/// Produces a uniform distribution without a `rand` production dependency.
+static SAMPLING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const MESH_SOURCE_PRINCIPAL: &str = "mesh.source.principal";
 const MESH_SOURCE_TRUST_DOMAIN: &str = "mesh.source.trust_domain";
@@ -26,6 +31,10 @@ pub struct WorkloadMetrics {
     workload_spiffe_id: Option<SpiffeId>,
     labels: HashMap<String, String>,
     trust_domain_aliases: Vec<TrustDomain>,
+    /// Tracing sampling percentage 0.0–100.0 (from Telemetry CRD).
+    sampling_percentage: f64,
+    /// Custom tags injected into every transaction's metadata.
+    custom_tags: HashMap<String, String>,
 }
 
 impl WorkloadMetrics {
@@ -51,6 +60,21 @@ impl WorkloadMetrics {
             .unwrap_or_default();
         let trust_domain_aliases =
             parse_trust_domain_aliases(config).map_err(|e| format!("workload_metrics: {e}"))?;
+        let sampling_percentage = config
+            .get("sampling_percentage")
+            .and_then(Value::as_f64)
+            .unwrap_or(100.0);
+        let custom_tags = config
+            .get("custom_tags")
+            .and_then(Value::as_object)
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|value| (key.clone(), value.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         Ok(Self {
             node_id: string_config(config, "node_id"),
@@ -59,11 +83,30 @@ impl WorkloadMetrics {
             workload_spiffe_id,
             labels,
             trust_domain_aliases,
+            sampling_percentage,
+            custom_tags,
         })
     }
 
     fn annotate_http_context(&self, ctx: &mut RequestContext, headers: &HashMap<String, String>) {
         self.insert_common_metadata(&mut ctx.metadata);
+        // Tracing sampling decision
+        if self.sampling_percentage < 100.0 {
+            let n = SAMPLING_COUNTER.fetch_add(1, Ordering::Relaxed);
+            // Golden-ratio hash for uniform distribution without rand
+            let hash = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let sampled = (hash as f64 / u64::MAX as f64) * 100.0 < self.sampling_percentage;
+            ctx.metadata.insert(
+                "trace_sampled".to_string(),
+                if sampled { "true" } else { "false" }.to_string(),
+            );
+        }
+        // Custom tags from Telemetry CRD
+        for (key, value) in &self.custom_tags {
+            ctx.metadata
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
         let hbone_identity = authenticated_hbone_identity(ctx, headers);
         // For authenticated ambient HBONE, the peer cert identifies the
         // ztunnel, while baggage identifies the originating workload. If the

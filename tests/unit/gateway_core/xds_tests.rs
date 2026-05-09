@@ -90,6 +90,7 @@ fn mesh_config() -> MeshConfig {
         }],
         service_entries: Vec::new(),
         request_authentications: Vec::new(),
+        telemetry_resources: Vec::new(),
         trust_bundles: None,
         multi_cluster: None,
     }

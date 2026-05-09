@@ -21,7 +21,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
-use crate::config::mesh::{EastWestGateway, MeshConfig, MeshJwtRule, MeshRequestAuthentication};
+use crate::config::mesh::{
+    EastWestGateway, MeshConfig, MeshJwtRule, MeshRequestAuthentication, MeshTelemetryConfig,
+    PolicyScope,
+};
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, GatewayConfig, PluginAssociation, PluginConfig, PluginScope,
     Proxy, ResponseBodyMode,
@@ -325,6 +328,7 @@ fn gateway_config_from_mesh_slice(
             peer_authentications: slice.peer_authentications.clone(),
             service_entries: slice.service_entries.clone(),
             request_authentications: slice.request_authentications.clone(),
+            telemetry_resources: slice.telemetry_resources.clone(),
             trust_bundles: slice.trust_bundles.clone(),
             multi_cluster: slice.multi_cluster.clone(),
         })),
@@ -498,28 +502,102 @@ fn inject_mesh_global_plugins(
         }),
         &runtime.namespace,
     );
+    // Merge applicable Telemetry resources (most specific scope wins per section).
+    let merged_telemetry = merge_applicable_telemetry(mesh_slice, runtime);
+
+    let mut workload_metrics_config = serde_json::json!({
+        "node_id": runtime.node_id.clone(),
+        "topology": runtime.topology.as_str(),
+        "namespace": mesh_slice.namespace.clone(),
+        "workload_spiffe_id": mesh_slice.workload_spiffe_id.clone(),
+        "labels": mesh_slice.labels.clone(),
+        "trust_domain_aliases": trust_domain_aliases,
+    });
+    // Apply tracing config from Telemetry CRD
+    if let Some(tracing) = &merged_telemetry.tracing {
+        workload_metrics_config["sampling_percentage"] =
+            serde_json::json!(tracing.sampling_percentage);
+        if !tracing.custom_tags.is_empty() {
+            workload_metrics_config["custom_tags"] = serde_json::json!(tracing.custom_tags);
+        }
+    }
     ensure_global_plugin(
         config,
         MESH_WORKLOAD_METRICS_PLUGIN_ID,
         "workload_metrics",
-        serde_json::json!({
-            "node_id": runtime.node_id.clone(),
-            "topology": runtime.topology.as_str(),
-            "namespace": mesh_slice.namespace.clone(),
-            "workload_spiffe_id": mesh_slice.workload_spiffe_id.clone(),
-            "labels": mesh_slice.labels.clone(),
-            "trust_domain_aliases": trust_domain_aliases,
-        }),
+        workload_metrics_config,
         &runtime.namespace,
     );
     inject_mesh_request_auth_plugin(config, runtime, mesh_slice);
+
+    // Build access log config with optional filter from Telemetry CRD
+    let access_log_config = if let Some(al) = &merged_telemetry.access_logging {
+        if !al.enabled {
+            // Access logging disabled — don't inject the plugin
+            config
+                .plugin_configs
+                .retain(|p| p.id != MESH_ACCESS_LOG_PLUGIN_ID);
+            return;
+        }
+        match &al.filter {
+            Some(filter) => serde_json::json!({ "filter": filter }),
+            None => serde_json::json!({}),
+        }
+    } else {
+        serde_json::json!({})
+    };
     ensure_global_plugin(
         config,
         MESH_ACCESS_LOG_PLUGIN_ID,
         "access_log",
-        serde_json::json!({}),
+        access_log_config,
         &runtime.namespace,
     );
+}
+
+/// Merge applicable `MeshTelemetryResource` entries by scope specificity.
+///
+/// More specific scopes (WorkloadSelector > Namespace > MeshWide) override
+/// less specific ones per config section (tracing, metrics, access_logging
+/// independently). Within the same scope level, later resources win.
+fn merge_applicable_telemetry(
+    mesh_slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+) -> MeshTelemetryConfig {
+    use crate::config::mesh::scope_applies_to_workload;
+
+    let mut applicable: Vec<(u8, &MeshTelemetryConfig)> = mesh_slice
+        .telemetry_resources
+        .iter()
+        .filter(|t| {
+            scope_applies_to_workload(&t.scope, &runtime.namespace, &runtime.workload_labels)
+        })
+        .map(|t| {
+            let specificity = match &t.scope {
+                PolicyScope::MeshWide => 0,
+                PolicyScope::Namespace { .. } => 1,
+                PolicyScope::WorkloadSelector { .. } => 2,
+            };
+            (specificity, &t.config)
+        })
+        .collect();
+
+    // Sort by specificity ascending so more-specific overwrites less-specific
+    applicable.sort_by_key(|(s, _)| *s);
+
+    let mut merged = MeshTelemetryConfig::default();
+    for (_, config) in &applicable {
+        if config.tracing.is_some() {
+            merged.tracing.clone_from(&config.tracing);
+        }
+        if config.metrics.is_some() {
+            merged.metrics.clone_from(&config.metrics);
+        }
+        if config.access_logging.is_some() {
+            merged.access_logging.clone_from(&config.access_logging);
+        }
+    }
+    merged
 }
 
 /// Inject a `jwks_auth` global plugin when the mesh slice carries applicable
