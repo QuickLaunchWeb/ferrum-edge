@@ -638,6 +638,51 @@ impl RedisRateLimitClient {
         }
     }
 
+    /// Read the previous sliding-window bucket, increment the current bucket,
+    /// and set the current bucket expiry in one Redis transaction.
+    ///
+    /// The caller makes its allow/deny decision from the returned post-INCR
+    /// current count, tying admission to the mutation even when many gateway
+    /// instances race on the same key.
+    pub async fn sliding_window_increment(
+        &self,
+        previous_key: &str,
+        current_key: &str,
+        ttl_seconds: u64,
+    ) -> Result<(i64, i64), ()> {
+        let mut conn = self.get_connection().await.ok_or(())?;
+
+        let result: Result<(Option<i64>, i64), redis::RedisError> = redis::pipe()
+            .atomic()
+            .cmd("GET")
+            .arg(previous_key)
+            .cmd("INCR")
+            .arg(current_key)
+            .cmd("EXPIRE")
+            .arg(current_key)
+            .arg(ttl_seconds as i64)
+            .ignore()
+            .query_async(&mut conn)
+            .await;
+
+        match result {
+            Ok((previous_count, current_count)) => {
+                self.available.store(true, Ordering::Relaxed);
+                Ok((previous_count.unwrap_or(0), current_count))
+            }
+            Err(e) => {
+                warn!(
+                    previous_key = %previous_key,
+                    current_key = %current_key,
+                    error = %e,
+                    "Redis sliding-window GET+INCR+EXPIRE transaction failed — falling back to local rate limiting"
+                );
+                self.mark_unavailable();
+                Err(())
+            }
+        }
+    }
+
     /// Increment a counter by a specific amount and set expiry. Returns the new total.
     ///
     /// Uses a Redis pipeline to send `INCRBY` + `EXPIRE` in a single round-trip.
