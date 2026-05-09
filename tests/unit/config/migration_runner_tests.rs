@@ -44,10 +44,12 @@ async fn test_migration_runner_fresh_database() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    // Only V1 should be applied on a fresh database
-    assert_eq!(applied.len(), 1);
+    // V1 + V2 should be applied on a fresh database
+    assert_eq!(applied.len(), 2);
     assert_eq!(applied[0].version, 1);
     assert_eq!(applied[0].name, "initial_schema");
+    assert_eq!(applied[1].version, 2);
+    assert_eq!(applied[1].name, "destination_rule_fields");
 
     // Running again should apply nothing
     let applied_again = runner.run_pending().await.unwrap();
@@ -106,16 +108,20 @@ async fn test_migration_runner_bootstrap_existing_db() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    // V1 should NOT be applied (bootstrapped instead) — nothing else pending
-    assert!(
-        applied.is_empty(),
-        "No migrations should be newly applied; V1 is bootstrapped"
+    // V1 should NOT be applied (bootstrapped instead), but V2 should apply
+    // (the pre-migration DB lacks the new columns).
+    assert_eq!(
+        applied.len(),
+        1,
+        "V2 should be newly applied; V1 is bootstrapped"
     );
+    assert_eq!(applied[0].version, 2);
 
-    // Check that V1 (bootstrapped) is recorded
+    // Check that V1 (bootstrapped) + V2 (applied) are recorded
     let status = runner.status().await.unwrap();
-    assert_eq!(status.applied.len(), 1);
+    assert_eq!(status.applied.len(), 2);
     assert_eq!(status.applied[0].version, 1);
+    assert_eq!(status.applied[1].version, 2);
     assert!(status.pending.is_empty());
 }
 
@@ -125,17 +131,17 @@ async fn test_migration_status() {
 
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
 
-    // Before running: V1 should be pending
+    // Before running: V1 + V2 should be pending
     let status = runner.status().await.unwrap();
     assert!(status.applied.is_empty());
-    assert_eq!(status.pending.len(), 1);
+    assert_eq!(status.pending.len(), 2);
 
     // Run migrations
     runner.run_pending().await.unwrap();
 
-    // After running: V1 should be applied
+    // After running: V1 + V2 should be applied
     let status = runner.status().await.unwrap();
-    assert_eq!(status.applied.len(), 1);
+    assert_eq!(status.applied.len(), 2);
     assert!(status.pending.is_empty());
 }
 
@@ -146,8 +152,10 @@ async fn test_v001_accepts_full_rfc3339_timestamps() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    assert_eq!(applied.len(), 1);
+    // V1 + V2 should be applied on a fresh database
+    assert_eq!(applied.len(), 2);
     assert_eq!(applied[0].version, 1);
+    assert_eq!(applied[1].version, 2);
 
     // Verify the schema accepts a full nanosecond-precision RFC 3339 timestamp
     // (35 chars, the maximum chrono produces)

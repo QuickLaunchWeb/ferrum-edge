@@ -2361,6 +2361,7 @@ async fn handle_h3_request(
                                 .passive_health
                                 .get(&proxy.id)
                                 .map(|r| r.value().clone()),
+                            max_ejection_percent: None,
                         }),
                     )
                 {

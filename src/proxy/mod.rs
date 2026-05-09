@@ -3807,6 +3807,7 @@ async fn handle_websocket_request_authenticated(
                                     .passive_health
                                     .get(&proxy.id)
                                     .map(|r| r.value().clone()),
+                                max_ejection_percent: None,
                             }),
                         )
                     {
@@ -7464,6 +7465,7 @@ async fn handle_proxy_request_inner(
                                 .passive_health
                                 .get(&proxy.id)
                                 .map(|r| r.value().clone()),
+                            max_ejection_percent: None,
                         }),
                     )
                 {
@@ -8257,6 +8259,7 @@ async fn handle_proxy_request_inner(
                             .passive_health
                             .get(&proxy.id)
                             .map(|r| r.value().clone()),
+                        max_ejection_percent: None,
                     }),
                 )
             {

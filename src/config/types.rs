@@ -41,6 +41,10 @@ pub const MAX_HOSTS_PER_PROXY: usize = 100;
 pub const MAX_TARGETS_PER_UPSTREAM: usize = 1000;
 /// Maximum number of tags per upstream target.
 pub const MAX_TAGS_PER_TARGET: usize = 50;
+/// Maximum number of subset definitions per upstream.
+pub const MAX_SUBSETS_PER_UPSTREAM: usize = 100;
+/// Maximum length for a subset name.
+pub const MAX_SUBSET_NAME_LENGTH: usize = 255;
 /// Maximum length for a tag key or value.
 pub const MAX_TAG_LENGTH: usize = 255;
 /// Maximum size of plugin config JSON in bytes.
@@ -181,6 +185,31 @@ pub enum LoadBalancerAlgorithm {
     Random,
 }
 
+/// Per-subset traffic policy overrides (Istio DestinationRule subset.trafficPolicy).
+///
+/// When a subset is selected for routing, these overrides replace the upstream's
+/// default settings for the matching subset targets.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubsetTrafficPolicy {
+    /// Override the upstream's load balancer algorithm for this subset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_balancer_algorithm: Option<LoadBalancerAlgorithm>,
+}
+
+/// A named subset of upstream targets identified by label selectors.
+///
+/// Targets whose `tags` are a superset of `labels` belong to this subset.
+/// Used for Istio DestinationRule subset routing: a proxy's `upstream_subset`
+/// field selects a named subset, and the load balancer pre-filters targets
+/// to only those matching the subset's labels.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubsetDefinition {
+    pub name: String,
+    pub labels: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_policy: Option<SubsetTrafficPolicy>,
+}
+
 /// A single backend target within an upstream group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamTarget {
@@ -309,6 +338,25 @@ pub struct PassiveHealthCheck {
     /// on active health checks or all-unhealthy fallback only).
     #[serde(default = "default_passive_healthy_after")]
     pub healthy_after_seconds: u64,
+    /// Maximum percentage of targets (0-100) that can be ejected simultaneously
+    /// via passive health checks. Prevents cascading failures where a transient
+    /// issue ejects all backends. When the ejection count would exceed this cap,
+    /// the most-recently-ejected targets are re-admitted first.
+    /// `None` (default) = no cap (existing behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ejection_percent: Option<u8>,
+    /// Subset of HTTP status codes (e.g., 502, 503, 504) that count as
+    /// gateway errors for outlier detection, tracked separately from the
+    /// general `unhealthy_status_codes`. When `split_external_local_origin_errors`
+    /// is true, these codes are used for the external-origin error bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_error_codes: Option<Vec<u16>>,
+    /// When true, track local-origin errors (connection failures, timeouts)
+    /// separately from external errors (HTTP 5xx responses). This allows
+    /// different thresholds and windows for network-level vs application-level
+    /// failures in outlier detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_external_local_origin_errors: Option<bool>,
 }
 
 impl Default for PassiveHealthCheck {
@@ -318,6 +366,9 @@ impl Default for PassiveHealthCheck {
             unhealthy_threshold: default_unhealthy_threshold(),
             unhealthy_window_seconds: default_passive_window(),
             healthy_after_seconds: default_passive_healthy_after(),
+            max_ejection_percent: None,
+            gateway_error_codes: None,
+            split_external_local_origin_errors: None,
         }
     }
 }
@@ -446,6 +497,11 @@ pub struct Upstream {
     pub health_checks: Option<HealthCheckConfig>,
     #[serde(default)]
     pub service_discovery: Option<ServiceDiscoveryConfig>,
+    /// Named subsets of targets identified by label selectors.
+    /// Used for Istio DestinationRule subset routing. Targets whose `tags`
+    /// are a superset of a subset's `labels` belong to that subset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subsets: Option<Vec<SubsetDefinition>>,
     /// Path to a PEM client certificate for mTLS with backend targets.
     #[serde(default)]
     pub backend_tls_client_cert_path: Option<String>,
@@ -1027,10 +1083,22 @@ pub struct Proxy {
     /// When set, overrides the global `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` default.
     #[serde(default)]
     pub pool_http3_connections_per_backend: Option<usize>,
+    /// Maximum number of requests to send over a single pooled connection
+    /// before closing it and opening a new one. Maps to Istio
+    /// DestinationRule `connectionPool.http.maxRequestsPerConnection`.
+    /// `None` (default) = no limit (connections are reused indefinitely).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_max_requests_per_connection: Option<u64>,
     /// Optional upstream ID for load-balanced backends.
     /// When set, overrides backend_host/backend_port with upstream target selection.
     #[serde(default)]
     pub upstream_id: Option<String>,
+    /// Named subset within the upstream to route traffic to. Must reference
+    /// a subset name defined in the upstream's `subsets` list. When set,
+    /// the load balancer pre-filters targets to only those matching the
+    /// subset's label selectors before applying the LB algorithm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_subset: Option<String>,
     /// ID of the `ApiSpec` that created this proxy via the spec-import admin API.
     /// `None` for hand-crafted proxies. Used to scope cascading DELETE when a
     /// spec is removed. NOT loaded by the gateway runtime — admin-only metadata.
@@ -2617,6 +2685,27 @@ impl Proxy {
             ));
         }
 
+        // pool_max_requests_per_connection: 0 means unlimited, so reject 0
+        if let Some(0) = self.pool_max_requests_per_connection {
+            errors.push(
+                "pool_max_requests_per_connection must be at least 1 (got 0) — omit the field for unlimited"
+                    .to_string(),
+            );
+        }
+
+        // upstream_subset requires upstream_id
+        if self.upstream_subset.is_some() && self.upstream_id.is_none() {
+            errors.push(
+                "upstream_subset requires upstream_id — subset routing only applies to upstream-backed proxies"
+                    .to_string(),
+            );
+        }
+        if let Some(ref subset) = self.upstream_subset
+            && let Err(e) = validate_string_field("upstream_subset", subset, MAX_SUBSET_NAME_LENGTH)
+        {
+            errors.push(e);
+        }
+
         // Reject backend TLS fields on non-TLS schemes — cert configs are
         // meaningless for plaintext backends and would waste disk I/O and
         // fragment the connection pool.
@@ -3322,6 +3411,54 @@ impl Upstream {
             }
         }
 
+        // Subset definitions
+        if let Some(ref subsets) = self.subsets {
+            if subsets.len() > MAX_SUBSETS_PER_UPSTREAM {
+                errors.push(format!(
+                    "subsets must not have more than {} entries (got {})",
+                    MAX_SUBSETS_PER_UPSTREAM,
+                    subsets.len()
+                ));
+            }
+            let mut seen_names = HashSet::new();
+            for (i, subset) in subsets.iter().enumerate() {
+                if subset.name.trim().is_empty() {
+                    errors.push(format!("subsets[{}].name must not be empty", i));
+                }
+                if let Err(e) =
+                    validate_string_field("subsets.name", &subset.name, MAX_SUBSET_NAME_LENGTH)
+                {
+                    errors.push(format!("subsets[{}].{}", i, e));
+                }
+                if !seen_names.insert(&subset.name) {
+                    errors.push(format!(
+                        "subsets[{}].name '{}' is a duplicate — subset names must be unique within an upstream",
+                        i, subset.name
+                    ));
+                }
+                if subset.labels.is_empty() {
+                    errors.push(format!(
+                        "subsets[{}].labels must not be empty — a subset must select at least one label",
+                        i
+                    ));
+                }
+                for (key, val) in &subset.labels {
+                    if key.len() > MAX_TAG_LENGTH {
+                        errors.push(format!(
+                            "subsets[{}].labels key must not exceed {} characters",
+                            i, MAX_TAG_LENGTH
+                        ));
+                    }
+                    if val.len() > MAX_TAG_LENGTH {
+                        errors.push(format!(
+                            "subsets[{}].labels value must not exceed {} characters",
+                            i, MAX_TAG_LENGTH
+                        ));
+                    }
+                }
+            }
+        }
+
         // Backend TLS file path lengths
         if let Some(ref path) = self.backend_tls_client_cert_path
             && let Err(e) =
@@ -3715,6 +3852,21 @@ impl HealthCheckConfig {
                 0,
                 MAX_TIMEOUT_SECONDS,
             ) {
+                errors.push(e);
+            }
+            // max_ejection_percent: 0-100
+            if let Some(pct) = passive.max_ejection_percent
+                && pct > 100
+            {
+                errors.push(format!(
+                    "passive.max_ejection_percent must be between 0 and 100 (got {})",
+                    pct
+                ));
+            }
+            // gateway_error_codes: valid HTTP status codes
+            if let Some(ref codes) = passive.gateway_error_codes
+                && let Err(e) = validate_status_codes("passive.gateway_error_codes", codes)
+            {
                 errors.push(e);
             }
         }

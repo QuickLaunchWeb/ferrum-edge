@@ -229,6 +229,7 @@ fn select_next_cross_protocol_retry_target(
             .passive_health
             .get(&proxy.id)
             .map(|r| r.value().clone()),
+        max_ejection_percent: None,
     };
 
     let next = crate::load_balancer::LoadBalancerCache::select_next_target_from(
