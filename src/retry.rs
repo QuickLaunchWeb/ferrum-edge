@@ -747,32 +747,40 @@ pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass
     // downcasts (e.g. reqwest::Error wrapped in Box<dyn Error>).
     let error_str = format!("{}", e);
     let debug_str = format!("{:?}", e);
+    let error_str_lower = error_str.to_ascii_lowercase();
     // Policy-enforced truncation from SizeLimitedStreamingResponse — classify
     // explicitly so dashboards can distinguish response size-limit enforcement
     // from generic backend/body errors.
-    if error_str.contains("response body exceeds maximum size") {
+    if error_str_lower.contains("response body exceeds maximum size") {
         return (ErrorClass::ResponseBodyTooLarge, false);
     }
-    // "canceled" in the string fallback indicates a client-side cancellation
-    // (e.g. the client dropped the connection mid-stream). The typed walk
-    // above correctly identifies `hyper::Error::is_canceled()` as
-    // `(ClientDisconnect, true)` — the string fallback must agree.
-    if error_str.contains("canceled") {
+    // Only classify string-only errors as client disconnects when the message
+    // names the client as the canceling side. Bare "canceled" is ambiguous:
+    // backend H2 RST_STREAM and other peer-side aborts can render that way.
+    if error_str_lower.contains("client disconnected")
+        || error_str_lower.contains("client canceled")
+        || error_str_lower.contains("client cancelled")
+        || error_str_lower.contains("request canceled by client")
+        || error_str_lower.contains("request cancelled by client")
+    {
         return (ErrorClass::ClientDisconnect, true);
     }
-    if error_str.contains("broken pipe")
+    if error_str_lower.contains("canceled") || error_str_lower.contains("cancelled") {
+        return (ErrorClass::ConnectionClosed, false);
+    }
+    if error_str_lower.contains("broken pipe")
         || debug_str.contains("BrokenPipe")
-        || error_str.contains("connection reset")
+        || error_str_lower.contains("connection reset")
         || debug_str.contains("ConnectionReset")
-        || error_str.contains("connection aborted")
+        || error_str_lower.contains("connection aborted")
         || debug_str.contains("ConnectionAborted")
-        || error_str.contains("closed before")
+        || error_str_lower.contains("closed before")
     {
         // Backend-side close during body streaming — keep client_disconnected
         // false so backend resets don't inflate client-disconnect metrics.
         return (ErrorClass::ConnectionClosed, false);
     }
-    if error_str.contains("timed out") || debug_str.contains("TimedOut") {
+    if error_str_lower.contains("timed out") || debug_str.contains("TimedOut") {
         return (ErrorClass::ReadWriteTimeout, false);
     }
     if debug_str.contains("GOAWAY")

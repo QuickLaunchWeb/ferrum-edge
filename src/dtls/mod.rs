@@ -1126,22 +1126,29 @@ pub fn load_dtls_certificate(
 pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore, anyhow::Error> {
     let pem_data = std::fs::read(pem_path)
         .map_err(|e| anyhow::anyhow!("Failed to read PEM file {}: {}", pem_path, e))?;
-    let certs: Vec<_> = rustls_pemfile::certs(&mut &pem_data[..])
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to parse PEM certificate in DTLS CA file {}: {}",
-                pem_path,
-                e
-            )
-        })?;
+    let mut certs = Vec::new();
+    let mut parse_errors = 0usize;
+    for cert in rustls_pemfile::certs(&mut &pem_data[..]) {
+        match cert {
+            Ok(cert) => certs.push(cert),
+            Err(err) => {
+                parse_errors += 1;
+                tracing::warn!(
+                    pem_path,
+                    error = %err,
+                    "Skipping unparsable certificate while loading DTLS CA bundle"
+                );
+            }
+        }
+    }
     let mut roots = rustls::RootCertStore::empty();
     let (added, ignored) = roots.add_parsable_certificates(certs);
     if added == 0 {
         return Err(anyhow::anyhow!(
-            "No valid certificates found in DTLS CA file {} (ignored: {})",
+            "No valid certificates found in DTLS CA file {} (ignored: {}, parse_errors: {})",
             pem_path,
-            ignored
+            ignored,
+            parse_errors
         ));
     }
     Ok(roots)

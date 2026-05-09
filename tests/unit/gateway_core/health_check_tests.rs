@@ -135,7 +135,7 @@ fn test_connection_error_recovery_on_success() {
 }
 
 #[test]
-fn test_remove_stale_targets_cleans_unhealthy() {
+fn test_remove_stale_passive_targets_for_proxy_cleans_unhealthy() {
     let checker = HealthChecker::new();
     let target1 = make_target("backend1", 8080);
     let target2 = make_target("backend2", 8080);
@@ -153,15 +153,15 @@ fn test_remove_stale_targets_cleans_unhealthy() {
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend2:8080"));
 
-    // Remove backend2 from the upstream
-    checker.remove_stale_targets("us1", std::slice::from_ref(&target1));
+    // Remove backend2 from the upstream for this proxy.
+    checker.remove_stale_passive_targets_for_proxy(TEST_PROXY, std::slice::from_ref(&target1));
 
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend2:8080"));
 }
 
 #[test]
-fn test_remove_stale_targets_empty_list_clears_all() {
+fn test_remove_stale_passive_targets_for_proxy_empty_list_clears_all() {
     let checker = HealthChecker::new();
     let target = make_target("backend1", 8080);
     let config = PassiveHealthCheck {
@@ -176,7 +176,7 @@ fn test_remove_stale_targets_empty_list_clears_all() {
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
-    checker.remove_stale_targets("us1", &[]);
+    checker.remove_stale_passive_targets_for_proxy(TEST_PROXY, &[]);
     assert_eq!(passive_unhealthy_count(&checker), 0);
 }
 
@@ -197,7 +197,7 @@ fn test_remove_stale_targets_no_op_when_all_present() {
         checker.report_response(TEST_PROXY, &target2, 500, false, Some(&config));
     }
 
-    checker.remove_stale_targets("us1", &[target1, target2]);
+    checker.remove_stale_passive_targets_for_proxy(TEST_PROXY, &[target1, target2]);
     assert_eq!(passive_unhealthy_count(&checker), 2);
 }
 

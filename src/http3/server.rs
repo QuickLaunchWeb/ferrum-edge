@@ -1132,10 +1132,11 @@ async fn handle_h3_request(
     }
     plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
 
-    // Authorization phase
-    {
+    // Authorization phase (pre-computed authorize plugin list — zero allocation).
+    let authorize_plugins = plugin_cache_view.authorize_plugins();
+    if !authorize_plugins.is_empty() {
         let phase_start = std::time::Instant::now();
-        for plugin in plugins.iter() {
+        for plugin in authorize_plugins.iter() {
             match plugin.authorize(&mut ctx).await {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }

@@ -148,8 +148,10 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
 
         // Track the Consul index for blocking queries.
         // Per Consul docs, when a server restarts the index can reset to a
-        // lower value. Detect this and reset to 0 for an immediate un-blocked
-        // re-query so we don't miss updates.
+        // lower value. Detect this and move the cursor to the new index. The
+        // current response body has already delivered that snapshot, and the
+        // next call can keep using a blocking query instead of tight-spinning
+        // on index=0 immediate responses.
         if let Some(new_index) = response
             .headers()
             .get("X-Consul-Index")
@@ -159,10 +161,10 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
             let current = self.last_index.load(Ordering::Relaxed);
             if new_index < current {
                 warn!(
-                    "Consul index decreased from {} to {}, resetting to 0 (server likely restarted)",
+                    "Consul index decreased from {} to {}, resetting blocking-query cursor to the new index (server likely restarted)",
                     current, new_index
                 );
-                self.last_index.store(0, Ordering::Relaxed);
+                self.last_index.store(new_index, Ordering::Relaxed);
             } else {
                 self.last_index.store(new_index, Ordering::Relaxed);
             }

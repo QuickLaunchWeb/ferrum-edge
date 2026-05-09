@@ -161,6 +161,41 @@ pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::r
 /// this via `extend_from_slice`, but the initial reservation is capped.
 pub(crate) const H3_BODY_PREALLOC_CAP_BYTES: u64 = 1024 * 1024;
 
+#[derive(Debug)]
+pub(crate) enum H3BodyDrainError {
+    Stream(h3::error::StreamError),
+    ResponseTooLarge { limit: usize },
+}
+
+impl std::fmt::Display for H3BodyDrainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stream(err) => write!(f, "{err}"),
+            Self::ResponseTooLarge { limit } => {
+                write!(
+                    f,
+                    "Backend response body exceeds maximum size of {limit} bytes"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for H3BodyDrainError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Stream(err) => Some(err),
+            Self::ResponseTooLarge { .. } => None,
+        }
+    }
+}
+
+impl From<h3::error::StreamError> for H3BodyDrainError {
+    fn from(err: h3::error::StreamError) -> Self {
+        Self::Stream(err)
+    }
+}
+
 /// Drain an H3 response stream into a `Vec<u8>`, tolerating a post-body
 /// graceful close signal. Two variants are recovered:
 ///
@@ -179,14 +214,33 @@ pub(crate) async fn drain_h3_response_body(
     method: &str,
     status: u16,
     content_length: Option<u64>,
-) -> Result<Vec<u8>, h3::error::StreamError> {
+    max_response_body_size_bytes: usize,
+) -> Result<Vec<u8>, H3BodyDrainError> {
+    if max_response_body_size_bytes > 0
+        && content_length.is_some_and(|len| len > max_response_body_size_bytes as u64)
+    {
+        return Err(H3BodyDrainError::ResponseTooLarge {
+            limit: max_response_body_size_bytes,
+        });
+    }
+
     let mut body = match content_length {
         Some(cl) => Vec::with_capacity(cl.min(H3_BODY_PREALLOC_CAP_BYTES) as usize),
         None => Vec::new(),
     };
     loop {
         match stream.recv_data().await {
-            Ok(Some(chunk)) => body.extend_from_slice(chunk.chunk()),
+            Ok(Some(chunk)) => {
+                let chunk = chunk.chunk();
+                if max_response_body_size_bytes > 0
+                    && body.len().saturating_add(chunk.len()) > max_response_body_size_bytes
+                {
+                    return Err(H3BodyDrainError::ResponseTooLarge {
+                        limit: max_response_body_size_bytes,
+                    });
+                }
+                body.extend_from_slice(chunk);
+            }
             Ok(None) => break,
             Err(e) => {
                 if is_h3_graceful_close(&e)
@@ -198,11 +252,20 @@ pub(crate) async fn drain_h3_response_body(
                     );
                     break;
                 }
-                return Err(e);
+                return Err(e.into());
             }
         }
     }
     Ok(body)
+}
+
+#[inline]
+fn connection_listed_headers_if_present(headers: &http::HeaderMap) -> Vec<http::HeaderName> {
+    if headers.contains_key(http::header::CONNECTION) {
+        parse_connection_listed_headers(headers)
+    } else {
+        Vec::new()
+    }
 }
 
 /// Whether `e` is a connection-level graceful-close signal that may legally
@@ -955,9 +1018,20 @@ impl Http3ConnectionPool {
         let cached = self
             .pool
             .cached_with(|buf| Self::write_pool_key(buf, proxy, start));
+        let max_response_body_size_bytes = self.env_config.max_response_body_size_bytes;
+
         if let Some(pooled) = cached {
             let mut sr = pooled.send_request;
-            match Self::do_request(&mut sr, proxy, method, backend_url, headers, body.clone()).await
+            match Self::do_request(
+                &mut sr,
+                proxy,
+                method,
+                backend_url,
+                headers,
+                body.clone(),
+                max_response_body_size_bytes,
+            )
+            .await
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
@@ -977,7 +1051,16 @@ impl Http3ConnectionPool {
         // Try cached connection on the selected index first
         if let Some(pooled) = self.pool.cached(&key) {
             let mut sr = pooled.send_request;
-            match Self::do_request(&mut sr, proxy, method, backend_url, headers, body.clone()).await
+            match Self::do_request(
+                &mut sr,
+                proxy,
+                method,
+                backend_url,
+                headers,
+                body.clone(),
+                max_response_body_size_bytes,
+            )
+            .await
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
@@ -1000,6 +1083,7 @@ impl Http3ConnectionPool {
                                 backend_url,
                                 headers,
                                 body.clone(),
+                                max_response_body_size_bytes,
                             )
                             .await
                             {
@@ -1044,6 +1128,7 @@ impl Http3ConnectionPool {
             backend_url,
             headers,
             body,
+            max_response_body_size_bytes,
         )
         .await
         .map_err(|e| e.promote_on_wire_if(any_request_on_wire))
@@ -1075,11 +1160,21 @@ impl Http3ConnectionPool {
         let key = Self::pool_key_for_target(proxy, target_host, target_port, start);
 
         let mut any_request_on_wire = false;
+        let max_response_body_size_bytes = self.env_config.max_response_body_size_bytes;
 
         // Try cached connection on the selected index first
         if let Some(pooled) = self.pool.cached(&key) {
             let mut sr = pooled.send_request;
-            match Self::do_request(&mut sr, proxy, method, backend_url, headers, body.clone()).await
+            match Self::do_request(
+                &mut sr,
+                proxy,
+                method,
+                backend_url,
+                headers,
+                body.clone(),
+                max_response_body_size_bytes,
+            )
+            .await
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
@@ -1110,6 +1205,7 @@ impl Http3ConnectionPool {
                                 backend_url,
                                 headers,
                                 body.clone(),
+                                max_response_body_size_bytes,
                             )
                             .await
                             {
@@ -1155,6 +1251,7 @@ impl Http3ConnectionPool {
             backend_url,
             headers,
             body,
+            max_response_body_size_bytes,
         )
         .await
         .map_err(|e| e.promote_on_wire_if(any_request_on_wire))
@@ -1348,6 +1445,7 @@ impl Http3ConnectionPool {
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         body: bytes::Bytes,
+        max_response_body_size_bytes: usize,
     ) -> H3PoolResult<(u16, Vec<u8>, HashMap<String, String>)> {
         let uri: http::Uri = backend_url
             .parse()
@@ -1401,7 +1499,7 @@ impl Http3ConnectionPool {
         // during collection. Hyper rejects `Connection` on H2/H3 frames
         // (RFC 9114 §4.2), so this is typically empty for native H3
         // backends — the snapshot exists for defence in depth.
-        let connection_listed = parse_connection_listed_headers(response.headers());
+        let connection_listed = connection_listed_headers_if_present(response.headers());
         for (name, value) in response.headers() {
             // Skip hop-by-hop headers during collection (avoids allocating
             // String keys that would be immediately removed by the caller).
@@ -1427,9 +1525,15 @@ impl Http3ConnectionPool {
         // point, so any recv_data error is post_wire. Recovery for graceful
         // CONNECTION_CLOSE(H3_NO_ERROR) / GOAWAY after a complete body lives
         // inside `drain_h3_response_body`.
-        let response_body = drain_h3_response_body(&mut stream, method, status, content_length)
-            .await
-            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("recv_data failed: {}", e)))?;
+        let response_body = drain_h3_response_body(
+            &mut stream,
+            method,
+            status,
+            content_length,
+            max_response_body_size_bytes,
+        )
+        .await
+        .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("recv_data failed: {}", e)))?;
 
         Ok((status, response_body, response_headers))
     }
@@ -1496,7 +1600,7 @@ impl Http3ConnectionPool {
         // during collection. Hyper rejects `Connection` on H2/H3 frames
         // (RFC 9114 §4.2), so this is typically empty for native H3
         // backends — the snapshot exists for defence in depth.
-        let connection_listed = parse_connection_listed_headers(response.headers());
+        let connection_listed = connection_listed_headers_if_present(response.headers());
         for (name, value) in response.headers() {
             // Skip hop-by-hop headers during collection (avoids allocating
             // String keys that would be immediately removed by the caller).
@@ -1621,7 +1725,7 @@ impl Http3ConnectionPool {
         // during collection. Hyper rejects `Connection` on H2/H3 frames
         // (RFC 9114 §4.2), so this is typically empty for native H3
         // backends — the snapshot exists for defence in depth.
-        let connection_listed = parse_connection_listed_headers(response.headers());
+        let connection_listed = connection_listed_headers_if_present(response.headers());
         for (name, value) in response.headers() {
             // Skip hop-by-hop headers during collection (avoids allocating
             // String keys that would be immediately removed by the caller).
@@ -1740,7 +1844,7 @@ impl Http3ConnectionPool {
         // during collection. Hyper rejects `Connection` on H2/H3 frames
         // (RFC 9114 §4.2), so this is typically empty for native H3
         // backends — the snapshot exists for defence in depth.
-        let connection_listed = parse_connection_listed_headers(response.headers());
+        let connection_listed = connection_listed_headers_if_present(response.headers());
         for (name, value) in response.headers() {
             match name.as_str() {
                 "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
@@ -2470,7 +2574,7 @@ impl Http3Client {
             .and_then(|v| v.parse().ok());
 
         let response_body =
-            drain_h3_response_body(&mut stream, method, status, content_length).await?;
+            drain_h3_response_body(&mut stream, method, status, content_length, 0).await?;
 
         Ok((status, response_body, response_headers))
     }

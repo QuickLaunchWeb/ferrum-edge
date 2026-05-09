@@ -63,6 +63,9 @@ impl Plugin for PriorityOverridePlugin {
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         self.inner.authorize(ctx).await
     }
+    fn is_authorize_plugin(&self) -> bool {
+        self.inner.is_authorize_plugin()
+    }
     fn modifies_request_headers(&self) -> bool {
         self.inner.modifies_request_headers()
     }
@@ -320,6 +323,8 @@ impl PluginCapabilities {
 pub struct PluginPhaseData {
     /// Auth plugins only (pre-filtered from the protocol plugin list).
     pub auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    /// Authorization plugins only (pre-filtered from the protocol plugin list).
+    pub authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Capability bitset for fast boolean checks.
     pub capabilities: PluginCapabilities,
 }
@@ -328,10 +333,14 @@ pub struct PluginPhaseData {
 fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut caps = 0u8;
     let mut auth = Vec::new();
+    let mut authorize = Vec::new();
     for p in plugins {
         if p.is_auth_plugin() {
             caps |= PluginCapabilities::HAS_AUTH_PLUGINS;
             auth.push(Arc::clone(p));
+        }
+        if p.is_authorize_plugin() {
+            authorize.push(Arc::clone(p));
         }
         if p.modifies_request_headers() {
             caps |= PluginCapabilities::MODIFIES_REQUEST_HEADERS;
@@ -351,6 +360,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     }
     PluginPhaseData {
         auth_plugins: Arc::new(auth),
+        authorize_plugins: Arc::new(authorize),
         capabilities: PluginCapabilities(caps),
     }
 }
@@ -541,6 +551,16 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    pub(crate) fn get_authorize_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.authorize_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
     pub(crate) fn get_capabilities(
         &self,
         proxy_id: &str,
@@ -580,6 +600,7 @@ impl PluginCacheInner {
         PluginCacheRequestView {
             plugins: self.get_plugins_for_protocol(proxy_id, protocol),
             auth_plugins: self.get_auth_plugins(proxy_id, protocol),
+            authorize_plugins: self.get_authorize_plugins(proxy_id, protocol),
             capabilities: self.get_capabilities(proxy_id, protocol),
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
@@ -597,6 +618,7 @@ impl PluginCacheInner {
 pub struct PluginCacheRequestView {
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     capabilities: PluginCapabilities,
     requires_response_body_buffering: bool,
     requires_request_body_buffering: bool,
@@ -612,6 +634,11 @@ impl PluginCacheRequestView {
     /// Get pre-computed auth plugins from this request view.
     pub fn auth_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.auth_plugins)
+    }
+
+    /// Get pre-computed authorization plugins from this request view.
+    pub fn authorize_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
+        Arc::clone(&self.authorize_plugins)
     }
 
     /// Get pre-computed capability bitset from this request view.

@@ -58,9 +58,15 @@ impl JwtAuth {
             "consumer_claim_field",
             "sub",
         )?;
+        let require_exp =
+            parse_optional_bool(config_obj.get("require_exp"), "require_exp")?.unwrap_or(true);
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
-        validation.required_spec_claims = HashSet::from(["exp".to_string()]);
+        if require_exp {
+            validation.required_spec_claims = HashSet::from(["exp".to_string()]);
+        } else {
+            validation.required_spec_claims.clear();
+        }
 
         Ok(Self {
             token_lookup,
@@ -211,4 +217,14 @@ fn parse_non_empty_string(
         return Err(format!("jwt_auth: '{field}' must not be empty"));
     }
     Ok(value.to_string())
+}
+
+fn parse_optional_bool(value: Option<&Value>, field: &str) -> Result<Option<bool>, String> {
+    value
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| format!("jwt_auth: '{field}' must be a boolean, got: {value}"))
+        })
+        .transpose()
 }

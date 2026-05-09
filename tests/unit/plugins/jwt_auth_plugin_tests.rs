@@ -23,6 +23,15 @@ fn make_ctx() -> RequestContext {
 }
 
 fn create_jwt_token(claims: &serde_json::Value, secret: &str) -> String {
+    let mut claims = claims.clone();
+    if let Some(obj) = claims.as_object_mut() {
+        obj.entry("exp")
+            .or_insert_with(|| serde_json::Value::from(9_999_999_999u64));
+    }
+    create_jwt_token_exact(&claims, secret)
+}
+
+fn create_jwt_token_exact(claims: &serde_json::Value, secret: &str) -> String {
     use jsonwebtoken::{EncodingKey, Header, encode};
     encode(
         &Header::default(),
@@ -78,6 +87,7 @@ fn test_jwt_auth_rejects_invalid_config() {
         json!({"token_lookup": "query:"}),
         json!({"consumer_claim_field": 123}),
         json!({"consumer_claim_field": ""}),
+        json!({"require_exp": "yes"}),
     ];
 
     for config in invalid_configs {
@@ -86,6 +96,34 @@ fn test_jwt_auth_rejects_invalid_config() {
             "config should be rejected: {config}"
         );
     }
+}
+
+#[tokio::test]
+async fn test_jwt_auth_rejects_missing_exp_by_default() {
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let token = create_jwt_token_exact(&json!({"sub": "testuser"}), "test-jwt-secret");
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_jwt_auth_require_exp_false_allows_legacy_token_without_exp() {
+    let plugin = JwtAuth::new(&json!({"require_exp": false})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let token = create_jwt_token_exact(&json!({"sub": "testuser"}), "test-jwt-secret");
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
 }
 
 #[tokio::test]

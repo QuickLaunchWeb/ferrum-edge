@@ -195,11 +195,22 @@ impl CircuitBreaker {
                     |v| v.checked_sub(1),
                 );
             }
-            STATE_CLOSED
+            STATE_CLOSED => {
+                // A different half-open probe can close the breaker before
+                // this probe records success. The request still owns one
+                // half-open slot from its can_execute() admission, so release
+                // it even though the state is already CLOSED.
+                if is_half_open_probe {
+                    let _ = self.half_open_in_flight.fetch_update(
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                        |v| v.checked_sub(1),
+                    );
+                }
                 // Reset failure count on success
-                if self.failure_count.load(Ordering::Relaxed) > 0 =>
-            {
-                self.failure_count.store(0, Ordering::Relaxed);
+                if self.failure_count.load(Ordering::Relaxed) > 0 {
+                    self.failure_count.store(0, Ordering::Relaxed);
+                }
             }
             _ => {}
         }

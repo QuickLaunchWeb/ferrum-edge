@@ -1436,6 +1436,14 @@ impl EnvConfig {
             mongo_server_selection_timeout_seconds: u64 = "FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS" => 30u64;
             mongo_connect_timeout_seconds: u64 = "FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS" => 10u64;
         }
+        if resolve_var(conf, "FERRUM_DB_POLL_INTERVAL")
+            .as_deref()
+            .is_some_and(|raw| raw.trim() == "0")
+        {
+            tracing::warn!(
+                "FERRUM_DB_POLL_INTERVAL=0 is clamped to 1 second; set a positive interval to avoid this implicit floor"
+            );
+        }
         let db_tls_mode = Self::resolve_db_tls_mode_legacy_alias(conf, db_tls_mode)?;
         let db_tls_ca_cert_path = Self::resolve_legacy_db_tls_path_alias(
             conf,
@@ -2653,26 +2661,27 @@ impl EnvConfig {
 
         // Non-fatal configuration warnings
         if self.db_pool_min_connections > self.db_pool_max_connections {
-            eprintln!(
+            tracing::warn!(
                 "WARNING: FERRUM_DB_POOL_MIN_CONNECTIONS ({}) exceeds FERRUM_DB_POOL_MAX_CONNECTIONS ({}). \
                  The pool will clamp min to max, wasting the higher setting.",
-                self.db_pool_min_connections, self.db_pool_max_connections
+                self.db_pool_min_connections,
+                self.db_pool_max_connections
             );
         }
 
         // Non-fatal security warnings
         if self.tls_no_verify {
-            eprintln!(
+            tracing::warn!(
                 "WARNING: FERRUM_TLS_NO_VERIFY=true — outbound TLS certificate verification is DISABLED. Do not use in production."
             );
         }
         if self.admin_tls_no_verify {
-            eprintln!(
+            tracing::warn!(
                 "WARNING: FERRUM_ADMIN_TLS_NO_VERIFY=true — admin TLS certificate verification is DISABLED. Do not use in production."
             );
         }
         if self.dp_grpc_tls_no_verify {
-            eprintln!(
+            tracing::warn!(
                 "WARNING: FERRUM_DP_GRPC_TLS_NO_VERIFY=true — gRPC TLS certificate verification is DISABLED. Do not use in production."
             );
         }

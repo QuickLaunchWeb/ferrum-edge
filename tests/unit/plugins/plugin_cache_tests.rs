@@ -330,6 +330,46 @@ fn test_request_view_stays_on_single_generation_after_rebuild() {
 }
 
 #[test]
+fn test_request_view_precomputes_authorize_plugins() {
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["acl", "rate_ip", "rate_consumer"],
+        )],
+        vec![
+            make_plugin_config(
+                "acl",
+                "access_control",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "rate_ip",
+                "rate_limiting",
+                json!({"window_seconds": 60, "max_requests": 100, "limit_by": "ip"}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "rate_consumer",
+                "rate_limiting",
+                json!({"window_seconds": 60, "max_requests": 100, "limit_by": "consumer"}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let request_view = cache.request_view("p1", ProxyProtocol::Http);
+
+    let authorize_plugins = request_view.authorize_plugins();
+    let names: Vec<&str> = authorize_plugins.iter().map(|p| p.name()).collect();
+    assert_eq!(names, vec!["access_control", "rate_limiting"]);
+}
+
+#[test]
 fn test_plugins_persist_across_get_calls() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec![])],

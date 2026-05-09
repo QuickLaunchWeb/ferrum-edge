@@ -95,6 +95,8 @@ struct JwksProvider {
     consumer_identity_claim: Option<String>,
     /// Per-provider override for the consumer header claim.
     consumer_header_claim: Option<String>,
+    /// Whether this provider requires tokens to include an `exp` claim.
+    require_exp: bool,
     /// The JWKS key store (shared via global cache).
     jwks_store: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
     /// Outbound hosts used by direct JWKS or discovery URLs.
@@ -123,6 +125,7 @@ impl JwksAuth {
         let global_role_claim = optional_claim_path(config_obj, "role_claim", "roles")?;
         let consumer_identity_claim =
             optional_claim_path(config_obj, "consumer_identity_claim", "sub")?;
+        let global_require_exp = optional_bool(config_obj, "require_exp")?.unwrap_or(true);
         let consumer_header_claim = match config_obj.get("consumer_header_claim") {
             Some(value) => parse_claim_path_value("consumer_header_claim", value)?,
             None => consumer_identity_claim.clone(),
@@ -169,6 +172,8 @@ impl JwksAuth {
                 optional_provider_claim_path(prov_obj, "consumer_identity_claim", idx)?;
             let prov_consumer_header_claim =
                 optional_provider_claim_path(prov_obj, "consumer_header_claim", idx)?;
+            let provider_require_exp =
+                optional_bool(prov_obj, "require_exp")?.unwrap_or(global_require_exp);
 
             let mut warmup_hostnames = Vec::new();
             if let Some(endpoint) = jwks_endpoint.as_ref() {
@@ -258,6 +263,7 @@ impl JwksAuth {
                 role_claim,
                 consumer_identity_claim: prov_consumer_identity_claim,
                 consumer_header_claim: prov_consumer_header_claim,
+                require_exp: provider_require_exp,
                 jwks_store: jwks_store_slot,
                 warmup_hostnames,
             });
@@ -521,7 +527,11 @@ async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Opt
     let build_validation = |algorithm: Algorithm| -> Validation {
         let mut validation = Validation::new(algorithm);
         validation.validate_exp = true;
-        validation.required_spec_claims = HashSet::from(["exp".to_string()]);
+        if provider.require_exp {
+            validation.required_spec_claims = HashSet::from(["exp".to_string()]);
+        } else {
+            validation.required_spec_claims.clear();
+        }
         if let Some(ref iss) = provider.issuer {
             validation.set_issuer(&[iss]);
         }
@@ -636,6 +646,17 @@ fn optional_u64(
     value
         .as_u64()
         .ok_or_else(|| format!("jwks_auth: '{field}' must be an unsigned integer, got: {value}"))
+}
+
+fn optional_bool(config: &Map<String, Value>, field: &str) -> Result<Option<bool>, String> {
+    config
+        .get(field)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| format!("jwks_auth: '{field}' must be a boolean, got: {value}"))
+        })
+        .transpose()
 }
 
 fn optional_claim_path(
