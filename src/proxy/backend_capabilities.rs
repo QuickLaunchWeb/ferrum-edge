@@ -124,14 +124,28 @@ impl BackendCapabilityProbeTarget {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct BackendCapabilityRegistry {
     entries: DashMap<String, Arc<BackendCapabilityRecord>>,
+}
+
+impl Default for BackendCapabilityRegistry {
+    fn default() -> Self {
+        Self {
+            entries: DashMap::new(),
+        }
+    }
 }
 
 impl BackendCapabilityRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_shard_amount(shard_amount: usize) -> Self {
+        Self {
+            entries: DashMap::with_shard_amount(shard_amount),
+        }
     }
 
     /// Hot-path lookup. Builds the key in a thread-local buffer — no

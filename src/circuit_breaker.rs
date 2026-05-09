@@ -240,8 +240,23 @@ impl CircuitBreaker {
             STATE_CLOSED => {
                 let failures = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if failures >= self.config.failure_threshold {
-                    warn!("Circuit breaker opening after {} failures", failures);
-                    self.state.store(STATE_OPEN, Ordering::Release);
+                    // CAS ensures only one thread wins the CLOSED→OPEN transition.
+                    // A concurrent record_success() could reset failure_count between
+                    // our fetch_add and here; with a plain store the transition would
+                    // still complete despite the counter being 0. CAS makes the
+                    // transition conditional on the state still being CLOSED.
+                    if self
+                        .state
+                        .compare_exchange(
+                            STATE_CLOSED,
+                            STATE_OPEN,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        warn!("Circuit breaker opening after {} failures", failures);
+                    }
                 }
             }
             STATE_HALF_OPEN => {

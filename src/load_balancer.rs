@@ -1160,6 +1160,12 @@ impl LoadBalancer {
 
     /// Smooth weighted round-robin (NGINX algorithm) using bitset.
     /// No Vec allocation — iterates targets directly, skipping unset bits.
+    ///
+    /// Stale-weight guard: when a target transitions from unhealthy back to
+    /// healthy, its accumulated `weights[i]` may hold a stale value from
+    /// before it went down. If the magnitude exceeds `total_weight * 2` the
+    /// weight is reset to 0 before the selection loop, preventing a traffic
+    /// burst (stale positive) or starvation (stale negative) on recovery.
     fn select_wrr_bitset(&self, healthy: &HealthBitset) -> Option<Arc<UpstreamTarget>> {
         let total_weight: i64 = self
             .targets
@@ -1176,6 +1182,18 @@ impl LoadBalancer {
         }
 
         let mut weights = self.wrr_state.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Reset stale weights for targets that just re-entered the healthy set.
+        // A healthy target whose accumulated weight magnitude exceeds
+        // `total_weight * 2` was excluded from previous rounds and drifted —
+        // zero it so it re-enters smoothly without a burst or starvation.
+        let drift_cap = total_weight.saturating_mul(2);
+        for i in 0..self.targets.len() {
+            if healthy.contains(i) && weights[i].abs() > drift_cap {
+                weights[i] = 0;
+            }
+        }
+
         let mut best_idx = 0;
         let mut best_current = i64::MIN;
 
@@ -1365,6 +1383,9 @@ impl LoadBalancer {
     // ─── Vec-based algorithm implementations (fallback for >128 targets) ─────
 
     /// Smooth weighted round-robin (NGINX algorithm) — Vec fallback.
+    ///
+    /// Applies the same stale-weight guard as `select_wrr_bitset` — see its
+    /// doc comment for rationale.
     fn select_wrr_vec(
         &self,
         candidates: &[(usize, &Arc<UpstreamTarget>)],
@@ -1380,6 +1401,15 @@ impl LoadBalancer {
         }
 
         let mut weights = self.wrr_state.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Reset stale weights for candidates that drifted while unhealthy.
+        let drift_cap = total_weight.saturating_mul(2);
+        for &(orig_idx, _) in candidates {
+            if weights[orig_idx].abs() > drift_cap {
+                weights[orig_idx] = 0;
+            }
+        }
+
         let mut best_idx = 0;
         let mut best_current = i64::MIN;
 

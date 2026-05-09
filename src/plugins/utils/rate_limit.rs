@@ -484,6 +484,18 @@ impl SlidingWindow {
         true
     }
 
+    /// Check whether the window would allow a request without incrementing.
+    /// Evicts stale entries to ensure an accurate count.
+    pub fn would_allow(&mut self, now: Instant) -> bool {
+        self.evict(now);
+        (self.timestamps.len() as u64) < self.limit
+    }
+
+    /// Record a request in the window (caller must have checked `would_allow` first).
+    pub fn increment(&mut self, now: Instant) {
+        self.timestamps.push_back(now);
+    }
+
     pub fn remaining(&self) -> u64 {
         self.limit.saturating_sub(self.timestamps.len() as u64)
     }
@@ -544,6 +556,18 @@ impl TokenBucket {
         } else {
             false
         }
+    }
+
+    /// Check whether the bucket would allow consuming `weight` tokens without
+    /// actually consuming them. Refills first to ensure an accurate count.
+    pub fn would_allow(&mut self, now: Instant, weight: u64) -> bool {
+        self.refill(now);
+        self.tokens >= weight as f64
+    }
+
+    /// Consume `weight` tokens (caller must have checked `would_allow` first).
+    pub fn consume(&mut self, weight: u64) {
+        self.tokens -= weight as f64;
     }
 
     pub fn remaining(&self) -> u64 {
@@ -632,19 +656,32 @@ impl RateLimitAlgorithm for HttpRateLimitAlgorithm {
         _op: &Self::Op,
         now: Instant,
     ) -> RateLimitOutcome {
-        let mut tightest: Option<(u64, u64, u64)> = None;
+        // Two-pass approach to prevent phantom counter increments.
+        // Without this, if window 0 allows+increments but window 1 denies,
+        // window 0's counter is inflated — the request was never served but
+        // the rate limit budget is consumed.
 
+        // First pass: check all windows without modifying counters.
         for (idx, window) in state.iter_mut().enumerate() {
             let spec = &self.specs[idx];
             let allowed = match window {
-                HttpWindowState::Sliding(sliding) => sliding.check_and_increment(now),
-                HttpWindowState::Bucket(bucket) => bucket.check_and_consume(now, 1),
+                HttpWindowState::Sliding(sliding) => sliding.would_allow(now),
+                HttpWindowState::Bucket(bucket) => bucket.would_allow(now, 1),
             };
-
             if !allowed {
                 return RateLimitOutcome::deny()
                     .with_limit(spec.limit)
                     .with_window(spec.duration.as_secs());
+            }
+        }
+
+        // Second pass: all windows allow — now increment all counters.
+        let mut tightest: Option<(u64, u64, u64)> = None;
+        for (idx, window) in state.iter_mut().enumerate() {
+            let spec = &self.specs[idx];
+            match window {
+                HttpWindowState::Sliding(sliding) => sliding.increment(now),
+                HttpWindowState::Bucket(bucket) => bucket.consume(1),
             }
 
             let remaining = window.remaining();

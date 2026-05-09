@@ -1428,7 +1428,9 @@ impl ProxyState {
             env_config_arc.clone(),
             dns_cache.clone(),
         ));
-        let backend_capabilities = Arc::new(BackendCapabilityRegistry::new());
+        let backend_capabilities = Arc::new(BackendCapabilityRegistry::with_shard_amount(
+            pool_shard_amount,
+        ));
         let backend_capabilities_refresh = Arc::new(RefreshCoalescer::new());
         let connection_pool = Arc::new(ConnectionPool::new(
             global_pool_config.clone(),
@@ -4692,7 +4694,7 @@ async fn run_websocket_proxy(
                 msg = ws_stream.next() => {
                     let Some(msg) = msg else { break };
                     match msg {
-                        Ok(raw @ (Message::Text(_) | Message::Binary(_) | Message::Ping(_))) => {
+                        Ok(raw @ (Message::Text(_) | Message::Binary(_) | Message::Ping(_) | Message::Pong(_))) => {
                             // Apply frame hooks when any plugin opted in (zero overhead when empty)
                             let outgoing = if ctb_plugins.is_empty() {
                                 raw
@@ -4782,9 +4784,6 @@ async fn run_websocket_proxy(
                             }
                             break;
                         }
-                        Ok(Message::Pong(_data)) => {
-                            trace!("Client -> Backend: Pong");
-                        }
                         Ok(Message::Frame(_)) => {
                             trace!("Client -> Backend: Frame");
                         }
@@ -4834,7 +4833,7 @@ async fn run_websocket_proxy(
                 msg = backend_stream.next() => {
                     let Some(msg) = msg else { break };
                     match msg {
-                        Ok(raw @ (Message::Text(_) | Message::Binary(_) | Message::Ping(_))) => {
+                        Ok(raw @ (Message::Text(_) | Message::Binary(_) | Message::Ping(_) | Message::Pong(_))) => {
                             // Apply frame hooks when any plugin opted in (zero overhead when empty)
                             let outgoing = if btc_plugins.is_empty() {
                                 raw
@@ -4919,9 +4918,6 @@ async fn run_websocket_proxy(
                                 }
                             }
                             break;
-                        }
-                        Ok(Message::Pong(_data)) => {
-                            trace!("Backend -> Client: Pong");
                         }
                         Ok(Message::Frame(_)) => {
                             trace!("Backend -> Client: Frame");
@@ -5988,6 +5984,7 @@ async fn handle_proxy_request_inner(
     let start_time = Instant::now();
 
     let method = req.method().as_str().to_owned();
+    let inbound_version = req.version();
     let is_hbone_connect = is_hbone_connect_request(&req, &state.env_config);
     let raw_path = req.uri().path();
     let path = if is_hbone_connect && raw_path.is_empty() {
@@ -8213,6 +8210,7 @@ async fn handle_proxy_request_inner(
             is_tls,
             current_dispatch_h3,
             &ctx.request_bytes_observed,
+            inbound_version,
         )
         .await;
 
@@ -8324,6 +8322,7 @@ async fn handle_proxy_request_inner(
                     should_stream && is_last_attempt,
                     &ctx.client_ip,
                     is_tls,
+                    inbound_version,
                 )
                 .await
             };
@@ -8359,6 +8358,7 @@ async fn handle_proxy_request_inner(
             is_tls,
             current_dispatch_h3,
             &ctx.request_bytes_observed,
+            inbound_version,
         )
         .await
         .0;
@@ -8736,7 +8736,12 @@ async fn handle_proxy_request_inner(
     }
 
     // Via header on response path (RFC 9110 §7.6.3)
-    if let Some(ref via) = state.via_header_http11 {
+    let resp_via = if inbound_version == hyper::Version::HTTP_2 {
+        &state.via_header_http2
+    } else {
+        &state.via_header_http11
+    };
+    if let Some(via) = resp_via {
         resp_builder = resp_builder.header("via", via.as_str());
     }
 
@@ -9037,6 +9042,7 @@ pub(crate) async fn proxy_to_backend_retry(
     stream_response: bool,
     client_ip: &str,
     is_tls: bool,
+    inbound_version: hyper::Version,
 ) -> retry::BackendResponse {
     // All reqwest clients use our DnsCacheResolver, so DNS resolution is
     // always served from the warmed cache — never hitting DNS on the hot path.
@@ -9148,7 +9154,12 @@ pub(crate) async fn proxy_to_backend_retry(
     if let Some(host) = headers.get("host") {
         req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
     }
-    if let Some(ref via) = state.via_header_http11 {
+    let via = if inbound_version == hyper::Version::HTTP_2 {
+        &state.via_header_http2
+    } else {
+        &state.via_header_http11
+    };
+    if let Some(via) = via {
         req_builder = req_builder.header("Via", via.as_str());
     }
     if state.add_forwarded_header {
@@ -9319,6 +9330,7 @@ async fn proxy_to_backend(
     // `ctx.request_bytes_observed.load(Ordering::Acquire)` once the request
     // has completed.
     ctx_request_bytes_observed: &Arc<std::sync::atomic::AtomicU64>,
+    inbound_version: hyper::Version,
 ) -> (retry::BackendResponse, Option<Bytes>) {
     // When retain_request_body is true (retries configured), the collected
     // body bytes are retained alongside the response so the caller can replay
@@ -9619,7 +9631,12 @@ async fn proxy_to_backend(
     if let Some(host) = headers.get("host") {
         req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
     }
-    if let Some(ref via) = state.via_header_http11 {
+    let via = if inbound_version == hyper::Version::HTTP_2 {
+        &state.via_header_http2
+    } else {
+        &state.via_header_http11
+    };
+    if let Some(via) = via {
         req_builder = req_builder.header("Via", via.as_str());
     }
     if state.add_forwarded_header {

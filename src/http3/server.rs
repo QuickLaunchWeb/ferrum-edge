@@ -1035,8 +1035,19 @@ async fn handle_h3_request(
         match plugin.on_request_received(&mut ctx).await {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-                let reject = plugin_result_into_reject_parts(reject)
-                    .expect("reject result should convert to rejection parts");
+                let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                    tracing::error!("Plugin result could not be converted to rejection parts");
+                    record_request(&state, 500);
+                    send_h3_reject_flavor_aware(
+                        &mut stream,
+                        http_flavor,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        b"Internal Server Error",
+                        &HashMap::new(),
+                    )
+                    .await?;
+                    return Ok(());
+                };
                 record_request(&state, reject.status_code);
                 let mut headers = reject.headers;
                 apply_after_proxy_hooks_to_rejection(
@@ -1141,8 +1152,21 @@ async fn handle_h3_request(
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
-                        let reject = plugin_result_into_reject_parts(reject)
-                            .expect("reject result should convert to rejection parts");
+                        let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                            tracing::error!(
+                                "Plugin result could not be converted to rejection parts"
+                            );
+                            record_request(&state, 500);
+                            send_h3_reject_flavor_aware(
+                                &mut stream,
+                                http_flavor,
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                b"Internal Server Error",
+                                &HashMap::new(),
+                            )
+                            .await?;
+                            return Ok(());
+                        };
                         record_request(&state, reject.status_code);
                         let mut headers = reject.headers;
                         apply_after_proxy_hooks_to_rejection(
@@ -1229,8 +1253,19 @@ async fn handle_h3_request(
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
-                    let reject = plugin_result_into_reject_parts(reject)
-                        .expect("reject result should convert to rejection parts");
+                    let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                        tracing::error!("Plugin result could not be converted to rejection parts");
+                        record_request(&state, 500);
+                        send_h3_reject_flavor_aware(
+                            &mut stream,
+                            http_flavor,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            b"Internal Server Error",
+                            &HashMap::new(),
+                        )
+                        .await?;
+                        return Ok(());
+                    };
                     record_request(&state, reject.status_code);
                     let mut headers = reject.headers;
                     apply_after_proxy_hooks_to_rejection(
@@ -1266,8 +1301,20 @@ async fn handle_h3_request(
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
-                    let reject = plugin_result_into_reject_parts(reject)
-                        .expect("reject result should convert to rejection parts");
+                    let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                        tracing::error!("Plugin result could not be converted to rejection parts");
+                        ctx.headers = tmp_headers;
+                        record_request(&state, 500);
+                        send_h3_reject_flavor_aware(
+                            &mut stream,
+                            http_flavor,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            b"Internal Server Error",
+                            &HashMap::new(),
+                        )
+                        .await?;
+                        return Ok(());
+                    };
                     ctx.headers = tmp_headers;
                     record_request(&state, reject.status_code);
                     let mut headers = reject.headers;
@@ -2071,8 +2118,18 @@ async fn handle_h3_request(
         crate::plugins::PluginResult::Continue => {}
         reject @ crate::plugins::PluginResult::Reject { .. }
         | reject @ crate::plugins::PluginResult::RejectBinary { .. } => {
-            let reject = plugin_result_into_reject_parts(reject)
-                .expect("reject result should convert to rejection parts");
+            let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                tracing::error!("Plugin result could not be converted to rejection parts");
+                record_request(&state, 500);
+                send_h3_reject_response(
+                    &mut stream,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"Internal Server Error",
+                    &HashMap::new(),
+                )
+                .await?;
+                return Ok(());
+            };
             record_request(&state, reject.status_code);
             let mut headers = reject.headers;
             apply_after_proxy_hooks_to_rejection(
@@ -2499,8 +2556,17 @@ async fn handle_h3_request(
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
-                        let reject = plugin_result_into_reject_parts(reject)
-                            .expect("reject result should convert to rejection parts");
+                        let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                            tracing::error!(
+                                "Plugin result could not be converted to rejection parts"
+                            );
+                            response_status = 500;
+                            response_headers.clear();
+                            response_headers
+                                .insert("content-type".to_string(), "application/json".to_string());
+                            response_body = b"Internal Server Error".to_vec();
+                            break;
+                        };
                         debug!(
                             plugin = plugin.name(),
                             status_code = reject.status_code,
@@ -2554,8 +2620,17 @@ async fn handle_h3_request(
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
-                        let reject = plugin_result_into_reject_parts(reject)
-                            .expect("reject result should convert to rejection parts");
+                        let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                            tracing::error!(
+                                "Plugin result could not be converted to rejection parts"
+                            );
+                            response_status = 500;
+                            response_headers.clear();
+                            response_headers
+                                .insert("content-type".to_string(), "application/json".to_string());
+                            response_body = b"Internal Server Error".to_vec();
+                            break;
+                        };
                         debug!(
                             plugin = plugin.name(),
                             status_code = reject.status_code,

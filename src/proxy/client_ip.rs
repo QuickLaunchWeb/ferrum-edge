@@ -166,7 +166,13 @@ impl TrustedProxies {
 
 impl CidrEntry {
     fn matches(&self, ip: &IpAddr) -> bool {
-        match (&self.network, ip) {
+        // Canonicalize IPv4-mapped IPv6 (::ffff:x.x.x.x) to IPv4 so that
+        // dual-stack listeners match IPv4 CIDR entries correctly.
+        let canonical = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(*ip),
+            other => *other,
+        };
+        match (&self.network, &canonical) {
             (IpAddr::V4(net), IpAddr::V4(addr)) => {
                 if self.prefix_len == 0 {
                     return true;
