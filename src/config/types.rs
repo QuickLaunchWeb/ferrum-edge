@@ -2452,7 +2452,8 @@ impl Proxy {
         // pipeline orders field validation first, normalization second).
         // Use `effective_scheme()` to apply the same Https-default-for-HTTP
         // rule at validation time without depending on dispatch_kind.
-        let is_stream_proxy = self.effective_scheme().is_stream();
+        let effective_scheme = self.effective_scheme();
+        let is_stream_proxy = effective_scheme.is_stream();
 
         // Passthrough mode validation
         if self.passthrough {
@@ -2704,18 +2705,16 @@ impl Proxy {
             ));
         }
 
-        // pool_max_requests_per_connection: 0 means unlimited, so reject 0
-        if let Some(0) = self.pool_max_requests_per_connection {
-            errors.push(
-                "pool_max_requests_per_connection must be at least 1 (got 0) — omit the field for unlimited"
-                    .to_string(),
-            );
-        }
-
         // upstream_subset requires upstream_id
         if self.upstream_subset.is_some() && self.upstream_id.is_none() {
             errors.push(
                 "upstream_subset requires upstream_id — subset routing only applies to upstream-backed proxies"
+                    .to_string(),
+            );
+        }
+        if self.upstream_subset.is_some() && effective_scheme.is_udp() {
+            errors.push(
+                "upstream_subset is not supported for udp/dtls proxies until UDP subset routing is implemented"
                     .to_string(),
             );
         }
@@ -2734,7 +2733,7 @@ impl Proxy {
         // populates `dispatch_kind` (file_loader runs field validation first,
         // then normalization). `effective_scheme()` applies the same
         // Https-default-for-HTTP-family rule at validation time.
-        let effective = self.effective_scheme();
+        let effective = effective_scheme;
         if !effective.is_tls_backend() {
             let scheme = self.scheme_display();
             if self.backend_tls_client_cert_path.is_some() {

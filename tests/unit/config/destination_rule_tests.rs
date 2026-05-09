@@ -6,7 +6,7 @@
 //! - pool_max_requests_per_connection serde
 
 use ferrum_edge::config::types::{
-    GatewayConfig, LoadBalancerAlgorithm, PassiveHealthCheck, SubsetDefinition,
+    GatewayConfig, LoadBalancerAlgorithm, PassiveHealthCheck, Proxy, SubsetDefinition,
     SubsetTrafficPolicy, Upstream, UpstreamTarget,
 };
 use std::collections::HashMap;
@@ -349,6 +349,24 @@ fn proxy_pool_max_requests_round_trip() {
 }
 
 #[test]
+fn proxy_pool_max_requests_zero_means_unlimited() {
+    let json = r#"{
+        "id": "p1",
+        "listen_path": "/test",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "pool_max_requests_per_connection": 0
+    }"#;
+
+    let proxy: Proxy = serde_json::from_str(json).unwrap();
+    assert_eq!(proxy.pool_max_requests_per_connection, Some(0));
+    assert!(
+        proxy.validate_fields().is_ok(),
+        "0 is Istio's explicit unlimited value and should validate"
+    );
+}
+
+#[test]
 fn proxy_upstream_subset_defaults_to_none() {
     let json = r#"{
         "id": "p1",
@@ -374,6 +392,30 @@ fn proxy_upstream_subset_round_trip() {
 
     let proxy: ferrum_edge::config::types::Proxy = serde_json::from_str(json).unwrap();
     assert_eq!(proxy.upstream_subset.as_deref(), Some("canary"));
+}
+
+#[test]
+fn proxy_upstream_subset_rejects_udp_and_dtls_until_runtime_supports_it() {
+    for scheme in ["udp", "dtls"] {
+        let json = serde_json::json!({
+            "id": format!("p-{scheme}"),
+            "backend_scheme": scheme,
+            "listen_port": 5353,
+            "backend_host": "localhost",
+            "backend_port": 5353,
+            "upstream_id": "u1",
+            "upstream_subset": "stable"
+        });
+
+        let proxy: Proxy = serde_json::from_value(json).unwrap();
+        let errors = proxy.validate_fields().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("upstream_subset is not supported for udp/dtls")),
+            "expected UDP/DTLS subset rejection for {scheme}, got: {errors:?}"
+        );
+    }
 }
 
 #[test]
