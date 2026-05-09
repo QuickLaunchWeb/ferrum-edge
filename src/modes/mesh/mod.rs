@@ -7,6 +7,7 @@
 //! existing plugins work in mesh context.
 
 pub mod config_consumer;
+pub mod dns_proxy;
 pub mod hbone;
 pub mod policy;
 pub mod runtime;
@@ -16,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use arc_swap::ArcSwap;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -29,6 +31,7 @@ use crate::config::types::{
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
+use crate::modes::mesh::dns_proxy::MeshDnsProxy;
 use crate::modes::mesh::runtime::MeshRuntimeState;
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
@@ -39,6 +42,10 @@ const DEFAULT_INBOUND_LISTEN_ADDR: &str = "0.0.0.0:15006";
 const DEFAULT_OUTBOUND_LISTEN_ADDR: &str = "127.0.0.1:15001";
 const DEFAULT_HBONE_LISTEN_ADDR: &str = "0.0.0.0:15008";
 const DEFAULT_EAST_WEST_LISTEN_PORT: u16 = 15443;
+const DEFAULT_DNS_LISTEN_ADDR: &str = "127.0.0.1:15053";
+const DEFAULT_DNS_UPSTREAM_ADDR: &str = "127.0.0.53:53";
+const DEFAULT_DNS_TTL_SECONDS: u32 = 60;
+const DEFAULT_DNS_ENABLED: bool = false;
 
 pub const MESH_SPIFFE_IDENTITY_PLUGIN_ID: &str = "__mesh_spiffe_identity";
 pub const MESH_AUTHZ_PLUGIN_ID: &str = "__mesh_authz";
@@ -149,6 +156,19 @@ pub struct MeshRuntimeConfig {
     /// (`key1=val1,key2=val2`); empty when unset. The Kubernetes injector
     /// (Phase D) can populate this from pod labels via the downward API.
     pub workload_labels: std::collections::HashMap<String, String>,
+    /// Whether the transparent DNS proxy is enabled. Opt-in because it
+    /// requires iptables/eBPF redirect to be useful.
+    /// Sourced from `FERRUM_MESH_DNS_PROXY_ENABLED` (default false).
+    pub dns_enabled: bool,
+    /// Listen address for the mesh DNS proxy.
+    /// Sourced from `FERRUM_MESH_DNS_LISTEN_ADDR` (default `127.0.0.1:15053`).
+    pub dns_listen_addr: SocketAddr,
+    /// Upstream DNS resolver for non-mesh queries.
+    /// Sourced from `FERRUM_MESH_DNS_UPSTREAM_ADDR` (default `127.0.0.53:53`).
+    pub dns_upstream_addr: SocketAddr,
+    /// TTL (seconds) for DNS responses served from the mesh resolution table.
+    /// Sourced from `FERRUM_MESH_DNS_TTL_SECONDS` (default 60).
+    pub dns_ttl_seconds: u32,
 }
 
 impl MeshRuntimeConfig {
@@ -203,6 +223,25 @@ impl MeshRuntimeConfig {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("FERRUM_MESH_TRUST_DOMAIN_ALIASES: {e}"))?;
 
+        let dns_enabled = resolve_ferrum_var("FERRUM_MESH_DNS_PROXY_ENABLED")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(DEFAULT_DNS_ENABLED);
+        let dns_listen_addr = parse_socket_addr(
+            "FERRUM_MESH_DNS_LISTEN_ADDR",
+            resolve_ferrum_var("FERRUM_MESH_DNS_LISTEN_ADDR")
+                .as_deref()
+                .unwrap_or(DEFAULT_DNS_LISTEN_ADDR),
+        )?;
+        let dns_upstream_addr = parse_socket_addr(
+            "FERRUM_MESH_DNS_UPSTREAM_ADDR",
+            resolve_ferrum_var("FERRUM_MESH_DNS_UPSTREAM_ADDR")
+                .as_deref()
+                .unwrap_or(DEFAULT_DNS_UPSTREAM_ADDR),
+        )?;
+        let dns_ttl_seconds = resolve_ferrum_var("FERRUM_MESH_DNS_TTL_SECONDS")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_DNS_TTL_SECONDS);
+
         Ok(Self {
             node_id,
             namespace: env_config.namespace.clone(),
@@ -216,6 +255,10 @@ impl MeshRuntimeConfig {
             workload_spiffe_id,
             trust_domain_aliases,
             workload_labels,
+            dns_enabled,
+            dns_listen_addr,
+            dns_upstream_addr,
+            dns_ttl_seconds,
         })
     }
 
@@ -656,7 +699,7 @@ async fn serve_mesh_runtime(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     mesh_state: MeshRuntimeState,
     initial_applied_mesh_slice: Option<MeshSlice>,
-    mesh_background_handles: Vec<JoinHandle<()>>,
+    mut mesh_background_handles: Vec<JoinHandle<()>>,
 ) -> Result<(), anyhow::Error> {
     let dns_cache = DnsCache::new(DnsConfig {
         global_overrides: env_config.dns_overrides.clone(),
@@ -743,12 +786,40 @@ async fn serve_mesh_runtime(
         env_config.status_metrics_window_seconds,
         shutdown_tx.subscribe(),
     );
+    // Start mesh DNS proxy if enabled
+    let dns_table_handle = if runtime.dns_enabled {
+        let dns_proxy = MeshDnsProxy::new(
+            runtime.dns_listen_addr,
+            runtime.dns_upstream_addr,
+            runtime.dns_ttl_seconds,
+        );
+        // Build initial resolution table from the applied slice
+        if let Some(ref slice) = initial_applied_mesh_slice {
+            dns_proxy.update_from_slice(slice);
+        }
+        let table_handle = Some(dns_proxy.resolution_table_handle());
+        let dns_shutdown = shutdown_tx.subscribe();
+        mesh_background_handles.push(tokio::spawn(async move {
+            dns_proxy.run(dns_shutdown).await;
+        }));
+        info!(
+            addr = %runtime.dns_listen_addr,
+            upstream = %runtime.dns_upstream_addr,
+            ttl = runtime.dns_ttl_seconds,
+            "Mesh DNS proxy started"
+        );
+        table_handle
+    } else {
+        None
+    };
+
     let mesh_apply_handle = start_mesh_slice_apply_task(
         mesh_state,
         proxy_state.clone(),
         runtime.clone(),
         initial_applied_mesh_slice,
         shutdown_tx.subscribe(),
+        dns_table_handle,
     );
 
     let frontend_tls = load_frontend_tls(&env_config, &tls_policy, &crls)?;
@@ -927,6 +998,7 @@ fn start_mesh_slice_apply_task(
     runtime: MeshRuntimeConfig,
     initial_applied_mesh_slice: Option<MeshSlice>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    dns_table: Option<Arc<ArcSwap<dns_proxy::DnsResolutionTable>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut updates = mesh_state.subscribe();
@@ -952,6 +1024,20 @@ fn start_mesh_slice_apply_task(
                                 applied,
                             );
                             if applied {
+                                // Update DNS resolution table on successful apply
+                                if let Some(ref dns) = dns_table {
+                                    let new_table =
+                                        dns_proxy::DnsResolutionTable::from_mesh_slice(&slice);
+                                    let exact_count = new_table.exact_count();
+                                    let wildcard_count = new_table.wildcard_count();
+                                    dns.store(Arc::new(new_table));
+                                    debug!(
+                                        exact_entries = exact_count,
+                                        wildcard_entries = wildcard_count,
+                                        mesh_slice_version = %slice.version,
+                                        "DNS resolution table rebuilt from mesh slice update"
+                                    );
+                                }
                                 info!(
                                     mesh_slice_version = %slice.version,
                                     "Applied mesh slice to proxy runtime"
@@ -1150,6 +1236,10 @@ mod tests {
             "FERRUM_MESH_WORKLOAD_LABELS",
             "FERRUM_MESH_TRUST_DOMAIN_ALIASES",
             "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS",
+            "FERRUM_MESH_DNS_PROXY_ENABLED",
+            "FERRUM_MESH_DNS_LISTEN_ADDR",
+            "FERRUM_MESH_DNS_UPSTREAM_ADDR",
+            "FERRUM_MESH_DNS_TTL_SECONDS",
             "FERRUM_POOL_WARMUP_ENABLED",
             "FERRUM_SHUTDOWN_DRAIN_SECONDS",
         ];
@@ -1487,6 +1577,10 @@ mod tests {
             workload_spiffe_id: None,
             trust_domain_aliases: Vec::new(),
             workload_labels: HashMap::new(),
+            dns_enabled: false,
+            dns_listen_addr: DEFAULT_DNS_LISTEN_ADDR.parse().unwrap(),
+            dns_upstream_addr: DEFAULT_DNS_UPSTREAM_ADDR.parse().unwrap(),
+            dns_ttl_seconds: DEFAULT_DNS_TTL_SECONDS,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
         let mesh_state = MeshRuntimeState::new();
@@ -1560,6 +1654,10 @@ mod tests {
             workload_spiffe_id: None,
             trust_domain_aliases: Vec::new(),
             workload_labels: HashMap::new(),
+            dns_enabled: false,
+            dns_listen_addr: DEFAULT_DNS_LISTEN_ADDR.parse().unwrap(),
+            dns_upstream_addr: DEFAULT_DNS_UPSTREAM_ADDR.parse().unwrap(),
+            dns_ttl_seconds: DEFAULT_DNS_TTL_SECONDS,
         }
     }
 
@@ -1962,6 +2060,7 @@ mod tests {
             runtime,
             None,
             shutdown_rx,
+            None,
         );
 
         mesh_state.install_slice(MeshSlice {
