@@ -450,6 +450,11 @@ impl ConfigSync for CpGrpcServer {
             last_update_at: now,
         });
 
+        // Register the receiver before loading the initial snapshot so a
+        // concurrent CP broadcast is either captured by this stream or already
+        // reflected in the loaded snapshot.
+        let rx = self.update_tx.subscribe();
+
         // Send initial full config
         let config = self.config.load_full();
         let config_json = serde_json::to_string(config.as_ref()).map_err(|e| {
@@ -464,7 +469,6 @@ impl ConfigSync for CpGrpcServer {
             ferrum_version: FERRUM_VERSION.to_string(),
         };
 
-        let rx = self.update_tx.subscribe();
         let config_for_recovery = self.config.clone();
         let stream = BroadcastStream::new(rx).filter_map(move |result| match result {
             Ok(update) => Some(Ok(update)),

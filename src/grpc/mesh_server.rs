@@ -237,6 +237,10 @@ impl MeshConfigSync for MeshGrpcServer {
             inner.workload_spiffe_id,
             inner.labels,
         );
+        // Register the receiver before loading the initial snapshot so a
+        // concurrent CP broadcast is either captured by this stream or already
+        // reflected in the loaded snapshot.
+        let rx = self.mesh_update_tx.subscribe();
         let config = self.config.load_full();
         let initial_slice = MeshSlice::from_gateway_config(config.as_ref(), slice_request.clone());
         let initial = Self::build_mesh_config_update_from_slice(initial_slice.clone())?;
@@ -252,7 +256,6 @@ impl MeshConfigSync for MeshGrpcServer {
 
         let mut stream_config = config.as_ref().clone();
         let mut previous_slice = initial_slice;
-        let rx = self.mesh_update_tx.subscribe();
         let config_for_recovery = self.config.clone();
         let stream = BroadcastStream::new(rx).filter_map(move |result| {
             let slice_request = slice_request.clone();

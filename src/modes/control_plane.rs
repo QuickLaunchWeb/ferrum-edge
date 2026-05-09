@@ -607,24 +607,21 @@ pub async fn run(
                                     &result.removed_upstream_ids,
                                 );
 
-                                // Broadcast deltas before updating local config
-                                // so that a DP calling GetFullConfig immediately after
-                                // receives the new version. Mesh streams render their
-                                // per-subscriber slices from the same delta payload.
-                                // DP and mesh broadcasts are intentionally coupled to the
-                                // same polling cycle so both subscriber types converge on
-                                // the same config version simultaneously.
+                                // Apply to CP's own in-memory config before broadcasting so
+                                // subscribers that connect during this poll either receive the
+                                // queued delta or load a snapshot that already contains it.
                                 let version = poll_ts.to_rfc3339();
-                                CpGrpcServer::broadcast_delta_with_registry(&update_tx, &result, &version, &dp_registry_poll);
-                                MeshGrpcServer::broadcast_delta_with_registry(&mesh_update_tx, &result, &version, &mesh_registry_poll);
-
-                                // Apply to CP's own in-memory config (for GetFullConfig
-                                // and the Admin API cached_config reads).
-                                // Clone current config, apply incremental changes, store.
                                 let mut new_config = (*config_poll.load_full()).clone();
-                                apply_incremental_to_config(&mut new_config, result);
+                                apply_incremental_to_config(&mut new_config, result.clone());
                                 new_config.normalize_fields();
                                 config_poll.store(Arc::new(new_config));
+
+                                // Mesh streams render their per-subscriber slices from the
+                                // same delta payload. DP and mesh broadcasts are intentionally
+                                // coupled to the same polling cycle so both subscriber types
+                                // converge on the same config version simultaneously.
+                                CpGrpcServer::broadcast_delta_with_registry(&update_tx, &result, &version, &dp_registry_poll);
+                                MeshGrpcServer::broadcast_delta_with_registry(&mesh_update_tx, &result, &version, &mesh_registry_poll);
 
                                 info!("Incremental config update pushed to DPs and mesh nodes");
                                 last_poll_at = Some(poll_ts);
