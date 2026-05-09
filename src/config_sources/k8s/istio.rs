@@ -3,9 +3,10 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use crate::config::mesh::{
-    AppProtocol, ConditionMatch, MeshEndpoint, MeshPolicy, MeshRule, MtlsMode, PeerAuthentication,
-    PolicyAction, PolicyScope, PrincipalMatch, RequestMatch, Resolution, ServiceEntry,
-    ServiceEntryLocation, ServicePort, Workload, WorkloadPort, WorkloadSelector,
+    AppProtocol, ConditionMatch, JwtHeader, MeshEndpoint, MeshJwtRule, MeshPolicy,
+    MeshRequestAuthentication, MeshRule, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope,
+    PrincipalMatch, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+    Workload, WorkloadPort, WorkloadSelector,
 };
 use crate::identity::spiffe::SpiffeId;
 
@@ -57,10 +58,9 @@ pub(super) fn translate(
             Ok(true)
         }
         "RequestAuthentication" => {
-            acc.warnings.push(format!(
-                "RequestAuthentication {}/{} accepted; JWT request identity is kept at the config-source boundary until the canonical request-auth model lands",
-                object.metadata.namespace, object.metadata.name
-            ));
+            acc.mesh
+                .request_authentications
+                .push(request_authentication(object)?);
             Ok(true)
         }
         "Sidecar" => {
@@ -322,6 +322,81 @@ fn peer_authentication(object: &K8sObject) -> Result<PeerAuthentication, K8sTran
             }),
         mtls_mode: effective_mtls_mode,
         port_overrides,
+    })
+}
+
+fn request_authentication(
+    object: &K8sObject,
+) -> Result<MeshRequestAuthentication, K8sTranslateError> {
+    let scope = match object.spec.get("selector") {
+        Some(selector) => PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: selector_from_istio(Some(selector)),
+                namespace: Some(object.metadata.namespace.clone()),
+            },
+        },
+        None => PolicyScope::Namespace {
+            namespace: object.metadata.namespace.clone(),
+        },
+    };
+
+    let jwt_rules: Vec<MeshJwtRule> = object
+        .spec
+        .get("jwtRules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|rule| translate_jwt_rule(object, rule))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(MeshRequestAuthentication {
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        scope,
+        jwt_rules,
+    })
+}
+
+fn translate_jwt_rule(object: &K8sObject, rule: &Value) -> Result<MeshJwtRule, K8sTranslateError> {
+    let issuer = string_field(rule, "issuer")
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                "RequestAuthentication jwtRules[].issuer is required",
+            )
+        })?
+        .to_string();
+
+    let audiences = string_array(rule, "audiences");
+    let jwks_uri = string_field(rule, "jwksUri").map(ToOwned::to_owned);
+    let jwks = string_field(rule, "jwks").map(ToOwned::to_owned);
+
+    let from_headers: Vec<JwtHeader> = rule
+        .get("fromHeaders")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|header| {
+            let name = string_field(header, "name")?.to_string();
+            let prefix = string_field(header, "prefix").map(ToOwned::to_owned);
+            Some(JwtHeader { name, prefix })
+        })
+        .collect();
+
+    let from_params = string_array(rule, "fromParams");
+    let forward_original_token = rule
+        .get("forwardOriginalToken")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    Ok(MeshJwtRule {
+        issuer,
+        audiences,
+        jwks_uri,
+        jwks,
+        from_headers,
+        from_params,
+        forward_original_token,
     })
 }
 
@@ -1542,5 +1617,193 @@ mod tests {
                     .contains("weight must be between 0 and 65535")
             );
         }
+    }
+
+    // ── RequestAuthentication ────────────────────────────────────────────
+
+    #[test]
+    fn translates_request_authentication_with_selector() {
+        let result = translate_k8s_objects(
+            &[object(
+                "RequestAuthentication",
+                serde_json::json!({
+                    "selector": {"matchLabels": {"app": "httpbin"}},
+                    "jwtRules": [{
+                        "issuer": "https://accounts.google.com",
+                        "jwksUri": "https://www.googleapis.com/oauth2/v3/certs",
+                        "audiences": ["my-app"],
+                        "fromHeaders": [
+                            {"name": "Authorization", "prefix": "Bearer "},
+                            {"name": "X-Custom-Token"}
+                        ],
+                        "fromParams": ["access_token"],
+                        "forwardOriginalToken": true
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.request_authentications.len(), 1);
+        let ra = &mesh.request_authentications[0];
+        assert_eq!(ra.name, "sample");
+        assert_eq!(ra.namespace, "default");
+        assert!(
+            matches!(&ra.scope, PolicyScope::WorkloadSelector { selector } if selector.labels.get("app") == Some(&"httpbin".to_string()))
+        );
+        assert_eq!(ra.jwt_rules.len(), 1);
+        let rule = &ra.jwt_rules[0];
+        assert_eq!(rule.issuer, "https://accounts.google.com");
+        assert_eq!(
+            rule.jwks_uri.as_deref(),
+            Some("https://www.googleapis.com/oauth2/v3/certs")
+        );
+        assert_eq!(rule.audiences, vec!["my-app"]);
+        assert_eq!(rule.from_headers.len(), 2);
+        assert_eq!(rule.from_headers[0].name, "Authorization");
+        assert_eq!(rule.from_headers[0].prefix.as_deref(), Some("Bearer "));
+        assert_eq!(rule.from_headers[1].name, "X-Custom-Token");
+        assert!(rule.from_headers[1].prefix.is_none());
+        assert_eq!(rule.from_params, vec!["access_token"]);
+        assert!(rule.forward_original_token);
+    }
+
+    #[test]
+    fn translates_request_authentication_without_selector_to_namespace_scope() {
+        let result = translate_k8s_objects(
+            &[object(
+                "RequestAuthentication",
+                serde_json::json!({
+                    "jwtRules": [{
+                        "issuer": "https://auth.example.com",
+                        "jwksUri": "https://auth.example.com/.well-known/jwks.json"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let ra = &mesh.request_authentications[0];
+        assert!(matches!(
+            &ra.scope,
+            PolicyScope::Namespace { namespace } if namespace == "default"
+        ));
+    }
+
+    #[test]
+    fn translates_request_authentication_with_empty_jwt_rules() {
+        let result = translate_k8s_objects(
+            &[object("RequestAuthentication", serde_json::json!({}))],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.request_authentications.len(), 1);
+        assert!(mesh.request_authentications[0].jwt_rules.is_empty());
+    }
+
+    #[test]
+    fn translates_request_authentication_with_inline_jwks() {
+        let result = translate_k8s_objects(
+            &[object(
+                "RequestAuthentication",
+                serde_json::json!({
+                    "jwtRules": [{
+                        "issuer": "https://auth.example.com",
+                        "jwks": "{\"keys\":[{\"kty\":\"RSA\"}]}"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let rule = &mesh.request_authentications[0].jwt_rules[0];
+        assert!(rule.jwks_uri.is_none());
+        assert_eq!(rule.jwks.as_deref(), Some("{\"keys\":[{\"kty\":\"RSA\"}]}"));
+    }
+
+    #[test]
+    fn translates_request_authentication_multiple_jwt_rules() {
+        let result = translate_k8s_objects(
+            &[object(
+                "RequestAuthentication",
+                serde_json::json!({
+                    "jwtRules": [
+                        {
+                            "issuer": "https://first.example.com",
+                            "jwksUri": "https://first.example.com/jwks"
+                        },
+                        {
+                            "issuer": "https://second.example.com",
+                            "jwksUri": "https://second.example.com/jwks",
+                            "audiences": ["aud-a", "aud-b"]
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.request_authentications[0].jwt_rules.len(), 2);
+        assert_eq!(
+            mesh.request_authentications[0].jwt_rules[0].issuer,
+            "https://first.example.com"
+        );
+        assert_eq!(
+            mesh.request_authentications[0].jwt_rules[1].audiences,
+            vec!["aud-a", "aud-b"]
+        );
+    }
+
+    #[test]
+    fn rejects_request_authentication_jwt_rule_without_issuer() {
+        let err = translate_k8s_objects(
+            &[object(
+                "RequestAuthentication",
+                serde_json::json!({
+                    "jwtRules": [{
+                        "jwksUri": "https://example.com/jwks"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("missing issuer must fail");
+
+        assert!(err.to_string().contains("issuer is required"));
+    }
+
+    #[test]
+    fn translates_request_authentication_no_warning_emitted() {
+        let result = translate_k8s_objects(
+            &[object(
+                "RequestAuthentication",
+                serde_json::json!({
+                    "jwtRules": [{
+                        "issuer": "https://auth.example.com",
+                        "jwksUri": "https://auth.example.com/jwks"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        // Should NOT emit a warning now that it's fully translated
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("RequestAuthentication"))
+        );
     }
 }

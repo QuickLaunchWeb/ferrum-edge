@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::config::mesh::{
-    MeshPolicy, MeshService, MultiClusterConfig, PeerAuthentication, ServiceEntry, TrustBundleSet,
-    Workload, policy_scope_applies_to_workload, workload_selector_matches,
+    MeshPolicy, MeshRequestAuthentication, MeshService, MultiClusterConfig, PeerAuthentication,
+    ServiceEntry, TrustBundleSet, Workload, policy_scope_applies_to_workload,
+    workload_selector_matches,
 };
 use crate::config::types::GatewayConfig;
 
@@ -67,6 +68,8 @@ pub struct MeshSlice {
     pub peer_authentications: Vec<PeerAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_entries: Vec<ServiceEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_authentications: Vec<MeshRequestAuthentication>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -88,6 +91,7 @@ impl MeshSlice {
             && self.mesh_policies == other.mesh_policies
             && self.peer_authentications == other.peer_authentications
             && self.service_entries == other.service_entries
+            && self.request_authentications == other.request_authentications
             && self.trust_bundles == other.trust_bundles
             && self.multi_cluster == other.multi_cluster
     }
@@ -164,6 +168,12 @@ impl MeshSlice {
             .filter(|entry| entry.namespace == namespace)
             .cloned()
             .collect();
+        let request_authentications: Vec<MeshRequestAuthentication> = mesh
+            .request_authentications
+            .iter()
+            .filter(|ra| ra.namespace == namespace)
+            .cloned()
+            .collect();
 
         Self {
             node_id: request.node_id,
@@ -176,6 +186,7 @@ impl MeshSlice {
             mesh_policies,
             peer_authentications,
             service_entries,
+            request_authentications,
             trust_bundles: mesh.trust_bundles.clone(),
             multi_cluster: mesh.multi_cluster.clone(),
         }
