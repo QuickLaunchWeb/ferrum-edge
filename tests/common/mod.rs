@@ -60,6 +60,7 @@
 pub mod config_builder;
 pub mod echo_servers;
 pub mod gateway_harness;
+pub mod hmac_helpers;
 
 pub use config_builder::{
     ConsumerBuilder, GatewayConfigBuilder, PluginConfigBuilder, ProxyBuilder, UpstreamBuilder,
@@ -70,3 +71,4 @@ pub use echo_servers::{
     spawn_http_slow_identifying, spawn_http_status, spawn_tcp_echo, spawn_udp_echo,
 };
 pub use gateway_harness::{DbType, GatewayMode, TestGateway, TestGatewayBuilder};
+pub use hmac_helpers::{empty_digest_header, generate_hmac_signature};

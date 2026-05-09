@@ -10,17 +10,13 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_auth_acl
 
-use crate::common::TestGateway;
+use crate::common::{TestGateway, empty_digest_header, generate_hmac_signature};
 
 use base64::Engine;
 use chrono::Utc;
-use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::time::Duration;
-
-type HmacSha256 = Hmac<Sha256>;
 
 fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> String {
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
@@ -384,23 +380,6 @@ fn generate_consumer_jwt(consumer_username: &str, secret: &str, exp_offset_secs:
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
     let key = EncodingKey::from_secret(secret.as_bytes());
     encode(&header, &claims, &key).expect("Failed to encode JWT")
-}
-
-/// Generate HMAC signature for a request
-fn generate_hmac_signature(method: &str, path: &str, date: &str, secret: &str) -> String {
-    let signing_string = format!("{}\n{}\n{}\n{}", method, path, date, empty_digest_header());
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("Failed to create HMAC instance");
-    mac.update(signing_string.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
-}
-
-fn empty_digest_header() -> String {
-    let digest = Sha256::digest([]);
-    format!(
-        "sha-256={}",
-        base64::engine::general_purpose::STANDARD.encode(digest)
-    )
 }
 
 #[tokio::test]

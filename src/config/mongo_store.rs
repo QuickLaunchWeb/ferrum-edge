@@ -910,6 +910,10 @@ mod inner {
     }
 
     /// Convert a BSON `Document` back into a domain `Proxy`.
+    ///
+    /// `Proxy` uses `#[serde(deny_unknown_fields)]`; strip MongoDB's `_id`
+    /// before deserialization. Apply the same treatment to other `doc_to_*`
+    /// functions if their types gain `deny_unknown_fields`.
     fn doc_to_proxy(mut doc: Document) -> Result<Proxy, anyhow::Error> {
         doc.remove("_id");
         let proxy: Proxy = mongodb::bson::from_document(doc)?;
