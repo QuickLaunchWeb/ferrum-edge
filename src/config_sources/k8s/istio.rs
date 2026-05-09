@@ -3,10 +3,12 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use crate::config::mesh::{
-    AppProtocol, ConditionMatch, JwtHeader, MeshEndpoint, MeshJwtRule, MeshPolicy,
-    MeshRequestAuthentication, MeshRule, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope,
-    PrincipalMatch, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
-    Workload, WorkloadPort, WorkloadSelector,
+    AccessLogFilter, AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig, MeshEndpoint,
+    MeshJwtRule, MeshMetricsConfig, MeshPolicy, MeshRequestAuthentication, MeshRule,
+    MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig, MetricTagOverride, MtlsMode,
+    PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch, Resolution,
+    ServiceEntry, ServiceEntryLocation, ServicePort, TagOverrideOperation, Workload, WorkloadPort,
+    WorkloadSelector,
 };
 use crate::identity::spiffe::SpiffeId;
 
@@ -71,10 +73,7 @@ pub(super) fn translate(
             Ok(true)
         }
         "Telemetry" => {
-            acc.warnings.push(format!(
-                "Telemetry {}/{} accepted; observability materialization is additive and remains behind Phase E runtime metrics",
-                object.metadata.namespace, object.metadata.name
-            ));
+            acc.mesh.telemetry_resources.push(telemetry(object)?);
             Ok(true)
         }
         _ => Ok(false),
@@ -759,6 +758,219 @@ fn app_protocol(value: Option<&str>) -> AppProtocol {
         "postgres" => AppProtocol::Postgres,
         _ => AppProtocol::Unknown,
     }
+}
+
+fn telemetry(object: &K8sObject) -> Result<MeshTelemetryResource, K8sTranslateError> {
+    let scope = match object.spec.get("selector") {
+        Some(selector) => PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: string_map(
+                    selector.get("matchLabels").unwrap_or(&Value::Null),
+                ),
+                namespace: None,
+            },
+        },
+        None => PolicyScope::Namespace {
+            namespace: object.metadata.namespace.clone(),
+        },
+    };
+
+    let tracing = object
+        .spec
+        .get("tracing")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .map(|t| {
+            let sampling = t
+                .get("randomSamplingPercentage")
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0);
+            let custom_tags = t
+                .get("customTags")
+                .and_then(Value::as_object)
+                .map(|tags| {
+                    tags.iter()
+                        .filter_map(|(key, val)| {
+                            // Istio customTags: { tagName: { literal: { value: "v" } } }
+                            let value = val
+                                .get("literal")
+                                .and_then(|l| l.get("value"))
+                                .and_then(Value::as_str)
+                                .or_else(|| {
+                                    val.get("environment")
+                                        .and_then(|e| e.get("name"))
+                                        .and_then(Value::as_str)
+                                })
+                                .or_else(|| {
+                                    val.get("header")
+                                        .and_then(|h| h.get("name"))
+                                        .and_then(Value::as_str)
+                                });
+                            value.map(|v| (key.clone(), v.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            MeshTracingConfig {
+                sampling_percentage: sampling,
+                custom_tags,
+            }
+        });
+
+    let metrics = object
+        .spec
+        .get("metrics")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .map(|m| {
+            let mut tag_overrides = Vec::new();
+            let mut disabled_metrics = Vec::new();
+            if let Some(overrides) = m.get("overrides").and_then(Value::as_array) {
+                for ovr in overrides {
+                    if ovr
+                        .get("disabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        let metric_name = ovr
+                            .get("match")
+                            .and_then(|m| m.get("metric"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("ALL_METRICS");
+                        disabled_metrics.push(metric_name.to_string());
+                    }
+                    if let Some(tags) = ovr.get("tagOverrides").and_then(Value::as_object) {
+                        for (tag_name, tag_spec) in tags {
+                            let op = tag_spec
+                                .get("operation")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let operation = match op {
+                                "REMOVE" => TagOverrideOperation::Remove,
+                                "UPSERT" => {
+                                    let value = tag_spec
+                                        .get("value")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string();
+                                    TagOverrideOperation::Set { value }
+                                }
+                                _ => continue,
+                            };
+                            tag_overrides.push(MetricTagOverride {
+                                name: tag_name.clone(),
+                                operation,
+                            });
+                        }
+                    }
+                }
+            }
+            MeshMetricsConfig {
+                tag_overrides,
+                disabled_metrics,
+            }
+        });
+
+    let access_logging = object
+        .spec
+        .get("accessLogging")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .map(|al| {
+            let disabled = al.get("disabled").and_then(Value::as_bool).unwrap_or(false);
+            let filter = al
+                .get("filter")
+                .and_then(|f| f.get("expression"))
+                .and_then(Value::as_str)
+                .and_then(parse_access_log_filter_expression);
+            MeshAccessLoggingConfig {
+                enabled: !disabled,
+                filter,
+            }
+        });
+
+    Ok(MeshTelemetryResource {
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        scope,
+        config: MeshTelemetryConfig {
+            tracing,
+            metrics,
+            access_logging,
+        },
+    })
+}
+
+/// Parse simple filter expressions like `response.code >= 400` into an
+/// [`AccessLogFilter`]. Returns `None` for unparseable expressions (caller
+/// should log a warning and skip the filter).
+fn parse_access_log_filter_expression(expr: &str) -> Option<AccessLogFilter> {
+    let mut filter = AccessLogFilter {
+        status_code_min: None,
+        status_code_max: None,
+        min_latency_ms: None,
+        errors_only: false,
+    };
+    let mut matched = false;
+
+    // Split on && to handle compound expressions
+    for part in expr.split("&&") {
+        let part = part.trim();
+        if part.starts_with("response.code") || part.starts_with("response.status") {
+            if let Some(val) = extract_numeric_comparison(part) {
+                match val {
+                    Comparison::Gte(n) => filter.status_code_min = Some(n as u16),
+                    Comparison::Gt(n) => filter.status_code_min = Some(n as u16 + 1),
+                    Comparison::Lte(n) => filter.status_code_max = Some(n as u16),
+                    Comparison::Lt(n) => filter.status_code_max = Some(n as u16 - 1),
+                    Comparison::Eq(n) => {
+                        filter.status_code_min = Some(n as u16);
+                        filter.status_code_max = Some(n as u16);
+                    }
+                }
+                matched = true;
+            }
+        } else if part.starts_with("response.duration")
+            && let Some(val) = extract_numeric_comparison(part)
+        {
+            match val {
+                Comparison::Gte(n) | Comparison::Gt(n) => {
+                    filter.min_latency_ms = Some(n as u64);
+                }
+                _ => {}
+            }
+            matched = true;
+        }
+    }
+
+    if matched { Some(filter) } else { None }
+}
+
+enum Comparison {
+    Gte(i64),
+    Gt(i64),
+    Lte(i64),
+    Lt(i64),
+    Eq(i64),
+}
+
+fn extract_numeric_comparison(expr: &str) -> Option<Comparison> {
+    let ops = [">=", "<=", ">", "<", "=="];
+    for op in ops {
+        if let Some(idx) = expr.find(op) {
+            let val_str = expr[idx + op.len()..].trim();
+            let val: i64 = val_str.parse().ok()?;
+            return match op {
+                ">=" => Some(Comparison::Gte(val)),
+                ">" => Some(Comparison::Gt(val)),
+                "<=" => Some(Comparison::Lte(val)),
+                "<" => Some(Comparison::Lt(val)),
+                "==" => Some(Comparison::Eq(val)),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 #[cfg(test)]

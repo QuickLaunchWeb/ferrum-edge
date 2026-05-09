@@ -128,11 +128,12 @@ pub struct MeshPolicy {
     pub rules: Vec<MeshRule>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PolicyScope {
     WorkloadSelector { selector: WorkloadSelector },
     Namespace { namespace: String },
+    #[default]
     MeshWide,
 }
 
@@ -350,6 +351,96 @@ pub struct JwtHeader {
     /// Prefix stripped before validation (e.g., `"Bearer "`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
+}
+
+// ── Telemetry ─────────────────────────────────────────────────────────────
+
+/// Raw Telemetry resource from Istio CRD translation (before workload merge).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshTelemetryResource {
+    pub name: String,
+    pub namespace: String,
+    #[serde(default)]
+    pub scope: PolicyScope,
+    pub config: MeshTelemetryConfig,
+}
+
+/// Merged telemetry configuration for a workload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MeshTelemetryConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracing: Option<MeshTracingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<MeshMetricsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_logging: Option<MeshAccessLoggingConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshTracingConfig {
+    /// Sampling percentage 0.0–100.0. Default 1.0 (= 1%).
+    #[serde(default = "default_tracing_sampling")]
+    pub sampling_percentage: f64,
+    /// Custom tags injected into every span / transaction metadata.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub custom_tags: HashMap<String, String>,
+}
+
+fn default_tracing_sampling() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshMetricsConfig {
+    /// Tag overrides: rename, remove, or set custom values for metric tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tag_overrides: Vec<MetricTagOverride>,
+    /// Specific metric names to disable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_metrics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricTagOverride {
+    pub name: String,
+    pub operation: TagOverrideOperation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum TagOverrideOperation {
+    Remove,
+    Rename { new_name: String },
+    Set { value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshAccessLoggingConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<AccessLogFilter>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Simple access log filter operating on transaction summary fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccessLogFilter {
+    /// Only log responses with status code >= this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code_min: Option<u16>,
+    /// Only log responses with status code <= this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code_max: Option<u16>,
+    /// Only log requests with latency above this threshold (ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_latency_ms: Option<u64>,
+    /// Only log requests that resulted in an error.
+    #[serde(default)]
+    pub errors_only: bool,
 }
 
 // ── PeerAuthentication ────────────────────────────────────────────────────
@@ -578,6 +669,8 @@ pub struct MeshConfig {
     pub service_entries: Vec<ServiceEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub request_authentications: Vec<MeshRequestAuthentication>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub telemetry_resources: Vec<MeshTelemetryResource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
