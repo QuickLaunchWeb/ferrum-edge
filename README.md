@@ -160,7 +160,7 @@ cargo run --release -- run
 
 # Data Plane (single CP)
 FERRUM_MODE=dp \
-FERRUM_DP_CP_GRPC_URL="http://localhost:50051" \
+FERRUM_DP_CP_GRPC_URLS="http://localhost:50051" \
 FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-secret" \
 cargo run --release -- run
 
@@ -227,7 +227,7 @@ consumers:
     username: "alice"
     credentials:
       keyauth:
-        key: "alice-api-key"
+        - key: "alice-api-key"
     acl_groups:
       - "engineering"
 

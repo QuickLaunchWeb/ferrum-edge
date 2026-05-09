@@ -483,7 +483,7 @@ When `limit` or `offset` is provided, the response wraps items in an envelope wi
 }
 ```
 
-When no pagination parameters are provided, the response is a plain JSON array (backward-compatible with existing clients).
+List responses always use the pagination envelope shown above.
 
 ## Database Considerations
 

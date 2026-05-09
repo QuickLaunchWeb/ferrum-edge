@@ -247,33 +247,6 @@ pub fn generate_dp_jwt_with_issuer(
     Ok(token)
 }
 
-/// Connect to the Control Plane with an optional shutdown signal.
-///
-/// Accepts a single CP URL for backward compatibility. For multi-CP failover,
-/// use [`start_dp_client_with_shutdown_and_startup_ready`] with a `Vec`.
-#[allow(dead_code)] // Used by tests and library callers; binary startup uses the startup-aware variant.
-pub async fn start_dp_client_with_shutdown(
-    cp_url: String,
-    jwt_secret: GrpcJwtSecret,
-    proxy_state: ProxyState,
-    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
-    tls_config: Option<DpGrpcTlsConfig>,
-    namespace: String,
-) {
-    start_dp_client_with_shutdown_and_startup_ready(
-        vec![cp_url],
-        jwt_secret,
-        proxy_state,
-        shutdown_rx,
-        tls_config,
-        None,
-        namespace,
-        0,
-        None,
-    )
-    .await;
-}
-
 /// Connect to Control Plane(s) with multi-CP failover and optional startup readiness.
 ///
 /// `cp_urls` is a priority-ordered list of CP gRPC URLs. The DP connects to the

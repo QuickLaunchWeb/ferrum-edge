@@ -2,7 +2,7 @@
 //!
 //! This test verifies end-to-end authentication and authorization flows:
 //! - Key Auth: API key in header and query param
-//! - Basic Auth: username:password with bcrypt hashing
+//! - Basic Auth: username:password with HMAC-SHA256 password hashes
 //! - JWT Auth: HS256-signed tokens with consumer-specific secrets
 //! - HMAC Auth: HMAC-signed requests with replay protection
 //! - Access Control (ACL): Consumer allow/deny lists
@@ -17,7 +17,7 @@ use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -388,11 +388,19 @@ fn generate_consumer_jwt(consumer_username: &str, secret: &str, exp_offset_secs:
 
 /// Generate HMAC signature for a request
 fn generate_hmac_signature(method: &str, path: &str, date: &str, secret: &str) -> String {
-    let signing_string = format!("{}\n{}\n{}", method, path, date);
+    let signing_string = format!("{}\n{}\n{}\n{}", method, path, date, empty_digest_header());
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("Failed to create HMAC instance");
     mac.update(signing_string.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+fn empty_digest_header() -> String {
+    let digest = Sha256::digest([]);
+    format!(
+        "sha-256={}",
+        base64::engine::general_purpose::STANDARD.encode(digest)
+    )
 }
 
 #[tokio::test]
@@ -778,9 +786,7 @@ async fn test_auth_acl_comprehensive() {
             "scope": "proxy",
             "proxy_id": "proxy-hmacauth",
             "enabled": true,
-            // Legacy 3-field signing string (no Digest header); the dedicated
-            // digest-mode functional tests cover the secure-by-default path.
-            "config": {"clock_skew_seconds": 300, "require_digest": false}
+            "config": {"clock_skew_seconds": 300}
         }),
         json!({
             "id": "plugin-keyauth-acl-allow",
@@ -1280,6 +1286,7 @@ async fn test_auth_acl_comprehensive() {
         .get(format!("{}/hmacauth", proxy_url))
         .header("Authorization", &hmac_header)
         .header("Date", &date)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .expect("Request failed");
@@ -1304,6 +1311,7 @@ async fn test_auth_acl_comprehensive() {
         .get(format!("{}/hmacauth", proxy_url))
         .header("Authorization", &hmac_header)
         .header("Date", &date)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .expect("Request failed");
@@ -1324,6 +1332,7 @@ async fn test_auth_acl_comprehensive() {
     let resp = client
         .get(format!("{}/hmacauth", proxy_url))
         .header("Authorization", &hmac_header)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .expect("Request failed");
@@ -1346,6 +1355,7 @@ async fn test_auth_acl_comprehensive() {
         .get(format!("{}/hmacauth", proxy_url))
         .header("Authorization", &hmac_header)
         .header("Date", &date)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .expect("Request failed");
@@ -1361,6 +1371,7 @@ async fn test_auth_acl_comprehensive() {
     let resp = client
         .get(format!("{}/hmacauth", proxy_url))
         .header("Date", Utc::now().to_rfc2822())
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .expect("Request failed");
@@ -2285,7 +2296,7 @@ async fn test_hmac_auth_plus_acl() {
                 "scope": "proxy",
                 "proxy_id": "proxy-hmac-allow",
                 "enabled": true,
-                "config": {"clock_skew_seconds": 300, "require_digest": false}
+                "config": {"clock_skew_seconds": 300}
             }),
             acl_plugin_id: "plugin-hmac-allow-acl",
             acl_config: json!({"allowed_consumers": ["hmac-alice"]}),
@@ -2308,7 +2319,7 @@ async fn test_hmac_auth_plus_acl() {
                 "scope": "proxy",
                 "proxy_id": "proxy-hmac-deny",
                 "enabled": true,
-                "config": {"clock_skew_seconds": 300, "require_digest": false}
+                "config": {"clock_skew_seconds": 300}
             }),
             acl_plugin_id: "plugin-hmac-deny-acl",
             acl_config: json!({"disallowed_consumers": ["hmac-mallory"]}),
@@ -2334,6 +2345,7 @@ async fn test_hmac_auth_plus_acl() {
         .get(format!("{}/hmac-acl-allow", proxy_url))
         .header("Authorization", header)
         .header("Date", date)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .unwrap();
@@ -2348,6 +2360,7 @@ async fn test_hmac_auth_plus_acl() {
         .get(format!("{}/hmac-acl-allow", proxy_url))
         .header("Authorization", header)
         .header("Date", date)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .unwrap();
@@ -2364,6 +2377,7 @@ async fn test_hmac_auth_plus_acl() {
         .get(format!("{}/hmac-acl-allow", proxy_url))
         .header("Authorization", header)
         .header("Date", date)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .unwrap();
@@ -2380,6 +2394,7 @@ async fn test_hmac_auth_plus_acl() {
         .get(format!("{}/hmac-acl-deny", proxy_url))
         .header("Authorization", header)
         .header("Date", date)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .unwrap();
@@ -2395,6 +2410,7 @@ async fn test_hmac_auth_plus_acl() {
         .get(format!("{}/hmac-acl-deny", proxy_url))
         .header("Authorization", header)
         .header("Date", date)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .unwrap();

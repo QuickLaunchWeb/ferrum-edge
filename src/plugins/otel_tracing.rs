@@ -190,10 +190,6 @@ impl OtelTracing {
     }
 }
 
-/// Backwards-compatible alias. Prefer `super::priority::OTEL_TRACING`.
-#[allow(dead_code)]
-pub const OTEL_TRACING_PRIORITY: u16 = super::priority::OTEL_TRACING;
-
 #[async_trait]
 impl Plugin for OtelTracing {
     fn name(&self) -> &str {

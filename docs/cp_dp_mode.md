@@ -130,7 +130,7 @@ Data Planes can be configured with a priority-ordered list of Control Plane URLs
 | Primary CP drops mid-stream | Stream ends → try primary first (clean disconnect) |
 | All CPs exhausted | Cycle back to primary; keep accumulated backoff |
 | Connected to fallback, primary comes back | After retry interval, disconnect from fallback and retry primary |
-| Single URL configured | Identical to current behavior (backward compatible) |
+| Single URL configured | Treated as a one-entry priority list |
 
 ### Configuration
 
@@ -144,7 +144,7 @@ FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS=300
 
 **TLS config is shared** across all CP URLs — the same `FERRUM_DP_GRPC_TLS_*` settings apply to every CP connection. SNI is extracted per-URL automatically.
 
-**Backward compatible** — `FERRUM_DP_CP_GRPC_URL` (single URL) continues to work. `FERRUM_DP_CP_GRPC_URLS` takes precedence when both are set.
+Use `FERRUM_DP_CP_GRPC_URLS` for both single-CP and multi-CP deployments.
 
 For multi-region high-availability patterns using this feature, see [Multi-Region High Availability](multi_region_ha.md).
 
@@ -170,8 +170,7 @@ For multi-region high-availability patterns using this feature, see [Multi-Regio
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `FERRUM_MODE` | Yes | Set to `dp` |
-| `FERRUM_DP_CP_GRPC_URL` | Yes (unless `_URLS` set) | CP gRPC endpoint URL (`http://` or `https://`) |
-| `FERRUM_DP_CP_GRPC_URLS` | No | Comma-separated priority-ordered CP URLs for failover |
+| `FERRUM_DP_CP_GRPC_URLS` | Yes | Comma-separated priority-ordered CP URLs (`http://` or `https://`) |
 | `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` | No | Retry primary CP interval when on fallback (default: 300) |
 | `FERRUM_CP_DP_GRPC_JWT_SECRET` | Yes | Shared JWT secret for CP/DP gRPC auth (same value as CP) |
 | `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | No | PEM CA cert for verifying CP server cert |
@@ -205,7 +204,7 @@ FERRUM_DB_POLL_INTERVAL=10 \
 
 ```bash
 FERRUM_MODE=dp \
-FERRUM_DP_CP_GRPC_URL=http://cp-host:50051 \
+FERRUM_DP_CP_GRPC_URLS=http://cp-host:50051 \
 FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-shared-secret \
 FERRUM_ADMIN_JWT_SECRET=admin-secret-key \
 FERRUM_PROXY_HTTP_PORT=8000 \
@@ -232,7 +231,7 @@ FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH=/certs/ca.pem \
 
 ```bash
 FERRUM_MODE=dp \
-FERRUM_DP_CP_GRPC_URL=https://cp-host:50051 \
+FERRUM_DP_CP_GRPC_URLS=https://cp-host:50051 \
 FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-shared-secret \
 FERRUM_DP_GRPC_TLS_CA_CERT_PATH=/certs/ca.pem \
 FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH=/certs/dp-client.pem \

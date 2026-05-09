@@ -33,7 +33,6 @@ const DEFAULT_INJECTOR_LISTEN_ADDR: &str = "0.0.0.0:9443";
 const DEFAULT_SIDECAR_IMAGE: &str = "ferrum-edge:latest";
 const DEFAULT_INJECTOR_TRUST_DOMAIN: &str = "cluster.local";
 const SIDECAR_ENV_KEYS: &[&str] = &[
-    "FERRUM_DP_CP_GRPC_URL",
     "FERRUM_DP_CP_GRPC_URLS",
     "FERRUM_CP_DP_GRPC_JWT_ISSUER",
     "FERRUM_DP_GRPC_TLS_CA_CERT_PATH",
@@ -567,7 +566,7 @@ mod tests {
             namespace: "default".to_string(),
             sidecar_image: "ferrum-edge:test".to_string(),
             sidecar_env: vec![(
-                "FERRUM_DP_CP_GRPC_URL".to_string(),
+                "FERRUM_DP_CP_GRPC_URLS".to_string(),
                 "http://cp:50051".to_string(),
             )],
             jwt_secret_ref: Some(SecretKeyRef {
@@ -639,7 +638,7 @@ mod tests {
             .and_then(Value::as_array)
             .expect("sidecar env");
         assert!(env.iter().any(|entry| {
-            entry.get("name").and_then(Value::as_str) == Some("FERRUM_DP_CP_GRPC_URL")
+            entry.get("name").and_then(Value::as_str) == Some("FERRUM_DP_CP_GRPC_URLS")
                 && entry.get("value").and_then(Value::as_str) == Some("http://cp:50051")
         }));
         assert!(env.iter().any(|entry| {

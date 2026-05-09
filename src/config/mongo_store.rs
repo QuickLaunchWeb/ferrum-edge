@@ -1965,13 +1965,9 @@ mod inner {
             key: &str,
             exclude_consumer_id: Option<&str>,
         ) -> Result<bool, anyhow::Error> {
-            // Supports both single-object and array formats for keyauth credentials
             let mut filter = doc! {
                 "namespace": namespace,
-                "$or": [
-                    { "credentials.keyauth.key": key },
-                    { "credentials.keyauth": { "$elemMatch": { "key": key } } }
-                ]
+                "credentials.keyauth": { "$elemMatch": { "key": key } }
             };
             if let Some(id) = exclude_consumer_id {
                 filter.insert("_id", doc! { "$ne": id });
@@ -1986,13 +1982,9 @@ mod inner {
             identity: &str,
             exclude_consumer_id: Option<&str>,
         ) -> Result<bool, anyhow::Error> {
-            // Supports both single-object and array formats for mtls_auth credentials
             let mut filter = doc! {
                 "namespace": namespace,
-                "$or": [
-                    { "credentials.mtls_auth.identity": identity },
-                    { "credentials.mtls_auth": { "$elemMatch": { "identity": identity } } }
-                ]
+                "credentials.mtls_auth": { "$elemMatch": { "identity": identity } }
             };
             if let Some(id) = exclude_consumer_id {
                 filter.insert("_id", doc! { "$ne": id });
@@ -2235,25 +2227,6 @@ mod inner {
         async fn run_migrations(&self) -> Result<(), anyhow::Error> {
             // MongoDB doesn't use SQL migrations. Instead, ensure indexes exist.
             // createIndex is idempotent — no-op if the index already exists.
-
-            // Drop legacy unique+sparse compound indexes so they can be
-            // recreated as unique+partialFilterExpression below. Older
-            // deployments may have the sparse form from pre-fix versions,
-            // which is buggy: MongoDB compound sparse indexes index a
-            // document whenever ANY compound field is present, treating
-            // the missing companion as an explicit null. That caused
-            // `{namespace, listen_port}` on HTTP proxies (which have no
-            // listen_port) to collide on `{ns, null}` across every HTTP
-            // proxy in the same namespace. `partial_filter_expression`
-            // with a type filter only indexes docs where the sparse field
-            // is actually a string/number, which is what we want.
-            //
-            // `drop_index` errors out when the index does not exist; this
-            // happens on fresh deployments and is expected — ignore.
-            let _ = self.proxies().drop_index("namespace_1_name_1").await;
-            let _ = self.proxies().drop_index("namespace_1_listen_port_1").await;
-            let _ = self.consumers().drop_index("namespace_1_custom_id_1").await;
-            let _ = self.upstreams().drop_index("namespace_1_name_1").await;
 
             // proxies indexes — uniqueness scoped to namespace
             self.proxies()

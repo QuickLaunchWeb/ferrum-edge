@@ -264,9 +264,10 @@ async fn test_key_auth_multiple_consumers_correct_match() {
         "key".to_string(),
         serde_json::Value::String("key-one".to_string()),
     );
-    consumer1
-        .credentials
-        .insert("keyauth".to_string(), serde_json::Value::Object(keyauth1));
+    consumer1.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::Value::Array(vec![serde_json::Value::Object(keyauth1)]),
+    );
 
     let mut consumer2 = create_test_consumer();
     consumer2.id = "consumer-2".to_string();
@@ -276,9 +277,10 @@ async fn test_key_auth_multiple_consumers_correct_match() {
         "key".to_string(),
         serde_json::Value::String("key-two".to_string()),
     );
-    consumer2
-        .credentials
-        .insert("keyauth".to_string(), serde_json::Value::Object(keyauth2));
+    consumer2.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::Value::Array(vec![serde_json::Value::Object(keyauth2)]),
+    );
 
     let consumer_index = ConsumerIndex::new(&[consumer1, consumer2]);
 
@@ -327,7 +329,10 @@ async fn test_key_auth_empty_key_does_not_match_any_consumer() {
     let mut keyauth = Map::new();
     keyauth.insert("key".to_string(), Value::String("".to_string()));
     let mut credentials = HashMap::new();
-    credentials.insert("keyauth".to_string(), Value::Object(keyauth));
+    credentials.insert(
+        "keyauth".to_string(),
+        Value::Array(vec![Value::Object(keyauth)]),
+    );
     let consumer = Consumer {
         id: "empty-key-consumer".to_string(),
         namespace: default_namespace(),

@@ -323,12 +323,12 @@ consumers:
     username: "alice"
     credentials:
       mtls_auth:
-        identity: "alice.client.local"
+        - identity: "alice.client.local"
   - id: "eve"
     username: "eve"
     credentials:
       mtls_auth:
-        identity: "eve.client.local"
+        - identity: "eve.client.local"
 
 plugin_configs:
   - id: "p-mtls"
@@ -507,12 +507,12 @@ consumers:
     username: "tcp-alice"
     credentials:
       mtls_auth:
-        identity: "tcp-alice"
+        - identity: "tcp-alice"
   - id: "tcp-eve"
     username: "tcp-eve"
     credentials:
       mtls_auth:
-        identity: "tcp-eve"
+        - identity: "tcp-eve"
 
 plugin_configs:
   - id: "p-tcp-mtls"
@@ -687,12 +687,12 @@ consumers:
     username: "dtls-alice"
     credentials:
       mtls_auth:
-        identity: "dtls-alice"
+        - identity: "dtls-alice"
   - id: "dtls-eve"
     username: "dtls-eve"
     credentials:
       mtls_auth:
-        identity: "dtls-eve"
+        - identity: "dtls-eve"
 
 plugin_configs:
   - id: "p-dtls-mtls"

@@ -131,8 +131,7 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 | `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` | No | `128` | CP broadcast channel capacity before lagging DPs receive a full snapshot |
 | `FERRUM_XDS_ENABLED` | No | `false` | Enable Phase B xDS ADS (`StreamAggregatedResources` and `DeltaAggregatedResources`) on the CP gRPC listener |
 | `FERRUM_XDS_STREAM_CHANNEL_CAPACITY` | No | `32` | Per-ADS-stream response queue capacity before slow xDS readers apply backpressure to their own stream task |
-| `FERRUM_DP_CP_GRPC_URL` | DP/mesh mode (unless `_URLS` set) | — | Control Plane gRPC URL |
-| `FERRUM_DP_CP_GRPC_URLS` | No | — | Comma-separated priority-ordered CP URLs for DP/mesh failover. Takes precedence over single URL |
+| `FERRUM_DP_CP_GRPC_URLS` | DP/mesh mode | — | Comma-separated priority-ordered CP URLs for DP/mesh failover |
 | `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` | No | `300` | Retry primary CP interval (seconds) when connected to a fallback. `0` = disabled |
 | `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | No | — | CA certificate for verifying the CP server |
 | `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` | No | — | DP client certificate for CP mTLS |
@@ -200,7 +199,7 @@ The Istio `AuthorizationPolicy` translator only consumes the four positive-match
 | `FERRUM_INJECTOR_TLS_CERT_PATH` | Kubernetes webhook deployments | — | TLS certificate presented by the injector webhook server |
 | `FERRUM_INJECTOR_TLS_KEY_PATH` | Kubernetes webhook deployments | — | TLS private key for `FERRUM_INJECTOR_TLS_CERT_PATH` |
 
-The injector copies non-secret mesh sidecar control-plane env vars from its own environment into injected containers when set: `FERRUM_DP_CP_GRPC_URL`, `FERRUM_DP_CP_GRPC_URLS`, `FERRUM_CP_DP_GRPC_JWT_ISSUER`, DP gRPC TLS vars, and `FERRUM_MESH_CONFIG_PROTOCOL`. It does not copy plaintext `FERRUM_CP_DP_GRPC_JWT_SECRET`; set `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` and `FERRUM_INJECTOR_JWT_SECRET_REF_KEY` to inject that variable via `valueFrom.secretKeyRef`.
+The injector copies non-secret mesh sidecar control-plane env vars from its own environment into injected containers when set: `FERRUM_DP_CP_GRPC_URLS`, `FERRUM_CP_DP_GRPC_JWT_ISSUER`, DP gRPC TLS vars, and `FERRUM_MESH_CONFIG_PROTOCOL`. It does not copy plaintext `FERRUM_CP_DP_GRPC_JWT_SECRET`; set `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` and `FERRUM_INJECTOR_JWT_SECRET_REF_KEY` to inject that variable via `valueFrom.secretKeyRef`.
 
 ### Migration
 
@@ -321,7 +320,7 @@ See [tcp_udp_proxy.md](tcp_udp_proxy.md) for full TCP/UDP proxy documentation.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_BASIC_AUTH_HMAC_SECRET` | No | `ferrum-edge-change-me-in-production` | Server secret for HMAC-SHA256 password verification (~1μs). The Admin API stores `hmac_sha256:<hex>` hashes. Existing bcrypt hashes remain valid. **Must be changed in production** — using the default allows anyone who knows it to compute valid credential hashes. |
+| `FERRUM_BASIC_AUTH_HMAC_SECRET` | No | `ferrum-edge-change-me-in-production` | Server secret for HMAC-SHA256 password verification (~1μs). The Admin API stores `hmac_sha256:<hex>` hashes. **Must be changed in production** — using the default allows anyone who knows it to compute valid credential hashes. |
 | `FERRUM_MAX_CREDENTIALS_PER_TYPE` | No | `2` | Maximum active credential entries per type per consumer |
 | `FERRUM_TRUSTED_PROXIES` | No | — | Comma-separated trusted proxy CIDRs/IPs for client IP resolution via `X-Forwarded-For` |
 | `FERRUM_BACKEND_ALLOW_IPS` | No | `both` | Backend SSRF policy: `both`, `private`, or `public` |
@@ -499,11 +498,8 @@ consumers:
     username: "alice"
     credentials:
       keyauth:
-        key: "alice-api-key"
-      # Array format for zero-downtime credential rotation:
-      # keyauth:
-      #   - key: "alice-current-key"
-      #   - key: "alice-rotated-key"
+        - key: "alice-api-key"
+        - key: "alice-rotated-key"
 
 plugin_configs:
   - id: "log-plugin"

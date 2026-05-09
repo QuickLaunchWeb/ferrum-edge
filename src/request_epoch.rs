@@ -361,7 +361,10 @@ mod tests {
         let mut credentials = HashMap::new();
         let mut keyauth = Map::new();
         keyauth.insert("key".to_string(), Value::String("secret-key".to_string()));
-        credentials.insert("keyauth".to_string(), Value::Object(keyauth));
+        credentials.insert(
+            "keyauth".to_string(),
+            Value::Array(vec![Value::Object(keyauth)]),
+        );
         let consumer = crate::config::types::Consumer {
             id: "c1".to_string(),
             namespace: default_namespace(),

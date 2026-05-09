@@ -67,18 +67,17 @@ async fn test_access_control_plugin_creation() {
 }
 
 #[tokio::test]
-async fn test_access_control_ignores_legacy_ip_keys_when_consumer_rules_exist() {
+async fn test_access_control_rejects_removed_ip_keys() {
     let config = json!({
         "allowed_ips": ["10.0.0.0/8"],
         "blocked_ips": ["192.168.1.100"],
         "allowed_consumers": ["testuser"]
     });
-    let plugin = AccessControl::new(&config).unwrap();
-
-    let mut ctx = create_test_context();
-    ctx.client_ip = "203.0.113.50".to_string();
-    let result = plugin.authorize(&mut ctx).await;
-    assert_continue(result);
+    let err = match AccessControl::new(&config) {
+        Ok(_) => panic!("removed IP keys should be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.contains("ip_restriction"), "got: {err}");
 }
 
 #[tokio::test]

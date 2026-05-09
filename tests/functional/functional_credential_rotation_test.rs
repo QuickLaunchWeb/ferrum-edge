@@ -17,7 +17,7 @@ use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -299,11 +299,19 @@ fn generate_consumer_jwt(consumer_username: &str, secret: &str, exp_offset_secs:
 }
 
 fn generate_hmac_signature(method: &str, path: &str, date: &str, secret: &str) -> String {
-    let signing_string = format!("{}\n{}\n{}", method, path, date);
+    let signing_string = format!("{}\n{}\n{}\n{}", method, path, date, empty_digest_header());
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("Failed to create HMAC instance");
     mac.update(signing_string.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+fn empty_digest_header() -> String {
+    let digest = Sha256::digest([]);
+    format!(
+        "sha-256={}",
+        base64::engine::general_purpose::STANDARD.encode(digest)
+    )
 }
 
 /// Config-poll settle delay. The gateway polls SQLite every 2s
@@ -733,9 +741,7 @@ async fn test_credential_rotation_hmac() {
             "scope": "proxy",
             "proxy_id": "rot-hmac-proxy",
             "enabled": true,
-            // Legacy 3-field signing string preserves the existing test
-            // expectations; the digest path has its own dedicated tests.
-            "config": {"clock_skew_seconds": 300, "require_digest": false}
+            "config": {"clock_skew_seconds": 300}
         }),
     )
     .await
@@ -772,6 +778,7 @@ async fn test_credential_rotation_hmac() {
             .get(url)
             .header("Authorization", header)
             .header("Date", date)
+            .header("Digest", empty_digest_header())
             .send()
             .await
             .expect("hmac request failed")

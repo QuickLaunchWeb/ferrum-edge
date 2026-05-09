@@ -174,71 +174,6 @@ impl MigrationRunner {
         Ok(())
     }
 
-    /// Detect pre-migration databases and bootstrap the tracking table.
-    ///
-    /// If the `proxies` table exists but `_ferrum_migrations` is empty,
-    /// this is a database created before the migration system was added.
-    /// Mark V1 (initial_schema) as already applied.
-    async fn bootstrap_if_needed(&self) -> Result<(), anyhow::Error> {
-        // Check if any migrations are already recorded
-        let rows: Vec<AnyRow> = sqlx::query("SELECT version FROM _ferrum_migrations")
-            .fetch_all(&self.pool)
-            .await?;
-        if !rows.is_empty() {
-            return Ok(());
-        }
-
-        // Check if the proxies table exists (pre-migration database)
-        let table_exists = self.table_exists("proxies").await?;
-        if !table_exists {
-            // Fresh database — let normal migration flow handle everything
-            return Ok(());
-        }
-
-        // Pre-migration database detected — mark V1 as applied
-        info!("Detected pre-migration database. Bootstrapping migration tracking for V1.");
-        let now = Utc::now().to_rfc3339();
-        let v1 = v001_initial_schema::V001InitialSchema;
-        let insert_sql = Self::migration_insert_sql(&self.db_type);
-        sqlx::query(&insert_sql)
-            .bind(v1.version())
-            .bind(v1.name())
-            .bind(&now)
-            .bind(v1.checksum())
-            .bind(0i64)
-            .execute(&self.pool)
-            .await?;
-
-        info!("Bootstrapped: V1 ({}) marked as applied", v1.name());
-        Ok(())
-    }
-
-    /// Check if a table exists in the database, dispatching per db_type.
-    ///
-    /// PostgreSQL uses `$1` for bind parameters (the `?` placeholder is
-    /// ambiguous because PostgreSQL reserves `?` as a JSON operator).
-    async fn table_exists(&self, table_name: &str) -> Result<bool, anyhow::Error> {
-        let sql = match self.db_type.as_str() {
-            "postgres" => {
-                "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename = $1"
-            }
-            "mysql" => {
-                "SELECT table_name FROM information_schema.tables WHERE table_name = ? AND table_schema = DATABASE()"
-            }
-            _ => {
-                // SQLite
-                "SELECT name FROM sqlite_master WHERE type='table' AND name = ?"
-            }
-        };
-
-        let rows: Vec<AnyRow> = sqlx::query(sql)
-            .bind(table_name)
-            .fetch_all(&self.pool)
-            .await?;
-
-        Ok(!rows.is_empty())
-    }
-
     /// Return the migration INSERT statement with the correct bind parameter
     /// syntax for the target database. PostgreSQL uses `$N`, MySQL/SQLite use `?`.
     fn migration_insert_sql(db_type: &str) -> String {
@@ -272,7 +207,6 @@ impl MigrationRunner {
     /// Run all pending migrations in order. Returns the list of newly applied migrations.
     pub async fn run_pending(&self) -> Result<Vec<MigrationRecord>, anyhow::Error> {
         self.ensure_tracking_table().await?;
-        self.bootstrap_if_needed().await?;
 
         let applied = self.applied_versions().await?;
         let applied_versions: Vec<i64> = applied.iter().map(|r| r.version).collect();

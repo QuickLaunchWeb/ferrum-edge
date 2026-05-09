@@ -420,12 +420,12 @@ fn test_consumer_credential_value_too_long() {
     let mut consumer = make_consumer("test", "alice");
     consumer.credentials.insert(
         "keyauth".into(),
-        serde_json::json!({"key": "a".repeat(MAX_CREDENTIAL_VALUE_LENGTH + 1)}),
+        serde_json::json!([{"key": "a".repeat(MAX_CREDENTIAL_VALUE_LENGTH + 1)}]),
     );
     let errs = consumer.validate_fields().unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("credentials.keyauth.key") && e.contains("exceed"))
+            .any(|e| e.contains("credentials.keyauth[0].key") && e.contains("exceed"))
     );
 }
 
@@ -434,11 +434,11 @@ fn test_consumer_credential_control_chars() {
     let mut consumer = make_consumer("test", "alice");
     consumer
         .credentials
-        .insert("keyauth".into(), serde_json::json!({"key": "abc\x00def"}));
+        .insert("keyauth".into(), serde_json::json!([{"key": "abc\x00def"}]));
     let errs = consumer.validate_fields().unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("credentials.keyauth.key") && e.contains("control"))
+            .any(|e| e.contains("credentials.keyauth[0].key") && e.contains("control"))
     );
 }
 
@@ -449,7 +449,7 @@ fn test_consumer_credentials_total_size_limit() {
     let big_value = "a".repeat(MAX_CREDENTIALS_SIZE + 1);
     consumer
         .credentials
-        .insert("keyauth".into(), serde_json::json!({"key": big_value}));
+        .insert("keyauth".into(), serde_json::json!([{"key": big_value}]));
     let errs = consumer.validate_fields().unwrap_err();
     assert!(
         errs.iter()

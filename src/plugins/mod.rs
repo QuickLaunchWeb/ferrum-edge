@@ -586,11 +586,6 @@ pub struct MirrorResponseMeta {
     pub mirror_error: Option<String>,
 }
 
-/// Serde skip predicate: true when the namespace is the default (`"ferrum"`).
-fn is_default_namespace(ns: &str) -> bool {
-    ns == crate::config::types::DEFAULT_NAMESPACE
-}
-
 /// Serde skip predicate: true when the value is zero. Used to keep logs tidy
 /// when new u64 counters are unset for a given transaction.
 fn is_zero_u64(v: &u64) -> bool {
@@ -655,9 +650,7 @@ pub enum DisconnectCause {
 /// ```
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct TransactionSummary {
-    /// Namespace of the matched proxy. Omitted from serialization when it equals
-    /// the default (`"ferrum"`) to keep log volume down for single-namespace deployments.
-    #[serde(skip_serializing_if = "is_default_namespace")]
+    /// Namespace of the matched proxy.
     pub namespace: String,
     pub timestamp_received: String,
     pub client_ip: String,
@@ -751,15 +744,6 @@ pub struct TransactionSummary {
     /// body size limit exceeded) or when no streaming occurred.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub body_completed: bool,
-    /// Total bytes of response body actually written to the client. May be
-    /// less than `Content-Length` if streaming was interrupted.
-    ///
-    /// Streaming-specific. For a unified "body bytes delivered to client"
-    /// field that covers both streaming and buffered responses, prefer
-    /// `response_bytes` — this legacy field is retained so existing log
-    /// dashboards keyed on `bytes_streamed_to_client` continue to work.
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub bytes_streamed_to_client: u64,
     /// Total bytes of the request body received from the client.
     ///
     /// Accuracy by request type:
@@ -785,15 +769,8 @@ pub struct TransactionSummary {
     ///   WS error path): populated synchronously from the final `Bytes::len()`
     ///   before the summary is logged.
     /// * **Streaming responses**: populated at deferred-log fire time from
-    ///   the same counter that drives `bytes_streamed_to_client` — on a
-    ///   successful streaming completion these two fields agree. On a
-    ///   client disconnect mid-stream both reflect bytes actually flushed
-    ///   before the disconnect.
-    ///
-    /// Unlike `bytes_streamed_to_client` (which is zero for buffered
-    /// responses), this field is populated uniformly across response types
-    /// and is the preferred field for log consumers that want response size
-    /// without branching on `response_streamed`.
+    ///   the body counter. On a client disconnect mid-stream this reflects
+    ///   bytes actually flushed before the disconnect.
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub response_bytes: u64,
     /// True when this summary represents a mirror (shadow) request, not the
@@ -838,7 +815,6 @@ impl TransactionSummary {
         mirror.error_class = None;
         mirror.body_error_class = None;
         mirror.body_completed = false;
-        mirror.bytes_streamed_to_client = 0;
         // Mirror traffic is fire-and-forget from the client's perspective — body
         // byte counters from the primary transaction are not meaningful on the
         // mirror summary. Mirror response size goes into metadata instead.
@@ -947,8 +923,7 @@ impl StreamConnectionContext {
 /// Transaction summary for stream proxy (TCP/UDP) logging plugins.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StreamTransactionSummary {
-    /// Namespace of the matched proxy. Omitted when it equals the default (`"ferrum"`).
-    #[serde(skip_serializing_if = "is_default_namespace")]
+    /// Namespace of the matched proxy.
     pub namespace: String,
     pub proxy_id: String,
     pub proxy_name: Option<String>,
@@ -1159,7 +1134,7 @@ pub trait Plugin: Send + Sync {
     /// covers a `Digest:` header per RFC 9421 / RFC 3230).
     ///
     /// Override this only for auth plugins that perform body integrity checks
-    /// at authentication time (e.g., `hmac_auth` with `require_digest = true`).
+    /// at authentication time (e.g., `hmac_auth`).
     fn requires_request_body_before_authenticate(&self) -> bool {
         false
     }
@@ -1377,7 +1352,7 @@ pub trait Plugin: Send + Sync {
     /// For example, CORS only applies to HTTP, while ip_restriction works on all
     /// protocols. Plugins are skipped for protocols they don't support.
     ///
-    /// Default is HTTP-only (backwards compatible for existing plugins).
+    /// Default is HTTP-only.
     /// Use the protocol constants (`ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, etc.)
     /// for common patterns.
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {

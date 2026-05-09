@@ -1,14 +1,8 @@
-//! HTTP Basic Authentication plugin with dual hash verification.
+//! HTTP Basic Authentication plugin with HMAC-SHA256 password verification.
 //!
-//! Supports two password hash formats:
-//! - **HMAC-SHA256** (`hmac_sha256:<hex>`) — ~1μs verification using a server secret.
-//!   This is the recommended format for high-throughput gateways.
-//! - **bcrypt** (`$2b$...` / `$2a$...`) — ~100ms verification, always available as
-//!   a backward-compatible fallback.
-//!
-//! The HMAC-SHA256 fast path eliminates bcrypt's per-request CPU overhead and
-//! removes timing side-channels that could be used for username enumeration
-//! (bcrypt's variable-time comparison leaks whether a username exists).
+//! Supports `hmac_sha256:<hex>` password hashes using a server secret. This
+//! keeps verification fast and avoids variable-time password-hash work on the
+//! request path.
 //!
 //! The server secret (`FERRUM_BASIC_AUTH_HMAC_SECRET`) MUST be set to a unique,
 //! random value in production. The default value is public and insecure.
@@ -30,8 +24,7 @@ use super::{RequestContext, strip_auth_scheme};
 type HmacSha256 = Hmac<Sha256>;
 
 /// Default HMAC secret used when FERRUM_BASIC_AUTH_HMAC_SECRET is not set.
-/// This enables HMAC-SHA256 mode by default for performance (~1μs vs ~100ms bcrypt)
-/// and eliminates bcrypt timing side-channels for username enumeration.
+/// This enables HMAC-SHA256 mode by default for performance.
 ///
 /// IMPORTANT: Operators MUST override this in production by setting
 /// FERRUM_BASIC_AUTH_HMAC_SECRET to a unique, random value. Using the default
@@ -40,9 +33,6 @@ pub const DEFAULT_HMAC_SECRET: &str = "ferrum-edge-change-me-in-production";
 
 pub struct BasicAuth {
     /// Pre-computed HMAC key from FERRUM_BASIC_AUTH_HMAC_SECRET (or default).
-    /// Password hashes prefixed with `hmac_sha256:` are verified using
-    /// HMAC-SHA256 (~1μs). Bcrypt hashes ($2b$/$2a$) are always supported
-    /// as a fallback regardless of this setting.
     hmac_secret: Vec<u8>,
 }
 
@@ -85,29 +75,23 @@ impl BasicAuth {
 
     /// Verify a password against a stored hash.
     ///
-    /// Supports two formats:
-    /// - `hmac_sha256:<hex>` — HMAC-SHA256 with server secret (~1μs)
-    /// - `$2b$...` / `$2a$...` — bcrypt (~100ms, always available, backward compatible)
+    /// Supports `hmac_sha256:<hex>` — HMAC-SHA256 with the server secret.
     fn verify_password(&self, password: &str, stored_hash: &str) -> bool {
-        if let Some(hex_hash) = stored_hash.strip_prefix("hmac_sha256:") {
-            // HMAC-SHA256 verification
-            let Ok(mut mac) = HmacSha256::new_from_slice(&self.hmac_secret) else {
-                warn!("basic_auth: failed to create HMAC instance");
-                return false;
-            };
-            mac.update(password.as_bytes());
-            let computed = mac.finalize().into_bytes();
-            let mut expected = [0u8; 32];
-            if hex::decode_to_slice(hex_hash, &mut expected).is_err() {
-                return false;
-            }
-
-            // Constant-time comparison to prevent timing attacks
-            constant_time_eq(&computed, &expected)
-        } else {
-            // Bcrypt fallback (handles $2b$, $2a$, $2y$ prefixes)
-            bcrypt::verify(password, stored_hash).unwrap_or(false)
+        let Some(hex_hash) = stored_hash.strip_prefix("hmac_sha256:") else {
+            return false;
+        };
+        let Ok(mut mac) = HmacSha256::new_from_slice(&self.hmac_secret) else {
+            warn!("basic_auth: failed to create HMAC instance");
+            return false;
+        };
+        mac.update(password.as_bytes());
+        let computed = mac.finalize().into_bytes();
+        let mut expected = [0u8; 32];
+        if hex::decode_to_slice(hex_hash, &mut expected).is_err() {
+            return false;
         }
+
+        constant_time_eq(&computed, &expected)
     }
 }
 

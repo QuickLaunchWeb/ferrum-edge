@@ -403,7 +403,7 @@ Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms`
 | `{prefix}.request.latency_plugin_execution_ms` | Timer | Plugin execution time |
 | `{prefix}.request.status.{N}xx` | Counter | Status code bucket (2xx, 4xx, 5xx, etc.) |
 
-Tags: `method`, `status`, `status_class`, `proxy` (plus any `global_tags`). When `FERRUM_NAMESPACE` is non-default, a `namespace` tag is automatically injected into all metrics.
+Tags: `method`, `status`, `status_class`, `proxy`, `namespace` (plus any `global_tags`).
 
 **Metrics emitted per stream (TCP/UDP) disconnect:**
 
@@ -414,7 +414,7 @@ Tags: `method`, `status`, `status_class`, `proxy` (plus any `global_tags`). When
 | `{prefix}.stream.bytes_sent` | Gauge | Bytes sent to client |
 | `{prefix}.stream.bytes_received` | Gauge | Bytes received from client |
 
-Tags: `protocol`, `proxy`, `error` (plus any `global_tags`).
+Tags: `protocol`, `proxy`, `error`, `namespace` (plus any `global_tags`).
 
 ```yaml
 plugin_name: statsd_logging
@@ -678,12 +678,12 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `error_class` | String or null | Error classification for pre-body failures (connect, TLS, headers); omitted from JSON when null |
 | `body_error_class` | String or null | Error classification for failures while streaming the response body (e.g., client RST mid-body, backend RST after headers); omitted when null |
 | `body_completed` | bool | `true` when the final body frame flushed to the client; `false` if streaming aborted before completion. Always `true` for buffered responses |
-| `bytes_streamed_to_client` | u64 | Actual bytes written to the client socket. May be less than the backend's advertised `Content-Length` when streaming was interrupted |
+| `bytes_streamed` | u64 | Actual bytes written to the client socket. May be less than the backend's advertised `Content-Length` when streaming was interrupted |
 | `metadata` | Object | Plugin-injected key-value pairs (correlation ID, trace ID, etc.) |
 
 **Notes on conditional fields:** `auth_method`, `response_streamed`, `client_disconnected`, `backend_resolved_ip`, `error_class`, and `body_error_class` are omitted from the JSON output when false/null to keep log entries compact.
 
-**`error_class` vs `body_error_class`:** `error_class` covers failures before or during the response header exchange (connect, TLS, DNS, pool, pre-header timeouts). `body_error_class` covers failures observed while streaming the response body after headers were sent. A transaction can have one, the other, both, or neither. A forthcoming `DeferredTransactionLogger` will move the `log` phase to body-completion so `body_error_class`, `body_completed`, and `bytes_streamed_to_client` reflect the full client-visible outcome.
+**`error_class` vs `body_error_class`:** `error_class` covers failures before or during the response header exchange (connect, TLS, DNS, pool, pre-header timeouts). `body_error_class` covers failures observed while streaming the response body after headers were sent. A transaction can have one, the other, both, or neither. A forthcoming `DeferredTransactionLogger` will move the `log` phase to body-completion so `body_error_class`, `body_completed`, and `bytes_streamed` reflect the full client-visible outcome.
 
 **`error_class` values** (serialized as `snake_case` strings — see [docs/error_classification.md](error_classification.md) for the canonical taxonomy and per-protocol semantics):
 
@@ -1023,7 +1023,7 @@ Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push
 | `authorization_header` | string | (none) | `Authorization` header value (Bearer/Basic) |
 | `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`) |
 | `labels` | object | `{"service":"ferrum-edge"}` | Static labels applied to every log stream |
-| `include_proxy_id_label` | bool | `true` | Add `proxy_id` as a label. The legacy key `include_listen_path_label` is still accepted for backward compatibility (the label name has always been `proxy_id`); if both are set, `include_proxy_id_label` wins |
+| `include_proxy_id_label` | bool | `true` | Add `proxy_id` as a label |
 | `include_status_class_label` | bool | `true` | Add `status_class` (2xx/3xx/4xx/5xx) as a label |
 | `gzip` | bool | `true` | Gzip-compress request bodies |
 | `batch_size` | integer | `100` | Max entries per batch |
@@ -1074,7 +1074,7 @@ the `/metrics` endpoint; this plugin only records request and stream metrics.
 | `stale_entry_ttl_seconds` | Integer | `3600` | How long idle metric entries live before eviction (prevents unbounded memory growth from deleted/recreated proxies) |
 | `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it. Under extreme load this prevents an allocation per request — the render TTL is the real freshness guarantee |
 
-> **Namespace isolation:** When `FERRUM_NAMESPACE` is set to a non-default value (anything other than `"ferrum"`), all Prometheus metrics include an additional `namespace` label (e.g., `namespace="staging"`). This prevents metric collisions when multiple gateway instances with different namespaces are scraped by the same Prometheus server. When namespace is the default, no label is added and output is identical to pre-namespace behavior.
+> **Namespace isolation:** All Prometheus metrics include a `namespace` label (for example, `namespace="ferrum"` or `namespace="staging"`). This prevents metric collisions when multiple gateway instances with different namespaces are scraped by the same Prometheus server.
 
 ### `api_chargeback`
 
@@ -1195,15 +1195,12 @@ Authenticates requests using the client's TLS/DTLS certificate, matching a confi
 
 **Supported `cert_field` values:** `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, `san_email`, `fingerprint_sha256`, `serial`
 
-**Consumer credential** (`mtls_auth`) — single or array for rotation:
+**Consumer credential** (`mtls_auth`) — array:
 ```yaml
 credentials:
   mtls_auth:
-    identity: "client.example.com"
-  # Array format for zero-downtime rotation:
-  # mtls_auth:
-  #   - identity: "old-cert-cn.example.com"
-  #   - identity: "new-cert-cn.example.com"
+    - identity: "client.example.com"
+    - identity: "new-cert-cn.example.com"
 ```
 
 **Issuer Filtering:**
@@ -1264,15 +1261,12 @@ Authenticates requests using HS256 JWT Bearer tokens matched against consumer cr
 | `token_lookup` | String | `header:Authorization` | Where to find the token (`header:<name>` or `query:<name>`) |
 | `consumer_claim_field` | String | `sub` | JWT claim identifying the consumer |
 
-**Consumer credential** (`jwt`) — single or array for rotation. Secrets must be at least 32 characters:
+**Consumer credential** (`jwt`) — array. Secrets must be at least 32 characters:
 ```yaml
 credentials:
   jwt:
-    secret: "consumer-specific-hs256-secret-key-here"
-  # Array format for zero-downtime rotation:
-  # jwt:
-  #   - secret: "old-secret-at-least-32-chars-long"
-  #   - secret: "new-secret-at-least-32-chars-long"
+    - secret: "consumer-specific-hs256-secret-key-here"
+    - secret: "new-secret-at-least-32-chars-long"
 ```
 
 ### `key_auth`
@@ -1285,37 +1279,28 @@ Authenticates requests using an API key matched against consumer credentials.
 |---|---|---|---|
 | `key_location` | String | `header:X-API-Key` | Where to find the key (`header:<name>` or `query:<name>`) |
 
-**Consumer credential** (`keyauth`) — single or array for rotation:
+**Consumer credential** (`keyauth`) — array:
 ```yaml
 credentials:
   keyauth:
-    key: "the-api-key-value"
-  # Array format for zero-downtime rotation:
-  # keyauth:
-  #   - key: "old-api-key"
-  #   - key: "new-api-key"
+    - key: "the-api-key-value"
+    - key: "new-api-key"
 ```
 
 ### `basic_auth`
 
-Authenticates using HTTP Basic credentials. Supports two hash formats:
-- **HMAC-SHA256** (~1μs) — default when `FERRUM_BASIC_AUTH_HMAC_SECRET` is set (recommended). A default secret is provided but **must be changed in production**.
-- **bcrypt** (~100ms) — backward-compatible fallback for `$2b$`/`$2a$` hashes.
+Authenticates using HTTP Basic credentials. Supports `hmac_sha256:<hex>` password hashes derived from `FERRUM_BASIC_AUTH_HMAC_SECRET`. A default secret is provided but **must be changed in production**.
 
 **Priority:** 1300
 
 **Config**: None required.
 
-**Consumer credential** (`basicauth`) — single or array for rotation:
+**Consumer credential** (`basicauth`) — array:
 ```yaml
 credentials:
   basicauth:
-    password_hash: "hmac_sha256:ab3f..." # HMAC-SHA256 (preferred)
-    # or: "$2b$12$..."                   # bcrypt (legacy)
-  # Array format for zero-downtime rotation:
-  # basicauth:
-  #   - password_hash: "hmac_sha256:old..."
-  #   - password_hash: "hmac_sha256:new..."
+    - password_hash: "hmac_sha256:ab3f..."
+    - password_hash: "hmac_sha256:new..."
 ```
 
 ### `hmac_auth`
@@ -1327,7 +1312,6 @@ Authenticates requests using HMAC signatures with mandatory request-body integri
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `clock_skew_seconds` | u64 | `300` | Maximum allowed skew for the `Date` header replay window |
-| `require_digest` | bool | `true` | When `true` (default, secure), inbound requests must include a `Digest:` (RFC 3230) or `Content-Digest:` (RFC 9421) header that matches the request body, and the digest header value is folded into the HMAC signing string. When `false`, the legacy 3-field signing string is used and the request body is NOT integrity-protected. |
 
 Expected `Authorization` header format:
 
@@ -1340,7 +1324,7 @@ hmac username="<username>", algorithm="hmac-sha256", signature="<base64>"
 - Unknown algorithms are rejected
 - Requests must include a valid `Date` header (RFC 2822 or RFC 3339) within the configured skew window
 
-**Signing string** (with `require_digest = true`, the default):
+**Signing string**:
 
 ```text
 {METHOD}\n{PATH}\n{DATE}\n{DIGEST_HEADER_VALUE}
@@ -1348,23 +1332,12 @@ hmac username="<username>", algorithm="hmac-sha256", signature="<base64>"
 
 where `DIGEST_HEADER_VALUE` is the literal value of the `Digest:` or `Content-Digest:` header (e.g., `sha-256=<base64-of-sha256-of-body>`). Including the digest header in the signing string means a tampered digest header (without re-signing) breaks the HMAC, and a tampered body (without recomputing the digest) breaks the digest verification.
 
-**Signing string** (with `require_digest = false`, legacy mode):
-
-```text
-{METHOD}\n{PATH}\n{DATE}
-```
-
-In legacy mode the request body is **not** integrity-protected — an attacker who captures a signed request can replay it with any modified body within the clock-skew window. Set `require_digest: true` for production. The plugin emits a `warn!` log at construction time when `require_digest = false`.
-
-**Consumer credential** (`hmac_auth`) — single or array for rotation:
+**Consumer credential** (`hmac_auth`) — array:
 ```yaml
 credentials:
   hmac_auth:
-    secret: "shared-secret"
-  # Array format for zero-downtime rotation:
-  # hmac_auth:
-  #   - secret: "old-secret"
-  #   - secret: "new-secret"
+    - secret: "shared-secret"
+    - secret: "new-secret"
 ```
 
 ### ldap_auth

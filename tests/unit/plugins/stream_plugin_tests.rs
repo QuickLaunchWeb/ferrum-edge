@@ -146,7 +146,7 @@ fn test_http_grpc_plugins() {
         ),
         (
             "response_transformer",
-            json!({"rules": [{"operation": "add", "key": "x-test", "value": "1"}]}),
+            json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]}),
         ),
         ("body_validator", json!({"required_fields": ["name"]})),
     ];

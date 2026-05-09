@@ -478,10 +478,9 @@ pub struct EnvConfig {
     /// with this value. Defaults to "ferrum-edge-cp-dp". Operators rotating
     /// the issuer must update CP and all DPs together.
     pub cp_dp_grpc_jwt_issuer: String,
-    pub dp_cp_grpc_url: Option<String>,
     /// Comma-separated, priority-ordered list of CP gRPC URLs for DP failover.
-    /// When set, takes precedence over `dp_cp_grpc_url`. The DP connects to the
-    /// first URL and fails over to subsequent URLs when unreachable.
+    /// The DP connects to the first URL and fails over to subsequent URLs when
+    /// unreachable.
     pub dp_cp_grpc_urls: Vec<String>,
     /// How often (in seconds) the DP retries the primary (first) CP URL while
     /// connected to a fallback CP. Default: 300 (5 minutes). 0 = disabled.
@@ -908,8 +907,8 @@ pub struct EnvConfig {
     pub real_ip_header: Option<String>,
 
     /// HMAC-SHA256 server secret for the basic_auth plugin. Password hashes
-    /// prefixed with "hmac_sha256:" are verified using this key (~1μs vs ~100ms
-    /// for bcrypt). Must be set to a unique, random value in production.
+    /// prefixed with "hmac_sha256:" are verified using this key. Must be set
+    /// to a unique, random value in production.
     /// If unset, an insecure default is used and a warning is logged at startup.
     /// Note: Also resolved via `resolve_ferrum_var()` in `basic_auth.rs` and
     /// `admin/mod.rs` for use sites that don't have `EnvConfig` in scope.
@@ -1195,7 +1194,6 @@ impl Default for EnvConfig {
             cp_grpc_listen_addr: None,
             cp_dp_grpc_jwt_secret: None,
             cp_dp_grpc_jwt_issuer: "ferrum-edge-cp-dp".to_string(),
-            dp_cp_grpc_url: None,
             dp_cp_grpc_urls: Vec::new(),
             dp_cp_failover_primary_retry_secs: 300,
             cp_grpc_tls_cert_path: None,
@@ -1458,7 +1456,6 @@ impl EnvConfig {
             cp_dp_grpc_jwt_secret: Option<String> = "FERRUM_CP_DP_GRPC_JWT_SECRET"
                 => required_for(["cp", "dp", "mesh"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
             cp_dp_grpc_jwt_issuer: String = "FERRUM_CP_DP_GRPC_JWT_ISSUER" => "ferrum-edge-cp-dp".to_string();
-            dp_cp_grpc_url: Option<String> = "FERRUM_DP_CP_GRPC_URL";
             dp_cp_grpc_urls: Vec<String> = "FERRUM_DP_CP_GRPC_URLS" => Vec::new();
             dp_cp_failover_primary_retry_secs: u64 = "FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS" => 300u64;
             cp_grpc_tls_cert_path: Option<String> = "FERRUM_CP_GRPC_TLS_CERT_PATH";
@@ -1801,7 +1798,6 @@ impl EnvConfig {
             cp_grpc_listen_addr,
             cp_dp_grpc_jwt_secret,
             cp_dp_grpc_jwt_issuer,
-            dp_cp_grpc_url,
             dp_cp_grpc_urls,
             dp_cp_failover_primary_retry_secs,
             cp_grpc_tls_cert_path,
@@ -1997,17 +1993,8 @@ impl EnvConfig {
     }
 
     /// Returns the resolved list of CP gRPC URLs for DP failover, priority-ordered.
-    ///
-    /// `FERRUM_DP_CP_GRPC_URLS` takes precedence. Falls back to
-    /// `FERRUM_DP_CP_GRPC_URL` as a single-element list.
     pub fn resolved_dp_cp_grpc_urls(&self) -> Vec<String> {
-        if !self.dp_cp_grpc_urls.is_empty() {
-            self.dp_cp_grpc_urls.clone()
-        } else if let Some(ref url) = self.dp_cp_grpc_url {
-            vec![url.clone()]
-        } else {
-            Vec::new()
-        }
+        self.dp_cp_grpc_urls.clone()
     }
 
     /// Collect all ports reserved by the gateway's own listeners.
@@ -2320,19 +2307,13 @@ impl EnvConfig {
                 }
             }
             OperatingMode::DataPlane => {
-                if self.dp_cp_grpc_url.is_none() && self.dp_cp_grpc_urls.is_empty() {
-                    return Err(
-                        "FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS is required in dp mode"
-                            .into(),
-                    );
+                if self.dp_cp_grpc_urls.is_empty() {
+                    return Err("FERRUM_DP_CP_GRPC_URLS is required in dp mode".into());
                 }
             }
             OperatingMode::Mesh => {
-                if self.dp_cp_grpc_url.is_none() && self.dp_cp_grpc_urls.is_empty() {
-                    return Err(
-                        "FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS is required in mesh mode"
-                            .into(),
-                    );
+                if self.dp_cp_grpc_urls.is_empty() {
+                    return Err("FERRUM_DP_CP_GRPC_URLS is required in mesh mode".into());
                 }
                 match self
                     .mesh_config_protocol

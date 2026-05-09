@@ -233,7 +233,7 @@ docker-compose --profile cp-dp up
 4. Config changes pushed to all DPs in real-time
 5. If CP unavailable, DPs continue with cached config
 
-**Multi-CP failover**: For high availability, DPs can be configured with multiple CP URLs. Set `FERRUM_DP_CP_GRPC_URLS` (comma-separated, priority-ordered) instead of `FERRUM_DP_CP_GRPC_URL` in the DP service environment. The DP automatically fails over to the next CP when the primary is unreachable. See [multi_region_ha.md](multi_region_ha.md) for multi-region deployment patterns.
+**Multi-CP failover**: For high availability, DPs can be configured with multiple CP URLs. Set `FERRUM_DP_CP_GRPC_URLS` to a comma-separated, priority-ordered list in the DP service environment. The DP automatically fails over to the next CP when the primary is unreachable. See [multi_region_ha.md](multi_region_ha.md) for multi-region deployment patterns.
 
 ## Configuration via Environment Variables
 
@@ -270,8 +270,8 @@ FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051
 FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-secret
 
 # Data Plane (for dp mode)
-FERRUM_DP_CP_GRPC_URL=http://cp:50051
-# For multi-CP failover (takes precedence over single URL):
+FERRUM_DP_CP_GRPC_URLS=http://cp:50051
+# For multi-CP failover:
 # FERRUM_DP_CP_GRPC_URLS=https://cp1:50051,https://cp2:50051,https://cp3:50051
 # FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS=300
 FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-secret

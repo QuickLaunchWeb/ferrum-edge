@@ -216,8 +216,7 @@ impl ConsumerBuilder {
         self
     }
 
-    /// Set a single credential entry for `cred_type`. The admin API accepts
-    /// either a single object or an array — this writes a single object.
+    /// Set a single credential entry for `cred_type`.
     /// For multi-credential rotation, use [`Self::credentials_multi`].
     pub fn credential(mut self, cred_type: impl Into<String>, value: Value) -> Self {
         let credentials = self
@@ -225,7 +224,7 @@ impl ConsumerBuilder {
             .entry("credentials".to_string())
             .or_insert_with(|| Value::Object(Map::new()));
         if let Value::Object(map) = credentials {
-            map.insert(cred_type.into(), value);
+            map.insert(cred_type.into(), Value::Array(vec![value]));
         }
         self
     }
@@ -546,8 +545,8 @@ mod tests {
             .credential("keyauth", json!({"key": "secret"}))
             .credential("basicauth", json!({"username": "alice", "password": "pw"}))
             .build();
-        assert_eq!(c["credentials"]["keyauth"]["key"], "secret");
-        assert_eq!(c["credentials"]["basicauth"]["username"], "alice");
+        assert_eq!(c["credentials"]["keyauth"][0]["key"], "secret");
+        assert_eq!(c["credentials"]["basicauth"][0]["username"], "alice");
     }
 
     #[test]

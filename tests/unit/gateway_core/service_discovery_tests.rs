@@ -634,6 +634,7 @@ async fn test_kubernetes_discover_parses_endpointslice() {
 #[test]
 fn test_yaml_config_with_service_discovery() {
     let yaml = r#"
+version: "1"
 proxies: []
 consumers: []
 plugin_configs: []

@@ -2036,20 +2036,16 @@ impl DatabaseStore {
                 String::new()
             });
             if let Ok(creds) = serde_json::from_str::<serde_json::Value>(&creds_str) {
-                // Check both single-object and array formats for keyauth credentials
-                let found = match creds.get("keyauth") {
-                    Some(serde_json::Value::Array(arr)) => arr.iter().any(|entry| {
-                        entry
-                            .get("key")
-                            .and_then(|k| k.as_str())
-                            .is_some_and(|k| k == api_key)
-                    }),
-                    Some(obj) => obj
-                        .get("key")
-                        .and_then(|k| k.as_str())
-                        .is_some_and(|k| k == api_key),
-                    None => false,
-                };
+                let found = creds
+                    .get("keyauth")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|arr| {
+                        arr.iter().any(|obj| {
+                            obj.get("key")
+                                .and_then(|k| k.as_str())
+                                .is_some_and(|k| k == api_key)
+                        })
+                    });
                 if found {
                     return Ok(false);
                 }
@@ -2095,20 +2091,16 @@ impl DatabaseStore {
                 String::new()
             });
             if let Ok(creds) = serde_json::from_str::<serde_json::Value>(&creds_str) {
-                // Check both single-object and array formats for mtls_auth credentials
-                let found = match creds.get("mtls_auth") {
-                    Some(serde_json::Value::Array(arr)) => arr.iter().any(|entry| {
-                        entry
-                            .get("identity")
-                            .and_then(|i| i.as_str())
-                            .is_some_and(|i| i == mtls_identity)
-                    }),
-                    Some(obj) => obj
-                        .get("identity")
-                        .and_then(|i| i.as_str())
-                        .is_some_and(|i| i == mtls_identity),
-                    None => false,
-                };
+                let found = creds
+                    .get("mtls_auth")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|arr| {
+                        arr.iter().any(|obj| {
+                            obj.get("identity")
+                                .and_then(|i| i.as_str())
+                                .is_some_and(|i| i == mtls_identity)
+                        })
+                    });
                 if found {
                     return Ok(false);
                 }

@@ -1,5 +1,4 @@
-//! Layer-2 mesh type tests: serde round-trips, byte-identical
-//! backwards-compat, decode helpers.
+//! Layer-2 mesh type tests: serde round-trips and decode helpers.
 
 use ferrum_edge::config::mesh::{
     AppProtocol, EastWestGateway, MeshConfig, MeshEndpoint, MeshPolicy, MeshRule, MeshService,

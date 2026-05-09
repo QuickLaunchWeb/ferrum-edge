@@ -150,7 +150,7 @@ When FERRUM_MODE=dp:
 **Required Environment Variables:**
 ```bash
 FERRUM_MODE=dp
-FERRUM_DP_CP_GRPC_URL=http://cp-host:50051
+FERRUM_DP_CP_GRPC_URLS=http://cp-host:50051
 FERRUM_CP_DP_GRPC_JWT_SECRET=<secret-key>
 FERRUM_ADMIN_JWT_SECRET=<secret-key>
 ```
@@ -248,7 +248,7 @@ curl -X POST http://localhost:9000/proxies \
 5. Start DP in another terminal (the DP automatically generates short-lived JWTs from the shared secret):
 ```bash
 FERRUM_MODE=dp \
-FERRUM_DP_CP_GRPC_URL=http://127.0.0.1:50051 \
+FERRUM_DP_CP_GRPC_URLS=http://127.0.0.1:50051 \
 FERRUM_CP_DP_GRPC_JWT_SECRET=test-grpc-secret \
 FERRUM_ADMIN_JWT_SECRET=test-secret \
 FERRUM_PROXY_HTTP_PORT=8000 \

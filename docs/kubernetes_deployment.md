@@ -365,9 +365,9 @@ env:
   - name: FERRUM_MODE
     value: dp
   # Single CP (simple):
-  - name: FERRUM_DP_CP_GRPC_URL
+  - name: FERRUM_DP_CP_GRPC_URLS
     value: http://ferrum-edge-cp:50051
-  # Multi-CP failover (recommended for HA — takes precedence over single URL):
+  # Multi-CP failover (recommended for HA):
   # - name: FERRUM_DP_CP_GRPC_URLS
   #   value: "https://cp-east:50051,https://cp-west:50051,https://cp-central:50051"
   # - name: FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS

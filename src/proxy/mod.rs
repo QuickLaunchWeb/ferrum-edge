@@ -6462,9 +6462,9 @@ async fn handle_proxy_request_inner(
     // and on_request_received so plugin-less early rejects skip the work.
     ctx.materialize_query_params();
 
-    // Some auth plugins (e.g. `hmac_auth` with `require_digest=true`) verify
-    // request body integrity at authenticate time. Buffer the body before the
-    // auth phase runs so those plugins can read `ctx.request_body_bytes`.
+    // Some auth plugins (for example `hmac_auth`) verify request body integrity
+    // at authenticate time. Buffer the body before the auth phase runs so those
+    // plugins can read `ctx.request_body_bytes`.
     let requires_body_before_authenticate = capabilities
         .has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
         && plugins.iter().any(|plugin| {
@@ -8567,7 +8567,7 @@ async fn handle_proxy_request_inner(
             // Response bytes for buffered responses: the ProxyBody::Buffered
             // arm is built from `Bytes::from(data)`; use the known data length
             // directly. For streaming responses, `response_bytes` is patched
-            // at deferred-log fire time from `bytes_streamed_to_client`.
+            // at deferred-log fire time from `bytes_streamed`.
             let response_bytes_buffered = match &response_body {
                 ResponseBody::Buffered(v) => v.len() as u64,
                 _ => 0,
@@ -13244,8 +13244,7 @@ mod tests {
     }
 
     // Sanity: a `None` shutdown receiver leaves the loop running indefinitely.
-    // Verifies the un-wired path is unchanged (regression cover for the
-    // legacy behaviour while shutdown wiring is opt-in via `Some`).
+    // Shutdown wiring remains opt-in via `Some`.
     #[tokio::test]
     async fn per_ip_cleanup_loop_runs_without_shutdown_receiver() {
         let counts: Arc<dashmap::DashMap<String, AtomicU64>> = Arc::new(dashmap::DashMap::new());

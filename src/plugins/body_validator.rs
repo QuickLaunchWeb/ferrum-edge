@@ -1009,7 +1009,7 @@ fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
 /// Per W3C XML 1.0 §2.3, XML whitespace is `#x20 | #x9 | #xD | #xA`.
 /// This correctly classifies `<foo/>`, `<foo />`, `<foo attr="v" />`,
 /// `<foo\n/>` as self-closing while keeping plain `<foo>` as opening.
-/// An empty tag `<>` is treated as opening (depth-inc) for backward compatibility.
+/// Empty tag text is treated as non-self-closing.
 fn is_self_closing_tag(bytes: &[u8], start_inclusive: usize, tag_end_exclusive: usize) -> bool {
     if tag_end_exclusive <= start_inclusive {
         return false;

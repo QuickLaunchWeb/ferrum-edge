@@ -552,7 +552,7 @@ export FERRUM_TLS_MAX_VERSION="1.3"
 export FERRUM_TLS_MIN_VERSION="1.3"
 export FERRUM_TLS_MAX_VERSION="1.3"
 
-# TLS 1.2 only (legacy compatibility)
+# TLS 1.2 only
 export FERRUM_TLS_MIN_VERSION="1.2"
 export FERRUM_TLS_MAX_VERSION="1.2"
 ```

@@ -291,7 +291,7 @@ consumers:
     custom_id: "cust-42"
     credentials:
       keyauth:
-        key: "my-secret-api-key"
+        - key: "my-secret-api-key"
 
 plugin_configs:
   - id: "key-auth-plugin"

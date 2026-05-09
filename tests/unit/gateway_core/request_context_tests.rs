@@ -229,7 +229,7 @@ fn materialize_query_params_raw_skips_no_equals() {
     assert_eq!(ctx.query_params.get("key").unwrap(), "val");
 }
 
-// -- Direct-set backwards compatibility tests --------------------------------
+// -- Direct mutation tests ----------------------------------------------------
 
 #[test]
 fn direct_query_params_set_works_without_materialization() {

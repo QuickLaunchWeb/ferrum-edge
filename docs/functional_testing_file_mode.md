@@ -195,11 +195,11 @@ consumers:
     custom_id: "alice-001"
     credentials:
       keyauth:
-        key: "api-key-value"
+        - key: "api-key-value"
       jwt:
-        secret: "jwt-secret"
+        - secret: "jwt-secret-at-least-32-characters"
       basicauth:
-        password_hash: "$2b$12$hash"
+        - password_hash: "hmac_sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 plugin_configs:
   - id: "plugin-id"

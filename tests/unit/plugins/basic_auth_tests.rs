@@ -25,18 +25,19 @@ fn basic_header(user: &str, pass: &str) -> String {
     format!("Basic {}", encoded)
 }
 
-/// Create a consumer with a known password bcrypt hash.
+/// Create a consumer with a known HMAC-SHA256 password hash.
 fn create_basic_auth_consumer() -> ferrum_edge::config::types::Consumer {
     use chrono::Utc;
-    use serde_json::{Map, Value};
+    use serde_json::Value;
     use std::collections::HashMap;
 
-    let hash = bcrypt::hash("password", 4).unwrap(); // cost=4 for fast tests
+    let hash = hmac_sha256_password_hash("password");
 
     let mut credentials = HashMap::new();
-    let mut basicauth_creds = Map::new();
-    basicauth_creds.insert("password_hash".to_string(), Value::String(hash));
-    credentials.insert("basicauth".to_string(), Value::Object(basicauth_creds));
+    credentials.insert(
+        "basicauth".to_string(),
+        Value::Array(vec![json!({"password_hash": hash})]),
+    );
 
     ferrum_edge::config::types::Consumer {
         id: "basic-consumer".to_string(),
@@ -55,13 +56,14 @@ fn create_basic_auth_consumer_with_hash(
     password_hash: String,
 ) -> ferrum_edge::config::types::Consumer {
     use chrono::Utc;
-    use serde_json::{Map, Value};
+    use serde_json::Value;
     use std::collections::HashMap;
 
     let mut credentials = HashMap::new();
-    let mut basicauth_creds = Map::new();
-    basicauth_creds.insert("password_hash".to_string(), Value::String(password_hash));
-    credentials.insert("basicauth".to_string(), Value::Object(basicauth_creds));
+    credentials.insert(
+        "basicauth".to_string(),
+        Value::Array(vec![json!({"password_hash": password_hash})]),
+    );
 
     ferrum_edge::config::types::Consumer {
         id: format!("{username}-consumer"),
@@ -137,7 +139,7 @@ async fn test_basic_auth_successful() {
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
     let mut ctx = make_ctx();
-    // The test consumer has bcrypt hash for password "password"
+    // The test consumer has an HMAC-SHA256 hash for password "password"
     ctx.headers.insert(
         "authorization".to_string(),
         basic_header("testuser", "password"),
@@ -313,23 +315,20 @@ async fn test_basic_auth_password_with_colon() {
 }
 
 #[tokio::test]
-async fn test_basic_auth_bcrypt_fallback() {
-    // Verify bcrypt hash verification works (the default path when HMAC is not configured)
+async fn test_basic_auth_rejects_bcrypt_hash() {
     let plugin = BasicAuth::new(&json!({})).unwrap();
 
-    // Create a consumer with a known bcrypt hash for "mypassword"
-    let hash = bcrypt::hash("mypassword", 4).unwrap(); // cost=4 for fast tests
-
     use chrono::Utc;
-    use serde_json::{Map, Value};
+    use serde_json::Value;
 
     let mut credentials = std::collections::HashMap::new();
-    let mut basicauth_creds = Map::new();
-    basicauth_creds.insert("password_hash".to_string(), Value::String(hash));
-    credentials.insert("basicauth".to_string(), Value::Object(basicauth_creds));
+    credentials.insert(
+        "basicauth".to_string(),
+        Value::Array(vec![json!({"password_hash": "$2b$04$abcdefghijklmnopqrstuu6NIIqkG2DLUQF6wqv0nO5Rvqf3PI0Q2"})]),
+    );
 
     let consumer = ferrum_edge::config::types::Consumer {
-        id: "bcrypt-consumer".to_string(),
+        id: "bcrypt-rejected-consumer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "bcryptuser".to_string(),
         custom_id: None,
@@ -340,7 +339,6 @@ async fn test_basic_auth_bcrypt_fallback() {
     };
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
-    // Correct password should succeed
     let mut ctx = make_ctx();
     ctx.headers.insert(
         "authorization".to_string(),
@@ -349,20 +347,7 @@ async fn test_basic_auth_bcrypt_fallback() {
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_continue(result);
-    assert!(ctx.identified_consumer.is_some());
-    assert_eq!(ctx.identified_consumer.unwrap().username, "bcryptuser");
-
-    // Wrong password should fail
-    let mut ctx2 = make_ctx();
-    ctx2.headers.insert(
-        "authorization".to_string(),
-        basic_header("bcryptuser", "wrongpassword"),
-    );
-    ctx2.identified_consumer = None;
-
-    let result2 = plugin.authenticate(&mut ctx2, &consumer_index).await;
-    assert_reject(result2, Some(401));
+    assert_reject(result, Some(401));
 }
 
 #[tokio::test]
@@ -419,8 +404,8 @@ fn create_basic_auth_consumer_with_two_passwords() -> ferrum_edge::config::types
     use serde_json::Value;
     use std::collections::HashMap;
 
-    let hash_old = bcrypt::hash("old-password", 4).unwrap();
-    let hash_new = bcrypt::hash("new-password", 4).unwrap();
+    let hash_old = hmac_sha256_password_hash("old-password");
+    let hash_new = hmac_sha256_password_hash("new-password");
 
     let mut credentials = HashMap::new();
     credentials.insert(

@@ -224,7 +224,7 @@ consumers:
     username: "grpc-test-service"
     credentials:
       keyauth:
-        key: "grpc-valid-api-key-99887766"
+        - key: "grpc-valid-api-key-99887766"
 
 plugin_configs:
   - id: "plugin-keyauth-grpc"

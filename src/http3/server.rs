@@ -1066,9 +1066,9 @@ async fn handle_h3_request(
     // for HTTP/3 — preserves existing behavior).
     ctx.materialize_query_params_raw();
 
-    // Some auth plugins (e.g. `hmac_auth` with `require_digest=true`) verify
-    // request body integrity at authenticate time. Buffer the body before the
-    // auth phase runs so those plugins can read `ctx.request_body_bytes`.
+    // Some auth plugins (for example `hmac_auth`) verify request body integrity
+    // at authenticate time. Buffer the body before the auth phase runs so those
+    // plugins can read `ctx.request_body_bytes`.
     let h3_requires_body_before_authenticate = capabilities
         .has(crate::plugin_cache::PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
         && plugins.iter().any(|plugin| {
@@ -1570,7 +1570,6 @@ async fn handle_h3_request(
             client_disconnected: outcome.client_disconnected,
             body_error_class: outcome.body_error_class,
             body_completed: outcome.body_completed,
-            bytes_streamed_to_client: outcome.bytes_streamed,
             request_bytes: outcome.request_bytes,
             response_bytes: outcome.bytes_streamed,
             error_class: outcome.error_class,
@@ -1993,7 +1992,6 @@ async fn handle_h3_request(
             error_class: None,
             body_error_class,
             body_completed,
-            bytes_streamed_to_client: bytes_streamed,
             // Request body was streamed frame-by-frame via the H3 pool
             // (`request_streaming_body`) — the exact byte count is not
             // currently surfaced back from the pool. Populating this would
@@ -2002,9 +2000,7 @@ async fn handle_h3_request(
             // `request_bytes` may be 0 even when a non-empty body was sent.
             request_bytes: 0,
             // Response bytes delivered to the client — tracked by the
-            // streaming loop above as `bytes_streamed`, identical to
-            // `bytes_streamed_to_client`. Populated here for the unified
-            // (buffered+streaming) response-size field.
+            // streaming loop above as `bytes_streamed`.
             response_bytes: bytes_streamed,
             mirror: false,
             metadata: ctx.metadata.clone(),
@@ -2253,7 +2249,6 @@ async fn handle_h3_request(
             error_class: h3_error_class,
             body_error_class: h3_stream_result.body_error_class,
             body_completed: h3_stream_result.body_completed,
-            bytes_streamed_to_client: h3_stream_result.bytes_streamed,
             request_bytes: request_body_bytes,
             // `bytes_streamed` from the H3 streaming helper is the final
             // count of body bytes pushed to the client's h3 stream. Mirror

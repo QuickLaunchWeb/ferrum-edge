@@ -78,16 +78,13 @@ impl ResponseTransformer {
                         "response_transformer: rule[{idx}]: rule must be an object"
                     ));
                 }
-                // `target` defaults to "header" only when the field is
-                // ABSENT (backward compat for terse header-only configs).
-                // An explicit `"target": null` — or any non-string value —
-                // is a configuration error. Silently defaulting an explicit
-                // null would mask typos / misconfiguration. Note: `query`
-                // is NOT a valid target for response_transformer; only
-                // `header` and `body` are accepted.
                 let target = match r.get("target") {
                     Some(Value::String(s)) => s.as_str(),
-                    None => "header",
+                    None => {
+                        return Err(format!(
+                            "response_transformer: rule[{idx}]: 'target' is required (expected header/body)"
+                        ));
+                    }
                     Some(_) => {
                         return Err(format!(
                             "response_transformer: rule[{idx}]: 'target' must be a string (expected header/body)"

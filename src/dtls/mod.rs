@@ -1412,9 +1412,8 @@ mod tests {
     ///
     /// Sets `connect_timeout_ms = 500` against a UDP socket whose peer is a
     /// silent black-hole (binds + drops every datagram). The handshake must
-    /// fail well before the legacy 10s budget — generous slack of 5s catches
-    /// loaded CI runners while still distinguishing the configured budget
-    /// from the legacy default.
+    /// fail well before the old 10s budget — generous slack of 5s catches
+    /// loaded CI runners while still distinguishing the configured budget.
     #[tokio::test]
     async fn dtls_backend_handshake_honors_connect_timeout_ms() {
         let _ = rustls::crypto::CryptoProvider::install_default(

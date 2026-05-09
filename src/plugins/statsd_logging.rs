@@ -130,9 +130,7 @@ impl StatsdLogging {
                     ));
                 }
             }
-            if ns != crate::config::types::DEFAULT_NAMESPACE
-                && !pairs.iter().any(|pair| pair.starts_with("namespace:"))
-            {
+            if !pairs.iter().any(|pair| pair.starts_with("namespace:")) {
                 pairs.push(format!("namespace:{}", sanitize_tag_value(ns)));
             }
             if pairs.is_empty() {

@@ -33,7 +33,6 @@ fn make_full_summary() -> TransactionSummary {
         error_class: None,
         body_error_class: None,
         body_completed: false,
-        bytes_streamed_to_client: 0,
         request_bytes: 0,
         response_bytes: 0,
         mirror: false,
@@ -93,6 +92,7 @@ fn test_summary_deserialization_roundtrip() {
     assert_eq!(parsed["http_method"], "POST");
     assert_eq!(parsed["request_path"], "/v1/users");
     assert_eq!(parsed["proxy_id"], "proxy-users");
+    assert_eq!(parsed["namespace"], "ferrum");
 }
 
 #[test]
@@ -293,6 +293,8 @@ fn test_plugin_http_call_ns_accumulator() {
 fn test_summary_json_omits_error_class_when_none() {
     let summary = make_full_summary();
     let json = serde_json::to_string(&summary).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed["namespace"], "ferrum");
 
     assert!(
         !json.contains("error_class"),

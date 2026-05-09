@@ -50,6 +50,8 @@ impl AccessControl {
             .as_object()
             .ok_or_else(|| format!("access_control: config must be an object, got: {config}"))?;
 
+        reject_removed_ip_keys(object)?;
+
         let allowed = parse_string_set(object, "allowed_consumers")?;
         let disallowed = parse_string_set(object, "disallowed_consumers")?;
         let allowed_groups = parse_string_set(object, "allowed_groups")?;
@@ -174,6 +176,17 @@ impl AccessControl {
 
         PluginResult::Continue
     }
+}
+
+fn reject_removed_ip_keys(object: &serde_json::Map<String, Value>) -> Result<(), String> {
+    for key in ["allowed_ips", "blocked_ips"] {
+        if object.contains_key(key) {
+            return Err(format!(
+                "access_control: '{key}' was removed; use the ip_restriction plugin for IP rules"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_string_set(

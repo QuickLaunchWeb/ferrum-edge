@@ -66,7 +66,7 @@ async fn test_migration_runner_fresh_database() {
 }
 
 #[tokio::test]
-async fn test_migration_runner_bootstrap_existing_db() {
+async fn test_migration_runner_rejects_existing_untracked_schema() {
     let pool = test_pool().await;
 
     // Simulate a pre-migration database by creating the tables directly.
@@ -104,19 +104,21 @@ async fn test_migration_runner_bootstrap_existing_db() {
     .unwrap();
 
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
-    let applied = runner.run_pending().await.unwrap();
-
-    // V1 should NOT be applied (bootstrapped instead) — nothing else pending
+    let err = runner
+        .run_pending()
+        .await
+        .expect_err("existing untracked schemas must not be bootstrapped");
+    let msg = err.to_string();
     assert!(
-        applied.is_empty(),
-        "No migrations should be newly applied; V1 is bootstrapped"
+        msg.contains("api_spec_id") || msg.contains("duplicate") || msg.contains("already exists"),
+        "expected V1 to fail against the untracked old schema, got: {msg}"
     );
 
-    // Check that V1 (bootstrapped) is recorded
+    // V1 is still pending because no bootstrap marker was inserted.
     let status = runner.status().await.unwrap();
-    assert_eq!(status.applied.len(), 1);
-    assert_eq!(status.applied[0].version, 1);
-    assert!(status.pending.is_empty());
+    assert!(status.applied.is_empty());
+    assert_eq!(status.pending.len(), 1);
+    assert_eq!(status.pending[0].version, 1);
 }
 
 #[tokio::test]

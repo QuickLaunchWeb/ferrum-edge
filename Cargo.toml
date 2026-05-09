@@ -61,7 +61,6 @@ tower = { version = "0.5", features = ["util"] }
 
 # JWT and auth
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
-bcrypt = "0.19"
 argon2 = "0.5"
 
 # LDAP — `tls-rustls-ring` selects rustls (matching the gateway's TLS stack)

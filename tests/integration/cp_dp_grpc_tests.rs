@@ -186,7 +186,6 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         db_read_replica_url: None,
         cp_grpc_listen_addr: None,
         cp_dp_grpc_jwt_secret: None,
-        dp_cp_grpc_url: None,
         dp_cp_grpc_urls: Vec::new(),
         dp_cp_failover_primary_retry_secs: 300,
         cp_grpc_tls_cert_path: None,
@@ -496,7 +495,7 @@ async fn test_xds_ads_stream_returns_lds_snapshot() {
             cluster: String::new(),
             metadata: Vec::new(),
         }),
-        resource_names: Vec::new(),
+        resource_names: vec!["*".to_string()],
         type_url: LDS_TYPE_URL.to_string(),
         response_nonce: String::new(),
         error_detail: None,
@@ -1079,17 +1078,20 @@ async fn test_dp_preserves_config_after_cp_shutdown() {
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
 
-    // Use start_dp_client_with_shutdown which has auto-reconnect logic
+    // Use the DP client loop with auto-reconnect logic.
     let ps = proxy_state.clone();
     let url_clone = cp_url.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::start_dp_client_with_shutdown(
-            url_clone,
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            vec![url_clone],
             test_secret(),
             ps,
             None,
             None,
+            None,
             "ferrum".to_string(),
+            0,
+            None,
         )
         .await;
     });

@@ -43,8 +43,7 @@ pub(crate) enum AfterValidateError {
     Response(Response<Full<Bytes>>),
 }
 
-/// Validation outcomes that preserve legacy plain-message responses for
-/// resource-specific checks while still supporting the generic field wrapper.
+/// Validation outcomes for resource-specific checks and generic field validation.
 pub(crate) enum ValidationError {
     Fields(Vec<String>),
     Message(String),
@@ -100,7 +99,7 @@ pub(crate) trait AdminResource:
         match error {
             ValidationError::Fields(errors) => validation_error_response::<Self>(errors),
             ValidationError::Message(message) => {
-                super::json_response(StatusCode::BAD_REQUEST, &json!({"error": message}))
+                validation_error_response::<Self>(&[message.to_string()])
             }
         }
     }

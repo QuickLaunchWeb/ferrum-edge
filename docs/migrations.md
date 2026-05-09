@@ -152,7 +152,7 @@ See [CUSTOM_PLUGINS.md](../CUSTOM_PLUGINS.md#database-migrations) for the comple
 
 ### Version Field
 
-Configuration files (YAML or JSON) support an optional `version` field:
+Configuration files (YAML or JSON) require a `version` field:
 
 ```yaml
 version: "1"
@@ -163,7 +163,7 @@ consumers: []
 plugin_configs: []
 ```
 
-When the `version` field is absent, the config is treated as version `"1"` (the original format). This ensures backwards compatibility with existing configuration files.
+When the `version` field is absent, validation fails before migrations run. New configs should declare the current schema explicitly.
 
 ### How Config Migrations Work
 

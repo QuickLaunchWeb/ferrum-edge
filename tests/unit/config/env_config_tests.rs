@@ -230,10 +230,10 @@ fn test_env_config_dp_mode_missing_grpc_url() {
             ),
         ],
         || {
-            remove_var("FERRUM_DP_CP_GRPC_URL");
+            remove_var("FERRUM_DP_CP_GRPC_URLS");
             let result = EnvConfig::from_env();
             assert!(result.is_err());
-            assert!(result.unwrap_err().contains("FERRUM_DP_CP_GRPC_URL"));
+            assert!(result.unwrap_err().contains("FERRUM_DP_CP_GRPC_URLS"));
         },
     );
 }
@@ -243,7 +243,7 @@ fn test_env_config_dp_mode_missing_jwt_secret() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
-            ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
         ],
         || {
             remove_var("FERRUM_CP_DP_GRPC_JWT_SECRET");
@@ -259,7 +259,7 @@ fn test_env_config_mesh_mode_valid() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "mesh"),
-            ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
                 "secret-padding-for-32-char-min!!",
@@ -295,15 +295,11 @@ fn test_env_config_mesh_mode_missing_grpc_url() {
             ),
         ],
         || {
-            remove_var("FERRUM_DP_CP_GRPC_URL");
+            remove_var("FERRUM_DP_CP_GRPC_URLS");
             remove_var("FERRUM_DP_CP_GRPC_URLS");
             let result = EnvConfig::from_env();
             assert!(result.is_err());
-            assert!(
-                result
-                    .unwrap_err()
-                    .contains("FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS")
-            );
+            assert!(result.unwrap_err().contains("FERRUM_DP_CP_GRPC_URLS"));
         },
     );
 }
@@ -313,7 +309,7 @@ fn test_env_config_mesh_mode_missing_jwt_secret() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "mesh"),
-            ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
         ],
         || {
             remove_var("FERRUM_CP_DP_GRPC_JWT_SECRET");
@@ -1013,7 +1009,7 @@ fn test_env_config_dp_mode_valid() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
-            ("FERRUM_DP_CP_GRPC_URL", "http://control-plane:50051"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://control-plane:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
                 "my-secret-padding-for-32-char-min!",
@@ -1023,8 +1019,8 @@ fn test_env_config_dp_mode_valid() {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.mode, OperatingMode::DataPlane);
             assert_eq!(
-                config.dp_cp_grpc_url,
-                Some("http://control-plane:50051".to_string())
+                config.dp_cp_grpc_urls,
+                vec!["http://control-plane:50051".to_string()]
             );
             assert_eq!(
                 config.cp_dp_grpc_jwt_secret,
@@ -3618,11 +3614,11 @@ fn test_env_config_status_metrics_window_seconds_minimum_clamped() {
 // --- DP CP failover URL tests ---
 
 #[test]
-fn test_resolved_dp_cp_grpc_urls_single_url_only() {
+fn test_resolved_dp_cp_grpc_urls_single_entry() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
-            ("FERRUM_DP_CP_GRPC_URL", "http://cp1:50051"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp1:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
                 "secret-padding-for-32-char-min!!",
@@ -3661,29 +3657,6 @@ fn test_resolved_dp_cp_grpc_urls_multi_urls_only() {
                     "https://cp3:50051",
                 ]
             );
-        },
-    );
-}
-
-#[test]
-fn test_resolved_dp_cp_grpc_urls_multi_takes_precedence() {
-    with_env_vars(
-        &[
-            ("FERRUM_MODE", "dp"),
-            ("FERRUM_DP_CP_GRPC_URL", "http://single:50051"),
-            (
-                "FERRUM_DP_CP_GRPC_URLS",
-                "https://cp1:50051,https://cp2:50051",
-            ),
-            (
-                "FERRUM_CP_DP_GRPC_JWT_SECRET",
-                "secret-padding-for-32-char-min!!",
-            ),
-        ],
-        || {
-            let config = EnvConfig::from_env().unwrap();
-            let urls = config.resolved_dp_cp_grpc_urls();
-            assert_eq!(urls, vec!["https://cp1:50051", "https://cp2:50051"]);
         },
     );
 }
@@ -3737,7 +3710,7 @@ fn test_resolved_dp_cp_grpc_urls_filters_empty() {
 }
 
 #[test]
-fn test_dp_mode_validation_accepts_urls_without_url() {
+fn test_dp_mode_validation_accepts_urls() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
@@ -3749,7 +3722,6 @@ fn test_dp_mode_validation_accepts_urls_without_url() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            assert!(config.dp_cp_grpc_url.is_none());
             assert_eq!(config.resolved_dp_cp_grpc_urls(), vec!["https://cp1:50051"]);
         },
     );
@@ -3770,8 +3742,8 @@ fn test_dp_mode_validation_rejects_no_url() {
             assert!(result.is_err());
             let err = result.unwrap_err();
             assert!(
-                err.contains("FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS"),
-                "Error should mention both env vars: {}",
+                err.contains("FERRUM_DP_CP_GRPC_URLS"),
+                "Error should mention required env var: {}",
                 err
             );
         },
@@ -3783,7 +3755,7 @@ fn test_dp_cp_failover_primary_retry_secs_default() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
-            ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
                 "secret-padding-for-32-char-min!!",
@@ -3801,7 +3773,7 @@ fn test_dp_cp_failover_primary_retry_secs_custom() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
-            ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
                 "secret-padding-for-32-char-min!!",

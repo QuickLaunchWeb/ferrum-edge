@@ -306,7 +306,9 @@ async fn test_list_proxies_falls_back_to_cached_config() {
     let (status, body, data_source) = admin_get(&base_url, "/proxies", &token).await;
 
     assert_eq!(status, 200);
-    let proxies = body.as_array().expect("Should return array of proxies");
+    let proxies = body["data"]
+        .as_array()
+        .expect("Should return envelope data array of proxies");
     assert_eq!(proxies.len(), 2);
     assert_eq!(proxies[0]["id"], "proxy-1");
     assert_eq!(proxies[1]["id"], "proxy-2");
@@ -350,7 +352,9 @@ async fn test_list_consumers_falls_back_to_cached_config() {
     let (status, body, data_source) = admin_get(&base_url, "/consumers", &token).await;
 
     assert_eq!(status, 200);
-    let consumers = body.as_array().expect("Should return array of consumers");
+    let consumers = body["data"]
+        .as_array()
+        .expect("Should return envelope data array of consumers");
     assert_eq!(consumers.len(), 1);
     assert_eq!(consumers[0]["username"], "alice");
     assert_eq!(data_source.as_deref(), Some("cached"));
@@ -389,9 +393,9 @@ async fn test_list_plugin_configs_falls_back_to_cached_config() {
     let (status, body, data_source) = admin_get(&base_url, "/plugins/config", &token).await;
 
     assert_eq!(status, 200);
-    let plugins = body
+    let plugins = body["data"]
         .as_array()
-        .expect("Should return array of plugin configs");
+        .expect("Should return envelope data array of plugin configs");
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0]["plugin_name"], "rate_limiting");
     assert_eq!(data_source.as_deref(), Some("cached"));
@@ -916,7 +920,7 @@ async fn test_cached_config_reflects_live_updates() {
     // Initial read: 2 proxies
     let (status, body, _) = admin_get(&base_url, "/proxies", &token).await;
     assert_eq!(status, 200);
-    assert_eq!(body.as_array().unwrap().len(), 2);
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
 
     // Simulate config update (e.g., from a polling loop or gRPC push)
     let mut updated_config = create_test_gateway_config();
@@ -932,7 +936,7 @@ async fn test_cached_config_reflects_live_updates() {
     let (status, body, _) = admin_get(&base_url, "/proxies", &token).await;
     assert_eq!(status, 200);
     assert_eq!(
-        body.as_array().unwrap().len(),
+        body["data"].as_array().unwrap().len(),
         3,
         "Updated cached config should be reflected immediately"
     );
@@ -1077,7 +1081,7 @@ async fn test_charges_requires_admin_jwt() {
 }
 
 #[tokio::test]
-async fn test_list_proxies_without_pagination_returns_plain_array() {
+async fn test_list_proxies_without_pagination_returns_envelope() {
     let tc = TestConfig::default();
     let state = create_pagination_admin_state(&tc);
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -1085,12 +1089,11 @@ async fn test_list_proxies_without_pagination_returns_plain_array() {
 
     let (status, body, _) = admin_get(&base_url, "/proxies", &token).await;
     assert_eq!(status, 200);
-    // Without pagination params, should be a plain array
-    assert!(
-        body.is_array(),
-        "Should return plain array without pagination params"
-    );
-    assert_eq!(body.as_array().unwrap().len(), 5);
+    assert!(body["data"].is_array(), "Should have data field");
+    assert_eq!(body["data"].as_array().unwrap().len(), 5);
+    assert_eq!(body["pagination"]["offset"], 0);
+    assert_eq!(body["pagination"]["limit"], 100);
+    assert_eq!(body["pagination"]["total"], 5);
 }
 
 #[tokio::test]
@@ -1851,10 +1854,10 @@ async fn test_restore_hashes_consumer_secrets() {
                 "id": "hash_c1",
                 "username": "hash_user",
                 "credentials": {
-                    "basicauth": {
+                    "basicauth": [{
                         "username": "hash_user",
                         "password": "my_secret_password"
-                    }
+                    }]
                 }
             }
         ]
@@ -1869,7 +1872,7 @@ async fn test_restore_hashes_consumer_secrets() {
     // (the plaintext "password" key should be removed, replaced by "password_hash")
     let (status, consumer_body, _) = admin_get(&base_url, "/consumers/hash_c1", &token).await;
     assert_eq!(status, reqwest::StatusCode::OK);
-    let creds = &consumer_body["credentials"]["basicauth"];
+    let creds = &consumer_body["credentials"]["basicauth"][0];
     // The API redacts password_hash, but the plaintext "password" key should NOT be present
     assert!(
         creds.get("password").is_none() || creds["password"].is_null(),
@@ -1915,7 +1918,9 @@ async fn test_list_upstreams_falls_back_to_cached_config() {
     let (status, body, data_source) = admin_get(&base_url, "/upstreams", &token).await;
 
     assert_eq!(status, 200);
-    let upstreams = body.as_array().expect("Should return array of upstreams");
+    let upstreams = body["data"]
+        .as_array()
+        .expect("Should return envelope data array of upstreams");
     assert_eq!(upstreams.len(), 2);
     assert_eq!(upstreams[0]["id"], "upstream-1");
     assert_eq!(upstreams[1]["id"], "upstream-2");
@@ -2115,7 +2120,7 @@ async fn test_upstream_crud_create_and_read() {
     // List should include it
     let (status, body, _) = admin_get(&base_url, "/upstreams", &token).await;
     assert_eq!(status, 200);
-    let upstreams = body.as_array().unwrap();
+    let upstreams = body["data"].as_array().unwrap();
     assert_eq!(upstreams.len(), 1);
     assert_eq!(upstreams[0]["id"], "crud-u1");
 }
@@ -2596,7 +2601,7 @@ async fn test_cached_config_reflects_upstream_updates() {
     // Initial read: 2 upstreams
     let (status, body, _) = admin_get(&base_url, "/upstreams", &token).await;
     assert_eq!(status, 200);
-    assert_eq!(body.as_array().unwrap().len(), 2);
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
 
     // Simulate config update (e.g., from polling loop)
     let mut updated_config = create_test_gateway_config_with_upstreams();
@@ -2609,7 +2614,7 @@ async fn test_cached_config_reflects_upstream_updates() {
     let (status, body, _) = admin_get(&base_url, "/upstreams", &token).await;
     assert_eq!(status, 200);
     assert_eq!(
-        body.as_array().unwrap().len(),
+        body["data"].as_array().unwrap().len(),
         3,
         "Updated cached config should be reflected immediately"
     );
