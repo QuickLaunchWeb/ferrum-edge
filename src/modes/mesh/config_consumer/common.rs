@@ -41,11 +41,14 @@ pub fn random_backoff_entropy() -> u64 {
 
 pub fn jittered_backoff_with_entropy(backoff_secs: u64, entropy: u64) -> Duration {
     let base_ms = backoff_secs.saturating_mul(1000);
-    let sleep_ms = if base_ms > 0 {
-        100 + (entropy % base_ms.saturating_sub(100).max(1))
+    let jitter_range_ms = base_ms / 4;
+    let jitter_ms = if jitter_range_ms > 0 {
+        let full_range = jitter_range_ms.saturating_mul(2);
+        (entropy % full_range) as i128 - jitter_range_ms as i128
     } else {
-        100
+        0
     };
+    let sleep_ms = (base_ms as i128 + jitter_ms).max(100) as u64;
     Duration::from_millis(sleep_ms)
 }
 
@@ -101,8 +104,17 @@ mod tests {
 
         for entropy in samples {
             let duration = jittered_backoff_with_entropy(1, entropy);
-            assert!(duration >= Duration::from_millis(100));
-            assert!(duration < Duration::from_millis(1000));
+            assert!(duration >= Duration::from_millis(750));
+            assert!(duration < Duration::from_millis(1250));
+        }
+    }
+
+    #[test]
+    fn jittered_backoff_preserves_max_backoff_floor() {
+        for entropy in [0, 1, 7_499, u64::MAX] {
+            let duration = jittered_backoff_with_entropy(BACKOFF_MAX_SECS, entropy);
+            assert!(duration >= Duration::from_millis(22_500));
+            assert!(duration < Duration::from_millis(37_500));
         }
     }
 
