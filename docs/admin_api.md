@@ -231,7 +231,7 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/cluster
 
 ### CP Mode Response
 
-Returns all connected Data Plane nodes:
+Returns all currently connected Data Plane nodes and Mesh nodes. Each registry is independent: a node that subscribes to both `ConfigSync.Subscribe` (DP) and `MeshConfigSync.MeshSubscribe` (mesh) appears in both arrays with separate `connected_at` timestamps.
 
 ```json
 {
@@ -246,12 +246,23 @@ Returns all connected Data Plane nodes:
       "connected_at": "2025-01-15T10:30:00Z",
       "last_sync_at": "2025-01-15T10:35:00Z"
     }
+  ],
+  "connected_mesh_nodes": 1,
+  "mesh_nodes": [
+    {
+      "node_id": "mesh-789",
+      "version": "0.9.0",
+      "namespace": "ferrum",
+      "status": "online",
+      "connected_at": "2025-01-15T10:32:00Z",
+      "last_sync_at": "2025-01-15T10:35:00Z"
+    }
   ]
 }
 ```
 
-- **`status`** is always `online` — disconnected DPs are automatically removed from the registry when their gRPC stream drops.
-- **`last_sync_at`** updates whenever the CP broadcasts a config update (full snapshot or delta) to connected DPs.
+- **`status`** is always `online` — disconnected DPs and mesh nodes are automatically removed from their registries when their gRPC stream drops.
+- **`last_sync_at`** updates whenever the CP broadcasts a config update (full snapshot or delta) to that registry. DP and mesh broadcasts share the same database polling cycle, so the timestamps converge on every successful poll.
 
 ### DP Mode Response
 

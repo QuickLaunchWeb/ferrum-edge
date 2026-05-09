@@ -1272,7 +1272,7 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub known_namespaces: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mesh: Option<Box<crate::config::mesh::MeshConfig>>,
+    pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
 }
 
 /// The current config schema version. Increment this when adding config migrations.

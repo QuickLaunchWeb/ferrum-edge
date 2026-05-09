@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::modes::mesh::runtime::MeshRuntimeState;
-use crate::xds::slice::MeshSlice;
+use crate::modes::mesh::slice::MeshSlice;
 
 /// Phase B shell for an xDS-backed mesh config consumer.
 ///
