@@ -12,7 +12,7 @@ proxies:
   - id: "proxy-health"
     name: "Health Check Proxy (E2E TLS)"
     listen_path: "/health"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "BACKEND_HOST"
     backend_port: 3443
     strip_listen_path: false
@@ -27,7 +27,7 @@ proxies:
   - id: "proxy-echo"
     name: "Echo API Proxy (E2E TLS)"
     listen_path: "/api/echo"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "BACKEND_HOST"
     backend_port: 3443
     strip_listen_path: false

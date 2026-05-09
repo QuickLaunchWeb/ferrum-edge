@@ -346,6 +346,106 @@ plugin_configs: []
     );
 }
 
+#[test]
+fn test_unknown_fields_rejected_on_each_resource_type() {
+    // `Proxy`, `Consumer`, `Upstream`, `PluginConfig`, and `GatewayConfig` all
+    // carry `#[serde(deny_unknown_fields)]`. A typo or removed field anywhere
+    // in the tree must surface as a clear deserialize error rather than being
+    // silently dropped.
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "GatewayConfig top-level",
+            r#"
+version: "1"
+extra_top_level_key: 1
+proxies: []
+consumers: []
+plugin_configs: []
+"#,
+            "extra_top_level_key",
+        ),
+        (
+            "Proxy entry",
+            r#"
+version: "1"
+proxies:
+  - id: "p1"
+    listen_path: "/v1"
+    backend_scheme: http
+    backend_host: "localhost"
+    backend_port: 8080
+    backend_protocol: http
+consumers: []
+plugin_configs: []
+"#,
+            "backend_protocol",
+        ),
+        (
+            "Consumer entry",
+            r#"
+version: "1"
+proxies: []
+consumers:
+  - id: "c1"
+    username: "alice"
+    not_a_consumer_field: "x"
+plugin_configs: []
+"#,
+            "not_a_consumer_field",
+        ),
+        (
+            "PluginConfig entry",
+            r#"
+version: "1"
+proxies: []
+consumers: []
+plugin_configs:
+  - id: "pc1"
+    plugin_name: "key_auth"
+    config: {}
+    scope: global
+    bogus_plugin_field: true
+"#,
+            "bogus_plugin_field",
+        ),
+        (
+            "Upstream entry",
+            r#"
+version: "1"
+proxies: []
+consumers: []
+plugin_configs: []
+upstreams:
+  - id: "u1"
+    targets:
+      - host: "localhost"
+        port: 8080
+    bogus_upstream_field: "x"
+"#,
+            "bogus_upstream_field",
+        ),
+    ];
+
+    for (label, yaml, expected_field) in cases {
+        let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+        write!(file, "{}", yaml).unwrap();
+        let result = load_config_from_file(
+            file.path().to_str().unwrap(),
+            30,
+            &ferrum_edge::config::BackendAllowIps::Both,
+            "ferrum",
+        );
+        let err = result.expect_err(&format!(
+            "{label}: unknown field {expected_field:?} should be rejected"
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(expected_field) || msg.contains("unknown field"),
+            "{label}: error should mention the unknown field {expected_field:?}: {msg}"
+        );
+    }
+}
+
 // ============================================================================
 // Auth Mode Tests
 // ============================================================================

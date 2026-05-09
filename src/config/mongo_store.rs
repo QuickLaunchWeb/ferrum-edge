@@ -911,9 +911,8 @@ mod inner {
 
     /// Convert a BSON `Document` back into a domain `Proxy`.
     ///
-    /// `Proxy` uses `#[serde(deny_unknown_fields)]`; strip MongoDB's `_id`
-    /// before deserialization. Apply the same treatment to other `doc_to_*`
-    /// functions if their types gain `deny_unknown_fields`.
+    /// All admin resource types use `#[serde(deny_unknown_fields)]`, so every
+    /// `doc_to_*` helper strips MongoDB's `_id` before deserialization.
     fn doc_to_proxy(mut doc: Document) -> Result<Proxy, anyhow::Error> {
         doc.remove("_id");
         let proxy: Proxy = mongodb::bson::from_document(doc)?;
@@ -930,7 +929,8 @@ mod inner {
         Ok(doc)
     }
 
-    fn doc_to_consumer(doc: Document) -> Result<Consumer, anyhow::Error> {
+    fn doc_to_consumer(mut doc: Document) -> Result<Consumer, anyhow::Error> {
+        doc.remove("_id");
         Ok(mongodb::bson::from_document(doc)?)
     }
 
@@ -941,7 +941,8 @@ mod inner {
         Ok(doc)
     }
 
-    fn doc_to_plugin_config(doc: Document) -> Result<PluginConfig, anyhow::Error> {
+    fn doc_to_plugin_config(mut doc: Document) -> Result<PluginConfig, anyhow::Error> {
+        doc.remove("_id");
         Ok(mongodb::bson::from_document(doc)?)
     }
 
@@ -956,7 +957,8 @@ mod inner {
         Ok(doc)
     }
 
-    fn doc_to_upstream(doc: Document) -> Result<Upstream, anyhow::Error> {
+    fn doc_to_upstream(mut doc: Document) -> Result<Upstream, anyhow::Error> {
+        doc.remove("_id");
         Ok(mongodb::bson::from_document(doc)?)
     }
 
@@ -980,6 +982,7 @@ mod inner {
     }
 
     fn doc_to_api_spec(mut doc: Document) -> Result<ApiSpec, anyhow::Error> {
+        doc.remove("_id");
         let spec_content = match doc.remove("spec_content") {
             Some(Bson::Binary(binary)) => binary.bytes,
             Some(Bson::Array(values)) => {

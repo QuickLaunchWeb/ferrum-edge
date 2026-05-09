@@ -1,4 +1,5 @@
 ---
+version: "1"
 # WebSocket Secure end-to-end TLS performance test config.
 # Client --WSS--> gateway --WSS--> backend. Every hop encrypted.
 # Used exclusively by gateways-protocol-benchmark.yml for the "wss" matrix job.

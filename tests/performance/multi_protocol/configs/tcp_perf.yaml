@@ -1,4 +1,5 @@
 ---
+version: "1"
 # TCP proxy performance test config
 proxies:
   - id: "tcp-echo"

@@ -425,6 +425,7 @@ impl BackendTlsConfig {
 
 /// An upstream defines a group of backend targets with load balancing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Upstream {
     #[serde(default)]
     pub id: String,
@@ -1107,6 +1108,7 @@ pub struct PluginAssociation {
 
 /// A consumer resource (API user).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Consumer {
     #[serde(default)]
     pub id: String,
@@ -1131,6 +1133,7 @@ pub struct Consumer {
 
 /// A plugin configuration resource.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginConfig {
     #[serde(default)]
     pub id: String,
@@ -1189,6 +1192,7 @@ pub enum SpecFormat {
 /// requiring decompression. See [`crate::admin::spec_codec`] for the
 /// compression + hashing helpers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiSpec {
     #[serde(default)]
     pub id: String,
@@ -1252,6 +1256,7 @@ pub struct ApiSpec {
 
 /// Full gateway configuration snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
     /// Configuration schema version.
     pub version: String,
