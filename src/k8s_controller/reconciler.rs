@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use serde_json::Value;
 use tokio::sync::{broadcast, watch};
 use tracing::{debug, error, info, warn};
 
@@ -55,6 +56,10 @@ pub fn spawn_reconcile_loop(
                 return;
             }
         };
+
+        if !wait_for_initial_store_readiness(&store_set, &mut change_rx, &mut shutdown).await {
+            return;
+        }
 
         // Initial reconciliation — block until first success.
         do_reconcile(
@@ -143,6 +148,54 @@ async fn debounce_events(change_rx: &mut watch::Receiver<u64>, window: Duration)
     }
 }
 
+async fn wait_for_initial_store_readiness(
+    store_set: &Arc<tokio::sync::Mutex<ResourceStoreSet>>,
+    change_rx: &mut watch::Receiver<u64>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    loop {
+        let stores = {
+            let set = store_set.lock().await;
+            set.stores()
+        };
+
+        if !stores.is_empty() {
+            for store in stores {
+                tokio::select! {
+                    result = store.wait_until_ready() => {
+                        if let Err(e) = result {
+                            warn!(error = %e, "K8s reflector store failed before initial readiness");
+                            return false;
+                        }
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            info!("K8s reconciler shutting down before initial store readiness");
+                            return false;
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    info!("K8s reconciler shutting down before any CRD stores became available");
+                    return false;
+                }
+            }
+            changed = change_rx.changed() => {
+                if changed.is_err() {
+                    info!("K8s CRD store change channel closed before initial readiness");
+                    return false;
+                }
+            }
+        }
+    }
+}
+
 struct ReconcileContext<'a> {
     config_arc: &'a Arc<ArcSwap<GatewayConfig>>,
     update_tx: &'a broadcast::Sender<ConfigUpdate>,
@@ -186,15 +239,7 @@ async fn do_reconcile(
     let new_config = translation.config;
     let old_config = ctx.config_arc.load();
 
-    let changed = new_config.proxies.len() != old_config.proxies.len()
-        || new_config.upstreams.len() != old_config.upstreams.len()
-        || new_config.consumers.len() != old_config.consumers.len()
-        || new_config.plugin_configs.len() != old_config.plugin_configs.len()
-        || new_config
-            .mesh
-            .as_ref()
-            .map(|m| m.as_ref() != old_config.mesh.as_deref().unwrap_or(&Default::default()))
-            .unwrap_or(old_config.mesh.is_some());
+    let changed = gateway_config_content_changed(&new_config, old_config.as_ref());
 
     if !changed {
         debug!("No config changes detected, skipping swap");
@@ -224,6 +269,133 @@ async fn do_reconcile(
         elapsed_ms = elapsed.as_millis() as u64,
         "Reconciliation complete"
     );
+}
+
+fn gateway_config_content_changed(new_config: &GatewayConfig, old_config: &GatewayConfig) -> bool {
+    stable_config_value(new_config) != stable_config_value(old_config)
+}
+
+fn stable_config_value(config: &GatewayConfig) -> Value {
+    let mut value = serde_json::json!({
+        "version": &config.version,
+        "proxies": &config.proxies,
+        "consumers": &config.consumers,
+        "plugin_configs": &config.plugin_configs,
+        "upstreams": &config.upstreams,
+        "known_namespaces": &config.known_namespaces,
+        "mesh": &config.mesh,
+    });
+    strip_volatile_timestamps(&mut value);
+    sort_top_level_collection(&mut value, "proxies", "id");
+    sort_top_level_collection(&mut value, "consumers", "id");
+    sort_top_level_collection(&mut value, "plugin_configs", "id");
+    sort_top_level_collection(&mut value, "upstreams", "id");
+    sort_string_array(&mut value, "known_namespaces");
+    value
+}
+
+fn strip_volatile_timestamps(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("loaded_at");
+            map.remove("created_at");
+            map.remove("updated_at");
+            for child in map.values_mut() {
+                strip_volatile_timestamps(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_volatile_timestamps(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sort_top_level_collection(value: &mut Value, field: &str, key: &str) {
+    let Some(items) = value.get_mut(field).and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    items.sort_by(|left, right| {
+        let left_key = left.get(key).and_then(Value::as_str).unwrap_or_default();
+        let right_key = right.get(key).and_then(Value::as_str).unwrap_or_default();
+        left_key.cmp(right_key)
+    });
+}
+
+fn sort_string_array(value: &mut Value, field: &str) {
+    let Some(items) = value.get_mut(field).and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    items.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::types::{PluginConfig, PluginScope};
+    use chrono::{Duration as ChronoDuration, Utc};
+    use serde_json::json;
+
+    fn plugin_config(id: &str, config: Value) -> PluginConfig {
+        PluginConfig {
+            id: id.to_string(),
+            plugin_name: "rate_limiting".to_string(),
+            namespace: "ferrum".to_string(),
+            config,
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn content_change_detects_same_count_plugin_edit() {
+        let mut old_config = GatewayConfig::default();
+        old_config
+            .plugin_configs
+            .push(plugin_config("rate", json!({"max_requests": 100})));
+        let mut new_config = old_config.clone();
+        new_config.plugin_configs[0].config = json!({"max_requests": 200});
+
+        assert!(gateway_config_content_changed(&new_config, &old_config));
+    }
+
+    #[test]
+    fn content_change_ignores_volatile_timestamps() {
+        let mut old_config = GatewayConfig::default();
+        old_config
+            .plugin_configs
+            .push(plugin_config("rate", json!({"max_requests": 100})));
+        let mut new_config = old_config.clone();
+        new_config.loaded_at = old_config.loaded_at + ChronoDuration::seconds(5);
+        new_config.plugin_configs[0].updated_at =
+            old_config.plugin_configs[0].updated_at + ChronoDuration::seconds(5);
+
+        assert!(!gateway_config_content_changed(&new_config, &old_config));
+    }
+
+    #[test]
+    fn content_change_ignores_top_level_resource_order() {
+        let mut old_config = GatewayConfig::default();
+        old_config
+            .plugin_configs
+            .push(plugin_config("b", json!({"value": 2})));
+        old_config
+            .plugin_configs
+            .push(plugin_config("a", json!({"value": 1})));
+        let mut new_config = old_config.clone();
+        new_config.plugin_configs.reverse();
+
+        assert!(!gateway_config_content_changed(&new_config, &old_config));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

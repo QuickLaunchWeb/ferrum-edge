@@ -31,6 +31,15 @@ impl CrdResourceStore {
             .collect()
     }
 
+    pub async fn wait_until_ready(&self) -> Result<(), String> {
+        self.store.wait_until_ready().await.map_err(|e| {
+            format!(
+                "{} {} reflector store was dropped before ready: {e}",
+                self.api_version, self.kind
+            )
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.store.state().len()
     }
@@ -76,8 +85,23 @@ impl ResourceStoreSet {
         }
     }
 
-    pub fn add_store(&mut self, store: Arc<CrdResourceStore>) {
+    pub fn add_store(&mut self, store: Arc<CrdResourceStore>) -> bool {
+        if self.has_store(&store.api_version, &store.kind) {
+            return false;
+        }
         self.stores.push(store);
+        self.notify_change();
+        true
+    }
+
+    pub fn has_store(&self, api_version: &str, kind: &str) -> bool {
+        self.stores
+            .iter()
+            .any(|store| store.api_version == api_version && store.kind == kind)
+    }
+
+    pub fn stores(&self) -> Vec<Arc<CrdResourceStore>> {
+        self.stores.clone()
     }
 
     pub fn snapshot_all(&self) -> Vec<K8sObject> {

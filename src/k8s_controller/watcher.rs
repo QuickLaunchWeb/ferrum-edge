@@ -206,7 +206,14 @@ pub async fn start_crd_watchers(
 
         let change_notifier = {
             let mut set = store_set.lock().await;
-            set.add_store(crd_store);
+            if !set.add_store(crd_store) {
+                debug!(
+                    kind = %kind,
+                    api_version = %api_version,
+                    "CRD watcher already running, skipping duplicate start"
+                );
+                continue;
+            }
             set.change_notifier()
         };
 
