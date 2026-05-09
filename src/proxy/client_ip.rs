@@ -194,35 +194,39 @@ fn canonicalize_cidr_network(ip: IpAddr, prefix_len: u8) -> Option<(IpAddr, u8)>
 
 impl CidrEntry {
     fn matches(&self, ip: &IpAddr) -> bool {
-        // Canonicalize IPv4-mapped IPv6 (::ffff:x.x.x.x) to IPv4 so that
-        // dual-stack listeners match IPv4 CIDR entries correctly.
-        let canonical = canonicalize_ip(*ip);
-        match (&self.network, &canonical) {
-            (IpAddr::V4(net), IpAddr::V4(addr)) => {
-                if self.prefix_len == 0 {
-                    return true;
+        match (&self.network, ip) {
+            (IpAddr::V4(net), IpAddr::V4(addr)) => matches_ipv4(*net, *addr, self.prefix_len),
+            (IpAddr::V4(net), IpAddr::V6(addr)) => {
+                if let Some(v4) = addr.to_ipv4_mapped() {
+                    matches_ipv4(*net, v4, self.prefix_len)
+                } else {
+                    false
                 }
-                let net_bits = u32::from(*net);
-                let addr_bits = u32::from(*addr);
-                let mask = u32::MAX
-                    .checked_shl(32 - self.prefix_len as u32)
-                    .unwrap_or(0);
-                (net_bits & mask) == (addr_bits & mask)
             }
-            (IpAddr::V6(net), IpAddr::V6(addr)) => {
-                if self.prefix_len == 0 {
-                    return true;
-                }
-                let net_bits = u128::from(*net);
-                let addr_bits = u128::from(*addr);
-                let mask = u128::MAX
-                    .checked_shl(128 - self.prefix_len as u32)
-                    .unwrap_or(0);
-                (net_bits & mask) == (addr_bits & mask)
-            }
+            (IpAddr::V6(net), IpAddr::V6(addr)) => matches_ipv6(*net, *addr, self.prefix_len),
             _ => false, // v4 vs v6 mismatch
         }
     }
+}
+
+fn matches_ipv4(network: std::net::Ipv4Addr, addr: std::net::Ipv4Addr, prefix_len: u8) -> bool {
+    if prefix_len == 0 {
+        return true;
+    }
+    let net_bits = u32::from(network);
+    let addr_bits = u32::from(addr);
+    let mask = u32::MAX.checked_shl(32 - prefix_len as u32).unwrap_or(0);
+    (net_bits & mask) == (addr_bits & mask)
+}
+
+fn matches_ipv6(network: std::net::Ipv6Addr, addr: std::net::Ipv6Addr, prefix_len: u8) -> bool {
+    if prefix_len == 0 {
+        return true;
+    }
+    let net_bits = u128::from(network);
+    let addr_bits = u128::from(addr);
+    let mask = u128::MAX.checked_shl(128 - prefix_len as u32).unwrap_or(0);
+    (net_bits & mask) == (addr_bits & mask)
 }
 
 /// Resolve the real client IP from the request context.

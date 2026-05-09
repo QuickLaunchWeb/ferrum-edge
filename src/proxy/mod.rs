@@ -1343,6 +1343,21 @@ fn via_header_for_inbound_version(state: &ProxyState, version: hyper::Version) -
     }
 }
 
+#[inline]
+fn via_header_for_backend_response_body<'a>(
+    state: &'a ProxyState,
+    response_body: &ResponseBody,
+) -> &'a Option<String> {
+    match response_body {
+        ResponseBody::Streaming(response) => {
+            via_header_for_inbound_version(state, response.version())
+        }
+        ResponseBody::StreamingH2(_) => &state.via_header_http2,
+        ResponseBody::StreamingH3(_) => &state.via_header_http3,
+        ResponseBody::Buffered(_) => &state.via_header_http11,
+    }
+}
+
 impl ProxyState {
     /// Construct the gateway state and start the health checker.
     ///
@@ -8789,8 +8804,10 @@ async fn handle_proxy_request_inner(
         resp_builder = resp_builder.header("connection", "close");
     }
 
-    // Via header on response path (RFC 9110 §7.6.3)
-    let resp_via = via_header_for_inbound_version(&state, inbound_version);
+    // Via header on response path (RFC 9110 §7.6.3): describe the protocol
+    // used by the upstream sender of this message, not the client-facing
+    // inbound protocol.
+    let resp_via = via_header_for_backend_response_body(&state, &response_body);
     if let Some(via) = resp_via {
         resp_builder = resp_builder.header("via", via.as_str());
     }
