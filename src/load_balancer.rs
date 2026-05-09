@@ -594,8 +594,7 @@ impl LoadBalancerCache {
     }
 
     /// Select a target from a named subset within an upstream.
-    /// Unknown subset names return `None`; defined but empty or unhealthy
-    /// subsets fall back to the upstream's full target set.
+    /// Unknown, empty, or fully unhealthy subsets return `None`.
     #[inline]
     pub fn select_target_subset_from(
         snapshot: &LoadBalancerCacheInner,
@@ -1198,10 +1197,9 @@ impl LoadBalancer {
     }
 
     /// Select a target from a named subset, intersecting subset membership
-    /// with the health bitset. Unknown subset names return `None` so config
-    /// typos cannot silently route across the whole upstream. When a defined
-    /// subset has no healthy members, selection falls back to the parent
-    /// upstream and marks the result as degraded.
+    /// with the health bitset. Unknown, empty, or fully unhealthy subsets
+    /// return `None` so config typos and subset outages cannot silently route
+    /// across the whole upstream.
     pub fn select_from_subset(
         &self,
         ctx_key: &str,
@@ -1215,7 +1213,7 @@ impl LoadBalancer {
 
         let subset_target_indices = match self.subset_indices.get(subset_name) {
             Some(indices) if !indices.is_empty() => indices,
-            Some(_) => return self.select_parent_as_subset_fallback(ctx_key, health),
+            Some(_) => return None,
             None => return None,
         };
         let algorithm = self.subset_algorithm(subset_name);
@@ -1242,7 +1240,7 @@ impl LoadBalancer {
         }
 
         if subset_healthy.is_empty() {
-            return self.select_parent_as_subset_fallback(ctx_key, health);
+            return None;
         }
 
         self.select_with_bitset_using(ctx_key, &subset_healthy, algorithm, wrr_state, hash_ring)
@@ -1250,17 +1248,6 @@ impl LoadBalancer {
                 target,
                 is_fallback: false,
             })
-    }
-
-    fn select_parent_as_subset_fallback(
-        &self,
-        ctx_key: &str,
-        health: Option<&HealthContext<'_>>,
-    ) -> Option<TargetSelection> {
-        self.select(ctx_key, health).map(|mut selection| {
-            selection.is_fallback = true;
-            selection
-        })
     }
 
     /// Vec-based subset selection fallback for >128 targets.
@@ -1284,7 +1271,7 @@ impl LoadBalancer {
             .collect();
 
         if subset_healthy.is_empty() {
-            return self.select_parent_as_subset_fallback(ctx_key, health);
+            return None;
         }
 
         self.select_from_candidates_vec_using(
@@ -1516,7 +1503,7 @@ impl LoadBalancer {
         }
         let subset_target_indices = match self.subset_indices.get(subset_name) {
             Some(indices) if !indices.is_empty() => indices,
-            Some(_) => return self.select_excluding(ctx_key, exclude, health),
+            Some(_) => return None,
             None => return None,
         };
 
@@ -1549,7 +1536,7 @@ impl LoadBalancer {
         }
 
         if subset_healthy.is_empty() {
-            return self.select_excluding(ctx_key, exclude, health);
+            return None;
         }
 
         self.select_with_bitset_using(
@@ -1597,7 +1584,7 @@ impl LoadBalancer {
         subset_name: &str,
         subset_indices: &[usize],
         exclude_idx: Option<usize>,
-        exclude: &UpstreamTarget,
+        _exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
         let all_healthy = self.healthy_targets_vec(health);
@@ -1614,7 +1601,7 @@ impl LoadBalancer {
             .collect();
 
         if subset_healthy.is_empty() {
-            return self.select_excluding(ctx_key, exclude, health);
+            return None;
         }
 
         self.select_from_candidates_vec_using(

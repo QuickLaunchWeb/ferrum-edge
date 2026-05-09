@@ -1958,7 +1958,7 @@ fn subset_routing_intersects_with_health() {
 }
 
 #[test]
-fn subset_routing_all_unhealthy_falls_back_to_parent_upstream() {
+fn subset_routing_all_unhealthy_returns_none() {
     use ferrum_edge::config::types::SubsetDefinition;
 
     let targets = make_tagged_targets();
@@ -1989,25 +1989,43 @@ fn subset_routing_all_unhealthy_falls_back_to_parent_upstream() {
         max_ejection_percent: None,
     };
 
-    // All subset targets unhealthy → degraded mode, falls back to the parent upstream.
-    let mut any_fallback = false;
-    let mut seen = std::collections::HashSet::new();
-    for _ in 0..50 {
-        let sel = lb.select_from_subset("", "stable", Some(&ctx)).unwrap();
-        if sel.is_fallback {
-            any_fallback = true;
-        }
-        seen.insert(sel.target.host.clone());
-    }
     assert!(
-        any_fallback,
-        "All subset targets unhealthy should trigger fallback mode"
+        lb.select_from_subset("", "stable", Some(&ctx)).is_none(),
+        "All subset targets unhealthy must not route to the parent upstream"
     );
-    assert!(seen.contains("v2-a"));
-    assert!(seen.contains("v2-b"));
+}
+
+#[test]
+fn subset_retry_does_not_fall_back_to_parent_upstream() {
+    use ferrum_edge::config::types::SubsetDefinition;
+
+    let targets = make_tagged_targets();
+    let subsets = vec![SubsetDefinition {
+        name: "v2-east".into(),
+        labels: HashMap::from([
+            ("version".into(), "v2".into()),
+            ("region".into(), "us-east".into()),
+        ]),
+        traffic_policy: None,
+    }];
+
+    let lb = LoadBalancer::with_subsets(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+        Some(&subsets),
+    );
+
+    let selected = lb
+        .select_from_subset("", "v2-east", None)
+        .expect("single subset target exists");
+    assert_eq!(selected.target.host, "v2-b");
+
     assert!(
-        !seen.contains("v1-a") && !seen.contains("v1-b"),
-        "Parent fallback should still honor health filtering"
+        lb.select_excluding_from_subset("", "v2-east", &selected.target, None)
+            .is_none(),
+        "Retry must stay inside the configured subset instead of falling back to parent"
     );
 }
 

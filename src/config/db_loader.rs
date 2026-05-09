@@ -5345,6 +5345,17 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         .map(|v| v != 0)
         .unwrap_or(true);
 
+    let subsets = match row.try_get::<String, _>("subsets") {
+        Ok(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            anyhow::anyhow!(
+                "Upstream {}: failed to parse subsets JSON: {}",
+                id_preview,
+                e
+            )
+        })?),
+        Err(_) => None,
+    };
+
     Ok(Upstream {
         id: row.try_get("id")?,
         namespace: row
@@ -5357,10 +5368,7 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         hash_on_cookie_config,
         health_checks,
         service_discovery,
-        subsets: row
-            .try_get::<String, _>("subsets")
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok()),
+        subsets,
         backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
         backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
         backend_tls_verify_server_cert,
