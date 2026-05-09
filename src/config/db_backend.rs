@@ -79,7 +79,7 @@ impl Default for ApiSpecListFilter {
 /// updates without loading the entire database.
 ///
 /// Serializable for CP-to-DP gRPC delta broadcasts.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct IncrementalResult {
     pub added_or_modified_proxies: Vec<Proxy>,
     pub removed_proxy_ids: Vec<String>,

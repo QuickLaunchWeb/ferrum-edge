@@ -8,10 +8,13 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
-use crate::plugins::mesh_authz::parse_trust_domain_aliases;
+use crate::plugins::mesh::authz::parse_trust_domain_aliases;
+use crate::plugins::{
+    ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
+    priority,
+};
 
 const MESH_SOURCE_PRINCIPAL: &str = "mesh.source.principal";
 const MESH_SOURCE_TRUST_DOMAIN: &str = "mesh.source.trust_domain";
@@ -195,11 +198,11 @@ impl Plugin for WorkloadMetrics {
     }
 
     fn priority(&self) -> u16 {
-        super::priority::WORKLOAD_METRICS
+        priority::WORKLOAD_METRICS
     }
 
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::ALL_PROTOCOLS
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        ALL_PROTOCOLS
     }
 
     async fn before_proxy(

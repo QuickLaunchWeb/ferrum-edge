@@ -12,11 +12,13 @@ use super::common::{
     BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs, sleep_or_shutdown, tonic_tls_config,
     wait_for_shutdown,
 };
-use crate::config::mesh::{AppProtocol, MeshService, ServicePort, TrustBundle, TrustBundleSet};
 use crate::grpc::dp_client::{DpGrpcTlsConfig, GrpcJwtSecret, generate_dp_jwt_with_issuer};
 use crate::identity::TrustDomain;
+use crate::modes::mesh::config::{
+    AppProtocol, MeshService, ServicePort, TrustBundle, TrustBundleSet,
+};
 use crate::modes::mesh::runtime::MeshRuntimeState;
-use crate::xds::MeshSlice;
+use crate::modes::mesh::slice::MeshSlice;
 use crate::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::xds::proto::{self, DiscoveryRequest, Node, Status};
 use crate::xds::translator::{

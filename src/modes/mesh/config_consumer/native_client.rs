@@ -12,10 +12,10 @@ use super::common::{
 use crate::grpc::dp_client::{
     DpGrpcTlsConfig, GrpcJwtSecret, check_cp_version_compatibility, generate_dp_jwt_with_issuer,
 };
-use crate::grpc::proto::config_sync_client::ConfigSyncClient;
+use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
 use crate::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
 use crate::modes::mesh::runtime::MeshRuntimeState;
-use crate::xds::slice::MeshSlice;
+use crate::modes::mesh::slice::MeshSlice;
 
 /// Phase B shell for Ferrum-native MeshSubscribe consumers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +142,7 @@ async fn connect_mesh_subscribe(
 
     #[allow(clippy::result_large_err)]
     let mut client =
-        ConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
+        MeshConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
             req.metadata_mut().insert("authorization", token.clone());
             Ok(req)
         });
