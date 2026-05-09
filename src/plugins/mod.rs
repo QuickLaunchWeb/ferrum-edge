@@ -30,6 +30,7 @@ pub mod bot_detection;
 pub mod compression;
 pub mod correlation_id;
 pub mod cors;
+pub mod fault_injection;
 pub mod geo_restriction;
 pub mod graphql;
 pub mod grpc_deadline;
@@ -1049,6 +1050,7 @@ pub mod priority {
     pub const GRAPHQL: u16 = 2850;
     pub const RATE_LIMITING: u16 = 2900;
     pub const AI_PROMPT_SHIELD: u16 = 2925;
+    pub const FAULT_INJECTION: u16 = 2950;
     pub const BODY_VALIDATOR: u16 = 2950;
     pub const AI_REQUEST_GUARD: u16 = 2975;
     pub const AI_FEDERATION: u16 = 2985;
@@ -1606,6 +1608,9 @@ pub fn create_plugin_with_http_client(
         "response_caching" => Ok(Some(Arc::new(response_caching::ResponseCaching::new(
             config,
         )?))),
+        "fault_injection" => Ok(Some(Arc::new(fault_injection::FaultInjectionPlugin::new(
+            config,
+        )?))),
         "response_mock" => Ok(Some(Arc::new(response_mock::ResponseMock::new(config)?))),
         "serverless_function" => Ok(Some(Arc::new(
             serverless_function::ServerlessFunction::new(config, http_client)?,
@@ -1776,6 +1781,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "spec_expose",
         "api_chargeback",
         "workload_metrics",
+        "fault_injection",
         "access_log",
     ];
     plugins.extend(crate::custom_plugins::custom_plugin_names());
