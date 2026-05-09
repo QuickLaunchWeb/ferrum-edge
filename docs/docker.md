@@ -94,6 +94,8 @@ docker run -v ferrum_data:/data ferrum-edge:latest
 
 The container includes a built-in health check using the `ferrum-edge health` CLI subcommand (no curl needed in distroless):
 
+The image default command is `ferrum-edge run`; override the Docker command with another subcommand such as `validate`, `health`, or `version` when needed.
+
 ```bash
 # Check container health
 docker ps

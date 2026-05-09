@@ -149,6 +149,7 @@ spec:
         - name: ferrum-edge
           image: ghcr.io/ferrum-edge/ferrum-edge:latest
           imagePullPolicy: IfNotPresent
+          args: ["run"]
           env:
             - name: FERRUM_MODE
               value: database

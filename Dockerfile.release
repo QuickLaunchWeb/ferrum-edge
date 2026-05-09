@@ -30,3 +30,4 @@ LABEL org.opencontainers.image.title="Ferrum Edge" \
       org.opencontainers.image.source="https://github.com/ferrum-edge/ferrum-edge"
 
 ENTRYPOINT ["/app/ferrum-edge"]
+CMD ["run"]

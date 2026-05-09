@@ -197,7 +197,7 @@ FERRUM_ADMIN_JWT_SECRET=admin-secret-key \
 FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051 \
 FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-shared-secret \
 FERRUM_DB_POLL_INTERVAL=10 \
-./ferrum-edge
+./ferrum-edge run
 ```
 
 ### Data Plane (Plaintext)
@@ -209,7 +209,7 @@ FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-shared-secret \
 FERRUM_ADMIN_JWT_SECRET=admin-secret-key \
 FERRUM_PROXY_HTTP_PORT=8000 \
 FERRUM_PROXY_HTTPS_PORT=8443 \
-./ferrum-edge
+./ferrum-edge run
 ```
 
 ### Control Plane (mTLS)
@@ -224,7 +224,7 @@ FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-shared-secret \
 FERRUM_CP_GRPC_TLS_CERT_PATH=/certs/server.pem \
 FERRUM_CP_GRPC_TLS_KEY_PATH=/certs/server-key.pem \
 FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH=/certs/ca.pem \
-./ferrum-edge
+./ferrum-edge run
 ```
 
 ### Data Plane (mTLS)
@@ -237,7 +237,7 @@ FERRUM_DP_GRPC_TLS_CA_CERT_PATH=/certs/ca.pem \
 FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH=/certs/dp-client.pem \
 FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH=/certs/dp-client-key.pem \
 FERRUM_ADMIN_JWT_SECRET=admin-secret-key \
-./ferrum-edge
+./ferrum-edge run
 ```
 
 ## Cluster Status Monitoring

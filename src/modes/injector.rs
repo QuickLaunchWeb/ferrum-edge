@@ -501,6 +501,7 @@ fn sidecar_container(config: &InjectorConfig, pod: &Value, namespace: &str) -> V
         "name": "ferrum-edge",
         "image": config.sidecar_image,
         "imagePullPolicy": "IfNotPresent",
+        "args": ["run"],
         "securityContext": {
             "runAsUser": config.proxy_uid.unwrap_or(DEFAULT_PROXY_UID),
             "allowPrivilegeEscalation": false
@@ -637,6 +638,7 @@ mod tests {
             .get("env")
             .and_then(Value::as_array)
             .expect("sidecar env");
+        assert_eq!(sidecar.get("args"), Some(&json!(["run"])));
         assert!(env.iter().any(|entry| {
             entry.get("name").and_then(Value::as_str) == Some("FERRUM_DP_CP_GRPC_URLS")
                 && entry.get("value").and_then(Value::as_str) == Some("http://cp:50051")

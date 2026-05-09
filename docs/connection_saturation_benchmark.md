@@ -110,7 +110,7 @@ FERRUM_MAX_CONNECTIONS=0 \
 FERRUM_POOL_MAX_IDLE_PER_HOST=2000 \
 FERRUM_POOL_WARMUP_ENABLED=true \
 FERRUM_TCP_IDLE_TIMEOUT_SECONDS=120 \
-./target/release/ferrum-edge &
+./target/release/ferrum-edge run &
 
 sleep 5
 

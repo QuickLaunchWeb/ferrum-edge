@@ -210,7 +210,7 @@ DEBUG=1 ./run_perf_test.sh
 # Check individual components
 ./backend_server  # Backend server
 # and in another terminal:
-FERRUM_MODE=file FERRUM_FILE_CONFIG_PATH=perf_config.yaml cargo run --bin ferrum-edge
+FERRUM_MODE=file FERRUM_FILE_CONFIG_PATH=perf_config.yaml cargo run --bin ferrum-edge -- run
 ```
 
 ## 🎯 Performance Optimization Tips

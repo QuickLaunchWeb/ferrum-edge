@@ -115,7 +115,7 @@ export FERRUM_BACKEND_TLS_CLIENT_CERT_PATH="/etc/ssl/certs/gateway-client.pem"
 export FERRUM_BACKEND_TLS_CLIENT_KEY_PATH="/etc/ssl/private/gateway-client-key.pem"
 
 # Start gateway
-./ferrum-edge
+./ferrum-edge run
 ```
 
 ### Example 2: Mixed Configuration
@@ -141,7 +141,7 @@ proxies:
     backend_tls_client_key_path: "/etc/ssl/private/secure-client-key.pem"
 EOF
 
-./ferrum-edge --mode file --config config.yaml
+./ferrum-edge run --mode file --spec config.yaml
 ```
 
 ## Testing
@@ -188,7 +188,7 @@ cargo test test_backend_mtls_global_config -- --nocapture
 
 1. **Enable Debug Logging**
    ```bash
-   RUST_LOG=debug ./ferrum-edge
+   RUST_LOG=debug ./ferrum-edge run
    ```
 
 2. **Test Certificate Loading**
