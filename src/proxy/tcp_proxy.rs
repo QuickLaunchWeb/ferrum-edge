@@ -1064,6 +1064,8 @@ struct TcpConnParams {
     retry: Option<crate::config::types::RetryConfig>,
     /// Upstream ID for load-balanced target selection on retry.
     upstream_id: Option<String>,
+    /// Optional upstream subset for DestinationRule-style retry target selection.
+    upstream_subset: Option<String>,
     /// When true, forward encrypted client bytes directly without TLS termination.
     passthrough: bool,
     /// Whether TCP Fast Open is enabled (gated on `FERRUM_TCP_FASTOPEN_ENABLED`).
@@ -1312,6 +1314,7 @@ async fn handle_tcp_connection_inner(
             tcp_half_close_max_wait_seconds,
             retry: proxy.retry.clone(),
             upstream_id: proxy.upstream_id.clone(),
+            upstream_subset: proxy.upstream_subset.clone(),
             passthrough: proxy.passthrough,
             tcp_fastopen_enabled: tcp_fastopen,
         };
@@ -2031,13 +2034,24 @@ fn try_next_target(
         path: None,
         tags: std::collections::HashMap::new(),
     };
-    let next = LoadBalancerCache::select_next_target_from(
-        lb_snapshot,
-        upstream_id,
-        current_host,
-        &exclude,
-        None,
-    )?;
+    let next = if let Some(subset_name) = params.upstream_subset.as_deref() {
+        LoadBalancerCache::select_next_target_subset_from(
+            lb_snapshot,
+            upstream_id,
+            current_host,
+            subset_name,
+            &exclude,
+            None,
+        )
+    } else {
+        LoadBalancerCache::select_next_target_from(
+            lb_snapshot,
+            upstream_id,
+            current_host,
+            &exclude,
+            None,
+        )
+    }?;
     Some((next.host.clone(), next.port))
 }
 

@@ -947,6 +947,18 @@ impl AdminResource for Proxy {
                             )]));
                         }
                     }
+                    if let Some(subset_name) = resource.upstream_subset.as_deref() {
+                        let subset_exists = upstream
+                            .subsets
+                            .as_ref()
+                            .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name));
+                        if !subset_exists {
+                            return Err(AfterValidateError::BadRequest(vec![format!(
+                                "upstream_subset '{}' is not defined on upstream_id '{}'",
+                                subset_name, upstream_id
+                            )]));
+                        }
+                    }
                 }
                 Ok(None) => {
                     return Err(AfterValidateError::BadRequest(vec![format!(

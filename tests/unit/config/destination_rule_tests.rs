@@ -6,8 +6,8 @@
 //! - pool_max_requests_per_connection serde
 
 use ferrum_edge::config::types::{
-    LoadBalancerAlgorithm, PassiveHealthCheck, SubsetDefinition, SubsetTrafficPolicy, Upstream,
-    UpstreamTarget,
+    GatewayConfig, LoadBalancerAlgorithm, PassiveHealthCheck, SubsetDefinition,
+    SubsetTrafficPolicy, Upstream, UpstreamTarget,
 };
 use std::collections::HashMap;
 
@@ -218,6 +218,19 @@ fn upstream_validates_too_many_subsets() {
 }
 
 #[test]
+fn upstream_rejects_empty_subset_list() {
+    let u = make_upstream(Some(vec![]));
+    let errors = u.validate_fields().unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("subsets must not be empty")),
+        "Expected empty subset list error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
 fn upstream_valid_subsets_pass_validation() {
     let u = make_upstream(Some(vec![
         SubsetDefinition {
@@ -361,4 +374,75 @@ fn proxy_upstream_subset_round_trip() {
 
     let proxy: ferrum_edge::config::types::Proxy = serde_json::from_str(json).unwrap();
     assert_eq!(proxy.upstream_subset.as_deref(), Some("canary"));
+}
+
+#[test]
+fn gateway_config_validates_proxy_subset_reference() {
+    let config: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "proxies": [{
+            "id": "p1",
+            "listen_path": "/test",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "upstream_id": "u1",
+            "upstream_subset": "missing"
+        }],
+        "consumers": [],
+        "plugin_configs": [],
+        "upstreams": [{
+            "id": "u1",
+            "targets": [{
+                "host": "10.0.0.1",
+                "port": 8080,
+                "tags": {"version": "v1"}
+            }],
+            "subsets": [{
+                "name": "stable",
+                "labels": {"version": "v1"}
+            }]
+        }]
+    }))
+    .unwrap();
+
+    let errors = config.validate_upstream_references().unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| { e.contains("upstream_subset 'missing'") && e.contains("upstream_id 'u1'") }),
+        "Expected missing subset reference error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn gateway_config_accepts_valid_proxy_subset_reference() {
+    let config: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "proxies": [{
+            "id": "p1",
+            "listen_path": "/test",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "upstream_id": "u1",
+            "upstream_subset": "stable"
+        }],
+        "consumers": [],
+        "plugin_configs": [],
+        "upstreams": [{
+            "id": "u1",
+            "targets": [{
+                "host": "10.0.0.1",
+                "port": 8080,
+                "tags": {"version": "v1"}
+            }],
+            "subsets": [{
+                "name": "stable",
+                "labels": {"version": "v1"}
+            }]
+        }]
+    }))
+    .unwrap();
+
+    assert!(config.validate_upstream_references().is_ok());
 }

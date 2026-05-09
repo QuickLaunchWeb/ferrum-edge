@@ -5,7 +5,7 @@ use super::Migration;
 /// V2: Add DestinationRule runtime support fields.
 ///
 /// Adds columns for subset routing, ejection cap, and per-connection request limits:
-/// - `proxies.pool_max_requests_per_connection` (INTEGER) — max requests before recycling a backend connection
+/// - `proxies.pool_max_requests_per_connection` (INTEGER) — DestinationRule schema-compatibility field
 /// - `proxies.upstream_subset` (TEXT) — named subset of the upstream to route to
 /// - `upstreams.subsets` (TEXT/JSON) — subset definitions with label selectors
 pub struct V002DestinationRuleFields;
@@ -56,6 +56,30 @@ impl V002DestinationRuleFields {
     }
 }
 
+fn is_duplicate_column_error(error: &sqlx::Error) -> bool {
+    let Some(db_error) = error.as_database_error() else {
+        return false;
+    };
+
+    if let Some(code) = db_error.code() {
+        match code.as_ref() {
+            // PostgreSQL duplicate_column
+            "42701" |
+            // MySQL / MariaDB duplicate column
+            "42S21" => return true,
+            _ => {}
+        }
+    }
+
+    let msg = db_error.message().to_ascii_lowercase();
+    // SQLite: "duplicate column name: ...". Some drivers expose no portable
+    // code, so keep the fallback narrow to column-specific text instead of
+    // treating every "already exists" error as idempotent.
+    msg.contains("duplicate column")
+        || msg.contains("duplicate column name")
+        || (msg.contains("column") && msg.contains("already exists"))
+}
+
 /// Execute an ALTER TABLE ADD COLUMN statement, silently ignoring "duplicate column"
 /// errors. This makes the migration idempotent when the column already exists
 /// (e.g., fresh databases where V001 includes the column in CREATE TABLE).
@@ -63,11 +87,7 @@ async fn add_column_if_missing(pool: &AnyPool, sql: &str) -> Result<(), anyhow::
     match sqlx::query(sql).execute(pool).await {
         Ok(_) => Ok(()),
         Err(e) => {
-            let msg = e.to_string().to_lowercase();
-            // SQLite: "duplicate column name: ..."
-            // PostgreSQL: "column \"...\" of relation \"...\" already exists"
-            // MySQL: "Duplicate column name '...'"
-            if msg.contains("duplicate column") || msg.contains("already exists") {
+            if is_duplicate_column_error(&e) {
                 Ok(())
             } else {
                 Err(e.into())

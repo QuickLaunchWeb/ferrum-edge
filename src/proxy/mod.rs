@@ -3795,21 +3795,38 @@ async fn handle_websocket_request_authenticated(
                     if let (Some(upstream_id), Some(prev_target)) =
                         (&proxy.upstream_id, &current_target)
                         && let Some(ref hash_key) = lb_hash_key
-                        && let Some(next) = LoadBalancerCache::select_next_target_from(
-                            &epoch.load_balancer,
-                            upstream_id,
-                            hash_key,
-                            prev_target,
-                            Some(&crate::load_balancer::HealthContext {
+                        && let Some(next) = {
+                            let health_ctx = crate::load_balancer::HealthContext {
                                 active_unhealthy: &state.health_checker.active_unhealthy_targets,
                                 proxy_passive: state
                                     .health_checker
                                     .passive_health
                                     .get(&proxy.id)
                                     .map(|r| r.value().clone()),
-                                max_ejection_percent: None,
-                            }),
-                        )
+                                max_ejection_percent: LoadBalancerCache::max_ejection_percent_from(
+                                    &epoch.load_balancer,
+                                    upstream_id,
+                                ),
+                            };
+                            if let Some(subset_name) = proxy.upstream_subset.as_deref() {
+                                LoadBalancerCache::select_next_target_subset_from(
+                                    &epoch.load_balancer,
+                                    upstream_id,
+                                    hash_key,
+                                    subset_name,
+                                    prev_target,
+                                    Some(&health_ctx),
+                                )
+                            } else {
+                                LoadBalancerCache::select_next_target_from(
+                                    &epoch.load_balancer,
+                                    upstream_id,
+                                    hash_key,
+                                    prev_target,
+                                    Some(&health_ctx),
+                                )
+                            }
+                        }
                     {
                         current_backend_url = build_websocket_backend_url_with_target(
                             &proxy,
@@ -7453,21 +7470,38 @@ async fn handle_proxy_request_inner(
                 if let (Some(upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &grpc_current_target)
                     && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = LoadBalancerCache::select_next_target_from(
-                        &epoch.load_balancer,
-                        upstream_id,
-                        hash_key,
-                        prev_target,
-                        Some(&crate::load_balancer::HealthContext {
+                    && let Some(next) = {
+                        let health_ctx = crate::load_balancer::HealthContext {
                             active_unhealthy: &state.health_checker.active_unhealthy_targets,
                             proxy_passive: state
                                 .health_checker
                                 .passive_health
                                 .get(&proxy.id)
                                 .map(|r| r.value().clone()),
-                            max_ejection_percent: None,
-                        }),
-                    )
+                            max_ejection_percent: LoadBalancerCache::max_ejection_percent_from(
+                                &epoch.load_balancer,
+                                upstream_id,
+                            ),
+                        };
+                        if let Some(subset_name) = proxy.upstream_subset.as_deref() {
+                            LoadBalancerCache::select_next_target_subset_from(
+                                &epoch.load_balancer,
+                                upstream_id,
+                                hash_key,
+                                subset_name,
+                                prev_target,
+                                Some(&health_ctx),
+                            )
+                        } else {
+                            LoadBalancerCache::select_next_target_from(
+                                &epoch.load_balancer,
+                                upstream_id,
+                                hash_key,
+                                prev_target,
+                                Some(&health_ctx),
+                            )
+                        }
+                    }
                 {
                     grpc_backend_url = build_backend_url_with_target(
                         &proxy,
@@ -8247,21 +8281,38 @@ async fn handle_proxy_request_inner(
             // same protocol.
             if let (Some(upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
                 && let Some(ref hash_key) = lb_hash_key
-                && let Some(next) = LoadBalancerCache::select_next_target_from(
-                    &epoch.load_balancer,
-                    upstream_id,
-                    hash_key,
-                    prev_target,
-                    Some(&crate::load_balancer::HealthContext {
+                && let Some(next) = {
+                    let health_ctx = crate::load_balancer::HealthContext {
                         active_unhealthy: &state.health_checker.active_unhealthy_targets,
                         proxy_passive: state
                             .health_checker
                             .passive_health
                             .get(&proxy.id)
                             .map(|r| r.value().clone()),
-                        max_ejection_percent: None,
-                    }),
-                )
+                        max_ejection_percent: LoadBalancerCache::max_ejection_percent_from(
+                            &epoch.load_balancer,
+                            upstream_id,
+                        ),
+                    };
+                    if let Some(subset_name) = proxy.upstream_subset.as_deref() {
+                        LoadBalancerCache::select_next_target_subset_from(
+                            &epoch.load_balancer,
+                            upstream_id,
+                            hash_key,
+                            subset_name,
+                            prev_target,
+                            Some(&health_ctx),
+                        )
+                    } else {
+                        LoadBalancerCache::select_next_target_from(
+                            &epoch.load_balancer,
+                            upstream_id,
+                            hash_key,
+                            prev_target,
+                            Some(&health_ctx),
+                        )
+                    }
+                }
             {
                 let target_changed = next.host != prev_target.host || next.port != prev_target.port;
                 current_url = build_backend_url_with_target(

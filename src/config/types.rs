@@ -341,20 +341,22 @@ pub struct PassiveHealthCheck {
     /// Maximum percentage of targets (0-100) that can be ejected simultaneously
     /// via passive health checks. Prevents cascading failures where a transient
     /// issue ejects all backends. When the ejection count would exceed this cap,
-    /// the most-recently-ejected targets are re-admitted first.
+    /// the earliest passive ejections are re-admitted first.
     /// `None` (default) = no cap (existing behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_ejection_percent: Option<u8>,
-    /// Subset of HTTP status codes (e.g., 502, 503, 504) that count as
+    /// Reserved for DestinationRule parity: subset of HTTP status codes (e.g., 502, 503, 504) that count as
     /// gateway errors for outlier detection, tracked separately from the
     /// general `unhealthy_status_codes`. When `split_external_local_origin_errors`
-    /// is true, these codes are used for the external-origin error bucket.
+    /// is true, these codes will be used for the external-origin error bucket.
+    /// Currently validated and persisted, but not yet applied by passive health.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_error_codes: Option<Vec<u16>>,
-    /// When true, track local-origin errors (connection failures, timeouts)
+    /// Reserved for DestinationRule parity: when true, track local-origin errors (connection failures, timeouts)
     /// separately from external errors (HTTP 5xx responses). This allows
     /// different thresholds and windows for network-level vs application-level
-    /// failures in outlier detection.
+    /// failures in outlier detection. Currently validated and persisted, but
+    /// not yet applied by passive health.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split_external_local_origin_errors: Option<bool>,
 }
@@ -1083,10 +1085,11 @@ pub struct Proxy {
     /// When set, overrides the global `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` default.
     #[serde(default)]
     pub pool_http3_connections_per_backend: Option<usize>,
-    /// Maximum number of requests to send over a single pooled connection
-    /// before closing it and opening a new one. Maps to Istio
-    /// DestinationRule `connectionPool.http.maxRequestsPerConnection`.
-    /// `None` (default) = no limit (connections are reused indefinitely).
+    /// Reserved for Istio DestinationRule
+    /// `connectionPool.http.maxRequestsPerConnection`. Reqwest/hyper do not
+    /// expose a stable per-connection request cap for the shared client pool
+    /// yet, so this is validated and persisted as a schema-compatibility field
+    /// but has no runtime effect. `None` (default) = no configured cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_max_requests_per_connection: Option<u64>,
     /// Optional upstream ID for load-balanced backends.
@@ -1775,17 +1778,33 @@ impl GatewayConfig {
     /// In file mode there's no DB, so this catches dangling references
     /// at config load time.
     pub fn validate_upstream_references(&self) -> Result<(), Vec<String>> {
-        let upstream_ids: HashSet<&str> = self.upstreams.iter().map(|u| u.id.as_str()).collect();
+        let upstreams_by_id: HashMap<&str, &Upstream> =
+            self.upstreams.iter().map(|u| (u.id.as_str(), u)).collect();
         let mut errors = Vec::new();
 
         for proxy in &self.proxies {
-            if let Some(ref uid) = proxy.upstream_id
-                && !upstream_ids.contains(uid.as_str())
-            {
-                errors.push(format!(
-                    "Proxy '{}' references non-existent upstream_id '{}'",
-                    proxy.id, uid
-                ));
+            if let Some(ref uid) = proxy.upstream_id {
+                match upstreams_by_id.get(uid.as_str()) {
+                    Some(upstream) => {
+                        if let Some(subset_name) = proxy.upstream_subset.as_deref() {
+                            let subset_exists = upstream.subsets.as_ref().is_some_and(|subsets| {
+                                subsets.iter().any(|s| s.name == subset_name)
+                            });
+                            if !subset_exists {
+                                errors.push(format!(
+                                    "Proxy '{}' references upstream_subset '{}' that is not defined on upstream_id '{}'",
+                                    proxy.id, subset_name, uid
+                                ));
+                            }
+                        }
+                    }
+                    None => {
+                        errors.push(format!(
+                            "Proxy '{}' references non-existent upstream_id '{}'",
+                            proxy.id, uid
+                        ));
+                    }
+                }
             }
         }
 
@@ -3413,6 +3432,12 @@ impl Upstream {
 
         // Subset definitions
         if let Some(ref subsets) = self.subsets {
+            if subsets.is_empty() {
+                errors.push(
+                    "subsets must not be empty — omit the field when no subsets are defined"
+                        .to_string(),
+                );
+            }
             if subsets.len() > MAX_SUBSETS_PER_UPSTREAM {
                 errors.push(format!(
                     "subsets must not have more than {} entries (got {})",
