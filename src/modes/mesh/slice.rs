@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-use crate::config::mesh::{
+use crate::config::types::GatewayConfig;
+use crate::modes::mesh::config::{
     MeshPolicy, MeshService, MultiClusterConfig, PeerAuthentication, ServiceEntry, TrustBundleSet,
     Workload, policy_scope_applies_to_workload, workload_selector_matches,
 };
-use crate::config::types::GatewayConfig;
 
 /// Node/workload selector used by both ADS and native `MeshSubscribe`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

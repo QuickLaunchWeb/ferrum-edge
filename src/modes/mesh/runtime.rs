@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use arc_swap::ArcSwap;
 use tokio::sync::{Notify, watch};
 
-use crate::xds::slice::MeshSlice;
+use crate::modes::mesh::slice::MeshSlice;
 
 /// Lock-free holder for the current Layer 2 mesh slice.
 #[derive(Clone)]

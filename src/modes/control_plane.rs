@@ -2,9 +2,9 @@
 //!
 //! The CP polls the database using the same incremental strategy as database
 //! mode, but instead of proxying traffic, it broadcasts config deltas to
-//! connected Data Planes via a tokio `broadcast` channel → gRPC `Subscribe`
-//! stream. On incremental poll failure, it falls back to a full reload and
-//! broadcasts a `FULL_SNAPSHOT` to all DPs.
+//! connected Data Planes and mesh nodes via dedicated tokio `broadcast`
+//! channels → gRPC streams. On incremental poll failure, it falls back to a
+//! full reload and broadcasts fresh snapshots to all subscribers.
 //!
 //! The admin API is read/write (same as database mode). The CP validates
 //! DP client JWT tokens using `FERRUM_CP_DP_GRPC_JWT_SECRET` and enforces
@@ -29,6 +29,7 @@ use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot as apply_incremental_to_config;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::cp_server::CpGrpcServer;
+use crate::grpc::mesh_server::MeshGrpcServer;
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
 use crate::xds::XdsAdsServer;
@@ -146,12 +147,22 @@ pub async fn run(
     // tokens with the same `iss` value and advertise the same namespace, or
     // the CP rejects them before streaming any config.
     let dp_registry = Arc::new(crate::grpc::cp_server::DpNodeRegistry::new());
+    let mesh_registry = Arc::new(crate::grpc::mesh_registry::MeshNodeRegistry::new());
     let (grpc_server, update_tx) =
         CpGrpcServer::with_channel_capacity_registry_issuer_and_namespace(
             config_arc.clone(),
             grpc_secret.clone(),
             env_config.cp_broadcast_channel_capacity,
             dp_registry.clone(),
+            env_config.cp_dp_grpc_jwt_issuer.clone(),
+            env_config.namespace.clone(),
+        );
+    let (mesh_grpc_server, mesh_update_tx) =
+        MeshGrpcServer::with_channel_capacity_registry_issuer_and_namespace(
+            config_arc.clone(),
+            grpc_secret.clone(),
+            env_config.cp_broadcast_channel_capacity,
+            mesh_registry.clone(),
             env_config.cp_dp_grpc_jwt_issuer.clone(),
             env_config.namespace.clone(),
         );
@@ -205,6 +216,7 @@ pub async fn run(
         admin_allowed_cidrs: admin_allowed_cidrs.clone(),
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         dp_registry: Some(dp_registry.clone()),
+        mesh_registry: Some(mesh_registry.clone()),
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
@@ -391,20 +403,20 @@ pub async fn run(
             };
             let incoming = TcpListenerStream::new(grpc_listener);
             let _ = grpc_started_tx.send(());
-            if let Some(xds_server) = xds_server {
-                if let Err(e) = builder
-                    .add_service(grpc_server.into_service())
+            let router = builder
+                .add_service(grpc_server.into_service())
+                .add_service(mesh_grpc_server.into_service());
+            let result = if let Some(xds_server) = xds_server {
+                router
                     .add_service(xds_server.into_service())
                     .serve_with_incoming_shutdown(incoming, shutdown_signal)
                     .await
-                {
-                    error!("gRPC server error: {}", e);
-                }
-            } else if let Err(e) = builder
-                .add_service(grpc_server.into_service())
-                .serve_with_incoming_shutdown(incoming, shutdown_signal)
-                .await
-            {
+            } else {
+                router
+                    .serve_with_incoming_shutdown(incoming, shutdown_signal)
+                    .await
+            };
+            if let Err(e) = result {
                 error!("gRPC server error: {}", e);
             }
         });
@@ -419,6 +431,7 @@ pub async fn run(
     } else {
         info!("CP gRPC listen port is 0 — gRPC listener disabled");
         drop(grpc_server); // consumed by the gRPC spawn when enabled
+        drop(mesh_grpc_server); // consumed by the gRPC spawn when enabled
         drop(xds_server);
         None
     };
@@ -468,7 +481,7 @@ pub async fn run(
         None
     };
 
-    // Database polling loop -> push incremental deltas to DPs (with shutdown).
+    // Database polling loop -> push incremental deltas to DPs and mesh nodes (with shutdown).
     //
     // Uses the same incremental polling strategy as database mode: indexed
     // `updated_at > ?` queries + lightweight ID queries for deletion detection.
@@ -511,6 +524,7 @@ pub async fn run(
     let replica_url_for_reconnect = effective_replica_url.clone();
     let poll_namespace = env_config.namespace.clone();
     let dp_registry_poll = dp_registry.clone();
+    let mesh_registry_poll = mesh_registry.clone();
 
     let db_poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
@@ -633,21 +647,27 @@ pub async fn run(
                                     &result.removed_upstream_ids,
                                 );
 
-                                // Broadcast delta to DPs before updating local config
-                                // so that a DP calling GetFullConfig immediately after
-                                // receives the new version.
+                                // Apply to CP's own in-memory config before broadcasting so
+                                // subscribers that connect during this poll either receive the
+                                // queued delta or load a snapshot that already contains it.
+                                // The local apply needs to consume an `IncrementalResult`, so
+                                // we clone exactly once for it; the CP broadcast borrows
+                                // (serializes to JSON), and the mesh broadcast consumes the
+                                // original — keeping the per-poll clone count to one.
                                 let version = poll_ts.to_rfc3339();
-                                CpGrpcServer::broadcast_delta_with_registry(&update_tx, &result, &version, &dp_registry_poll);
-
-                                // Apply to CP's own in-memory config (for GetFullConfig
-                                // and the Admin API cached_config reads).
-                                // Clone current config, apply incremental changes, store.
                                 let mut new_config = (*config_poll.load_full()).clone();
-                                apply_incremental_to_config(&mut new_config, result);
+                                apply_incremental_to_config(&mut new_config, result.clone());
                                 new_config.normalize_fields();
                                 config_poll.store(Arc::new(new_config));
 
-                                info!("Incremental config update pushed to DPs");
+                                // Mesh streams render their per-subscriber slices from the
+                                // same delta payload. DP and mesh broadcasts are intentionally
+                                // coupled to the same polling cycle so both subscriber types
+                                // converge on the same config version simultaneously.
+                                CpGrpcServer::broadcast_delta_with_registry(&update_tx, &result, &version, &dp_registry_poll);
+                                MeshGrpcServer::broadcast_delta_with_registry(&mesh_update_tx, result, &version, &mesh_registry_poll);
+
+                                info!("Incremental config update pushed to DPs and mesh nodes");
                                 last_poll_at = Some(poll_ts);
                             }
                             Err(e) => {
@@ -665,9 +685,11 @@ pub async fn run(
                                         known_plugin_config_ids = pc;
                                         known_upstream_ids = u;
                                         last_poll_at = Some(new_config.loaded_at);
-                                        config_poll.store(Arc::new(new_config.clone()));
+                                        let new_config_arc = Arc::new(new_config.clone());
+                                        config_poll.store(new_config_arc.clone());
                                         CpGrpcServer::broadcast_update_with_registry(&update_tx, &new_config, &dp_registry_poll);
-                                        info!("Configuration reloaded from database (full fallback) and pushed to DPs");
+                                        MeshGrpcServer::broadcast_full_with_registry(&mesh_update_tx, new_config_arc, &mesh_registry_poll);
+                                        info!("Configuration reloaded from database (full fallback) and pushed to DPs and mesh nodes");
                                     }
                                     Err(e2) => {
                                         // Both incremental and full reload failed —
@@ -683,9 +705,11 @@ pub async fn run(
                                                         known_plugin_config_ids = pc;
                                                         known_upstream_ids = u;
                                                         last_poll_at = Some(new_config.loaded_at);
-                                                        config_poll.store(Arc::new(new_config.clone()));
+                                                        let new_config_arc = Arc::new(new_config.clone());
+                                                        config_poll.store(new_config_arc.clone());
                                                         CpGrpcServer::broadcast_update_with_registry(&update_tx, &new_config, &dp_registry_poll);
-                                                        info!("Configuration reloaded from database (failover) and pushed to DPs");
+                                                        MeshGrpcServer::broadcast_full_with_registry(&mesh_update_tx, new_config_arc, &mesh_registry_poll);
+                                                        info!("Configuration reloaded from database (failover) and pushed to DPs and mesh nodes");
                                                     }
                                                     Err(e3) => {
                                                         db_available_poll.store(false, Ordering::Relaxed);

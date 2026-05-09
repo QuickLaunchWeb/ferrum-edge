@@ -13,12 +13,12 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::mesh::MeshConfig;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
     PluginAssociation, Proxy, ResponseBodyMode, Upstream, UpstreamTarget, default_namespace,
 };
 use crate::identity::spiffe::TrustDomain;
+use crate::modes::mesh::config::MeshConfig;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct K8sMetadata {
