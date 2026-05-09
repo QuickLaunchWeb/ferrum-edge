@@ -16,9 +16,9 @@ use crate::config::mesh::{AppProtocol, MeshService, ServicePort, TrustBundle, Tr
 use crate::grpc::dp_client::{DpGrpcTlsConfig, GrpcJwtSecret, generate_dp_jwt_with_issuer};
 use crate::identity::TrustDomain;
 use crate::modes::mesh::runtime::MeshRuntimeState;
+use crate::xds::MeshSlice;
 use crate::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::xds::proto::{self, DiscoveryRequest, Node, Status};
-use crate::xds::slice::MeshSlice;
 use crate::xds::translator::{
     CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL, SDS_TYPE_URL, XDS_TYPE_URLS,
 };
@@ -30,8 +30,29 @@ const INITIAL_TYPE_URL_ORDER: [&str; 5] = [
     RDS_TYPE_URL,
     SDS_TYPE_URL,
 ];
+const XDS_APPLY_DEBOUNCE: Duration = Duration::from_millis(25);
 
 type BearerToken = MetadataValue<tonic::metadata::Ascii>;
+
+#[derive(Clone)]
+struct AdsAuth {
+    jwt_secret: GrpcJwtSecret,
+    node_id: String,
+}
+
+impl AdsAuth {
+    fn bearer_token(&self) -> Result<BearerToken, tonic::Status> {
+        let auth_token = generate_dp_jwt_with_issuer(
+            self.jwt_secret.as_str(),
+            &self.node_id,
+            self.jwt_secret.issuer(),
+        )
+        .map_err(|e| tonic::Status::unauthenticated(format!("failed to mint xDS JWT: {e}")))?;
+        format!("Bearer {auth_token}").parse().map_err(|e| {
+            tonic::Status::internal(format!("failed to build authorization metadata: {e}"))
+        })
+    }
+}
 
 /// xDS ADS client settings for mesh mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +62,10 @@ pub struct XdsClientConfig {
     pub cluster: String,
     pub namespace: String,
     pub workload_spiffe_id: Option<String>,
+    pub stream_channel_capacity: usize,
+    pub primary_retry_secs: u64,
+    /// Client connection timeout. `0` disables tonic's explicit connect timeout.
+    pub connect_timeout_seconds: u64,
     pub labels: BTreeMap<String, String>,
 }
 
@@ -67,20 +92,28 @@ impl ClientSubscriptionState {
         }
     }
 
-    fn build_initial_requests(node_id: &str, cluster: &str) -> Vec<DiscoveryRequest> {
+    fn build_initial_requests(&self, node_id: &str, cluster: &str) -> Vec<DiscoveryRequest> {
         INITIAL_TYPE_URL_ORDER
             .iter()
-            .map(|type_url| DiscoveryRequest {
-                version_info: String::new(),
-                node: Some(Node {
-                    id: node_id.to_string(),
-                    cluster: cluster.to_string(),
-                    metadata: Vec::new(),
-                }),
-                resource_names: Vec::new(),
-                type_url: (*type_url).to_string(),
-                response_nonce: String::new(),
-                error_detail: None,
+            .map(|type_url| {
+                let subscription = self.subscriptions.get(*type_url);
+                DiscoveryRequest {
+                    version_info: subscription
+                        .and_then(|sub| sub.last_acked_version.clone())
+                        .unwrap_or_default(),
+                    node: Some(Node {
+                        id: node_id.to_string(),
+                        cluster: cluster.to_string(),
+                        metadata: Vec::new(),
+                    }),
+                    // Phase B subscribes wildcard-style to each supported type URL.
+                    // Ferrum CP and Istio wildcard modes accept empty resource_names;
+                    // explicit-resource subscriptions are a later xDS client mode.
+                    resource_names: Vec::new(),
+                    type_url: (*type_url).to_string(),
+                    response_nonce: String::new(),
+                    error_detail: None,
+                }
             })
             .collect()
     }
@@ -99,6 +132,7 @@ impl ClientSubscriptionState {
                 .and_then(|sub| sub.last_received_version.clone())
                 .unwrap_or_default(),
             node: None,
+            // Wildcard subscription: keep resource_names empty on ACKs too.
             resource_names: Vec::new(),
             type_url: type_url.to_string(),
             response_nonce: subscription
@@ -115,6 +149,7 @@ impl ClientSubscriptionState {
                 .and_then(|sub| sub.last_acked_version.clone())
                 .unwrap_or_default(),
             node: None,
+            // Wildcard subscription: keep resource_names empty on NACKs too.
             resource_names: Vec::new(),
             type_url: type_url.to_string(),
             response_nonce: subscription
@@ -143,6 +178,18 @@ impl ClientSubscriptionState {
     }
 }
 
+impl Default for ClientSubscriptionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct XdsStreamState {
+    subscriptions: ClientSubscriptionState,
+    accumulator: ResourceAccumulator,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ResourceAccumulator {
     resources_by_type: HashMap<String, Vec<AccumulatedResource>>,
@@ -152,8 +199,6 @@ struct ResourceAccumulator {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AccumulatedResource {
     name: String,
-    #[allow(dead_code)]
-    value: Vec<u8>,
 }
 
 impl ResourceAccumulator {
@@ -170,6 +215,11 @@ impl ResourceAccumulator {
         if !is_known_type_url(type_url) {
             return Err(format!("unknown xDS type_url '{type_url}'"));
         }
+        if !resources.is_empty() && version.trim().is_empty() {
+            return Err(format!(
+                "xDS response for type_url '{type_url}' has resources but empty version_info"
+            ));
+        }
 
         let mut accumulated = Vec::with_capacity(resources.len());
         for resource in resources {
@@ -185,10 +235,7 @@ impl ResourceAccumulator {
                     "xDS resource for type_url '{type_url}' has an empty name"
                 ));
             }
-            accumulated.push(AccumulatedResource {
-                name,
-                value: resource.value.clone(),
-            });
+            accumulated.push(AccumulatedResource { name });
         }
 
         self.resources_by_type
@@ -221,18 +268,13 @@ impl ResourceAccumulator {
 
 /// Maintain a live xDS ADS stream with simple multi-CP failover.
 pub async fn start_xds_client_with_shutdown(
-    cp_urls: Vec<String>,
     jwt_secret: GrpcJwtSecret,
     config: XdsClientConfig,
     state: MeshRuntimeState,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<DpGrpcTlsConfig>,
 ) {
-    let cp_urls = if cp_urls.is_empty() {
-        config.cp_urls.clone()
-    } else {
-        cp_urls
-    };
+    let cp_urls = config.cp_urls.clone();
     if cp_urls.is_empty() {
         error!("No CP URLs configured — cannot start xDS mesh client");
         return;
@@ -240,6 +282,7 @@ pub async fn start_xds_client_with_shutdown(
 
     let mut current_cp_index = 0usize;
     let mut backoff_secs = BACKOFF_INITIAL_SECS;
+    let mut stream_state = XdsStreamState::default();
 
     info!(
         node_id = %config.node_id,
@@ -256,18 +299,49 @@ pub async fn start_xds_client_with_shutdown(
         }
 
         let cp_url = &cp_urls[current_cp_index];
+        let is_primary = current_cp_index == 0;
+        let is_fallback = !is_primary && cp_urls.len() > 1;
         let mut stream_shutdown_rx = shutdown_rx.clone();
-        let result = tokio::select! {
-            result = connect_ads(
-                cp_url,
-                &jwt_secret,
-                &config,
-                state.clone(),
-                tls_config.as_ref(),
-            ) => result,
-            _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
-                info!("xDS mesh client shutting down");
-                return;
+        let should_race_primary = is_fallback && config.primary_retry_secs > 0;
+        let result = if should_race_primary {
+            tokio::select! {
+                result = connect_ads(
+                    cp_url,
+                    &jwt_secret,
+                    &config,
+                    state.clone(),
+                    tls_config.as_ref(),
+                    &mut stream_state,
+                ) => result,
+                _ = tokio::time::sleep(Duration::from_secs(config.primary_retry_secs)) => {
+                    info!(
+                        primary_retry_secs = config.primary_retry_secs,
+                        cp_url = %cp_url,
+                        "xDS primary retry interval elapsed; reconnecting to primary CP"
+                    );
+                    current_cp_index = 0;
+                    backoff_secs = BACKOFF_INITIAL_SECS;
+                    continue;
+                }
+                _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
+                    info!("xDS mesh client shutting down");
+                    return;
+                }
+            }
+        } else {
+            tokio::select! {
+                result = connect_ads(
+                    cp_url,
+                    &jwt_secret,
+                    &config,
+                    state.clone(),
+                    tls_config.as_ref(),
+                    &mut stream_state,
+                ) => result,
+                _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
+                    info!("xDS mesh client shutting down");
+                    return;
+                }
             }
         };
 
@@ -277,7 +351,9 @@ pub async fn start_xds_client_with_shutdown(
                     cp_url = %cp_url,
                     "xDS ADS stream ended; will reconnect"
                 );
-                current_cp_index = 0;
+                if is_fallback {
+                    current_cp_index = 0;
+                }
                 backoff_secs = BACKOFF_INITIAL_SECS;
                 false
             }
@@ -307,9 +383,12 @@ async fn connect_ads(
     config: &XdsClientConfig,
     state: MeshRuntimeState,
     tls_config: Option<&DpGrpcTlsConfig>,
+    stream_state: &mut XdsStreamState,
 ) -> Result<(), anyhow::Error> {
-    let mut endpoint =
-        Channel::from_shared(cp_url.to_string())?.connect_timeout(Duration::from_secs(10));
+    let mut endpoint = Channel::from_shared(cp_url.to_string())?;
+    if config.connect_timeout_seconds > 0 {
+        endpoint = endpoint.connect_timeout(Duration::from_secs(config.connect_timeout_seconds));
+    }
 
     if let Some(tls) = tls_config {
         let mut client_tls = tonic_tls_config(tls);
@@ -322,9 +401,10 @@ async fn connect_ads(
     }
 
     let channel = endpoint.connect().await?;
-    let auth_token =
-        generate_dp_jwt_with_issuer(jwt_secret.as_str(), &config.node_id, jwt_secret.issuer())?;
-    let token: BearerToken = format!("Bearer {auth_token}").parse()?;
+    let auth = AdsAuth {
+        jwt_secret: jwt_secret.clone(),
+        node_id: config.node_id.clone(),
+    };
     let consumer = XdsConfigConsumer::new(config.clone(), state);
 
     info!(
@@ -335,110 +415,178 @@ async fn connect_ads(
         "Connected to CP, subscribing for xDS ADS config"
     );
 
-    run_ads_stream_with_auth(channel, Some(token), config, &consumer).await
-}
-
-#[allow(dead_code)]
-async fn run_ads_stream(
-    channel: Channel,
-    config: &XdsClientConfig,
-    consumer: &XdsConfigConsumer,
-) -> Result<(), anyhow::Error> {
-    run_ads_stream_with_auth(channel, None, config, consumer).await
+    run_ads_stream_with_auth(channel, Some(auth), config, &consumer, stream_state).await
 }
 
 async fn run_ads_stream_with_auth(
     channel: Channel,
-    auth_token: Option<BearerToken>,
+    auth: Option<AdsAuth>,
     config: &XdsClientConfig,
     consumer: &XdsConfigConsumer,
+    stream_state: &mut XdsStreamState,
 ) -> Result<(), anyhow::Error> {
     #[allow(clippy::result_large_err)]
     let mut client = AggregatedDiscoveryServiceClient::with_interceptor(
         channel,
         move |mut req: tonic::Request<()>| {
-            if let Some(token) = auth_token.clone() {
+            if let Some(auth) = auth.as_ref() {
+                let token = auth.bearer_token()?;
                 req.metadata_mut().insert("authorization", token);
             }
             Ok(req)
         },
     );
 
-    let (tx, rx) = mpsc::channel(16);
+    let (tx, rx) = mpsc::channel(config.stream_channel_capacity.max(1));
     let request_stream = ReceiverStream::new(rx);
     let mut response_stream = client
         .stream_aggregated_resources(request_stream)
         .await?
         .into_inner();
 
-    let mut subscriptions = ClientSubscriptionState::new();
-    for request in ClientSubscriptionState::build_initial_requests(&config.node_id, &config.cluster)
+    for request in stream_state
+        .subscriptions
+        .build_initial_requests(&config.node_id, &config.cluster)
     {
         tx.send(request)
             .await
             .map_err(|_| anyhow::anyhow!("xDS ADS request stream closed before initial request"))?;
     }
 
-    let mut accumulator = ResourceAccumulator::new();
-    while let Some(response) = response_stream.message().await? {
-        let type_url = response.type_url.clone();
-        if !is_known_type_url(&type_url) {
-            return Err(anyhow::anyhow!(
-                "unknown xDS response type_url '{type_url}'"
-            ));
-        }
+    let debounce = tokio::time::sleep(Duration::from_secs(60 * 60 * 24));
+    tokio::pin!(debounce);
+    let mut debounce_active = false;
+    let mut pending_slice: Option<PendingXdsSlice> = None;
 
-        debug!(
-            node_id = %config.node_id,
-            type_url = %type_url,
-            version = %response.version_info,
-            nonce = %response.nonce,
-            resources = response.resources.len(),
-            "Received xDS ADS response"
-        );
-
-        subscriptions.record_response(&type_url, &response.version_info, &response.nonce);
-        let apply_result =
-            accumulator.apply_sotw_response(&type_url, &response.resources, &response.version_info);
-        let slice_result = apply_result.and_then(|_| accumulator.try_build_mesh_slice(config));
-
-        match slice_result {
-            Ok(Some(slice)) => {
-                let version = slice.version.clone();
-                consumer.apply_slice(slice);
-                send_ads_request(&tx, subscriptions.build_ack(&type_url)).await?;
-                subscriptions.mark_acked(&type_url);
-                info!(
-                    node_id = %config.node_id,
-                    namespace = %config.namespace,
-                    version = %version,
-                    type_url = %type_url,
-                    all_types_ready = subscriptions.all_types_have_initial_response(),
-                    "Applied xDS ADS update"
-                );
+    loop {
+        tokio::select! {
+            response = response_stream.message() => {
+                let Some(response) = response? else {
+                    break;
+                };
+                if let Some(pending) =
+                    handle_ads_response(
+                        response,
+                        config,
+                        &tx,
+                        &mut stream_state.subscriptions,
+                        &mut stream_state.accumulator,
+                    ).await?
+                {
+                    pending_slice = Some(pending);
+                    debounce
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + XDS_APPLY_DEBOUNCE);
+                    debounce_active = true;
+                }
             }
-            Ok(None) => {
-                send_ads_request(&tx, subscriptions.build_ack(&type_url)).await?;
-                subscriptions.mark_acked(&type_url);
-                debug!(
-                    node_id = %config.node_id,
-                    type_url = %type_url,
-                    "ACKed xDS ADS response while waiting for remaining resource types"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    node_id = %config.node_id,
-                    type_url = %type_url,
-                    error = %e,
-                    "NACKing invalid xDS ADS response"
-                );
-                send_ads_request(&tx, subscriptions.build_nack(&type_url, e)).await?;
+            _ = &mut debounce, if debounce_active => {
+                if let Some(pending) = pending_slice.take() {
+                    apply_pending_xds_slice(consumer, config, pending);
+                }
+                debounce_active = false;
             }
         }
     }
 
+    if let Some(pending) = pending_slice.take() {
+        apply_pending_xds_slice(consumer, config, pending);
+    }
+
     Ok(())
+}
+
+#[derive(Debug)]
+struct PendingXdsSlice {
+    slice: MeshSlice,
+    type_url: String,
+    all_types_ready: bool,
+}
+
+async fn handle_ads_response(
+    response: proto::DiscoveryResponse,
+    config: &XdsClientConfig,
+    tx: &mpsc::Sender<DiscoveryRequest>,
+    subscriptions: &mut ClientSubscriptionState,
+    accumulator: &mut ResourceAccumulator,
+) -> Result<Option<PendingXdsSlice>, anyhow::Error> {
+    let type_url = response.type_url.clone();
+    if !is_known_type_url(&type_url) {
+        subscriptions.record_response(&type_url, &response.version_info, &response.nonce);
+        let message = format!("unknown xDS response type_url '{type_url}'");
+        send_ads_request(tx, subscriptions.build_nack(&type_url, message.clone())).await?;
+        warn!(
+            node_id = %config.node_id,
+            type_url = %type_url,
+            "Received unknown xDS type_url; sent NACK"
+        );
+        return Ok(None);
+    }
+
+    debug!(
+        node_id = %config.node_id,
+        type_url = %type_url,
+        version = %response.version_info,
+        nonce = %response.nonce,
+        resources = response.resources.len(),
+        "Received xDS ADS response"
+    );
+
+    subscriptions.record_response(&type_url, &response.version_info, &response.nonce);
+    let snapshot = accumulator.clone();
+    let apply_result =
+        accumulator.apply_sotw_response(&type_url, &response.resources, &response.version_info);
+    let slice_result = apply_result.and_then(|_| accumulator.try_build_mesh_slice(config));
+
+    match slice_result {
+        Ok(Some(slice)) => {
+            send_ads_request(tx, subscriptions.build_ack(&type_url)).await?;
+            subscriptions.mark_acked(&type_url);
+            Ok(Some(PendingXdsSlice {
+                slice,
+                type_url,
+                all_types_ready: subscriptions.all_types_have_initial_response(),
+            }))
+        }
+        Ok(None) => {
+            send_ads_request(tx, subscriptions.build_ack(&type_url)).await?;
+            subscriptions.mark_acked(&type_url);
+            debug!(
+                node_id = %config.node_id,
+                type_url = %type_url,
+                "ACKed xDS ADS response while waiting for remaining resource types"
+            );
+            Ok(None)
+        }
+        Err(e) => {
+            *accumulator = snapshot;
+            warn!(
+                node_id = %config.node_id,
+                type_url = %type_url,
+                error = %e,
+                "NACKing invalid xDS ADS response"
+            );
+            send_ads_request(tx, subscriptions.build_nack(&type_url, e)).await?;
+            Ok(None)
+        }
+    }
+}
+
+fn apply_pending_xds_slice(
+    consumer: &XdsConfigConsumer,
+    config: &XdsClientConfig,
+    pending: PendingXdsSlice,
+) {
+    let version = pending.slice.version.clone();
+    consumer.apply_slice(pending.slice);
+    info!(
+        node_id = %config.node_id,
+        namespace = %config.namespace,
+        version = %version,
+        type_url = %pending.type_url,
+        all_types_ready = pending.all_types_ready,
+        "Applied debounced xDS ADS update"
+    );
 }
 
 async fn send_ads_request(
@@ -545,6 +693,9 @@ fn reverse_translate(
         services,
         mesh_policies: Vec::new(),
         peer_authentications: Vec::new(),
+        // Phase B reverse translation rebuilds service routing names only.
+        // External ServiceEntry shape is not recoverable from the minimal
+        // CDS/EDS names consumed here; richer xDS metadata will fill this in.
         service_entries: Vec::new(),
         trust_bundles: build_trust_bundle_set(trust_domains, config)?,
         multi_cluster: None,
@@ -708,6 +859,9 @@ fn trust_domain_from_spiffe_id(spiffe_id: &str) -> Option<&str> {
 }
 
 fn empty_trust_bundle(trust_domain: &str) -> Result<TrustBundle, String> {
+    // Phase B reverse translation preserves trust-domain identity from SDS
+    // resource names. Actual CA/JWT authority material is populated by the
+    // later SDS material path, so these bundles intentionally start empty.
     Ok(TrustBundle {
         trust_domain: TrustDomain::new(trust_domain)
             .map_err(|e| format!("invalid trust domain '{trust_domain}': {e}"))?,
@@ -733,6 +887,9 @@ mod tests {
             cluster: "default".to_string(),
             namespace: "default".to_string(),
             workload_spiffe_id: None,
+            stream_channel_capacity: 32,
+            primary_retry_secs: 300,
+            connect_timeout_seconds: 10,
             labels: BTreeMap::new(),
         }
     }
@@ -767,6 +924,22 @@ mod tests {
         }
     }
 
+    fn discovery_response(
+        type_url: &str,
+        version: &str,
+        nonce: &str,
+        resources: Vec<proto::Any>,
+    ) -> proto::DiscoveryResponse {
+        proto::DiscoveryResponse {
+            version_info: version.to_string(),
+            resources,
+            canary: false,
+            type_url: type_url.to_string(),
+            nonce: nonce.to_string(),
+            control_plane: None,
+        }
+    }
+
     fn apply_all_empty(accumulator: &mut ResourceAccumulator) {
         for type_url in XDS_TYPE_URLS {
             if !accumulator.versions_by_type.contains_key(type_url) {
@@ -791,7 +964,7 @@ mod tests {
 
     #[test]
     fn initial_requests_are_ordered_cds_first() {
-        let requests = ClientSubscriptionState::build_initial_requests("node-a", "default");
+        let requests = ClientSubscriptionState::new().build_initial_requests("node-a", "default");
         let type_urls: Vec<&str> = requests
             .iter()
             .map(|request| request.type_url.as_str())
@@ -816,6 +989,14 @@ mod tests {
     }
 
     #[test]
+    fn initial_type_url_order_matches_supported_type_set() {
+        let supported: BTreeSet<_> = XDS_TYPE_URLS.iter().copied().collect();
+        let initial: BTreeSet<_> = INITIAL_TYPE_URL_ORDER.iter().copied().collect();
+
+        assert_eq!(initial, supported);
+    }
+
+    #[test]
     fn ack_echoes_nonce_and_version() {
         let mut state = ClientSubscriptionState::new();
         state.record_response(CDS_TYPE_URL, "v1", "n1");
@@ -828,6 +1009,22 @@ mod tests {
         assert!(ack.error_detail.is_none());
         assert!(ack.resource_names.is_empty());
         assert!(ack.node.is_none());
+    }
+
+    #[test]
+    fn reconnect_initial_request_uses_last_acked_version() {
+        let mut state = ClientSubscriptionState::new();
+        state.record_response(CDS_TYPE_URL, "v1", "n1");
+        state.mark_acked(CDS_TYPE_URL);
+
+        let requests = state.build_initial_requests("node-a", "default");
+        let cds = requests
+            .iter()
+            .find(|request| request.type_url == CDS_TYPE_URL)
+            .expect("CDS request");
+
+        assert_eq!(cds.version_info, "v1");
+        assert!(cds.response_nonce.is_empty());
     }
 
     #[test]
@@ -855,6 +1052,37 @@ mod tests {
         assert_eq!(detail.message, "bad config");
     }
 
+    #[tokio::test]
+    async fn unknown_type_url_is_nacked_without_erroring_stream() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut state = ClientSubscriptionState::new();
+        let mut accumulator = ResourceAccumulator::new();
+
+        let result = handle_ads_response(
+            discovery_response(
+                "type.googleapis.com/envoy.config.route.v3.ScopedRouteConfiguration",
+                "v1",
+                "n1",
+                Vec::new(),
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+        )
+        .await
+        .expect("unknown type should be NACKed, not fail the stream");
+
+        assert!(result.is_none());
+        let nack = rx.recv().await.expect("NACK sent");
+        assert_eq!(
+            nack.type_url,
+            "type.googleapis.com/envoy.config.route.v3.ScopedRouteConfiguration"
+        );
+        assert_eq!(nack.response_nonce, "n1");
+        assert!(nack.error_detail.is_some());
+    }
+
     #[test]
     fn accumulator_replaces_resources_on_sotw() {
         let mut accumulator = ResourceAccumulator::new();
@@ -880,6 +1108,72 @@ mod tests {
             accumulator.versions_by_type.get(CDS_TYPE_URL).unwrap(),
             "v2"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_cross_type_update_rolls_back_accumulator() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut state = ClientSubscriptionState::new();
+        let mut accumulator = ResourceAccumulator::new();
+
+        accumulator
+            .apply_sotw_response(
+                CDS_TYPE_URL,
+                &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+                "v1",
+            )
+            .expect("CDS applies");
+        accumulator
+            .apply_sotw_response(
+                RDS_TYPE_URL,
+                &[any_resource(RDS_TYPE_URL, "route/default/api")],
+                "v1",
+            )
+            .expect("RDS applies");
+        apply_all_empty(&mut accumulator);
+
+        let result = handle_ads_response(
+            discovery_response(
+                RDS_TYPE_URL,
+                "v2",
+                "n2",
+                vec![any_resource(RDS_TYPE_URL, "route/default/missing")],
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+        )
+        .await
+        .expect("invalid cross-type update should NACK");
+
+        assert!(result.is_none());
+        assert_eq!(
+            accumulator.resources(RDS_TYPE_URL)[0].name,
+            "route/default/api"
+        );
+        assert_eq!(
+            accumulator.versions_by_type.get(RDS_TYPE_URL).unwrap(),
+            "v1"
+        );
+        let nack = rx.recv().await.expect("NACK sent");
+        assert_eq!(nack.type_url, RDS_TYPE_URL);
+        assert_eq!(nack.version_info, "");
+        assert!(nack.error_detail.is_some());
+    }
+
+    #[test]
+    fn non_empty_response_requires_version_info() {
+        let mut accumulator = ResourceAccumulator::new();
+        let err = accumulator
+            .apply_sotw_response(
+                CDS_TYPE_URL,
+                &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+                "",
+            )
+            .expect_err("non-empty response with empty version must be rejected");
+
+        assert!(err.contains("empty version_info"));
     }
 
     #[test]
