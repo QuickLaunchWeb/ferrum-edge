@@ -138,6 +138,7 @@ impl Default for BackendCapabilityRegistry {
 }
 
 impl BackendCapabilityRegistry {
+    #[allow(dead_code)] // Used by tests and external lib callers; binary uses sharded constructor.
     pub fn new() -> Self {
         Self::default()
     }

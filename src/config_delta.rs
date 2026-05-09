@@ -297,12 +297,11 @@ fn diff_removed_ids<T: HasIdAndTimestamp>(old: &[T], new: &[T]) -> Vec<String> {
 
 /// Resources present in both whose `updated_at` changed.
 ///
-/// Uses `!=` instead of `>` so that clock skew (backward timestamp drift)
-/// and coarse-grained timestamps that land on the same value after a real
-/// modification are both detected. The only false positive is when the
-/// timestamp is truly identical AND the resource is unchanged — an
-/// unnecessary but harmless cache rebuild that is strictly preferable to
-/// silently missing a modification.
+/// Uses `!=` instead of `>` for snapshot-to-snapshot comparison so a full
+/// snapshot can detect backward timestamp drift once both versions are present
+/// locally. Incremental SQL polling still depends on its `updated_at > cursor`
+/// predicate to fetch candidates in the first place, so this is a defensive
+/// diff guard rather than a substitute for monotonic database timestamps.
 fn diff_modified<T: HasIdAndTimestamp + Clone>(old: &[T], new: &[T]) -> Vec<T> {
     let old_map: HashMap<&str, DateTime<Utc>> =
         old.iter().map(|r| (r.id(), r.updated_at())).collect();

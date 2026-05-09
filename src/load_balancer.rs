@@ -126,7 +126,7 @@ impl HealthBitset {
 }
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 /// Health context passed to target selection, bundling both active (shared
 /// per-upstream) and passive (per-proxy) unhealthy target state.
@@ -654,6 +654,9 @@ pub struct LoadBalancer {
     /// Protected by a mutex to prevent weight drift under concurrency.
     /// The critical section is sub-microsecond (weight arithmetic only).
     wrr_state: std::sync::Mutex<Vec<i64>>,
+    /// Set on target recovery so WRR pays the stale-weight scan only on the
+    /// first post-recovery selection instead of every steady-state request.
+    wrr_needs_stale_check: AtomicBool,
     /// Active connections per target (for least-connections).
     pub active_connections: DashMap<String, AtomicI64>,
     /// Consistent hash ring (sorted hash values -> target index).
@@ -725,6 +728,7 @@ impl LoadBalancer {
             algorithm,
             rr_counter: AtomicU64::new(0),
             wrr_state: std::sync::Mutex::new(wrr_weights),
+            wrr_needs_stale_check: AtomicBool::new(false),
             active_connections: DashMap::new(),
             hash_ring,
             latency_ewma,
@@ -837,6 +841,7 @@ impl LoadBalancer {
             Some(k) => k,
             None => return,
         };
+        self.wrr_needs_stale_check.store(true, Ordering::Release);
 
         // Find minimum EWMA among all targets (excluding unset)
         let min_ewma = self
@@ -1163,9 +1168,8 @@ impl LoadBalancer {
     ///
     /// Stale-weight guard: when a target transitions from unhealthy back to
     /// healthy, its accumulated `weights[i]` may hold a stale value from
-    /// before it went down. If the magnitude exceeds `total_weight * 2` the
-    /// weight is reset to 0 before the selection loop, preventing a traffic
-    /// burst (stale positive) or starvation (stale negative) on recovery.
+    /// before it went down. The recovery hook sets `wrr_needs_stale_check`,
+    /// so this scan runs only once per recovery event, not on every request.
     fn select_wrr_bitset(&self, healthy: &HealthBitset) -> Option<Arc<UpstreamTarget>> {
         let total_weight: i64 = self
             .targets
@@ -1183,14 +1187,15 @@ impl LoadBalancer {
 
         let mut weights = self.wrr_state.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Reset stale weights for targets that just re-entered the healthy set.
-        // A healthy target whose accumulated weight magnitude exceeds
-        // `total_weight * 2` was excluded from previous rounds and drifted —
-        // zero it so it re-enters smoothly without a burst or starvation.
-        let drift_cap = total_weight.saturating_mul(2);
-        for i in 0..self.targets.len() {
-            if healthy.contains(i) && weights[i].abs() > drift_cap {
-                weights[i] = 0;
+        if self.wrr_needs_stale_check.swap(false, Ordering::AcqRel) {
+            // Reset stale weights for targets that just re-entered the healthy set.
+            // Use a deliberately loose cap so heterogeneous high-weight targets
+            // are not reset during normal smooth-WRR oscillation.
+            let drift_cap = total_weight.saturating_mul(4).max(1);
+            for i in 0..self.targets.len() {
+                if healthy.contains(i) && weights[i].abs() > drift_cap {
+                    weights[i] = 0;
+                }
             }
         }
 
@@ -1402,11 +1407,13 @@ impl LoadBalancer {
 
         let mut weights = self.wrr_state.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Reset stale weights for candidates that drifted while unhealthy.
-        let drift_cap = total_weight.saturating_mul(2);
-        for &(orig_idx, _) in candidates {
-            if weights[orig_idx].abs() > drift_cap {
-                weights[orig_idx] = 0;
+        if self.wrr_needs_stale_check.swap(false, Ordering::AcqRel) {
+            // Reset stale weights for candidates that drifted while unhealthy.
+            let drift_cap = total_weight.saturating_mul(4).max(1);
+            for &(orig_idx, _) in candidates {
+                if weights[orig_idx].abs() > drift_cap {
+                    weights[orig_idx] = 0;
+                }
             }
         }
 

@@ -240,11 +240,16 @@ impl CircuitBreaker {
             STATE_CLOSED => {
                 let failures = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if failures >= self.config.failure_threshold {
-                    // CAS ensures only one thread wins the CLOSED→OPEN transition.
-                    // A concurrent record_success() could reset failure_count between
-                    // our fetch_add and here; with a plain store the transition would
-                    // still complete despite the counter being 0. CAS makes the
-                    // transition conditional on the state still being CLOSED.
+                    // Re-read the counter before and after the transition attempt.
+                    // A concurrent CLOSED-state success may reset failure_count
+                    // after our fetch_add; opening on that stale `failures` value
+                    // would turn a broken consecutive-failure streak into an OPEN
+                    // circuit. CAS still ensures only one thread performs the
+                    // CLOSED→OPEN transition, while the counter checks keep the
+                    // transition tied to the current consecutive-failure count.
+                    if self.failure_count.load(Ordering::Acquire) < self.config.failure_threshold {
+                        return;
+                    }
                     if self
                         .state
                         .compare_exchange(
@@ -255,7 +260,20 @@ impl CircuitBreaker {
                         )
                         .is_ok()
                     {
-                        warn!("Circuit breaker opening after {} failures", failures);
+                        let current_failures = self.failure_count.load(Ordering::Acquire);
+                        if current_failures < self.config.failure_threshold {
+                            let _ = self.state.compare_exchange(
+                                STATE_OPEN,
+                                STATE_CLOSED,
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
+                            );
+                            return;
+                        }
+                        warn!(
+                            "Circuit breaker opening after {} failures",
+                            current_failures
+                        );
                     }
                 }
             }

@@ -475,15 +475,6 @@ impl SlidingWindow {
         }
     }
 
-    pub fn check_and_increment(&mut self, now: Instant) -> bool {
-        self.evict(now);
-        if self.timestamps.len() as u64 >= self.limit {
-            return false;
-        }
-        self.timestamps.push_back(now);
-        true
-    }
-
     /// Check whether the window would allow a request without incrementing.
     /// Evicts stale entries to ensure an accurate count.
     pub fn would_allow(&mut self, now: Instant) -> bool {
@@ -567,7 +558,7 @@ impl TokenBucket {
 
     /// Consume `weight` tokens (caller must have checked `would_allow` first).
     pub fn consume(&mut self, weight: u64) {
-        self.tokens -= weight as f64;
+        self.tokens = (self.tokens - weight as f64).max(0.0);
     }
 
     pub fn remaining(&self) -> u64 {
@@ -709,8 +700,19 @@ impl RateLimitAlgorithm for HttpRateLimitAlgorithm {
         key: &str,
         _op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
-        let mut tightest: Option<(u64, u64, u64)> = None;
+        struct RedisWindowCheck {
+            curr_key: String,
+            ttl: u64,
+            elapsed_fraction: f64,
+            prev_count: i64,
+            limit: u64,
+            window_seconds: u64,
+        }
 
+        // Two-pass Redis check to match the local path and avoid phantom
+        // increments: if any configured window denies, no window is consumed
+        // by this request.
+        let mut checks = Vec::with_capacity(self.specs.len());
         for spec in self.specs.iter() {
             let window = FixedWindow::new(spec.limit, spec.duration.as_secs());
             let curr_idx = RedisRateLimitClient::window_index(window.window_seconds);
@@ -720,20 +722,40 @@ impl RateLimitAlgorithm for HttpRateLimitAlgorithm {
             let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
             let ttl = window.window_seconds * 2 + 1;
 
-            let result = redis
-                .sliding_window_check(&prev_key, &curr_key, ttl, elapsed_fraction, spec.limit)
-                .await?;
-
-            if !result.allowed {
+            let (prev_count, curr_count) = redis.get_two_counters(&prev_key, &curr_key).await?;
+            let weighted_after_consume =
+                prev_count as f64 * (1.0 - elapsed_fraction) + curr_count as f64 + 1.0;
+            if weighted_after_consume > spec.limit as f64 {
                 return Ok(RateLimitOutcome::deny()
                     .with_limit(spec.limit)
                     .with_window(spec.duration.as_secs()));
             }
 
+            checks.push(RedisWindowCheck {
+                curr_key,
+                ttl,
+                elapsed_fraction,
+                prev_count,
+                limit: spec.limit,
+                window_seconds: spec.duration.as_secs(),
+            });
+        }
+
+        let mut tightest: Option<(u64, u64, u64)> = None;
+
+        for check in checks {
+            let curr_count = redis
+                .incr_with_expire(&check.curr_key, check.ttl)
+                .await?
+                .max(0);
+            let weighted =
+                check.prev_count as f64 * (1.0 - check.elapsed_fraction) + curr_count as f64;
+            let remaining = (check.limit as f64 - weighted).max(0.0) as u64;
+
             match tightest {
-                Some((current_remaining, _, _)) if result.remaining >= current_remaining => {}
+                Some((current_remaining, _, _)) if remaining >= current_remaining => {}
                 _ => {
-                    tightest = Some((result.remaining, spec.limit, spec.duration.as_secs()));
+                    tightest = Some((remaining, check.limit, check.window_seconds));
                 }
             }
         }
@@ -1273,6 +1295,13 @@ mod tests {
         let outcome = window.outcome(8, 4, 0.25);
         assert!(outcome.allowed);
         assert_eq!(outcome.remaining, Some(0));
+    }
+
+    #[test]
+    fn token_bucket_consume_saturates_at_zero() {
+        let mut bucket = TokenBucket::from_window(1, Duration::from_secs(1));
+        bucket.consume(2);
+        assert_eq!(bucket.remaining(), 0);
     }
 
     #[tokio::test]

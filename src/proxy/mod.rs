@@ -1334,6 +1334,15 @@ pub struct ProxyState {
     pub mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
 }
 
+#[inline]
+fn via_header_for_inbound_version(state: &ProxyState, version: hyper::Version) -> &Option<String> {
+    match version {
+        hyper::Version::HTTP_2 => &state.via_header_http2,
+        hyper::Version::HTTP_3 => &state.via_header_http3,
+        _ => &state.via_header_http11,
+    }
+}
+
 impl ProxyState {
     /// Construct the gateway state and start the health checker.
     ///
@@ -4536,6 +4545,39 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
 /// on a healthy TCP connection, so 100ms is generous for the happy path while
 /// still bounding teardown for pathological peers.
 const WS_CANCEL_CLOSE_TIMEOUT_MS: u64 = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WsControlKind {
+    Ping,
+    Pong,
+}
+
+fn ws_control_kind(message: &Message) -> Option<WsControlKind> {
+    match message {
+        Message::Ping(_) => Some(WsControlKind::Ping),
+        Message::Pong(_) => Some(WsControlKind::Pong),
+        _ => None,
+    }
+}
+
+fn guard_ws_control_transform(
+    original: &Message,
+    transformed: Message,
+    direction: WebSocketFrameDirection,
+) -> Message {
+    match (ws_control_kind(original), ws_control_kind(&transformed)) {
+        (Some(WsControlKind::Ping), Some(WsControlKind::Pong))
+        | (Some(WsControlKind::Pong), Some(WsControlKind::Ping)) => {
+            warn!(
+                ?direction,
+                "WebSocket frame plugin attempted to flip Ping/Pong control frame type; forwarding original frame"
+            );
+            original.clone()
+        }
+        _ => transformed,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_websocket_proxy(
     upgraded: Upgraded,
@@ -4699,6 +4741,7 @@ async fn run_websocket_proxy(
                             let outgoing = if ctb_plugins.is_empty() {
                                 raw
                             } else {
+                                let original = raw.clone();
                                 let mut current = raw;
                                 for plugin in &ctb_plugins {
                                     if let Some(transformed) = plugin
@@ -4713,7 +4756,11 @@ async fn run_websocket_proxy(
                                         current = transformed;
                                     }
                                 }
-                                current
+                                guard_ws_control_transform(
+                                    &original,
+                                    current,
+                                    WebSocketFrameDirection::ClientToBackend,
+                                )
                             };
                             // If a plugin transformed the frame into a Close, close both sides.
                             // Race cancel in case the opposite direction already exited while we
@@ -4735,6 +4782,7 @@ async fn run_websocket_proxy(
                                     trace!(bytes = d.len(), "Client -> Backend: Binary message")
                                 }
                                 Message::Ping(_) => trace!("Client -> Backend: Ping"),
+                                Message::Pong(_) => trace!("Client -> Backend: Pong"),
                                 _ => {}
                             }
                             // Cancel-aware send: if the opposite direction has exited and
@@ -4838,6 +4886,7 @@ async fn run_websocket_proxy(
                             let outgoing = if btc_plugins.is_empty() {
                                 raw
                             } else {
+                                let original = raw.clone();
                                 let mut current = raw;
                                 for plugin in &btc_plugins {
                                     if let Some(transformed) = plugin
@@ -4852,7 +4901,11 @@ async fn run_websocket_proxy(
                                         current = transformed;
                                     }
                                 }
-                                current
+                                guard_ws_control_transform(
+                                    &original,
+                                    current,
+                                    WebSocketFrameDirection::BackendToClient,
+                                )
                             };
                             // If a plugin transformed the frame into a Close, close both sides.
                             // Race cancel — the opposite direction may have already exited while
@@ -4873,6 +4926,7 @@ async fn run_websocket_proxy(
                                     trace!(bytes = d.len(), "Backend -> Client: Binary message")
                                 }
                                 Message::Ping(_) => trace!("Backend -> Client: Ping"),
+                                Message::Pong(_) => trace!("Backend -> Client: Pong"),
                                 _ => {}
                             }
                             // Cancel-aware send (mirror of c2b hot path): prevents
@@ -8736,11 +8790,7 @@ async fn handle_proxy_request_inner(
     }
 
     // Via header on response path (RFC 9110 §7.6.3)
-    let resp_via = if inbound_version == hyper::Version::HTTP_2 {
-        &state.via_header_http2
-    } else {
-        &state.via_header_http11
-    };
+    let resp_via = via_header_for_inbound_version(&state, inbound_version);
     if let Some(via) = resp_via {
         resp_builder = resp_builder.header("via", via.as_str());
     }
@@ -9154,11 +9204,7 @@ pub(crate) async fn proxy_to_backend_retry(
     if let Some(host) = headers.get("host") {
         req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
     }
-    let via = if inbound_version == hyper::Version::HTTP_2 {
-        &state.via_header_http2
-    } else {
-        &state.via_header_http11
-    };
+    let via = via_header_for_inbound_version(state, inbound_version);
     if let Some(via) = via {
         req_builder = req_builder.header("Via", via.as_str());
     }
@@ -9631,11 +9677,7 @@ async fn proxy_to_backend(
     if let Some(host) = headers.get("host") {
         req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
     }
-    let via = if inbound_version == hyper::Version::HTTP_2 {
-        &state.via_header_http2
-    } else {
-        &state.via_header_http11
-    };
+    let via = via_header_for_inbound_version(state, inbound_version);
     if let Some(via) = via {
         req_builder = req_builder.header("Via", via.as_str());
     }

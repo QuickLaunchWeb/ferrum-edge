@@ -138,6 +138,7 @@ impl TrustedProxies {
         if let Some((ip_str, prefix_str)) = entry.split_once('/') {
             let ip: IpAddr = ip_str.parse().ok()?;
             let prefix_len: u8 = prefix_str.parse().ok()?;
+            let (ip, prefix_len) = canonicalize_cidr_network(ip, prefix_len)?;
             let max_prefix = match ip {
                 IpAddr::V4(_) => 32,
                 IpAddr::V6(_) => 128,
@@ -152,6 +153,7 @@ impl TrustedProxies {
         } else {
             // Bare IP — treat as /32 or /128
             let ip: IpAddr = entry.parse().ok()?;
+            let ip = canonicalize_ip(ip);
             let prefix_len = match ip {
                 IpAddr::V4(_) => 32,
                 IpAddr::V6(_) => 128,
@@ -164,14 +166,37 @@ impl TrustedProxies {
     }
 }
 
+fn canonicalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        other => other,
+    }
+}
+
+fn canonicalize_cidr_network(ip: IpAddr, prefix_len: u8) -> Option<(IpAddr, u8)> {
+    match ip {
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                if prefix_len < 96 {
+                    return None;
+                }
+                Some((IpAddr::V4(v4), prefix_len - 96))
+            } else {
+                Some((IpAddr::V6(v6), prefix_len))
+            }
+        }
+        other => Some((other, prefix_len)),
+    }
+}
+
 impl CidrEntry {
     fn matches(&self, ip: &IpAddr) -> bool {
         // Canonicalize IPv4-mapped IPv6 (::ffff:x.x.x.x) to IPv4 so that
         // dual-stack listeners match IPv4 CIDR entries correctly.
-        let canonical = match ip {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(*ip),
-            other => *other,
-        };
+        let canonical = canonicalize_ip(*ip);
         match (&self.network, &canonical) {
             (IpAddr::V4(net), IpAddr::V4(addr)) => {
                 if self.prefix_len == 0 {

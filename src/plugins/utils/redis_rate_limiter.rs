@@ -758,59 +758,6 @@ impl RedisRateLimitClient {
         }
     }
 
-    /// Sliding window approximation using two fixed windows.
-    ///
-    /// Fetches the previous window's count and increments the current window's count
-    /// in a single pipeline round-trip. Returns the weighted approximation result.
-    ///
-    /// The caller computes: `effective = prev * (1 - elapsed_fraction) + current`
-    /// to get a smooth sliding window estimate.
-    pub async fn sliding_window_check(
-        &self,
-        prev_key: &str,
-        curr_key: &str,
-        ttl_seconds: u64,
-        elapsed_fraction: f64,
-        limit: u64,
-    ) -> Result<SlidingWindowResult, ()> {
-        let mut conn = self.get_connection().await.ok_or(())?;
-
-        // Pipeline: GET prev + INCR curr + EXPIRE curr
-        let result: Result<(Option<i64>, i64), redis::RedisError> = redis::pipe()
-            .atomic()
-            .cmd("GET")
-            .arg(prev_key)
-            .cmd("INCR")
-            .arg(curr_key)
-            .cmd("EXPIRE")
-            .arg(curr_key)
-            .arg(ttl_seconds as i64)
-            .ignore()
-            .query_async(&mut conn)
-            .await;
-
-        match result {
-            Ok((prev_count, curr_count)) => {
-                self.available.store(true, Ordering::Relaxed);
-                let prev = prev_count.unwrap_or(0) as f64;
-                let weighted = prev * (1.0 - elapsed_fraction) + curr_count as f64;
-
-                Ok(SlidingWindowResult {
-                    allowed: weighted <= limit as f64,
-                    remaining: (limit as f64 - weighted).max(0.0) as u64,
-                })
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "Redis sliding window check failed — falling back to local rate limiting"
-                );
-                self.mark_unavailable();
-                Err(())
-            }
-        }
-    }
-
     /// Get a raw byte value from Redis.
     ///
     /// Used by plugins that need arbitrary key-value storage (e.g., request
@@ -919,14 +866,6 @@ impl RedisRateLimitClient {
     pub fn warmup_hostname(&self) -> Option<String> {
         self.config.hostname()
     }
-}
-
-/// Result of a sliding window rate limit check.
-pub struct SlidingWindowResult {
-    /// Whether the request is allowed (weighted count <= limit).
-    pub allowed: bool,
-    /// Approximate remaining requests before the limit is reached.
-    pub remaining: u64,
 }
 
 impl std::fmt::Debug for RedisRateLimitClient {
