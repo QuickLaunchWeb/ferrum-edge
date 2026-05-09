@@ -1361,11 +1361,11 @@ pub trait Plugin: Send + Sync {
     /// Returns `true` if this plugin participates in the authorization phase.
     ///
     /// The gateway uses this to pre-filter authorize callbacks at config
-    /// reload time instead of calling the default no-op implementation on
-    /// every plugin for every request. Custom authorization plugins should
-    /// override this to return `true`.
+    /// reload time when a plugin can safely declare it has no authorization
+    /// work. The default stays `true` so existing custom plugins that already
+    /// override `authorize()` keep running after upgrade.
     fn is_authorize_plugin(&self) -> bool {
-        false
+        true
     }
 
     /// Returns hostnames that this plugin will send traffic to.

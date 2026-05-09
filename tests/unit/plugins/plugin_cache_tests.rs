@@ -10,6 +10,19 @@ use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
 use std::sync::Arc;
 
+struct LegacyAuthorizePlugin;
+
+#[async_trait::async_trait]
+impl Plugin for LegacyAuthorizePlugin {
+    fn name(&self) -> &str {
+        "legacy_authorize"
+    }
+
+    async fn authorize(&self, _ctx: &mut RequestContext) -> PluginResult {
+        PluginResult::Continue
+    }
+}
+
 /// Returns the minimal valid config for a given plugin name so that `create_plugin` succeeds.
 fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
     match plugin_name {
@@ -367,6 +380,13 @@ fn test_request_view_precomputes_authorize_plugins() {
     let authorize_plugins = request_view.authorize_plugins();
     let names: Vec<&str> = authorize_plugins.iter().map(|p| p.name()).collect();
     assert_eq!(names, vec!["access_control", "rate_limiting"]);
+}
+
+#[test]
+fn test_authorize_plugin_default_preserves_legacy_custom_plugins() {
+    let plugin: Arc<dyn Plugin> = Arc::new(LegacyAuthorizePlugin);
+
+    assert!(plugin.is_authorize_plugin());
 }
 
 #[test]

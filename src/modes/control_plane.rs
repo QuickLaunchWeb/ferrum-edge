@@ -486,7 +486,6 @@ pub async fn run(
     let dp_registry_poll = dp_registry.clone();
     let poll_cert_expiry_warning_days = env_config.tls_cert_expiry_warning_days;
     let poll_backend_allow_ips = env_config.backend_allow_ips.clone();
-    let poll_reserved_ports = env_config.reserved_gateway_ports();
     let mesh_registry_poll = mesh_registry.clone();
 
     let db_poll_handle = tokio::spawn(async move {
@@ -643,10 +642,6 @@ pub async fn run(
                                 if let Err(errs) = new_config.validate_plugin_references() {
                                     validation_errors.extend(errs);
                                 }
-                                if let Err(errs) = new_config.validate_stream_proxy_port_conflicts(&poll_reserved_ports) {
-                                    validation_errors.extend(errs);
-                                }
-
                                 if !validation_errors.is_empty() {
                                     for msg in &validation_errors {
                                         error!("CP incremental config rejected: {}", msg);
