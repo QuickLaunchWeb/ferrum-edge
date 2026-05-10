@@ -825,7 +825,7 @@ fn mesh_egress_proxy_id(namespace: &str, name: &str, host: &str, port: u16) -> S
         "mesh-egress-{}-{}-{}-{port}",
         sanitize_egress_id_part(namespace),
         sanitize_egress_id_part(name),
-        sanitize_egress_id_part(host)
+        sanitize_egress_host_id_part(host)
     )
 }
 
@@ -834,7 +834,7 @@ fn mesh_egress_upstream_id(namespace: &str, name: &str, host: &str, port: u16) -
         "mesh-egress-up-{}-{}-{}-{port}",
         sanitize_egress_id_part(namespace),
         sanitize_egress_id_part(name),
-        sanitize_egress_id_part(host)
+        sanitize_egress_host_id_part(host)
     )
 }
 
@@ -858,6 +858,37 @@ fn sanitize_egress_id_part(value: &str) -> String {
     } else {
         sanitized.to_string()
     }
+}
+
+fn sanitize_egress_host_id_part(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '*' => push_egress_id_token(&mut sanitized, "wildcard"),
+            '.' => push_egress_id_token(&mut sanitized, "dot"),
+            '-' => push_egress_id_token(&mut sanitized, "dash"),
+            '/' => push_egress_id_token(&mut sanitized, "slash"),
+            ch if ch.is_ascii_alphanumeric() || ch == '_' => sanitized.push(ch),
+            ch => {
+                let token = format!("x{:x}", ch as u32);
+                push_egress_id_token(&mut sanitized, &token);
+            }
+        }
+    }
+    let sanitized = sanitized.trim_matches('-');
+    if sanitized.is_empty() {
+        "any".to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
+fn push_egress_id_token(sanitized: &mut String, token: &str) {
+    if !sanitized.is_empty() && !sanitized.ends_with('-') {
+        sanitized.push('-');
+    }
+    sanitized.push_str(token);
+    sanitized.push('-');
 }
 
 fn inject_mesh_global_plugins(
@@ -1318,7 +1349,13 @@ fn validate_egress_gateway_mtls_config(
         ));
     }
 
-    if env_config.frontend_tls_client_ca_bundle_path.is_none() && !env_config.tls_no_verify {
+    if env_config.tls_no_verify {
+        return Err(anyhow::anyhow!(
+            "FERRUM_MESH_TOPOLOGY=egress_gateway cannot be used with FERRUM_TLS_NO_VERIFY=true because the egress mTLS listener must verify sidecar client certificates"
+        ));
+    }
+
+    if env_config.frontend_tls_client_ca_bundle_path.is_none() {
         return Err(anyhow::anyhow!(
             "FERRUM_MESH_TOPOLOGY=egress_gateway requires FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH so sidecar client certificates are verified"
         ));
@@ -2590,6 +2627,10 @@ mod tests {
 
         env.frontend_tls_client_ca_bundle_path = Some("/tmp/client-ca.pem".to_string());
         validate_egress_gateway_mtls_config(&runtime, &env).expect("mTLS config is complete");
+
+        env.tls_no_verify = true;
+        let err = validate_egress_gateway_mtls_config(&runtime, &env).unwrap_err();
+        assert!(err.to_string().contains("FERRUM_TLS_NO_VERIFY=true"));
     }
 
     fn test_external_service_entry(
@@ -2632,7 +2673,7 @@ mod tests {
         let proxy = &proxies[0];
         assert_eq!(
             proxy.id,
-            "mesh-egress-default-external-api-api-external-com-443"
+            "mesh-egress-default-external-api-api-dot-external-dot-com-443"
         );
         assert_eq!(proxy.hosts, vec!["api.external.com"]);
         assert!(proxy.listen_path.is_none());
@@ -2642,14 +2683,14 @@ mod tests {
         assert!(!proxy.passthrough);
         assert_eq!(
             proxy.upstream_id.as_deref(),
-            Some("mesh-egress-up-default-external-api-api-external-com-443")
+            Some("mesh-egress-up-default-external-api-api-dot-external-dot-com-443")
         );
         assert!(proxy.preserve_host_header);
 
         let upstream = &upstreams[0];
         assert_eq!(
             upstream.id,
-            "mesh-egress-up-default-external-api-api-external-com-443"
+            "mesh-egress-up-default-external-api-api-dot-external-dot-com-443"
         );
         assert!(
             upstream
@@ -2773,12 +2814,24 @@ mod tests {
         assert_eq!(proxies.len(), 1);
         assert_eq!(
             proxies[0].id,
-            "mesh-egress-default-wildcard-api-wildcard-api-external-com-443"
+            "mesh-egress-default-wildcard-api-wildcard-dot-api-dot-external-dot-com-443"
         );
         assert_eq!(proxies[0].hosts, vec!["*.api.external.com"]);
         assert_eq!(
             upstreams[0].id,
-            "mesh-egress-up-default-wildcard-api-wildcard-api-external-com-443"
+            "mesh-egress-up-default-wildcard-api-wildcard-dot-api-dot-external-dot-com-443"
+        );
+    }
+
+    #[test]
+    fn egress_host_id_sanitization_preserves_distinct_valid_hostnames() {
+        assert_ne!(
+            sanitize_egress_host_id_part("a.b.com"),
+            sanitize_egress_host_id_part("a-b.com")
+        );
+        assert_eq!(
+            sanitize_egress_host_id_part("*.api.external.com"),
+            "wildcard-dot-api-dot-external-dot-com"
         );
     }
 
@@ -2817,17 +2870,17 @@ mod tests {
         assert!(
             proxies
                 .iter()
-                .any(|p| p.id == "mesh-egress-default-multi-host-api-example-com-80")
+                .any(|p| p.id == "mesh-egress-default-multi-host-api-dot-example-dot-com-80")
         );
         assert!(
             proxies
                 .iter()
-                .any(|p| p.id == "mesh-egress-default-multi-host-cdn-example-com-80")
+                .any(|p| p.id == "mesh-egress-default-multi-host-cdn-dot-example-dot-com-80")
         );
 
         let http_proxy = proxies
             .iter()
-            .find(|p| p.id == "mesh-egress-default-multi-host-api-example-com-80")
+            .find(|p| p.id == "mesh-egress-default-multi-host-api-dot-example-dot-com-80")
             .unwrap();
         assert_eq!(http_proxy.backend_scheme, Some(BackendScheme::Http));
     }
@@ -2896,7 +2949,7 @@ mod tests {
         assert_eq!(upstreams.len(), 2);
         let primary = upstreams
             .iter()
-            .find(|upstream| upstream.id.contains("primary-external-com"))
+            .find(|upstream| upstream.id.contains("primary-dot-external-dot-com"))
             .expect("primary upstream");
         assert_eq!(primary.targets.len(), 1);
         assert_eq!(primary.targets[0].host, "primary.external.com");
@@ -2904,7 +2957,7 @@ mod tests {
 
         let secondary = upstreams
             .iter()
-            .find(|upstream| upstream.id.contains("secondary-external-com"))
+            .find(|upstream| upstream.id.contains("secondary-dot-external-dot-com"))
             .expect("secondary upstream");
         assert_eq!(secondary.targets.len(), 1);
         assert_eq!(secondary.targets[0].host, "secondary.external.com");
@@ -2943,7 +2996,7 @@ mod tests {
         let egress_proxy = prepared
             .proxies
             .iter()
-            .find(|proxy| proxy.id == "mesh-egress-default-ext-api-api-partner-com-443")
+            .find(|proxy| proxy.id == "mesh-egress-default-ext-api-api-dot-partner-dot-com-443")
             .expect("egress proxy should be materialized");
         assert_eq!(egress_proxy.hosts, vec!["api.partner.com"]);
         assert!(!egress_proxy.frontend_tls);
@@ -2953,7 +3006,9 @@ mod tests {
         let egress_upstream = prepared
             .upstreams
             .iter()
-            .find(|upstream| upstream.id == "mesh-egress-up-default-ext-api-api-partner-com-443")
+            .find(|upstream| {
+                upstream.id == "mesh-egress-up-default-ext-api-api-dot-partner-dot-com-443"
+            })
             .expect("egress upstream should be materialized");
         assert_eq!(egress_upstream.targets.len(), 1);
         assert_eq!(egress_upstream.targets[0].host, "api.partner.com");
