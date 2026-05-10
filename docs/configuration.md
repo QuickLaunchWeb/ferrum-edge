@@ -144,7 +144,7 @@ See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_
 
 Mesh mode consumes Layer 2 mesh slices from the control protocols and prepares the shared sidecar/ambient data-plane listeners. Non-mesh modes do not instantiate this runtime.
 
-With the native `MeshSubscribe` protocol, mesh mode waits for the first delivered mesh slice before serving, builds the proxy/plugin runtime from that slice, and hot-applies later valid slices atomically. Invalid slice updates are logged and ignored so the last accepted runtime config keeps serving.
+With the native `MeshSubscribe` protocol, mesh mode waits for the first delivered mesh slice before serving, builds the proxy/plugin runtime from that slice, and hot-applies later valid slices atomically. Duplicate-content slices are skipped before rebuilding the proxy runtime. Invalid slice updates are logged and ignored so the last accepted runtime config keeps serving.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
