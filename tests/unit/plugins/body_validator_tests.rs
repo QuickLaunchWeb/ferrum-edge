@@ -74,6 +74,7 @@ fn test_invalid_config_shapes_rejected() {
         json!({"required_xml_elements": [123]}),
         json!({"content_types": "application/json"}),
         json!({"content_types": ["application/json", 123]}),
+        json!({"grpc_max_decompressed_size_bytes": "10"}),
         json!({"response_json_schema": false}),
         json!({"response_json_schema": {"type": "string", "pattern": "["}}),
         json!({"response_required_fields": [false]}),
@@ -1596,6 +1597,37 @@ async fn test_protobuf_compressed_gzip_frame_valid() {
     headers.insert("content-type".to_string(), "application/grpc".to_string());
     headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
     assert_continue(plugin.on_final_request_body(&headers, &frame).await);
+}
+
+#[tokio::test]
+async fn test_protobuf_compressed_gzip_frame_rejects_configured_decompressed_cap() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_request_type": "test.HelloRequest",
+        "grpc_max_decompressed_size_bytes": 8
+    }))
+    .unwrap();
+
+    let payload = encode_hello_request("compressed-payload-that-exceeds-eight-bytes", 25);
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&payload).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut frame = Vec::with_capacity(5 + compressed.len());
+    frame.push(1);
+    frame.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&compressed);
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    assert_reject(
+        plugin.on_final_request_body(&headers, &frame).await,
+        Some(400),
+    );
 }
 
 #[tokio::test]

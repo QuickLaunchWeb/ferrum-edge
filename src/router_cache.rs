@@ -1130,19 +1130,6 @@ fn find_prefix_match_indexed(routes: &IndexedPrefixRoutes, path: &str) -> Option
         }
     }
 
-    // 3. Check if original path (with query string) has a "?" boundary match.
-    //    E.g., listen_path "/api" matching "/api?foo=bar"
-    if match_path.len() < path.len() {
-        // There was a query string; match_path is the path before "?"
-        if let Some(proxy) = routes.path_index.get(match_path) {
-            return Some(RouteMatch {
-                proxy: Arc::clone(proxy),
-                path_params: Vec::new(),
-                matched_prefix_len: match_path.len(),
-            });
-        }
-    }
-
     None
 }
 

@@ -1412,7 +1412,7 @@ impl EnvConfig {
             [database]
             db_type: Option<String> = "FERRUM_DB_TYPE";
             db_url: Option<String> = "FERRUM_DB_URL";
-            db_poll_interval: u64 = "FERRUM_DB_POLL_INTERVAL" => 30u64;
+            db_poll_interval: u64 = "FERRUM_DB_POLL_INTERVAL" => 30u64, max(1u64);
             db_tls_mode: Option<DbTlsMode> = "FERRUM_DB_TLS_MODE";
             db_tls_ca_cert_path: Option<String> = "FERRUM_DB_TLS_CA_CERT_PATH";
             db_tls_client_cert_path: Option<String> = "FERRUM_DB_TLS_CLIENT_CERT_PATH";
@@ -1435,6 +1435,14 @@ impl EnvConfig {
             mongo_auth_mechanism: Option<String> = "FERRUM_MONGO_AUTH_MECHANISM";
             mongo_server_selection_timeout_seconds: u64 = "FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS" => 30u64;
             mongo_connect_timeout_seconds: u64 = "FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS" => 10u64;
+        }
+        if resolve_var(conf, "FERRUM_DB_POLL_INTERVAL")
+            .as_deref()
+            .is_some_and(|raw| raw.trim() == "0")
+        {
+            tracing::warn!(
+                "FERRUM_DB_POLL_INTERVAL=0 is clamped to 1 second; set a positive interval to avoid this implicit floor"
+            );
         }
         let db_tls_mode = Self::resolve_db_tls_mode_legacy_alias(conf, db_tls_mode)?;
         let db_tls_ca_cert_path = Self::resolve_legacy_db_tls_path_alias(
@@ -2651,19 +2659,29 @@ impl EnvConfig {
             }
         }
 
+        // Non-fatal configuration warnings
+        if self.db_pool_min_connections > self.db_pool_max_connections {
+            tracing::warn!(
+                "WARNING: FERRUM_DB_POOL_MIN_CONNECTIONS ({}) exceeds FERRUM_DB_POOL_MAX_CONNECTIONS ({}). \
+                 The pool will clamp min to max, wasting the higher setting.",
+                self.db_pool_min_connections,
+                self.db_pool_max_connections
+            );
+        }
+
         // Non-fatal security warnings
         if self.tls_no_verify {
-            eprintln!(
+            tracing::warn!(
                 "WARNING: FERRUM_TLS_NO_VERIFY=true — outbound TLS certificate verification is DISABLED. Do not use in production."
             );
         }
         if self.admin_tls_no_verify {
-            eprintln!(
+            tracing::warn!(
                 "WARNING: FERRUM_ADMIN_TLS_NO_VERIFY=true — admin TLS certificate verification is DISABLED. Do not use in production."
             );
         }
         if self.dp_grpc_tls_no_verify {
-            eprintln!(
+            tracing::warn!(
                 "WARNING: FERRUM_DP_GRPC_TLS_NO_VERIFY=true — gRPC TLS certificate verification is DISABLED. Do not use in production."
             );
         }
@@ -2788,5 +2806,26 @@ mod tests {
             err.contains("FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD"),
             "error should name request critical env var: {err}"
         );
+    }
+
+    #[test]
+    fn validate_warns_db_pool_min_above_max() {
+        let mut config = file_mode_config();
+        config.db_pool_min_connections = 10;
+        config.db_pool_max_connections = 5;
+        // validate() should still succeed (warning, not error)
+        config
+            .validate()
+            .expect("db_pool_min > max is a warning, not a fatal error");
+    }
+
+    #[test]
+    fn validate_accepts_db_pool_min_equal_max() {
+        let mut config = file_mode_config();
+        config.db_pool_min_connections = 5;
+        config.db_pool_max_connections = 5;
+        config
+            .validate()
+            .expect("db_pool_min == max should be valid");
     }
 }

@@ -1132,38 +1132,37 @@ async fn handle_h3_request(
     }
     plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
 
-    // Authorization phase
-    {
+    // Authorization phase (pre-computed authorize plugin list — zero allocation).
+    let authorize_plugins = plugin_cache_view.authorize_plugins();
+    if !authorize_plugins.is_empty() {
         let phase_start = std::time::Instant::now();
-        for plugin in plugins.iter() {
-            if plugin.name() == "access_control" {
-                match plugin.authorize(&mut ctx).await {
-                    PluginResult::Continue => {}
-                    reject @ PluginResult::Reject { .. }
-                    | reject @ PluginResult::RejectBinary { .. } => {
-                        let reject = plugin_result_into_reject_parts(reject)
-                            .expect("reject result should convert to rejection parts");
-                        record_request(&state, reject.status_code);
-                        let mut headers = reject.headers;
-                        apply_after_proxy_hooks_to_rejection(
-                            &plugins,
-                            &mut ctx,
-                            reject.status_code,
-                            &mut headers,
-                        )
-                        .await;
-                        let http_status = StatusCode::from_u16(reject.status_code)
-                            .unwrap_or(StatusCode::FORBIDDEN);
-                        send_h3_reject_flavor_aware(
-                            &mut stream,
-                            http_flavor,
-                            http_status,
-                            &reject.body,
-                            &headers,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
+        for plugin in authorize_plugins.iter() {
+            match plugin.authorize(&mut ctx).await {
+                PluginResult::Continue => {}
+                reject @ PluginResult::Reject { .. }
+                | reject @ PluginResult::RejectBinary { .. } => {
+                    let reject = plugin_result_into_reject_parts(reject)
+                        .expect("reject result should convert to rejection parts");
+                    record_request(&state, reject.status_code);
+                    let mut headers = reject.headers;
+                    apply_after_proxy_hooks_to_rejection(
+                        &plugins,
+                        &mut ctx,
+                        reject.status_code,
+                        &mut headers,
+                    )
+                    .await;
+                    let http_status =
+                        StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::FORBIDDEN);
+                    send_h3_reject_flavor_aware(
+                        &mut stream,
+                        http_flavor,
+                        http_status,
+                        &reject.body,
+                        &headers,
+                    )
+                    .await?;
+                    return Ok(());
                 }
             }
         }
