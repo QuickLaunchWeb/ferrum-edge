@@ -397,6 +397,16 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
             _ => ServiceEntryLocation::MeshExternal,
         },
         ports: service_ports(object)?,
+        export_to: string_array(&object.spec, "exportTo"),
+        workload_selector: object
+            .spec
+            .get("workloadSelector")
+            .and_then(|selector| selector.get("labels"))
+            .map(string_map)
+            .map(|labels| WorkloadSelector {
+                namespace: Some(object.metadata.namespace.clone()),
+                labels,
+            }),
     })
 }
 

@@ -13,6 +13,8 @@ mod circuit_breaker;
 mod cli;
 mod config;
 mod config_delta;
+#[allow(dead_code)]
+mod config_sources;
 mod connection_pool;
 mod consumer_index;
 #[path = "../custom_plugins/mod.rs"]
@@ -25,6 +27,8 @@ mod health_check;
 mod http3;
 #[allow(dead_code)]
 mod identity;
+#[allow(dead_code)]
+mod k8s_controller;
 #[allow(dead_code)]
 mod lazy_timeout;
 mod load_balancer;

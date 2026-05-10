@@ -27,6 +27,7 @@ pub mod grpc;
 pub mod health_check;
 pub mod http3;
 pub mod identity;
+pub mod k8s_controller;
 pub mod lazy_timeout;
 pub mod load_balancer;
 pub mod metrics;

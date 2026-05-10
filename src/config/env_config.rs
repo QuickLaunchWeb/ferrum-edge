@@ -507,9 +507,8 @@ pub struct EnvConfig {
     /// Capacity of the per-ADS-stream response queue between the request
     /// reader task and tonic response stream. Default: 32.
     pub xds_stream_channel_capacity: usize,
-    /// Mesh runtime config source. `native` consumes Ferrum MeshSubscribe.
-    /// `xds` is reserved for the future mesh DP xDS client and is rejected in
-    /// mesh mode until that client is wired.
+    /// Mesh runtime config source. `native` consumes Ferrum MeshSubscribe;
+    /// `xds` consumes Envoy-compatible ADS.
     pub mesh_config_protocol: String,
     /// Additional SPIFFE trust domains accepted as equivalent to the peer
     /// cert's trust domain when validating HBONE baggage `source.principal`.
@@ -521,6 +520,35 @@ pub struct EnvConfig {
     /// this to keep mesh-internal identity claims (e.g. `source.`) from
     /// leaking to non-mesh upstream services.
     pub mesh_egress_strip_baggage_keys: Vec<String>,
+
+    // Kubernetes CRD controller (Layer 8)
+    /// Enable the Kubernetes CRD controller in CP mode. When true, the CP
+    /// watches Istio and Gateway API CRDs and reconciles them into Ferrum
+    /// config via `translate_k8s_objects()`. Default: false.
+    pub k8s_controller_enabled: bool,
+    /// Comma-separated namespaces to watch for CRDs. Empty = all namespaces
+    /// (requires ClusterRole). Default: "" (all).
+    pub k8s_watch_namespaces: Vec<String>,
+    /// Override kubeconfig path for out-of-cluster development. Empty = use
+    /// in-cluster config or infer from `~/.kube/config`.
+    pub k8s_kubeconfig_path: Option<String>,
+    /// Debounce window in milliseconds for CRD event coalescing. Events
+    /// arriving within this window are batched into a single reconciliation.
+    /// Default: 500.
+    pub k8s_reconcile_debounce_ms: u64,
+    /// Periodic full re-list interval in seconds. Safety valve against missed
+    /// watch events. Default: 300 (5 minutes).
+    pub k8s_full_sync_interval_secs: u64,
+    /// Enable watching Istio CRDs (security.istio.io, networking.istio.io,
+    /// telemetry.istio.io). Default: true.
+    pub k8s_watch_istio_crds: bool,
+    /// Enable watching Gateway API CRDs (gateway.networking.k8s.io).
+    /// Default: true.
+    pub k8s_watch_gateway_api_crds: bool,
+    /// SPIFFE trust domain for K8s-sourced mesh policies. Used by
+    /// `translate_k8s_objects()` when building SPIFFE IDs from K8s
+    /// ServiceAccount references. Default: "cluster.local".
+    pub k8s_trust_domain: String,
 
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
@@ -1205,6 +1233,14 @@ impl Default for EnvConfig {
             mesh_config_protocol: "native".to_string(),
             mesh_trust_domain_aliases: Vec::new(),
             mesh_egress_strip_baggage_keys: Vec::new(),
+            k8s_controller_enabled: false,
+            k8s_watch_namespaces: Vec::new(),
+            k8s_kubeconfig_path: None,
+            k8s_reconcile_debounce_ms: 500,
+            k8s_full_sync_interval_secs: 300,
+            k8s_watch_istio_crds: true,
+            k8s_watch_gateway_api_crds: true,
+            k8s_trust_domain: "cluster.local".to_string(),
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -1475,6 +1511,14 @@ impl EnvConfig {
             mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
+            k8s_controller_enabled: bool = "FERRUM_K8S_CONTROLLER_ENABLED" => false;
+            k8s_watch_namespaces: Vec<String> = "FERRUM_K8S_WATCH_NAMESPACES" => Vec::new();
+            k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
+            k8s_reconcile_debounce_ms: u64 = "FERRUM_K8S_RECONCILE_DEBOUNCE_MS" => 500u64;
+            k8s_full_sync_interval_secs: u64 = "FERRUM_K8S_FULL_SYNC_INTERVAL_SECS" => 300u64;
+            k8s_watch_istio_crds: bool = "FERRUM_K8S_WATCH_ISTIO_CRDS" => true;
+            k8s_watch_gateway_api_crds: bool = "FERRUM_K8S_WATCH_GATEWAY_API_CRDS" => true;
+            k8s_trust_domain: String = "FERRUM_K8S_TRUST_DOMAIN" => "cluster.local".to_string();
             dp_grpc_tls_ca_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CA_CERT_PATH";
             dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
@@ -1758,7 +1802,7 @@ impl EnvConfig {
             clamped
         };
 
-        let config = Self {
+        let mut config = Self {
             mode: mode.clone(),
             namespace,
             log_level,
@@ -1817,6 +1861,14 @@ impl EnvConfig {
             mesh_config_protocol,
             mesh_trust_domain_aliases,
             mesh_egress_strip_baggage_keys,
+            k8s_controller_enabled,
+            k8s_watch_namespaces,
+            k8s_kubeconfig_path,
+            k8s_reconcile_debounce_ms,
+            k8s_full_sync_interval_secs,
+            k8s_watch_istio_crds,
+            k8s_watch_gateway_api_crds,
+            k8s_trust_domain,
             dp_grpc_tls_ca_cert_path,
             dp_grpc_tls_client_cert_path,
             dp_grpc_tls_client_key_path,
@@ -2299,7 +2351,7 @@ impl EnvConfig {
         Ok(())
     }
 
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&mut self) -> Result<(), String> {
         match &self.mode {
             OperatingMode::Database | OperatingMode::ControlPlane => {
                 if self.db_type.is_none() {
@@ -2329,15 +2381,7 @@ impl EnvConfig {
                     .to_ascii_lowercase()
                     .as_str()
                 {
-                    "native" => {}
-                    "xds" => {
-                        return Err(
-                            "FERRUM_MESH_CONFIG_PROTOCOL=xds is not supported by mesh runtime yet; \
-                             use FERRUM_MESH_CONFIG_PROTOCOL=native for Ferrum MeshSubscribe. \
-                             FERRUM_XDS_ENABLED only exposes CP ADS for Envoy-compatible clients."
-                                .into(),
-                        );
-                    }
+                    "native" | "xds" => {}
                     other => {
                         return Err(format!(
                             "Invalid FERRUM_MESH_CONFIG_PROTOCOL '{other}'. Expected: native or xds"
@@ -2478,7 +2522,7 @@ impl EnvConfig {
             ));
         }
 
-        // Overload threshold ordering: critical >= pressure for each pair.
+        // Overload threshold ordering: critical > pressure for each pair.
         //
         // The RED probabilistic shedding ramp in src/overload.rs computes
         //   probability = (ratio - pressure) / (critical - pressure) * SCALE
@@ -2487,36 +2531,60 @@ impl EnvConfig {
         // disable_keepalive flag fires at the pressure threshold while the
         // RED ramp silently produces 0% drop probability. critical < pressure
         // is even worse: a negative range yields a negative ratio that also
-        // saturates to 0 on the u32 cast. Reject both at startup so the
-        // disagreement can never reach the hot path.
-        for (pressure_name, pressure_val, critical_name, critical_val) in [
-            (
-                "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD",
-                self.overload_fd_pressure_threshold,
-                "FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD",
-                self.overload_fd_critical_threshold,
-            ),
-            (
-                "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD",
-                self.overload_conn_pressure_threshold,
-                "FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD",
-                self.overload_conn_critical_threshold,
-            ),
-            (
-                "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD",
-                self.overload_req_pressure_threshold,
-                "FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD",
-                self.overload_req_critical_threshold,
-            ),
-        ] {
-            if critical_val <= pressure_val {
-                return Err(format!(
-                    "{critical_name} ({critical_val:.2}) must be greater than {pressure_name} ({pressure_val:.2}). \
-                     The RED probabilistic shedding ramp divides by (critical - pressure); equal or inverted \
-                     thresholds produce NaN/saturated probabilities and cause silent disagreement between the \
-                     binary load-shedding flags and the smooth ramp."
-                ));
-            }
+        // saturates to 0 on the u32 cast. Auto-correct strictly inverted
+        // thresholds by swapping; reject equal thresholds because swapping
+        // equal values cannot create the positive RED ramp width the hot path
+        // requires.
+        if self.overload_fd_pressure_threshold == self.overload_fd_critical_threshold {
+            return Err(format!(
+                "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD ({}) must be less than FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD ({})",
+                self.overload_fd_pressure_threshold, self.overload_fd_critical_threshold
+            ));
+        }
+        if self.overload_fd_pressure_threshold > self.overload_fd_critical_threshold {
+            tracing::warn!(
+                pressure = self.overload_fd_pressure_threshold,
+                critical = self.overload_fd_critical_threshold,
+                "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD is greater than FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD; swapping to correct ordering"
+            );
+            std::mem::swap(
+                &mut self.overload_fd_pressure_threshold,
+                &mut self.overload_fd_critical_threshold,
+            );
+        }
+        if self.overload_conn_pressure_threshold == self.overload_conn_critical_threshold {
+            return Err(format!(
+                "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD ({}) must be less than FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD ({})",
+                self.overload_conn_pressure_threshold, self.overload_conn_critical_threshold
+            ));
+        }
+        if self.overload_conn_pressure_threshold > self.overload_conn_critical_threshold {
+            tracing::warn!(
+                pressure = self.overload_conn_pressure_threshold,
+                critical = self.overload_conn_critical_threshold,
+                "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD is greater than FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD; swapping to correct ordering"
+            );
+            std::mem::swap(
+                &mut self.overload_conn_pressure_threshold,
+                &mut self.overload_conn_critical_threshold,
+            );
+        }
+        if self.overload_req_pressure_threshold == self.overload_req_critical_threshold {
+            return Err(format!(
+                "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD ({}) must be less than FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD ({})",
+                self.overload_req_pressure_threshold, self.overload_req_critical_threshold
+            ));
+        }
+        if self.overload_req_pressure_threshold > self.overload_req_critical_threshold {
+            tracing::warn!(
+                pressure = self.overload_req_pressure_threshold,
+                critical = self.overload_req_critical_threshold,
+                "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD is greater than FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD; swapping to correct ordering"
+            );
+            std::mem::swap(
+                &mut self.overload_req_pressure_threshold,
+                &mut self.overload_req_critical_threshold,
+            );
         }
 
         // Non-fatal configuration warnings
@@ -2605,66 +2673,97 @@ mod tests {
 
     #[test]
     fn validate_accepts_default_overload_thresholds() {
-        let config = file_mode_config();
+        let mut config = file_mode_config();
         // Defaults: pressure 0.80/0.85/0.85 < critical 0.95/0.95/0.95.
         config.validate().expect("default thresholds must validate");
     }
 
     #[test]
-    fn validate_rejects_overload_fd_pressure_above_critical() {
+    fn validate_swaps_overload_fd_pressure_above_critical() {
         let mut config = file_mode_config();
         config.overload_fd_pressure_threshold = 0.85;
         config.overload_fd_critical_threshold = 0.80;
-        let err = config
+        config
             .validate()
-            .expect_err("inverted FD thresholds must be rejected");
+            .expect("inverted FD thresholds should be auto-corrected");
         assert!(
-            err.contains("FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD")
-                && err.contains("FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD"),
-            "error should name both env vars: {err}"
+            config.overload_fd_pressure_threshold < config.overload_fd_critical_threshold,
+            "pressure ({}) must be less than critical ({}) after swap",
+            config.overload_fd_pressure_threshold,
+            config.overload_fd_critical_threshold,
+        );
+        assert!(
+            (config.overload_fd_pressure_threshold - 0.80).abs() < f64::EPSILON,
+            "pressure should be 0.80 after swap"
+        );
+        assert!(
+            (config.overload_fd_critical_threshold - 0.85).abs() < f64::EPSILON,
+            "critical should be 0.85 after swap"
         );
     }
 
     #[test]
     fn validate_rejects_overload_fd_pressure_equals_critical() {
-        // Equal thresholds yield a zero-width RED ramp — divide-by-zero NaN.
         let mut config = file_mode_config();
         config.overload_fd_pressure_threshold = 0.90;
         config.overload_fd_critical_threshold = 0.90;
         let err = config
             .validate()
-            .expect_err("equal FD thresholds must be rejected");
-        assert!(
-            err.contains("FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD"),
-            "error should name FD critical env var: {err}"
-        );
+            .expect_err("equal FD thresholds create a zero-width RED ramp");
+        assert!(err.contains("FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD"));
     }
 
     #[test]
-    fn validate_rejects_overload_conn_pressure_above_critical() {
+    fn validate_rejects_overload_conn_pressure_equals_critical() {
+        let mut config = file_mode_config();
+        config.overload_conn_pressure_threshold = 0.90;
+        config.overload_conn_critical_threshold = 0.90;
+        let err = config
+            .validate()
+            .expect_err("equal connection thresholds create a zero-width RED ramp");
+        assert!(err.contains("FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD"));
+    }
+
+    #[test]
+    fn validate_rejects_overload_req_pressure_equals_critical() {
+        let mut config = file_mode_config();
+        config.overload_req_pressure_threshold = 0.90;
+        config.overload_req_critical_threshold = 0.90;
+        let err = config
+            .validate()
+            .expect_err("equal request thresholds create a zero-width RED ramp");
+        assert!(err.contains("FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD"));
+    }
+
+    #[test]
+    fn validate_swaps_overload_conn_pressure_above_critical() {
         let mut config = file_mode_config();
         config.overload_conn_pressure_threshold = 0.95;
         config.overload_conn_critical_threshold = 0.85;
-        let err = config
+        config
             .validate()
-            .expect_err("inverted connection thresholds must be rejected");
+            .expect("inverted connection thresholds should be auto-corrected");
         assert!(
-            err.contains("FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD"),
-            "error should name connection critical env var: {err}"
+            config.overload_conn_pressure_threshold < config.overload_conn_critical_threshold,
+            "pressure ({}) must be less than critical ({}) after swap",
+            config.overload_conn_pressure_threshold,
+            config.overload_conn_critical_threshold,
         );
     }
 
     #[test]
-    fn validate_rejects_overload_req_pressure_above_critical() {
+    fn validate_swaps_overload_req_pressure_above_critical() {
         let mut config = file_mode_config();
         config.overload_req_pressure_threshold = 0.99;
         config.overload_req_critical_threshold = 0.50;
-        let err = config
+        config
             .validate()
-            .expect_err("inverted request thresholds must be rejected");
+            .expect("inverted request thresholds should be auto-corrected");
         assert!(
-            err.contains("FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD"),
-            "error should name request critical env var: {err}"
+            config.overload_req_pressure_threshold < config.overload_req_critical_threshold,
+            "pressure ({}) must be less than critical ({}) after swap",
+            config.overload_req_pressure_threshold,
+            config.overload_req_critical_threshold,
         );
     }
 

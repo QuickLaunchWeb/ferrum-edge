@@ -285,6 +285,32 @@ pub fn workload_selector_matches<L: WorkloadLabels + ?Sized>(
         .all(|(key, value)| proxy_labels.lookup(key) == Some(value.as_str()))
 }
 
+/// Returns true when a ServiceEntry is visible to a workload namespace under
+/// Ferrum's egress materialization rules. Empty `export_to` is intentionally
+/// namespace-local to avoid cross-tenant exposure by omission. Istio
+/// `workloadSelector` describes backing workloads/endpoints, not which clients
+/// may consume the service, so it is deliberately not part of this visibility
+/// check.
+pub fn service_entry_exported_to_namespace(entry: &ServiceEntry, workload_namespace: &str) -> bool {
+    if entry.export_to.is_empty() {
+        return entry.namespace == workload_namespace;
+    }
+
+    entry.export_to.iter().any(|target| {
+        target == "*"
+            || target == workload_namespace
+            || (target == "." && entry.namespace == workload_namespace)
+    })
+}
+
+pub fn service_entry_applies_to_workload<L: WorkloadLabels + ?Sized>(
+    entry: &ServiceEntry,
+    workload_namespace: &str,
+    _workload_labels: &L,
+) -> bool {
+    service_entry_exported_to_namespace(entry, workload_namespace)
+}
+
 // ── PeerAuthentication ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -323,6 +349,13 @@ pub struct ServiceEntry {
     pub location: ServiceEntryLocation,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<ServicePort>,
+    /// Optional Istio-style visibility list. Empty means namespace-local for
+    /// Ferrum's materialization path; `*` exports mesh-wide, `.` exports to
+    /// this entry's namespace, and a namespace value exports there explicitly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub export_to: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_selector: Option<WorkloadSelector>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

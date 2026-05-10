@@ -101,7 +101,7 @@ Hot atomics on `OverloadState` (`disable_keepalive`, `reject_new_connections`, `
 
 ### External Secret Resolution
 
-At startup, before config load. Env var suffixes resolve the base name: `_VAULT` (HashiCorp Vault KV v2), `_AWS` (Secrets Manager), `_AZURE` (Key Vault), `_GCP` (Secret Manager), `_FILE` (disk), `_ENV` (another env var). Backends grouped per provider (one client). Conflict detection prevents two providers setting the same base key. See `src/secrets/`.
+At startup, before config load. Env var suffixes resolve the base name: `_VAULT` (HashiCorp Vault KV v2), `_AWS` (Secrets Manager), `_AZURE` (Key Vault), `_GCP` (Secret Manager), `_FILE` (disk). Backends grouped per provider (one client). Conflict detection prevents two providers setting the same base key. See `src/secrets/`.
 
 ### Source Layout (pointers)
 

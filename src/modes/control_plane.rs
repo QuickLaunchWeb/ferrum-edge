@@ -441,6 +441,48 @@ pub async fn run(
     startup_ready.store(true, Ordering::Release);
     info!("Control plane startup complete; /health now reports ready");
 
+    // Kubernetes CRD controller (Layer 8) — opt-in via FERRUM_K8S_CONTROLLER_ENABLED.
+    // When enabled, watches Istio + Gateway API CRDs and reconciles them into
+    // Ferrum config via translate_k8s_objects(). Runs alongside DB polling.
+    let _k8s_controller_handle = if env_config.k8s_controller_enabled {
+        let controller_config = crate::k8s_controller::K8sControllerConfig {
+            namespace: env_config.namespace.clone(),
+            trust_domain: env_config.k8s_trust_domain.clone(),
+            watch_namespaces: env_config.k8s_watch_namespaces.clone(),
+            watch_istio: env_config.k8s_watch_istio_crds,
+            watch_gateway_api: env_config.k8s_watch_gateway_api_crds,
+            debounce_ms: env_config.k8s_reconcile_debounce_ms,
+            full_sync_interval_secs: env_config.k8s_full_sync_interval_secs,
+            kubeconfig_path: env_config.k8s_kubeconfig_path.clone(),
+        };
+        match crate::k8s_controller::start_k8s_controller(
+            controller_config,
+            config_arc.clone(),
+            update_tx.clone(),
+            dp_registry.clone(),
+            mesh_update_tx.clone(),
+            mesh_registry.clone(),
+            shutdown_tx.subscribe(),
+        )
+        .await
+        {
+            Ok(handle) => {
+                info!("Kubernetes CRD controller started");
+                Some(handle)
+            }
+            Err(e) => {
+                error!("Failed to start K8s controller: {}", e);
+                warn!(
+                    "Continuing without K8s CRD watching — DB-sourced config still active. \
+                     Check FERRUM_K8S_KUBECONFIG_PATH or in-cluster configuration."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Database polling loop -> push incremental deltas to DPs and mesh nodes (with shutdown).
     //
     // Uses the same incremental polling strategy as database mode: indexed
