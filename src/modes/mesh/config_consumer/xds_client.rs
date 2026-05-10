@@ -191,6 +191,13 @@ struct XdsStreamState {
     accumulator: ResourceAccumulator,
 }
 
+impl XdsStreamState {
+    fn reset_for_new_control_plane(&mut self) {
+        self.subscriptions = ClientSubscriptionState::new();
+        self.accumulator = ResourceAccumulator::new();
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct ResourceAccumulator {
     resources_by_type: HashMap<String, Vec<AccumulatedResource>>,
@@ -284,6 +291,7 @@ pub async fn start_xds_client_with_shutdown(
     let mut current_cp_index = 0usize;
     let mut backoff_secs = BACKOFF_INITIAL_SECS;
     let mut stream_state = XdsStreamState::default();
+    let mut last_cp_url: Option<String> = None;
 
     info!(
         node_id = %config.node_id,
@@ -300,6 +308,17 @@ pub async fn start_xds_client_with_shutdown(
         }
 
         let cp_url = &cp_urls[current_cp_index];
+        if last_cp_url.as_deref() != Some(cp_url.as_str()) {
+            if let Some(previous_cp_url) = last_cp_url.as_deref() {
+                info!(
+                    previous_cp_url,
+                    cp_url = %cp_url,
+                    "xDS control plane changed; resetting ADS version state"
+                );
+                stream_state.reset_for_new_control_plane();
+            }
+            last_cp_url = Some(cp_url.clone());
+        }
         let is_primary = current_cp_index == 0;
         let is_fallback = !is_primary && cp_urls.len() > 1;
         let mut stream_shutdown_rx = shutdown_rx.clone();
@@ -975,6 +994,36 @@ mod tests {
 
         assert_eq!(cds.version_info, "v1");
         assert!(cds.response_nonce.is_empty());
+    }
+
+    #[test]
+    fn control_plane_switch_resets_server_scoped_ads_state() {
+        let mut state = XdsStreamState::default();
+        state
+            .subscriptions
+            .record_response(CDS_TYPE_URL, "v1", "n1");
+        state.subscriptions.mark_acked(CDS_TYPE_URL);
+        state
+            .accumulator
+            .apply_sotw_response(
+                CDS_TYPE_URL,
+                &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+                "v1",
+            )
+            .expect("CDS applies");
+
+        state.reset_for_new_control_plane();
+
+        assert!(state.accumulator.resources(CDS_TYPE_URL).is_empty());
+        assert!(state.accumulator.versions_by_type.is_empty());
+        assert!(!state.subscriptions.required_types_have_initial_response());
+        assert!(
+            state
+                .subscriptions
+                .build_initial_requests("node-a", "default")
+                .iter()
+                .all(|request| request.version_info.is_empty())
+        );
     }
 
     #[test]
