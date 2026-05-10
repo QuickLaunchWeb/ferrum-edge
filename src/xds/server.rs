@@ -1131,7 +1131,7 @@ fn build_sotw_subscription(
     resource_names: &[String],
 ) -> XdsSubscription {
     let has_wildcard = resource_names.iter().any(|name| name == "*")
-        || (previous.is_none() && resource_names.is_empty());
+        || (resource_names.is_empty() && previous.is_none_or(|subscription| subscription.wildcard));
     let mut resource_names = resource_names
         .iter()
         .filter(|name| name.as_str() != "*")
@@ -1898,7 +1898,7 @@ mod tests {
     }
 
     #[test]
-    fn sotw_empty_after_explicit_wildcard_is_unsubscribe_all() {
+    fn sotw_empty_after_explicit_wildcard_preserves_wildcard() {
         let previous = build_sotw_subscription(
             None,
             "node-a",
@@ -1915,7 +1915,7 @@ mod tests {
             &[],
         );
 
-        assert!(!subscription.wildcard);
+        assert!(subscription.wildcard);
         assert!(subscription.resource_names.is_empty());
     }
 
