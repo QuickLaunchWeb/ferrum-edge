@@ -20,6 +20,23 @@ Recommended pattern:
 - Expose `50051` only to Data Plane pods.
 - For raw TCP/UDP proxy listeners, add each configured `listen_port` to the pod and service spec explicitly.
 
+## Mesh Injector Chart Defaults
+
+The `charts/ferrum-mesh` injector Deployment defaults to a non-root, read-only
+runtime with `allowPrivilegeEscalation: false`, all Linux capabilities dropped,
+`RuntimeDefault` seccomp, and CPU/memory requests and limits. Override
+`injector.podSecurityContext`, `injector.securityContext`, or
+`injector.resources` only when your custom image or cluster policy requires it.
+
+The injector webhook also ships with a default `namespaceSelector` that excludes
+`kube-system`, `kube-public`, `kube-node-lease`, `istio-system`, and namespaces
+labelled `ferrum.io/injection=disabled`. The injector still requires per-pod
+opt-in by default through `FERRUM_INJECTOR_REQUIRE_ANNOTATION=true`.
+
+The chart mounts the injector serving certificate through a Secret volume; the
+injector process does not read Kubernetes Secrets through the API, so the default
+service account does not need Secret RBAC for that mount.
+
 ## Liveness and Readiness Probes
 
 Ferrum Edge serves unauthenticated `/health` and `/status` on the admin listener. The response includes `status`, `mode`, `database`, `cached_config`, and `admin_writes_enabled`.
