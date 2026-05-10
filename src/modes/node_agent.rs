@@ -8,17 +8,20 @@
 //! The node agent does NOT run proxy listeners. Traffic capture is its sole
 //! responsibility.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::capture::CaptureConfig;
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
+use crate::ebpf::cgroup;
 use crate::ebpf::kernel_probe::{self, KernelProbeResult};
-use crate::ebpf::pod_watcher;
-use crate::ebpf::{EbpfBackend, FallbackMode, MockEbpfBackend, PodAttachmentState};
+use crate::ebpf::pod_watcher::{self, EnrollmentDecision};
+use crate::ebpf::veth;
+use crate::ebpf::{EbpfBackend, FallbackMode, MockEbpfBackend, PodAttachmentState, PodInfo};
 
 const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const DEFAULT_BPF_FS_PATH: &str = "/sys/fs/bpf";
@@ -121,6 +124,23 @@ fn create_backend() -> Box<dyn EbpfBackend> {
     }
 }
 
+/// Metrics tracked by the node agent.
+pub struct NodeAgentMetrics {
+    pub pods_enrolled: AtomicU64,
+    pub pods_unenrolled: AtomicU64,
+    pub attach_errors: AtomicU64,
+}
+
+impl Default for NodeAgentMetrics {
+    fn default() -> Self {
+        Self {
+            pods_enrolled: AtomicU64::new(0),
+            pods_unenrolled: AtomicU64::new(0),
+            attach_errors: AtomicU64::new(0),
+        }
+    }
+}
+
 async fn run_with_backend(
     mut backend: Box<dyn EbpfBackend>,
     config: &NodeAgentConfig,
@@ -129,6 +149,7 @@ async fn run_with_backend(
     initialize_backend(backend.as_mut(), config)?;
 
     let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+    let metrics = NodeAgentMetrics::default();
 
     info!(
         "Node agent initialized, waiting for pod events on node {}",
@@ -138,10 +159,148 @@ async fn run_with_backend(
     let mut shutdown_rx = shutdown_tx.subscribe();
     shutdown_rx.changed().await.ok();
 
-    info!("Node agent shutting down, detaching BPF programs");
+    info!(
+        pods_enrolled = metrics.pods_enrolled.load(Ordering::Relaxed),
+        pods_unenrolled = metrics.pods_unenrolled.load(Ordering::Relaxed),
+        attach_errors = metrics.attach_errors.load(Ordering::Relaxed),
+        attached_pods = pod_states.len(),
+        "Node agent shutting down, detaching BPF programs"
+    );
     cleanup_all_pods(backend.as_mut(), &pod_states);
 
     Ok(())
+}
+
+#[allow(dead_code)]
+/// Describes a pod event for enrollment processing.
+pub struct PodEvent<'a> {
+    pub pod_uid: &'a str,
+    pub pod_name: &'a str,
+    pub namespace: &'a str,
+    pub labels: &'a HashMap<String, String>,
+    pub annotations: &'a HashMap<String, String>,
+    pub pod_ip_str: Option<&'a str>,
+    pub pod_pid: Option<u32>,
+}
+
+#[allow(dead_code)]
+pub fn handle_pod_added(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    event: &PodEvent<'_>,
+) {
+    let (pod_uid, pod_name, namespace) = (event.pod_uid, event.pod_name, event.namespace);
+    let decision = pod_watcher::evaluate_enrollment(
+        event.labels,
+        event.annotations,
+        namespace,
+        &config.excluded_namespaces,
+    );
+    if decision != EnrollmentDecision::Enroll {
+        debug!(
+            pod_uid,
+            pod_name, namespace, "Pod does not meet enrollment criteria"
+        );
+        return;
+    }
+
+    if pod_states.contains_key(pod_uid) {
+        debug!(pod_uid, pod_name, "Pod already enrolled, skipping");
+        return;
+    }
+
+    let pod_ip = event.pod_ip_str.and_then(pod_watcher::parse_pod_ip);
+    let cgroup_path = cgroup::resolve_pod_cgroup_path(&config.cgroup_root, pod_uid)
+        .map(|p| p.to_string_lossy().to_string());
+    let veth_iface = veth::discover_veth_for_pod(event.pod_pid);
+
+    let mut state = PodAttachmentState {
+        pod_uid: pod_uid.to_string(),
+        pod_name: pod_name.to_string(),
+        namespace: namespace.to_string(),
+        pod_ip,
+        cgroup_path: cgroup_path.clone(),
+        veth_iface: veth_iface.clone(),
+        attached: false,
+    };
+
+    if let Some(ref cgroup) = cgroup_path {
+        let programs = [
+            "ferrum_connect4",
+            "ferrum_connect6",
+            "ferrum_getpeername4",
+            "ferrum_getpeername6",
+        ];
+        let mut attach_ok = true;
+        for prog in &programs {
+            if let Err(e) = backend.attach_cgroup(cgroup, prog) {
+                warn!(pod_uid, program = prog, error = %e, "Failed to attach cgroup program");
+                metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+                attach_ok = false;
+                break;
+            }
+        }
+        if attach_ok {
+            if let Some(ref iface) = veth_iface
+                && let Err(e) = backend.attach_tc(iface, "ferrum_tc_inbound")
+            {
+                warn!(pod_uid, iface, error = %e, "Failed to attach tc program");
+                metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(ip) = pod_ip {
+                let info = PodInfo {
+                    proxy_port: config.capture_config.outbound_port,
+                    cgroup_id: 0,
+                };
+                let _ = backend.update_pod_ip(ip, &info);
+            }
+            state.attached = true;
+            metrics.pods_enrolled.fetch_add(1, Ordering::Relaxed);
+            info!(
+                pod_uid,
+                pod_name,
+                namespace,
+                ?pod_ip,
+                "Pod enrolled for eBPF capture"
+            );
+        }
+    } else {
+        warn!(
+            pod_uid,
+            pod_name, "Could not resolve cgroup path, skipping attachment"
+        );
+        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pod_states.insert(pod_uid.to_string(), state);
+}
+
+#[allow(dead_code)]
+pub fn handle_pod_removed(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+    pod_uid: &str,
+) {
+    let removed = pod_states.remove(pod_uid);
+    let Some((_, state)) = removed else {
+        return;
+    };
+
+    if state.attached {
+        if let Err(e) = backend.detach_pod(pod_uid) {
+            warn!(pod_uid, error = %e, "Failed to detach BPF programs");
+        }
+        if let Some(ip) = state.pod_ip
+            && let Err(e) = backend.remove_pod_ip(ip)
+        {
+            warn!(pod_uid, %ip, error = %e, "Failed to remove pod IP from map");
+        }
+        metrics.pods_unenrolled.fetch_add(1, Ordering::Relaxed);
+        info!(pod_uid, pod_name = %state.pod_name, "Pod unenrolled from eBPF capture");
+    }
 }
 
 fn handle_fallback(
@@ -315,6 +474,187 @@ mod tests {
         };
 
         assert!(handle_fallback(&config, &probe).is_ok());
+    }
+
+    #[test]
+    fn handle_pod_added_enrolls_matching_pod() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "test-pod",
+            namespace: "default",
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert!(pod_states.contains_key("pod-uid-1"));
+    }
+
+    #[test]
+    fn handle_pod_added_skips_non_matching() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+        };
+        let event = PodEvent {
+            pod_uid: "pod-uid-2",
+            pod_name: "no-mesh-pod",
+            namespace: "default",
+            labels: &HashMap::new(),
+            annotations: &HashMap::new(),
+            pod_ip_str: None,
+            pod_pid: None,
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert!(!pod_states.contains_key("pod-uid-2"));
+        assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn handle_pod_added_skips_excluded_namespace() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let excluded = pod_watcher::build_excluded_namespaces(&[]);
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: excluded,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-3",
+            pod_name: "system-pod",
+            namespace: "kube-system",
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: None,
+            pod_pid: None,
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert!(!pod_states.contains_key("pod-uid-3"));
+    }
+
+    #[test]
+    fn handle_pod_removed_cleans_up_attached() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 5);
+
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "test-pod".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: Some(ip),
+                cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid1".to_string()),
+                veth_iface: Some("veth123".to_string()),
+                attached: true,
+            },
+        );
+        backend
+            .update_pod_ip(
+                ip,
+                &PodInfo {
+                    proxy_port: 15001,
+                    cgroup_id: 0,
+                },
+            )
+            .unwrap();
+
+        handle_pod_removed(&mut backend, &pod_states, &metrics, "pod-uid-1");
+
+        assert!(!pod_states.contains_key("pod-uid-1"));
+        assert_eq!(backend.detached_pods, vec!["pod-uid-1"]);
+        assert!(!backend.pod_ips.contains_key(&ip));
+        assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_pod_removed_noop_for_unknown() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+
+        handle_pod_removed(&mut backend, &pod_states, &metrics, "nonexistent");
+
+        assert!(backend.detached_pods.is_empty());
+        assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn handle_pod_added_skips_duplicate() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "existing".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: None,
+                cgroup_path: None,
+                veth_iface: None,
+                attached: true,
+            },
+        );
+
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "duplicate",
+            namespace: "default",
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: None,
+            pod_pid: None,
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert_eq!(pod_states.get("pod-uid-1").unwrap().pod_name, "existing");
     }
 
     #[test]
