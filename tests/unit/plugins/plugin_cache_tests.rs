@@ -1369,6 +1369,35 @@ async fn test_requires_ws_frame_hooks_defaults_false_for_all_plugins() {
 }
 
 #[tokio::test]
+async fn test_pre_auth_body_buffering_plugins_are_explicitly_tracked_for_hbone() {
+    use ferrum_edge::plugins::{available_plugins, create_plugin};
+
+    const HBONE_PRE_AUTH_BODY_PLUGINS: &[&str] = &["hmac_auth"];
+
+    let ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "CONNECT".to_string(),
+        "/".to_string(),
+    );
+    let mut pre_auth_body_plugins = Vec::new();
+
+    for name in available_plugins() {
+        let config = minimal_plugin_config(name);
+        if let Ok(Some(plugin)) = create_plugin(name, &config)
+            && plugin.requires_request_body_before_authenticate()
+            && plugin.should_buffer_request_body(&ctx)
+        {
+            pre_auth_body_plugins.push(name);
+        }
+    }
+
+    assert_eq!(
+        pre_auth_body_plugins, HBONE_PRE_AUTH_BODY_PLUGINS,
+        "new pre-auth body-buffering plugins must update HBONE CONNECT coverage"
+    );
+}
+
+#[tokio::test]
 async fn test_on_ws_frame_default_returns_none() {
     use ferrum_edge::plugins::{WebSocketFrameDirection, create_plugin};
     use tokio_tungstenite::tungstenite::Message;

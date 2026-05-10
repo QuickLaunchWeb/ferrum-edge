@@ -274,6 +274,12 @@ async fn mesh_authz_ignores_hbone_baggage_without_authenticated_peer() {
     );
     assert_eq!(
         ctx.metadata
+            .get("mesh_authz.ignored_baggage.unauthenticated")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata
             .get("mesh_authz.deny_policy")
             .map(String::as_str),
         Some("unauthenticated_baggage")
@@ -738,6 +744,10 @@ async fn workload_metrics_does_not_trust_hbone_baggage_without_authenticated_pee
             .map(String::as_str),
         Some("none")
     );
+    assert_eq!(
+        ctx.metadata.get("mesh.ignored_baggage").map(String::as_str),
+        Some("unauthenticated_hbone")
+    );
     assert!(!ctx.metadata.contains_key("mesh.source.principal"));
     assert!(!ctx.metadata.contains_key("mesh.source.service_account"));
 }
@@ -806,6 +816,12 @@ async fn mesh_authz_drops_baggage_with_mismatched_trust_domain() {
             .get("mesh_authz.ignored_baggage")
             .map(String::as_str),
         Some("trust_domain_mismatch")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_baggage.trust_domain_mismatch")
+            .map(String::as_str),
+        Some("true")
     );
 }
 
@@ -919,6 +935,24 @@ async fn workload_metrics_drops_baggage_with_mismatched_trust_domain() {
             .get("mesh.connection_security_policy")
             .map(String::as_str),
         Some("mutual_tls")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_sampling_zero_records_unsampled() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "sampling_percentage": 0.0
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("trace_sampled").map(String::as_str),
+        Some("false")
     );
 }
 
