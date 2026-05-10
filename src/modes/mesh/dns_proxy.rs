@@ -581,23 +581,17 @@ async fn handle_dns_tcp_connection(
         if len == 0 {
             continue;
         }
+
+        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+            warn!(client = %src, payload_bytes = len, "DNS proxy TCP query concurrency limit reached");
+            return;
+        };
+
         let mut packet = vec![0u8; len];
         if let Err(e) = stream.read_exact(&mut packet).await {
             debug!(client = %src, error = %e, "Failed to read DNS TCP query");
             return;
         }
-
-        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
-            if let Some(response) = build_dns_error_response_from_packet(
-                &packet,
-                RCODE_SERVFAIL,
-                DNS_MAX_TCP_PACKET_SIZE,
-            ) {
-                let _ = write_dns_tcp_response(&mut stream, &response).await;
-            }
-            warn!(client = %src, "DNS proxy query concurrency limit reached");
-            continue;
-        };
 
         let response = match evaluate_dns_query(&packet, table, ttl, DNS_MAX_TCP_PACKET_SIZE) {
             DnsDecision::Respond(response) => response,
@@ -1673,6 +1667,30 @@ mod tests {
             u16::from_be_bytes([response[offset], response[offset + 1]]),
             QTYPE_TXT
         );
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_rejects_before_payload_read_when_limit_saturated() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let semaphore = Arc::new(Semaphore::new(0));
+
+        let server = tokio::spawn(async move {
+            let (stream, src) = listener.accept().await.unwrap();
+            let table = ArcSwap::from_pointee(DnsResolutionTable::empty());
+            handle_dns_tcp_connection(stream, src, &table, listen_addr, 60, semaphore).await;
+        });
+
+        let mut client = TcpStream::connect(listen_addr).await.unwrap();
+        client.write_all(&u16::MAX.to_be_bytes()).await.unwrap();
+
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut buf))
+            .await
+            .expect("server should close without waiting for payload")
+            .expect("read should complete");
+        assert_eq!(read, 0);
+        server.await.unwrap();
     }
 
     #[test]
