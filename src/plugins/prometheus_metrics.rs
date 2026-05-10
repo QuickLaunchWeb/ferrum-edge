@@ -238,6 +238,9 @@ pub struct MetricsRegistry {
     /// idle timeouts from genuine errors and see which side initiated the
     /// disconnect.
     pub stream_disconnect_counter: DashMap<StreamDisconnectKey, TimestampedCounter>,
+    /// Mesh DNS upstream transaction-ID exhaustion events. This is process-wide
+    /// because the transparent mesh DNS proxy uses one shared upstream socket.
+    pub mesh_dns_upstream_id_exhaustions: AtomicU64,
     /// Cached render output with generation timestamp
     render_cache: ArcSwap<Option<(Instant, String)>>,
     /// Configurable render cache TTL in seconds
@@ -274,6 +277,7 @@ impl MetricsRegistry {
             stream_duration_buckets: DashMap::new(),
             client_disconnect_counter: DashMap::new(),
             stream_disconnect_counter: DashMap::new(),
+            mesh_dns_upstream_id_exhaustions: AtomicU64::new(0),
             render_cache: ArcSwap::from_pointee(None),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
             stale_entry_ttl_nanos: AtomicU64::new(DEFAULT_STALE_TTL_NANOS),
@@ -341,6 +345,12 @@ impl MetricsRegistry {
             .or_insert_with(|| TimestampedCounter::new(self.epoch))
             .increment(self.epoch);
 
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_mesh_dns_upstream_id_exhaustion(&self) {
+        self.mesh_dns_upstream_id_exhaustions
+            .fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
     }
 
@@ -735,6 +745,26 @@ impl MetricsRegistry {
                     proxy_id, protocol, key.cause, key.direction, ns_label, count
                 ));
             }
+        }
+
+        let mesh_dns_exhaustions = self
+            .mesh_dns_upstream_id_exhaustions
+            .load(Ordering::Relaxed);
+        output.push_str(
+            "# HELP ferrum_mesh_dns_upstream_id_exhaustions_total Mesh DNS upstream transaction ID exhaustion events.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_dns_upstream_id_exhaustions_total counter\n");
+        if ns_label.is_empty() {
+            output.push_str(&format!(
+                "ferrum_mesh_dns_upstream_id_exhaustions_total {}\n",
+                mesh_dns_exhaustions
+            ));
+        } else {
+            output.push_str(&format!(
+                "ferrum_mesh_dns_upstream_id_exhaustions_total{{{}}} {}\n",
+                &ns_label[1..],
+                mesh_dns_exhaustions
+            ));
         }
 
         output
