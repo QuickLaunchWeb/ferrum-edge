@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
-use crate::config::mesh::{AppProtocol, MeshService, ServicePort};
 use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT};
+use crate::modes::mesh::config::{AppProtocol, MeshService, ServicePort};
 
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, RouteBackend, RouteProxySpec, SourceKind,

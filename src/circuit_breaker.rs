@@ -195,11 +195,22 @@ impl CircuitBreaker {
                     |v| v.checked_sub(1),
                 );
             }
-            STATE_CLOSED
+            STATE_CLOSED => {
+                // A different half-open probe can close the breaker before
+                // this probe records success. The request still owns one
+                // half-open slot from its can_execute() admission, so release
+                // it even though the state is already CLOSED.
+                if is_half_open_probe {
+                    let _ = self.half_open_in_flight.fetch_update(
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                        |v| v.checked_sub(1),
+                    );
+                }
                 // Reset failure count on success
-                if self.failure_count.load(Ordering::Relaxed) > 0 =>
-            {
-                self.failure_count.store(0, Ordering::Relaxed);
+                if self.failure_count.load(Ordering::Relaxed) > 0 {
+                    self.failure_count.store(0, Ordering::Relaxed);
+                }
             }
             _ => {}
         }
@@ -225,10 +236,26 @@ impl CircuitBreaker {
     ) {
         if connection_error {
             if !self.config.trip_on_connection_errors {
+                // Filtered failure — release the probe slot without state transition
+                if is_half_open_probe {
+                    let _ = self.half_open_in_flight.fetch_update(
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                        |v| v.checked_sub(1),
+                    );
+                }
                 return;
             }
         } else if !self.config.failure_status_codes.contains(&status_code) {
-            // Non-failure status codes are neutral — don't treat as success or failure
+            // Non-failure status codes are neutral — release probe slot without
+            // state transition
+            if is_half_open_probe {
+                let _ = self.half_open_in_flight.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |v| v.checked_sub(1),
+                );
+            }
             return;
         }
 

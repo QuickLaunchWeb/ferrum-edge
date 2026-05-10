@@ -747,20 +747,20 @@ impl DatabaseStore {
     // such helpers verbose without meaningful runtime benefit.
 
     /// Number of `?` placeholders in `PROXY_INSERT_SQL` (no api_spec_id).
-    /// 45 base columns + `created_at` + `updated_at` = 47.
+    /// 47 base columns + `created_at` + `updated_at` = 49.
     ///
     /// Used only by the drift-catcher tests in `proxy_insert_sql_drift_tests`;
     /// kept available outside `#[cfg(test)]` so it remains a visible
     /// drift-prevention anchor when reading the SQL definition.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 47;
+    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 49;
 
     /// Number of `?` placeholders in the `submit_api_spec_bundle` proxy
     /// INSERT statement (which adds `api_spec_id` between
     /// `udp_max_response_amplification_factor` and `created_at`).
-    /// 47 base + 1 (api_spec_id) = 48.
+    /// 49 base + 1 (api_spec_id) = 50.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 48;
+    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 50;
 
     /// Proxy INSERT SQL without `api_spec_id` (direct admin path and bulk import).
     ///
@@ -781,13 +781,15 @@ impl DatabaseStore {
          pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, \
          pool_http2_initial_connection_window_size, pool_http2_adaptive_window, \
          pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
-         pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, \
+         pool_http3_connections_per_backend, pool_max_requests_per_connection, \
+         listen_port, frontend_tls, passthrough, \
          udp_idle_timeout_seconds, tcp_idle_timeout_seconds, \
          allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
+         upstream_subset, \
          created_at, updated_at) \
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                ?, ?)";
+                ?, ?, ?, ?)";
 
     // ---- CRUD for Admin API ----
 
@@ -881,6 +883,7 @@ impl DatabaseStore {
             .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
             .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
             .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
+            .bind(proxy.pool_max_requests_per_connection.map(|v| v as i64))
             .bind(proxy.listen_port.map(|v| v as i32))
             .bind(if proxy.frontend_tls { 1i32 } else { 0 })
             .bind(if proxy.passthrough { 1i32 } else { 0 })
@@ -903,6 +906,7 @@ impl DatabaseStore {
                     .udp_max_response_amplification_factor
                     .map(|v| v as f64),
             )
+            .bind(&proxy.upstream_subset)
             .bind(proxy.created_at.to_rfc3339())
             .bind(proxy.updated_at.to_rfc3339())
             .execute(&mut *tx)
@@ -947,7 +951,7 @@ impl DatabaseStore {
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
         sqlx::query(
-            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, updated_at=? WHERE id=?")
         )
         .bind(&proxy.name)
         .bind(&hosts_json)
@@ -969,6 +973,7 @@ impl DatabaseStore {
         .bind(proxy.dns_cache_ttl_seconds.map(|v| v as i64))
         .bind(match proxy.auth_mode { AuthMode::Multi => "multi", _ => "single" })
         .bind(&proxy.upstream_id)
+        .bind(&proxy.upstream_subset)
         .bind(&circuit_breaker_json)
         .bind(&retry_json)
         .bind(response_body_mode_str)
@@ -984,6 +989,7 @@ impl DatabaseStore {
         .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
         .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
         .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
+        .bind(proxy.pool_max_requests_per_connection.map(|v| v as i64))
         .bind(proxy.listen_port.map(|v| v as i32))
         .bind(if proxy.frontend_tls { 1i32 } else { 0 })
         .bind(if proxy.passthrough { 1i32 } else { 0 })
@@ -1610,6 +1616,12 @@ impl DatabaseStore {
             .map(serde_json::to_string)
             .transpose()?;
 
+        let subsets_json = upstream
+            .subsets
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
         let hash_on_cookie_config_json = upstream
             .hash_on_cookie_config
             .as_ref()
@@ -1617,7 +1629,7 @@ impl DatabaseStore {
             .transpose()?;
 
         sqlx::query(
-            &self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&upstream.id)
         .bind(&upstream.namespace)
@@ -1628,6 +1640,7 @@ impl DatabaseStore {
         .bind(&hash_on_cookie_config_json)
         .bind(&health_checks_json)
         .bind(&service_discovery_json)
+        .bind(&subsets_json)
         .bind(&upstream.backend_tls_client_cert_path)
         .bind(&upstream.backend_tls_client_key_path)
         .bind(upstream.backend_tls_verify_server_cert as i32)
@@ -1656,6 +1669,11 @@ impl DatabaseStore {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let subsets_json = upstream
+            .subsets
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
 
         let hash_on_cookie_config_json = upstream
             .hash_on_cookie_config
@@ -1664,7 +1682,7 @@ impl DatabaseStore {
             .transpose()?;
 
         sqlx::query(
-            &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, subsets=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, updated_at=? WHERE id=?")
         )
         .bind(&upstream.name)
         .bind(&targets_json)
@@ -1673,6 +1691,7 @@ impl DatabaseStore {
         .bind(&hash_on_cookie_config_json)
         .bind(&health_checks_json)
         .bind(&service_discovery_json)
+        .bind(&subsets_json)
         .bind(&upstream.backend_tls_client_cert_path)
         .bind(&upstream.backend_tls_client_key_path)
         .bind(upstream.backend_tls_verify_server_cert as i32)
@@ -2741,6 +2760,7 @@ impl DatabaseStore {
                 .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
                 .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
                 .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
+                .bind(proxy.pool_max_requests_per_connection.map(|v| v as i64))
                 .bind(proxy.listen_port.map(|v| v as i32))
                 .bind(if proxy.frontend_tls { 1i32 } else { 0 })
                 .bind(if proxy.passthrough { 1i32 } else { 0 })
@@ -2763,6 +2783,7 @@ impl DatabaseStore {
                         .udp_max_response_amplification_factor
                         .map(|v| v as f64),
                 )
+                .bind(&proxy.upstream_subset)
                 .bind(proxy.created_at.to_rfc3339())
                 .bind(proxy.updated_at.to_rfc3339())
                 .execute(&mut *tx)
@@ -2934,7 +2955,7 @@ impl DatabaseStore {
         upstreams: &[Upstream],
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
-        let sql = self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql = self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
         for upstream in upstreams {
             let targets_json = serde_json::to_string(&upstream.targets)?;
@@ -2955,6 +2976,11 @@ impl DatabaseStore {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            let subsets_json = upstream
+                .subsets
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
             sqlx::query(&sql)
                 .bind(&upstream.id)
                 .bind(&upstream.namespace)
@@ -2965,6 +2991,7 @@ impl DatabaseStore {
                 .bind(&hash_on_cookie_config_json)
                 .bind(&health_checks_json)
                 .bind(&service_discovery_json)
+                .bind(&subsets_json)
                 .bind(&upstream.backend_tls_client_cert_path)
                 .bind(&upstream.backend_tls_client_key_path)
                 .bind(upstream.backend_tls_verify_server_cert as i32)
@@ -3322,6 +3349,7 @@ impl DatabaseStore {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            let subsets_json = u.subsets.as_ref().map(serde_json::to_string).transpose()?;
             let hash_on_cookie_config_json = u
                 .hash_on_cookie_config
                 .as_ref()
@@ -3330,10 +3358,10 @@ impl DatabaseStore {
 
             sqlx::query(&self.q("INSERT INTO upstreams \
                  (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, \
-                  health_checks, service_discovery, backend_tls_client_cert_path, \
+                  health_checks, service_discovery, subsets, backend_tls_client_cert_path, \
                   backend_tls_client_key_path, backend_tls_verify_server_cert, \
                   backend_tls_server_ca_cert_path, api_spec_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
             .bind(&u.id)
             .bind(&u.namespace)
             .bind(&u.name)
@@ -3343,6 +3371,7 @@ impl DatabaseStore {
             .bind(&hash_on_cookie_config_json)
             .bind(&health_checks_json)
             .bind(&service_discovery_json)
+            .bind(&subsets_json)
             .bind(&u.backend_tls_client_cert_path)
             .bind(&u.backend_tls_client_key_path)
             .bind(u.backend_tls_verify_server_cert as i32)
@@ -3381,20 +3410,21 @@ impl DatabaseStore {
                   backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, \
                   backend_tls_client_cert_path, backend_tls_client_key_path, \
                   backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, \
-                  dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, \
+                  dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, upstream_subset, \
                   circuit_breaker, retry, response_body_mode, \
                   pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, \
                   pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, \
                   pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, \
                   pool_http2_initial_connection_window_size, pool_http2_adaptive_window, \
                   pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
-                  pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, \
+                  pool_http3_connections_per_backend, pool_max_requests_per_connection, \
+                  listen_port, frontend_tls, passthrough, \
                   udp_idle_timeout_seconds, tcp_idle_timeout_seconds, \
                   allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
                   api_spec_id, created_at, updated_at) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                         ?, ?, ?)"))
+                         ?, ?, ?, ?, ?)"))
             .bind(&p.id)
             .bind(&p.namespace)
             .bind(&p.name)
@@ -3424,6 +3454,7 @@ impl DatabaseStore {
                 _ => "single",
             })
             .bind(&p.upstream_id)
+            .bind(&p.upstream_subset)
             .bind(&circuit_breaker_json)
             .bind(&retry_json)
             .bind(response_body_mode_str)
@@ -3448,6 +3479,7 @@ impl DatabaseStore {
             .bind(p.pool_http2_max_frame_size.map(|v| v as i64))
             .bind(p.pool_http2_max_concurrent_streams.map(|v| v as i64))
             .bind(p.pool_http3_connections_per_backend.map(|v| v as i64))
+            .bind(p.pool_max_requests_per_connection.map(|v| v as i64))
             .bind(p.listen_port.map(|v| v as i32))
             .bind(if p.frontend_tls { 1i32 } else { 0 })
             .bind(if p.passthrough { 1i32 } else { 0 })
@@ -3669,6 +3701,7 @@ impl DatabaseStore {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            let subsets_json = u.subsets.as_ref().map(serde_json::to_string).transpose()?;
             let hash_on_cookie_config_json = u
                 .hash_on_cookie_config
                 .as_ref()
@@ -3677,10 +3710,10 @@ impl DatabaseStore {
 
             sqlx::query(&self.q("INSERT INTO upstreams \
                  (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, \
-                  health_checks, service_discovery, backend_tls_client_cert_path, \
+                  health_checks, service_discovery, subsets, backend_tls_client_cert_path, \
                   backend_tls_client_key_path, backend_tls_verify_server_cert, \
                   backend_tls_server_ca_cert_path, api_spec_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
             .bind(&u.id)
             .bind(&u.namespace)
             .bind(&u.name)
@@ -3690,6 +3723,7 @@ impl DatabaseStore {
             .bind(&hash_on_cookie_config_json)
             .bind(&health_checks_json)
             .bind(&service_discovery_json)
+            .bind(&subsets_json)
             .bind(&u.backend_tls_client_cert_path)
             .bind(&u.backend_tls_client_key_path)
             .bind(u.backend_tls_verify_server_cert as i32)
@@ -3726,6 +3760,7 @@ impl DatabaseStore {
                  backend_tls_client_cert_path = ?, backend_tls_client_key_path = ?, \
                  backend_tls_verify_server_cert = ?, backend_tls_server_ca_cert_path = ?, \
                  dns_override = ?, dns_cache_ttl_seconds = ?, auth_mode = ?, upstream_id = ?, \
+                 upstream_subset = ?, \
                  circuit_breaker = ?, retry = ?, response_body_mode = ?, \
                  pool_idle_timeout_seconds = ?, pool_enable_http_keep_alive = ?, \
                  pool_enable_http2 = ?, pool_tcp_keepalive_seconds = ?, \
@@ -3736,6 +3771,7 @@ impl DatabaseStore {
                  pool_http2_adaptive_window = ?, pool_http2_max_frame_size = ?, \
                  pool_http2_max_concurrent_streams = ?, \
                  pool_http3_connections_per_backend = ?, \
+                 pool_max_requests_per_connection = ?, \
                  listen_port = ?, frontend_tls = ?, passthrough = ?, \
                  udp_idle_timeout_seconds = ?, tcp_idle_timeout_seconds = ?, \
                  allowed_methods = ?, allowed_ws_origins = ?, \
@@ -3770,6 +3806,7 @@ impl DatabaseStore {
                 _ => "single",
             })
             .bind(&p.upstream_id)
+            .bind(&p.upstream_subset)
             .bind(&circuit_breaker_json)
             .bind(&retry_json)
             .bind(response_body_mode_str)
@@ -3794,6 +3831,7 @@ impl DatabaseStore {
             .bind(p.pool_http2_max_frame_size.map(|v| v as i64))
             .bind(p.pool_http2_max_concurrent_streams.map(|v| v as i64))
             .bind(p.pool_http3_connections_per_backend.map(|v| v as i64))
+            .bind(p.pool_max_requests_per_connection.map(|v| v as i64))
             .bind(p.listen_port.map(|v| v as i32))
             .bind(if p.frontend_tls { 1i32 } else { 0 })
             .bind(if p.passthrough { 1i32 } else { 0 })
@@ -5079,6 +5117,11 @@ fn row_to_proxy(
             .try_get::<i64, _>("pool_http3_connections_per_backend")
             .ok()
             .map(|v| v.max(1) as usize),
+        pool_max_requests_per_connection: row
+            .try_get::<i64, _>("pool_max_requests_per_connection")
+            .ok()
+            .map(|v| v.max(0) as u64),
+        upstream_subset: row.try_get::<String, _>("upstream_subset").ok(),
         listen_port: row
             .try_get::<i32, _>("listen_port")
             .ok()
@@ -5302,6 +5345,17 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         .map(|v| v != 0)
         .unwrap_or(true);
 
+    let subsets = match row.try_get::<String, _>("subsets") {
+        Ok(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            anyhow::anyhow!(
+                "Upstream {}: failed to parse subsets JSON: {}",
+                id_preview,
+                e
+            )
+        })?),
+        Err(_) => None,
+    };
+
     Ok(Upstream {
         id: row.try_get("id")?,
         namespace: row
@@ -5314,6 +5368,7 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         hash_on_cookie_config,
         health_checks,
         service_discovery,
+        subsets,
         backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
         backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
         backend_tls_verify_server_cert,
@@ -5506,7 +5561,7 @@ mod proxy_insert_sql_drift_tests {
         // change there.
         let values_clause = "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                                     ?, ?, ?)";
+                                     ?, ?, ?, ?, ?)";
         let placeholders = values_clause.matches('?').count();
         assert_eq!(
             placeholders,

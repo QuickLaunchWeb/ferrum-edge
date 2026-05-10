@@ -458,6 +458,8 @@ pub struct UdpListenerConfig {
     /// accepts DTLS connections from clients instead of plain UDP.
     pub frontend_dtls_config: Option<crate::dtls::FrontendDtlsConfig>,
     pub tls_no_verify: bool,
+    /// Global CA bundle path for outbound TLS verification (fallback when proxy has no per-proxy CA).
+    pub tls_ca_bundle_path: Option<String>,
     /// Maximum concurrent sessions per proxy (from `FERRUM_UDP_MAX_SESSIONS`, default 10000).
     pub max_sessions: usize,
     /// Frontend TLS/DTLS handshake timeout in seconds. 0 disables the deadline.
@@ -513,6 +515,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         metrics,
         frontend_dtls_config,
         tls_no_verify,
+        tls_ca_bundle_path,
         max_sessions,
         frontend_tls_handshake_timeout_seconds,
         cleanup_interval_seconds,
@@ -544,6 +547,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             metrics,
             dtls_config,
             tls_no_verify,
+            tls_ca_bundle_path,
             max_sessions,
             frontend_tls_handshake_timeout_seconds,
             circuit_breaker_cache,
@@ -724,6 +728,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &sessions,
                                                     &metrics,
                                                     tls_no_verify,
+                                                    tls_ca_bundle_path.as_deref(),
                                                     max_sessions,
                                                     &mut last_client,
                                                     &mut batch_dgrams_out,
@@ -763,6 +768,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &sessions,
                                         &metrics,
                                         tls_no_verify,
+                                        tls_ca_bundle_path.as_deref(),
                                         max_sessions,
                                         &mut last_client,
                                         &mut batch_dgrams_out,
@@ -839,6 +845,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     &sessions,
                     &metrics,
                     tls_no_verify,
+                    tls_ca_bundle_path.as_deref(),
                     max_sessions,
                     &mut last_client,
                     &mut batch_dgrams_out,
@@ -906,6 +913,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &sessions,
                                                     &metrics,
                                                     tls_no_verify,
+                                                    tls_ca_bundle_path.as_deref(),
                                                     max_sessions,
                                                     &mut last_client,
                                                     &mut batch_dgrams_out,
@@ -945,6 +953,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &sessions,
                                         &metrics,
                                         tls_no_verify,
+                                        tls_ca_bundle_path.as_deref(),
                                         max_sessions,
                                         &mut last_client,
                                         &mut batch_dgrams_out,
@@ -990,6 +999,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     &sessions,
                                     &metrics,
                                     tls_no_verify,
+                                    tls_ca_bundle_path.as_deref(),
                                     max_sessions,
                                     &mut last_client,
                                     &mut batch_dgrams_out,
@@ -1056,6 +1066,7 @@ async fn process_datagram(
     sessions: &SessionMap,
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
+    tls_ca_bundle_path: Option<&str>,
     max_sessions: usize,
     last_client: &mut Option<(SocketAddr, Arc<UdpSession>)>,
     batch_dgrams_out: &mut u64,
@@ -1132,6 +1143,7 @@ async fn process_datagram(
             sessions,
             metrics,
             tls_no_verify,
+            tls_ca_bundle_path,
             max_sessions,
             listen_port,
             circuit_breaker_cache,
@@ -1198,6 +1210,7 @@ async fn lookup_or_create_session(
     sessions: &SessionMap,
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
+    tls_ca_bundle_path: Option<&str>,
     max_sessions: usize,
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
@@ -1234,6 +1247,7 @@ async fn lookup_or_create_session(
         sessions,
         metrics,
         tls_no_verify,
+        tls_ca_bundle_path,
         listen_port,
         circuit_breaker_cache,
         crls,
@@ -1353,6 +1367,7 @@ async fn start_dtls_frontend_listener(
     metrics: Arc<UdpProxyMetrics>,
     dtls_config: crate::dtls::FrontendDtlsConfig,
     tls_no_verify: bool,
+    tls_ca_bundle_path: Option<String>,
     max_sessions: usize,
     frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
@@ -1518,6 +1533,7 @@ async fn start_dtls_frontend_listener(
                 let connected_at = chrono::Utc::now();
 
                 let handler_crls = crls.clone();
+                let handler_ca_bundle = tls_ca_bundle_path.clone();
                 tokio::spawn(async move {
                     // Hold the guard for the lifetime of the handler task. Drop
                     // at task exit decrements `OverloadState.active_connections`.
@@ -1530,6 +1546,7 @@ async fn start_dtls_frontend_listener(
                         &handler_dns,
                         &handler_metrics,
                         tls_no_verify,
+                        handler_ca_bundle.as_deref(),
                         &handler_cb_cache,
                         &handler_datagram_plugins,
                         handler_proxy_name.as_deref(),
@@ -1661,6 +1678,7 @@ async fn handle_dtls_client(
     dns_cache: &DnsCache,
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
+    tls_ca_bundle_path: Option<&str>,
     circuit_breaker_cache: &CircuitBreakerCache,
     datagram_plugins: &Arc<[Arc<dyn Plugin>]>,
     proxy_name: Option<&str>,
@@ -1682,6 +1700,7 @@ async fn handle_dtls_client(
         dns_cache,
         metrics,
         tls_no_verify,
+        tls_ca_bundle_path,
         circuit_breaker_cache,
         &mut backend_info,
         Arc::clone(&bytes_sent),
@@ -1791,6 +1810,7 @@ async fn handle_dtls_client_inner(
     dns_cache: &DnsCache,
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
+    tls_ca_bundle_path: Option<&str>,
     circuit_breaker_cache: &CircuitBreakerCache,
     backend_info: &mut DtlsBackendInfo,
     bytes_sent: Arc<AtomicU64>,
@@ -1914,8 +1934,13 @@ async fn handle_dtls_client_inner(
                 e
             ));
         }
-        let dtls_params =
-            crate::dtls::build_backend_dtls_config(&proxy, &backend_host, tls_no_verify, crls)?;
+        let dtls_params = crate::dtls::build_backend_dtls_config(
+            &proxy,
+            &backend_host,
+            tls_no_verify,
+            crls,
+            tls_ca_bundle_path,
+        )?;
         let dtls = match crate::dtls::DtlsConnection::connect(socket, dtls_params).await {
             Ok(d) => Arc::new(d),
             Err(e) => {
@@ -2195,6 +2220,7 @@ async fn create_session(
     sessions: &SessionMap,
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
+    tls_ca_bundle_path: Option<&str>,
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
     crls: &crate::tls::CrlList,
@@ -2344,8 +2370,13 @@ async fn create_session(
                 ));
             }
 
-            let dtls_params =
-                crate::dtls::build_backend_dtls_config(&proxy, &backend_host, tls_no_verify, crls)?;
+            let dtls_params = crate::dtls::build_backend_dtls_config(
+                &proxy,
+                &backend_host,
+                tls_no_verify,
+                crls,
+                tls_ca_bundle_path,
+            )?;
             let dtls = match crate::dtls::DtlsConnection::connect(socket, dtls_params).await {
                 Ok(d) => Arc::new(d),
                 Err(e) => {

@@ -229,15 +229,30 @@ fn select_next_cross_protocol_retry_target(
             .passive_health
             .get(&proxy.id)
             .map(|r| r.value().clone()),
+        max_ejection_percent: crate::load_balancer::LoadBalancerCache::max_ejection_percent_from(
+            &epoch.load_balancer,
+            upstream_id,
+        ),
     };
 
-    let next = crate::load_balancer::LoadBalancerCache::select_next_target_from(
-        &epoch.load_balancer,
-        upstream_id,
-        hash_key,
-        prev_target,
-        Some(&health_ctx),
-    )?;
+    let next = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
+        crate::load_balancer::LoadBalancerCache::select_next_target_subset_from(
+            &epoch.load_balancer,
+            upstream_id,
+            hash_key,
+            subset_name,
+            prev_target,
+            Some(&health_ctx),
+        )
+    } else {
+        crate::load_balancer::LoadBalancerCache::select_next_target_from(
+            &epoch.load_balancer,
+            upstream_id,
+            hash_key,
+            prev_target,
+            Some(&health_ctx),
+        )
+    }?;
 
     let strip_len = proxy.listen_path.as_deref().map(str::len).unwrap_or(0);
     let next_url = crate::proxy::build_backend_url_with_target(

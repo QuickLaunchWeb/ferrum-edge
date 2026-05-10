@@ -3,13 +3,13 @@ use std::collections::{BTreeMap, HashMap};
 use chrono::Utc;
 use prost::Message;
 
-use ferrum_edge::config::mesh::{
+use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::identity::{SpiffeId, TrustDomain};
+use ferrum_edge::modes::mesh::config::{
     AppProtocol, MeshConfig, MeshPolicy, MeshRule, MeshService, MtlsMode, PeerAuthentication,
     PolicyAction, PolicyScope, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
     TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadSelector,
 };
-use ferrum_edge::config::types::GatewayConfig;
-use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::xds::conformance::{XdsConformanceCase, required_phase_b_cases};
 use ferrum_edge::xds::proto;
 use ferrum_edge::xds::{
@@ -262,7 +262,7 @@ fn mesh_slice_content_eq_ignores_only_version() {
     assert!(!left.content_eq(&right));
 
     left.namespace = right.namespace.clone();
-    right.multi_cluster = Some(ferrum_edge::config::mesh::MultiClusterConfig {
+    right.multi_cluster = Some(ferrum_edge::modes::mesh::config::MultiClusterConfig {
         local_cluster: Some("cluster-a".to_string()),
         ..Default::default()
     });

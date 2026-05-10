@@ -574,6 +574,62 @@ impl AdminResource for Upstream {
 
         Ok(None)
     }
+
+    async fn after_validate(
+        db: &dyn DatabaseBackend,
+        _state: &AdminState,
+        namespace: &str,
+        resource: &Self,
+        _existing: Option<&Self>,
+        _ctx: &ValidationCtx<'_>,
+    ) -> Result<(), AfterValidateError> {
+        let subset_names: HashSet<&str> = resource
+            .subsets
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|subset| subset.name.as_str())
+            .collect();
+        let mut errors = Vec::new();
+        let mut offset = 0_i64;
+        const PAGE_SIZE: i64 = 1_000;
+
+        loop {
+            let page = db
+                .list_proxies_paginated(namespace, PAGE_SIZE, offset)
+                .await
+                .map_err(AfterValidateError::Db)?;
+            let items_len = page.items.len() as i64;
+
+            for proxy in page.items {
+                if proxy.upstream_id.as_deref() != Some(resource.id.as_str()) {
+                    continue;
+                }
+                if let Some(subset_name) = proxy.upstream_subset.as_deref()
+                    && !subset_names.contains(subset_name)
+                {
+                    errors.push(format!(
+                        "upstream '{}' cannot remove subset '{}' while proxy '{}' references it",
+                        resource.id, subset_name, proxy.id
+                    ));
+                }
+            }
+
+            if items_len == 0 {
+                break;
+            }
+            offset += items_len;
+            if offset >= page.total {
+                break;
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(AfterValidateError::BadRequest(errors))
+        }
+    }
 }
 
 impl AdminResource for PluginConfig {
@@ -944,6 +1000,18 @@ impl AdminResource for Proxy {
                             return Err(AfterValidateError::BadRequest(vec![format!(
                                 "upstream_id '{}' is owned by api_spec '{}' and cannot be attached to proxy '{}'; create a hand-managed upstream or update the owning API spec",
                                 upstream_id, owner_spec_id, resource.id
+                            )]));
+                        }
+                    }
+                    if let Some(subset_name) = resource.upstream_subset.as_deref() {
+                        let subset_exists = upstream
+                            .subsets
+                            .as_ref()
+                            .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name));
+                        if !subset_exists {
+                            return Err(AfterValidateError::BadRequest(vec![format!(
+                                "upstream_subset '{}' is not defined on upstream_id '{}'",
+                                subset_name, upstream_id
                             )]));
                         }
                     }

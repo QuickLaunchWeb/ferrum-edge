@@ -13,7 +13,7 @@ use crate::config::types::UpstreamTarget;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Characters that must be percent-encoded in a URL path segment (RFC 3986 §3.3).
 /// Encodes everything except unreserved chars and sub-delims that are safe in path segments.
@@ -146,14 +146,28 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
 
         let response = request.send().await?;
 
-        // Track the Consul index for blocking queries
-        if let Some(index) = response
+        // Track the Consul index for blocking queries.
+        // Per Consul docs, when a server restarts the index can reset to a
+        // lower value. Detect this and move the cursor to the new index. The
+        // current response body has already delivered that snapshot, and the
+        // next call can keep using a blocking query instead of tight-spinning
+        // on index=0 immediate responses.
+        if let Some(new_index) = response
             .headers()
             .get("X-Consul-Index")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
         {
-            self.last_index.store(index, Ordering::Relaxed);
+            let current = self.last_index.load(Ordering::Relaxed);
+            if new_index < current {
+                warn!(
+                    "Consul index decreased from {} to {}, resetting blocking-query cursor to the new index (server likely restarted)",
+                    current, new_index
+                );
+                self.last_index.store(new_index, Ordering::Relaxed);
+            } else {
+                self.last_index.store(new_index, Ordering::Relaxed);
+            }
         }
 
         if !response.status().is_success() {
