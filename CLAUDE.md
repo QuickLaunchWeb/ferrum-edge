@@ -108,13 +108,43 @@ At startup, before config load. Env var suffixes resolve the base name: `_VAULT`
 - `src/{main,cli}.rs` — CLI, mode dispatch, signals
 - `src/admin/` — REST API + JWT middleware; `api_specs/` (extractor + handlers), `spec_codec.rs` (gzip + sha256)
 - `src/config/` — `types.rs` (domain model), `env_config.rs` (90+ vars), `db_backend.rs` trait + `db_loader.rs`/`mongo_store.rs`, `file_loader.rs`, `migrations/`
-- `src/modes/` — database/file/control_plane/data_plane/migrate; `src/modes/mesh/` — mesh mode (config, slice, HBONE parsing, policy, gRPC client, runtime)
+- `src/modes/` — database/file/control_plane/data_plane/migrate; `src/modes/mesh/` — mesh mode (`mod.rs` runtime + plugin injection + materialization, `config.rs` data model, `slice.rs` per-node filtering, `policy.rs` authz evaluation, `hbone.rs` identity parsing, `dns_proxy.rs` transparent DNS, `runtime.rs` ArcSwap state, `config_consumer/` native + xDS clients); `src/modes/injector.rs` — K8s admission webhook
 - `src/proxy/` — `mod.rs` (handle_proxy_request), `hbone_proxy.rs` (HBONE transport handler), `handler.rs`, `body.rs` (ProxyBody + Coalescing adapters), `grpc_proxy.rs`, `http2_pool.rs`, `tcp_proxy.rs`, `udp_proxy.rs`, `udp_batch.rs`, `sni.rs`, `stream_listener.rs`, `client_ip.rs`
 - `src/plugins/` — `mod.rs` (trait + priorities), `utils/`, per-plugin files; `src/plugins/mesh/` — mesh plugins (authz, spiffe_identity, workload_metrics, Prometheus/OTel helpers)
 - `src/grpc/` — `cp_server.rs`, `dp_client.rs`, `mesh_server.rs`, `mesh_registry.rs`; `src/http3/` — QUIC server + `Http3ConnectionPool`
 - `src/{dtls,dns,secrets,tls,service_discovery}/`
 - Top-level utilities: `overload.rs`, `load_balancer.rs`, `health_check.rs`, `circuit_breaker.rs`, `retry.rs`, `pool/`, `connection_pool.rs`, `router_cache.rs`, `plugin_cache.rs`, `consumer_index.rs`, `config_delta.rs`, `date_cache.rs`, `lazy_timeout.rs`, `socket_opts.rs`, `tls_offload.rs`
 - `custom_plugins/` — auto-discovered by `build.rs`; supports `plugin_migrations()`
+
+### Mesh Mode Architecture (`src/modes/mesh/`)
+
+Full docs: [docs/mesh.md](docs/mesh.md). Key engineering invariants below.
+
+**Topologies** (`MeshTopology`): `Sidecar` (inbound 15006 mTLS + outbound 15001 plaintext capture), `Ambient` (HBONE 15008 + outbound 15001), `EastWestGateway` (SNI-routed passthrough on 15443), `EgressGateway` (mTLS inbound 15090 → external ServiceEntry backends). Topology drives which listeners spawn; all share the same proxy/plugin chain.
+
+**Runtime state** (`MeshRuntimeState` in `runtime.rs`): `ArcSwap<Option<MeshSlice>>` — lock-free hot-swap, same pattern as `GatewayConfig`. `wait_for_first_slice()` blocks startup until the first valid slice arrives. `subscribe()` returns a `watch::Receiver` for config-update notifications.
+
+**Config consumption** (`config_consumer/`): `FERRUM_MESH_CONFIG_PROTOCOL=native` uses `MeshConfigSync.MeshSubscribe` gRPC (server pushes full `MeshSlice` JSON). `xds` uses a standard ADS client consuming CDS/EDS/LDS/RDS/SDS with 25ms debounce. Both protocols: jittered exponential backoff (1s→30s, ±25%), multi-CP failover via `FERRUM_DP_CP_GRPC_URLS`, JWT auth in metadata.
+
+**MeshSlice** (`slice.rs`): per-node filtered view of mesh config. `from_gateway_config()` filters workloads/policies/peer_auth/service_entries/request_auth/telemetry by namespace + PolicyScope + export_to visibility. `content_eq()` suppresses no-op updates (ignores transport version stamp). The CP computes slices per subscriber; the `start_mesh_slice_apply_task` background task applies valid slices atomically and skips invalid ones.
+
+**Mesh data model** (`config.rs`): `Workload` (SPIFFE identity unit), `MeshService` (logical service grouping workloads), `MeshPolicy` (authorization with PolicyScope + rules), `PeerAuthentication` (per-port mTLS mode), `ServiceEntry` (external service hosts/endpoints/resolution/location/export_to), `MeshRequestAuthentication` (JWT validation rules with scope — permissive: declares valid JWTs, not required ones), `MeshTelemetryResource` (per-scope tracing/metrics/access-logging config), `TrustBundleSet` (local + federated X.509/JWT authorities), `MultiClusterConfig` (remote clusters + east-west gateways). Validation: `validate_mesh_config()` returns flat `Vec<String>` errors.
+
+**HBONE protocol** (`hbone.rs`): HTTP/2 CONNECT over mTLS on port 15008. `is_hbone_connect()` detects via method + optional `x-ferrum-mesh-protocol`/`x-istio-protocol` headers. `HboneIdentity::from_headers()` extracts `source.principal`/`destination.principal` from W3C Baggage with percent-decoding. Fallback key aliases: `source.principal`, `source_principal`, `source.identity`, `source_identity`, `src.identity`, `src_identity`. Trust-domain gating: baggage `source.principal` honored only when its trust domain matches peer cert's or appears in `FERRUM_MESH_TRUST_DOMAIN_ALIASES`; mismatches fall back to peer cert identity with audit metadata.
+
+**DNS proxy** (`dns_proxy.rs`): `MeshDnsProxy` with `DnsResolutionTable` rebuilt atomically from `MeshSlice` on every update (via `ArcSwap`). Resolves ServiceEntry hosts → endpoint IPs and MeshService names → workload addresses (both FQDN `{name}.{ns}.svc.{cluster_domain}` and short `{name}.{ns}`). Wildcard hosts (`*.example.com`) via bucketed suffix matching. Non-mesh queries forwarded to upstream. UDP + TCP, A/AAAA, EDNS(0), concurrent query semaphore. Enabled via `FERRUM_MESH_DNS_PROXY_ENABLED`.
+
+**Mesh plugin injection** (`mod.rs::inject_mesh_global_plugins()`): auto-injects reserved-ID global plugins at slice-apply time: `__mesh_spiffe_identity` (spiffe_identity, priority 940), `__mesh_authz` (mesh_authz, 2075), `__mesh_workload_metrics` (workload_metrics), `__mesh_request_auth` (jwks_auth, only when MeshRequestAuthentication has JWT rules), `__mesh_access_log` (access_log with Telemetry API filter). Operator-managed globals of the same type override mesh-injected ones.
+
+**Mesh materialization**: `materialize_east_west_gateway_proxies()` creates SNI-routed passthrough TCP proxies from `MultiClusterConfig.east_west_gateways` (east-west topology only). `materialize_egress_gateway_proxies()` creates HTTP-family proxies from `ServiceEntry` resources with `location: mesh_external` (egress topology only; internal entries and non-HTTP protocols are skipped).
+
+**Telemetry API merge** (`merge_applicable_telemetry()`): merges `MeshTelemetryResource` entries by scope specificity (`WorkloadSelector` > `Namespace` > `MeshWide`). Each section (tracing, metrics, access_logging) is merged independently — most-specific-scope wins per section.
+
+**Authorization evaluation** (`policy.rs`): `evaluate_mesh_authorization()` → `MeshAuthzDecision::{Allow, Deny, Audit}`. DENY rules checked first (first match wins). If any ALLOW rule exists but none matched → implicit deny (Istio semantics). Principal matching (SPIFFE glob, namespace glob, trust domain), request matching (methods, paths, hosts, ports with glob patterns, headers case-insensitive), condition matching (attribute values OR, not_values NOT). Header rules are normalized at config-load time so hot path avoids allocation.
+
+**MeshGrpcServer** (`src/grpc/mesh_server.rs`): implements `MeshConfigSync.MeshSubscribe` on the CP. JWT auth per subscribe, namespace validation, version compatibility check. Broadcasts config updates via tokio `broadcast` (capacity `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`); lagging subscribers auto-get full snapshots. `MeshNodeRegistry` (`mesh_registry.rs`) tracks connected nodes in DashMap, auto-removed on stream drop via `TrackedMeshStream`.
+
+**Injector mode** (`src/modes/injector.rs`): Kubernetes admission webhook (`POST /mutate`). `InjectorConfig::from_env_config()` parses env vars. JSON patches: sidecar container (ferrum-edge run, mesh env vars, runAsUser=PROXY_UID), optional init container for iptables capture (NET_ADMIN). SPIFFE ID derived: `spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}`. JWT secret via `SecretKeyRef` (valueFrom.secretKeyRef, never plaintext). Annotations: `ferrum.io/inject=true` or `ferrum.io/mesh=enabled` opt in; `sidecar.istio.io/inject=false` or `ferrum.io/inject=false` opt out.
 
 ### Domain Model (`src/config/types.rs`)
 
@@ -558,8 +588,12 @@ Full docs reference: `docs/configuration.md`. Runtime parsing/defaults: `src/con
 - `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` (128; per-channel — DP `ConfigSync.Subscribe` and mesh `MeshConfigSync.MeshSubscribe` are independent broadcast channels; lagging subscribers on either auto-snapshot)
 - `FERRUM_XDS_ENABLED` (`false`); `FERRUM_XDS_STREAM_CHANNEL_CAPACITY` (32; per-ADS-stream response queue)
 - `FERRUM_DP_CP_GRPC_URLS` (required dp); `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` (300)
-- `FERRUM_MESH_CAPTURE_MODE` (`explicit`; `iptables` or `ebpf` for mesh capture planning, with eBPF fallback to iptables); `FERRUM_MESH_PROXY_UID` (1337 in injected sidecars)
-- `FERRUM_INJECTOR_LISTEN_ADDR` (`0.0.0.0:9443`); `FERRUM_INJECTOR_SIDECAR_IMAGE` (`ferrum-edge:latest`); `FERRUM_INJECTOR_REQUIRE_ANNOTATION` (`true`); `FERRUM_INJECTOR_TLS_CERT_PATH`/`KEY_PATH` for Kubernetes webhook HTTPS
+- `FERRUM_MESH_CONFIG_PROTOCOL` (`native`; `xds` for standard ADS); `FERRUM_MESH_TOPOLOGY` (`sidecar`; `ambient`/`east_west_gateway`/`egress_gateway`); `FERRUM_MESH_NODE_ID` (`$HOSTNAME` or `ferrum-mesh-node`)
+- `FERRUM_MESH_INBOUND_LISTEN_ADDR` (`0.0.0.0:15006`); `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` (`127.0.0.1:15001`); `FERRUM_MESH_HBONE_LISTEN_ADDR` (`0.0.0.0:15008`); `FERRUM_MESH_EGRESS_LISTEN_ADDR` (`0.0.0.0:15090`); `FERRUM_MESH_EAST_WEST_LISTEN_PORT` (`15443`)
+- `FERRUM_MESH_WORKLOAD_SPIFFE_ID` (optional SPIFFE hint); `FERRUM_MESH_WORKLOAD_LABELS` (`k1=v1,k2=v2` for PolicyScope matching); `FERRUM_MESH_TRUST_DOMAIN_ALIASES` (comma-separated extra trust domains for HBONE baggage)
+- `FERRUM_MESH_DNS_PROXY_ENABLED` (`false`); `FERRUM_MESH_DNS_LISTEN_ADDR` (`127.0.0.1:15053`); `FERRUM_MESH_DNS_UPSTREAM_ADDR` (`127.0.0.53:53`); `FERRUM_MESH_DNS_TTL_SECONDS` (`60`); `FERRUM_MESH_CLUSTER_DOMAIN` (`cluster.local`)
+- `FERRUM_MESH_CAPTURE_MODE` (`explicit`; `iptables` or `ebpf` for mesh capture planning, with eBPF fallback to iptables); `FERRUM_MESH_PROXY_UID` (1337 in injected sidecars); `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS` (comma-separated key prefixes stripped at egress dispatch)
+- `FERRUM_INJECTOR_LISTEN_ADDR` (`0.0.0.0:9443`); `FERRUM_INJECTOR_SIDECAR_IMAGE` (`ferrum-edge:latest`); `FERRUM_INJECTOR_REQUIRE_ANNOTATION` (`true`); `FERRUM_INJECTOR_TRUST_DOMAIN` (`cluster.local`); `FERRUM_INJECTOR_TLS_CERT_PATH`/`KEY_PATH` for Kubernetes webhook HTTPS
 - `FERRUM_MAX_CONNECTIONS` (100000)/`MAX_REQUESTS` (0 = unlimited)
 - `FERRUM_SHUTDOWN_DRAIN_SECONDS` (30; `0` immediate)
 - `FERRUM_WORKER_THREADS` (CPU cores); `FERRUM_BLOCKING_THREADS` (512; **bump to ≥1024 with io_uring splice at scale**)
