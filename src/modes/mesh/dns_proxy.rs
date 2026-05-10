@@ -1646,6 +1646,8 @@ mod tests {
                 protocol: AppProtocol::Http,
                 name: Some("https".to_string()),
             }],
+            export_to: Vec::new(),
+            workload_selector: None,
         }
     }
 

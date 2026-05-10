@@ -338,6 +338,8 @@ fn service_entry_requires_hosts() {
         resolution: Resolution::Dns,
         location: ServiceEntryLocation::MeshExternal,
         ports: Vec::new(),
+        export_to: Vec::new(),
+        workload_selector: None,
     };
     let errors = validate_mesh_config(&[], &[], &[], &[], &[se], None);
     assert!(errors.iter().any(|e| e.contains("hosts must not be empty")));
@@ -359,6 +361,8 @@ fn service_entry_endpoints_only_with_static_resolution() {
         resolution: Resolution::Dns,
         location: ServiceEntryLocation::MeshExternal,
         ports: Vec::new(),
+        export_to: Vec::new(),
+        workload_selector: None,
     };
     let errors = validate_mesh_config(&[], &[], &[], &[], &[se], None);
     assert!(
