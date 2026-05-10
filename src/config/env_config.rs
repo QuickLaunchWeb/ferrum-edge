@@ -522,6 +522,35 @@ pub struct EnvConfig {
     /// leaking to non-mesh upstream services.
     pub mesh_egress_strip_baggage_keys: Vec<String>,
 
+    // Kubernetes CRD controller (Layer 8)
+    /// Enable the Kubernetes CRD controller in CP mode. When true, the CP
+    /// watches Istio and Gateway API CRDs and reconciles them into Ferrum
+    /// config via `translate_k8s_objects()`. Default: false.
+    pub k8s_controller_enabled: bool,
+    /// Comma-separated namespaces to watch for CRDs. Empty = all namespaces
+    /// (requires ClusterRole). Default: "" (all).
+    pub k8s_watch_namespaces: Vec<String>,
+    /// Override kubeconfig path for out-of-cluster development. Empty = use
+    /// in-cluster config or infer from `~/.kube/config`.
+    pub k8s_kubeconfig_path: Option<String>,
+    /// Debounce window in milliseconds for CRD event coalescing. Events
+    /// arriving within this window are batched into a single reconciliation.
+    /// Default: 500.
+    pub k8s_reconcile_debounce_ms: u64,
+    /// Periodic full re-list interval in seconds. Safety valve against missed
+    /// watch events. Default: 300 (5 minutes).
+    pub k8s_full_sync_interval_secs: u64,
+    /// Enable watching Istio CRDs (security.istio.io, networking.istio.io,
+    /// telemetry.istio.io). Default: true.
+    pub k8s_watch_istio_crds: bool,
+    /// Enable watching Gateway API CRDs (gateway.networking.k8s.io).
+    /// Default: true.
+    pub k8s_watch_gateway_api_crds: bool,
+    /// SPIFFE trust domain for K8s-sourced mesh policies. Used by
+    /// `translate_k8s_objects()` when building SPIFFE IDs from K8s
+    /// ServiceAccount references. Default: "cluster.local".
+    pub k8s_trust_domain: String,
+
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
     /// When set, the DP verifies the CP server's identity.
@@ -1206,6 +1235,14 @@ impl Default for EnvConfig {
             mesh_config_protocol: "native".to_string(),
             mesh_trust_domain_aliases: Vec::new(),
             mesh_egress_strip_baggage_keys: Vec::new(),
+            k8s_controller_enabled: false,
+            k8s_watch_namespaces: Vec::new(),
+            k8s_kubeconfig_path: None,
+            k8s_reconcile_debounce_ms: 500,
+            k8s_full_sync_interval_secs: 300,
+            k8s_watch_istio_crds: true,
+            k8s_watch_gateway_api_crds: true,
+            k8s_trust_domain: "cluster.local".to_string(),
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -1497,6 +1534,14 @@ impl EnvConfig {
             mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
+            k8s_controller_enabled: bool = "FERRUM_K8S_CONTROLLER_ENABLED" => false;
+            k8s_watch_namespaces: Vec<String> = "FERRUM_K8S_WATCH_NAMESPACES" => Vec::new();
+            k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
+            k8s_reconcile_debounce_ms: u64 = "FERRUM_K8S_RECONCILE_DEBOUNCE_MS" => 500u64;
+            k8s_full_sync_interval_secs: u64 = "FERRUM_K8S_FULL_SYNC_INTERVAL_SECS" => 300u64;
+            k8s_watch_istio_crds: bool = "FERRUM_K8S_WATCH_ISTIO_CRDS" => true;
+            k8s_watch_gateway_api_crds: bool = "FERRUM_K8S_WATCH_GATEWAY_API_CRDS" => true;
+            k8s_trust_domain: String = "FERRUM_K8S_TRUST_DOMAIN" => "cluster.local".to_string();
             dp_grpc_tls_ca_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CA_CERT_PATH";
             dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
@@ -1840,6 +1885,14 @@ impl EnvConfig {
             mesh_config_protocol,
             mesh_trust_domain_aliases,
             mesh_egress_strip_baggage_keys,
+            k8s_controller_enabled,
+            k8s_watch_namespaces,
+            k8s_kubeconfig_path,
+            k8s_reconcile_debounce_ms,
+            k8s_full_sync_interval_secs,
+            k8s_watch_istio_crds,
+            k8s_watch_gateway_api_crds,
+            k8s_trust_domain,
             dp_grpc_tls_ca_cert_path,
             dp_grpc_tls_client_cert_path,
             dp_grpc_tls_client_key_path,
