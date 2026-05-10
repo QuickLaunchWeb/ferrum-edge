@@ -1560,9 +1560,22 @@ fn start_mesh_slice_apply_task(
                 } else {
                     match gateway_config_from_mesh_slice(&slice, &runtime) {
                         Ok(config) => {
+                            let previous_loaded_at = proxy_state.config.load_full().loaded_at;
+                            let candidate_loaded_at = config.loaded_at;
                             let applied = proxy_state.update_config(config);
-                            record_mesh_slice_apply_result(&mut last_applied_slice, &slice, true);
-                            if let Some(ref dns_proxy) = dns_proxy {
+                            let current_loaded_at = proxy_state.config.load_full().loaded_at;
+                            let accepted = mesh_proxy_update_was_accepted(
+                                applied,
+                                previous_loaded_at,
+                                current_loaded_at,
+                                candidate_loaded_at,
+                            );
+                            record_mesh_slice_apply_result(
+                                &mut last_applied_slice,
+                                &slice,
+                                accepted,
+                            );
+                            if accepted && let Some(ref dns_proxy) = dns_proxy {
                                 dns_proxy.update_from_slice(&slice);
                             }
                             if applied {
@@ -1570,10 +1583,15 @@ fn start_mesh_slice_apply_task(
                                     mesh_slice_version = %slice.version,
                                     "Applied mesh slice to proxy runtime"
                                 );
-                            } else {
+                            } else if accepted {
                                 debug!(
                                     mesh_slice_version = %slice.version,
                                     "Accepted mesh slice with no proxy runtime delta"
+                                );
+                            } else {
+                                warn!(
+                                    mesh_slice_version = %slice.version,
+                                    "Rejected mesh slice proxy config; leaving last applied slice and DNS table unchanged"
                                 );
                             }
                         }
@@ -1615,6 +1633,15 @@ fn record_mesh_slice_apply_result(
     if applied {
         *last_applied_slice = Some(slice.clone());
     }
+}
+
+fn mesh_proxy_update_was_accepted(
+    applied: bool,
+    previous_loaded_at: chrono::DateTime<chrono::Utc>,
+    current_loaded_at: chrono::DateTime<chrono::Utc>,
+    candidate_loaded_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    applied || (current_loaded_at == candidate_loaded_at && current_loaded_at != previous_loaded_at)
 }
 
 struct MeshBackgroundTasks {
@@ -2624,6 +2651,25 @@ mod tests {
                 labels: [("app".to_string(), "api".to_string())].into(),
                 ..MeshSlice::default()
             }
+        ));
+    }
+
+    #[test]
+    fn mesh_proxy_update_acceptance_distinguishes_no_delta_from_rejection() {
+        let previous = chrono::Utc::now();
+        let candidate = previous + chrono::Duration::milliseconds(1);
+
+        assert!(mesh_proxy_update_was_accepted(
+            true, previous, previous, candidate
+        ));
+        assert!(mesh_proxy_update_was_accepted(
+            false, previous, candidate, candidate
+        ));
+        assert!(!mesh_proxy_update_was_accepted(
+            false, previous, previous, candidate
+        ));
+        assert!(!mesh_proxy_update_was_accepted(
+            false, previous, previous, previous
         ));
     }
 
