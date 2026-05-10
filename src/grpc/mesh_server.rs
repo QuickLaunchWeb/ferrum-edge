@@ -2,12 +2,15 @@
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
+use futures_util::stream;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::sync::broadcast;
+use tokio::time::{Instant, interval_at};
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
@@ -20,6 +23,8 @@ use crate::FERRUM_VERSION;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::{GatewayConfig, default_namespace};
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+
+pub const MESH_SUBSCRIBE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub enum MeshConfigBroadcast {
@@ -47,12 +52,19 @@ impl<S> Drop for TrackedMeshStream<S> {
 
 impl<S> tokio_stream::Stream for TrackedMeshStream<S>
 where
-    S: tokio_stream::Stream + Unpin,
+    S: tokio_stream::Stream,
 {
     type Item = S::Item;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.inner.as_mut().poll_next(cx)
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(item)) => {
+                self.registry
+                    .touch_heartbeat(&self.node_id, self.connected_at);
+                Poll::Ready(Some(item))
+            }
+            other => other,
+        }
     }
 }
 
@@ -147,7 +159,18 @@ impl MeshGrpcServer {
             timestamp: chrono::Utc::now().timestamp(),
             mesh_slice_json,
             ferrum_version: FERRUM_VERSION.to_string(),
+            heartbeat: false,
         })
+    }
+
+    fn build_mesh_subscribe_heartbeat(version: String) -> MeshConfigUpdate {
+        MeshConfigUpdate {
+            version,
+            timestamp: chrono::Utc::now().timestamp(),
+            mesh_slice_json: String::new(),
+            ferrum_version: FERRUM_VERSION.to_string(),
+            heartbeat: true,
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -251,14 +274,16 @@ impl MeshConfigSync for MeshGrpcServer {
             version: node_version,
             namespace: node_namespace,
             connected_at: now,
+            last_heartbeat_at: now,
             last_update_at: now,
         });
 
         let mut stream_config = config.as_ref().clone();
         let mut previous_slice = initial_slice;
         let config_for_recovery = self.config.clone();
+        let stream_slice_request = slice_request.clone();
         let stream = BroadcastStream::new(rx).filter_map(move |result| {
-            let slice_request = slice_request.clone();
+            let slice_request = stream_slice_request.clone();
             match result {
                 Ok(MeshConfigBroadcast::Full(config)) => {
                     let mut config = config.as_ref().clone();
@@ -330,7 +355,18 @@ impl MeshConfigSync for MeshGrpcServer {
         });
 
         let initial_stream = tokio_stream::once(Ok(initial));
-        let combined = initial_stream.chain(stream);
+        let heartbeat_config = self.config.clone();
+        let heartbeat_stream = IntervalStream::new(interval_at(
+            Instant::now() + MESH_SUBSCRIBE_HEARTBEAT_INTERVAL,
+            MESH_SUBSCRIBE_HEARTBEAT_INTERVAL,
+        ))
+        .map(move |_| {
+            let current = heartbeat_config.load_full();
+            Ok(Self::build_mesh_subscribe_heartbeat(
+                current.loaded_at.to_rfc3339(),
+            ))
+        });
+        let combined = initial_stream.chain(stream::select(stream, heartbeat_stream));
         let tracked = TrackedMeshStream {
             inner: Box::pin(combined),
             registry: self.registry.clone(),
@@ -438,5 +474,15 @@ mod tests {
             stream_config.mesh.as_ref().unwrap().services[0].name,
             "stream-local"
         );
+    }
+
+    #[test]
+    fn mesh_subscribe_heartbeat_is_lightweight() {
+        let heartbeat = MeshGrpcServer::build_mesh_subscribe_heartbeat("v1".to_string());
+
+        assert!(heartbeat.heartbeat);
+        assert_eq!(heartbeat.version, "v1");
+        assert!(heartbeat.mesh_slice_json.is_empty());
+        assert_eq!(heartbeat.ferrum_version, crate::FERRUM_VERSION);
     }
 }
