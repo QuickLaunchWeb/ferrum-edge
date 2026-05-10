@@ -534,7 +534,7 @@ The container runs as `FERRUM_MESH_PROXY_UID` (default 1337) with `allowPrivileg
 |---|---|
 | `explicit` (default) | No automatic capture; applications must explicitly route to the proxy |
 | `iptables` | Inject init container with `NET_ADMIN`/`NET_RAW` capabilities that sets up iptables rules to redirect traffic through the sidecar (inbound to 15006, outbound to 15001) |
-| `ebpf` | eBPF-based capture (falls back to iptables if unavailable) |
+| `ebpf` | eBPF-based capture (planned; capture planning infrastructure exists but is not yet wired into the injector path) |
 
 ## Control Plane Integration
 
