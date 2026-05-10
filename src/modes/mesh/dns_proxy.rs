@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::modes::mesh::slice::MeshSlice;
@@ -150,7 +150,12 @@ impl DnsResolutionTable {
                 .filter(is_routable_mesh_dns_ip)
                 .collect();
             if !ips.is_empty() {
-                workload_ips.insert(wl.spiffe_id.as_str(), ips);
+                let entry = workload_ips.entry(wl.spiffe_id.as_str()).or_default();
+                for ip in ips {
+                    if !entry.contains(&ip) {
+                        entry.push(ip);
+                    }
+                }
             }
         }
 
@@ -445,7 +450,8 @@ impl MeshDnsProxy {
             "Mesh DNS proxy listening on UDP and TCP"
         );
 
-        let semaphore = Arc::new(Semaphore::new(self.max_concurrent_queries));
+        let query_semaphore = Arc::new(Semaphore::new(self.max_concurrent_queries));
+        let tcp_session_semaphore = Arc::new(Semaphore::new(self.max_concurrent_queries));
         let mut buf = vec![0u8; DNS_MAX_UDP_PACKET_SIZE];
 
         loop {
@@ -453,7 +459,7 @@ impl MeshDnsProxy {
                 result = socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, src)) => {
-                            let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                            let Ok(permit) = query_semaphore.clone().try_acquire_owned() else {
                                 if let Some(response) = build_dns_error_response_from_packet(
                                     &buf[..len],
                                     RCODE_SERVFAIL,
@@ -483,18 +489,26 @@ impl MeshDnsProxy {
                 result = tcp_listener.accept() => {
                     match result {
                         Ok((stream, src)) => {
+                            let Some(session_permit) = try_acquire_dns_tcp_session_permit(
+                                &tcp_session_semaphore,
+                                src,
+                            ) else {
+                                drop(stream);
+                                continue;
+                            };
                             let table = self.resolution_table.clone();
                             let upstream = self.upstream_resolver;
                             let ttl = self.ttl_seconds;
-                            let semaphore = semaphore.clone();
+                            let query_semaphore = query_semaphore.clone();
                             tokio::spawn(async move {
+                                let _session_permit = session_permit;
                                 handle_dns_tcp_connection(
                                     stream,
                                     src,
                                     &table,
                                     upstream,
                                     ttl,
-                                    semaphore,
+                                    query_semaphore,
                                 )
                                 .await;
                             });
@@ -515,6 +529,19 @@ impl MeshDnsProxy {
 
         drop(forward_tx);
         let _ = forward_handle.await;
+    }
+}
+
+fn try_acquire_dns_tcp_session_permit(
+    semaphore: &Arc<Semaphore>,
+    src: SocketAddr,
+) -> Option<OwnedSemaphorePermit> {
+    match semaphore.clone().try_acquire_owned() {
+        Ok(permit) => Some(permit),
+        Err(_) => {
+            warn!(client = %src, "DNS proxy TCP session concurrency limit reached");
+            None
+        }
     }
 }
 
@@ -1747,6 +1774,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dns_tcp_session_limit_rejects_before_length_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let session_semaphore = Arc::new(Semaphore::new(0));
+
+        let server = tokio::spawn(async move {
+            let (stream, src) = listener.accept().await.unwrap();
+            assert!(try_acquire_dns_tcp_session_permit(&session_semaphore, src).is_none());
+            drop(stream);
+        });
+
+        let mut client = TcpStream::connect(listen_addr).await.unwrap();
+
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut buf))
+            .await
+            .expect("server should close without waiting for a length prefix")
+            .expect("read should complete");
+        assert_eq!(read, 0);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn dns_tcp_length_read_has_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen_addr = listener.local_addr().unwrap();
@@ -1903,6 +1953,27 @@ mod tests {
         // Short name: my-api.default
         let ips = table.resolve("my-api.default").unwrap();
         assert_eq!(ips.len(), 2);
+    }
+
+    #[test]
+    fn resolution_table_merges_duplicate_spiffe_workload_entries() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/api";
+        let slice = MeshSlice {
+            workloads: vec![
+                test_workload(spiffe, vec!["10.1.0.1", "10.1.0.2"]),
+                test_workload(spiffe, vec!["10.1.0.2", "10.1.0.3"]),
+            ],
+            services: vec![test_mesh_service("my-api", "default", vec![spiffe])],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        let ips = table.resolve("my-api.default.svc.cluster.local").unwrap();
+
+        assert_eq!(ips.len(), 3);
+        assert!(ips.contains(&"10.1.0.1".parse::<IpAddr>().unwrap()));
+        assert!(ips.contains(&"10.1.0.2".parse::<IpAddr>().unwrap()));
+        assert!(ips.contains(&"10.1.0.3".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
