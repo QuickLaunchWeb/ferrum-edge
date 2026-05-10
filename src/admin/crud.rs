@@ -532,8 +532,12 @@ impl AdminResource for Upstream {
         namespace: &str,
         pagination: &super::PaginationParams,
     ) -> DbResult<PaginatedResult<Self>> {
-        db.list_upstreams_paginated(namespace, pagination.limit as i64, pagination.offset as i64)
-            .await
+        db.list_upstreams_paginated(
+            namespace,
+            pagination.query_limit_i64(),
+            pagination.offset as i64,
+        )
+        .await
     }
 
     async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
@@ -633,7 +637,7 @@ impl AdminResource for PluginConfig {
     ) -> DbResult<PaginatedResult<Self>> {
         db.list_plugin_configs_paginated(
             namespace,
-            pagination.limit as i64,
+            pagination.query_limit_i64(),
             pagination.offset as i64,
         )
         .await
@@ -818,8 +822,12 @@ impl AdminResource for Proxy {
         namespace: &str,
         pagination: &super::PaginationParams,
     ) -> DbResult<PaginatedResult<Self>> {
-        db.list_proxies_paginated(namespace, pagination.limit as i64, pagination.offset as i64)
-            .await
+        db.list_proxies_paginated(
+            namespace,
+            pagination.query_limit_i64(),
+            pagination.offset as i64,
+        )
+        .await
     }
 
     async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
@@ -1071,8 +1079,12 @@ impl AdminResource for Consumer {
         namespace: &str,
         pagination: &super::PaginationParams,
     ) -> DbResult<PaginatedResult<Self>> {
-        db.list_consumers_paginated(namespace, pagination.limit as i64, pagination.offset as i64)
-            .await
+        db.list_consumers_paginated(
+            namespace,
+            pagination.query_limit_i64(),
+            pagination.offset as i64,
+        )
+        .await
     }
 
     async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {

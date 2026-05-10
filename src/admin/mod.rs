@@ -320,15 +320,30 @@ async fn handle_admin_connection(
 /// Pagination parameters parsed from query string.
 pub(crate) struct PaginationParams {
     offset: usize,
-    limit: usize,
+    limit: Option<usize>,
 }
 
 const DEFAULT_PAGE_SIZE: usize = 100;
 const MAX_PAGE_SIZE: usize = 1000;
 
+impl PaginationParams {
+    fn in_memory_limit(&self) -> usize {
+        self.limit.unwrap_or(usize::MAX)
+    }
+
+    pub(crate) fn query_limit_i64(&self) -> i64 {
+        self.limit.map(|limit| limit as i64).unwrap_or(i64::MAX)
+    }
+
+    fn response_limit(&self, total: usize) -> usize {
+        self.limit
+            .unwrap_or_else(|| total.saturating_sub(self.offset))
+    }
+}
+
 fn parse_pagination(uri: &hyper::Uri) -> PaginationParams {
     let mut offset = 0usize;
-    let mut limit = DEFAULT_PAGE_SIZE;
+    let mut limit = None;
     if let Some(query) = uri.query() {
         for pair in query.split('&') {
             let mut parts = pair.splitn(2, '=');
@@ -338,10 +353,12 @@ fn parse_pagination(uri: &hyper::Uri) -> PaginationParams {
                         offset = val.parse().unwrap_or(0);
                     }
                     "limit" => {
-                        limit = val.parse().unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE);
-                        if limit == 0 {
-                            limit = DEFAULT_PAGE_SIZE;
-                        }
+                        let parsed = val.parse().unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE);
+                        limit = Some(if parsed == 0 {
+                            DEFAULT_PAGE_SIZE
+                        } else {
+                            parsed
+                        });
                     }
                     _ => {}
                 }
@@ -362,13 +379,13 @@ fn paginate_response(items: &Value, pagination: &PaginationParams) -> Value {
     let paginated: Vec<_> = arr
         .iter()
         .skip(pagination.offset)
-        .take(pagination.limit)
+        .take(pagination.in_memory_limit())
         .collect();
     json!({
         "data": paginated,
         "pagination": {
             "offset": pagination.offset,
-            "limit": pagination.limit,
+            "limit": pagination.response_limit(total),
             "total": total
         }
     })
@@ -384,7 +401,7 @@ fn paginate_db_response<T: Serialize>(
         "data": items,
         "pagination": {
             "offset": pagination.offset,
-            "limit": pagination.limit,
+            "limit": pagination.response_limit(total.max(0) as usize),
             "total": total
         }
     })
@@ -2417,5 +2434,37 @@ fn protocol_support_label(
         ProtocolSupport::Unknown => "unknown",
         ProtocolSupport::Supported => "supported",
         ProtocolSupport::Unsupported => "unsupported",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unpaginated_response_returns_all_items() {
+        let uri: hyper::Uri = "/proxies".parse().unwrap();
+        let pagination = parse_pagination(&uri);
+        let items = json!((0..150).collect::<Vec<_>>());
+
+        let response = paginate_response(&items, &pagination);
+
+        assert_eq!(response["data"].as_array().unwrap().len(), 150);
+        assert_eq!(response["pagination"]["limit"], 150);
+        assert_eq!(pagination.query_limit_i64(), i64::MAX);
+    }
+
+    #[test]
+    fn explicit_limit_still_caps_response() {
+        let uri: hyper::Uri = "/proxies?limit=25&offset=10".parse().unwrap();
+        let pagination = parse_pagination(&uri);
+        let items = json!((0..150).collect::<Vec<_>>());
+
+        let response = paginate_response(&items, &pagination);
+
+        assert_eq!(response["data"].as_array().unwrap().len(), 25);
+        assert_eq!(response["pagination"]["offset"], 10);
+        assert_eq!(response["pagination"]["limit"], 25);
+        assert_eq!(pagination.query_limit_i64(), 25);
     }
 }

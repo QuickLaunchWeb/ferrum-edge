@@ -1125,12 +1125,13 @@ fn resources_equal_ignoring_version(
 }
 
 fn build_sotw_subscription(
-    _previous: Option<&XdsSubscription>,
+    previous: Option<&XdsSubscription>,
     node_id: &str,
     type_url: &str,
     resource_names: &[String],
 ) -> XdsSubscription {
-    let has_wildcard = resource_names.iter().any(|name| name == "*");
+    let has_wildcard = resource_names.iter().any(|name| name == "*")
+        || (previous.is_none() && resource_names.is_empty());
     let mut resource_names = resource_names
         .iter()
         .filter(|name| name.as_str() != "*")
@@ -1161,7 +1162,7 @@ fn build_delta_subscription(
         .unwrap_or_default();
     let mut wildcard = previous
         .map(|subscription| subscription.wildcard)
-        .unwrap_or(false);
+        .unwrap_or(resource_names_subscribe.is_empty() && resource_names_unsubscribe.is_empty());
 
     for name in resource_names_subscribe {
         if name == "*" {
@@ -1888,6 +1889,15 @@ mod tests {
     }
 
     #[test]
+    fn sotw_initial_empty_subscription_is_wildcard() {
+        let subscription =
+            build_sotw_subscription(None, "node-a", super::super::translator::CDS_TYPE_URL, &[]);
+
+        assert!(subscription.wildcard);
+        assert!(subscription.resource_names.is_empty());
+    }
+
+    #[test]
     fn sotw_empty_after_explicit_wildcard_is_unsubscribe_all() {
         let previous = build_sotw_subscription(
             None,
@@ -1948,6 +1958,22 @@ mod tests {
             subscription.resource_names,
             vec!["cluster/default/api/8080".to_string()]
         );
+    }
+
+    #[test]
+    fn delta_initial_empty_subscription_is_wildcard() {
+        let (subscription, changed, explicit) = build_delta_subscription(
+            None,
+            "node-a",
+            super::super::translator::CDS_TYPE_URL,
+            &[],
+            &[],
+        );
+
+        assert!(changed);
+        assert!(!explicit);
+        assert!(subscription.wildcard);
+        assert!(subscription.resource_names.is_empty());
     }
 
     #[test]
