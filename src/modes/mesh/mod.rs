@@ -2650,7 +2650,7 @@ mod tests {
         with_mesh_env(
             &[
                 ("FERRUM_MODE", "mesh"),
-                ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
                 (
                     "FERRUM_CP_DP_GRPC_JWT_SECRET",
                     "secret-padding-for-32-char-min!!",
@@ -2677,7 +2677,7 @@ mod tests {
         with_mesh_env(
             &[
                 ("FERRUM_MODE", "mesh"),
-                ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
                 (
                     "FERRUM_CP_DP_GRPC_JWT_SECRET",
                     "secret-padding-for-32-char-min!!",
