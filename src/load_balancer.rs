@@ -786,6 +786,10 @@ pub struct LoadBalancer {
     /// Smooth-WRR state isolated per subset so weighted routing in one subset
     /// cannot perturb the current weights of another subset.
     subset_wrr_state: HashMap<String, std::sync::Mutex<Vec<i64>>>,
+    /// Stale-weight scan flags isolated per WRR subset. The parent WRR state
+    /// and each subset WRR state can be selected independently after a recovery
+    /// event, so one state consuming its scan flag must not clear another's.
+    subset_wrr_needs_stale_check: HashMap<String, AtomicBool>,
     /// Per-subset consistent-hash rings. These avoid walking the full upstream
     /// ring when a small subset uses consistent hashing.
     subset_hash_rings: HashMap<String, Vec<(u64, usize)>>,
@@ -885,6 +889,7 @@ impl LoadBalancer {
         };
 
         let mut subset_wrr_state = HashMap::new();
+        let mut subset_wrr_needs_stale_check = HashMap::new();
         let mut subset_hash_rings = HashMap::new();
         for (subset_name, subset_algorithm) in &subset_algorithms {
             if *subset_algorithm == LoadBalancerAlgorithm::WeightedRoundRobin {
@@ -892,6 +897,7 @@ impl LoadBalancer {
                     subset_name.clone(),
                     std::sync::Mutex::new(vec![0; targets.len()]),
                 );
+                subset_wrr_needs_stale_check.insert(subset_name.clone(), AtomicBool::new(false));
             }
             if *subset_algorithm == LoadBalancerAlgorithm::ConsistentHashing
                 && let Some(indices) = subset_indices.get(subset_name)
@@ -920,6 +926,7 @@ impl LoadBalancer {
             subset_indices,
             subset_algorithms,
             subset_wrr_state,
+            subset_wrr_needs_stale_check,
             subset_hash_rings,
         }
     }
@@ -1029,6 +1036,9 @@ impl LoadBalancer {
             None => return,
         };
         self.wrr_needs_stale_check.store(true, Ordering::Release);
+        for flag in self.subset_wrr_needs_stale_check.values() {
+            flag.store(true, Ordering::Release);
+        }
 
         // Find minimum EWMA among all targets (excluding unset)
         let min_ewma = self
@@ -1311,6 +1321,26 @@ impl LoadBalancer {
         self.subset_wrr_state
             .get(subset_name)
             .unwrap_or(&self.wrr_state)
+    }
+
+    fn stale_check_flag_for_wrr_state(
+        &self,
+        wrr_state: &std::sync::Mutex<Vec<i64>>,
+    ) -> &AtomicBool {
+        if std::ptr::eq(wrr_state, &self.wrr_state) {
+            return &self.wrr_needs_stale_check;
+        }
+
+        self.subset_wrr_state
+            .iter()
+            .find_map(|(subset_name, subset_state)| {
+                if std::ptr::eq(wrr_state, subset_state) {
+                    self.subset_wrr_needs_stale_check.get(subset_name)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(&self.wrr_needs_stale_check)
     }
 
     #[inline]
@@ -1648,7 +1678,10 @@ impl LoadBalancer {
 
         let mut weights = wrr_state.lock().unwrap_or_else(|e| e.into_inner());
 
-        if self.wrr_needs_stale_check.swap(false, Ordering::AcqRel) {
+        if self
+            .stale_check_flag_for_wrr_state(wrr_state)
+            .swap(false, Ordering::AcqRel)
+        {
             // Reset stale weights for targets that just re-entered the healthy set.
             // Use a deliberately loose cap so heterogeneous high-weight targets
             // are not reset during normal smooth-WRR oscillation.
@@ -1879,7 +1912,10 @@ impl LoadBalancer {
 
         let mut weights = wrr_state.lock().unwrap_or_else(|e| e.into_inner());
 
-        if self.wrr_needs_stale_check.swap(false, Ordering::AcqRel) {
+        if self
+            .stale_check_flag_for_wrr_state(wrr_state)
+            .swap(false, Ordering::AcqRel)
+        {
             // Reset stale weights for candidates that drifted while unhealthy.
             let drift_cap = total_weight.saturating_mul(4).max(1);
             for &(orig_idx, _) in candidates {
@@ -2270,6 +2306,50 @@ mod tests {
             let result = lb.select("ignored", None);
             assert!(result.is_some());
         }
+    }
+
+    #[test]
+    fn recovered_target_marks_parent_and_subset_wrr_stale_flags_independently() {
+        let mut v1 = make_target("10.0.0.1", 8080);
+        v1.tags = HashMap::from([("version".to_string(), "v1".to_string())]);
+        let mut v2 = make_target("10.0.0.2", 8080);
+        v2.tags = HashMap::from([("version".to_string(), "v2".to_string())]);
+        let targets = vec![v1, v2];
+        let subsets = vec![SubsetDefinition {
+            name: "canary".to_string(),
+            labels: HashMap::from([("version".to_string(), "v2".to_string())]),
+            traffic_policy: Some(crate::config::types::SubsetTrafficPolicy {
+                load_balancer_algorithm: Some(LoadBalancerAlgorithm::WeightedRoundRobin),
+            }),
+        }];
+        let lb = LoadBalancer::with_subsets(
+            "upstream-wrr",
+            LoadBalancerAlgorithm::WeightedRoundRobin,
+            &targets,
+            None,
+            Some(&subsets),
+        );
+
+        lb.reset_recovered_target_latency(&targets[1]);
+        assert!(lb.wrr_needs_stale_check.load(Ordering::Acquire));
+        assert!(
+            lb.subset_wrr_needs_stale_check
+                .get("canary")
+                .expect("subset stale flag")
+                .load(Ordering::Acquire)
+        );
+
+        let healthy = HealthBitset::all(targets.len());
+        let _ = lb.select_wrr_bitset(&healthy, &lb.wrr_state);
+
+        assert!(!lb.wrr_needs_stale_check.load(Ordering::Acquire));
+        assert!(
+            lb.subset_wrr_needs_stale_check
+                .get("canary")
+                .expect("subset stale flag")
+                .load(Ordering::Acquire),
+            "parent WRR selection must not clear the subset WRR stale flag"
+        );
     }
 
     /// Consistent hash with targets produces a non-empty ring and selects
