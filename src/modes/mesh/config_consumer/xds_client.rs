@@ -13,10 +13,7 @@ use super::common::{
     wait_for_shutdown,
 };
 use crate::grpc::dp_client::{DpGrpcTlsConfig, GrpcJwtSecret, generate_dp_jwt_with_issuer};
-use crate::identity::TrustDomain;
-use crate::modes::mesh::config::{
-    AppProtocol, MeshService, ServicePort, TrustBundle, TrustBundleSet,
-};
+use crate::modes::mesh::config::{AppProtocol, MeshService, ServicePort};
 use crate::modes::mesh::runtime::MeshRuntimeState;
 use crate::modes::mesh::slice::MeshSlice;
 use crate::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
@@ -32,6 +29,8 @@ const INITIAL_TYPE_URL_ORDER: [&str; 5] = [
     RDS_TYPE_URL,
     SDS_TYPE_URL,
 ];
+const REQUIRED_MESH_SLICE_TYPE_URLS: [&str; 4] =
+    [CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL];
 const XDS_APPLY_DEBOUNCE: Duration = Duration::from_millis(25);
 
 type BearerToken = MetadataValue<tonic::metadata::Ascii>;
@@ -171,8 +170,8 @@ impl ClientSubscriptionState {
         }
     }
 
-    fn all_types_have_initial_response(&self) -> bool {
-        XDS_TYPE_URLS.iter().all(|type_url| {
+    fn required_types_have_initial_response(&self) -> bool {
+        REQUIRED_MESH_SLICE_TYPE_URLS.iter().all(|type_url| {
             self.subscriptions
                 .get(*type_url)
                 .is_some_and(|subscription| subscription.has_initial_response)
@@ -254,14 +253,14 @@ impl ResourceAccumulator {
             .unwrap_or(&[])
     }
 
-    fn has_all_types(&self) -> bool {
-        XDS_TYPE_URLS
+    fn has_required_types(&self) -> bool {
+        REQUIRED_MESH_SLICE_TYPE_URLS
             .iter()
             .all(|type_url| self.versions_by_type.contains_key(*type_url))
     }
 
     fn try_build_mesh_slice(&self, config: &XdsClientConfig) -> Result<Option<MeshSlice>, String> {
-        if !self.has_all_types() {
+        if !self.has_required_types() {
             return Ok(None);
         }
         reverse_translate(self, config).map(Some)
@@ -547,7 +546,7 @@ async fn handle_ads_response(
             Ok(Some(PendingXdsSlice {
                 slice,
                 type_url,
-                all_types_ready: subscriptions.all_types_have_initial_response(),
+                all_types_ready: subscriptions.required_types_have_initial_response(),
             }))
         }
         Ok(None) => {
@@ -680,6 +679,7 @@ fn reverse_translate(
     for resource in accumulator.resources(SDS_TYPE_URL) {
         trust_domains.push(parse_spiffe_bundle_secret_name(&resource.name)?);
     }
+    log_omitted_sds_trust_domains(trust_domains);
 
     Ok(MeshSlice {
         node_id: config.node_id.clone(),
@@ -699,7 +699,7 @@ fn reverse_translate(
         // External ServiceEntry shape is not recoverable from the minimal
         // CDS/EDS names consumed here; richer xDS metadata will fill this in.
         service_entries: Vec::new(),
-        trust_bundles: build_trust_bundle_set(trust_domains, config)?,
+        trust_bundles: None,
         multi_cluster: None,
     })
 }
@@ -807,70 +807,18 @@ fn parse_spiffe_bundle_secret_name(name: &str) -> Result<String, String> {
     Ok(trust_domain.to_string())
 }
 
-fn build_trust_bundle_set(
-    mut trust_domains: Vec<String>,
-    config: &XdsClientConfig,
-) -> Result<Option<TrustBundleSet>, String> {
+fn log_omitted_sds_trust_domains(mut trust_domains: Vec<String>) {
     if trust_domains.is_empty() {
-        return Ok(None);
+        return;
     }
 
     trust_domains.sort();
     trust_domains.dedup();
 
-    let local_trust_domain = preferred_local_trust_domain(&trust_domains, config)
-        .unwrap_or_else(|| trust_domains[0].clone());
-    let local = empty_trust_bundle(&local_trust_domain)?;
-    let federated = trust_domains
-        .into_iter()
-        .filter(|trust_domain| trust_domain != &local_trust_domain)
-        .map(|trust_domain| empty_trust_bundle(&trust_domain))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(Some(TrustBundleSet { local, federated }))
-}
-
-fn preferred_local_trust_domain(
-    trust_domains: &[String],
-    config: &XdsClientConfig,
-) -> Option<String> {
-    if let Some(workload_spiffe_id) = config.workload_spiffe_id.as_deref()
-        && let Some(trust_domain) = trust_domain_from_spiffe_id(workload_spiffe_id)
-        && trust_domains
-            .iter()
-            .any(|candidate| candidate == trust_domain)
-    {
-        return Some(trust_domain.to_string());
-    }
-
-    if trust_domains
-        .iter()
-        .any(|candidate| candidate == "cluster.local")
-    {
-        return Some("cluster.local".to_string());
-    }
-
-    None
-}
-
-fn trust_domain_from_spiffe_id(spiffe_id: &str) -> Option<&str> {
-    let rest = spiffe_id.strip_prefix("spiffe://")?;
-    rest.split('/')
-        .next()
-        .filter(|trust_domain| !trust_domain.is_empty())
-}
-
-fn empty_trust_bundle(trust_domain: &str) -> Result<TrustBundle, String> {
-    // Phase B reverse translation preserves trust-domain identity from SDS
-    // resource names. Actual CA/JWT authority material is populated by the
-    // later SDS material path, so these bundles intentionally start empty.
-    Ok(TrustBundle {
-        trust_domain: TrustDomain::new(trust_domain)
-            .map_err(|e| format!("invalid trust domain '{trust_domain}': {e}"))?,
-        x509_authorities: Vec::new(),
-        jwt_authorities: Vec::new(),
-        refresh_hint_seconds: None,
-    })
+    debug!(
+        trust_domains = ?trust_domains,
+        "xDS SDS resource names do not include authority material; omitting trust bundles"
+    );
 }
 
 fn is_known_type_url(type_url: &str) -> bool {
@@ -1179,19 +1127,19 @@ mod tests {
     }
 
     #[test]
-    fn accumulator_requires_all_types() {
+    fn accumulator_requires_core_types_but_not_sds() {
         let mut accumulator = ResourceAccumulator::new();
-        for type_url in [CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL] {
+        for type_url in [CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL] {
             accumulator
                 .apply_sotw_response(type_url, &[], "v1")
                 .expect("response applies");
         }
 
-        assert!(!accumulator.has_all_types());
+        assert!(!accumulator.has_required_types());
         accumulator
-            .apply_sotw_response(SDS_TYPE_URL, &[], "v1")
+            .apply_sotw_response(RDS_TYPE_URL, &[], "v1")
             .expect("response applies");
-        assert!(accumulator.has_all_types());
+        assert!(accumulator.has_required_types());
     }
 
     #[test]
@@ -1248,7 +1196,7 @@ mod tests {
     }
 
     #[test]
-    fn reverse_translate_sds_trust_domain() {
+    fn reverse_translate_sds_names_do_not_emit_empty_trust_bundles() {
         let mut accumulator = ResourceAccumulator::new();
         accumulator
             .apply_sotw_response(
@@ -1266,9 +1214,33 @@ mod tests {
             .try_build_mesh_slice(&test_config())
             .expect("reverse translate succeeds")
             .expect("all types are present");
-        let bundles = slice.trust_bundles.expect("trust bundle set is present");
 
-        assert_eq!(bundles.local.trust_domain.as_str(), "cluster.local");
+        assert!(slice.trust_bundles.is_none());
+    }
+
+    #[test]
+    fn reverse_translate_does_not_wait_for_sds() {
+        let mut accumulator = ResourceAccumulator::new();
+        accumulator
+            .apply_sotw_response(
+                CDS_TYPE_URL,
+                &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+                "v1",
+            )
+            .expect("CDS response applies");
+        for type_url in [EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL] {
+            accumulator
+                .apply_sotw_response(type_url, &[], "v1")
+                .expect("empty response applies");
+        }
+
+        let slice = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("reverse translate succeeds")
+            .expect("required non-SDS types are present");
+
+        assert_eq!(slice.services.len(), 1);
+        assert!(slice.trust_bundles.is_none());
     }
 
     #[test]
