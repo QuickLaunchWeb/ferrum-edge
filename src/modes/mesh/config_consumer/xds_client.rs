@@ -32,6 +32,7 @@ const INITIAL_TYPE_URL_ORDER: [&str; 5] = [
 const REQUIRED_MESH_SLICE_TYPE_URLS: [&str; 4] =
     [CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL];
 const XDS_APPLY_DEBOUNCE: Duration = Duration::from_millis(25);
+const XDS_CONSECUTIVE_NACK_LIMIT: u32 = 5;
 
 type BearerToken = MetadataValue<tonic::metadata::Ascii>;
 
@@ -189,12 +190,34 @@ impl Default for ClientSubscriptionState {
 struct XdsStreamState {
     subscriptions: ClientSubscriptionState,
     accumulator: ResourceAccumulator,
+    nack_circuit_breaker: NackCircuitBreaker,
 }
 
 impl XdsStreamState {
     fn reset_for_new_control_plane(&mut self) {
         self.subscriptions = ClientSubscriptionState::new();
         self.accumulator = ResourceAccumulator::new();
+        self.nack_circuit_breaker = NackCircuitBreaker::default();
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct NackCircuitBreaker {
+    consecutive_nacks_by_type: HashMap<String, u32>,
+}
+
+impl NackCircuitBreaker {
+    fn record_ack(&mut self, type_url: &str) {
+        self.consecutive_nacks_by_type.remove(type_url);
+    }
+
+    fn record_nack(&mut self, type_url: &str) -> u32 {
+        let count = self
+            .consecutive_nacks_by_type
+            .entry(type_url.to_string())
+            .or_insert(0);
+        *count = count.saturating_add(1);
+        *count
     }
 }
 
@@ -496,20 +519,30 @@ async fn run_ads_stream_with_auth(
                 let Some(response) = response? else {
                     break;
                 };
-                if let Some(pending) =
-                    handle_ads_response(
-                        response,
-                        config,
-                        &tx,
-                        &mut stream_state.subscriptions,
-                        &mut stream_state.accumulator,
-                    ).await?
-                {
-                    pending_slice = Some(pending);
-                    debounce
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + XDS_APPLY_DEBOUNCE);
-                    debounce_active = true;
+                match handle_ads_response(
+                    response,
+                    config,
+                    &tx,
+                    &mut stream_state.subscriptions,
+                    &mut stream_state.accumulator,
+                    &mut stream_state.nack_circuit_breaker,
+                ).await {
+                    Ok(Some(pending)) => {
+                        pending_slice = Some(pending);
+                        debounce
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + XDS_APPLY_DEBOUNCE);
+                        debounce_active = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return flush_pending_xds_slice_before_error(
+                            consumer,
+                            config,
+                            &mut pending_slice,
+                            e,
+                        );
+                    }
                 }
             }
             _ = &mut debounce, if debounce_active => {
@@ -528,6 +561,18 @@ async fn run_ads_stream_with_auth(
     Ok(())
 }
 
+fn flush_pending_xds_slice_before_error(
+    consumer: &XdsConfigConsumer,
+    config: &XdsClientConfig,
+    pending_slice: &mut Option<PendingXdsSlice>,
+    error: anyhow::Error,
+) -> Result<(), anyhow::Error> {
+    if let Some(pending) = pending_slice.take() {
+        apply_pending_xds_slice(consumer, config, pending);
+    }
+    Err(error)
+}
+
 #[derive(Debug)]
 struct PendingXdsSlice {
     slice: MeshSlice,
@@ -541,6 +586,7 @@ async fn handle_ads_response(
     tx: &mpsc::Sender<DiscoveryRequest>,
     subscriptions: &mut ClientSubscriptionState,
     accumulator: &mut ResourceAccumulator,
+    nack_circuit_breaker: &mut NackCircuitBreaker,
 ) -> Result<Option<PendingXdsSlice>, anyhow::Error> {
     let type_url = response.type_url.clone();
     if !is_known_type_url(&type_url) {
@@ -575,6 +621,7 @@ async fn handle_ads_response(
         Ok(Some(slice)) => {
             send_ads_request(tx, subscriptions.build_ack(&type_url)).await?;
             subscriptions.mark_acked(&type_url);
+            nack_circuit_breaker.record_ack(&type_url);
             Ok(Some(PendingXdsSlice {
                 slice,
                 type_url,
@@ -584,6 +631,7 @@ async fn handle_ads_response(
         Ok(None) => {
             send_ads_request(tx, subscriptions.build_ack(&type_url)).await?;
             subscriptions.mark_acked(&type_url);
+            nack_circuit_breaker.record_ack(&type_url);
             debug!(
                 node_id = %config.node_id,
                 type_url = %type_url,
@@ -600,9 +648,28 @@ async fn handle_ads_response(
                 "NACKing invalid xDS ADS response"
             );
             send_ads_request(tx, subscriptions.build_nack(&type_url, e)).await?;
+            trip_nack_circuit_if_needed(config, nack_circuit_breaker, &type_url)?;
             Ok(None)
         }
     }
+}
+
+fn trip_nack_circuit_if_needed(
+    config: &XdsClientConfig,
+    nack_circuit_breaker: &mut NackCircuitBreaker,
+    type_url: &str,
+) -> Result<(), anyhow::Error> {
+    let consecutive_nacks = nack_circuit_breaker.record_nack(type_url);
+    if consecutive_nacks < XDS_CONSECUTIVE_NACK_LIMIT {
+        return Ok(());
+    }
+
+    Err(anyhow::anyhow!(
+        "xDS ADS NACK circuit breaker tripped for type_url '{}' after {} consecutive NACKs on node '{}'; closing stream to trigger reconnect/failover",
+        type_url,
+        consecutive_nacks,
+        config.node_id
+    ))
 }
 
 fn apply_pending_xds_slice(
@@ -1052,6 +1119,7 @@ mod tests {
             .subscriptions
             .record_response(CDS_TYPE_URL, "v1", "n1");
         state.subscriptions.mark_acked(CDS_TYPE_URL);
+        state.nack_circuit_breaker.record_nack(CDS_TYPE_URL);
         state
             .accumulator
             .apply_sotw_response(
@@ -1065,6 +1133,12 @@ mod tests {
 
         assert!(state.accumulator.resources(CDS_TYPE_URL).is_empty());
         assert!(state.accumulator.versions_by_type.is_empty());
+        assert!(
+            state
+                .nack_circuit_breaker
+                .consecutive_nacks_by_type
+                .is_empty()
+        );
         assert!(!state.subscriptions.required_types_have_initial_response());
         assert!(
             state
@@ -1100,11 +1174,23 @@ mod tests {
         assert_eq!(detail.message, "bad config");
     }
 
+    #[test]
+    fn nack_circuit_breaker_resets_on_ack() {
+        let mut breaker = NackCircuitBreaker::default();
+
+        assert_eq!(breaker.record_nack(CDS_TYPE_URL), 1);
+        assert_eq!(breaker.record_nack(CDS_TYPE_URL), 2);
+        breaker.record_ack(CDS_TYPE_URL);
+
+        assert_eq!(breaker.record_nack(CDS_TYPE_URL), 1);
+    }
+
     #[tokio::test]
     async fn unknown_type_url_is_nacked_without_erroring_stream() {
         let (tx, mut rx) = mpsc::channel(4);
         let mut state = ClientSubscriptionState::new();
         let mut accumulator = ResourceAccumulator::new();
+        let mut nack_circuit_breaker = NackCircuitBreaker::default();
 
         let result = handle_ads_response(
             discovery_response(
@@ -1117,6 +1203,7 @@ mod tests {
             &tx,
             &mut state,
             &mut accumulator,
+            &mut nack_circuit_breaker,
         )
         .await
         .expect("unknown type should be NACKed, not fail the stream");
@@ -1134,6 +1221,7 @@ mod tests {
                 .subscriptions
                 .contains_key("type.googleapis.com/envoy.config.route.v3.ScopedRouteConfiguration")
         );
+        assert!(nack_circuit_breaker.consecutive_nacks_by_type.is_empty());
     }
 
     #[test]
@@ -1168,6 +1256,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let mut state = ClientSubscriptionState::new();
         let mut accumulator = ResourceAccumulator::new();
+        let mut nack_circuit_breaker = NackCircuitBreaker::default();
 
         accumulator
             .apply_sotw_response(
@@ -1196,6 +1285,7 @@ mod tests {
             &tx,
             &mut state,
             &mut accumulator,
+            &mut nack_circuit_breaker,
         )
         .await
         .expect("invalid cross-type update should NACK");
@@ -1213,6 +1303,113 @@ mod tests {
         assert_eq!(nack.type_url, RDS_TYPE_URL);
         assert_eq!(nack.version_info, "");
         assert!(nack.error_detail.is_some());
+    }
+
+    #[tokio::test]
+    async fn repeated_invalid_update_trips_nack_circuit_breaker() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut state = ClientSubscriptionState::new();
+        let mut accumulator = ResourceAccumulator::new();
+        let mut nack_circuit_breaker = NackCircuitBreaker::default();
+
+        accumulator
+            .apply_sotw_response(
+                CDS_TYPE_URL,
+                &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+                "v1",
+            )
+            .expect("CDS applies");
+        accumulator
+            .apply_sotw_response(
+                RDS_TYPE_URL,
+                &[any_resource(RDS_TYPE_URL, "route/default/api")],
+                "v1",
+            )
+            .expect("RDS applies");
+        apply_all_empty(&mut accumulator);
+
+        for attempt in 1..XDS_CONSECUTIVE_NACK_LIMIT {
+            let result = handle_ads_response(
+                discovery_response(
+                    RDS_TYPE_URL,
+                    &format!("v{}", attempt + 1),
+                    &format!("n{}", attempt + 1),
+                    vec![any_resource(RDS_TYPE_URL, "route/default/missing")],
+                ),
+                &test_config(),
+                &tx,
+                &mut state,
+                &mut accumulator,
+                &mut nack_circuit_breaker,
+            )
+            .await
+            .expect("below threshold should only NACK");
+
+            assert!(result.is_none());
+        }
+
+        let err = handle_ads_response(
+            discovery_response(
+                RDS_TYPE_URL,
+                "v-final",
+                "n-final",
+                vec![any_resource(RDS_TYPE_URL, "route/default/missing")],
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect_err("threshold NACK should close the ADS stream");
+
+        assert!(
+            err.to_string()
+                .contains("xDS ADS NACK circuit breaker tripped")
+        );
+
+        let mut nack_count = 0;
+        while let Ok(nack) = rx.try_recv() {
+            assert_eq!(nack.type_url, RDS_TYPE_URL);
+            assert!(nack.error_detail.is_some());
+            nack_count += 1;
+        }
+        assert_eq!(nack_count, XDS_CONSECUTIVE_NACK_LIMIT);
+    }
+
+    #[test]
+    fn pending_slice_is_flushed_before_ads_error_returns() {
+        let config = test_config();
+        let state = MeshRuntimeState::new();
+        let consumer = XdsConfigConsumer::new(config.clone(), state.clone());
+        let mut pending_slice = Some(PendingXdsSlice {
+            slice: MeshSlice {
+                version: "v-pending".to_string(),
+                ..MeshSlice::default()
+            },
+            type_url: CDS_TYPE_URL.to_string(),
+            all_types_ready: true,
+        });
+
+        let err = flush_pending_xds_slice_before_error(
+            &consumer,
+            &config,
+            &mut pending_slice,
+            anyhow::anyhow!("breaker"),
+        )
+        .expect_err("error is preserved after flush");
+
+        assert_eq!(err.to_string(), "breaker");
+        assert!(pending_slice.is_none());
+        assert_eq!(
+            state
+                .snapshot()
+                .as_ref()
+                .as_ref()
+                .map(|slice| slice.version.as_str()),
+            Some("v-pending")
+        );
     }
 
     #[test]
