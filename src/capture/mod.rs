@@ -165,6 +165,35 @@ impl IptablesPlan {
 
         Self { commands }
     }
+
+    /// Generate iptables commands that reverse the setup performed by
+    /// [`for_config`]. The cleanup order matters:
+    ///
+    /// 1. Delete the jump rules from the built-in chains (`PREROUTING`,
+    ///    `OUTPUT`) so no new traffic enters the custom chains.
+    /// 2. Flush the custom chains (remove all rules inside them).
+    /// 3. Delete the now-empty custom chains.
+    ///
+    /// Each command uses `2>/dev/null || true` so partial cleanup (e.g.
+    /// chains already removed by a previous run) does not fail the overall
+    /// teardown.
+    pub fn cleanup_commands(config: &CaptureConfig) -> Vec<String> {
+        // Silence the config parameter — the cleanup sequence is the same
+        // regardless of config contents (flush covers all per-config rules).
+        let _ = config;
+
+        vec![
+            // Step 1: remove jump rules from built-in chains
+            idempotent_delete("nat", "OUTPUT", "-p tcp -j FERRUM_MESH_OUTBOUND"),
+            idempotent_delete("nat", "PREROUTING", "-p tcp -j FERRUM_MESH_INBOUND"),
+            // Step 2: flush custom chains
+            flush_chain("nat", "FERRUM_MESH_INBOUND"),
+            flush_chain("nat", "FERRUM_MESH_OUTBOUND"),
+            // Step 3: delete custom chains (must be empty first)
+            delete_chain("nat", "FERRUM_MESH_INBOUND"),
+            delete_chain("nat", "FERRUM_MESH_OUTBOUND"),
+        ]
+    }
 }
 
 #[allow(dead_code)]
@@ -225,6 +254,18 @@ fn idempotent_append(table: &str, chain: &str, rule: &str) -> String {
     format!(
         "iptables -t {table} -C {chain} {rule} 2>/dev/null || iptables -t {table} -A {chain} {rule}"
     )
+}
+
+fn idempotent_delete(table: &str, chain: &str, rule: &str) -> String {
+    format!("iptables -t {table} -D {chain} {rule} 2>/dev/null || true")
+}
+
+fn flush_chain(table: &str, chain: &str) -> String {
+    format!("iptables -t {table} -F {chain} 2>/dev/null || true")
+}
+
+fn delete_chain(table: &str, chain: &str) -> String {
+    format!("iptables -t {table} -X {chain} 2>/dev/null || true")
 }
 
 #[cfg(test)]
@@ -295,6 +336,167 @@ mod tests {
                 .iter()
                 .any(|cmd| cmd.contains("--to-ports 15001"))
         );
+    }
+
+    #[test]
+    fn cleanup_commands_reverses_setup() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.proxy_uid = Some(DEFAULT_PROXY_UID);
+        config.exclude_cidrs.push("10.0.0.0/8".to_string());
+        config.exclude_ports.push(15020);
+
+        let cleanup = IptablesPlan::cleanup_commands(&config);
+
+        // Must remove jumps from built-in chains first
+        assert!(cleanup.iter().any(|cmd| cmd.contains("-D OUTPUT")));
+        assert!(cleanup.iter().any(|cmd| cmd.contains("-D PREROUTING")));
+
+        // Must flush then delete custom chains
+        assert!(
+            cleanup
+                .iter()
+                .any(|cmd| cmd.contains("-F FERRUM_MESH_INBOUND"))
+        );
+        assert!(
+            cleanup
+                .iter()
+                .any(|cmd| cmd.contains("-F FERRUM_MESH_OUTBOUND"))
+        );
+        assert!(
+            cleanup
+                .iter()
+                .any(|cmd| cmd.contains("-X FERRUM_MESH_INBOUND"))
+        );
+        assert!(
+            cleanup
+                .iter()
+                .any(|cmd| cmd.contains("-X FERRUM_MESH_OUTBOUND"))
+        );
+
+        // Flush must come before delete (chain must be empty before removal)
+        let flush_inbound_pos = cleanup
+            .iter()
+            .position(|cmd| cmd.contains("-F FERRUM_MESH_INBOUND"))
+            .unwrap();
+        let delete_inbound_pos = cleanup
+            .iter()
+            .position(|cmd| cmd.contains("-X FERRUM_MESH_INBOUND"))
+            .unwrap();
+        assert!(
+            flush_inbound_pos < delete_inbound_pos,
+            "flush must precede delete for FERRUM_MESH_INBOUND"
+        );
+
+        let flush_outbound_pos = cleanup
+            .iter()
+            .position(|cmd| cmd.contains("-F FERRUM_MESH_OUTBOUND"))
+            .unwrap();
+        let delete_outbound_pos = cleanup
+            .iter()
+            .position(|cmd| cmd.contains("-X FERRUM_MESH_OUTBOUND"))
+            .unwrap();
+        assert!(
+            flush_outbound_pos < delete_outbound_pos,
+            "flush must precede delete for FERRUM_MESH_OUTBOUND"
+        );
+
+        // Jump deletions must come before flush (no new traffic enters chains
+        // while they are being torn down)
+        let delete_output_pos = cleanup
+            .iter()
+            .position(|cmd| cmd.contains("-D OUTPUT"))
+            .unwrap();
+        assert!(
+            delete_output_pos < flush_outbound_pos,
+            "OUTPUT jump delete must precede OUTBOUND flush"
+        );
+        let delete_prerouting_pos = cleanup
+            .iter()
+            .position(|cmd| cmd.contains("-D PREROUTING"))
+            .unwrap();
+        assert!(
+            delete_prerouting_pos < flush_inbound_pos,
+            "PREROUTING jump delete must precede INBOUND flush"
+        );
+    }
+
+    #[test]
+    fn cleanup_commands_all_tolerate_missing_chains() {
+        let config = CaptureConfig::explicit(15006, 15001);
+        let cleanup = IptablesPlan::cleanup_commands(&config);
+
+        // Every cleanup command must have "|| true" so partial cleanup doesn't
+        // fail the overall teardown
+        for cmd in &cleanup {
+            assert!(
+                cmd.contains("|| true"),
+                "cleanup command must tolerate missing chains: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_then_cleanup_covers_all_chains() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.proxy_uid = Some(DEFAULT_PROXY_UID);
+
+        let setup = IptablesPlan::for_config(&config);
+        let cleanup = IptablesPlan::cleanup_commands(&config);
+
+        // Every custom chain created in setup must be deleted in cleanup
+        let setup_chains: Vec<&str> = setup
+            .commands
+            .iter()
+            .filter(|cmd| cmd.contains("-N "))
+            .filter_map(|cmd| cmd.split("-N ").nth(1))
+            .filter_map(|s| s.split_whitespace().next())
+            .collect();
+
+        for chain in &setup_chains {
+            assert!(
+                cleanup
+                    .iter()
+                    .any(|cmd| cmd.contains(&format!("-X {chain}"))),
+                "chain {chain} created in setup but not deleted in cleanup"
+            );
+            assert!(
+                cleanup
+                    .iter()
+                    .any(|cmd| cmd.contains(&format!("-F {chain}"))),
+                "chain {chain} created in setup but not flushed in cleanup"
+            );
+        }
+
+        // Every built-in chain jump in setup must have a corresponding delete in cleanup
+        let setup_jumps: Vec<(&str, &str)> = setup
+            .commands
+            .iter()
+            .filter(|cmd| {
+                (cmd.contains("-A PREROUTING") || cmd.contains("-C PREROUTING"))
+                    || (cmd.contains("-A OUTPUT") || cmd.contains("-C OUTPUT"))
+            })
+            .filter_map(|cmd| {
+                if cmd.contains("PREROUTING") {
+                    Some(("PREROUTING", "FERRUM_MESH_INBOUND"))
+                } else if cmd.contains("OUTPUT") {
+                    Some(("OUTPUT", "FERRUM_MESH_OUTBOUND"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (chain, target) in &setup_jumps {
+            assert!(
+                cleanup
+                    .iter()
+                    .any(|cmd| cmd.contains(&format!("-D {chain}"))
+                        && cmd.contains(&format!("-j {target}"))),
+                "jump from {chain} to {target} in setup but no -D in cleanup"
+            );
+        }
     }
 
     #[test]

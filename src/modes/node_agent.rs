@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use dashmap::DashMap;
 use tracing::{debug, error, info, warn};
 
-use crate::capture::CaptureConfig;
+use crate::capture::{CaptureConfig, IptablesPlan};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::ebpf::cgroup;
@@ -106,7 +106,7 @@ pub async fn run(
     );
 
     if !probe.supports_ebpf() {
-        return handle_fallback(&config, &probe);
+        return handle_fallback(&config, &probe, &shutdown_tx).await;
     }
 
     run_with_backend(create_backend(), &config, &shutdown_tx).await
@@ -303,9 +303,10 @@ pub fn handle_pod_removed(
     }
 }
 
-fn handle_fallback(
+async fn handle_fallback(
     config: &NodeAgentConfig,
     probe: &KernelProbeResult,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
 ) -> Result<(), anyhow::Error> {
     match config.fallback_mode {
         FallbackMode::Iptables => {
@@ -316,7 +317,19 @@ fn handle_fallback(
                 bpf_fs = probe.bpf_fs_available,
                 "Kernel does not support eBPF capture, falling back to iptables mode"
             );
-            info!("Node agent running in iptables fallback mode");
+
+            let plan = IptablesPlan::for_config(&config.capture_config);
+            execute_iptables_commands(&plan.commands, "setup").await;
+
+            info!("Iptables fallback rules applied, awaiting shutdown signal");
+
+            let mut shutdown_rx = shutdown_tx.subscribe();
+            shutdown_rx.changed().await.ok();
+
+            info!("Shutdown signal received, cleaning up iptables rules");
+            let cleanup = IptablesPlan::cleanup_commands(&config.capture_config);
+            execute_iptables_commands(&cleanup, "cleanup").await;
+
             Ok(())
         }
         FallbackMode::Fail => {
@@ -335,6 +348,47 @@ fn handle_fallback(
                 probe.cgroup_v2_available,
                 probe.bpf_fs_available,
             );
+        }
+    }
+}
+
+/// Execute a list of shell commands (iptables setup or cleanup) sequentially.
+///
+/// Each command is run via `sh -c` so that shell operators (`||`, `2>/dev/null`)
+/// are interpreted correctly. Failures are logged but do not abort the remaining
+/// commands — iptables rules are idempotent, so partial application is safe and
+/// a subsequent retry will converge.
+async fn execute_iptables_commands(commands: &[String], phase: &str) {
+    for cmd in commands {
+        debug!(command = %cmd, phase, "Executing iptables command");
+        match tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output()
+            .await
+        {
+            Ok(output) => {
+                if output.status.success() {
+                    debug!(command = %cmd, phase, "iptables command succeeded");
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    error!(
+                        command = %cmd,
+                        phase,
+                        exit_code = output.status.code(),
+                        stderr = %stderr.trim(),
+                        "iptables command failed"
+                    );
+                }
+            }
+            Err(e) => {
+                error!(
+                    command = %cmd,
+                    phase,
+                    error = %e,
+                    "Failed to spawn iptables command"
+                );
+            }
         }
     }
 }
@@ -456,8 +510,8 @@ mod tests {
         assert!(backend.cleaned_up);
     }
 
-    #[test]
-    fn handle_fallback_iptables_succeeds() {
+    #[tokio::test]
+    async fn handle_fallback_iptables_succeeds() {
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
             capture_config: CaptureConfig::explicit(15006, 15001),
@@ -472,8 +526,28 @@ mod tests {
             cgroup_v2_available: false,
             bpf_fs_available: false,
         };
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
-        assert!(handle_fallback(&config, &probe).is_ok());
+        // Send shutdown from a spawned task after a brief delay so
+        // handle_fallback's internal subscriber is registered before the
+        // send arrives. The iptables commands all fail fast on non-Linux
+        // (no iptables binary) so the subscribe point is reached quickly.
+        let tx_clone = shutdown_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tx_clone.send(true).ok();
+        });
+
+        // handle_fallback will attempt to run iptables commands which will
+        // fail on non-Linux (or without privileges), but the function logs
+        // errors and continues — it should still return Ok.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            handle_fallback(&config, &probe, &shutdown_tx),
+        )
+        .await
+        .expect("handle_fallback should complete within timeout");
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -657,8 +731,8 @@ mod tests {
         assert_eq!(pod_states.get("pod-uid-1").unwrap().pod_name, "existing");
     }
 
-    #[test]
-    fn handle_fallback_fail_returns_error() {
+    #[tokio::test]
+    async fn handle_fallback_fail_returns_error() {
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
             capture_config: CaptureConfig::explicit(15006, 15001),
@@ -673,7 +747,12 @@ mod tests {
             cgroup_v2_available: false,
             bpf_fs_available: false,
         };
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
-        assert!(handle_fallback(&config, &probe).is_err());
+        assert!(
+            handle_fallback(&config, &probe, &shutdown_tx)
+                .await
+                .is_err()
+        );
     }
 }
