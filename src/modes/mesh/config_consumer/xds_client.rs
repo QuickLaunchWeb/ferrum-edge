@@ -739,6 +739,8 @@ fn reverse_translate(
         services,
         mesh_policies: Vec::new(),
         peer_authentications: Vec::new(),
+        request_authentications: Vec::new(),
+        telemetry_resources: Vec::new(),
         // Phase B reverse translation rebuilds service routing names only.
         // External ServiceEntry shape is not recoverable from the minimal
         // CDS/EDS names consumed here; richer xDS metadata will fill this in.

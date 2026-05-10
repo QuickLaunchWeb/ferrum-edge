@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::config::types::GatewayConfig;
 use crate::modes::mesh::config::{
-    MeshPolicy, MeshService, MultiClusterConfig, PeerAuthentication, ServiceEntry, TrustBundleSet,
-    Workload, policy_scope_applies_to_workload, service_entry_applies_to_workload,
-    workload_selector_matches,
+    MeshPolicy, MeshRequestAuthentication, MeshService, MeshTelemetryResource, MultiClusterConfig,
+    PeerAuthentication, ServiceEntry, TrustBundleSet, Workload, policy_scope_applies_to_workload,
+    scope_applies_to_workload, service_entry_applies_to_workload, workload_selector_matches,
 };
 
 /// Node/workload selector used by both ADS and native `MeshSubscribe`.
@@ -68,6 +68,10 @@ pub struct MeshSlice {
     pub peer_authentications: Vec<PeerAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_entries: Vec<ServiceEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_authentications: Vec<MeshRequestAuthentication>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub telemetry_resources: Vec<MeshTelemetryResource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,6 +93,8 @@ impl MeshSlice {
             && self.mesh_policies == other.mesh_policies
             && self.peer_authentications == other.peer_authentications
             && self.service_entries == other.service_entries
+            && self.request_authentications == other.request_authentications
+            && self.telemetry_resources == other.telemetry_resources
             && self.trust_bundles == other.trust_bundles
             && self.multi_cluster == other.multi_cluster
     }
@@ -167,6 +173,20 @@ impl MeshSlice {
             })
             .cloned()
             .collect();
+        let request_authentications: Vec<MeshRequestAuthentication> = mesh
+            .request_authentications
+            .iter()
+            .filter(|ra| {
+                scope_applies_to_workload(&ra.scope, effective_namespace, &effective_labels)
+            })
+            .cloned()
+            .collect();
+        let telemetry_resources: Vec<MeshTelemetryResource> = mesh
+            .telemetry_resources
+            .iter()
+            .filter(|t| scope_applies_to_workload(&t.scope, effective_namespace, &effective_labels))
+            .cloned()
+            .collect();
 
         Self {
             node_id: request.node_id,
@@ -179,6 +199,8 @@ impl MeshSlice {
             mesh_policies,
             peer_authentications,
             service_entries,
+            request_authentications,
+            telemetry_resources,
             trust_bundles: mesh.trust_bundles.clone(),
             multi_cluster: mesh.multi_cluster.clone(),
         }

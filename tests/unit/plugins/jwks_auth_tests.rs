@@ -479,7 +479,8 @@ async fn test_jwks_auth_does_not_fetch_jwks_on_auth_hot_path_when_cache_empty() 
     .unwrap();
     let initial_count = wait_for_received_request_count(&mock_server, 1).await;
 
-    let consumer_index = ConsumerIndex::new(&[]);
+    let consumers: Vec<ferrum_edge::config::types::Consumer> = Vec::new();
+    let consumer_index = ConsumerIndex::new(&consumers);
     let mut ctx = make_ctx();
     ctx.headers
         .insert("authorization".to_string(), "Bearer not.a.jwt".to_string());
@@ -604,6 +605,45 @@ async fn test_jwks_auth_allows_missing_exp_when_require_exp_false() {
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("idp-user"));
+}
+
+#[tokio::test]
+async fn test_jwks_auth_strips_authorization_when_forward_original_token_false() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks_uri": jwks_uri,
+                "forward_original_token": false
+            }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumers: Vec<ferrum_edge::config::types::Consumer> = Vec::new();
+    let consumer_index = ConsumerIndex::new(&consumers);
+    let token = create_rs256_token(&json!({"sub": "idp-user"}), private_key_pem);
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+
+    let mut headers = ctx.headers.clone();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    assert!(
+        !headers.contains_key("authorization"),
+        "Authorization should be stripped before proxying"
+    );
 }
 
 #[tokio::test]
