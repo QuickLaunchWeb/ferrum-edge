@@ -164,6 +164,14 @@ async fn connect_mesh_subscribe(
             return Err(anyhow::anyhow!(msg));
         }
 
+        if update.heartbeat {
+            tracing::debug!(
+                version = %update.version,
+                "Received native MeshSubscribe heartbeat"
+            );
+            continue;
+        }
+
         let version = update.version.clone();
         match consumer.apply_update(update) {
             Ok(slice) => {
@@ -228,6 +236,7 @@ mod tests {
             })
             .expect("mesh slice serializes"),
             ferrum_version: crate::FERRUM_VERSION.to_string(),
+            heartbeat: false,
         };
 
         let slice = consumer.apply_update(update).expect("update applies");

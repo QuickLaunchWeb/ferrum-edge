@@ -33,6 +33,7 @@ const REQUIRED_MESH_SLICE_TYPE_URLS: [&str; 4] =
     [CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL];
 const XDS_APPLY_DEBOUNCE: Duration = Duration::from_millis(25);
 const XDS_CONSECUTIVE_NACK_LIMIT: u32 = 5;
+const XDS_APPLY_MAX_DELAY: Duration = Duration::from_millis(500);
 
 type BearerToken = MetadataValue<tonic::metadata::Ascii>;
 
@@ -511,6 +512,7 @@ async fn run_ads_stream_with_auth(
     let debounce = tokio::time::sleep(Duration::from_secs(60 * 60 * 24));
     tokio::pin!(debounce);
     let mut debounce_active = false;
+    let mut pending_since: Option<tokio::time::Instant> = None;
     let mut pending_slice: Option<PendingXdsSlice> = None;
 
     loop {
@@ -529,9 +531,11 @@ async fn run_ads_stream_with_auth(
                 ).await {
                     Ok(Some(pending)) => {
                         pending_slice = Some(pending);
+                        let now = tokio::time::Instant::now();
+                        let first_pending_at = *pending_since.get_or_insert(now);
                         debounce
                             .as_mut()
-                            .reset(tokio::time::Instant::now() + XDS_APPLY_DEBOUNCE);
+                            .reset(next_xds_apply_deadline(now, first_pending_at));
                         debounce_active = true;
                     }
                     Ok(None) => {}
@@ -550,6 +554,7 @@ async fn run_ads_stream_with_auth(
                     apply_pending_xds_slice(consumer, config, pending);
                 }
                 debounce_active = false;
+                pending_since = None;
             }
         }
     }
@@ -571,6 +576,16 @@ fn flush_pending_xds_slice_before_error(
         apply_pending_xds_slice(consumer, config, pending);
     }
     Err(error)
+}
+
+fn next_xds_apply_deadline(
+    now: tokio::time::Instant,
+    first_pending_at: tokio::time::Instant,
+) -> tokio::time::Instant {
+    std::cmp::min(
+        now + XDS_APPLY_DEBOUNCE,
+        first_pending_at + XDS_APPLY_MAX_DELAY,
+    )
 }
 
 #[derive(Debug)]
@@ -1079,6 +1094,22 @@ mod tests {
         assert!(should_race_primary_retry(true, 300, true));
         assert!(!should_race_primary_retry(false, 300, true));
         assert!(!should_race_primary_retry(true, 0, true));
+    }
+
+    #[test]
+    fn xds_apply_deadline_caps_debounce_bursts() {
+        let first_pending_at = tokio::time::Instant::now();
+        let early_burst = first_pending_at + Duration::from_millis(100);
+        let late_burst = first_pending_at + Duration::from_millis(490);
+
+        assert_eq!(
+            next_xds_apply_deadline(early_burst, first_pending_at),
+            early_burst + XDS_APPLY_DEBOUNCE
+        );
+        assert_eq!(
+            next_xds_apply_deadline(late_burst, first_pending_at),
+            first_pending_at + XDS_APPLY_MAX_DELAY
+        );
     }
 
     #[test]

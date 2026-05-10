@@ -3223,6 +3223,63 @@ async fn test_cluster_endpoint_cp_mode_with_connected_dps() {
 }
 
 #[tokio::test]
+async fn test_cluster_endpoint_cp_mode_with_connected_mesh_nodes() {
+    let tc = TestConfig::default();
+    let registry = std::sync::Arc::new(ferrum_edge::grpc::mesh_registry::MeshNodeRegistry::new());
+    let connected_at = Utc::now();
+    let last_heartbeat_at = connected_at + chrono::Duration::seconds(30);
+    let last_update_at = connected_at + chrono::Duration::seconds(60);
+
+    registry.insert(ferrum_edge::grpc::mesh_registry::MeshNodeInfo {
+        node_id: "mesh-node-1".to_string(),
+        version: "0.9.0".to_string(),
+        namespace: "ferrum".to_string(),
+        connected_at,
+        last_heartbeat_at,
+        last_update_at,
+    });
+
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: None,
+        proxy_state: None,
+        mode: "cp".to_string(),
+        read_only: true,
+        startup_ready: None,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
+        cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        mesh_registry: Some(registry),
+        cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/cluster", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["mode"], "cp");
+    assert_eq!(body["connected_mesh_nodes"], 1);
+    let mesh_nodes = body["mesh_nodes"].as_array().unwrap();
+    assert_eq!(mesh_nodes.len(), 1);
+    assert_eq!(mesh_nodes[0]["node_id"], "mesh-node-1");
+    assert_eq!(
+        mesh_nodes[0]["last_heartbeat_at"],
+        last_heartbeat_at.to_rfc3339()
+    );
+    assert_eq!(mesh_nodes[0]["last_sync_at"], last_update_at.to_rfc3339());
+}
+
+#[tokio::test]
 async fn test_cluster_endpoint_dp_mode_connected() {
     let tc = TestConfig::default();
     let now = Utc::now();
