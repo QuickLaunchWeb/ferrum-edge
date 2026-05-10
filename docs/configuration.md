@@ -287,7 +287,7 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 
 These TLS policy settings apply uniformly to both inbound (frontend) and outbound (backend) connections across all TLS-capable protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP-TLS). DTLS uses a separate library and is not affected. See [frontend_tls.md](frontend_tls.md) and [backend_mtls.md](backend_mtls.md) for detailed TLS configuration guides.
 
-Gateway SVID files are static startup inputs. Set all three SVID path variables together; the gateway rejects partial configuration and validates the leaf certificate, PKCS#8 key match, and trust bundle before serving. The SPIFFE ID is read from the leaf URI SAN when present; `FERRUM_GATEWAY_SPIFFE_ID` is only a fallback for file bundles without a SPIFFE URI SAN.
+Gateway SVID files are static startup inputs. Set all three SVID path variables together; the gateway rejects partial configuration and validates the leaf certificate, intermediate certificate freshness, PKCS#8 key match, and trust bundle before serving. The SPIFFE ID is read from the leaf URI SAN when present; `FERRUM_GATEWAY_SPIFFE_ID` is only a fallback for file bundles without a SPIFFE URI SAN. Private keys must be PKCS#8 PEM (`BEGIN PRIVATE KEY`); legacy `BEGIN RSA PRIVATE KEY` or `BEGIN EC PRIVATE KEY` files are rejected.
 
 Admin listener TLS and mTLS variables are listed in [Admin API](#admin-api).
 

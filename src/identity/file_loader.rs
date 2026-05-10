@@ -30,6 +30,12 @@ pub fn load_svid_bundle_from_files(
         .as_slice();
     validate_cert_is_current(leaf, "gateway SVID leaf certificate")?;
     validate_leaf_is_not_ca(leaf)?;
+    for (idx, intermediate) in cert_chain_der.iter().enumerate().skip(1) {
+        validate_cert_is_current(
+            intermediate,
+            &format!("gateway SVID intermediate certificate #{idx}"),
+        )?;
+    }
     for (idx, ca) in x509_authorities.iter().enumerate() {
         validate_cert_is_current(ca, &format!("gateway SVID trust bundle cert #{}", idx + 1))?;
     }
@@ -178,6 +184,9 @@ fn verify_leaf_key_match(leaf_der: &[u8], key_der: &[u8]) -> Result<(), SpiffeTl
     let key_pair = rcgen::KeyPair::try_from(key_der).map_err(|e| {
         SpiffeTlsError::BadKeyMaterial(format!("gateway SVID private key is invalid: {e}"))
     })?;
+    // Both sources are ASN.1 DER-encoded SubjectPublicKeyInfo. Comparing the
+    // canonical DER keeps this check allocation-free but can reject exotic
+    // non-canonical encodings from third-party certificate tooling.
     let cert_spki = leaf.tbs_certificate.subject_pki.raw;
     let key_spki = key_pair.subject_public_key_info();
     if cert_spki != key_spki.as_slice() {
