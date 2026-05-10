@@ -109,8 +109,27 @@ pub async fn run(
         return Ok(());
     }
 
-    let mut backend = MockEbpfBackend::default();
-    initialize_backend(&mut backend, &config)?;
+    run_with_backend(create_backend(), &config, &shutdown_tx).await
+}
+
+fn create_backend() -> Box<dyn EbpfBackend> {
+    #[cfg(feature = "ebpf")]
+    {
+        Box::new(crate::ebpf::AyaEbpfBackend::new())
+    }
+    #[cfg(not(feature = "ebpf"))]
+    {
+        info!("ebpf feature not enabled, using mock backend");
+        Box::new(MockEbpfBackend::default())
+    }
+}
+
+async fn run_with_backend(
+    mut backend: Box<dyn EbpfBackend>,
+    config: &NodeAgentConfig,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+) -> Result<(), anyhow::Error> {
+    initialize_backend(backend.as_mut(), config)?;
 
     let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
 
@@ -122,7 +141,7 @@ pub async fn run(
     wait_for_shutdown(&shutdown_tx).await;
 
     info!("Node agent shutting down, detaching BPF programs");
-    cleanup_all_pods(&mut backend, &pod_states);
+    cleanup_all_pods(backend.as_mut(), &pod_states);
 
     Ok(())
 }
@@ -176,7 +195,7 @@ fn handle_fallback(
 }
 
 fn initialize_backend(
-    backend: &mut impl EbpfBackend,
+    backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
 ) -> Result<(), anyhow::Error> {
     backend.load_programs().map_err(anyhow::Error::msg)?;
@@ -206,7 +225,7 @@ fn initialize_backend(
 }
 
 fn cleanup_all_pods(
-    backend: &mut impl EbpfBackend,
+    backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
 ) {
     for entry in pod_states.iter() {
