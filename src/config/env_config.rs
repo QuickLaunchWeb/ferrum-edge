@@ -27,6 +27,7 @@ pub enum OperatingMode {
     DataPlane,
     Mesh,
     Injector,
+    NodeAgent,
     Migrate,
 }
 
@@ -45,9 +46,10 @@ impl OperatingMode {
             "dp" => Ok(Self::DataPlane),
             "mesh" => Ok(Self::Mesh),
             "injector" => Ok(Self::Injector),
+            "node_agent" => Ok(Self::NodeAgent),
             "migrate" => Ok(Self::Migrate),
             other => Err(format!(
-                "Invalid FERRUM_MODE '{}'. Expected: database, file, cp, dp, mesh, injector, migrate",
+                "Invalid FERRUM_MODE '{}'. Expected: database, file, cp, dp, mesh, injector, node_agent, migrate",
                 other
             )),
         }
@@ -2389,7 +2391,7 @@ impl EnvConfig {
                     }
                 }
             }
-            OperatingMode::Injector => {}
+            OperatingMode::Injector | OperatingMode::NodeAgent => {}
             OperatingMode::Migrate => {
                 // Migrate mode: validation depends on FERRUM_MIGRATE_ACTION.
                 // For "config", FERRUM_FILE_CONFIG_PATH is required.

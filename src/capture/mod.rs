@@ -51,6 +51,58 @@ impl CaptureConfig {
             exclude_ports: Vec::new(),
         }
     }
+
+    pub fn from_env() -> Result<Self, String> {
+        let mode = CaptureMode::parse(
+            &std::env::var("FERRUM_MESH_CAPTURE_MODE").unwrap_or_else(|_| "explicit".to_string()),
+        )?;
+        let proxy_uid = std::env::var("FERRUM_MESH_PROXY_UID")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .or(Some(DEFAULT_PROXY_UID));
+        let include_cidrs = parse_cidr_env(
+            &std::env::var("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS")
+                .unwrap_or_else(|_| "0.0.0.0/0".to_string()),
+        );
+        validate_cidr_list(&include_cidrs)?;
+        let exclude_cidrs =
+            parse_cidr_env(&std::env::var("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS").unwrap_or_default());
+        if !exclude_cidrs.is_empty() {
+            validate_cidr_list(&exclude_cidrs)?;
+        }
+        let exclude_ports = parse_port_list(
+            &std::env::var("FERRUM_MESH_CAPTURE_EXCLUDE_PORTS")
+                .unwrap_or_else(|_| "15001,15006,15008,15020".to_string()),
+        )?;
+        Ok(Self {
+            mode,
+            proxy_uid,
+            inbound_port: 15006,
+            outbound_port: 15001,
+            include_cidrs,
+            exclude_cidrs,
+            exclude_ports,
+        })
+    }
+}
+
+fn parse_cidr_env(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn parse_port_list(raw: &str) -> Result<Vec<u16>, String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<u16>()
+                .map_err(|_| format!("Invalid port '{s}' in capture exclude ports"))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,8 +167,6 @@ impl IptablesPlan {
     }
 }
 
-// Phase D keeps the eBPF planner available for the ambient DaemonSet/node-agent
-// integration while the injector path consumes the iptables fallback first.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EbpfPlan {
@@ -125,7 +175,6 @@ pub struct EbpfPlan {
     pub required_kernel: &'static str,
 }
 
-// The sidecar injector only needs the iptables fallback in this slice.
 #[allow(dead_code)]
 impl EbpfPlan {
     pub fn for_config(config: &CaptureConfig) -> Self {
@@ -137,8 +186,6 @@ impl EbpfPlan {
     }
 }
 
-// Used by the eBPF node-agent path once it is wired to runtime kernel probing.
-#[allow(dead_code)]
 pub fn should_fallback_to_iptables(kernel_release: &str) -> bool {
     let mut parts = kernel_release.split('.');
     let major = parts.next().and_then(|p| p.parse::<u32>().ok());
@@ -149,9 +196,6 @@ pub fn should_fallback_to_iptables(kernel_release: &str) -> bool {
     }
 }
 
-// Validates operator-provided include/exclude CIDRs before emitting capture
-// rules; the env-facing CIDR knobs land with the node-agent integration.
-#[allow(dead_code)]
 pub fn validate_cidr_list(cidrs: &[String]) -> Result<(), String> {
     for cidr in cidrs {
         let Some((addr, prefix)) = cidr.split_once('/') else {
@@ -257,5 +301,39 @@ mod tests {
     fn cidr_validation_checks_prefix_range() {
         assert!(validate_cidr_list(&["10.0.0.0/8".to_string()]).is_ok());
         assert!(validate_cidr_list(&["10.0.0.0/64".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parse_cidr_env_splits_and_trims() {
+        let result = parse_cidr_env("10.0.0.0/8, 172.16.0.0/12 , 192.168.0.0/16");
+        assert_eq!(
+            result,
+            vec![
+                "10.0.0.0/8".to_string(),
+                "172.16.0.0/12".to_string(),
+                "192.168.0.0/16".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_cidr_env_empty_string_returns_empty() {
+        assert!(parse_cidr_env("").is_empty());
+    }
+
+    #[test]
+    fn parse_port_list_valid() {
+        let result = parse_port_list("15001, 15006, 15008 ,15020").unwrap();
+        assert_eq!(result, vec![15001, 15006, 15008, 15020]);
+    }
+
+    #[test]
+    fn parse_port_list_rejects_non_numeric() {
+        assert!(parse_port_list("15001,abc").is_err());
+    }
+
+    #[test]
+    fn parse_port_list_empty_string_returns_empty() {
+        assert!(parse_port_list("").unwrap().is_empty());
     }
 }

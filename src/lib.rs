@@ -23,6 +23,7 @@ pub mod custom_plugins;
 pub mod date_cache;
 pub mod dns;
 pub mod dtls;
+pub mod ebpf;
 pub mod grpc;
 pub mod health_check;
 pub mod http3;

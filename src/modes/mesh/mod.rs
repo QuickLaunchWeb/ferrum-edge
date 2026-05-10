@@ -207,6 +207,10 @@ pub struct MeshRuntimeConfig {
     /// Kubernetes cluster DNS domain used for synthetic mesh service names.
     /// Sourced from `FERRUM_MESH_CLUSTER_DOMAIN` (default `cluster.local`).
     pub cluster_domain: String,
+    /// Traffic capture mode for observability/logging. Does not change proxy
+    /// behavior — listeners are topology-driven. Sourced from
+    /// `FERRUM_MESH_CAPTURE_MODE` (default `explicit`).
+    pub capture_mode: crate::capture::CaptureMode,
 }
 
 impl MeshRuntimeConfig {
@@ -301,6 +305,10 @@ impl MeshRuntimeConfig {
         let cluster_domain = resolve_ferrum_var("FERRUM_MESH_CLUSTER_DOMAIN")
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string());
+        let capture_mode = crate::capture::CaptureMode::parse(
+            &resolve_ferrum_var("FERRUM_MESH_CAPTURE_MODE")
+                .unwrap_or_else(|| "explicit".to_string()),
+        )?;
 
         Ok(Self {
             node_id,
@@ -326,6 +334,7 @@ impl MeshRuntimeConfig {
             dns_ttl_seconds,
             dns_max_concurrent_queries,
             cluster_domain,
+            capture_mode,
         })
     }
 
@@ -2374,6 +2383,7 @@ mod tests {
             dns_ttl_seconds: DEFAULT_DNS_TTL_SECONDS,
             dns_max_concurrent_queries: DEFAULT_DNS_MAX_CONCURRENT_QUERIES,
             cluster_domain: dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
+            capture_mode: crate::capture::CaptureMode::Explicit,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
         let mesh_state = MeshRuntimeState::new();
@@ -2458,6 +2468,7 @@ mod tests {
             dns_ttl_seconds: DEFAULT_DNS_TTL_SECONDS,
             dns_max_concurrent_queries: DEFAULT_DNS_MAX_CONCURRENT_QUERIES,
             cluster_domain: dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
+            capture_mode: crate::capture::CaptureMode::Explicit,
         }
     }
 
