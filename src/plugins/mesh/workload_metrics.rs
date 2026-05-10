@@ -5,9 +5,10 @@
 //! changes.
 
 use async_trait::async_trait;
+use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::Value;
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
@@ -38,7 +39,6 @@ pub struct WorkloadMetrics {
     custom_header_tags: HashMap<String, String>,
     metric_tag_overrides: Vec<MetricTagOverrideConfig>,
     disabled_metrics: Vec<String>,
-    sampling_counter: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -111,14 +111,13 @@ impl WorkloadMetrics {
             custom_header_tags,
             metric_tag_overrides,
             disabled_metrics,
-            sampling_counter: AtomicU64::new(0),
         })
     }
 
     fn annotate_http_context(&self, ctx: &mut RequestContext, headers: &HashMap<String, String>) {
         self.insert_common_metadata(&mut ctx.metadata);
         self.apply_telemetry_metadata(&mut ctx.metadata, headers);
-        let hbone_identity = authenticated_hbone_identity(ctx, headers);
+        let hbone_identity = hbone_identity_from_headers(ctx, headers);
         // For authenticated ambient HBONE, the peer cert identifies the
         // ztunnel, while baggage identifies the originating workload. If the
         // baggage identity's trust domain neither matches the peer cert's
@@ -128,6 +127,11 @@ impl WorkloadMetrics {
         let baggage_source_principal = hbone_identity
             .as_ref()
             .and_then(|identity| identity.source_principal.clone());
+        let trusted_baggage_source_principal = ctx
+            .peer_spiffe_id
+            .is_some()
+            .then(|| baggage_source_principal.clone())
+            .flatten();
         let trust_domain_mismatch = match (
             ctx.peer_spiffe_id.as_ref(),
             baggage_source_principal.as_ref(),
@@ -142,13 +146,23 @@ impl WorkloadMetrics {
                 "mesh.ignored_baggage".to_string(),
                 "trust_domain_mismatch".to_string(),
             );
+        } else if ctx.peer_spiffe_id.is_none()
+            && hbone_identity
+                .as_ref()
+                .and_then(|identity| identity.source_principal.as_ref())
+                .is_some()
+        {
+            ctx.metadata.insert(
+                "mesh.ignored_baggage".to_string(),
+                "unauthenticated_hbone".to_string(),
+            );
         }
         let source_identity = if trust_domain_mismatch {
             ctx.peer_spiffe_id
                 .clone()
                 .or_else(|| self.workload_spiffe_id.clone())
         } else {
-            baggage_source_principal
+            trusted_baggage_source_principal
                 .or_else(|| ctx.peer_spiffe_id.clone())
                 .or_else(|| self.workload_spiffe_id.clone())
         };
@@ -207,9 +221,7 @@ impl WorkloadMetrics {
         headers: &HashMap<String, String>,
     ) {
         if self.sampling_percentage < 100.0 {
-            let n = self.sampling_counter.fetch_add(1, Ordering::Relaxed);
-            let hash = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            let sampled = (hash as f64 / u64::MAX as f64) * 100.0 < self.sampling_percentage;
+            let sampled = trace_sampled(self.sampling_percentage);
             metadata.insert(
                 "trace_sampled".to_string(),
                 if sampled { "true" } else { "false" }.to_string(),
@@ -439,15 +451,14 @@ fn request_protocol(ctx: &RequestContext, headers: &HashMap<String, String>) -> 
     }
 }
 
-fn authenticated_hbone_identity(
+fn hbone_identity_from_headers(
     ctx: &RequestContext,
     headers: &HashMap<String, String>,
 ) -> Option<HboneIdentity> {
-    if ctx.peer_spiffe_id.is_none()
-        || ctx
-            .metadata
-            .get("request_protocol")
-            .is_none_or(|value| value != "hbone")
+    if ctx
+        .metadata
+        .get("request_protocol")
+        .is_none_or(|value| value != "hbone")
     {
         return None;
     }
@@ -456,6 +467,51 @@ fn authenticated_hbone_identity(
         .get(BAGGAGE_HEADER)
         .map(String::as_str)
         .map(HboneIdentity::from_baggage_header)
+}
+
+thread_local! {
+    static TRACE_SAMPLING_STATE: Cell<u64> = Cell::new(random_sampling_seed());
+}
+
+fn trace_sampled(sampling_percentage: f64) -> bool {
+    if sampling_percentage <= 0.0 {
+        return false;
+    }
+    if sampling_percentage >= 100.0 {
+        return true;
+    }
+
+    let random = next_sampling_u64();
+    (random as f64 / u64::MAX as f64) * 100.0 < sampling_percentage
+}
+
+fn next_sampling_u64() -> u64 {
+    TRACE_SAMPLING_STATE.with(|state| {
+        let next = state.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+        state.set(next);
+        splitmix64(next)
+    })
+}
+
+fn random_sampling_seed() -> u64 {
+    let mut bytes = [0u8; 8];
+    if SystemRandom::new().fill(&mut bytes).is_ok() {
+        let seed = u64::from_ne_bytes(bytes);
+        if seed != 0 {
+            return seed;
+        }
+    }
+
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0xA5A5_5A5A_D3C1_B2A0)
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 fn is_grpc_content_type(value: &str) -> bool {
