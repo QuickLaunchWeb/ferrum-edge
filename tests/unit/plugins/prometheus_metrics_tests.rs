@@ -1,9 +1,12 @@
 //! Tests for prometheus_metrics plugin
 
 use ferrum_edge::plugins::prometheus_metrics::{
-    CounterKey, MetricsRegistry, PrometheusMetrics, global_registry,
+    CounterKey, HboneRelayFailureKey, MetricsRegistry, PrometheusMetrics, global_registry,
 };
-use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, StreamTransactionSummary, TransactionSummary};
+use ferrum_edge::plugins::{
+    ALL_PROTOCOLS, Direction, Plugin, StreamTransactionSummary, TransactionSummary,
+};
+use ferrum_edge::retry::ErrorClass;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -366,6 +369,39 @@ async fn test_registry_render_contains_expected_metrics() {
 
     // Check rate limit counter
     assert!(output.contains("ferrum_rate_limit_exceeded_total 0"));
+}
+
+#[tokio::test]
+async fn test_registry_records_hbone_relay_failure_counter() {
+    let registry = MetricsRegistry::new();
+
+    registry.record_hbone_relay_failure(
+        "mesh-hbone",
+        Direction::BackendToClient,
+        ErrorClass::ConnectionReset,
+    );
+
+    let key = HboneRelayFailureKey {
+        proxy_id: Arc::from("mesh-hbone"),
+        direction: "backend_to_client",
+        error_class: Arc::from("connection_reset"),
+    };
+    assert!(registry.hbone_relay_failure_counter.contains_key(&key));
+    assert_eq!(
+        registry
+            .hbone_relay_failure_counter
+            .get(&key)
+            .unwrap()
+            .value
+            .load(Ordering::Relaxed),
+        1
+    );
+
+    let output = registry.render_uncached();
+    assert!(output.contains("# TYPE ferrum_mesh_hbone_relay_failures_total counter"));
+    assert!(output.contains(
+        r#"ferrum_mesh_hbone_relay_failures_total{proxy_id="mesh-hbone",direction="backend_to_client",error_class="connection_reset"} 1"#
+    ));
 }
 
 #[tokio::test]
