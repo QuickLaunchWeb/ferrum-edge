@@ -115,6 +115,12 @@ impl IptablesPlan {
     }
 }
 
+// EbpfPlan and helpers are consumed by the node-agent eBPF capture path
+// (ambient DaemonSet integration). The sidecar injector deliberately does NOT
+// inject an init container for eBPF mode — privileged capabilities would cause
+// Pod Security Baseline/Restricted admission rejection on every pod, even when
+// the script does nothing on 5.7+ kernels.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EbpfPlan {
     pub enabled: bool,
@@ -122,6 +128,7 @@ pub struct EbpfPlan {
     pub required_kernel: &'static str,
 }
 
+#[allow(dead_code)]
 impl EbpfPlan {
     pub fn for_config(config: &CaptureConfig) -> Self {
         Self {
@@ -149,6 +156,7 @@ impl EbpfPlan {
     }
 }
 
+#[allow(dead_code)]
 fn parse_kernel_requirement(version: &str) -> (u32, u32) {
     let mut parts = version.split('.');
     let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(5);

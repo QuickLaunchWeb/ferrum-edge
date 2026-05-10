@@ -534,7 +534,7 @@ The container runs as `FERRUM_MESH_PROXY_UID` (default 1337) with `allowPrivileg
 |---|---|
 | `explicit` (default) | No automatic capture; applications must explicitly route to the proxy |
 | `iptables` | Inject init container with `NET_ADMIN`/`NET_RAW` capabilities that sets up iptables rules to redirect traffic through the sidecar (inbound to 15006, outbound to 15001) |
-| `ebpf` | eBPF-based capture with iptables fallback. The init container checks the kernel version at runtime; on kernels below 5.7 it falls back to iptables rules automatically. On 5.7+ it skips iptables setup (eBPF capture is handled by the node agent) |
+| `ebpf` | eBPF-based capture handled by a node-level agent (requires kernel 5.7+). The injector does not inject a privileged init container for this mode -- the node agent's DaemonSet manages eBPF program attachment. Capture planning infrastructure (`EbpfPlan` with iptables fallback for pre-5.7 kernels) is available in `src/capture/mod.rs` for the node agent path |
 
 ## Control Plane Integration
 

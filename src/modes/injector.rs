@@ -23,7 +23,7 @@ use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info};
 
-use crate::capture::{CaptureConfig, CaptureMode, DEFAULT_PROXY_UID, EbpfPlan, IptablesPlan};
+use crate::capture::{CaptureConfig, CaptureMode, DEFAULT_PROXY_UID, IptablesPlan};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::identity::spiffe::TrustDomain;
@@ -366,10 +366,7 @@ fn build_sidecar_patch_for_namespace(
         value: Some(sidecar_container(config, pod, &pod_namespace)),
     });
 
-    if matches!(
-        config.capture_mode,
-        CaptureMode::Iptables | CaptureMode::Ebpf
-    ) {
+    if config.capture_mode == CaptureMode::Iptables {
         ensure_init_containers(pod, &mut patch);
         patch.push(JsonPatchOperation {
             op: "add",
@@ -518,17 +515,7 @@ fn sidecar_container(config: &InjectorConfig, pod: &Value, namespace: &str) -> V
 }
 
 fn init_container(config: &InjectorConfig) -> Value {
-    let capture = capture_config(config);
-    let (script, env_mode) = match config.capture_mode {
-        CaptureMode::Ebpf => {
-            let plan = EbpfPlan::for_config(&capture);
-            (plan.fallback_script(), "ebpf")
-        }
-        _ => {
-            let plan = IptablesPlan::for_config(&capture);
-            (plan.commands.join("\n"), "iptables")
-        }
-    };
+    let plan = IptablesPlan::for_config(&capture_config(config));
     json!({
         "name": "ferrum-edge-init",
         "image": config.sidecar_image,
@@ -538,11 +525,11 @@ fn init_container(config: &InjectorConfig) -> Value {
             "runAsUser": 0
         },
         "env": [
-            {"name": "FERRUM_MESH_CAPTURE_MODE", "value": env_mode},
+            {"name": "FERRUM_MESH_CAPTURE_MODE", "value": "iptables"},
             {"name": "FERRUM_MESH_PROXY_UID", "value": config.proxy_uid.unwrap_or(DEFAULT_PROXY_UID).to_string()}
         ],
         "command": ["/bin/sh", "-c"],
-        "args": [script]
+        "args": [plan.commands.join("\n")]
     })
 }
 
@@ -735,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_injects_ebpf_init_with_kernel_check_fallback() {
+    fn patch_ebpf_mode_skips_init_container() {
         let pod = json!({
             "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
             "spec": {
@@ -747,28 +734,10 @@ mod tests {
             build_sidecar_patch_for_namespace(&pod, &test_config(true, CaptureMode::Ebpf), None);
 
         assert!(patch.iter().any(|op| op.path == "/spec/containers/-"));
-        assert!(patch.iter().any(|op| op.path == "/spec/initContainers/-"));
-
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
-        let env = init.get("env").and_then(Value::as_array).expect("init env");
-        assert!(env.iter().any(|entry| {
-            entry.get("name").and_then(Value::as_str) == Some("FERRUM_MESH_CAPTURE_MODE")
-                && entry.get("value").and_then(Value::as_str) == Some("ebpf")
-        }));
-        let script = init
-            .get("args")
-            .and_then(Value::as_array)
-            .and_then(|a| a.first())
-            .and_then(Value::as_str)
-            .expect("init script");
-        assert!(script.contains("uname -r"));
-        assert!(script.contains("falling back to iptables"));
-        assert!(script.contains("supports eBPF"));
-        assert!(script.contains("--to-ports 15001"));
+        assert!(
+            !patch.iter().any(|op| op.path == "/spec/initContainers/-"),
+            "ebpf mode should not inject privileged init container"
+        );
     }
 
     #[test]
