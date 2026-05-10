@@ -1112,7 +1112,7 @@ async fn test_list_proxies_without_pagination_returns_envelope() {
     assert!(body["data"].is_array(), "Should have data field");
     assert_eq!(body["data"].as_array().unwrap().len(), 5);
     assert_eq!(body["pagination"]["offset"], 0);
-    assert_eq!(body["pagination"]["limit"], 100);
+    assert_eq!(body["pagination"]["limit"], 5);
     assert_eq!(body["pagination"]["total"], 5);
 }
 
