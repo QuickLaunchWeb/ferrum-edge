@@ -950,8 +950,8 @@ fn telemetry(
 }
 
 /// Parse simple filter expressions like `response.code >= 400` into an
-/// [`AccessLogFilter`]. Returns `Ok(None)` for unparseable expressions and
-/// `Err` for numeric values that would truncate or wrap.
+/// [`AccessLogFilter`]. Returns `Ok(None)` for expressions without supported
+/// access-log predicates and `Err` for malformed supported predicates.
 fn parse_access_log_filter_expression(expr: &str) -> Result<Option<AccessLogFilter>, String> {
     if expr.contains("||") {
         return Err(
@@ -971,24 +971,28 @@ fn parse_access_log_filter_expression(expr: &str) -> Result<Option<AccessLogFilt
     for part in expr.split("&&") {
         let part = part.trim();
         if part.starts_with("response.code") || part.starts_with("response.status") {
-            if let Some(val) = extract_numeric_comparison(part) {
-                match val {
-                    Comparison::Gte(n) => filter.status_code_min = Some(status_code_value(n)?),
-                    Comparison::Gt(n) => {
-                        filter.status_code_min = Some(status_code_value(comparison_increment(n)?)?)
-                    }
-                    Comparison::Lte(n) => filter.status_code_max = Some(status_code_value(n)?),
-                    Comparison::Lt(n) => {
-                        filter.status_code_max = Some(status_code_value(comparison_decrement(n)?)?)
-                    }
-                    Comparison::Eq(n) => {
-                        let code = status_code_value(n)?;
-                        filter.status_code_min = Some(code);
-                        filter.status_code_max = Some(code);
-                    }
+            let Some(val) = extract_numeric_comparison(part) else {
+                return Err(
+                    "Telemetry access log response.code filter must use a numeric comparison"
+                        .to_string(),
+                );
+            };
+            match val {
+                Comparison::Gte(n) => filter.status_code_min = Some(status_code_value(n)?),
+                Comparison::Gt(n) => {
+                    filter.status_code_min = Some(status_code_value(comparison_increment(n)?)?)
                 }
-                matched = true;
+                Comparison::Lte(n) => filter.status_code_max = Some(status_code_value(n)?),
+                Comparison::Lt(n) => {
+                    filter.status_code_max = Some(status_code_value(comparison_decrement(n)?)?)
+                }
+                Comparison::Eq(n) => {
+                    let code = status_code_value(n)?;
+                    filter.status_code_min = Some(code);
+                    filter.status_code_max = Some(code);
+                }
             }
+            matched = true;
         } else if part.starts_with("response.duration") {
             let Some(val) = extract_numeric_comparison(part) else {
                 return Err(
@@ -2147,6 +2151,29 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("response.duration filters only support")
+        );
+    }
+
+    #[test]
+    fn telemetry_access_log_malformed_status_filter_is_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{
+                        "filter": {
+                            "expression": "response.code != 500"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("malformed status filter should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("response.code filter must use a numeric comparison")
         );
     }
 

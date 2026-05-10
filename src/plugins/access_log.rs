@@ -70,6 +70,9 @@ impl AccessLog {
         let Some(filter) = &self.filter else {
             return true;
         };
+        if filter.status_code_min.is_some() || filter.status_code_max.is_some() {
+            return false;
+        }
         if let Some(min_ms) = filter.min_latency_ms
             && summary.duration_ms < (min_ms as f64)
         {
@@ -127,5 +130,52 @@ impl Plugin for AccessLog {
             Ok(json) => tracing::info!(target: "mesh_access_log", "{}", json),
             Err(e) => warn!("access_log: failed to serialize stream summary: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::*;
+
+    fn stream_summary() -> StreamTransactionSummary {
+        StreamTransactionSummary {
+            namespace: "ferrum".to_string(),
+            proxy_id: "proxy-1".to_string(),
+            proxy_name: None,
+            client_ip: "127.0.0.1".to_string(),
+            consumer_username: None,
+            auth_method: None,
+            backend_target: "127.0.0.1:8080".to_string(),
+            backend_resolved_ip: None,
+            protocol: "tcp".to_string(),
+            listen_port: 15432,
+            duration_ms: 250.0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            connection_error: None,
+            error_class: None,
+            disconnect_direction: None,
+            disconnect_cause: None,
+            timestamp_connected: "2026-05-10T00:00:00Z".to_string(),
+            timestamp_disconnected: "2026-05-10T00:00:01Z".to_string(),
+            sni_hostname: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn stream_status_code_filter_does_not_match_without_status() {
+        let plugin = AccessLog::new(&json!({
+            "filter": {
+                "status_code_min": 500
+            }
+        }))
+        .expect("plugin config");
+
+        assert!(!plugin.should_log_stream(&stream_summary()));
     }
 }
