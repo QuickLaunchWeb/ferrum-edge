@@ -2342,6 +2342,7 @@ async fn handle_cluster_status(state: &AdminState) -> Result<Response<Full<Bytes
                         "namespace": n.namespace,
                         "status": "online",
                         "connected_at": n.connected_at.to_rfc3339(),
+                        "last_heartbeat_at": n.last_heartbeat_at.to_rfc3339(),
                         "last_sync_at": n.last_update_at.to_rfc3339(),
                     })
                 })
