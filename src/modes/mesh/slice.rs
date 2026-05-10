@@ -3,9 +3,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::config::types::GatewayConfig;
 use crate::modes::mesh::config::{
-    MeshPolicy, MeshRequestAuthentication, MeshService, MeshTelemetryResource, MultiClusterConfig,
-    PeerAuthentication, ServiceEntry, TrustBundleSet, Workload, policy_scope_applies_to_workload,
-    scope_applies_to_workload, service_entry_applies_to_workload, workload_selector_matches,
+    MeshDestinationRule, MeshPolicy, MeshRequestAuthentication, MeshService, MeshTelemetryResource,
+    MultiClusterConfig, PeerAuthentication, ServiceEntry, TrustBundleSet, Workload,
+    policy_scope_applies_to_workload, scope_applies_to_workload, service_entry_applies_to_workload,
+    workload_selector_matches,
 };
 
 /// Node/workload selector used by both ADS and native `MeshSubscribe`.
@@ -72,6 +73,8 @@ pub struct MeshSlice {
     pub request_authentications: Vec<MeshRequestAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub telemetry_resources: Vec<MeshTelemetryResource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destination_rules: Vec<MeshDestinationRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +98,7 @@ impl MeshSlice {
             && self.service_entries == other.service_entries
             && self.request_authentications == other.request_authentications
             && self.telemetry_resources == other.telemetry_resources
+            && self.destination_rules == other.destination_rules
             && self.trust_bundles == other.trust_bundles
             && self.multi_cluster == other.multi_cluster
     }
@@ -187,6 +191,12 @@ impl MeshSlice {
             .filter(|t| scope_applies_to_workload(&t.scope, effective_namespace, &effective_labels))
             .cloned()
             .collect();
+        let destination_rules: Vec<MeshDestinationRule> = mesh
+            .destination_rules
+            .iter()
+            .filter(|dr| dr.namespace == namespace)
+            .cloned()
+            .collect();
 
         Self {
             node_id: request.node_id,
@@ -201,6 +211,7 @@ impl MeshSlice {
             service_entries,
             request_authentications,
             telemetry_resources,
+            destination_rules,
             trust_bundles: mesh.trust_bundles.clone(),
             multi_cluster: mesh.multi_cluster.clone(),
         }

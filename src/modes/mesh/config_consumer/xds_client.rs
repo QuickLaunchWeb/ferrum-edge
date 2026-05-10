@@ -827,6 +827,7 @@ fn reverse_translate(
         // External ServiceEntry shape is not recoverable from the minimal
         // CDS/EDS names consumed here; richer xDS metadata will fill this in.
         service_entries: Vec::new(),
+        destination_rules: Vec::new(),
         trust_bundles: None,
         multi_cluster: None,
     })

@@ -28,14 +28,14 @@ use crate::config::conf_file::resolve_ferrum_var;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm,
     PassiveHealthCheck, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,
-    Upstream, UpstreamTarget,
+    SubsetDefinition, SubsetTrafficPolicy, Upstream, UpstreamTarget,
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
 use crate::modes::mesh::config::{
-    AppProtocol, EastWestGateway, MeshConfig, MeshJwtRule, MeshRequestAuthentication,
-    MeshTelemetryConfig, PolicyScope, Resolution, ServiceEntry, ServiceEntryLocation,
-    service_entry_exported_to_namespace,
+    AppProtocol, EastWestGateway, MeshConfig, MeshJwtRule, MeshLoadBalancer,
+    MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig, MeshTrafficPolicy, PolicyScope,
+    Resolution, ServiceEntry, ServiceEntryLocation, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
@@ -466,6 +466,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     inject_mesh_global_plugins(&mut config, runtime, mesh_slice);
     materialize_east_west_gateway_proxies(&mut config, runtime, mesh_slice);
     materialize_egress_gateway_proxies(&mut config, runtime, mesh_slice);
+    apply_destination_rules(&mut config, mesh_slice);
     config.normalize_fields();
     Ok(config)
 }
@@ -486,6 +487,7 @@ fn gateway_config_from_mesh_slice(
             service_entries: slice.service_entries.clone(),
             request_authentications: slice.request_authentications.clone(),
             telemetry_resources: slice.telemetry_resources.clone(),
+            destination_rules: slice.destination_rules.clone(),
             trust_bundles: slice.trust_bundles.clone(),
             multi_cluster: slice.multi_cluster.clone(),
         })),
@@ -886,6 +888,128 @@ fn mesh_east_west_service_proxy_id(namespace: &str, name: &str) -> String {
 
 fn mesh_east_west_service_upstream_id(namespace: &str, name: &str) -> String {
     format!("__mesh-ew-upstream-{namespace}-{name}").replace(['/', '.'], "-")
+}
+
+// ── DestinationRule application ────────────────────────────────────────
+
+/// Apply DestinationRule traffic policies onto matching upstreams.
+///
+/// For each DestinationRule, we find upstreams whose targets match the DR
+/// host and apply:
+/// - `connectionPool.tcp.connectTimeout` onto proxies referencing the upstream
+/// - `outlierDetection` onto the upstream's passive health check
+/// - `loadBalancer` onto the upstream's algorithm
+/// - `subsets` as `SubsetDefinition` entries on the upstream
+fn apply_destination_rules(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
+    for dr in &mesh_slice.destination_rules {
+        // Find matching upstream: upstream targets whose host matches the DR host,
+        // or upstream name/id contains the DR host.
+        let upstream_index = config.upstreams.iter().position(|upstream| {
+            upstream.targets.iter().any(|target| target.host == dr.host)
+                || upstream.name.as_deref().is_some_and(|name| name == dr.host)
+        });
+
+        let Some(idx) = upstream_index else {
+            debug!(
+                host = %dr.host,
+                rule = %dr.name,
+                "DestinationRule has no matching upstream; skipping"
+            );
+            continue;
+        };
+
+        let upstream = &mut config.upstreams[idx];
+
+        // Apply top-level traffic policy to the upstream.
+        if let Some(ref policy) = dr.traffic_policy {
+            apply_traffic_policy_to_upstream(upstream, policy);
+
+            // Apply connect timeout to proxies referencing this upstream.
+            if let Some(timeout_ms) = policy.connect_timeout_ms {
+                for proxy in &mut config.proxies {
+                    if proxy.upstream_id.as_deref() == Some(&upstream.id) {
+                        proxy.backend_connect_timeout_ms = timeout_ms;
+                    }
+                }
+            }
+        }
+
+        // Build subset definitions from DR subsets.
+        if !dr.subsets.is_empty() {
+            let mut subset_defs: Vec<SubsetDefinition> = Vec::with_capacity(dr.subsets.len());
+            for subset in &dr.subsets {
+                let subset_traffic_policy =
+                    subset
+                        .traffic_policy
+                        .as_ref()
+                        .map(|sp| SubsetTrafficPolicy {
+                            load_balancer_algorithm: mesh_lb_to_ferrum(&sp.load_balancer),
+                        });
+                subset_defs.push(SubsetDefinition {
+                    name: subset.name.clone(),
+                    labels: subset.labels.clone(),
+                    traffic_policy: subset_traffic_policy,
+                });
+            }
+            upstream.subsets = Some(subset_defs);
+        }
+    }
+}
+
+/// Apply a `MeshTrafficPolicy` onto a Ferrum `Upstream`.
+fn apply_traffic_policy_to_upstream(upstream: &mut Upstream, policy: &MeshTrafficPolicy) {
+    // Load balancer algorithm.
+    if let Some(lb) = &policy.load_balancer {
+        if let Some(algorithm) = mesh_lb_to_ferrum(&Some(lb.clone())) {
+            upstream.algorithm = algorithm;
+        }
+        // Set hash_on for consistent hashing.
+        if let MeshLoadBalancer::ConsistentHash(ch) = lb {
+            if let Some(header) = &ch.http_header_name {
+                upstream.hash_on = Some(format!("header:{header}"));
+            } else if let Some(cookie) = &ch.http_cookie_name {
+                upstream.hash_on = Some(format!("cookie:{cookie}"));
+            } else if ch.use_source_ip {
+                upstream.hash_on = Some("ip".to_string());
+            }
+        }
+    }
+
+    // Outlier detection -> passive health check.
+    if let Some(ref od) = policy.outlier_detection {
+        let passive = upstream
+            .health_checks
+            .get_or_insert_with(HealthCheckConfig::default)
+            .passive
+            .get_or_insert_with(PassiveHealthCheck::default);
+
+        if let Some(consecutive) = od.consecutive_errors {
+            passive.unhealthy_threshold = consecutive;
+        }
+        if let Some(interval) = od.interval_seconds {
+            passive.unhealthy_window_seconds = interval;
+        }
+        if let Some(ejection) = od.base_ejection_seconds {
+            passive.healthy_after_seconds = ejection;
+        }
+        if let Some(max_pct) = od.max_ejection_percent {
+            passive.max_ejection_percent = Some(max_pct);
+        }
+    }
+}
+
+/// Convert a mesh LB config to a Ferrum `LoadBalancerAlgorithm`.
+fn mesh_lb_to_ferrum(lb: &Option<MeshLoadBalancer>) -> Option<LoadBalancerAlgorithm> {
+    match lb {
+        Some(MeshLoadBalancer::Simple(simple)) => match simple {
+            MeshSimpleLb::RoundRobin => Some(LoadBalancerAlgorithm::RoundRobin),
+            MeshSimpleLb::LeastRequest => Some(LoadBalancerAlgorithm::LeastConnections),
+            MeshSimpleLb::Random => Some(LoadBalancerAlgorithm::Random),
+            MeshSimpleLb::Passthrough => Some(LoadBalancerAlgorithm::RoundRobin),
+        },
+        Some(MeshLoadBalancer::ConsistentHash(_)) => Some(LoadBalancerAlgorithm::ConsistentHashing),
+        None => None,
+    }
 }
 
 // ── Egress gateway proxy materialization ─────────────────────────────────
@@ -2817,6 +2941,7 @@ mod tests {
                     },
                 },
             ],
+            destination_rules: Vec::new(),
             trust_bundles: None,
             multi_cluster: None,
         };
