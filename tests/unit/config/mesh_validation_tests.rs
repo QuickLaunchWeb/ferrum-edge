@@ -31,7 +31,7 @@ fn fresh_workload() -> Workload {
 
 #[test]
 fn empty_mesh_config_passes_validation() {
-    let errors = validate_mesh_config(&[], &[], &[], &[], &[], None);
+    let errors = validate_mesh_config(&[], &[], &[], &[], &[], &[], None);
     assert!(errors.is_empty());
 }
 
@@ -40,7 +40,7 @@ fn workload_validates_trust_domain_consistency() {
     let mut wl = fresh_workload();
     // Replace spiffe_id with one in a DIFFERENT trust domain.
     wl.spiffe_id = SpiffeId::new("spiffe://other.example/ns/svc/sa/api").unwrap();
-    let errors = validate_mesh_config(&[wl], &[], &[], &[], &[], None);
+    let errors = validate_mesh_config(&[wl], &[], &[], &[], &[], &[], None);
     assert!(
         errors.iter().any(|e| e.contains("trust domain")),
         "expected trust-domain mismatch error, got: {:?}",
@@ -52,7 +52,7 @@ fn workload_validates_trust_domain_consistency() {
 fn workload_rejects_empty_namespace() {
     let mut wl = fresh_workload();
     wl.namespace = String::new();
-    let errors = validate_mesh_config(&[wl], &[], &[], &[], &[], None);
+    let errors = validate_mesh_config(&[wl], &[], &[], &[], &[], &[], None);
     assert!(
         errors
             .iter()
@@ -64,7 +64,7 @@ fn workload_rejects_empty_namespace() {
 fn workload_rejects_empty_service_name() {
     let mut wl = fresh_workload();
     wl.service_name = String::new();
-    let errors = validate_mesh_config(&[wl], &[], &[], &[], &[], None);
+    let errors = validate_mesh_config(&[wl], &[], &[], &[], &[], &[], None);
     assert!(errors.iter().any(|e| e.contains("service_name")));
 }
 
@@ -77,7 +77,7 @@ fn mesh_service_rejects_empty_name() {
         workloads: Vec::new(),
         protocol_overrides: HashMap::new(),
     };
-    let errors = validate_mesh_config(&[], &[svc], &[], &[], &[], None);
+    let errors = validate_mesh_config(&[], &[svc], &[], &[], &[], &[], None);
     assert!(errors.iter().any(|e| e.contains("name must not be empty")));
 }
 
@@ -102,7 +102,7 @@ fn mesh_policy_principal_must_have_at_least_one_field() {
             action: PolicyAction::Allow,
         }],
     };
-    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
     assert!(
         errors.iter().any(|e| e.contains("at least one of")),
         "expected principal-empty error, got: {:?}",
@@ -128,7 +128,7 @@ fn mesh_policy_request_match_must_have_at_least_one_constraint() {
             action: PolicyAction::Allow,
         }],
     };
-    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
     assert!(
         errors.iter().any(|e| e.contains("methods/paths/hosts")),
         "expected to-empty error, got: {:?}",
@@ -158,7 +158,7 @@ fn mesh_policy_glob_pattern_must_be_valid() {
             action: PolicyAction::Allow,
         }],
     };
-    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
     assert!(
         errors.iter().any(|e| e.contains("not a valid glob")),
         "expected glob error, got: {:?}",
@@ -191,7 +191,7 @@ fn mesh_policy_rejects_host_pattern_with_empty_port() {
         hosts: vec!["example.com:".into()],
         ..RequestMatch::default()
     });
-    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
     assert!(
         errors
             .iter()
@@ -207,7 +207,7 @@ fn mesh_policy_rejects_host_pattern_with_non_numeric_port() {
         hosts: vec!["example.com:abc".into()],
         ..RequestMatch::default()
     });
-    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
     assert!(
         errors
             .iter()
@@ -223,7 +223,7 @@ fn mesh_policy_rejects_host_pattern_with_out_of_range_port() {
         hosts: vec!["example.com:70000".into()],
         ..RequestMatch::default()
     });
-    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
     assert!(
         errors
             .iter()
@@ -239,7 +239,7 @@ fn mesh_policy_rejects_bracketed_host_pattern_with_out_of_range_port() {
         hosts: vec!["[2001:db8::1]:70000".into()],
         ..RequestMatch::default()
     });
-    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
     assert!(
         errors
             .iter()
@@ -255,7 +255,7 @@ fn mesh_policy_rejects_host_pattern_with_multiple_unbracketed_colons() {
         hosts: vec!["api.default:443:abc".into()],
         ..RequestMatch::default()
     });
-    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
     assert!(
         errors
             .iter()
@@ -271,7 +271,7 @@ fn mesh_policy_accepts_wildcard_host_port_pattern() {
         hosts: vec!["api.default:*".into()],
         ..RequestMatch::default()
     });
-    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
     assert!(
         errors.is_empty(),
         "expected no errors for `host:*`, got: {:?}",
@@ -285,7 +285,7 @@ fn mesh_policy_rejects_mid_string_port_pattern() {
         port_patterns: vec!["8*9".into()],
         ..RequestMatch::default()
     });
-    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
     assert!(
         errors
             .iter()
@@ -301,7 +301,7 @@ fn mesh_policy_rejects_named_port_pattern() {
         port_patterns: vec!["http".into()],
         ..RequestMatch::default()
     });
-    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], None);
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
     assert!(
         errors
             .iter()
@@ -320,7 +320,7 @@ fn peer_authentication_requires_namespace() {
         mtls_mode: ferrum_edge::config::mesh::MtlsMode::Strict,
         port_overrides: HashMap::new(),
     };
-    let errors = validate_mesh_config(&[], &[], &[], &[pa], &[], None);
+    let errors = validate_mesh_config(&[], &[], &[], &[pa], &[], &[], None);
     assert!(
         errors
             .iter()
@@ -339,7 +339,7 @@ fn service_entry_requires_hosts() {
         location: ServiceEntryLocation::MeshExternal,
         ports: Vec::new(),
     };
-    let errors = validate_mesh_config(&[], &[], &[], &[], &[se], None);
+    let errors = validate_mesh_config(&[], &[], &[], &[], &[se], &[], None);
     assert!(errors.iter().any(|e| e.contains("hosts must not be empty")));
 }
 
@@ -360,7 +360,7 @@ fn service_entry_endpoints_only_with_static_resolution() {
         location: ServiceEntryLocation::MeshExternal,
         ports: Vec::new(),
     };
-    let errors = validate_mesh_config(&[], &[], &[], &[], &[se], None);
+    let errors = validate_mesh_config(&[], &[], &[], &[], &[se], &[], None);
     assert!(
         errors
             .iter()
@@ -381,7 +381,7 @@ fn trust_bundle_set_must_have_authorities() {
         },
         federated: Vec::new(),
     };
-    let errors = validate_mesh_config(&[], &[], &[], &[], &[], Some(&tbs));
+    let errors = validate_mesh_config(&[], &[], &[], &[], &[], &[], Some(&tbs));
     assert!(
         errors.iter().any(|e| e.contains("no authorities")),
         "expected empty-bundle error, got: {:?}",
@@ -400,7 +400,7 @@ fn trust_bundle_set_rejects_invalid_base64() {
         },
         federated: Vec::new(),
     };
-    let errors = validate_mesh_config(&[], &[], &[], &[], &[], Some(&tbs));
+    let errors = validate_mesh_config(&[], &[], &[], &[], &[], &[], Some(&tbs));
     assert!(
         errors.iter().any(|e| e.contains("invalid base64")),
         "expected base64 error, got: {:?}",

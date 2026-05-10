@@ -131,8 +131,12 @@ pub struct MeshPolicy {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PolicyScope {
-    WorkloadSelector { selector: WorkloadSelector },
-    Namespace { namespace: String },
+    WorkloadSelector {
+        selector: WorkloadSelector,
+    },
+    Namespace {
+        namespace: String,
+    },
     #[default]
     MeshWide,
 }
@@ -714,6 +718,7 @@ pub fn validate_mesh_config(
     policies: &[MeshPolicy],
     peer_auths: &[PeerAuthentication],
     service_entries: &[ServiceEntry],
+    request_authentications: &[MeshRequestAuthentication],
     trust_bundles: Option<&TrustBundleSet>,
 ) -> Vec<String> {
     validate_mesh_config_internal(
@@ -722,7 +727,7 @@ pub fn validate_mesh_config(
         policies,
         peer_auths,
         service_entries,
-        &[],
+        request_authentications,
         trust_bundles,
         None,
     )
@@ -916,6 +921,24 @@ fn validate_mesh_config_internal(
             if rule.jwks_uri.is_none() && rule.jwks.is_none() {
                 errors.push(format!(
                     "MeshRequestAuthentication '{}' jwt_rules[{}]: one of jwks_uri or jwks is required",
+                    ra.name, i
+                ));
+            }
+            if rule.jwks_uri.is_none() && rule.jwks.is_some() {
+                errors.push(format!(
+                    "MeshRequestAuthentication '{}' jwt_rules[{}]: inline jwks is not supported yet; use jwks_uri",
+                    ra.name, i
+                ));
+            }
+            if rule.audiences.len() > 1 {
+                errors.push(format!(
+                    "MeshRequestAuthentication '{}' jwt_rules[{}]: multiple audiences are not supported yet",
+                    ra.name, i
+                ));
+            }
+            if !rule.from_headers.is_empty() || !rule.from_params.is_empty() {
+                errors.push(format!(
+                    "MeshRequestAuthentication '{}' jwt_rules[{}]: custom token locations are not supported yet",
                     ra.name, i
                 ));
             }

@@ -10,11 +10,11 @@ use url::Url;
 
 use crate::consumer_index::ConsumerIndex;
 
-use super::RequestContext;
 use super::utils::PluginHttpClient;
-use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
+use super::utils::auth_flow::{AuthMechanism, ExtractedCredential, VerifyOutcome};
 use super::utils::jwks_cache::get_or_create_jwks_store;
 use super::utils::jwks_store::JwksKeyStore;
+use super::{PluginResult, RequestContext};
 
 /// Default JWKS refresh interval: 15 minutes.
 const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
@@ -73,6 +73,7 @@ pub struct JwksAuth {
     /// JWT claim value sent as `X-Consumer-Username` header to the backend.
     /// Defaults to `consumer_identity_claim` if not set separately.
     consumer_header_claim: String,
+    strip_authorization_on_success: bool,
 }
 
 /// A single identity provider configuration.
@@ -93,6 +94,8 @@ struct JwksProvider {
     consumer_identity_claim: Option<String>,
     /// Per-provider override for the consumer header claim.
     consumer_header_claim: Option<String>,
+    /// Whether to forward the original Authorization header upstream.
+    forward_original_token: bool,
     /// The JWKS key store (shared via global cache).
     jwks_store: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
     /// Outbound hosts used by direct JWKS or discovery URLs.
@@ -167,6 +170,8 @@ impl JwksAuth {
                 optional_provider_claim_path(prov_obj, "consumer_identity_claim", idx)?;
             let prov_consumer_header_claim =
                 optional_provider_claim_path(prov_obj, "consumer_header_claim", idx)?;
+            let forward_original_token =
+                optional_provider_bool(prov_obj, "forward_original_token", idx)?.unwrap_or(true);
 
             let mut warmup_hostnames = Vec::new();
             if let Some(endpoint) = jwks_endpoint.as_ref() {
@@ -256,10 +261,15 @@ impl JwksAuth {
                 role_claim,
                 consumer_identity_claim: prov_consumer_identity_claim,
                 consumer_header_claim: prov_consumer_header_claim,
+                forward_original_token,
                 jwks_store: jwks_store_slot,
                 warmup_hostnames,
             });
         }
+
+        let strip_authorization_on_success = providers
+            .iter()
+            .any(|provider| !provider.forward_original_token);
 
         Ok(Self {
             providers,
@@ -267,6 +277,7 @@ impl JwksAuth {
             global_role_claim,
             consumer_identity_claim,
             consumer_header_claim,
+            strip_authorization_on_success,
         })
     }
 
@@ -413,6 +424,79 @@ impl JwksAuth {
 
         Ok(())
     }
+
+    async fn authenticate_request(
+        &self,
+        ctx: &mut RequestContext,
+        consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        let credential = self.extract(ctx);
+
+        match credential {
+            ExtractedCredential::Missing => {
+                debug!("jwks_auth: no credential present");
+                PluginResult::Continue
+            }
+            ExtractedCredential::InvalidFormat(body) => reject(401, body),
+            ExtractedCredential::BearerToken(token) => {
+                let (claims, provider_idx) = match self.validate_token(&token).await {
+                    Ok(result) => result,
+                    Err((status, body)) => return reject(status, body.to_string()),
+                };
+
+                let provider = &self.providers[provider_idx];
+                if let Err((status, body)) = self.check_claims_authorization(&claims, provider) {
+                    return reject(status, body);
+                }
+
+                match self.resolve_identity(&claims, provider, consumer_index) {
+                    VerifyOutcome::Success {
+                        consumer,
+                        external_identity,
+                        external_identity_header,
+                    } => {
+                        let consumer_identified = consumer.is_some();
+                        let external_identity_identified = external_identity.is_some();
+
+                        if let Some(consumer) = consumer
+                            && ctx.identified_consumer.is_none()
+                        {
+                            debug!("jwks_auth: identified consumer '{}'", consumer.username);
+                            ctx.identified_consumer = Some(consumer);
+                        }
+
+                        if let Some(external_identity) = external_identity {
+                            ctx.authenticated_identity = Some(external_identity);
+                        }
+                        if let Some(external_identity_header) = external_identity_header {
+                            ctx.authenticated_identity_header = Some(external_identity_header);
+                        }
+
+                        if ctx.auth_method.is_none()
+                            && (consumer_identified || external_identity_identified)
+                        {
+                            ctx.auth_method = Some("jwks_auth");
+                        }
+                        if !provider.forward_original_token {
+                            ctx.metadata.insert(
+                                "jwks_auth.strip_authorization".to_string(),
+                                "true".to_string(),
+                            );
+                        }
+                        PluginResult::Continue
+                    }
+                    VerifyOutcome::NotApplicable => PluginResult::Continue,
+                    VerifyOutcome::InvalidFormat(body)
+                    | VerifyOutcome::Invalid(body)
+                    | VerifyOutcome::ConsumerNotFound(body)
+                    | VerifyOutcome::VerificationFailed(body) => reject(401, body),
+                    VerifyOutcome::Forbidden(body) => reject(403, body),
+                    VerifyOutcome::Internal(body) => reject(500, body),
+                }
+            }
+            _ => PluginResult::Continue,
+        }
+    }
 }
 
 #[async_trait]
@@ -466,12 +550,51 @@ impl AuthMechanism for JwksAuth {
     }
 }
 
-auth_flow::impl_auth_plugin!(
-    JwksAuth,
-    "jwks_auth",
-    super::priority::JWKS_AUTH,
-    crate::plugins::HTTP_FAMILY_PROTOCOLS,
-    auth_flow::run_auth_external_identity;
+#[async_trait]
+impl super::Plugin for JwksAuth {
+    fn name(&self) -> &str {
+        "jwks_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    fn priority(&self) -> u16 {
+        super::priority::JWKS_AUTH
+    }
+
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        crate::plugins::HTTP_FAMILY_PROTOCOLS
+    }
+
+    async fn authenticate(
+        &self,
+        ctx: &mut RequestContext,
+        consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        self.authenticate_request(ctx, consumer_index).await
+    }
+
+    fn modifies_request_headers(&self) -> bool {
+        self.strip_authorization_on_success
+    }
+
+    async fn before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut std::collections::HashMap<String, String>,
+    ) -> PluginResult {
+        if ctx
+            .metadata
+            .remove("jwks_auth.strip_authorization")
+            .is_some()
+        {
+            headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+        }
+        PluginResult::Continue
+    }
+
     fn warmup_hostnames(&self) -> Vec<String> {
         let mut hosts = Vec::new();
         for prov in &self.providers {
@@ -497,7 +620,7 @@ auth_flow::impl_auth_plugin!(
         }
         uris
     }
-);
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -757,6 +880,30 @@ fn parse_string_array(
         values.push(value.to_string());
     }
     Ok(values)
+}
+
+fn optional_provider_bool(
+    config: &Map<String, Value>,
+    field: &str,
+    provider_idx: usize,
+) -> Result<Option<bool>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .ok_or_else(|| {
+            format!("jwks_auth: 'provider[{provider_idx}].{field}' must be a boolean, got: {value}")
+        })
+        .map(Some)
+}
+
+fn reject(status_code: u16, body: String) -> PluginResult {
+    PluginResult::Reject {
+        status_code,
+        body,
+        headers: std::collections::HashMap::new(),
+    }
 }
 
 /// Escape characters that could cause JSON injection in error response bodies.

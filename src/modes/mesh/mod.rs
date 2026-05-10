@@ -521,6 +521,9 @@ fn inject_mesh_global_plugins(
             workload_metrics_config["custom_tags"] = serde_json::json!(tracing.custom_tags);
         }
     }
+    if let Some(metrics) = &merged_telemetry.metrics {
+        workload_metrics_config["metrics"] = serde_json::json!(metrics);
+    }
     ensure_global_plugin(
         config,
         MESH_WORKLOAD_METRICS_PLUGIN_ID,
@@ -566,7 +569,7 @@ fn merge_applicable_telemetry(
 ) -> MeshTelemetryConfig {
     use crate::config::mesh::scope_applies_to_workload;
 
-    let mut applicable: Vec<(u8, &MeshTelemetryConfig)> = mesh_slice
+    let mut applicable: Vec<(u8, &str, &str, &MeshTelemetryConfig)> = mesh_slice
         .telemetry_resources
         .iter()
         .filter(|t| {
@@ -578,15 +581,22 @@ fn merge_applicable_telemetry(
                 PolicyScope::Namespace { .. } => 1,
                 PolicyScope::WorkloadSelector { .. } => 2,
             };
-            (specificity, &t.config)
+            (
+                specificity,
+                t.namespace.as_str(),
+                t.name.as_str(),
+                &t.config,
+            )
         })
         .collect();
 
-    // Sort by specificity ascending so more-specific overwrites less-specific
-    applicable.sort_by_key(|(s, _)| *s);
+    // Sort by specificity ascending so more-specific overwrites less-specific.
+    // Namespace/name tie-breaks make same-specificity merges deterministic
+    // across informer delivery orders.
+    applicable.sort_by(|left, right| (left.0, left.1, left.2).cmp(&(right.0, right.1, right.2)));
 
     let mut merged = MeshTelemetryConfig::default();
-    for (_, config) in &applicable {
+    for (_, _, _, config) in &applicable {
         if config.tracing.is_some() {
             merged.tracing.clone_from(&config.tracing);
         }
@@ -635,7 +645,9 @@ fn inject_mesh_request_auth_plugin(
     let mut providers = Vec::new();
     for ra in &applicable {
         for rule in &ra.jwt_rules {
-            providers.push(build_jwks_provider_config(rule));
+            if let Some(provider) = build_jwks_provider_config(rule) {
+                providers.push(provider);
+            }
         }
     }
 
@@ -663,39 +675,20 @@ fn inject_mesh_request_auth_plugin(
 }
 
 /// Build a single `jwks_auth` provider configuration from a [`MeshJwtRule`].
-fn build_jwks_provider_config(rule: &MeshJwtRule) -> serde_json::Value {
+fn build_jwks_provider_config(rule: &MeshJwtRule) -> Option<serde_json::Value> {
+    let uri = rule.jwks_uri.as_ref()?;
+
     let mut provider = serde_json::json!({
         "issuer": rule.issuer,
+        "jwks_uri": uri,
+        "forward_original_token": rule.forward_original_token,
     });
 
     if !rule.audiences.is_empty() {
         provider["audience"] = serde_json::json!(rule.audiences[0]);
     }
 
-    if let Some(ref uri) = rule.jwks_uri {
-        provider["jwks_uri"] = serde_json::json!(uri);
-    } else if let Some(ref _jwks) = rule.jwks {
-        // Inline JWKS: use OIDC discovery as a fallback since jwks_auth
-        // requires either jwks_uri or discovery_url. For inline JWKS, we
-        // construct a data URI placeholder — the actual inline JWKS support
-        // would need a jwks_auth enhancement. For now, fall back to the
-        // jwks_uri field if available.
-        //
-        // NOTE: The current jwks_auth plugin requires jwks_uri or
-        // discovery_url. Inline JWKS from the CRD is not yet supported
-        // and will be logged as a warning at plugin construction time.
-    }
-
-    // Token extraction locations
-    if !rule.from_headers.is_empty() || !rule.from_params.is_empty() {
-        // jwks_auth extracts from Authorization: Bearer by default. Custom
-        // locations are documented as a future enhancement. For now, the
-        // default Bearer extraction handles the vast majority of cases.
-        // Non-default locations are silently ignored — the operator can
-        // always override with a manual jwks_auth plugin.
-    }
-
-    provider
+    Some(provider)
 }
 
 fn ensure_global_plugin(
@@ -705,12 +698,6 @@ fn ensure_global_plugin(
     plugin_config: serde_json::Value,
     namespace: &str,
 ) {
-    if config.plugin_configs.iter().any(|plugin| {
-        plugin.enabled && plugin.scope == PluginScope::Global && plugin.plugin_name == plugin_name
-    }) {
-        return;
-    }
-
     let now = chrono::Utc::now();
     let mesh_plugin = PluginConfig {
         id: id.to_string(),
@@ -732,6 +719,13 @@ fn ensure_global_plugin(
         .find(|plugin| plugin.id == id)
     {
         *existing = mesh_plugin;
+    } else if config
+        .plugin_configs
+        .iter()
+        .any(|plugin| plugin.scope == PluginScope::Global && plugin.plugin_name == plugin_name)
+    {
+        // A user-managed global plugin of the same type is an explicit
+        // operator override. Reserved mesh-managed IDs still update above.
     } else {
         config.plugin_configs.push(mesh_plugin);
     }
@@ -2254,6 +2248,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mesh_runtime_updates_mesh_managed_global_plugin_by_id() {
+        let runtime = test_mesh_runtime_config();
+        let now = chrono::Utc::now();
+        let existing = PluginConfig {
+            id: MESH_REQUEST_AUTH_PLUGIN_ID.to_string(),
+            plugin_name: "jwks_auth".to_string(),
+            namespace: "default".to_string(),
+            config: serde_json::json!({
+                "providers": [
+                    { "issuer": "https://stale.example.com", "jwks_uri": "https://stale.example.com/jwks" }
+                ]
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                request_authentications: vec![test_request_authentication(
+                    "fresh",
+                    PolicyScope::MeshWide,
+                )],
+                ..MeshConfig::default()
+            })),
+            plugin_configs: vec![existing],
+            ..GatewayConfig::default()
+        };
+
+        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let jwks_plugins: Vec<_> = prepared
+            .plugin_configs
+            .iter()
+            .filter(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID)
+            .collect();
+        assert_eq!(jwks_plugins.len(), 1);
+        assert_eq!(
+            jwks_plugins[0].config["providers"][0]
+                .get("issuer")
+                .and_then(|issuer| issuer.as_str()),
+            Some("https://fresh.example.com")
+        );
+    }
+
     // ── RequestAuthentication injection ──────────────────────────────────
 
     fn test_request_authentication(name: &str, scope: PolicyScope) -> MeshRequestAuthentication {
@@ -2426,7 +2468,7 @@ mod tests {
                     scope: PolicyScope::MeshWide,
                     jwt_rules: vec![MeshJwtRule {
                         issuer: "https://auth.example.com".to_string(),
-                        audiences: vec!["my-api".to_string(), "other".to_string()],
+                        audiences: vec!["my-api".to_string()],
                         jwks_uri: Some("https://auth.example.com/jwks".to_string()),
                         jwks: None,
                         from_headers: Vec::new(),

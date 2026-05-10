@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::config::mesh::{
     MeshPolicy, MeshRequestAuthentication, MeshService, MeshTelemetryResource, MultiClusterConfig,
     PeerAuthentication, ServiceEntry, TrustBundleSet, Workload, policy_scope_applies_to_workload,
-    workload_selector_matches,
+    scope_applies_to_workload, workload_selector_matches,
 };
 use crate::config::types::GatewayConfig;
 
@@ -174,13 +174,15 @@ impl MeshSlice {
         let request_authentications: Vec<MeshRequestAuthentication> = mesh
             .request_authentications
             .iter()
-            .filter(|ra| ra.namespace == namespace)
+            .filter(|ra| {
+                scope_applies_to_workload(&ra.scope, effective_namespace, &effective_labels)
+            })
             .cloned()
             .collect();
         let telemetry_resources: Vec<MeshTelemetryResource> = mesh
             .telemetry_resources
             .iter()
-            .filter(|t| t.namespace == namespace)
+            .filter(|t| scope_applies_to_workload(&t.scope, effective_namespace, &effective_labels))
             .cloned()
             .collect();
 

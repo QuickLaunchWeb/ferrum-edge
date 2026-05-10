@@ -217,6 +217,12 @@ impl K8sAccumulator {
 
     fn finish(mut self) -> K8sTranslation {
         self.mesh.normalize();
+        self.mesh.request_authentications.sort_by(|left, right| {
+            (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
+        });
+        self.mesh.telemetry_resources.sort_by(|left, right| {
+            (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
+        });
         if self.mesh != MeshConfig::default() {
             self.config.mesh = Some(Box::new(self.mesh));
         }

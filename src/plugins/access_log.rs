@@ -26,26 +26,18 @@ struct Filter {
 
 impl AccessLog {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let filter = config.get("filter").and_then(|f| {
-            if f.is_null() {
-                return None;
-            }
-            Some(Filter {
-                status_code_min: f
-                    .get("status_code_min")
-                    .and_then(Value::as_u64)
-                    .map(|v| v as u16),
-                status_code_max: f
-                    .get("status_code_max")
-                    .and_then(Value::as_u64)
-                    .map(|v| v as u16),
+        let filter = match config.get("filter") {
+            Some(f) if !f.is_null() => Some(Filter {
+                status_code_min: parse_optional_u16(f, "status_code_min")?,
+                status_code_max: parse_optional_u16(f, "status_code_max")?,
                 min_latency_ms: f.get("min_latency_ms").and_then(Value::as_u64),
                 errors_only: f
                     .get("errors_only")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
-            })
-        });
+            }),
+            _ => None,
+        };
         Ok(Self { filter })
     }
 
@@ -73,6 +65,34 @@ impl AccessLog {
         }
         true
     }
+
+    fn should_log_stream(&self, summary: &StreamTransactionSummary) -> bool {
+        let Some(filter) = &self.filter else {
+            return true;
+        };
+        if let Some(min_ms) = filter.min_latency_ms
+            && summary.duration_ms < (min_ms as f64)
+        {
+            return false;
+        }
+        if filter.errors_only && summary.error_class.is_none() && summary.connection_error.is_none()
+        {
+            return false;
+        }
+        true
+    }
+}
+
+fn parse_optional_u16(config: &Value, key: &str) -> Result<Option<u16>, String> {
+    let Some(value) = config.get(key) else {
+        return Ok(None);
+    };
+    let Some(raw) = value.as_u64() else {
+        return Err(format!("access_log: filter.{key} must be an integer"));
+    };
+    u16::try_from(raw)
+        .map(Some)
+        .map_err(|_| format!("access_log: filter.{key} must be between 0 and 65535"))
 }
 
 #[async_trait]
@@ -100,7 +120,9 @@ impl Plugin for AccessLog {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        // Stream summaries always logged — filter only applies to HTTP
+        if !self.should_log_stream(summary) {
+            return;
+        }
         match serde_json::to_string(summary) {
             Ok(json) => tracing::info!(target: "mesh_access_log", "{}", json),
             Err(e) => warn!("access_log: failed to serialize stream summary: {e}"),

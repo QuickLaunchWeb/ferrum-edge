@@ -19,6 +19,8 @@ use super::{
 };
 use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT};
 
+const ISTIO_ROOT_NAMESPACE: &str = "istio-system";
+
 pub(super) fn translate(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -327,17 +329,7 @@ fn peer_authentication(object: &K8sObject) -> Result<PeerAuthentication, K8sTran
 fn request_authentication(
     object: &K8sObject,
 ) -> Result<MeshRequestAuthentication, K8sTranslateError> {
-    let scope = match object.spec.get("selector") {
-        Some(selector) => PolicyScope::WorkloadSelector {
-            selector: WorkloadSelector {
-                labels: selector_from_istio(Some(selector)),
-                namespace: Some(object.metadata.namespace.clone()),
-            },
-        },
-        None => PolicyScope::Namespace {
-            namespace: object.metadata.namespace.clone(),
-        },
-    };
+    let scope = istio_policy_scope(object, object.spec.get("selector"));
 
     let jwt_rules: Vec<MeshJwtRule> = object
         .spec
@@ -366,7 +358,12 @@ fn translate_jwt_rule(object: &K8sObject, rule: &Value) -> Result<MeshJwtRule, K
         })?
         .to_string();
 
-    let audiences = string_array(rule, "audiences");
+    let audiences = optional_string_array(
+        object,
+        rule,
+        "audiences",
+        "RequestAuthentication jwtRules[].audiences",
+    )?;
     let jwks_uri = string_field(rule, "jwksUri").map(ToOwned::to_owned);
     let jwks = string_field(rule, "jwks").map(ToOwned::to_owned);
 
@@ -382,7 +379,12 @@ fn translate_jwt_rule(object: &K8sObject, rule: &Value) -> Result<MeshJwtRule, K
         })
         .collect();
 
-    let from_params = string_array(rule, "fromParams");
+    let from_params = optional_string_array(
+        object,
+        rule,
+        "fromParams",
+        "RequestAuthentication jwtRules[].fromParams",
+    )?;
     let forward_original_token = rule
         .get("forwardOriginalToken")
         .and_then(Value::as_bool)
@@ -397,6 +399,47 @@ fn translate_jwt_rule(object: &K8sObject, rule: &Value) -> Result<MeshJwtRule, K
         from_params,
         forward_original_token,
     })
+}
+
+fn istio_policy_scope(object: &K8sObject, selector: Option<&Value>) -> PolicyScope {
+    match selector {
+        Some(selector) => PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: selector_from_istio(Some(selector)),
+                namespace: Some(object.metadata.namespace.clone()),
+            },
+        },
+        None if object.metadata.namespace == ISTIO_ROOT_NAMESPACE => PolicyScope::MeshWide,
+        None => PolicyScope::Namespace {
+            namespace: object.metadata.namespace.clone(),
+        },
+    }
+}
+
+fn optional_string_array(
+    object: &K8sObject,
+    value: &Value,
+    key: &str,
+    display_path: &str,
+) -> Result<Vec<String>, K8sTranslateError> {
+    let Some(raw) = value.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = raw.as_array() else {
+        return Err(invalid_resource(
+            object,
+            format!("{display_path} must be an array of strings"),
+        ));
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            item.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                invalid_resource(object, format!("{display_path}[{index}] must be a string"))
+            })
+        })
+        .collect()
 }
 
 fn port_from_string(object: &K8sObject, raw: &str, field: &str) -> Result<u16, K8sTranslateError> {
@@ -761,19 +804,7 @@ fn app_protocol(value: Option<&str>) -> AppProtocol {
 }
 
 fn telemetry(object: &K8sObject) -> Result<MeshTelemetryResource, K8sTranslateError> {
-    let scope = match object.spec.get("selector") {
-        Some(selector) => PolicyScope::WorkloadSelector {
-            selector: WorkloadSelector {
-                labels: string_map(
-                    selector.get("matchLabels").unwrap_or(&Value::Null),
-                ),
-                namespace: None,
-            },
-        },
-        None => PolicyScope::Namespace {
-            namespace: object.metadata.namespace.clone(),
-        },
-    };
+    let scope = istio_policy_scope(object, object.spec.get("selector"));
 
     let tracing = object
         .spec
@@ -827,16 +858,17 @@ fn telemetry(object: &K8sObject) -> Result<MeshTelemetryResource, K8sTranslateEr
             let mut disabled_metrics = Vec::new();
             if let Some(overrides) = m.get("overrides").and_then(Value::as_array) {
                 for ovr in overrides {
-                    if ovr
-                        .get("disabled")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                    {
+                    if ovr.get("disabled").and_then(Value::as_bool).unwrap_or(false) {
                         let metric_name = ovr
                             .get("match")
                             .and_then(|m| m.get("metric"))
                             .and_then(Value::as_str)
-                            .unwrap_or("ALL_METRICS");
+                            .ok_or_else(|| {
+                                invalid_resource(
+                                    object,
+                                    "Telemetry metrics.overrides[].match.metric is required when disabled=true",
+                                )
+                            })?;
                         disabled_metrics.push(metric_name.to_string());
                     }
                     if let Some(tags) = ovr.get("tagOverrides").and_then(Value::as_object) {
@@ -865,11 +897,12 @@ fn telemetry(object: &K8sObject) -> Result<MeshTelemetryResource, K8sTranslateEr
                     }
                 }
             }
-            MeshMetricsConfig {
+            Ok::<_, K8sTranslateError>(MeshMetricsConfig {
                 tag_overrides,
                 disabled_metrics,
-            }
-        });
+            })
+        })
+        .transpose()?;
 
     let access_logging = object
         .spec
@@ -882,12 +915,16 @@ fn telemetry(object: &K8sObject) -> Result<MeshTelemetryResource, K8sTranslateEr
                 .get("filter")
                 .and_then(|f| f.get("expression"))
                 .and_then(Value::as_str)
-                .and_then(parse_access_log_filter_expression);
-            MeshAccessLoggingConfig {
+                .map(parse_access_log_filter_expression)
+                .transpose()
+                .map_err(|message| invalid_resource(object, message))?
+                .flatten();
+            Ok::<_, K8sTranslateError>(MeshAccessLoggingConfig {
                 enabled: !disabled,
                 filter,
-            }
-        });
+            })
+        })
+        .transpose()?;
 
     Ok(MeshTelemetryResource {
         name: object.metadata.name.clone(),
@@ -902,9 +939,9 @@ fn telemetry(object: &K8sObject) -> Result<MeshTelemetryResource, K8sTranslateEr
 }
 
 /// Parse simple filter expressions like `response.code >= 400` into an
-/// [`AccessLogFilter`]. Returns `None` for unparseable expressions (caller
-/// should log a warning and skip the filter).
-fn parse_access_log_filter_expression(expr: &str) -> Option<AccessLogFilter> {
+/// [`AccessLogFilter`]. Returns `Ok(None)` for unparseable expressions and
+/// `Err` for numeric values that would truncate or wrap.
+fn parse_access_log_filter_expression(expr: &str) -> Result<Option<AccessLogFilter>, String> {
     let mut filter = AccessLogFilter {
         status_code_min: None,
         status_code_max: None,
@@ -919,13 +956,18 @@ fn parse_access_log_filter_expression(expr: &str) -> Option<AccessLogFilter> {
         if part.starts_with("response.code") || part.starts_with("response.status") {
             if let Some(val) = extract_numeric_comparison(part) {
                 match val {
-                    Comparison::Gte(n) => filter.status_code_min = Some(n as u16),
-                    Comparison::Gt(n) => filter.status_code_min = Some(n as u16 + 1),
-                    Comparison::Lte(n) => filter.status_code_max = Some(n as u16),
-                    Comparison::Lt(n) => filter.status_code_max = Some(n as u16 - 1),
+                    Comparison::Gte(n) => filter.status_code_min = Some(status_code_value(n)?),
+                    Comparison::Gt(n) => {
+                        filter.status_code_min = Some(status_code_value(comparison_increment(n)?)?)
+                    }
+                    Comparison::Lte(n) => filter.status_code_max = Some(status_code_value(n)?),
+                    Comparison::Lt(n) => {
+                        filter.status_code_max = Some(status_code_value(comparison_decrement(n)?)?)
+                    }
                     Comparison::Eq(n) => {
-                        filter.status_code_min = Some(n as u16);
-                        filter.status_code_max = Some(n as u16);
+                        let code = status_code_value(n)?;
+                        filter.status_code_min = Some(code);
+                        filter.status_code_max = Some(code);
                     }
                 }
                 matched = true;
@@ -935,7 +977,7 @@ fn parse_access_log_filter_expression(expr: &str) -> Option<AccessLogFilter> {
         {
             match val {
                 Comparison::Gte(n) | Comparison::Gt(n) => {
-                    filter.min_latency_ms = Some(n as u64);
+                    filter.min_latency_ms = Some(duration_value(n)?);
                 }
                 _ => {}
             }
@@ -943,7 +985,31 @@ fn parse_access_log_filter_expression(expr: &str) -> Option<AccessLogFilter> {
         }
     }
 
-    if matched { Some(filter) } else { None }
+    if matched { Ok(Some(filter)) } else { Ok(None) }
+}
+
+fn status_code_value(value: i64) -> Result<u16, String> {
+    u16::try_from(value).map_err(|_| {
+        format!("Telemetry access log response code filter value {value} is outside 0..=65535")
+    })
+}
+
+fn duration_value(value: i64) -> Result<u64, String> {
+    u64::try_from(value).map_err(|_| {
+        format!("Telemetry access log duration filter value {value} must be non-negative")
+    })
+}
+
+fn comparison_increment(value: i64) -> Result<i64, String> {
+    value
+        .checked_add(1)
+        .ok_or_else(|| format!("Telemetry access log comparison value {value} overflows"))
+}
+
+fn comparison_decrement(value: i64) -> Result<i64, String> {
+    value
+        .checked_sub(1)
+        .ok_or_else(|| format!("Telemetry access log comparison value {value} underflows"))
 }
 
 enum Comparison {
