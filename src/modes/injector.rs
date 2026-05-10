@@ -111,9 +111,9 @@ impl InjectorConfig {
         let sidecar_resources = container_resources_from_runtime(
             "FERRUM_INJECTOR_SIDECAR",
             default_sidecar_resources(),
-        );
+        )?;
         let init_resources =
-            container_resources_from_runtime("FERRUM_INJECTOR_INIT", default_init_resources());
+            container_resources_from_runtime("FERRUM_INJECTOR_INIT", default_init_resources())?;
         let require_annotation = resolve_ferrum_var("FERRUM_INJECTOR_REQUIRE_ANNOTATION")
             .and_then(|value| value.parse::<bool>().ok())
             .unwrap_or(true);
@@ -231,25 +231,65 @@ fn default_init_resources() -> ContainerResourceConfig {
 fn container_resources_from_runtime(
     key_prefix: &str,
     defaults: ContainerResourceConfig,
-) -> ContainerResourceConfig {
+) -> Result<ContainerResourceConfig, String> {
     let cpu_request_key = format!("{key_prefix}_CPU_REQUEST");
     let memory_request_key = format!("{key_prefix}_MEMORY_REQUEST");
     let cpu_limit_key = format!("{key_prefix}_CPU_LIMIT");
     let memory_limit_key = format!("{key_prefix}_MEMORY_LIMIT");
 
-    ContainerResourceConfig {
-        cpu_request: resolve_resource_quantity(&cpu_request_key, &defaults.cpu_request),
-        memory_request: resolve_resource_quantity(&memory_request_key, &defaults.memory_request),
-        cpu_limit: resolve_resource_quantity(&cpu_limit_key, &defaults.cpu_limit),
-        memory_limit: resolve_resource_quantity(&memory_limit_key, &defaults.memory_limit),
+    Ok(ContainerResourceConfig {
+        cpu_request: resolve_resource_quantity(&cpu_request_key, &defaults.cpu_request)?,
+        memory_request: resolve_resource_quantity(&memory_request_key, &defaults.memory_request)?,
+        cpu_limit: resolve_resource_quantity(&cpu_limit_key, &defaults.cpu_limit)?,
+        memory_limit: resolve_resource_quantity(&memory_limit_key, &defaults.memory_limit)?,
+    })
+}
+
+fn resolve_resource_quantity(key: &str, default: &str) -> Result<String, String> {
+    let value = resolve_ferrum_var(key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_string());
+    if is_valid_kubernetes_quantity(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "Invalid {key}: '{value}' is not a valid Kubernetes resource quantity"
+        ))
     }
 }
 
-fn resolve_resource_quantity(key: &str, default: &str) -> String {
-    resolve_ferrum_var(key)
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| default.to_string())
+fn is_valid_kubernetes_quantity(value: &str) -> bool {
+    if value.is_empty() || value.starts_with('-') || value.starts_with('+') {
+        return false;
+    }
+
+    let numeric = if let Some(prefix) = value.strip_suffix("Ki") {
+        prefix
+    } else if let Some(prefix) = value.strip_suffix("Mi") {
+        prefix
+    } else if let Some(prefix) = value.strip_suffix("Gi") {
+        prefix
+    } else if let Some(prefix) = value.strip_suffix("Ti") {
+        prefix
+    } else if let Some(prefix) = value.strip_suffix("Pi") {
+        prefix
+    } else if let Some(prefix) = value.strip_suffix("Ei") {
+        prefix
+    } else if let Some(last) = value.chars().last() {
+        if matches!(
+            last,
+            'n' | 'u' | 'm' | 'k' | 'K' | 'M' | 'G' | 'T' | 'P' | 'E'
+        ) {
+            &value[..value.len() - last.len_utf8()]
+        } else {
+            value
+        }
+    } else {
+        value
+    };
+
+    !numeric.is_empty() && numeric.parse::<f64>().is_ok_and(f64::is_finite)
 }
 
 fn sidecar_env_from_runtime() -> Vec<(String, String)> {
@@ -611,7 +651,8 @@ fn sidecar_container(config: &InjectorConfig, pod: &Value, namespace: &str) -> V
             "runAsNonRoot": true,
             "allowPrivilegeEscalation": false,
             "readOnlyRootFilesystem": true,
-            "capabilities": {"drop": ["ALL"]}
+            "capabilities": {"drop": ["ALL"]},
+            "seccompProfile": {"type": "RuntimeDefault"}
         },
         "resources": {
             "requests": {
@@ -639,11 +680,13 @@ fn init_container(config: &InjectorConfig) -> Value {
         "imagePullPolicy": "IfNotPresent",
         "securityContext": {
             "runAsUser": 0,
+            "runAsNonRoot": false,
             "allowPrivilegeEscalation": false,
             "capabilities": {
                 "drop": ["ALL"],
                 "add": ["NET_ADMIN", "NET_RAW"]
-            }
+            },
+            "seccompProfile": {"type": "RuntimeDefault"}
         },
         "resources": {
             "requests": {
@@ -795,8 +838,16 @@ mod tests {
             Some(&Value::Bool(true))
         );
         assert_eq!(
+            sidecar.pointer("/securityContext/seccompProfile/type"),
+            Some(&Value::String("RuntimeDefault".to_string()))
+        );
+        assert_eq!(
             sidecar.pointer("/resources/limits/memory"),
             Some(&Value::String("256Mi".to_string()))
+        );
+        assert_eq!(
+            init.pointer("/securityContext/runAsNonRoot"),
+            Some(&Value::Bool(false))
         );
         assert_eq!(
             init.pointer("/securityContext/capabilities/drop"),
@@ -805,6 +856,10 @@ mod tests {
         assert_eq!(
             init.pointer("/securityContext/capabilities/add"),
             Some(&json!(["NET_ADMIN", "NET_RAW"]))
+        );
+        assert_eq!(
+            init.pointer("/securityContext/seccompProfile/type"),
+            Some(&Value::String("RuntimeDefault".to_string()))
         );
         assert_eq!(
             init.pointer("/resources/limits/memory"),
@@ -955,6 +1010,15 @@ mod tests {
 
         assert!(err.contains("FERRUM_MESH_PROXY_UID"));
         assert!(err.contains("non-zero"));
+    }
+
+    #[test]
+    fn injector_config_rejects_invalid_resource_quantity() {
+        let err =
+            resolve_resource_quantity("FERRUM_INJECTOR_SIDECAR_CPU_REQUEST", "not-a-quantity")
+                .expect_err("invalid quantity rejected");
+
+        assert!(err.contains("FERRUM_INJECTOR_SIDECAR_CPU_REQUEST"));
     }
 
     #[test]
