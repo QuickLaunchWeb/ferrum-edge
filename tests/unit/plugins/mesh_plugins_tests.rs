@@ -1218,8 +1218,8 @@ async fn mesh_authz_workload_selector_missing_label_does_not_affect_unrelated_wo
 
 #[tokio::test]
 async fn mesh_authz_workload_selector_empty_labels_matches_any_workload() {
-    // Empty labels + no namespace → applies to any workload (legacy behavior
-    // preserved). Existing tests rely on this; this test pins the contract.
+    // Empty labels + no namespace applies to any workload. This test pins the
+    // selector contract.
     let plugin = MeshAuthz::new(&json!({
         "mesh_policies": [policy_with_scope(
             "wl-any-allow",

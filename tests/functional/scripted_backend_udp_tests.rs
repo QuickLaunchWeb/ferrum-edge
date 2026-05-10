@@ -313,6 +313,7 @@ async fn udp_session_idle_timeout_cleans_session_map() {
     let build_yaml = move |listen_port: u16| {
         format!(
             r#"
+version: "1"
 proxies:
   - id: "udp-idle"
     listen_port: {listen_port}
@@ -448,6 +449,7 @@ async fn udp_amplification_bound_enforced() {
     let build_yaml = move |listen_port: u16| {
         format!(
             r#"
+version: "1"
 proxies:
   - id: "udp-amp"
     listen_port: {listen_port}
@@ -564,6 +566,7 @@ async fn dtls_passthrough_sni_routes_to_correct_backend() {
     let build_yaml = move |listen_port: u16| {
         format!(
             r#"
+version: "1"
 proxies:
   - id: "dtls-a"
     listen_port: {listen_port}

@@ -4,30 +4,49 @@ use chrono::Utc;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, Proxy, default_namespace,
 };
+use ferrum_edge::plugins::basic_auth::DEFAULT_HMAC_SECRET;
 use ferrum_edge::plugins::{PluginResult, RequestContext};
+use hmac::{KeyInit, Mac};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+
+fn hmac_sha256_password_hash(password: &str) -> String {
+    type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+
+    let mut mac = HmacSha256::new_from_slice(DEFAULT_HMAC_SECRET.as_bytes()).unwrap();
+    mac.update(password.as_bytes());
+    format!("hmac_sha256:{}", hex::encode(mac.finalize().into_bytes()))
+}
 
 /// Create a test consumer with all credential types
 pub fn create_test_consumer() -> Consumer {
     let mut credentials = HashMap::new();
     let mut keyauth_creds = Map::new();
     keyauth_creds.insert("key".to_string(), Value::String("test-api-key".to_string()));
-    credentials.insert("keyauth".to_string(), Value::Object(keyauth_creds));
+    credentials.insert(
+        "keyauth".to_string(),
+        Value::Array(vec![Value::Object(keyauth_creds)]),
+    );
 
     let mut basicauth_creds = Map::new();
     basicauth_creds.insert(
         "password_hash".to_string(),
-        Value::String("$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBdXwtGtrmuPq6".to_string()),
+        Value::String(hmac_sha256_password_hash("password")),
     );
-    credentials.insert("basicauth".to_string(), Value::Object(basicauth_creds));
+    credentials.insert(
+        "basicauth".to_string(),
+        Value::Array(vec![Value::Object(basicauth_creds)]),
+    );
 
     let mut jwt_creds = Map::new();
     jwt_creds.insert(
         "secret".to_string(),
         Value::String("test-jwt-secret".to_string()),
     );
-    credentials.insert("jwt".to_string(), Value::Object(jwt_creds));
+    credentials.insert(
+        "jwt".to_string(),
+        Value::Array(vec![Value::Object(jwt_creds)]),
+    );
 
     Consumer {
         id: "test-consumer".to_string(),
@@ -150,7 +169,6 @@ pub fn create_test_transaction_summary() -> ferrum_edge::plugins::TransactionSum
         error_class: None,
         body_error_class: None,
         body_completed: false,
-        bytes_streamed_to_client: 0,
         request_bytes: 0,
         response_bytes: 0,
         mirror: false,

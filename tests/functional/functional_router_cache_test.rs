@@ -154,7 +154,7 @@ async fn start_gateway_with_retry(
 /// all pointing at the same backend.
 fn build_yaml_with_n_proxies(n: usize, backend_port: u16) -> String {
     let mut out = String::with_capacity(n * 180);
-    out.push_str("proxies:\n");
+    out.push_str("version: \"1\"\nproxies:\n");
     for i in 0..n {
         use std::fmt::Write as _;
         let _ = write!(

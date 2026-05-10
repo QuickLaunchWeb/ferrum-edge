@@ -341,28 +341,28 @@ chmod +x ferrum-edge
 ```bash
 gh release download v0.2.0 -p "ferrum-edge-linux-x86_64"
 chmod +x ferrum-edge-linux-x86_64
-./ferrum-edge-linux-x86_64
+./ferrum-edge-linux-x86_64 run
 ```
 
 **Linux ARM64** (ARM 64-bit, Graviton, etc.)
 ```bash
 gh release download v0.2.0 -p "ferrum-edge-linux-aarch64"
 chmod +x ferrum-edge-linux-aarch64
-./ferrum-edge-linux-aarch64
+./ferrum-edge-linux-aarch64 run
 ```
 
 **macOS x86_64** (Intel Macs)
 ```bash
 gh release download v0.2.0 -p "ferrum-edge-macos-x86_64"
 chmod +x ferrum-edge-macos-x86_64
-./ferrum-edge-macos-x86_64
+./ferrum-edge-macos-x86_64 run
 ```
 
 **macOS ARM64** (Apple Silicon M1/M2/M3)
 ```bash
 gh release download v0.2.0 -p "ferrum-edge-macos-aarch64"
 chmod +x ferrum-edge-macos-aarch64
-./ferrum-edge-macos-aarch64
+./ferrum-edge-macos-aarch64 run
 ```
 
 ### Checksum Verification

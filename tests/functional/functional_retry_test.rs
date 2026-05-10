@@ -87,6 +87,7 @@ fn write_frontend_certs(scratch: &std::path::Path, ca_name: &str) -> (String, St
 /// File-mode YAML for one HTTP proxy with an explicit retry policy.
 fn http_with_retry(port: u16, retry: serde_json::Value) -> String {
     let config = json!({
+        "version": "1",
         "proxies": [{
             "id": "phase8-retry",
             "listen_path": "/api",
@@ -109,6 +110,7 @@ fn http_with_retry(port: u16, retry: serde_json::Value) -> String {
 /// File-mode YAML for one HTTPS proxy with an explicit retry policy.
 fn https_with_retry(port: u16, retry: serde_json::Value) -> String {
     let config = json!({
+        "version": "1",
         "proxies": [{
             "id": "phase8-retry-h3",
             "listen_path": "/api",
@@ -1011,6 +1013,7 @@ async fn retry_rotation_across_mixed_capability_targets_recomputes_dispatch() {
 
     // Proxy with a load-balanced upstream containing both targets.
     let yaml_value = json!({
+        "version": "1",
         "proxies": [{
             "id": "phase8-mixed-capability",
             "listen_path": "/api",

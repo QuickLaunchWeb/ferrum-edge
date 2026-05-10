@@ -56,6 +56,7 @@ fn write_frontend_certs(
 /// Includes the file-mode-required empty collections.
 fn file_mode_yaml_for_h3(port: u16) -> String {
     let config = json!({
+        "version": "1",
         "proxies": [{
             "id": "scripted-h3",
             "listen_path": "/api",
@@ -696,6 +697,7 @@ async fn h3_pool_key_separates_by_dns_override() {
 
     // Two proxies with the same backend host + port but different dns_override.
     let config = json!({
+        "version": "1",
         "proxies": [
             {
                 "id": "p-a",
@@ -947,6 +949,7 @@ async fn h3_client_without_host_header_synthesizes_from_authority_preserve_true(
     // preserve_host_header=true: backend Host should be the H3 client's
     // `:authority` value. Without the synthesis fix, no Host is emitted.
     let config = json!({
+        "version": "1",
         "proxies": [{
             "id": "scripted-h3-preserve",
             "listen_path": "/api",
@@ -1040,6 +1043,7 @@ async fn h3_client_explicit_host_matches_authority_preserved() {
     .expect("spawn tls");
 
     let config = json!({
+        "version": "1",
         "proxies": [{
             "id": "scripted-h3-preserve-explicit",
             "listen_path": "/api",
@@ -1185,6 +1189,7 @@ async fn h3_native_pool_synthesizes_host_from_upstream_target_not_proxy_backend_
     // end up as "localhost" while the H3 connection lands at "127.0.0.1".
     // With the fix, the synthesized Host = upstream target host = "127.0.0.1".
     let config = json!({
+        "version": "1",
         "proxies": [{
             "id": "h3-codex-p1",
             "listen_path": "/api",

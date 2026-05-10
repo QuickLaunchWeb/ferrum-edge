@@ -223,7 +223,7 @@ Optionally connect a test DP to the staging CP to verify the full gRPC config sy
 
 ```bash
 FERRUM_MODE=dp \
-  FERRUM_DP_CP_GRPC_URL=http://cp-host:50052 \
+  FERRUM_DP_CP_GRPC_URLS=http://cp-host:50052 \
   FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-secret \
   FERRUM_PROXY_HTTP_PORT=8100 \
   FERRUM_ADMIN_HTTP_PORT=9200 \
@@ -263,7 +263,7 @@ Upgrade DP nodes one at a time (or in batches). Each DP reconnects to the CP on 
 ```bash
 # On each DP node, stop old binary and start new:
 FERRUM_MODE=dp \
-  FERRUM_DP_CP_GRPC_URL=http://cp-host:50051 \
+  FERRUM_DP_CP_GRPC_URLS=http://cp-host:50051 \
   FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-secret \
   FERRUM_ADMIN_JWT_SECRET=your-secret \
   ./ferrum-edge-new
@@ -401,7 +401,7 @@ FERRUM_MODE=file \
 
 ### Environment Variable Changes
 
-New Ferrum versions may introduce new `FERRUM_*` environment variables. Review `ferrum.conf` in the release for new defaults. Deprecated database TLS aliases (`FERRUM_DB_SSL_MODE`, `FERRUM_DB_SSL_ROOT_CERT`, `FERRUM_DB_SSL_CLIENT_CERT`, `FERRUM_DB_SSL_CLIENT_KEY`, `FERRUM_DB_TLS_ENABLED`, `FERRUM_DB_TLS_INSECURE`) are still accepted with startup warnings; rename them to the canonical `FERRUM_DB_TLS_*` variables before a future major release.
+New Ferrum versions may introduce new `FERRUM_*` environment variables. Review `ferrum.conf` in the release for new defaults.
 
 ### Logging Metadata Redaction
 

@@ -16,9 +16,7 @@ use std::path::{Path, PathBuf};
 #[command(
     name = "ferrum-edge",
     version,
-    about = "A high-performance edge proxy built in Rust",
-    subcommand_required = false,
-    arg_required_else_help = false
+    about = "A high-performance edge proxy built in Rust"
 )]
 pub struct Cli {
     #[command(subcommand)]

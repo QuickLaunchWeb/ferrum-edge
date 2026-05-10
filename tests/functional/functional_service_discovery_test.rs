@@ -167,6 +167,7 @@ async fn test_service_discovery_dns_sd_config_parses() {
     // traffic. SD upstream with DNS-SD provider just needs to parse/start.
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "static-proxy"
     listen_path: "/static"
@@ -230,6 +231,7 @@ async fn test_service_discovery_kubernetes_config_parses() {
     // startup must succeed without crashing.
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "static-proxy"
     listen_path: "/static"
@@ -290,6 +292,7 @@ async fn test_service_discovery_consul_unreachable_does_not_crash_gateway() {
     // serving the unrelated static proxy below.
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "static-proxy"
     listen_path: "/static"
@@ -398,6 +401,7 @@ async fn test_service_discovery_consul_stub_routes_to_discovered_target() {
     // interval so the first discovery completes quickly.
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "sd-proxy"
     listen_path: "/sd"

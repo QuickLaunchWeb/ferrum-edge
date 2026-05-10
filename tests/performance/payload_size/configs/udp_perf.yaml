@@ -1,4 +1,5 @@
 ---
+version: "1"
 # UDP proxy performance test config
 proxies:
   - id: "udp-echo"

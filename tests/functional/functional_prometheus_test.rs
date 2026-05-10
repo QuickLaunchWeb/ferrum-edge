@@ -22,6 +22,7 @@ async fn test_prometheus_metrics_endpoint_returns_data() {
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "test-proxy"
     listen_path: "/test"
@@ -116,6 +117,7 @@ async fn test_prometheus_metrics_reflect_traffic() {
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "traffic-proxy"
     listen_path: "/traffic"

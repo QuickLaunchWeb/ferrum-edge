@@ -636,6 +636,7 @@ async fn functional_stream_listener_reload_remove_and_add() {
         let config_path = dir.path().join("config.yaml");
         let initial = format!(
             r#"
+version: "1"
 proxies:
   - id: "stream-a"
     listen_port: {stream_port_a}
@@ -710,6 +711,7 @@ plugin_configs: []
     // Rewrite config: remove A, add B.
     let updated = format!(
         r#"
+version: "1"
 proxies:
   - id: "stream-b"
     listen_port: {stream_port_b}

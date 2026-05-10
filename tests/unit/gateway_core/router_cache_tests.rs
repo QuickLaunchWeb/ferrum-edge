@@ -3,7 +3,7 @@ use ferrum_edge::RouterCache;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::proxy::build_backend_url;
 
-// This suite intentionally exercises the legacy public RouterCache facade.
+// This suite intentionally exercises the public RouterCache facade.
 // Request hot paths use epoch-loaded route snapshots and are covered by
 // request_epoch tests; these checks keep the standalone library/test API stable.
 
@@ -307,7 +307,7 @@ fn test_e2e_multiple_proxies_different_backends() {
 }
 
 #[test]
-fn test_e2e_https_backend_protocol() {
+fn test_e2e_https_backend_scheme() {
     let mut proxy = test_proxy("secure", "/api");
     proxy.backend_scheme = Some(BackendScheme::Https);
     proxy.dispatch_kind = DispatchKind::from(BackendScheme::Https);

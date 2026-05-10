@@ -147,7 +147,6 @@ fn create_http3_test_env_config() -> EnvConfig {
         db_read_replica_url: None,
         cp_grpc_listen_addr: None,
         cp_dp_grpc_jwt_secret: None,
-        dp_cp_grpc_url: None,
         dp_cp_grpc_urls: Vec::new(),
         dp_cp_failover_primary_retry_secs: 300,
         cp_grpc_tls_cert_path: None,
@@ -453,8 +452,7 @@ async fn test_http3_environment_variables() {
 /// Post-refactor, H3 is not a scheme — backend H3 selection is runtime
 /// capability-driven and `BackendScheme::Https` always maps to
 /// `DispatchKind::HttpsPool`. The wire format for the scheme field is plain
-/// "https"; the legacy "h3" string is only accepted by the DB loader's
-/// `parse_scheme()` for backward-compatible row parsing.
+/// "https"; the old "h3" spelling is rejected.
 #[tokio::test]
 async fn test_http3_scheme_enum() {
     let scheme = BackendScheme::Https;

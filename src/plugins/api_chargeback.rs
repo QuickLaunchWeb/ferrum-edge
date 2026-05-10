@@ -145,8 +145,7 @@ pub struct ChargebackRegistry {
     render_cache_ttl_secs: AtomicU64,
     stale_entry_ttl_nanos: AtomicU64,
     cache_invalidation_min_age_nanos: AtomicU64,
-    /// Extra label fragment for namespace isolation. Empty for default namespace,
-    /// otherwise `",namespace=\"<ns>\""`. Matches the prometheus_metrics pattern.
+    /// Extra label fragment for namespace isolation.
     namespace_label: std::sync::RwLock<String>,
     /// Guards against spawning duplicate background cleanup tasks.
     cleanup_task_started: AtomicBool,
@@ -196,11 +195,7 @@ impl ChargebackRegistry {
             Ordering::Relaxed,
         );
         if let Ok(mut ns_label) = self.namespace_label.write() {
-            if namespace != crate::config::types::DEFAULT_NAMESPACE {
-                *ns_label = format!(",namespace=\"{}\"", escape_label_value(namespace));
-            } else {
-                ns_label.clear();
-            }
+            *ns_label = format!(",namespace=\"{}\"", escape_label_value(namespace));
         }
     }
 

@@ -217,6 +217,7 @@ async fn in_process_harness_applies_namespace_override_before_loading_yaml() {
     // (the harness's old default), the cross-resource uniqueness validator
     // would reject the YAML for duplicate `listen_path: /api`.
     let yaml = serde_yaml::to_string(&serde_json::json!({
+        "version": "1",
         "proxies": [
             {
                 "id": "ferrum-proxy",
@@ -373,9 +374,10 @@ async fn serve_blocks_until_shutdown_when_no_listener_handles() {
     // Empty config — we don't need any proxy to serve traffic; we just
     // need `serve()` to bring up zero HTTP/admin listeners and hand back
     // a `ServeHandles` whose `listener_handles` Vec is empty.
-    let config: GatewayConfig =
-        serde_yaml::from_str("proxies: []\nconsumers: []\nupstreams: []\nplugin_configs: []\n")
-            .expect("parse empty config");
+    let config: GatewayConfig = serde_yaml::from_str(
+        "version: '1'\nproxies: []\nconsumers: []\nupstreams: []\nplugin_configs: []\n",
+    )
+    .expect("parse empty config");
 
     let env_config = EnvConfig {
         mode: OperatingMode::File,
@@ -621,6 +623,7 @@ async fn serve_drains_spawned_tasks_when_late_startup_fails() {
     // via serde_json so the indent / multi-line YAML pitfalls don't
     // creep in.
     let config_json = serde_json::json!({
+        "version": "1",
         "proxies": [{
             "id": "stream-proxy",
             "backend_scheme": "tcp",

@@ -551,7 +551,7 @@ async fn test_mirror_falls_back_to_metadata_when_no_body_bytes() {
 
     let mut ctx = make_ctx_with_proxy();
 
-    // Only the UTF-8 metadata key is set (legacy/normal path)
+    // Only the UTF-8 metadata key is set.
     ctx.metadata.insert(
         "request_body".to_string(),
         r#"{"hello":"world"}"#.to_string(),

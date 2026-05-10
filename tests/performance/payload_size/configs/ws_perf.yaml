@@ -1,4 +1,5 @@
 ---
+version: "1"
 # WebSocket payload size test config
 # Gateway proxies WebSocket connections to backend WS echo server
 proxies:

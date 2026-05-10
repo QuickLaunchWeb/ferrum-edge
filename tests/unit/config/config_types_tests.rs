@@ -385,10 +385,10 @@ fn test_unique_listen_paths_duplicate() {
 fn test_unique_consumer_credentials_valid() {
     let mut c1 = make_consumer("c1", "alice");
     c1.credentials
-        .insert("keyauth".into(), serde_json::json!({"key": "key-aaa"}));
+        .insert("keyauth".into(), serde_json::json!([{"key": "key-aaa"}]));
     let mut c2 = make_consumer("c2", "bob");
     c2.credentials
-        .insert("keyauth".into(), serde_json::json!({"key": "key-bbb"}));
+        .insert("keyauth".into(), serde_json::json!([{"key": "key-bbb"}]));
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
     assert!(config.validate_unique_consumer_credentials().is_ok());
@@ -398,10 +398,10 @@ fn test_unique_consumer_credentials_valid() {
 fn test_unique_consumer_credentials_duplicate_keyauth() {
     let mut c1 = make_consumer("c1", "alice");
     c1.credentials
-        .insert("keyauth".into(), serde_json::json!({"key": "same-key"}));
+        .insert("keyauth".into(), serde_json::json!([{"key": "same-key"}]));
     let mut c2 = make_consumer("c2", "bob");
     c2.credentials
-        .insert("keyauth".into(), serde_json::json!({"key": "same-key"}));
+        .insert("keyauth".into(), serde_json::json!([{"key": "same-key"}]));
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
     let err = config.validate_unique_consumer_credentials().unwrap_err();
@@ -427,12 +427,12 @@ fn test_unique_consumer_credentials_duplicate_basicauth() {
     let mut c1 = make_consumer("c1", "alice");
     c1.credentials.insert(
         "basicauth".into(),
-        serde_json::json!({"password_hash": "$2b$12$abc"}),
+        serde_json::json!([{"password_hash": "hmac_sha256:abc"}]),
     );
     let mut c2 = make_consumer("c2", "alice");
     c2.credentials.insert(
         "basicauth".into(),
-        serde_json::json!({"password_hash": "$2b$12$def"}),
+        serde_json::json!([{"password_hash": "hmac_sha256:def"}]),
     );
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
@@ -446,12 +446,12 @@ fn test_unique_consumer_credentials_basicauth_different_usernames_ok() {
     let mut c1 = make_consumer("c1", "alice");
     c1.credentials.insert(
         "basicauth".into(),
-        serde_json::json!({"password_hash": "$2b$12$abc"}),
+        serde_json::json!([{"password_hash": "hmac_sha256:abc"}]),
     );
     let mut c2 = make_consumer("c2", "bob");
     c2.credentials.insert(
         "basicauth".into(),
-        serde_json::json!({"password_hash": "$2b$12$def"}),
+        serde_json::json!([{"password_hash": "hmac_sha256:def"}]),
     );
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
@@ -463,12 +463,12 @@ fn test_unique_consumer_credentials_duplicate_mtls_identity() {
     let mut c1 = make_consumer("c1", "alice");
     c1.credentials.insert(
         "mtls_auth".into(),
-        serde_json::json!({"identity": "CN=client1"}),
+        serde_json::json!([{"identity": "CN=client1"}]),
     );
     let mut c2 = make_consumer("c2", "bob");
     c2.credentials.insert(
         "mtls_auth".into(),
-        serde_json::json!({"identity": "CN=client1"}),
+        serde_json::json!([{"identity": "CN=client1"}]),
     );
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
@@ -482,12 +482,12 @@ fn test_unique_consumer_credentials_mtls_different_identities_ok() {
     let mut c1 = make_consumer("c1", "alice");
     c1.credentials.insert(
         "mtls_auth".into(),
-        serde_json::json!({"identity": "CN=client1"}),
+        serde_json::json!([{"identity": "CN=client1"}]),
     );
     let mut c2 = make_consumer("c2", "bob");
     c2.credentials.insert(
         "mtls_auth".into(),
-        serde_json::json!({"identity": "CN=client2"}),
+        serde_json::json!([{"identity": "CN=client2"}]),
     );
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
@@ -497,13 +497,12 @@ fn test_unique_consumer_credentials_mtls_different_identities_ok() {
 // ---- Multi-credential (array format) tests ----
 
 #[test]
-fn test_credential_entries_single_object() {
+fn test_credential_entries_object_value_is_ignored() {
     let mut c = make_consumer("c1", "alice");
     c.credentials
         .insert("keyauth".into(), serde_json::json!({"key": "abc"}));
     let entries = c.credential_entries("keyauth");
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].get("key").unwrap().as_str().unwrap(), "abc");
+    assert!(entries.is_empty());
 }
 
 #[test]
@@ -538,11 +537,11 @@ fn test_credential_entries_filters_non_objects_in_array() {
 }
 
 #[test]
-fn test_has_credential_single_object() {
+fn test_has_credential_object_value_is_false() {
     let mut c = make_consumer("c1", "alice");
     c.credentials
         .insert("keyauth".into(), serde_json::json!({"key": "abc"}));
-    assert!(c.has_credential("keyauth"));
+    assert!(!c.has_credential("keyauth"));
     assert!(!c.has_credential("jwt"));
 }
 
@@ -565,7 +564,7 @@ fn test_unique_credentials_array_duplicate_keyauth_across_consumers() {
     );
     let mut c2 = make_consumer("c2", "bob");
     c2.credentials
-        .insert("keyauth".into(), serde_json::json!({"key": "key-bbb"}));
+        .insert("keyauth".into(), serde_json::json!([{"key": "key-bbb"}]));
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
     let err = config.validate_unique_consumer_credentials().unwrap_err();
@@ -582,7 +581,7 @@ fn test_unique_credentials_array_no_duplicate() {
     );
     let mut c2 = make_consumer("c2", "bob");
     c2.credentials
-        .insert("keyauth".into(), serde_json::json!({"key": "key-ccc"}));
+        .insert("keyauth".into(), serde_json::json!([{"key": "key-ccc"}]));
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
     assert!(config.validate_unique_consumer_credentials().is_ok());
@@ -596,8 +595,10 @@ fn test_unique_credentials_array_duplicate_mtls_across_consumers() {
         serde_json::json!([{"identity": "CN=a"}, {"identity": "CN=b"}]),
     );
     let mut c2 = make_consumer("c2", "bob");
-    c2.credentials
-        .insert("mtls_auth".into(), serde_json::json!({"identity": "CN=b"}));
+    c2.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "CN=b"}]),
+    );
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
     let err = config.validate_unique_consumer_credentials().unwrap_err();
@@ -651,21 +652,35 @@ fn test_validate_fields_array_rejects_empty_array() {
 #[test]
 fn test_validate_fields_rejects_non_object_credential_value() {
     let mut c = make_consumer("c1", "alice");
-    // Plain string instead of object or array
+    // Plain string instead of array
     c.credentials
         .insert("keyauth".into(), serde_json::json!("just-a-string"));
     let err = c.validate_fields().unwrap_err();
     assert!(
         err.iter()
-            .any(|e| e.contains("must be a JSON object or array"))
+            .any(|e| e.contains("must be an array of JSON objects"))
+    );
+}
+
+#[test]
+fn test_validate_fields_rejects_single_object_credential_value() {
+    let mut c = make_consumer("c1", "alice");
+    c.credentials
+        .insert("keyauth".into(), serde_json::json!({"key": "abc"}));
+    let err = c.validate_fields().unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.contains("must be an array of JSON objects"))
     );
 }
 
 #[test]
 fn test_validate_fields_rejects_short_jwt_secret() {
     let mut c = make_consumer("c1", "alice");
-    c.credentials
-        .insert("jwt".into(), serde_json::json!({"secret": "short-secret"}));
+    c.credentials.insert(
+        "jwt".into(),
+        serde_json::json!([{"secret": "short-secret"}]),
+    );
     let err = c.validate_fields().unwrap_err();
     assert!(
         err.iter()
@@ -678,7 +693,7 @@ fn test_validate_fields_accepts_valid_jwt_secret() {
     let mut c = make_consumer("c1", "alice");
     c.credentials.insert(
         "jwt".into(),
-        serde_json::json!({"secret": "this-is-a-valid-jwt-secret-key-32chars"}),
+        serde_json::json!([{"secret": "this-is-a-valid-jwt-secret-key-32chars"}]),
     );
     assert!(c.validate_fields().is_ok());
 }

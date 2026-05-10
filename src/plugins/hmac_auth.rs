@@ -8,8 +8,7 @@
 //!
 //! ## Signing string
 //!
-//! When `require_digest = true` (default, secure-by-default per RFC 9421 /
-//! RFC 3230), the signature is computed over four newline-separated fields:
+//! The signature is computed over four newline-separated fields:
 //!
 //!   ```text
 //!   {METHOD}\n{PATH}\n{DATE}\n{DIGEST_HEADER_VALUE}
@@ -20,11 +19,6 @@
 //! body, formatted as `sha-256=<base64>` or `sha-512=<base64>`. The plugin
 //! verifies that the digest matches the actual buffered body bytes; tampering
 //! with either the body or the digest header invalidates the HMAC.
-//!
-//! When `require_digest = false`, the legacy three-field signing string
-//! (`{METHOD}\n{PATH}\n{DATE}`) is preserved for backward compatibility.
-//! Body bytes are NOT integrity-protected in this mode — see the warn-level
-//! log emitted at construction time.
 //!
 //! Consumer credentials should include:
 //!   { "hmac_auth": { "secret": "<shared-secret>" } }
@@ -47,12 +41,6 @@ type HmacSha512 = Hmac<Sha512>;
 
 pub struct HmacAuth {
     clock_skew_seconds: u64,
-    /// When `true` (default), inbound requests must include a
-    /// `Digest:`/`Content-Digest:` header that matches the request body, and
-    /// the digest header value is folded into the HMAC signing string. When
-    /// `false`, the legacy 3-field signing string is used and bodies are not
-    /// integrity-protected.
-    require_digest: bool,
 }
 
 impl HmacAuth {
@@ -65,20 +53,14 @@ impl HmacAuth {
             "clock_skew_seconds",
             300,
         )?;
-        let require_digest =
-            parse_bool_field(config_obj.get("require_digest"), "require_digest", true)?;
-
-        if !require_digest {
-            warn!(
-                "hmac_auth: digest verification disabled — request bodies are NOT \
-                 integrity-protected. Set `require_digest: true` for production."
+        if config_obj.get("require_digest").is_some() {
+            return Err(
+                "hmac_auth: 'require_digest' was removed; request digests are always required"
+                    .to_string(),
             );
         }
 
-        Ok(Self {
-            clock_skew_seconds,
-            require_digest,
-        })
+        Ok(Self { clock_skew_seconds })
     }
 
     fn hmac_matches(secret: &[u8], data: &[u8], algorithm: &str, expected: &[u8]) -> bool {
@@ -241,17 +223,13 @@ impl AuthMechanism for HmacAuth {
         // Enforce digest presence at extraction so we surface the clearest
         // error before consumer lookup. The actual body-vs-digest comparison
         // happens in `verify` once we have the buffered body.
-        let digest_header = if self.require_digest {
-            match Self::extract_digest_header(ctx) {
-                Some(header) => header,
-                None => {
-                    return ExtractedCredential::InvalidFormat(
-                        r#"{"error":"Missing required Digest header"}"#.to_string(),
-                    );
-                }
+        let digest_header = match Self::extract_digest_header(ctx) {
+            Some(header) => header,
+            None => {
+                return ExtractedCredential::InvalidFormat(
+                    r#"{"error":"Missing required Digest header"}"#.to_string(),
+                );
             }
-        } else {
-            String::new()
         };
 
         ExtractedCredential::HmacAuth {
@@ -262,21 +240,18 @@ impl AuthMechanism for HmacAuth {
             method: ctx.method.clone(),
             path: ctx.path.clone(),
             digest_header,
-            request_body: if self.require_digest {
-                // Prefer binary-safe bytes; fall back to UTF-8 metadata for
-                // older buffering paths. Empty body (GET/HEAD) → empty Vec.
-                ctx.request_body_bytes
-                    .as_ref()
-                    .map(|b| b.to_vec())
-                    .or_else(|| {
-                        ctx.metadata
-                            .get("request_body")
-                            .map(|s| s.as_bytes().to_vec())
-                    })
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            },
+            // Prefer binary-safe bytes; fall back to UTF-8 metadata for older
+            // buffering paths. Empty body (GET/HEAD) → empty Vec.
+            request_body: ctx
+                .request_body_bytes
+                .as_ref()
+                .map(|b| b.to_vec())
+                .or_else(|| {
+                    ctx.metadata
+                        .get("request_body")
+                        .map(|s| s.as_bytes().to_vec())
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -308,7 +283,7 @@ impl AuthMechanism for HmacAuth {
         // Verify that the Digest header matches the actual request body.
         // Done before consumer lookup so a tampered body fails fast and the
         // error message is independent of whether the consumer exists.
-        if self.require_digest && !Self::verify_body_digest(&digest_header, &request_body) {
+        if !Self::verify_body_digest(&digest_header, &request_body) {
             debug!("hmac_auth: digest header does not match request body");
             return VerifyOutcome::Invalid(
                 r#"{"error":"Digest header does not match request body"}"#.to_string(),
@@ -332,15 +307,9 @@ impl AuthMechanism for HmacAuth {
             );
         }
 
-        // Signing string includes the digest header value when require_digest
-        // is true. Tampering with the digest header itself (without re-signing
-        // with the secret) breaks the HMAC.
-        let signing_string = build_signing_string(
-            &method,
-            &path,
-            &date,
-            self.require_digest.then_some(digest_header.as_str()),
-        );
+        // Tampering with the digest header itself (without re-signing with
+        // the secret) breaks the HMAC because the digest value is signed.
+        let signing_string = build_signing_string(&method, &path, &date, &digest_header);
 
         let expected_signature = match base64::engine::general_purpose::STANDARD.decode(&signature)
         {
@@ -379,15 +348,15 @@ auth_flow::impl_auth_plugin!(
     auth_flow::run_auth;
 
     fn requires_request_body_before_authenticate(&self) -> bool {
-        self.require_digest
+        true
     }
 
     fn should_buffer_request_body(&self, _ctx: &crate::plugins::RequestContext) -> bool {
-        self.require_digest
+        true
     }
 
     fn needs_request_body_bytes(&self) -> bool {
-        self.require_digest
+        true
     }
 );
 
@@ -400,37 +369,16 @@ fn parse_u64_field(value: Option<&Value>, field: &str, default_value: u64) -> Re
         .ok_or_else(|| format!("hmac_auth: '{field}' must be an unsigned integer, got: {value}"))
 }
 
-fn parse_bool_field(
-    value: Option<&Value>,
-    field: &str,
-    default_value: bool,
-) -> Result<bool, String> {
-    let Some(value) = value else {
-        return Ok(default_value);
-    };
-    value
-        .as_bool()
-        .ok_or_else(|| format!("hmac_auth: '{field}' must be a boolean, got: {value}"))
-}
-
-fn build_signing_string(
-    method: &str,
-    path: &str,
-    date: &str,
-    digest_header: Option<&str>,
-) -> String {
-    let digest_len = digest_header.map_or(0, str::len);
+fn build_signing_string(method: &str, path: &str, date: &str, digest_header: &str) -> String {
     let mut signing_string =
-        String::with_capacity(method.len() + path.len() + date.len() + digest_len + 3);
+        String::with_capacity(method.len() + path.len() + date.len() + digest_header.len() + 3);
     signing_string.push_str(method);
     signing_string.push('\n');
     signing_string.push_str(path);
     signing_string.push('\n');
     signing_string.push_str(date);
-    if let Some(digest_header) = digest_header {
-        signing_string.push('\n');
-        signing_string.push_str(digest_header);
-    }
+    signing_string.push('\n');
+    signing_string.push_str(digest_header);
     signing_string
 }
 

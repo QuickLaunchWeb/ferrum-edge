@@ -852,7 +852,8 @@ paths:
       description: |
         Creates a new API consumer. A UUID is generated when `id` is omitted
         or empty. Plaintext `password` fields inside `basicauth` credentials
-        are automatically bcrypt-hashed and stored as `password_hash`.
+        are automatically HMAC-SHA256 hashed (using `FERRUM_BASIC_AUTH_HMAC_SECRET`)
+        and stored as `password_hash`.
       tags: [Consumers]
       requestBody:
         required: true
@@ -2554,8 +2555,8 @@ components:
         - Stream-family proxies (`tcp`/`tcps`/`udp`/`dtls`): `listen_path`
           MUST be null/omitted, and `listen_port` MUST be set,
           and `backend_scheme` MUST be set explicitly.
-        - Legacy field `backend_protocol` is rejected. Use `backend_scheme`
-          and let runtime capability classification handle backend HTTP/3.
+        - Unknown fields are rejected. Backend H3 selection is runtime
+          capability-driven for `Https` backends — there is no scheme for it.
       allOf:
         - $ref: "#/components/schemas/Proxy"
       required:
@@ -2755,9 +2756,8 @@ components:
         password_hash:
           type: string
           description: >-
-            Pre-hashed password. Accepts `hmac_sha256:<hex>` (fast, ~1μs) or
-            bcrypt `$2b$`/`$2a$` format (~100ms, backward compatible). On read,
-            this field is always returned instead of `password`.
+            Pre-hashed password in `hmac_sha256:<hex>` format (constant-time,
+            ~1μs). On read, this field is always returned instead of `password`.
       description: >-
         Basic auth credential for the `basic_auth` plugin. Supply either
         `password` (auto-hashed) or `password_hash` (pre-hashed). Indexed by
@@ -4603,11 +4603,7 @@ components:
         include_proxy_id_label:
           type: boolean
           default: true
-          description: Add the matched proxy_id as a Loki label. Legacy alias `include_listen_path_label` is still accepted for backward compatibility; if both are set, this key wins
-        include_listen_path_label:
-          type: boolean
-          description: "Deprecated alias for include_proxy_id_label (the label name has always been proxy_id). Accepted for backward compatibility"
-          deprecated: true
+          description: Add the matched proxy_id as a Loki label
         include_status_class_label:
           type: boolean
           default: true
@@ -4891,7 +4887,7 @@ components:
 
     BasicAuthConfig:
       type: object
-      description: "Plugin: basic_auth — HTTP Basic credentials (HMAC-SHA256 or bcrypt)."
+      description: "Plugin: basic_auth — HTTP Basic credentials verified against HMAC-SHA256 password hashes."
       properties: {}
 
     LdapAuthConfig:
@@ -4959,17 +4955,13 @@ components:
 
     HmacAuthConfig:
       type: object
-      description: "Plugin: hmac_auth — HMAC signature verification with mandatory request-body integrity protection (RFC 9421 / RFC 3230). When require_digest is true (default, secure), requests must include a Digest or Content-Digest header that matches the request body, and the digest header value is folded into the HMAC signing string (METHOD\\nPATH\\nDATE\\nDIGEST). When require_digest is false, the legacy 3-field signing string (METHOD\\nPATH\\nDATE) is used and request bodies are NOT integrity-protected — set true for production. Consumer credentials store the shared secret."
+      description: "Plugin: hmac_auth — HMAC signature verification with mandatory request-body integrity protection (RFC 9421 / RFC 3230). Requests must include a Digest or Content-Digest header that matches the request body; the digest header value is folded into the HMAC signing string (METHOD\\nPATH\\nDATE\\nDIGEST). Consumer credentials store the shared secret."
       properties:
         clock_skew_seconds:
           type: integer
           format: uint64
           default: 300
           description: Maximum allowed clock skew in seconds for the Date header replay protection window
-        require_digest:
-          type: boolean
-          default: true
-          description: When true (default, secure-by-default), inbound requests must include a Digest (RFC 3230) or Content-Digest (RFC 9421) header that matches the request body, and the digest header value is folded into the HMAC signing string. When false, the legacy 3-field signing string is used and request bodies are NOT integrity-protected (a warn-level log is emitted at startup).
 
     SoapWsSecurityConfig:
       type: object

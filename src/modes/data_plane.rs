@@ -124,7 +124,7 @@ pub async fn run(
     let cp_urls = env_config.resolved_dp_cp_grpc_urls();
     if cp_urls.is_empty() {
         return Err(anyhow::anyhow!(
-            "FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS is required in dp mode"
+            "FERRUM_DP_CP_GRPC_URLS is required in dp mode"
         ));
     }
     if cp_urls.len() > 1 {

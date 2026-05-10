@@ -11,6 +11,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ferrum-sqlite
+    command: ["run"]
     ports:
       - "8000:8000"     # HTTP proxy
       - "8443:8443"     # HTTPS proxy
@@ -62,6 +63,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ferrum-postgres
+    command: ["run"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -119,6 +121,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ferrum-mongodb
+    command: ["run"]
     depends_on:
       mongodb:
         condition: service_healthy
@@ -156,6 +159,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ferrum-cp
+    command: ["run"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -192,6 +196,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ferrum-dp-1
+    command: ["run"]
     depends_on:
       - ferrum-cp
     ports:
@@ -200,7 +205,7 @@ services:
       - "9003:9000"     # Read-only Admin API HTTP
     environment:
       FERRUM_MODE: dp
-      FERRUM_DP_CP_GRPC_URL: http://ferrum-cp:50051
+      FERRUM_DP_CP_GRPC_URLS: http://ferrum-cp:50051
       FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:-dev-grpc-secret-change-in-production}
       FERRUM_LOG_LEVEL: info
     networks:
@@ -223,6 +228,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ferrum-dp-2
+    command: ["run"]
     depends_on:
       - ferrum-cp
     ports:
@@ -231,7 +237,7 @@ services:
       - "9004:9000"     # Read-only Admin API HTTP
     environment:
       FERRUM_MODE: dp
-      FERRUM_DP_CP_GRPC_URL: http://ferrum-cp:50051
+      FERRUM_DP_CP_GRPC_URLS: http://ferrum-cp:50051
       FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:-dev-grpc-secret-change-in-production}
       FERRUM_LOG_LEVEL: info
     networks:

@@ -136,6 +136,7 @@ async fn test_ai_prompt_shield_rejects_pii() {
 
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "ai-proxy"
     listen_path: "/ai"
@@ -227,6 +228,7 @@ async fn test_ai_prompt_shield_allows_clean_request() {
 
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "ai-proxy"
     listen_path: "/ai"
@@ -311,6 +313,7 @@ async fn test_ai_request_guard_rejects_disallowed_model() {
 
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "ai-proxy"
     listen_path: "/ai"
@@ -398,6 +401,7 @@ async fn test_ai_request_guard_rejects_excess_tokens() {
 
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "ai-proxy"
     listen_path: "/ai"
@@ -490,6 +494,7 @@ async fn test_ai_request_guard_allows_valid_request() {
 
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "ai-proxy"
     listen_path: "/ai"

@@ -314,6 +314,7 @@ async fn test_round_robin_load_balancing() {
     let config_path = temp_dir.path().join("config.yaml");
 
     let config = r#"
+version: "1"
 proxies:
   - id: "lb-proxy"
     listen_path: "/api"
@@ -421,6 +422,7 @@ async fn test_weighted_round_robin_load_balancing() {
 
     // Weight 5 for heavy, weight 1 for light — heavy should get ~5x traffic
     let config = r#"
+version: "1"
 proxies:
   - id: "lb-wrr-proxy"
     listen_path: "/wrr"
@@ -519,6 +521,7 @@ async fn test_consistent_hashing_load_balancing() {
     let config_path = temp_dir.path().join("config.yaml");
 
     let config = r#"
+version: "1"
 proxies:
   - id: "lb-hash-proxy"
     listen_path: "/hash"
@@ -608,6 +611,7 @@ async fn test_active_health_check_excludes_unhealthy() {
     // Server on port 30031 is healthy, server on port 30032 returns 500s,
     // active health checks should mark 30032 as unhealthy after threshold
     let config = r#"
+version: "1"
 proxies:
   - id: "lb-health-proxy"
     listen_path: "/health-test"
@@ -713,6 +717,7 @@ async fn test_passive_health_check_marks_unhealthy() {
 
     // One server always returns 500, passive health check should eventually mark it unhealthy
     let config = r#"
+version: "1"
 proxies:
   - id: "lb-passive-proxy"
     listen_path: "/passive"
@@ -825,6 +830,7 @@ async fn test_active_health_check_recovery() {
     // Server on port 30052 starts failing then recovers (flapping server).
     // Active health check should eventually re-include server 2.
     let config = r#"
+version: "1"
 proxies:
   - id: "lb-recovery-proxy"
     listen_path: "/recovery"
@@ -934,6 +940,7 @@ async fn test_config_reload_updates_upstream_targets() {
 
     // Initial config with 2 targets
     let initial_config = r#"
+version: "1"
 proxies:
   - id: "lb-reload-proxy"
     listen_path: "/reload"
@@ -1006,6 +1013,7 @@ plugin_configs: []
 
     // Update config: add target-c, remove target-b
     let updated_config = r#"
+version: "1"
 proxies:
   - id: "lb-reload-proxy"
     listen_path: "/reload"
@@ -1098,6 +1106,7 @@ async fn test_retry_selects_different_target() {
 
     // One server always returns 502, retry should go to the other server
     let config = r#"
+version: "1"
 proxies:
   - id: "lb-retry-proxy"
     listen_path: "/retry"
@@ -1193,6 +1202,7 @@ async fn test_all_unhealthy_fallback() {
     // Active health checks will mark both as unhealthy,
     // but requests should still be served (fallback to all targets).
     let config = r#"
+version: "1"
 proxies:
   - id: "lb-fallback-proxy"
     listen_path: "/fallback"
@@ -1289,6 +1299,7 @@ async fn test_multiple_upstreams() {
     let config_path = temp_dir.path().join("config.yaml");
 
     let config = r#"
+version: "1"
 proxies:
   - id: "api-proxy"
     listen_path: "/api"
@@ -1430,6 +1441,7 @@ async fn test_weighted_round_robin_three_targets() {
     let config_path = temp_dir.path().join("config.yaml");
 
     let config = r#"
+version: "1"
 proxies:
   - id: "lb-wrr3-proxy"
     listen_path: "/wrr3"
@@ -1535,6 +1547,7 @@ async fn test_combined_active_and_passive_health_checks() {
     let config_path = temp_dir.path().join("config.yaml");
 
     let config = r#"
+version: "1"
 proxies:
   - id: "lb-combined-proxy"
     listen_path: "/combined"
@@ -1651,6 +1664,7 @@ async fn test_unreachable_target_with_retry() {
 
     // One target is on a port where nothing is listening (connection refused)
     let config = r#"
+version: "1"
 proxies:
   - id: "lb-unreachable-proxy"
     listen_path: "/unreachable"
@@ -1746,6 +1760,7 @@ async fn test_single_backend_and_load_balanced_coexist() {
 
     // Two proxies: one uses upstream_id (load balanced), one uses direct backend
     let config = r#"
+version: "1"
 proxies:
   - id: "direct-proxy"
     listen_path: "/direct"
@@ -1906,6 +1921,7 @@ async fn test_least_connections_load_balancing() {
     let config_path = temp_dir.path().join("config.yaml");
 
     let config = r#"
+version: "1"
 proxies:
   - id: "lb-lc-proxy"
     listen_path: "/lc"
@@ -2029,6 +2045,7 @@ async fn test_random_load_balancing() {
     let config_path = temp_dir.path().join("config.yaml");
 
     let config = r#"
+version: "1"
 proxies:
   - id: "lb-rand-proxy"
     listen_path: "/rand"
@@ -2137,6 +2154,7 @@ async fn test_active_health_check_tcp_probe() {
     // Server on 30221 is healthy (TCP-accepting), server on 30222 has nothing listening.
     // TCP probe should detect 30222 as unhealthy (connection refused).
     let config = r#"
+version: "1"
 proxies:
   - id: "lb-tcp-probe-proxy"
     listen_path: "/tcp-probe"
@@ -2236,6 +2254,7 @@ async fn test_passive_health_check_recovery_timer() {
     // One server returns 500s initially then recovers, the other is always healthy.
     // After the recovery timer fires, the flapping server should be restored.
     let config = r#"
+version: "1"
 proxies:
   - id: "lb-recovery-timer-proxy"
     listen_path: "/recovery-timer"
@@ -2378,6 +2397,7 @@ async fn test_active_health_check_custom_status_codes() {
     // Server on 30241 returns 200 (healthy), server on 30242 returns 503.
     // Because 503 is in healthy_status_codes, BOTH servers should stay healthy.
     let config = r#"
+version: "1"
 proxies:
   - id: "lb-custom-codes-proxy"
     listen_path: "/custom-codes"

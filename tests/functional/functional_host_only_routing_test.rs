@@ -80,6 +80,7 @@ async fn functional_host_only_routing_matches_any_path() {
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "host-only-a"
     hosts: ["a.example.com"]
@@ -133,6 +134,7 @@ async fn functional_host_only_is_fallback_after_path_match() {
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "path-api"
     hosts: ["shared.example.com"]
@@ -193,6 +195,7 @@ async fn functional_host_only_disjoint_hosts_coexist() {
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "host-only-a"
     hosts: ["a.example.com"]

@@ -1,4 +1,5 @@
 ---
+version: "1"
 # UDP end-to-end DTLS performance test config.
 # Client --DTLS--> gateway --DTLS--> backend. Every hop encrypted.
 # Used exclusively by gateways-protocol-benchmark.yml for the "udp-dtls" matrix job.

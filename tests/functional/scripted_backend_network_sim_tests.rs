@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 /// a silent mis-wiring masking a real TTFB regression.
 fn ttfb_test_config(backend_port: u16) -> String {
     let config = json!({
+        "version": "1",
         "proxies": [{
             "id": "scripted",
             "listen_path": "/api",

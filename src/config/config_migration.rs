@@ -54,7 +54,7 @@ impl ConfigMigrator {
         let current_version = value
             .get("version")
             .and_then(|v| v.as_str())
-            .unwrap_or("1")
+            .ok_or_else(|| anyhow::anyhow!("Config is missing required 'version' field"))?
             .to_string();
 
         if current_version == target_version {
@@ -130,7 +130,7 @@ impl ConfigMigrator {
         let from_version = value
             .get("version")
             .and_then(|v| v.as_str())
-            .unwrap_or("1")
+            .ok_or_else(|| anyhow::anyhow!("Config is missing required 'version' field"))?
             .to_string();
 
         let target = CURRENT_CONFIG_VERSION;
@@ -213,7 +213,7 @@ impl ConfigMigrator {
         let version = value
             .get("version")
             .and_then(|v| v.as_str())
-            .unwrap_or("1")
+            .ok_or_else(|| anyhow::anyhow!("Config is missing required 'version' field"))?
             .to_string();
 
         Ok(version)
@@ -226,7 +226,7 @@ impl ConfigMigrator {
         let current = value
             .get("version")
             .and_then(|v| v.as_str())
-            .unwrap_or("1")
+            .ok_or_else(|| anyhow::anyhow!("Config is missing required 'version' field"))?
             .to_string();
 
         if current == target {

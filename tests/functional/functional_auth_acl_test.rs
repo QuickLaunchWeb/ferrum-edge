@@ -2,7 +2,7 @@
 //!
 //! This test verifies end-to-end authentication and authorization flows:
 //! - Key Auth: API key in header and query param
-//! - Basic Auth: username:password with bcrypt hashing
+//! - Basic Auth: username:password with HMAC-SHA256 password hashes
 //! - JWT Auth: HS256-signed tokens with consumer-specific secrets
 //! - HMAC Auth: HMAC-signed requests with replay protection
 //! - Access Control (ACL): Consumer allow/deny lists
@@ -10,17 +10,13 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_auth_acl
 
-use crate::common::TestGateway;
+use crate::common::{TestGateway, empty_digest_header, generate_hmac_signature};
 
 use base64::Engine;
 use chrono::Utc;
-use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
-use sha2::Sha256;
 use std::time::Duration;
-
-type HmacSha256 = Hmac<Sha256>;
 
 fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> String {
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
@@ -286,13 +282,14 @@ async fn add_credential(
     cred_type: &str,
     cred_data: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let credential_set = serde_json::Value::Array(vec![cred_data.clone()]);
     let resp = client
         .put(format!(
             "{}/consumers/{}/credentials/{}",
             admin_url, consumer_id, cred_type
         ))
         .header("Authorization", auth_header)
-        .json(cred_data)
+        .json(&credential_set)
         .send()
         .await?;
     assert!(
@@ -384,15 +381,6 @@ fn generate_consumer_jwt(consumer_username: &str, secret: &str, exp_offset_secs:
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
     let key = EncodingKey::from_secret(secret.as_bytes());
     encode(&header, &claims, &key).expect("Failed to encode JWT")
-}
-
-/// Generate HMAC signature for a request
-fn generate_hmac_signature(method: &str, path: &str, date: &str, secret: &str) -> String {
-    let signing_string = format!("{}\n{}\n{}", method, path, date);
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("Failed to create HMAC instance");
-    mac.update(signing_string.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
 #[tokio::test]
@@ -778,9 +766,7 @@ async fn test_auth_acl_comprehensive() {
             "scope": "proxy",
             "proxy_id": "proxy-hmacauth",
             "enabled": true,
-            // Legacy 3-field signing string (no Digest header); the dedicated
-            // digest-mode functional tests cover the secure-by-default path.
-            "config": {"clock_skew_seconds": 300, "require_digest": false}
+            "config": {"clock_skew_seconds": 300}
         }),
         json!({
             "id": "plugin-keyauth-acl-allow",
@@ -1280,6 +1266,7 @@ async fn test_auth_acl_comprehensive() {
         .get(format!("{}/hmacauth", proxy_url))
         .header("Authorization", &hmac_header)
         .header("Date", &date)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .expect("Request failed");
@@ -1304,6 +1291,7 @@ async fn test_auth_acl_comprehensive() {
         .get(format!("{}/hmacauth", proxy_url))
         .header("Authorization", &hmac_header)
         .header("Date", &date)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .expect("Request failed");
@@ -1324,6 +1312,7 @@ async fn test_auth_acl_comprehensive() {
     let resp = client
         .get(format!("{}/hmacauth", proxy_url))
         .header("Authorization", &hmac_header)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .expect("Request failed");
@@ -1346,6 +1335,7 @@ async fn test_auth_acl_comprehensive() {
         .get(format!("{}/hmacauth", proxy_url))
         .header("Authorization", &hmac_header)
         .header("Date", &date)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .expect("Request failed");
@@ -1361,6 +1351,7 @@ async fn test_auth_acl_comprehensive() {
     let resp = client
         .get(format!("{}/hmacauth", proxy_url))
         .header("Date", Utc::now().to_rfc2822())
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .expect("Request failed");
@@ -1631,7 +1622,10 @@ async fn test_auth_acl_comprehensive() {
     let consumer_json: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(consumer_json["username"], "alice");
     // Verify password_hash is redacted
-    if let Some(basicauth) = consumer_json["credentials"]["basicauth"].as_object()
+    if let Some(basicauth) = consumer_json["credentials"]["basicauth"]
+        .as_array()
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry.as_object())
         && let Some(hash) = basicauth.get("password_hash")
     {
         assert_eq!(
@@ -1652,8 +1646,9 @@ async fn test_auth_acl_comprehensive() {
         .expect("Request failed");
     assert!(resp.status().is_success());
     let consumers: serde_json::Value = resp.json().await.unwrap();
-    assert!(consumers.is_array());
-    let consumers_arr = consumers.as_array().unwrap();
+    let consumers_arr = consumers["data"]
+        .as_array()
+        .expect("consumer list response should include data array");
     assert!(
         consumers_arr.len() >= 3,
         "Should have at least 3 consumers (alice, bob, charlie)"
@@ -2285,7 +2280,7 @@ async fn test_hmac_auth_plus_acl() {
                 "scope": "proxy",
                 "proxy_id": "proxy-hmac-allow",
                 "enabled": true,
-                "config": {"clock_skew_seconds": 300, "require_digest": false}
+                "config": {"clock_skew_seconds": 300}
             }),
             acl_plugin_id: "plugin-hmac-allow-acl",
             acl_config: json!({"allowed_consumers": ["hmac-alice"]}),
@@ -2308,7 +2303,7 @@ async fn test_hmac_auth_plus_acl() {
                 "scope": "proxy",
                 "proxy_id": "proxy-hmac-deny",
                 "enabled": true,
-                "config": {"clock_skew_seconds": 300, "require_digest": false}
+                "config": {"clock_skew_seconds": 300}
             }),
             acl_plugin_id: "plugin-hmac-deny-acl",
             acl_config: json!({"disallowed_consumers": ["hmac-mallory"]}),
@@ -2334,6 +2329,7 @@ async fn test_hmac_auth_plus_acl() {
         .get(format!("{}/hmac-acl-allow", proxy_url))
         .header("Authorization", header)
         .header("Date", date)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .unwrap();
@@ -2348,6 +2344,7 @@ async fn test_hmac_auth_plus_acl() {
         .get(format!("{}/hmac-acl-allow", proxy_url))
         .header("Authorization", header)
         .header("Date", date)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .unwrap();
@@ -2364,6 +2361,7 @@ async fn test_hmac_auth_plus_acl() {
         .get(format!("{}/hmac-acl-allow", proxy_url))
         .header("Authorization", header)
         .header("Date", date)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .unwrap();
@@ -2380,6 +2378,7 @@ async fn test_hmac_auth_plus_acl() {
         .get(format!("{}/hmac-acl-deny", proxy_url))
         .header("Authorization", header)
         .header("Date", date)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .unwrap();
@@ -2395,6 +2394,7 @@ async fn test_hmac_auth_plus_acl() {
         .get(format!("{}/hmac-acl-deny", proxy_url))
         .header("Authorization", header)
         .header("Date", date)
+        .header("Digest", empty_digest_header())
         .send()
         .await
         .unwrap();

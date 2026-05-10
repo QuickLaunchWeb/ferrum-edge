@@ -74,6 +74,7 @@ async fn test_file_mode_basic_request_routing() {
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "echo-proxy"
     listen_path: "/echo"
@@ -124,6 +125,7 @@ async fn test_file_mode_config_reload_on_sighup() {
 
     let initial_config = format!(
         r#"
+version: "1"
 proxies:
   - id: "proxy-initial"
     listen_path: "/api/v1"
@@ -155,6 +157,7 @@ plugin_configs: []
     // Rewrite the config file in place with a second proxy added.
     let updated_config = format!(
         r#"
+version: "1"
 proxies:
   - id: "proxy-initial"
     listen_path: "/api/v1"
@@ -203,6 +206,7 @@ plugin_configs: []
 #[tokio::test]
 async fn test_file_mode_empty_config() {
     let config = r#"
+version: "1"
 proxies: []
 consumers: []
 plugin_configs: []
@@ -225,6 +229,7 @@ async fn test_file_mode_multiple_backends() {
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "backend1"
     listen_path: "/api/backend1"
@@ -275,6 +280,7 @@ async fn test_file_mode_consumer_identity_headers_forwarded() {
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "auth-proxy"
     listen_path: "/auth-api"
@@ -291,7 +297,7 @@ consumers:
     custom_id: "cust-42"
     credentials:
       keyauth:
-        key: "my-secret-api-key"
+        - key: "my-secret-api-key"
 
 plugin_configs:
   - id: "key-auth-plugin"
@@ -369,6 +375,7 @@ async fn test_file_mode_namespace_filtering() {
     // but only the proxies matching FERRUM_NAMESPACE are routable.
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "prod-proxy"
     namespace: "prod"

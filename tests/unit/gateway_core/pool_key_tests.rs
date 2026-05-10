@@ -482,7 +482,7 @@ fn h2_pool_key_pipe_delimiter_count() {
 #[test]
 fn h2_pool_key_no_protocol_field() {
     // H2 pool is always TLS, so there's no protocol field in the key
-    // (unlike ConnectionPool which includes backend_protocol)
+    // (unlike ConnectionPool which includes the backend scheme).
     let mut p1 = minimal_proxy();
     p1.backend_scheme = Some(BackendScheme::Http);
     let mut p2 = minimal_proxy();
@@ -820,7 +820,7 @@ fn h3_pool_key_pipe_delimiter_count() {
 
 #[test]
 fn h3_pool_key_no_protocol_field() {
-    // H3 pool key does not include backend_protocol (always QUIC/TLS)
+    // H3 pool key does not include the backend scheme (always QUIC/TLS).
     let mut p1 = minimal_proxy();
     p1.backend_scheme = Some(BackendScheme::Http);
     let mut p2 = minimal_proxy();

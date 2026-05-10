@@ -471,13 +471,13 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
         if !r.is_object() {
             return Err(format!("rule[{idx}]: rule must be an object"));
         }
-        // `target` is optional — callers (request_transformer) default missing
-        // target to "header", so `None` means "not a body rule, skip". But if
-        // `target` is PRESENT and not a string (including explicit null), it
-        // is a configuration error and must not be silently ignored.
         let target = match r.get("target") {
             Some(Value::String(s)) => s.as_str(),
-            None => continue,
+            None => {
+                return Err(format!(
+                    "rule[{idx}]: 'target' is required (expected header/query/body)"
+                ));
+            }
             Some(_) => {
                 return Err(format!(
                     "rule[{idx}]: 'target' must be a string (expected header/query/body)"

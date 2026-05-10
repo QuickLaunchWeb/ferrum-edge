@@ -303,7 +303,7 @@ async fn test_plugin_creation_all_plugins() {
                 json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
             }
             "response_transformer" => {
-                json!({"rules": [{"operation": "add", "key": "x-test", "value": "1"}]})
+                json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
             }
             "request_size_limiting" => json!({"max_bytes": 1048576}),
             "response_size_limiting" => json!({"max_bytes": 1048576}),

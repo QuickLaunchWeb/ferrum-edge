@@ -347,7 +347,10 @@ async fn test_database_mode_comprehensive() {
 
     assert!(response.status().is_success(), "Failed to list proxies");
     let proxies: serde_json::Value = response.json().await.expect("Failed to parse proxies");
-    assert!(proxies.is_array(), "Proxies response should be an array");
+    assert!(
+        proxies["data"].is_array(),
+        "Proxies response should include a data array"
+    );
     println!("✓ Proxy listing works");
 
     gateway.shutdown();

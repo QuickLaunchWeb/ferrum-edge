@@ -73,3 +73,4 @@ LABEL org.opencontainers.image.title="Ferrum Edge" \
 
 # Run the gateway (already running as nonroot via distroless tag)
 ENTRYPOINT ["/app/ferrum-edge"]
+CMD ["run"]

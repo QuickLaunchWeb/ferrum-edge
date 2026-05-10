@@ -79,7 +79,10 @@ fn create_mtls_consumer(id: &str, username: &str, identity: &str) -> Consumer {
     let mut credentials = HashMap::new();
     let mut mtls_creds = Map::new();
     mtls_creds.insert("identity".to_string(), Value::String(identity.to_string()));
-    credentials.insert("mtls_auth".to_string(), Value::Object(mtls_creds));
+    credentials.insert(
+        "mtls_auth".to_string(),
+        Value::Array(vec![Value::Object(mtls_creds)]),
+    );
 
     Consumer {
         id: id.to_string(),
@@ -598,7 +601,7 @@ async fn test_mtls_auth_ca_fingerprint_case_insensitive() {
     assert_continue(result);
 }
 
-// --- No constraints configured (backwards compatible) ---
+// --- No issuer constraints configured ---
 
 #[tokio::test]
 async fn test_mtls_auth_no_issuer_constraints_allows_any_ca() {
@@ -607,7 +610,7 @@ async fn test_mtls_auth_no_issuer_constraints_allows_any_ca() {
     let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
     let index = ConsumerIndex::new(&[consumer]);
 
-    // No allowed_issuers or fingerprints — should work like before
+    // No allowed_issuers or fingerprints means any trusted client CA is allowed.
     let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
     let mut ctx = create_ctx_with_cert(client_der);
 
@@ -734,11 +737,11 @@ fn test_mtls_auth_rejects_unknown_allowed_issuer_field() {
 }
 
 #[test]
-fn test_mtls_auth_rejects_bad_legacy_issuer_verification() {
+fn test_mtls_auth_rejects_removed_issuer_verification() {
     let err = MtlsAuth::new(&json!({"issuer_verification": {"cn": "CA"}}))
         .err()
-        .expect("bad legacy issuer field must be rejected");
-    assert!(err.contains("unsupported issuer field"), "got: {err}");
+        .expect("removed issuer field must be rejected");
+    assert!(err.contains("issuer_verification"), "got: {err}");
 }
 
 #[test]
@@ -988,15 +991,13 @@ async fn test_mtls_auth_dtls_stream_connect_rejects_unknown_consumer() {
 }
 
 #[tokio::test]
-async fn test_mtls_auth_dtls_with_issuer_verification() {
+async fn test_mtls_auth_dtls_with_allowed_issuer() {
     let (ca_der, client_der) =
         create_ca_signed_cert("Test CA", Some("TestOrg"), None, "dtls-client.example.com");
     let consumer = create_mtls_consumer("c1", "bob", "dtls-client.example.com");
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
-        "issuer_verification": {
-            "issuer_cn": "Test CA"
-        }
+        "allowed_issuers": [{"cn": "Test CA"}]
     }))
     .unwrap();
     let mut ctx = StreamConnectionContext {
@@ -1021,15 +1022,13 @@ async fn test_mtls_auth_dtls_with_issuer_verification() {
 }
 
 #[tokio::test]
-async fn test_mtls_auth_dtls_issuer_verification_rejects_mismatch() {
+async fn test_mtls_auth_dtls_allowed_issuer_rejects_mismatch() {
     let (ca_der, client_der) =
         create_ca_signed_cert("Test CA", Some("TestOrg"), None, "dtls-client.example.com");
     let consumer = create_mtls_consumer("c1", "bob", "dtls-client.example.com");
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
-        "issuer_verification": {
-            "issuer_cn": "Other CA"
-        }
+        "allowed_issuers": [{"cn": "Other CA"}]
     }))
     .unwrap();
     let mut ctx = StreamConnectionContext {

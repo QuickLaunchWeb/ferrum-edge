@@ -166,6 +166,7 @@ fn write_ws_config_with_plugins(
 ) {
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "ws-echo-proxy"
     listen_path: "/ws-echo"

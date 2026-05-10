@@ -334,7 +334,7 @@ jobs:
           FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
           FERRUM_POOL_ENABLE_HTTP2=false \
           FERRUM_POOL_WARMUP_ENABLED=true \
-          ./target/ci-release/ferrum-edge > /tmp/gateway.log 2>&1 &
+          ./target/ci-release/ferrum-edge run > /tmp/gateway.log 2>&1 &
           echo "GATEWAY_PID=$!" >> $GITHUB_ENV
           for i in $(seq 1 15); do
             if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then

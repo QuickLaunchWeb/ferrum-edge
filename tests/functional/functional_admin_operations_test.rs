@@ -327,7 +327,7 @@ async fn test_admin_consumer_credential_crud() {
             harness.admin_base_url
         ))
         .header("Authorization", &auth)
-        .json(&json!({"key": "my-secret-api-key"}))
+        .json(&json!([{"key": "my-secret-api-key"}]))
         .send()
         .await
         .unwrap();
@@ -349,7 +349,7 @@ async fn test_admin_consumer_credential_crud() {
         .unwrap();
     let consumer: serde_json::Value = resp.json().await.unwrap();
     assert!(
-        consumer["credentials"]["keyauth"].is_object(),
+        consumer["credentials"]["keyauth"].is_array(),
         "Consumer should have keyauth credentials"
     );
 
@@ -360,7 +360,7 @@ async fn test_admin_consumer_credential_crud() {
             harness.admin_base_url
         ))
         .header("Authorization", &auth)
-        .json(&json!({"secret": "my-jwt-secret-padding-1234567890ab"}))
+        .json(&json!([{"secret": "my-jwt-secret-padding-1234567890ab"}]))
         .send()
         .await
         .unwrap();
@@ -404,7 +404,7 @@ async fn test_admin_consumer_credential_crud() {
         "Keyauth credential should be deleted"
     );
     assert!(
-        consumer["credentials"]["jwt"].is_object(),
+        consumer["credentials"]["jwt"].is_array(),
         "JWT credential should still exist"
     );
 }

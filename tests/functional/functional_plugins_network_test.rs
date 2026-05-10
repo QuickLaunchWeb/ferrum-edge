@@ -30,6 +30,7 @@ fn yaml_with_plugin(
     plugin_config: Value,
 ) -> String {
     let config = json!({
+        "version": "1",
         "proxies": [{
             "id": "phase8-plugin",
             "listen_path": "/api",

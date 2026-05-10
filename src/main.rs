@@ -105,7 +105,7 @@ impl<'a> MakeWriter<'a> for SeverityWriter {
 /// Entry point for the Ferrum Edge gateway binary.
 ///
 /// Startup sequence:
-/// 1. Parse CLI arguments (if any — no args falls through to legacy env-var mode)
+/// 1. Parse CLI arguments
 /// 2. Install rustls crypto provider (ring backend)
 /// 3. Resolve external secrets (Vault, AWS, Azure, GCP, env, file) using a
 ///    temporary runtime that is dropped before env mutation
@@ -156,7 +156,7 @@ fn main() {
     match &cli.command {
         Some(cli::Command::Run(args)) => cli::apply_run_overrides(args),
         Some(cli::Command::Validate(args)) => cli::apply_validate_overrides(args),
-        _ => {} // No subcommand: legacy env-var-only mode.
+        _ => {}
     }
 
     // ── Crypto provider ─────────────────────────────────────────────────

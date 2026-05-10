@@ -247,10 +247,9 @@ pub struct MetricsRegistry {
     /// Minimum cache age (nanos) before record() bothers to invalidate.
     /// Prevents an Arc allocation on every request under high load.
     cache_invalidation_min_age_nanos: AtomicU64,
-    /// Extra label fragment for namespace isolation. Empty when namespace is
-    /// the default ("ferrum"), otherwise `",namespace=\"<ns>\""`. Injected
-    /// into every metric's label set during render so that multiple gateway
-    /// instances with different namespaces produce distinct time series.
+    /// Extra label fragment for namespace isolation. Injected into every
+    /// metric's label set during render so that multiple gateway instances with
+    /// different namespaces produce distinct time series.
     namespace_label: std::sync::RwLock<String>,
 }
 
@@ -305,14 +304,9 @@ impl MetricsRegistry {
             cache_invalidation_min_age_ms.saturating_mul(1_000_000),
             Ordering::Relaxed,
         );
-        // Set namespace label fragment for non-default namespaces.
-        // Empty string for the default "ferrum" namespace (backward compatible).
+        // Set namespace label fragment for every namespace.
         if let Ok(mut ns_label) = self.namespace_label.write() {
-            if namespace != crate::config::types::DEFAULT_NAMESPACE {
-                *ns_label = format!(",namespace=\"{}\"", escape_label_value(namespace));
-            } else {
-                ns_label.clear();
-            }
+            *ns_label = format!(",namespace=\"{}\"", escape_label_value(namespace));
         }
     }
 
@@ -560,7 +554,7 @@ impl MetricsRegistry {
             + self.stream_duration_buckets.len() * 800;
         let mut output = String::with_capacity(estimated_cap);
 
-        // Read namespace label fragment once (empty for default namespace).
+        // Read namespace label fragment once for the render pass.
         let ns_label = self
             .namespace_label
             .read()
@@ -825,10 +819,6 @@ impl PrometheusMetrics {
         Ok(Self { registry })
     }
 }
-
-/// Backwards-compatible alias. Prefer `super::priority::PROMETHEUS_METRICS`.
-#[allow(dead_code)]
-pub const PROMETHEUS_METRICS_PRIORITY: u16 = super::priority::PROMETHEUS_METRICS;
 
 #[async_trait]
 impl Plugin for PrometheusMetrics {

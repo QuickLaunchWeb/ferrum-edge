@@ -34,7 +34,6 @@ struct XdsSubscription {
     type_url: String,
     resource_names: Vec<String>,
     wildcard: bool,
-    legacy_wildcard: bool,
 }
 
 #[derive(Clone)]
@@ -1131,12 +1130,8 @@ fn build_sotw_subscription(
     type_url: &str,
     resource_names: &[String],
 ) -> XdsSubscription {
-    let has_wildcard = resource_names.iter().any(|name| name == "*");
-    let legacy_wildcard = resource_names.is_empty()
-        && !has_wildcard
-        && previous.is_none_or(|subscription| {
-            subscription.legacy_wildcard && subscription.resource_names.is_empty()
-        });
+    let has_wildcard = resource_names.iter().any(|name| name == "*")
+        || (resource_names.is_empty() && previous.is_none_or(|subscription| subscription.wildcard));
     let mut resource_names = resource_names
         .iter()
         .filter(|name| name.as_str() != "*")
@@ -1149,8 +1144,7 @@ fn build_sotw_subscription(
         node_id: node_id.to_string(),
         type_url: type_url.to_string(),
         resource_names,
-        wildcard: has_wildcard || legacy_wildcard,
-        legacy_wildcard,
+        wildcard: has_wildcard,
     }
 }
 
@@ -1168,15 +1162,11 @@ fn build_delta_subscription(
         .unwrap_or_default();
     let mut wildcard = previous
         .map(|subscription| subscription.wildcard)
-        .unwrap_or(!explicit_subscription_request);
-    let mut legacy_wildcard = previous
-        .map(|subscription| subscription.legacy_wildcard)
-        .unwrap_or(!explicit_subscription_request);
+        .unwrap_or(resource_names_subscribe.is_empty() && resource_names_unsubscribe.is_empty());
 
     for name in resource_names_subscribe {
         if name == "*" {
             wildcard = true;
-            legacy_wildcard = false;
             continue;
         }
         if !resource_names.contains(name) {
@@ -1193,7 +1183,6 @@ fn build_delta_subscription(
             .collect();
         if removed.contains("*") {
             wildcard = false;
-            legacy_wildcard = false;
         }
         resource_names.retain(|name| !removed.contains(name.as_str()));
     }
@@ -1203,7 +1192,6 @@ fn build_delta_subscription(
         type_url: type_url.to_string(),
         resource_names,
         wildcard,
-        legacy_wildcard,
     };
     let changed = previous.is_none_or(|previous| previous != &subscription);
     (subscription, changed, explicit_subscription_request)
@@ -1370,7 +1358,6 @@ mod tests {
                 type_url: super::super::translator::CDS_TYPE_URL.to_string(),
                 resource_names: Vec::new(),
                 wildcard: true,
-                legacy_wildcard: true,
             },
         )])
     }
@@ -1514,6 +1501,7 @@ mod tests {
         let mut subscriptions = HashMap::new();
         let request = DiscoveryRequest {
             type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+            resource_names: vec!["*".to_string()],
             ..DiscoveryRequest::default()
         };
 
@@ -1546,6 +1534,7 @@ mod tests {
         server.catch_up_pending_updates(&mut updates, &mut stream_config);
         let request = DeltaDiscoveryRequest {
             type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+            resource_names_subscribe: vec!["*".to_string()],
             ..DeltaDiscoveryRequest::default()
         };
         let (subscription, _, _) = build_delta_subscription(
@@ -1636,6 +1625,7 @@ mod tests {
         let mut subscriptions = HashMap::new();
         let request = DiscoveryRequest {
             type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+            resource_names: vec!["*".to_string()],
             ..DiscoveryRequest::default()
         };
 
@@ -1817,7 +1807,6 @@ mod tests {
                 type_url: super::super::translator::CDS_TYPE_URL.to_string(),
                 resource_names: Vec::new(),
                 wildcard: true,
-                legacy_wildcard: true,
             },
             &initial_resource_versions,
             &[],
@@ -1842,7 +1831,6 @@ mod tests {
                 type_url: super::super::translator::CDS_TYPE_URL.to_string(),
                 resource_names: Vec::new(),
                 wildcard: false,
-                legacy_wildcard: false,
             },
             &HashMap::new(),
             &[],
@@ -1860,7 +1848,6 @@ mod tests {
             type_url: super::super::translator::CDS_TYPE_URL.to_string(),
             resource_names: vec!["cluster/default/api/8080".to_string()],
             wildcard: false,
-            legacy_wildcard: false,
         };
         let (subscription, changed, explicit) = build_delta_subscription(
             Some(&previous),
@@ -1902,7 +1889,16 @@ mod tests {
     }
 
     #[test]
-    fn sotw_empty_after_explicit_wildcard_is_unsubscribe_all() {
+    fn sotw_initial_empty_subscription_is_wildcard() {
+        let subscription =
+            build_sotw_subscription(None, "node-a", super::super::translator::CDS_TYPE_URL, &[]);
+
+        assert!(subscription.wildcard);
+        assert!(subscription.resource_names.is_empty());
+    }
+
+    #[test]
+    fn sotw_empty_after_explicit_wildcard_preserves_wildcard() {
         let previous = build_sotw_subscription(
             None,
             "node-a",
@@ -1910,7 +1906,6 @@ mod tests {
             &["*".to_string()],
         );
         assert!(previous.wildcard);
-        assert!(!previous.legacy_wildcard);
         assert!(previous.resource_names.is_empty());
 
         let subscription = build_sotw_subscription(
@@ -1920,8 +1915,7 @@ mod tests {
             &[],
         );
 
-        assert!(!subscription.wildcard);
-        assert!(!subscription.legacy_wildcard);
+        assert!(subscription.wildcard);
         assert!(subscription.resource_names.is_empty());
     }
 
@@ -1932,7 +1926,6 @@ mod tests {
             type_url: super::super::translator::CDS_TYPE_URL.to_string(),
             resource_names: Vec::new(),
             wildcard: true,
-            legacy_wildcard: true,
         };
         let (subscription, changed, explicit) = build_delta_subscription(
             Some(&previous),
@@ -1968,6 +1961,22 @@ mod tests {
     }
 
     #[test]
+    fn delta_initial_empty_subscription_is_wildcard() {
+        let (subscription, changed, explicit) = build_delta_subscription(
+            None,
+            "node-a",
+            super::super::translator::CDS_TYPE_URL,
+            &[],
+            &[],
+        );
+
+        assert!(changed);
+        assert!(!explicit);
+        assert!(subscription.wildcard);
+        assert!(subscription.resource_names.is_empty());
+    }
+
+    #[test]
     fn delta_explicit_missing_subscription_returns_removed_resource() {
         let server = test_server(gateway_config_with_service(false, 0));
         let snapshot = server.rebuild_snapshot("node-a");
@@ -1980,7 +1989,6 @@ mod tests {
                 type_url: super::super::translator::CDS_TYPE_URL.to_string(),
                 resource_names: vec![subscribed.clone()],
                 wildcard: false,
-                legacy_wildcard: false,
             },
             &HashMap::new(),
             std::slice::from_ref(&subscribed),
@@ -2001,7 +2009,6 @@ mod tests {
             type_url: super::super::translator::CDS_TYPE_URL.to_string(),
             resource_names: vec![unsubscribed.clone()],
             wildcard: true,
-            legacy_wildcard: false,
         };
         let (subscription, changed, explicit) = build_delta_subscription(
             Some(&previous_subscription),
@@ -2039,7 +2046,6 @@ mod tests {
             type_url: super::super::translator::CDS_TYPE_URL.to_string(),
             resource_names: vec!["cluster/default/api/8080".to_string()],
             wildcard: false,
-            legacy_wildcard: false,
         };
         let (subscription, changed, explicit) = build_delta_subscription(
             Some(&previous),

@@ -176,6 +176,7 @@ async fn functional_regex_routing_basic_mixed_routes() {
     let config_path = temp_dir.path().join("config.yaml");
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "prefix-api"
     listen_path: "/api"
@@ -308,6 +309,7 @@ async fn functional_regex_routing_full_path_anchoring() {
     let config_path = temp_dir.path().join("config.yaml");
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "regex-users"
     listen_path: "~/users/[^/]+"
@@ -377,6 +379,7 @@ async fn functional_regex_routing_dot_star_suffix_matches_deep_paths() {
     let config_path = temp_dir.path().join("config.yaml");
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "regex-versioned"
     listen_path: "~/api/v[0-9]+/.*"
@@ -449,6 +452,7 @@ async fn functional_regex_routing_first_match_wins_config_order() {
     let config_path = temp_dir.path().join("config.yaml");
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "regex-first-specific"
     listen_path: "~/thing/[^/]+"
@@ -519,6 +523,7 @@ async fn functional_regex_routing_prefix_wins_over_regex() {
     let config_path = temp_dir.path().join("config.yaml");
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "prefix-api"
     listen_path: "/api"
@@ -583,7 +588,7 @@ async fn functional_regex_routing_scale_50_regex_routes() {
     sleep(Duration::from_millis(300)).await;
 
     // Build YAML with 50 regex proxies: ~/rNN/[^/]+ → backend-rNN.
-    let mut yaml = String::from("proxies:\n");
+    let mut yaml = String::from("version: \"1\"\nproxies:\n");
     for (i, (port, _)) in backends.iter().enumerate() {
         yaml.push_str(&format!(
             "  - id: \"regex-r{:02}\"\n    listen_path: \"~/r{:02}/[^/]+\"\n    backend_scheme: http\n    backend_host: \"127.0.0.1\"\n    backend_port: {}\n    strip_listen_path: false\n\n",

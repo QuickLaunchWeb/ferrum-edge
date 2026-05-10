@@ -79,7 +79,7 @@ No TLS configuration needed:
 # Gateway starts with:
 # - HTTP listener on port 8000 (configurable via FERRUM_PROXY_HTTP_PORT)
 # - No HTTPS listener
-./ferrum-edge
+./ferrum-edge run
 ```
 
 ### 2. HTTPS + HTTP (Dual Listeners)
@@ -90,7 +90,7 @@ Enable server TLS:
 export FERRUM_FRONTEND_TLS_CERT_PATH="/etc/ssl/certs/gateway.crt"
 export FERRUM_FRONTEND_TLS_KEY_PATH="/etc/ssl/private/gateway.key"
 
-./ferrum-edge
+./ferrum-edge run
 ```
 
 **What happens:**
@@ -110,7 +110,7 @@ export FERRUM_FRONTEND_TLS_CERT_PATH="/etc/ssl/certs/gateway.crt"
 export FERRUM_FRONTEND_TLS_KEY_PATH="/etc/ssl/private/gateway.key"
 export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="/etc/ssl/certs/client-ca-bundle.pem"
 
-./ferrum-edge
+./ferrum-edge run
 ```
 
 **What happens:**
@@ -154,7 +154,7 @@ TLS not configured - HTTPS listener disabled
 **Development:**
 ```bash
 # HTTP only for easy development
-./ferrum-edge
+./ferrum-edge run
 # Access: http://localhost:8000
 ```
 
@@ -163,7 +163,7 @@ TLS not configured - HTTPS listener disabled
 # Both HTTP and HTTPS for testing
 export FERRUM_FRONTEND_TLS_CERT_PATH="./staging.crt"
 export FERRUM_FRONTEND_TLS_KEY_PATH="./staging.key"
-./ferrum-edge
+./ferrum-edge run
 # Access: http://localhost:8000 AND https://localhost:8443
 ```
 
@@ -182,7 +182,7 @@ export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="/prod/certs/client-ca.pem"
 export FERRUM_ADMIN_TLS_CERT_PATH="/prod/certs/admin.crt"
 export FERRUM_ADMIN_TLS_KEY_PATH="/prod/certs/admin.key"
 
-./ferrum-edge
+./ferrum-edge run
 # Proxy: https://localhost:8443 only (mTLS required)
 # Admin: https://localhost:9443 only
 # No plaintext listeners bound — nothing to firewall
@@ -254,7 +254,7 @@ export FERRUM_ADMIN_JWT_SECRET="your-secret-key"
 
 #### **1. Admin HTTP Only (Default)**
 ```bash
-./ferrum-edge
+./ferrum-edge run
 # Admin HTTP: http://localhost:9000
 # No Admin HTTPS
 ```
@@ -263,7 +263,7 @@ export FERRUM_ADMIN_JWT_SECRET="your-secret-key"
 ```bash
 export FERRUM_ADMIN_TLS_CERT_PATH="/etc/ssl/certs/admin.crt"
 export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"
-./ferrum-edge
+./ferrum-edge run
 # Admin HTTP: http://localhost:9000
 # Admin HTTPS: https://localhost:9443
 ```
@@ -273,7 +273,7 @@ export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"
 export FERRUM_ADMIN_TLS_CERT_PATH="/etc/ssl/certs/admin.crt"
 export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"
 export FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH="/etc/ssl/certs/admin-client-ca.pem"
-./ferrum-edge
+./ferrum-edge run
 # Admin HTTP: http://localhost:9000
 # Admin HTTPS/mTLS: https://localhost:9443 (client certs required)
 ```
@@ -283,7 +283,7 @@ export FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH="/etc/ssl/certs/admin-client-ca.pe
 export FERRUM_ADMIN_HTTP_PORT=0  # Disable plaintext admin
 export FERRUM_ADMIN_TLS_CERT_PATH="/etc/ssl/certs/admin.crt"
 export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"
-./ferrum-edge
+./ferrum-edge run
 # Admin HTTPS only: https://localhost:9443
 # No HTTP listener — plaintext admin requests are impossible
 ```
@@ -293,7 +293,7 @@ export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"
 export FERRUM_ADMIN_TLS_CERT_PATH="/etc/ssl/certs/admin.crt"
 export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"
 export FERRUM_ADMIN_TLS_NO_VERIFY="true"
-./ferrum-edge
+./ferrum-edge run
 # Admin HTTP: http://localhost:9000
 # Admin HTTPS: https://localhost:9443 (no cert verification)
 ```
@@ -377,7 +377,7 @@ export FERRUM_FRONTEND_TLS_CERT_PATH="./server.crt"
 export FERRUM_FRONTEND_TLS_KEY_PATH="./server.key"
 export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="./client-ca-bundle.pem"
 
-./ferrum-edge
+./ferrum-edge run
 ```
 
 ### Test with Client Certificate
@@ -511,7 +511,7 @@ Enable debug logging to troubleshoot TLS issues:
 
 ```bash
 export RUST_LOG=debug
-./ferrum-edge
+./ferrum-edge run
 ```
 
 Look for messages like:
@@ -552,7 +552,7 @@ export FERRUM_TLS_MAX_VERSION="1.3"
 export FERRUM_TLS_MIN_VERSION="1.3"
 export FERRUM_TLS_MAX_VERSION="1.3"
 
-# TLS 1.2 only (legacy compatibility)
+# TLS 1.2 only
 export FERRUM_TLS_MIN_VERSION="1.2"
 export FERRUM_TLS_MAX_VERSION="1.2"
 ```

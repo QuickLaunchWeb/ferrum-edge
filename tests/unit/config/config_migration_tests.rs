@@ -16,16 +16,15 @@ fn test_migrate_value_already_current() {
 }
 
 #[test]
-fn test_migrate_value_no_version_defaults_to_1() {
+fn test_migrate_value_no_version_is_rejected() {
     let mut value = serde_json::json!({
         "proxies": [],
         "consumers": [],
         "plugin_configs": []
     });
 
-    // Since current version is "1" and default is "1", no migration needed
-    let steps = ConfigMigrator::migrate_value(&mut value, "1").unwrap();
-    assert_eq!(steps, 0);
+    let err = ConfigMigrator::migrate_value(&mut value, "1").unwrap_err();
+    assert!(err.to_string().contains("version"));
 }
 
 #[test]
@@ -43,7 +42,7 @@ fn test_detect_version_from_file() {
 }
 
 #[test]
-fn test_detect_version_defaults_to_1_when_absent() {
+fn test_detect_version_rejects_absent_version() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.yaml");
     std::fs::write(
@@ -52,8 +51,8 @@ fn test_detect_version_defaults_to_1_when_absent() {
     )
     .unwrap();
 
-    let version = ConfigMigrator::detect_version(config_path.to_str().unwrap()).unwrap();
-    assert_eq!(version, "1");
+    let err = ConfigMigrator::detect_version(config_path.to_str().unwrap()).unwrap_err();
+    assert!(err.to_string().contains("version"));
 }
 
 #[test]

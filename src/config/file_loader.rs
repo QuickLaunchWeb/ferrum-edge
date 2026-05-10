@@ -85,7 +85,7 @@ pub fn load_config_from_file(
     let file_version = value
         .get("version")
         .and_then(|v| v.as_str())
-        .unwrap_or("1")
+        .ok_or_else(|| anyhow::anyhow!("Configuration file missing required 'version' field"))?
         .to_string();
 
     if file_version != CURRENT_CONFIG_VERSION {

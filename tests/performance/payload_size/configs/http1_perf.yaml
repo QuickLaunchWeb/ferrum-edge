@@ -1,4 +1,5 @@
 ---
+version: "1"
 # HTTP/1.1 payload size test config
 # Gateway listens on HTTP (8000), proxies to HTTP/1.1 backend
 proxies:

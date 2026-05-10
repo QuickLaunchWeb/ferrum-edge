@@ -1,4 +1,5 @@
 ---
+version: "1"
 # HTTP/3 (QUIC) payload size test config
 # Gateway listens with HTTP/3 enabled, proxies to HTTP/3 backend
 proxies:

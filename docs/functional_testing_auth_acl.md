@@ -7,7 +7,7 @@ This document describes the comprehensive end-to-end functional test suite for a
 The functional test (`tests/functional/functional_auth_acl_test.rs`) validates the complete authentication and authorization pipeline across all supported auth plugins. It exercises 40 test cases covering:
 
 - **Key Auth**: API key authentication via header and query parameter
-- **Basic Auth**: Username/password authentication with bcrypt hashing
+- **Basic Auth**: Username/password authentication with HMAC-SHA256 password hashes
 - **JWT Auth**: HS256-signed token authentication with per-consumer secrets
 - **HMAC Auth**: HMAC-signed request authentication with replay protection
 - **Access Control (ACL)**: Consumer allow/deny lists for authorization

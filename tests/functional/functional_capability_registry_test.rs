@@ -84,6 +84,7 @@ fn write_frontend_certs(scratch: &std::path::Path, ca_name: &str) -> (String, St
 /// Single-proxy file-mode YAML for HTTPS at `127.0.0.1:<port>`.
 fn h3_file_config(port: u16) -> String {
     let config = json!({
+        "version": "1",
         "proxies": [{
             "id": "phase8-h3",
             "listen_path": "/api",
