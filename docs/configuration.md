@@ -211,7 +211,7 @@ The Istio `AuthorizationPolicy` translator only consumes the four positive-match
 
 The injector copies non-secret mesh sidecar control-plane env vars from its own environment into injected containers when set: `FERRUM_DP_CP_GRPC_URLS`, `FERRUM_CP_DP_GRPC_JWT_ISSUER`, DP gRPC TLS vars, and `FERRUM_MESH_CONFIG_PROTOCOL`. It does not copy plaintext `FERRUM_CP_DP_GRPC_JWT_SECRET`; set `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` and `FERRUM_INJECTOR_JWT_SECRET_REF_KEY` to inject that variable via `valueFrom.secretKeyRef`.
 
-Outbound capture exclusions can also be set per pod with `traffic.sidecar.istio.io/excludeOutboundPorts` or `ferrum.io/excludeOutboundPorts`, using comma-separated TCP ports. Global and pod-local lists are merged and deduplicated before the init container renders iptables `RETURN` rules.
+Outbound capture exclusions can also be set per pod with `traffic.sidecar.istio.io/excludeOutboundPorts` or `ferrum.io/excludeOutboundPorts`, using comma-separated TCP ports. Global and pod-local lists are merged and deduplicated before the init container renders iptables `RETURN` rules. Other Istio capture annotations such as `excludeInboundPorts`, `includeOutboundPorts`, `excludeOutboundIPRanges`, and `includeOutboundIPRanges` are not implemented yet.
 
 ### Migration
 
