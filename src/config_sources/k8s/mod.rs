@@ -46,6 +46,7 @@ pub struct K8sTranslationOptions {
     pub namespace: String,
     pub trust_domain: TrustDomain,
     pub prefer_istio_on_overlap: bool,
+    pub istio_root_namespace: String,
 }
 
 impl K8sTranslationOptions {
@@ -54,7 +55,15 @@ impl K8sTranslationOptions {
             namespace,
             trust_domain,
             prefer_istio_on_overlap: true,
+            istio_root_namespace: "istio-system".to_string(),
         }
+    }
+
+    pub fn with_istio_root_namespace(mut self, namespace: String) -> Self {
+        if !namespace.trim().is_empty() {
+            self.istio_root_namespace = namespace;
+        }
+        self
     }
 }
 

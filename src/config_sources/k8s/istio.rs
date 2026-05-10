@@ -13,13 +13,12 @@ use crate::modes::mesh::config::{
 };
 
 use super::{
-    K8sAccumulator, K8sObject, K8sTranslateError, RouteBackend, RouteProxySpec, SourceKind,
-    exact_path_listen_path, invalid_resource, optional_port_field, port_from_u64, proxy_for_route,
-    resource_id, selector_from_istio, string_array, string_field, string_map, upstream_for_route,
+    K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions, RouteBackend,
+    RouteProxySpec, SourceKind, exact_path_listen_path, invalid_resource, optional_port_field,
+    port_from_u64, proxy_for_route, resource_id, selector_from_istio, string_array, string_field,
+    string_map, upstream_for_route,
 };
 use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT};
-
-const ISTIO_ROOT_NAMESPACE: &str = "istio-system";
 
 pub(super) fn translate(
     acc: &mut K8sAccumulator,
@@ -64,7 +63,7 @@ pub(super) fn translate(
         "RequestAuthentication" => {
             acc.mesh
                 .request_authentications
-                .push(request_authentication(object)?);
+                .push(request_authentication(acc, object)?);
             Ok(true)
         }
         "Sidecar" => {
@@ -75,7 +74,7 @@ pub(super) fn translate(
             Ok(true)
         }
         "Telemetry" => {
-            acc.mesh.telemetry_resources.push(telemetry(object)?);
+            acc.mesh.telemetry_resources.push(telemetry(acc, object)?);
             Ok(true)
         }
         _ => Ok(false),
@@ -327,9 +326,10 @@ fn peer_authentication(object: &K8sObject) -> Result<PeerAuthentication, K8sTran
 }
 
 fn request_authentication(
+    acc: &K8sAccumulator,
     object: &K8sObject,
 ) -> Result<MeshRequestAuthentication, K8sTranslateError> {
-    let scope = istio_policy_scope(object, object.spec.get("selector"));
+    let scope = istio_policy_scope(&acc.options, object, object.spec.get("selector"));
 
     let jwt_rules: Vec<MeshJwtRule> = object
         .spec
@@ -401,15 +401,20 @@ fn translate_jwt_rule(object: &K8sObject, rule: &Value) -> Result<MeshJwtRule, K
     })
 }
 
-fn istio_policy_scope(object: &K8sObject, selector: Option<&Value>) -> PolicyScope {
+fn istio_policy_scope(
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+    selector: Option<&Value>,
+) -> PolicyScope {
+    let is_root_namespace = object.metadata.namespace == options.istio_root_namespace;
     match selector {
         Some(selector) => PolicyScope::WorkloadSelector {
             selector: WorkloadSelector {
                 labels: selector_from_istio(Some(selector)),
-                namespace: Some(object.metadata.namespace.clone()),
+                namespace: (!is_root_namespace).then(|| object.metadata.namespace.clone()),
             },
         },
-        None if object.metadata.namespace == ISTIO_ROOT_NAMESPACE => PolicyScope::MeshWide,
+        None if is_root_namespace => PolicyScope::MeshWide,
         None => PolicyScope::Namespace {
             namespace: object.metadata.namespace.clone(),
         },
@@ -803,8 +808,11 @@ fn app_protocol(value: Option<&str>) -> AppProtocol {
     }
 }
 
-fn telemetry(object: &K8sObject) -> Result<MeshTelemetryResource, K8sTranslateError> {
-    let scope = istio_policy_scope(object, object.spec.get("selector"));
+fn telemetry(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+) -> Result<MeshTelemetryResource, K8sTranslateError> {
+    let scope = istio_policy_scope(&acc.options, object, object.spec.get("selector"));
 
     let tracing = object
         .spec
@@ -1052,6 +1060,13 @@ mod tests {
     fn options() -> K8sTranslationOptions {
         K8sTranslationOptions::new(
             "default".to_string(),
+            TrustDomain::new("cluster.local").expect("test trust domain"),
+        )
+    }
+
+    fn options_for_namespace(namespace: &str) -> K8sTranslationOptions {
+        K8sTranslationOptions::new(
+            namespace.to_string(),
             TrustDomain::new("cluster.local").expect("test trust domain"),
         )
     }
@@ -1929,7 +1944,7 @@ mod tests {
         assert_eq!(ra.name, "sample");
         assert_eq!(ra.namespace, "default");
         assert!(
-            matches!(&ra.scope, PolicyScope::WorkloadSelector { selector } if selector.labels.get("app") == Some(&"httpbin".to_string()))
+            matches!(&ra.scope, PolicyScope::WorkloadSelector { selector } if selector.namespace.as_deref() == Some("default") && selector.labels.get("app") == Some(&"httpbin".to_string()))
         );
         assert_eq!(ra.jwt_rules.len(), 1);
         let rule = &ra.jwt_rules[0];
@@ -1946,6 +1961,34 @@ mod tests {
         assert!(rule.from_headers[1].prefix.is_none());
         assert_eq!(rule.from_params, vec!["access_token"]);
         assert!(rule.forward_original_token);
+    }
+
+    #[test]
+    fn root_namespace_request_authentication_selector_is_mesh_wide_by_labels() {
+        let mut ra = object(
+            "RequestAuthentication",
+            serde_json::json!({
+                "selector": {"matchLabels": {"app": "httpbin"}},
+                "jwtRules": [{
+                    "issuer": "https://accounts.google.com",
+                    "jwksUri": "https://www.googleapis.com/oauth2/v3/certs"
+                }]
+            }),
+        );
+        ra.metadata.namespace = "istio-config".to_string();
+
+        let result = translate_k8s_objects(
+            &[ra],
+            options_for_namespace("istio-config")
+                .with_istio_root_namespace("istio-config".to_string()),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let scope = &mesh.request_authentications[0].scope;
+        assert!(
+            matches!(scope, PolicyScope::WorkloadSelector { selector } if selector.namespace.is_none() && selector.labels.get("app") == Some(&"httpbin".to_string()))
+        );
     }
 
     #[test]
@@ -1970,6 +2013,31 @@ mod tests {
             &ra.scope,
             PolicyScope::Namespace { namespace } if namespace == "default"
         ));
+    }
+
+    #[test]
+    fn root_namespace_telemetry_selector_is_mesh_wide_by_labels() {
+        let mut telemetry = object(
+            "Telemetry",
+            serde_json::json!({
+                "selector": {"matchLabels": {"app": "gateway"}},
+                "tracing": [{"randomSamplingPercentage": 10.0}]
+            }),
+        );
+        telemetry.metadata.namespace = "istio-config".to_string();
+
+        let result = translate_k8s_objects(
+            &[telemetry],
+            options_for_namespace("istio-config")
+                .with_istio_root_namespace("istio-config".to_string()),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let scope = &mesh.telemetry_resources[0].scope;
+        assert!(
+            matches!(scope, PolicyScope::WorkloadSelector { selector } if selector.namespace.is_none() && selector.labels.get("app") == Some(&"gateway".to_string()))
+        );
     }
 
     #[test]
