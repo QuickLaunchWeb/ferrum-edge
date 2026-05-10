@@ -949,7 +949,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
                                 ) {
                                     update_state_config_received(connection_state);
                                     info!(
-                                        "Gateway trust bundle update applied from rejected CP delta"
+                                        "Gateway trust bundle update applied from CP despite rejected resource delta"
                                     );
                                 }
                                 if was_empty {

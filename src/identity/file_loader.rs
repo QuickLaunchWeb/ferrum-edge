@@ -184,9 +184,8 @@ fn verify_leaf_key_match(leaf_der: &[u8], key_der: &[u8]) -> Result<(), SpiffeTl
     let key_pair = rcgen::KeyPair::try_from(key_der).map_err(|e| {
         SpiffeTlsError::BadKeyMaterial(format!("gateway SVID private key is invalid: {e}"))
     })?;
-    // Both sources are ASN.1 DER-encoded SubjectPublicKeyInfo. Comparing the
-    // canonical DER keeps this check allocation-free but can reject exotic
-    // non-canonical encodings from third-party certificate tooling.
+    // Compare canonical DER SubjectPublicKeyInfo bytes. x509-parser preserves
+    // the certificate SPKI DER and rcgen emits canonical SPKI DER for the key.
     let cert_spki = leaf.tbs_certificate.subject_pki.raw;
     let key_spki = key_pair.subject_public_key_info();
     if cert_spki != key_spki.as_slice() {

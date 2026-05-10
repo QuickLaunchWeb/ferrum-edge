@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::fmt::Write;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -130,7 +131,7 @@ impl HbonePoolError {
 
 pub struct HboneConnectionPool {
     entries: DashMap<String, Vec<HbonePoolEntry>>,
-    pending_creations: DashMap<String, std::sync::Arc<Mutex<()>>>,
+    creation_locks: DashMap<String, Arc<Mutex<()>>>,
     gateway_svid: SharedSvidBundle,
     dns_cache: DnsCache,
     pool_config: PoolConfig,
@@ -146,7 +147,7 @@ impl HboneConnectionPool {
     ) -> Self {
         Self {
             entries: DashMap::with_shard_amount(shard_amount),
-            pending_creations: DashMap::with_shard_amount(shard_amount),
+            creation_locks: DashMap::with_shard_amount(shard_amount),
             gateway_svid,
             dns_cache,
             pool_config,
@@ -312,83 +313,111 @@ impl HboneConnectionPool {
             None => {}
         }
 
+        let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+        let creation_started = Instant::now();
+        let authority = authority_for_host_port(target_host, target_port);
         let creation_lock = self
-            .pending_creations
+            .creation_locks
             .entry(key.to_string())
-            .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
-        let sender_result = {
-            let _guard = creation_lock.lock().await;
-            // Coalesce first-connection bursts for the same pool key. Another
-            // waiter may have inserted a sender while we were queued on the
-            // per-key creation lock, so re-check before dialing.
-            match self.cached_sender(key, max_entries) {
-                Some(CachedSender::Ready(sender)) => Ok((sender, false)),
-                Some(CachedSender::Pending(sender)) => {
-                    let authority = authority_for_host_port(target_host, target_port);
-                    match tokio::time::timeout(
-                        Duration::from_millis(proxy.backend_connect_timeout_ms),
-                        sender.ready(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(sender)) => Ok((sender, false)),
-                        Ok(Err(err)) => {
-                            debug!(
-                                target_host,
-                                target_port,
-                                hbone_port,
-                                error = %err,
-                                "Cached HBONE HTTP/2 sender closed while waiting for readiness; creating a replacement"
-                            );
-                            let sender = self
-                                .create_sender(proxy, target_host, hbone_port, pool_config)
-                                .await?;
-                            self.insert_sender(key, sender.clone(), pool_config);
-                            Ok((sender, true))
-                        }
-                        Err(_) => Err(HbonePoolError::ConnectStream {
+        let _creation_guard = tokio::time::timeout(connect_timeout, creation_lock.lock())
+            .await
+            .map_err(|_| HbonePoolError::ConnectStream {
+                authority: authority.clone(),
+                message: format!(
+                    "timed out after {}ms waiting to coalesce HBONE HTTP/2 sender creation",
+                    proxy.backend_connect_timeout_ms
+                ),
+            })?;
+        match self.cached_sender(key, max_entries) {
+            Some(CachedSender::Ready(sender)) => {
+                return Ok(sender);
+            }
+            Some(CachedSender::Pending(sender)) => {
+                let remaining = crate::pool::remaining_connect_timeout(
+                    creation_started,
+                    connect_timeout,
+                )
+                .ok_or_else(|| HbonePoolError::ConnectStream {
+                    authority: authority.clone(),
+                    message: format!(
+                        "timed out after {}ms waiting for coalesced HBONE HTTP/2 sender creation",
+                        proxy.backend_connect_timeout_ms
+                    ),
+                })?;
+                match tokio::time::timeout(remaining, sender.ready()).await {
+                    Ok(Ok(sender)) => {
+                        return Ok(sender);
+                    }
+                    Ok(Err(err)) => {
+                        debug!(
+                            target_host,
+                            target_port,
+                            hbone_port,
+                            error = %err,
+                            "Cached HBONE HTTP/2 sender closed after coalesced creation wait; creating a replacement"
+                        );
+                    }
+                    Err(_) => {
+                        return Err(HbonePoolError::ConnectStream {
                             authority,
                             message: format!(
-                                "timed out after {}ms waiting for cached HBONE HTTP/2 sender readiness",
+                                "timed out after {}ms waiting for coalesced HBONE HTTP/2 sender readiness",
                                 proxy.backend_connect_timeout_ms
                             ),
-                        }),
+                        });
                     }
                 }
-                None => {
-                    let sender = self
-                        .create_sender(proxy, target_host, hbone_port, pool_config)
-                        .await?;
-                    self.insert_sender(key, sender.clone(), pool_config);
-                    Ok((sender, true))
-                }
+            }
+            None => {}
+        }
+
+        let remaining = match crate::pool::remaining_connect_timeout(
+            creation_started,
+            connect_timeout,
+        ) {
+            Some(remaining) => remaining,
+            None => {
+                return Err(HbonePoolError::ConnectStream {
+                    authority: authority.clone(),
+                    message: format!(
+                        "timed out after {}ms waiting for coalesced HBONE HTTP/2 sender creation",
+                        proxy.backend_connect_timeout_ms
+                    ),
+                });
             }
         };
-        self.pending_creations
-            .remove_if(key, |_, lock| std::sync::Arc::ptr_eq(lock, &creation_lock));
-        let (sender, created) = sender_result?;
-        if created {
-            debug!(
-                target_host,
-                target_port, hbone_port, "Created gateway HBONE HTTP/2 connection"
-            );
-        }
-        Ok(sender)
-    }
-
-    fn insert_sender(&self, key: &str, sender: SendRequest<Bytes>, pool_config: &PoolConfig) {
-        let now = Instant::now();
-        let max_entries = pool_config.http2_connections_per_host.max(1);
+        let sender = match tokio::time::timeout(
+            remaining,
+            self.create_sender(proxy, target_host, hbone_port, pool_config),
+        )
+        .await
+        {
+            Ok(Ok(sender)) => sender,
+            Ok(Err(err)) => {
+                return Err(err);
+            }
+            Err(_) => {
+                return Err(HbonePoolError::ConnectStream {
+                    authority,
+                    message: format!(
+                        "timed out after {}ms creating coalesced HBONE HTTP/2 sender",
+                        proxy.backend_connect_timeout_ms
+                    ),
+                });
+            }
+        };
         self.entries
             .entry(key.to_string())
             .and_modify(|entries| {
                 prune_pool_entries(entries);
                 entries.push(HbonePoolEntry {
                     sender: sender.clone(),
-                    last_used_at: now,
+                    last_used_at: Instant::now(),
                     idle_timeout_seconds: pool_config.idle_timeout_seconds,
                 });
+                let max_entries = pool_config.http2_connections_per_host.max(1);
                 if entries.len() > max_entries {
                     let overflow = entries.len() - max_entries;
                     entries.drain(0..overflow);
@@ -396,17 +425,23 @@ impl HboneConnectionPool {
             })
             .or_insert_with(|| {
                 vec![HbonePoolEntry {
-                    sender,
-                    last_used_at: now,
+                    sender: sender.clone(),
+                    last_used_at: Instant::now(),
                     idle_timeout_seconds: pool_config.idle_timeout_seconds,
                 }]
             });
+        debug!(
+            target_host,
+            target_port, hbone_port, "Created gateway HBONE HTTP/2 connection"
+        );
+        Ok(sender)
     }
 
     fn cached_sender(&self, key: &str, max_entries: usize) -> Option<CachedSender> {
         let mut entries = self.entries.get_mut(key)?;
         prune_pool_entries(&mut entries);
         let mut pending = None;
+        let mut pending_idx = None;
         let mut idx = 0;
         while idx < entries.len() {
             let entry = &mut entries[idx];
@@ -423,12 +458,18 @@ impl HboneConnectionPool {
                 None => {
                     if pending.is_none() {
                         pending = Some(sender);
+                        pending_idx = Some(idx);
                     }
                 }
             }
             idx += 1;
         }
         if entries.len() >= max_entries {
+            if let Some(idx) = pending_idx
+                && let Some(entry) = entries.get_mut(idx)
+            {
+                entry.last_used_at = Instant::now();
+            }
             pending.map(CachedSender::Pending)
         } else {
             None
@@ -479,6 +520,9 @@ impl HboneConnectionPool {
         self.entries.retain(|_, entries| {
             prune_pool_entries(entries);
             !entries.is_empty()
+        });
+        self.creation_locks.retain(|key, lock| {
+            self.entries.contains_key(key.as_str()) || Arc::strong_count(lock) > 1
         });
     }
 
@@ -1018,10 +1062,14 @@ fn set_tcp_keepalive(stream: &TcpStream, keepalive_seconds: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::types::{
+        AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
+    };
     use crate::dns::DnsConfig;
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
     use crate::identity::{TrustBundle, TrustBundleSet};
     use arc_swap::ArcSwap;
+    use chrono::Utc;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1035,6 +1083,65 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect::<HashMap<_, _>>(),
             path: None,
+        }
+    }
+
+    fn test_proxy(connect_timeout_ms: u64) -> Proxy {
+        let now = Utc::now();
+        Proxy {
+            id: "hbone-test".to_string(),
+            namespace: crate::config::types::default_namespace(),
+            name: None,
+            hosts: vec![],
+            listen_path: Some("/hbone".to_string()),
+            backend_scheme: Some(BackendScheme::Http),
+            dispatch_kind: DispatchKind::from(BackendScheme::Http),
+            backend_host: "orders.default.svc.cluster.local".to_string(),
+            backend_port: 8080,
+            backend_path: None,
+            strip_listen_path: true,
+            preserve_host_header: false,
+            backend_connect_timeout_ms: connect_timeout_ms,
+            backend_read_timeout_ms: 30_000,
+            backend_write_timeout_ms: 30_000,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            resolved_tls: BackendTlsConfig::default_verify(),
+            dns_override: None,
+            dns_cache_ttl_seconds: None,
+            auth_mode: AuthMode::Single,
+            plugins: vec![],
+            pool_idle_timeout_seconds: None,
+            pool_enable_http_keep_alive: None,
+            pool_enable_http2: None,
+            pool_tcp_keepalive_seconds: None,
+            pool_http2_keep_alive_interval_seconds: None,
+            pool_http2_keep_alive_timeout_seconds: None,
+            pool_http2_initial_stream_window_size: None,
+            pool_http2_initial_connection_window_size: None,
+            pool_http2_adaptive_window: None,
+            pool_http2_max_frame_size: None,
+            pool_http2_max_concurrent_streams: None,
+            pool_http3_connections_per_backend: None,
+            pool_max_requests_per_connection: None,
+            upstream_id: None,
+            upstream_subset: None,
+            api_spec_id: None,
+            circuit_breaker: None,
+            retry: None,
+            response_body_mode: ResponseBodyMode::default(),
+            listen_port: None,
+            frontend_tls: false,
+            passthrough: false,
+            udp_idle_timeout_seconds: 60,
+            tcp_idle_timeout_seconds: Some(300),
+            allowed_methods: None,
+            allowed_ws_origins: vec![],
+            udp_max_response_amplification_factor: None,
+            created_at: now,
+            updated_at: now,
         }
     }
 
@@ -1199,6 +1306,96 @@ mod tests {
             pool.entries.is_empty(),
             "map-level idle maintenance should drop keys with no live senders"
         );
+    }
+
+    #[test]
+    fn idle_maintenance_prunes_orphaned_creation_locks() {
+        let pool_config = PoolConfig {
+            idle_timeout_seconds: 1,
+            ..PoolConfig::default()
+        };
+        let pool = HboneConnectionPool::new(
+            pool_config,
+            DnsCache::new(DnsConfig::default()),
+            Arc::new(ArcSwap::new(Arc::new(None))),
+            4,
+        );
+        let stale_key = "hbone|stale|8080|15008||oldfingerprint".to_string();
+        let active_key = "hbone|active|8080|15008||oldfingerprint".to_string();
+        let active_lock = Arc::new(Mutex::new(()));
+        let active_ref = active_lock.clone();
+
+        pool.creation_locks
+            .insert(stale_key.clone(), Arc::new(Mutex::new(())));
+        pool.creation_locks
+            .insert(active_key.clone(), active_lock.clone());
+
+        pool.maybe_prune_idle_entries();
+
+        assert!(!pool.creation_locks.contains_key(&stale_key));
+        assert!(
+            pool.creation_locks.contains_key(&active_key),
+            "in-flight creation locks with external references must survive pruning"
+        );
+
+        drop(active_ref);
+        drop(active_lock);
+        pool.last_idle_prune_unix_secs.store(0, Ordering::Relaxed);
+        pool.maybe_prune_idle_entries();
+
+        assert!(!pool.creation_locks.contains_key(&active_key));
+    }
+
+    #[tokio::test]
+    async fn coalesced_creation_lock_wait_obeys_connect_timeout() {
+        let pool_config = PoolConfig {
+            idle_timeout_seconds: 60,
+            ..PoolConfig::default()
+        };
+        let pool = HboneConnectionPool::new(
+            pool_config.clone(),
+            DnsCache::new(DnsConfig::default()),
+            Arc::new(ArcSwap::new(Arc::new(None))),
+            4,
+        );
+        let proxy = test_proxy(10);
+        let key = pool_key_owned(
+            "orders.default.svc.cluster.local",
+            8080,
+            ISTIO_HBONE_PORT,
+            None,
+            "fingerprint",
+            &pool_config,
+        );
+        let creation_lock = Arc::new(Mutex::new(()));
+        let _held_guard = creation_lock.lock().await;
+        pool.creation_locks
+            .insert(key.clone(), creation_lock.clone());
+
+        let started = Instant::now();
+        let err = pool
+            .get_or_create_sender(
+                &proxy,
+                "orders.default.svc.cluster.local",
+                8080,
+                ISTIO_HBONE_PORT,
+                &key,
+                &pool_config,
+            )
+            .await
+            .expect_err("coalesced lock wait should time out");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "lock wait must respect backend_connect_timeout_ms instead of queueing indefinitely"
+        );
+        match err {
+            HbonePoolError::ConnectStream { authority, message } => {
+                assert_eq!(authority, "orders.default.svc.cluster.local:8080");
+                assert!(message.contains("waiting to coalesce HBONE HTTP/2 sender creation"));
+            }
+            other => panic!("expected ConnectStream timeout, got {other:?}"),
+        }
     }
 
     #[test]

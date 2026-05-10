@@ -117,6 +117,16 @@ const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 const BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP: u64 = 5_000;
 const GATEWAY_WORKLOAD_METRICS_PLUGIN_ID: &str = "__gateway_workload_metrics";
 const WORKLOAD_METRICS_PLUGIN_NAME: &str = "workload_metrics";
+const HBONE_INNER_IDENTITY_BAGGAGE_PREFIXES: &[&str] = &[
+    "source.",
+    "source_",
+    "src.",
+    "src_",
+    "destination.",
+    "destination_",
+    "dst.",
+    "dst_",
+];
 
 /// Partial outcome of a single H3 capability probe. `probe_h2_tls` writes
 /// directly into `record` (it owns `&mut record`), but `probe_h3` runs in
@@ -305,6 +315,30 @@ fn annotate_gateway_hbone_metadata(
             ctx.metadata.insert(metadata_key.to_string(), value.clone());
         }
     }
+}
+
+fn hbone_inner_baggage_strip_prefixes(configured_prefixes: &[String]) -> Vec<String> {
+    let mut prefixes = configured_prefixes.to_vec();
+    for prefix in HBONE_INNER_IDENTITY_BAGGAGE_PREFIXES {
+        if !prefixes.iter().any(|existing| existing == prefix) {
+            prefixes.push((*prefix).to_string());
+        }
+    }
+    prefixes
+}
+
+fn hbone_inner_headers_with_stripped_baggage(
+    headers: &HashMap<String, String>,
+    configured_prefixes: &[String],
+) -> Option<HashMap<String, String>> {
+    if !crate::modes::mesh::hbone::has_baggage_header_in_map(headers) {
+        return None;
+    }
+
+    let mut owned = headers.clone();
+    let prefixes = hbone_inner_baggage_strip_prefixes(configured_prefixes);
+    crate::modes::mesh::hbone::strip_egress_baggage_in_map(&mut owned, &prefixes);
+    Some(owned)
 }
 
 impl H3ProbeOutcome {
@@ -1488,6 +1522,10 @@ impl ProxyState {
     /// with the new trust material so TLS builders see the update through the
     /// same lock-free slot. If there is no SVID, keep the bundles separately
     /// for future gateway-mesh features.
+    ///
+    /// This is called from the DP config-apply loop, which is single-writer for
+    /// CP-delivered gateway trust. If another writer is introduced later, this
+    /// load/modify/store needs to become an atomic compare-and-swap update.
     pub fn update_gateway_trust_bundles(&self, trust_bundles: RuntimeTrustBundleSet) {
         self.gateway_trust_bundles
             .store(Arc::new(Some(trust_bundles.clone())));
@@ -11132,12 +11170,8 @@ async fn proxy_to_backend_hbone(
     };
     parts.headers.clear();
     let backend_host_header = hbone_pool::authority_for_host_port(&target.host, target.port);
-    let mut owned_hbone_headers = None;
-    hbone_proxy::strip_egress_baggage_in_proxy_headers(
-        &mut owned_hbone_headers,
-        headers,
-        &state.mesh_egress_strip_baggage_keys,
-    );
+    let owned_hbone_headers =
+        hbone_inner_headers_with_stripped_baggage(headers, &state.mesh_egress_strip_baggage_keys);
     let headers = owned_hbone_headers.as_ref().unwrap_or(headers);
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (k, v) in headers {
@@ -14176,6 +14210,31 @@ mod tests {
 
         assert!(!ctx.metadata.contains_key("mesh.connection_security_policy"));
         assert!(!ctx.metadata.contains_key("mesh.gateway.transport"));
+    }
+
+    #[test]
+    fn hbone_inner_baggage_strips_identity_members() {
+        let headers = HashMap::from([(
+            "baggage".to_string(),
+            "trace_id=abc,source.principal=spiffe%3A%2F%2Fattacker,destination_identity=spiffe%3A%2F%2Ftarget,custom.token=secret"
+                .to_string(),
+        )]);
+
+        let filtered =
+            hbone_inner_headers_with_stripped_baggage(&headers, &["custom.".to_string()])
+                .expect("baggage should produce an owned filtered header map");
+
+        assert_eq!(
+            filtered.get("baggage").map(String::as_str),
+            Some("trace_id=abc")
+        );
+    }
+
+    #[test]
+    fn hbone_inner_baggage_skips_clone_when_absent() {
+        let headers = HashMap::from([("x-request-id".to_string(), "abc".to_string())]);
+
+        assert!(hbone_inner_headers_with_stripped_baggage(&headers, &[]).is_none());
     }
 
     // ----- Per-IP cleanup task shutdown wiring ---------------------------
