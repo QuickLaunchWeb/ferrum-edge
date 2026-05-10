@@ -28,6 +28,21 @@ fn parse_ipv4_cidr() {
 }
 
 #[test]
+fn parse_ipv4_mapped_ipv6_cidr_matches_ipv4_socket() {
+    let tp = TrustedProxies::parse("::ffff:10.0.0.0/120");
+    assert!(tp.contains(&"10.0.0.42".parse().unwrap()));
+    assert!(tp.contains(&"::ffff:10.0.0.42".parse().unwrap()));
+    assert!(!tp.contains(&"10.0.1.1".parse().unwrap()));
+}
+
+#[test]
+fn ipv4_mapped_ipv6_socket_can_match_ipv6_cidr() {
+    let tp = TrustedProxies::parse("::/0");
+    assert!(tp.contains(&"::ffff:10.0.0.42".parse().unwrap()));
+    assert!(!tp.contains(&"10.0.0.42".parse().unwrap()));
+}
+
+#[test]
 fn parse_multiple_cidrs_with_whitespace() {
     let tp = TrustedProxies::parse(" 10.0.0.0/8 , 172.16.0.0/12 , ::1 ");
     assert!(tp.contains(&"10.1.2.3".parse().unwrap()));

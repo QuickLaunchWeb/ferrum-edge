@@ -1231,7 +1231,7 @@ async fn test_plugin_body_validator_request_validation_without_transformer() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/body-validator-request").await;
 
     let rejected = client
         .post(format!(

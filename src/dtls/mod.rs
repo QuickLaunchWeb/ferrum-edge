@@ -472,6 +472,12 @@ impl DtlsConnection {
     }
 }
 
+impl Drop for DtlsConnection {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.try_send(());
+    }
+}
+
 // ============================================================================
 // DtlsServer — frontend DTLS session demuxer
 // ============================================================================
@@ -1116,6 +1122,11 @@ pub fn load_dtls_certificate(
         .map_err(|e| anyhow::anyhow!("Failed to parse private key PEM: {}", e))?
         .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
 
+    // SAFETY: dimpl::DtlsCertificate stores `private_key` as plain Vec<u8>
+    // without zeroize-on-drop. Unlike the kTLS path (which uses
+    // Zeroizing<Vec<u8>>), we cannot wrap the key here because dimpl owns
+    // the Vec. The key material persists in freed heap until reallocation.
+    // Upstream contribution needed to add Zeroize to dimpl::DtlsCertificate.
     Ok(DtlsCertificate {
         certificate: cert_der.to_vec(),
         private_key: key_der.secret_der().to_vec(),
