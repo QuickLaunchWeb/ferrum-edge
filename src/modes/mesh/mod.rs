@@ -1048,24 +1048,19 @@ fn start_mesh_slice_apply_task(
                     match gateway_config_from_mesh_slice(&slice, &runtime) {
                         Ok(config) => {
                             let applied = proxy_state.update_config(config);
-                            record_mesh_slice_apply_result(
-                                &mut last_applied_slice,
-                                &slice,
-                                applied,
-                            );
+                            record_mesh_slice_apply_result(&mut last_applied_slice, &slice, true);
+                            if let Some(ref dns_proxy) = dns_proxy {
+                                dns_proxy.update_from_slice(&slice);
+                            }
                             if applied {
-                                // Update DNS resolution table on successful apply
-                                if let Some(ref dns_proxy) = dns_proxy {
-                                    dns_proxy.update_from_slice(&slice);
-                                }
                                 info!(
                                     mesh_slice_version = %slice.version,
                                     "Applied mesh slice to proxy runtime"
                                 );
                             } else {
-                                warn!(
+                                debug!(
                                     mesh_slice_version = %slice.version,
-                                    "Mesh slice was not applied to proxy runtime; retaining last accepted slice"
+                                    "Accepted mesh slice with no proxy runtime delta"
                                 );
                             }
                         }

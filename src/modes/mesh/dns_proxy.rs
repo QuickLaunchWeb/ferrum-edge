@@ -458,16 +458,20 @@ impl MeshDnsProxy {
                 result = tcp_listener.accept() => {
                     match result {
                         Ok((stream, src)) => {
-                            let Ok(permit) = semaphore.clone().try_acquire_owned() else {
-                                warn!(src = %src, "DNS proxy TCP concurrency limit reached");
-                                continue;
-                            };
                             let table = self.resolution_table.clone();
                             let upstream = self.upstream_resolver;
                             let ttl = self.ttl_seconds;
+                            let semaphore = semaphore.clone();
                             tokio::spawn(async move {
-                                let _permit = permit;
-                                handle_dns_tcp_connection(stream, src, &table, upstream, ttl).await;
+                                handle_dns_tcp_connection(
+                                    stream,
+                                    src,
+                                    &table,
+                                    upstream,
+                                    ttl,
+                                    semaphore,
+                                )
+                                .await;
                             });
                         }
                         Err(e) => {
@@ -540,6 +544,7 @@ async fn handle_dns_tcp_connection(
     table: &ArcSwap<DnsResolutionTable>,
     upstream: SocketAddr,
     ttl: u32,
+    semaphore: Arc<Semaphore>,
 ) {
     loop {
         let mut len_buf = [0u8; 2];
@@ -558,6 +563,18 @@ async fn handle_dns_tcp_connection(
             return;
         }
 
+        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+            if let Some(response) = build_dns_error_response_from_packet(
+                &packet,
+                RCODE_SERVFAIL,
+                DNS_MAX_TCP_PACKET_SIZE,
+            ) {
+                let _ = write_dns_tcp_response(&mut stream, &response).await;
+            }
+            warn!(client = %src, "DNS proxy query concurrency limit reached");
+            continue;
+        };
+
         let response = match evaluate_dns_query(&packet, table, ttl, DNS_MAX_TCP_PACKET_SIZE) {
             DnsDecision::Respond(response) => response,
             DnsDecision::Forward(_) => match forward_to_upstream_tcp(&packet, upstream).await {
@@ -571,22 +588,30 @@ async fn handle_dns_tcp_connection(
             },
             DnsDecision::Drop => continue,
         };
+        drop(permit);
 
-        if response.len() > u16::MAX as usize {
-            warn!(client = %src, response_bytes = response.len(), "DNS TCP response too large");
-            return;
-        }
-        if stream
-            .write_all(&(response.len() as u16).to_be_bytes())
-            .await
-            .is_err()
-        {
-            return;
-        }
-        if stream.write_all(&response).await.is_err() {
+        if !write_dns_tcp_response(&mut stream, &response).await {
             return;
         }
     }
+}
+
+async fn write_dns_tcp_response(stream: &mut TcpStream, response: &[u8]) -> bool {
+    if response.len() > u16::MAX as usize {
+        warn!(
+            response_bytes = response.len(),
+            "DNS TCP response too large"
+        );
+        return false;
+    }
+    if stream
+        .write_all(&(response.len() as u16).to_be_bytes())
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    stream.write_all(response).await.is_ok()
 }
 
 fn evaluate_dns_query(
