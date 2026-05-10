@@ -1985,6 +1985,10 @@ async fn serve_mesh_runtime(
         None
     };
 
+    // Resolve mTLS mode from the initial mesh slice before moving it.
+    let inbound_mtls_mode =
+        resolve_inbound_mtls_mode(initial_applied_mesh_slice.as_ref(), &runtime);
+
     let mesh_apply_handle = start_mesh_slice_apply_task(
         mesh_state,
         proxy_state.clone(),
@@ -1995,7 +1999,7 @@ async fn serve_mesh_runtime(
     );
 
     validate_egress_gateway_mtls_config(&runtime, &env_config)?;
-    let frontend_tls = load_frontend_tls(&env_config, &tls_policy, &crls)?;
+    let frontend_tls = load_mesh_frontend_tls(&env_config, &tls_policy, &crls, inbound_mtls_mode)?;
     if let Some(ref tls_config) = frontend_tls {
         proxy_state
             .stream_listener_manager
@@ -2005,17 +2009,20 @@ async fn serve_mesh_runtime(
 
     info!(
         listeners = runtime.listener_plan().len(),
+        ?inbound_mtls_mode,
         "Mesh listener plan prepared"
     );
     let mut listener_handles = Vec::new();
     let mut startup_signals = Vec::new();
     for listener in runtime.listener_plan() {
-        let tls_config = listener_tls_config(&listener, frontend_tls.clone());
+        let tls_config =
+            listener_tls_config_for_mtls_mode(&listener, frontend_tls.clone(), inbound_mtls_mode);
         if tls_config.is_none()
             && matches!(
                 listener.kind,
                 MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
             )
+            && inbound_mtls_mode != config::MtlsMode::Disable
         {
             warn!(
                 direction = ?listener.direction,
@@ -2125,6 +2132,9 @@ async fn serve_mesh_runtime(
     Ok(())
 }
 
+/// Load the non-mesh frontend TLS config. Retained for the egress gateway
+/// validation path that does not use PeerAuthentication.
+#[allow(dead_code)]
 fn load_frontend_tls(
     env_config: &EnvConfig,
     tls_policy: &TlsPolicy,
@@ -2153,6 +2163,68 @@ fn load_frontend_tls(
         tls::enable_secret_extraction_for_ktls(&mut config);
     }
     Ok(Some(config))
+}
+
+/// Resolve the effective mTLS mode for the inbound listener from the initial
+/// mesh slice. Falls back to `Permissive` when no slice or no
+/// PeerAuthentication policies are available.
+fn resolve_inbound_mtls_mode(
+    initial_slice: Option<&MeshSlice>,
+    runtime: &MeshRuntimeConfig,
+) -> config::MtlsMode {
+    let Some(slice) = initial_slice else {
+        return config::MtlsMode::Permissive;
+    };
+    let inbound_port = runtime.inbound_listen_addr.port();
+    slice.resolve_effective_mtls_mode(inbound_port)
+}
+
+/// Build the mesh frontend TLS configuration respecting the resolved mTLS mode.
+///
+/// - `Strict` / `Permissive`: Load TLS with the appropriate client-auth mode.
+/// - `Disable`: Return `None` (plaintext listener).
+fn load_mesh_frontend_tls(
+    env_config: &EnvConfig,
+    tls_policy: &TlsPolicy,
+    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+    mtls_mode: config::MtlsMode,
+) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
+    if mtls_mode == config::MtlsMode::Disable {
+        info!(
+            "Mesh PeerAuthentication mTLS mode is DISABLE; inbound listener will accept plaintext only"
+        );
+        return Ok(None);
+    }
+
+    let (Some(cert_path), Some(key_path)) = (
+        env_config.frontend_tls_cert_path.as_ref(),
+        env_config.frontend_tls_key_path.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+
+    let client_auth = match mtls_mode {
+        config::MtlsMode::Strict => tls::MeshClientAuth::Required,
+        config::MtlsMode::Permissive => tls::MeshClientAuth::Optional,
+        config::MtlsMode::Disable => unreachable!("handled above"),
+    };
+
+    let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
+    let mut tls_config = tls::load_mesh_tls_config(
+        cert_path,
+        key_path,
+        client_ca_bundle_path,
+        client_auth,
+        tls_policy,
+        env_config.tls_cert_expiry_warning_days,
+        crls,
+    )
+    .map_err(|e| anyhow::anyhow!("Invalid mesh frontend TLS configuration: {}", e))?;
+    tls::enable_early_data(&mut tls_config, tls_policy);
+    if env_config.ktls_enabled.could_be_enabled() {
+        tls::enable_secret_extraction_for_ktls(&mut tls_config);
+    }
+    Ok(Some(tls_config))
 }
 
 fn validate_egress_gateway_mtls_config(
@@ -2192,6 +2264,22 @@ fn listener_tls_config(
         MeshListenerKind::PlaintextCapture => None,
         MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination => frontend_tls,
     }
+}
+
+/// Resolve the per-listener TLS config, respecting PeerAuthentication mTLS mode.
+///
+/// - `Disable` mode: all listeners run plaintext (no TLS config).
+/// - `Strict` / `Permissive`: mTLS/HBONE listeners get the frontend TLS config;
+///   plaintext-capture listeners stay plaintext.
+fn listener_tls_config_for_mtls_mode(
+    listener: &MeshListener,
+    frontend_tls: Option<Arc<rustls::ServerConfig>>,
+    mtls_mode: config::MtlsMode,
+) -> Option<Arc<rustls::ServerConfig>> {
+    if mtls_mode == config::MtlsMode::Disable {
+        return None;
+    }
+    listener_tls_config(listener, frontend_tls)
 }
 
 fn start_mesh_slice_apply_task(

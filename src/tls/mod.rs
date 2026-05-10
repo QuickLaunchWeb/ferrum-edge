@@ -468,6 +468,147 @@ pub fn load_tls_config_with_client_auth(
     Ok(Arc::new(config))
 }
 
+/// Client authentication policy for mesh frontend TLS configs.
+///
+/// Maps from the mesh PeerAuthentication `MtlsMode` to rustls verifier
+/// behavior:
+/// - `Required`: `WebPkiClientVerifier` without `.allow_unauthenticated()`
+///   (TLS handshake fails if no client cert).
+/// - `Optional`: `WebPkiClientVerifier` with `.allow_unauthenticated()`
+///   (client cert verified when present, plaintext clients accepted).
+/// - `None`: `with_no_client_auth()` (no CertificateRequest sent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshClientAuth {
+    /// Require a valid client certificate (Strict mTLS).
+    Required,
+    /// Accept connections with or without a client certificate (Permissive).
+    Optional,
+    /// Do not request client certificates at all. The mesh `Disable` mode
+    /// typically bypasses TLS entirely (no `ServerConfig` built), but this
+    /// variant is available for callers that still need a TLS config without
+    /// any client-auth request.
+    #[allow(dead_code)]
+    None,
+}
+
+/// Load TLS server configuration with the specified mesh client-auth mode.
+///
+/// This is the mesh-specific variant of [`load_tls_config_with_client_auth`].
+/// The caller passes a [`MeshClientAuth`] that was resolved from the
+/// PeerAuthentication policies via `resolve_effective_mtls_mode()`.
+///
+/// `client_ca_bundle_path` is required for `Required` and `Optional` modes;
+/// `None` mode ignores it.
+#[allow(clippy::too_many_arguments)]
+pub fn load_mesh_tls_config(
+    cert_path: &str,
+    key_path: &str,
+    client_ca_bundle_path: Option<&str>,
+    client_auth: MeshClientAuth,
+    tls_policy: &TlsPolicy,
+    cert_expiry_warning_days: u64,
+    crls: &[CertificateRevocationListDer<'static>],
+) -> Result<Arc<ServerConfig>, anyhow::Error> {
+    check_cert_expiry(cert_path, "mesh server TLS cert", cert_expiry_warning_days)?;
+    if let Some(ca_path) = client_ca_bundle_path {
+        check_cert_expiry(ca_path, "mesh client CA bundle", cert_expiry_warning_days)?;
+    }
+
+    let cert_file = File::open(cert_path)?;
+    let key_file = File::open(key_path)?;
+
+    let cert_chain: Vec<_> = certs(&mut BufReader::new(cert_file))
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let key = private_key(&mut BufReader::new(key_file))?
+        .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
+
+    let builder = ServerConfig::builder_with_provider(tls_policy.crypto_provider.clone())
+        .with_protocol_versions(&tls_policy.protocol_versions)
+        .map_err(|e| anyhow::anyhow!("Failed to set TLS protocol versions: {}", e))?;
+
+    let mut config = match client_auth {
+        MeshClientAuth::Required | MeshClientAuth::Optional => {
+            let ca_bundle_path = client_ca_bundle_path.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Mesh mTLS {:?} mode requires a client CA bundle path \
+                     (FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH)",
+                    client_auth
+                )
+            })?;
+
+            let ca_file = File::open(ca_bundle_path)?;
+            let ca_certs: Vec<_> = certs(&mut BufReader::new(ca_file))
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let mut client_auth_roots = rustls::RootCertStore::empty();
+            let (added, _ignored) = client_auth_roots.add_parsable_certificates(ca_certs);
+            if added == 0 {
+                return Err(anyhow::anyhow!(
+                    "No valid client CA certificates found in {}",
+                    ca_bundle_path
+                ));
+            }
+
+            let mut verifier_builder =
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
+
+            if client_auth == MeshClientAuth::Optional {
+                verifier_builder = verifier_builder.allow_unauthenticated();
+            }
+
+            if !crls.is_empty() {
+                verifier_builder = verifier_builder
+                    .with_crls(crls.iter().cloned())
+                    .allow_unknown_revocation_status()
+                    .only_check_end_entity_revocation();
+            }
+
+            let verifier = verifier_builder.build().map_err(|e| {
+                anyhow::anyhow!("Failed to build mesh client certificate verifier: {}", e)
+            })?;
+
+            info!(
+                mesh_client_auth = ?client_auth,
+                "Mesh TLS configuration loaded with {:?} client auth from cert: {}, key: {}, client CA: {}",
+                client_auth, cert_path, key_path, ca_bundle_path,
+            );
+
+            builder
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(cert_chain, key)?
+        }
+        MeshClientAuth::None => {
+            info!(
+                "Mesh TLS configuration loaded without client auth from cert: {}, key: {}",
+                cert_path, key_path,
+            );
+            builder
+                .with_no_client_auth()
+                .with_single_cert(cert_chain, key)?
+        }
+    };
+
+    config.ignore_client_order = tls_policy.prefer_server_cipher_order;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    match rustls::crypto::ring::Ticketer::new() {
+        Ok(ticketer) => {
+            config.ticketer = ticketer;
+        }
+        Err(e) => {
+            warn!("Failed to create mesh TLS session ticket rotator: {}", e);
+        }
+    }
+    config.session_storage =
+        rustls::server::ServerSessionMemoryCache::new(tls_policy.session_cache_size);
+    config.max_early_data_size = 0;
+
+    Ok(Arc::new(config))
+}
+
 /// Enable kTLS session-secret extraction on a `ServerConfig` returned by
 /// [`load_tls_config_with_client_auth`].
 ///
