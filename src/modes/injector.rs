@@ -32,6 +32,9 @@ use crate::tls::{self, TlsPolicy};
 const DEFAULT_INJECTOR_LISTEN_ADDR: &str = "0.0.0.0:9443";
 const DEFAULT_SIDECAR_IMAGE: &str = "ferrum-edge:latest";
 const DEFAULT_INJECTOR_TRUST_DOMAIN: &str = "cluster.local";
+const ISTIO_EXCLUDE_OUTBOUND_PORTS_ANNOTATION: &str =
+    "traffic.sidecar.istio.io/excludeOutboundPorts";
+const FERRUM_EXCLUDE_OUTBOUND_PORTS_ANNOTATION: &str = "ferrum.io/excludeOutboundPorts";
 const SIDECAR_ENV_KEYS: &[&str] = &[
     "FERRUM_DP_CP_GRPC_URLS",
     "FERRUM_CP_DP_GRPC_JWT_ISSUER",
@@ -58,6 +61,7 @@ pub struct InjectorConfig {
     pub require_annotation: bool,
     pub capture_mode: CaptureMode,
     pub proxy_uid: Option<u32>,
+    pub exclude_outbound_ports: Vec<u16>,
     pub trust_domain: String,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
@@ -83,6 +87,8 @@ impl InjectorConfig {
         )?;
         let proxy_uid =
             resolve_ferrum_var("FERRUM_MESH_PROXY_UID").and_then(|value| value.parse::<u32>().ok());
+        let exclude_outbound_ports =
+            parse_port_list(resolve_ferrum_var("FERRUM_MESH_EXCLUDE_OUTBOUND_PORTS").as_deref())?;
         let trust_domain = resolve_ferrum_var("FERRUM_INJECTOR_TRUST_DOMAIN")
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_INJECTOR_TRUST_DOMAIN.to_string());
@@ -114,6 +120,7 @@ impl InjectorConfig {
             require_annotation,
             capture_mode,
             proxy_uid,
+            exclude_outbound_ports,
             trust_domain,
             tls_cert_path,
             tls_key_path,
@@ -126,6 +133,32 @@ fn validate_injector_trust_domain(value: &str) -> Result<(), String> {
     TrustDomain::new(value.to_string())
         .map(|_| ())
         .map_err(|e| format!("Invalid FERRUM_INJECTOR_TRUST_DOMAIN: {e}"))
+}
+
+fn parse_port_list(raw: Option<&str>) -> Result<Vec<u16>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+
+    let mut ports = Vec::new();
+    for token in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        let port = token
+            .parse::<u16>()
+            .map_err(|e| format!("invalid mesh outbound port exclusion '{token}': {e}"))?;
+        if port == 0 {
+            return Err(
+                "invalid mesh outbound port exclusion '0': port must be 1-65535".to_string(),
+            );
+        }
+        ports.push(port);
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    Ok(ports)
 }
 
 fn jwt_secret_ref_from_runtime() -> Result<Option<SecretKeyRef>, String> {
@@ -315,9 +348,6 @@ pub fn admission_response(body: &[u8], config: &InjectorConfig) -> Result<Value,
     let Some(request) = review.request else {
         return Err("AdmissionReview.request is required".to_string());
     };
-    let patches =
-        build_sidecar_patch_for_namespace(&request.object, config, request.namespace.as_deref());
-
     let mut response = json!({
         "apiVersion": api_version,
         "kind": kind,
@@ -326,6 +356,27 @@ pub fn admission_response(body: &[u8], config: &InjectorConfig) -> Result<Value,
             "allowed": true
         }
     });
+
+    let patches = match build_sidecar_patch_for_namespace(
+        &request.object,
+        config,
+        request.namespace.as_deref(),
+    ) {
+        Ok(patches) => patches,
+        Err(message) => {
+            if let Some(resp) = response.get_mut("response").and_then(Value::as_object_mut) {
+                resp.insert("allowed".to_string(), Value::Bool(false));
+                resp.insert(
+                    "status".to_string(),
+                    json!({
+                        "code": 400,
+                        "message": message,
+                    }),
+                );
+            }
+            return Ok(response);
+        }
+    };
 
     if !patches.is_empty() {
         let patch_json =
@@ -347,9 +398,9 @@ fn build_sidecar_patch_for_namespace(
     pod: &Value,
     config: &InjectorConfig,
     admission_namespace: Option<&str>,
-) -> Vec<JsonPatchOperation> {
+) -> Result<Vec<JsonPatchOperation>, String> {
     if !should_inject(pod, config) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut patch = Vec::new();
@@ -371,11 +422,11 @@ fn build_sidecar_patch_for_namespace(
         patch.push(JsonPatchOperation {
             op: "add",
             path: "/spec/initContainers/-".to_string(),
-            value: Some(init_container(config)),
+            value: Some(init_container(config, pod)?),
         });
     }
 
-    patch
+    Ok(patch)
 }
 
 fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
@@ -514,9 +565,9 @@ fn sidecar_container(config: &InjectorConfig, pod: &Value, namespace: &str) -> V
     })
 }
 
-fn init_container(config: &InjectorConfig) -> Value {
-    let plan = IptablesPlan::for_config(&capture_config(config));
-    json!({
+fn init_container(config: &InjectorConfig, pod: &Value) -> Result<Value, String> {
+    let plan = IptablesPlan::for_config(&capture_config(config, pod)?);
+    Ok(json!({
         "name": "ferrum-edge-init",
         "image": config.sidecar_image,
         "imagePullPolicy": "IfNotPresent",
@@ -530,14 +581,40 @@ fn init_container(config: &InjectorConfig) -> Value {
         ],
         "command": ["/bin/sh", "-c"],
         "args": [plan.commands.join("\n")]
-    })
+    }))
 }
 
-fn capture_config(config: &InjectorConfig) -> CaptureConfig {
+fn capture_config(config: &InjectorConfig, pod: &Value) -> Result<CaptureConfig, String> {
     let mut capture = CaptureConfig::explicit(15006, 15001);
     capture.mode = config.capture_mode;
     capture.proxy_uid = Some(config.proxy_uid.unwrap_or(DEFAULT_PROXY_UID));
-    capture
+    capture.exclude_ports = exclude_outbound_ports_for_pod(config, pod)?;
+    Ok(capture)
+}
+
+fn exclude_outbound_ports_for_pod(
+    config: &InjectorConfig,
+    pod: &Value,
+) -> Result<Vec<u16>, String> {
+    let annotations = pod
+        .pointer("/metadata/annotations")
+        .and_then(Value::as_object);
+    let mut ports = config.exclude_outbound_ports.clone();
+    for key in [
+        ISTIO_EXCLUDE_OUTBOUND_PORTS_ANNOTATION,
+        FERRUM_EXCLUDE_OUTBOUND_PORTS_ANNOTATION,
+    ] {
+        let annotation_ports = parse_port_list(
+            annotations
+                .and_then(|annotations| annotations.get(key))
+                .and_then(Value::as_str),
+        )
+        .map_err(|e| format!("invalid {key}: {e}"))?;
+        ports.extend(annotation_ports);
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    Ok(ports)
 }
 
 fn json_response(status: StatusCode, value: Value) -> Response<Full<Bytes>> {
@@ -577,6 +654,7 @@ mod tests {
             require_annotation,
             capture_mode,
             proxy_uid: Some(1337),
+            exclude_outbound_ports: Vec::new(),
             trust_domain: "cluster.local".to_string(),
             tls_cert_path: None,
             tls_key_path: None,
@@ -591,7 +669,8 @@ mod tests {
             &pod,
             &test_config(true, CaptureMode::Explicit),
             None,
-        );
+        )
+        .expect("patch");
         assert!(patch.is_empty());
     }
 
@@ -608,7 +687,8 @@ mod tests {
             &pod,
             &test_config(true, CaptureMode::Explicit),
             None,
-        );
+        )
+        .expect("patch");
         assert!(patch.is_empty());
     }
 
@@ -625,7 +705,8 @@ mod tests {
             &pod,
             &test_config(true, CaptureMode::Iptables),
             None,
-        );
+        )
+        .expect("patch");
 
         assert!(patch.iter().any(|op| op.path == "/spec/containers/-"));
         assert!(patch.iter().any(|op| op.path == "/spec/initContainers/-"));
@@ -663,6 +744,93 @@ mod tests {
             jwt_secret.pointer("/valueFrom/secretKeyRef/key"),
             Some(&Value::String("cp-dp-grpc-jwt-secret".to_string()))
         );
+    }
+
+    #[test]
+    fn patch_excludes_configured_and_annotated_outbound_ports() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/excludeOutboundPorts": "5432, 9092",
+                    "ferrum.io/excludeOutboundPorts": "15020"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let mut config = test_config(true, CaptureMode::Iptables);
+        config.exclude_outbound_ports = vec![3306, 5432];
+
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+        let init = patch
+            .iter()
+            .find(|op| op.path == "/spec/initContainers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("init container");
+        let commands = init
+            .pointer("/args/0")
+            .and_then(Value::as_str)
+            .expect("iptables plan");
+
+        for port in [3306, 5432, 9092, 15020] {
+            assert!(commands.contains(&format!("--dport {port} -j RETURN")));
+        }
+    }
+
+    #[test]
+    fn patch_rejects_invalid_exclude_outbound_ports_annotation() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/excludeOutboundPorts": "not-a-port"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+
+        let err = build_sidecar_patch_for_namespace(&pod, &config, None)
+            .expect_err("invalid annotation rejected");
+
+        assert!(err.contains("traffic.sidecar.istio.io/excludeOutboundPorts"));
+    }
+
+    #[test]
+    fn admission_response_denies_invalid_exclude_outbound_ports_annotation() {
+        let review = json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "bad-ports",
+                "namespace": "payments",
+                "object": {
+                    "metadata": {
+                        "labels": {"ferrum.io/mesh": "enabled"},
+                        "annotations": {
+                            "traffic.sidecar.istio.io/excludeOutboundPorts": "not-a-port"
+                        }
+                    },
+                    "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+                }
+            }
+        });
+        let response = admission_response(
+            review.to_string().as_bytes(),
+            &test_config(true, CaptureMode::Iptables),
+        )
+        .expect("admission denial");
+
+        assert_eq!(
+            response.pointer("/response/allowed"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(response.pointer("/response/patch"), None);
+        let message = response
+            .pointer("/response/status/message")
+            .and_then(Value::as_str)
+            .expect("denial message");
+        assert!(message.contains("traffic.sidecar.istio.io/excludeOutboundPorts"));
     }
 
     #[test]
