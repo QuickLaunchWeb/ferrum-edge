@@ -93,7 +93,7 @@ pub struct StreamDisconnectKey {
 pub struct HboneRelayFailureKey {
     pub proxy_id: Arc<str>,
     pub direction: &'static str,
-    pub error_class: Arc<str>,
+    pub error_class: &'static str,
 }
 
 /// Map a `DisconnectCause` variant to its snake_case label, reusing static
@@ -368,11 +368,10 @@ impl MetricsRegistry {
         direction: Direction,
         error_class: ErrorClass,
     ) {
-        let error_class = error_class.to_string();
         let key = HboneRelayFailureKey {
             proxy_id: Arc::from(proxy_id),
             direction: direction_label(Some(direction)),
-            error_class: Arc::from(error_class),
+            error_class: error_class.as_str(),
         };
         self.hbone_relay_failure_counter
             .entry(key)

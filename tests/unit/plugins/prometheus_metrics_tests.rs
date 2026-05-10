@@ -375,32 +375,50 @@ async fn test_registry_render_contains_expected_metrics() {
 async fn test_registry_records_hbone_relay_failure_counter() {
     let registry = MetricsRegistry::new();
 
-    registry.record_hbone_relay_failure(
-        "mesh-hbone",
-        Direction::BackendToClient,
-        ErrorClass::ConnectionReset,
-    );
+    let cases = [
+        (
+            Direction::BackendToClient,
+            ErrorClass::ConnectionReset,
+            "backend_to_client",
+            "connection_reset",
+        ),
+        (
+            Direction::ClientToBackend,
+            ErrorClass::ReadWriteTimeout,
+            "client_to_backend",
+            "read_write_timeout",
+        ),
+    ];
 
-    let key = HboneRelayFailureKey {
-        proxy_id: Arc::from("mesh-hbone"),
-        direction: "backend_to_client",
-        error_class: Arc::from("connection_reset"),
-    };
-    assert!(registry.hbone_relay_failure_counter.contains_key(&key));
-    assert_eq!(
-        registry
-            .hbone_relay_failure_counter
-            .get(&key)
-            .unwrap()
-            .value
-            .load(Ordering::Relaxed),
-        1
-    );
+    for (direction, error_class, _, _) in cases {
+        registry.record_hbone_relay_failure("mesh-hbone", direction, error_class);
+    }
+
+    for (_, _, direction_label, error_class_label) in cases {
+        let key = HboneRelayFailureKey {
+            proxy_id: Arc::from("mesh-hbone"),
+            direction: direction_label,
+            error_class: error_class_label,
+        };
+        assert!(registry.hbone_relay_failure_counter.contains_key(&key));
+        assert_eq!(
+            registry
+                .hbone_relay_failure_counter
+                .get(&key)
+                .unwrap()
+                .value
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
 
     let output = registry.render_uncached();
     assert!(output.contains("# TYPE ferrum_mesh_hbone_relay_failures_total counter"));
     assert!(output.contains(
         r#"ferrum_mesh_hbone_relay_failures_total{proxy_id="mesh-hbone",direction="backend_to_client",error_class="connection_reset"} 1"#
+    ));
+    assert!(output.contains(
+        r#"ferrum_mesh_hbone_relay_failures_total{proxy_id="mesh-hbone",direction="client_to_backend",error_class="read_write_timeout"} 1"#
     ));
 }
 
