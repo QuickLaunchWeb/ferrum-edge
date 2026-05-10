@@ -367,17 +367,7 @@ fn translate_jwt_rule(object: &K8sObject, rule: &Value) -> Result<MeshJwtRule, K
     let jwks_uri = string_field(rule, "jwksUri").map(ToOwned::to_owned);
     let jwks = string_field(rule, "jwks").map(ToOwned::to_owned);
 
-    let from_headers: Vec<JwtHeader> = rule
-        .get("fromHeaders")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|header| {
-            let name = string_field(header, "name")?.to_string();
-            let prefix = string_field(header, "prefix").map(ToOwned::to_owned);
-            Some(JwtHeader { name, prefix })
-        })
-        .collect();
+    let from_headers = jwt_from_headers(object, rule)?;
 
     let from_params = optional_string_array(
         object,
@@ -399,6 +389,48 @@ fn translate_jwt_rule(object: &K8sObject, rule: &Value) -> Result<MeshJwtRule, K
         from_params,
         forward_original_token,
     })
+}
+
+fn jwt_from_headers(object: &K8sObject, rule: &Value) -> Result<Vec<JwtHeader>, K8sTranslateError> {
+    let Some(raw) = rule.get("fromHeaders") else {
+        return Ok(Vec::new());
+    };
+    let Some(headers) = raw.as_array() else {
+        return Err(invalid_resource(
+            object,
+            "RequestAuthentication jwtRules[].fromHeaders must be an array of objects",
+        ));
+    };
+
+    headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| {
+            let name = string_field(header, "name").ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    format!(
+                        "RequestAuthentication jwtRules[].fromHeaders[{index}].name is required"
+                    ),
+                )
+            })?;
+            let prefix = match header.get("prefix") {
+                Some(prefix) => Some(prefix.as_str().ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        format!(
+                            "RequestAuthentication jwtRules[].fromHeaders[{index}].prefix must be a string"
+                        ),
+                    )
+                })?),
+                None => None,
+            };
+            Ok(JwtHeader {
+                name: name.to_string(),
+                prefix: prefix.map(ToOwned::to_owned),
+            })
+        })
+        .collect()
 }
 
 fn istio_policy_scope(
@@ -977,21 +1009,7 @@ fn parse_access_log_filter_expression(expr: &str) -> Result<Option<AccessLogFilt
                         .to_string(),
                 );
             };
-            match val {
-                Comparison::Gte(n) => filter.status_code_min = Some(status_code_value(n)?),
-                Comparison::Gt(n) => {
-                    filter.status_code_min = Some(status_code_value(comparison_increment(n)?)?)
-                }
-                Comparison::Lte(n) => filter.status_code_max = Some(status_code_value(n)?),
-                Comparison::Lt(n) => {
-                    filter.status_code_max = Some(status_code_value(comparison_decrement(n)?)?)
-                }
-                Comparison::Eq(n) => {
-                    let code = status_code_value(n)?;
-                    filter.status_code_min = Some(code);
-                    filter.status_code_max = Some(code);
-                }
-            }
+            apply_status_code_comparison(&mut filter, val)?;
             matched = true;
         } else if part.starts_with("response.duration") {
             let Some(val) = extract_numeric_comparison(part) else {
@@ -1019,6 +1037,39 @@ fn parse_access_log_filter_expression(expr: &str) -> Result<Option<AccessLogFilt
     }
 
     if matched { Ok(Some(filter)) } else { Ok(None) }
+}
+
+fn apply_status_code_comparison(
+    filter: &mut AccessLogFilter,
+    comparison: Comparison,
+) -> Result<(), String> {
+    match comparison {
+        Comparison::Gte(n) => merge_status_code_min(&mut filter.status_code_min, n)?,
+        Comparison::Gt(n) => {
+            merge_status_code_min(&mut filter.status_code_min, comparison_increment(n)?)?
+        }
+        Comparison::Lte(n) => merge_status_code_max(&mut filter.status_code_max, n)?,
+        Comparison::Lt(n) => {
+            merge_status_code_max(&mut filter.status_code_max, comparison_decrement(n)?)?
+        }
+        Comparison::Eq(n) => {
+            merge_status_code_min(&mut filter.status_code_min, n)?;
+            merge_status_code_max(&mut filter.status_code_max, n)?;
+        }
+    }
+    Ok(())
+}
+
+fn merge_status_code_min(current: &mut Option<u16>, value: i64) -> Result<(), String> {
+    let value = status_code_value(value)?;
+    *current = Some(current.map_or(value, |existing| existing.max(value)));
+    Ok(())
+}
+
+fn merge_status_code_max(current: &mut Option<u16>, value: i64) -> Result<(), String> {
+    let value = status_code_value(value)?;
+    *current = Some(current.map_or(value, |existing| existing.min(value)));
+    Ok(())
 }
 
 fn status_code_value(value: i64) -> Result<u16, String> {
@@ -1989,6 +2040,57 @@ mod tests {
     }
 
     #[test]
+    fn request_authentication_rejects_malformed_from_headers() {
+        let err = translate_k8s_objects(
+            &[object(
+                "RequestAuthentication",
+                serde_json::json!({
+                    "jwtRules": [{
+                        "issuer": "https://accounts.google.com",
+                        "jwksUri": "https://www.googleapis.com/oauth2/v3/certs",
+                        "fromHeaders": [
+                            {"prefix": "Bearer "}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("malformed fromHeaders should fail translation");
+
+        assert!(
+            err.to_string()
+                .contains("RequestAuthentication jwtRules[].fromHeaders[0].name is required")
+        );
+    }
+
+    #[test]
+    fn request_authentication_rejects_malformed_from_header_prefix() {
+        let err = translate_k8s_objects(
+            &[object(
+                "RequestAuthentication",
+                serde_json::json!({
+                    "jwtRules": [{
+                        "issuer": "https://accounts.google.com",
+                        "jwksUri": "https://www.googleapis.com/oauth2/v3/certs",
+                        "fromHeaders": [
+                            {"name": "Authorization", "prefix": 42}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("malformed fromHeaders prefix should fail translation");
+
+        assert!(
+            err.to_string().contains(
+                "RequestAuthentication jwtRules[].fromHeaders[0].prefix must be a string"
+            )
+        );
+    }
+
+    #[test]
     fn root_namespace_request_authentication_selector_is_mesh_wide_by_labels() {
         let mut ra = object(
             "RequestAuthentication",
@@ -2152,6 +2254,25 @@ mod tests {
             err.to_string()
                 .contains("response.duration filters only support")
         );
+    }
+
+    #[test]
+    fn telemetry_access_log_repeated_status_predicates_intersect() {
+        let filter =
+            parse_access_log_filter_expression("response.code >= 500 && response.code >= 400")
+                .expect("filter parses")
+                .expect("filter is present");
+
+        assert_eq!(filter.status_code_min, Some(500));
+        assert_eq!(filter.status_code_max, None);
+
+        let filter =
+            parse_access_log_filter_expression("response.code <= 599 && response.code <= 499")
+                .expect("filter parses")
+                .expect("filter is present");
+
+        assert_eq!(filter.status_code_min, None);
+        assert_eq!(filter.status_code_max, Some(499));
     }
 
     #[test]
