@@ -34,6 +34,8 @@ use crate::FERRUM_VERSION;
 use crate::config::EnvConfig;
 use crate::config::db_loader::IncrementalResult;
 use crate::config::types::GatewayConfig;
+use crate::identity::TrustBundleSet as RuntimeTrustBundleSet;
+use crate::modes::mesh::config::TrustBundleSet as ConfigTrustBundleSet;
 use crate::proxy::{IncrementalApplyOutcome, ProxyState};
 
 /// Tracks the DP's connection status to its Control Plane.
@@ -526,6 +528,88 @@ fn update_state_config_received(connection_state: Option<&Arc<ArcSwap<DpCpConnec
     }
 }
 
+#[derive(Debug)]
+enum GatewayTrustBundleUpdate {
+    Unchanged,
+    Replace(RuntimeTrustBundleSet),
+    Clear,
+}
+
+fn validate_gateway_trust_bundles(
+    trust_bundles: &ConfigTrustBundleSet,
+    source: &str,
+) -> Result<(), String> {
+    let errors = crate::modes::mesh::config::validate_mesh_config(
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        Some(trust_bundles),
+    );
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "gateway trust bundles {source} failed validation: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+fn convert_gateway_trust_bundles(
+    trust_bundles: ConfigTrustBundleSet,
+    source: &str,
+) -> Result<RuntimeTrustBundleSet, String> {
+    validate_gateway_trust_bundles(&trust_bundles, source)?;
+    trust_bundles
+        .to_runtime()
+        .map_err(|e| format!("gateway trust bundles {source} contains invalid trust material: {e}"))
+}
+
+fn parse_gateway_trust_bundle_update(
+    trust_bundles_json: &str,
+) -> Result<GatewayTrustBundleUpdate, String> {
+    let trust_bundles_json = trust_bundles_json.trim();
+    if !trust_bundles_json.is_empty() {
+        let trust_bundles: Option<ConfigTrustBundleSet> = serde_json::from_str(trust_bundles_json)
+            .map_err(|e| format!("gateway trust bundles side-channel is not valid JSON: {e}"))?;
+        return match trust_bundles {
+            Some(trust_bundles) => convert_gateway_trust_bundles(trust_bundles, "side-channel")
+                .map(GatewayTrustBundleUpdate::Replace),
+            None => Ok(GatewayTrustBundleUpdate::Clear),
+        };
+    }
+
+    Ok(GatewayTrustBundleUpdate::Unchanged)
+}
+
+fn apply_gateway_trust_bundle_update(
+    proxy_state: &ProxyState,
+    update: GatewayTrustBundleUpdate,
+) -> bool {
+    match update {
+        GatewayTrustBundleUpdate::Unchanged => false,
+        GatewayTrustBundleUpdate::Replace(trust_bundles) => {
+            let trust_domain = trust_bundles.local.trust_domain.clone();
+            let federated_count = trust_bundles.federated.len();
+            proxy_state.update_gateway_trust_bundles(trust_bundles);
+            info!(
+                %trust_domain,
+                federated_count,
+                "Updated gateway SPIFFE trust bundles from CP"
+            );
+            true
+        }
+        GatewayTrustBundleUpdate::Clear => {
+            proxy_state.clear_gateway_trust_bundles();
+            info!("Cleared CP-delivered gateway SPIFFE trust bundles");
+            true
+        }
+    }
+}
+
 #[allow(dead_code)] // Used by tests and library callers; binary startup uses the startup-aware variant.
 pub async fn connect_and_subscribe(
     cp_url: &str,
@@ -653,6 +737,21 @@ pub async fn connect_and_subscribe_with_startup_ready(
                 // FULL_SNAPSHOT — replace entire config
                 match serde_json::from_str::<GatewayConfig>(&update.config_json) {
                     Ok(mut config) => {
+                        let gateway_trust_bundle_update =
+                            match parse_gateway_trust_bundle_update(&update.trust_bundles_json) {
+                                Ok(update) => update,
+                                Err(msg) => {
+                                    error!("CP config rejected — {}", msg);
+                                    error!(
+                                        "Ignoring config update with invalid gateway trust bundles"
+                                    );
+                                    continue;
+                                }
+                            };
+                        // Gateway trust material is delivered via the ConfigUpdate
+                        // side-channel. Do not retain any legacy/config-file copy in
+                        // the DP's regular GatewayConfig snapshot.
+                        config.trust_bundles = None;
                         // Defense in depth: even though the CP-side
                         // namespace check should prevent any
                         // cross-namespace resources from reaching this
@@ -723,6 +822,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
                             continue;
                         }
                         proxy_state.update_config(config);
+                        apply_gateway_trust_bundle_update(proxy_state, gateway_trust_bundle_update);
                         update_state_config_received(connection_state);
                         if !initial_snapshot_applied {
                             proxy_state
@@ -759,6 +859,15 @@ pub async fn connect_and_subscribe_with_startup_ready(
                 // DELTA — apply incremental changes only
                 match serde_json::from_str::<IncrementalResult>(&update.config_json) {
                     Ok(mut result) => {
+                        let gateway_trust_bundle_update =
+                            match parse_gateway_trust_bundle_update(&update.trust_bundles_json) {
+                                Ok(update) => update,
+                                Err(msg) => {
+                                    error!("CP delta rejected — {}", msg);
+                                    error!("Ignoring delta with invalid gateway trust bundles");
+                                    continue;
+                                }
+                            };
                         // Defense in depth: filter cross-namespace
                         // additions/modifications before applying. See
                         // `filter_incremental_to_namespace`.
@@ -807,10 +916,22 @@ pub async fn connect_and_subscribe_with_startup_ready(
 
                         match proxy_state.apply_incremental(result).await {
                             IncrementalApplyOutcome::Applied => {
+                                apply_gateway_trust_bundle_update(
+                                    proxy_state,
+                                    gateway_trust_bundle_update,
+                                );
                                 update_state_config_received(connection_state);
                                 info!("Incremental config delta applied from CP");
                             }
                             IncrementalApplyOutcome::NoChanges => {
+                                if apply_gateway_trust_bundle_update(
+                                    proxy_state,
+                                    gateway_trust_bundle_update,
+                                ) {
+                                    update_state_config_received(connection_state);
+                                    info!("Gateway trust bundle update applied from CP");
+                                    continue;
+                                }
                                 // Empty delta — preserve original behavior of not
                                 // touching `last_config_received_at` so cluster
                                 // observability still reflects only deltas that
@@ -1000,6 +1121,45 @@ mod tests {
         );
     }
 
+    fn test_config_trust_bundles(x509_authorities: Vec<String>) -> ConfigTrustBundleSet {
+        ConfigTrustBundleSet {
+            local: crate::modes::mesh::config::TrustBundle {
+                trust_domain: crate::identity::TrustDomain::new("cluster.local")
+                    .expect("test trust domain should be valid"),
+                x509_authorities,
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parse_gateway_trust_bundle_update_treats_empty_side_channel_as_unchanged() {
+        let update = parse_gateway_trust_bundle_update("").expect("empty side-channel is valid");
+        assert!(matches!(update, GatewayTrustBundleUpdate::Unchanged));
+    }
+
+    #[test]
+    fn parse_gateway_trust_bundle_update_treats_null_side_channel_as_clear() {
+        let update = parse_gateway_trust_bundle_update("null").expect("null side-channel is valid");
+        assert!(matches!(update, GatewayTrustBundleUpdate::Clear));
+    }
+
+    #[test]
+    fn parse_gateway_trust_bundle_update_rejects_semantically_invalid_bundle() {
+        let trust_bundles = test_config_trust_bundles(Vec::new());
+        let json = serde_json::to_string(&trust_bundles).expect("test bundle should serialize");
+        let err = parse_gateway_trust_bundle_update(&json)
+            .expect_err("empty authority bundle should be rejected");
+
+        assert!(err.contains("failed validation"), "unexpected error: {err}");
+        assert!(
+            err.contains("has no authorities"),
+            "unexpected error: {err}"
+        );
+    }
+
     fn proxy_in_namespace(id: &str, ns: &str) -> crate::config::types::Proxy {
         serde_json::from_value(json!({
             "id": id,
@@ -1064,6 +1224,7 @@ mod tests {
             ],
             loaded_at: Utc::now(),
             known_namespaces: Vec::new(),
+            trust_bundles: None,
             mesh: None,
         };
 
@@ -1090,6 +1251,7 @@ mod tests {
             upstreams: vec![],
             loaded_at: Utc::now(),
             known_namespaces: Vec::new(),
+            trust_bundles: None,
             mesh: None,
         };
         assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);

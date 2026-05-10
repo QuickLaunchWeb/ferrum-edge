@@ -25,7 +25,8 @@ use ferrum_edge::grpc::dp_client::{self, DpGrpcTlsConfig, GrpcJwtSecret};
 use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, MeshConfig, MeshService, ServicePort, Workload, WorkloadPort, WorkloadSelector,
+    AppProtocol, MeshConfig, MeshService, ServicePort, TrustBundle, TrustBundleSet, Workload,
+    WorkloadPort, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::config_consumer::native_client::{
     NativeMeshClientConfig, start_native_mesh_client_with_shutdown,
@@ -115,6 +116,23 @@ fn create_test_config(proxy_count: usize) -> GatewayConfig {
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
+    }
+}
+
+fn create_test_trust_bundles() -> TrustBundleSet {
+    TrustBundleSet {
+        local: TrustBundle {
+            trust_domain: TrustDomain::new("cluster.local").unwrap(),
+            x509_authorities: vec!["AQIDBA==".to_string()],
+            jwt_authorities: Vec::new(),
+            refresh_hint_seconds: Some(300),
+        },
+        federated: vec![TrustBundle {
+            trust_domain: TrustDomain::new("remote.local").unwrap(),
+            x509_authorities: vec!["BQYH".to_string()],
+            jwt_authorities: Vec::new(),
+            refresh_hint_seconds: None,
+        }],
     }
 }
 
@@ -377,6 +395,182 @@ async fn test_dp_receives_initial_config_from_cp() {
         Ok(Err(e)) => panic!("connect_and_subscribe failed: {}", e),
         Err(_) => {} // Timeout is acceptable - we already verified config was received
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_stores_gateway_trust_bundles_from_initial_snapshot() {
+    let mut cp_config = create_test_config(1);
+    cp_config.trust_bundles = Some(Box::new(create_test_trust_bundles()));
+    let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "trust-bundle-node-1",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
+    });
+
+    let received = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.gateway_trust_bundles.load().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        received.is_ok(),
+        "DP should store CP-delivered gateway trust bundles"
+    );
+
+    let loaded = proxy_state.gateway_trust_bundles.load_full();
+    let trust_bundles = loaded.as_ref().as_ref().expect("trust bundles stored");
+    assert_eq!(trust_bundles.local.trust_domain.as_str(), "cluster.local");
+    assert_eq!(trust_bundles.local.x509_authorities, vec![vec![1, 2, 3, 4]]);
+    assert_eq!(trust_bundles.federated.len(), 1);
+    assert!(
+        proxy_state.config.load().trust_bundles.is_none(),
+        "DP-facing GatewayConfig JSON should not carry trust bundles"
+    );
+    assert!(proxy_state.gateway_svid_bundle.load().is_none());
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_stores_gateway_trust_bundles_from_delta_side_channel() {
+    let cp_config = create_test_config(1);
+    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "trust-bundle-node-2",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
+    });
+
+    let received_initial = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(received_initial.is_ok(), "DP should receive initial config");
+
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    let trust_bundles = create_test_trust_bundles();
+    CpGrpcServer::broadcast_delta_with_trust_bundles(
+        &update_tx,
+        &delta,
+        "trust-bundles-v2",
+        Some(&trust_bundles),
+    );
+
+    let received_trust = timeout(Duration::from_secs(5), async {
+        loop {
+            let loaded = proxy_state.gateway_trust_bundles.load();
+            if loaded
+                .as_ref()
+                .as_ref()
+                .is_some_and(|tb| tb.local.x509_authorities == vec![vec![1, 2, 3, 4]])
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        received_trust.is_ok(),
+        "DP should apply gateway trust bundles from delta side-channel"
+    );
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_clears_gateway_trust_bundles_from_explicit_side_channel_null() {
+    let mut cp_config = create_test_config(1);
+    cp_config.trust_bundles = Some(Box::new(create_test_trust_bundles()));
+    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "trust-bundle-node-3",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
+    });
+
+    let received_initial = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.gateway_trust_bundles.load().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        received_initial.is_ok(),
+        "DP should receive initial gateway trust bundles"
+    );
+
+    let cleared_config = create_test_config(1);
+    CpGrpcServer::broadcast_update(&update_tx, &cleared_config);
+
+    let cleared = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.gateway_trust_bundles.load().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        cleared.is_ok(),
+        "DP should clear CP-delivered trust bundles when CP sends side-channel null"
+    );
+
+    client_handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1061,6 +1255,7 @@ async fn test_dp_handles_malformed_config() {
         version: "bad".to_string(),
         timestamp: chrono::Utc::now().timestamp(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        trust_bundles_json: String::new(),
     };
     let _ = update_tx.send(malformed_update);
 
@@ -1705,6 +1900,7 @@ async fn test_dp_ignores_malformed_delta() {
         version: "bad".to_string(),
         timestamp: Utc::now().timestamp(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        trust_bundles_json: String::new(),
     };
     let _ = update_tx.send(malformed);
 
@@ -2953,6 +3149,55 @@ async fn test_cp_rejects_dp_with_mismatched_namespace_get_full_config() {
         "Error should mention both DP and CP namespaces, got: {}",
         status.message()
     );
+
+    server_handle.abort();
+}
+
+/// `GetFullConfig` returns the same gateway trust-bundle side channel as the
+/// Subscribe full snapshot while keeping trust material out of `config_json`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_full_config_returns_gateway_trust_bundles_side_channel() {
+    let mut cp_config = create_test_config(1);
+    cp_config.trust_bundles = Some(Box::new(create_test_trust_bundles()));
+    let (addr, _update_tx, server_handle) =
+        start_test_cp_server_with_namespace(cp_config, "ferrum").await;
+
+    let generated_token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "test-dp").unwrap();
+    let token_meta: tonic::metadata::MetadataValue<_> =
+        format!("Bearer {}", generated_token).parse().unwrap();
+    let channel = tonic::transport::Channel::from_shared(format!("http://{}", addr))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let mut client =
+        ferrum_edge::grpc::proto::config_sync_client::ConfigSyncClient::with_interceptor(
+            channel,
+            move |mut req: tonic::Request<()>| {
+                req.metadata_mut()
+                    .insert("authorization", token_meta.clone());
+                Ok(req)
+            },
+        );
+
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::FullConfigRequest {
+        node_id: "test-dp".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+    });
+
+    let response = client
+        .get_full_config(request)
+        .await
+        .expect("GetFullConfig should succeed")
+        .into_inner();
+
+    let config_json: serde_json::Value =
+        serde_json::from_str(&response.config_json).expect("config JSON should parse");
+    assert!(config_json.get("trust_bundles").is_none());
+    assert_ne!(response.trust_bundles_json, "null");
+    assert!(response.trust_bundles_json.contains("cluster.local"));
 
     server_handle.abort();
 }

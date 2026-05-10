@@ -24,18 +24,46 @@ use tracing::{error, info, warn};
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
-use crate::config::db_backend::{self, DatabaseBackend};
+use crate::config::db_backend::{self, DatabaseBackend, GatewayTrustBundlePoll};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot as apply_incremental_to_config;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::cp_server::CpGrpcServer;
 use crate::grpc::mesh_server::MeshGrpcServer;
+use crate::modes::mesh::config::TrustBundleSet as MeshTrustBundleSet;
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
 use crate::xds::XdsAdsServer;
 
 #[cfg(test)]
 use crate::config::incremental_apply::upsert_by_id;
+
+fn sanitize_gateway_trust_bundles_from_source(
+    trust_bundles: Option<Box<MeshTrustBundleSet>>,
+    context: &str,
+) -> Option<Box<MeshTrustBundleSet>> {
+    if let Some(ref trust_bundles) = trust_bundles {
+        let errors = crate::modes::mesh::config::validate_mesh_config(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            Some(trust_bundles),
+        );
+        if !errors.is_empty() {
+            error!(
+                "Clearing invalid gateway trust bundles from CP {}: {}",
+                context,
+                errors.join("; ")
+            );
+            return None;
+        }
+    }
+
+    trust_bundles
+}
 
 pub async fn run(
     env_config: EnvConfig,
@@ -540,6 +568,7 @@ pub async fn run(
 
         // Seed incremental state from the initial config load
         let initial_config = config_poll.load_full();
+        let mut last_gateway_trust_bundles = initial_config.trust_bundles.clone();
         let (
             mut known_proxy_ids,
             mut known_consumer_ids,
@@ -624,6 +653,46 @@ pub async fn run(
                             Ok(result) => {
                                 db_available_poll.store(true, Ordering::Relaxed);
                                 if result.is_empty() {
+                                    let source_trust_bundles = match db_poll
+                                        .load_gateway_trust_bundles(&poll_namespace)
+                                        .await
+                                    {
+                                        Ok(GatewayTrustBundlePoll::Unchanged) => {
+                                            last_poll_at = Some(result.poll_timestamp);
+                                            continue;
+                                        }
+                                        Ok(GatewayTrustBundlePoll::Current(trust_bundles)) => {
+                                            sanitize_gateway_trust_bundles_from_source(
+                                                trust_bundles,
+                                                "empty incremental poll",
+                                            )
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to refresh gateway trust bundles after empty incremental poll; \
+                                                 leaving last_poll_at unchanged so the next poll retries: {}",
+                                                e
+                                            );
+                                            continue;
+                                        }
+                                    };
+                                    if source_trust_bundles != last_gateway_trust_bundles {
+                                        let version = result.poll_timestamp.to_rfc3339();
+                                        let mut refreshed_config = (*config_poll.load_full()).clone();
+                                        refreshed_config.trust_bundles =
+                                            source_trust_bundles.clone();
+                                        refreshed_config.loaded_at = result.poll_timestamp;
+                                        config_poll.store(Arc::new(refreshed_config));
+                                        CpGrpcServer::broadcast_delta_with_registry(
+                                            &update_tx,
+                                            &result,
+                                            &version,
+                                            &dp_registry_poll,
+                                            source_trust_bundles.as_deref(),
+                                        );
+                                        last_gateway_trust_bundles =
+                                            source_trust_bundles;
+                                    }
                                     last_poll_at = Some(result.poll_timestamp);
                                     continue;
                                 }
@@ -696,6 +765,24 @@ pub async fn run(
                                     continue;
                                 }
 
+                                match db_poll.load_gateway_trust_bundles(&poll_namespace).await {
+                                    Ok(GatewayTrustBundlePoll::Unchanged) => {}
+                                    Ok(GatewayTrustBundlePoll::Current(trust_bundles)) => {
+                                        new_config.trust_bundles =
+                                            sanitize_gateway_trust_bundles_from_source(
+                                                trust_bundles,
+                                                "incremental poll",
+                                            );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to refresh gateway trust bundles during incremental poll; \
+                                             applying resource delta with previous trust material: {}",
+                                            e
+                                        );
+                                    }
+                                }
+
                                 // Validation passed — advance known IDs, broadcast
                                 // the delta to DPs, and store the new config.
                                 update_known_ids(&mut known_proxy_ids, &added_proxy_ids, &removed_proxy_ids);
@@ -711,14 +798,22 @@ pub async fn run(
                                 // (serializes to JSON), and the mesh broadcast consumes the
                                 // original — keeping the per-poll clone count to one.
                                 let version = poll_ts.to_rfc3339();
-                                config_poll.store(Arc::new(new_config));
+                                let new_config = Arc::new(new_config);
+                                config_poll.store(new_config.clone());
 
                                 // Mesh streams render their per-subscriber slices from the
                                 // same delta payload. DP and mesh broadcasts are intentionally
                                 // coupled to the same polling cycle so both subscriber types
                                 // converge on the same config version simultaneously.
-                                CpGrpcServer::broadcast_delta_with_registry(&update_tx, &result, &version, &dp_registry_poll);
+                                CpGrpcServer::broadcast_delta_with_registry(
+                                    &update_tx,
+                                    &result,
+                                    &version,
+                                    &dp_registry_poll,
+                                    new_config.trust_bundles.as_deref(),
+                                );
                                 MeshGrpcServer::broadcast_delta_with_registry(&mesh_update_tx, result, &version, &mesh_registry_poll);
+                                last_gateway_trust_bundles = new_config.trust_bundles.clone();
 
                                 info!(
                                     "Incremental config update validated and pushed to DPs and mesh nodes (version={})",
@@ -741,6 +836,7 @@ pub async fn run(
                                         known_plugin_config_ids = pc;
                                         known_upstream_ids = u;
                                         last_poll_at = Some(new_config.loaded_at);
+                                        last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                         let new_config_arc = Arc::new(new_config.clone());
                                         config_poll.store(new_config_arc.clone());
                                         CpGrpcServer::broadcast_update_with_registry(&update_tx, &new_config, &dp_registry_poll);
@@ -761,6 +857,7 @@ pub async fn run(
                                                         known_plugin_config_ids = pc;
                                                         known_upstream_ids = u;
                                                         last_poll_at = Some(new_config.loaded_at);
+                                                        last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                                         let new_config_arc = Arc::new(new_config.clone());
                                                         config_poll.store(new_config_arc.clone());
                                                         CpGrpcServer::broadcast_update_with_registry(&update_tx, &new_config, &dp_registry_poll);

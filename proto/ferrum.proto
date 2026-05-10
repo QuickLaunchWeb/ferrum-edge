@@ -35,6 +35,10 @@ message FullConfigResponse {
   string version = 2;
   // Ferrum Edge binary version of the CP (e.g. "0.9.0")
   string ferrum_version = 3;
+  // JSON-encoded modes::mesh::config::TrustBundleSet for gateway-to-mesh TLS,
+  // or JSON null to clear previously delivered CP trust material. Kept
+  // out-of-band so config_json stays compatible with older DPs.
+  string trust_bundles_json = 4;
 }
 
 message ConfigUpdate {
@@ -48,6 +52,12 @@ message ConfigUpdate {
   int64 timestamp = 4;
   // Ferrum Edge binary version of the CP (e.g. "0.9.0")
   string ferrum_version = 5;
+  // JSON-encoded modes::mesh::config::TrustBundleSet for gateway-to-mesh TLS,
+  // or JSON null to clear previously delivered CP trust material. Kept
+  // out-of-band so DELTA updates can refresh trust without changing the
+  // incremental resource payload and FULL_SNAPSHOT config_json stays
+  // compatible with older DPs.
+  string trust_bundles_json = 6;
 }
 
 message MeshSubscribeRequest {

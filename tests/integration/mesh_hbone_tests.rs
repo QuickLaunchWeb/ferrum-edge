@@ -77,6 +77,7 @@ fn create_mesh_proxy_state(proxy: Proxy) -> ProxyState {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        trust_bundles: None,
         mesh: None,
     };
     let env_config = EnvConfig {
