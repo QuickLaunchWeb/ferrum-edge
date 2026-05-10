@@ -170,6 +170,8 @@ fn service_entry_static_resolution_with_endpoints() {
             protocol: AppProtocol::Http2,
             name: Some("https".into()),
         }],
+        export_to: Vec::new(),
+        workload_selector: None,
     };
     let s = serde_json::to_string(&entry).unwrap();
     let back: ServiceEntry = serde_json::from_str(&s).unwrap();

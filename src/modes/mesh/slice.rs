@@ -5,7 +5,7 @@ use crate::config::types::GatewayConfig;
 use crate::modes::mesh::config::{
     MeshPolicy, MeshRequestAuthentication, MeshService, MeshTelemetryResource, MultiClusterConfig,
     PeerAuthentication, ServiceEntry, TrustBundleSet, Workload, policy_scope_applies_to_workload,
-    scope_applies_to_workload, workload_selector_matches,
+    scope_applies_to_workload, service_entry_applies_to_workload, workload_selector_matches,
 };
 
 /// Node/workload selector used by both ADS and native `MeshSubscribe`.
@@ -168,7 +168,9 @@ impl MeshSlice {
         let service_entries: Vec<ServiceEntry> = mesh
             .service_entries
             .iter()
-            .filter(|entry| entry.namespace == namespace)
+            .filter(|entry| {
+                service_entry_applies_to_workload(entry, effective_namespace, &effective_labels)
+            })
             .cloned()
             .collect();
         let request_authentications: Vec<MeshRequestAuthentication> = mesh

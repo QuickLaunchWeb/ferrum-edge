@@ -156,6 +156,8 @@ fn translators_deduplicate_colliding_cluster_resources() {
             protocol: AppProtocol::Http,
             name: Some("http".to_string()),
         }],
+        export_to: Vec::new(),
+        workload_selector: None,
     });
     let config = GatewayConfig {
         mesh: Some(Box::new(mesh)),
@@ -173,6 +175,45 @@ fn translators_deduplicate_colliding_cluster_resources() {
     let eds = snapshot.resources(EDS_TYPE_URL);
     assert_eq!(eds.len(), 1);
     assert_eq!(eds[0].name, "cluster/default/api/8080");
+}
+
+#[test]
+fn service_entry_workload_selector_does_not_hide_visible_entry() {
+    let mut mesh = mesh_config();
+    mesh.service_entries.push(ServiceEntry {
+        name: "vm-backed-api".to_string(),
+        namespace: "default".to_string(),
+        hosts: vec!["vm.example.test".to_string()],
+        endpoints: Vec::new(),
+        resolution: Resolution::Dns,
+        location: ServiceEntryLocation::MeshExternal,
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }],
+        export_to: Vec::new(),
+        workload_selector: Some(WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "vm-backend".to_string())]),
+            namespace: Some("default".to_string()),
+        }),
+    });
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    let request = MeshSliceRequest {
+        node_id: "sidecar-api".to_string(),
+        namespace: "default".to_string(),
+        workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/api".to_string()),
+        labels: BTreeMap::new(),
+    };
+
+    let slice = MeshSlice::from_gateway_config(&config, request);
+
+    assert_eq!(slice.service_entries.len(), 1);
+    assert_eq!(slice.service_entries[0].name, "vm-backed-api");
 }
 
 #[test]
