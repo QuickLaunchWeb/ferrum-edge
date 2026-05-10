@@ -196,6 +196,8 @@ fn http_route_proxies(
                 upstream_id: upstream_id.clone(),
                 backend_scheme: BackendScheme::Http,
                 listen_port: None,
+                retry: None,
+                timeout_ms: None,
             }));
         }
     }
@@ -379,6 +381,8 @@ fn l4_route_proxies(
             upstream_id: None,
             backend_scheme: scheme,
             listen_port: Some(backend_port),
+            retry: None,
+            timeout_ms: None,
         }));
     }
     Ok(proxies)

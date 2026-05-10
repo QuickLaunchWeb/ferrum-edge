@@ -15,7 +15,8 @@ use serde_json::Value;
 
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
-    PluginAssociation, Proxy, ResponseBodyMode, Upstream, UpstreamTarget, default_namespace,
+    PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode, RetryConfig, Upstream,
+    UpstreamTarget, default_namespace,
 };
 use crate::identity::spiffe::TrustDomain;
 use crate::modes::mesh::config::MeshConfig;
@@ -414,10 +415,15 @@ pub(crate) struct RouteProxySpec {
     pub upstream_id: Option<String>,
     pub backend_scheme: BackendScheme,
     pub listen_port: Option<u16>,
+    /// Per-route retry config extracted from VirtualService `retries`.
+    pub retry: Option<RetryConfig>,
+    /// Per-route backend read timeout in ms extracted from VirtualService `timeout`.
+    pub timeout_ms: Option<u64>,
 }
 
 pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
     let now = Utc::now();
+    let backend_read_timeout_ms = spec.timeout_ms.unwrap_or(30_000);
     Proxy {
         id: spec.id,
         name: None,
@@ -432,7 +438,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         strip_listen_path: spec.strip_listen_path,
         preserve_host_header: false,
         backend_connect_timeout_ms: 30_000,
-        backend_read_timeout_ms: 30_000,
+        backend_read_timeout_ms,
         backend_write_timeout_ms: 30_000,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -460,7 +466,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         upstream_subset: None,
         api_spec_id: None,
         circuit_breaker: None,
-        retry: None,
+        retry: spec.retry,
         response_body_mode: ResponseBodyMode::Stream,
         listen_port: spec.listen_port,
         frontend_tls: false,
@@ -473,6 +479,191 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         created_at: now,
         updated_at: now,
     }
+}
+
+/// Build a `fault_injection` plugin config scoped to a specific proxy.
+pub(crate) fn fault_injection_plugin_for_proxy(
+    proxy_id: &str,
+    namespace: &str,
+    fault: &Value,
+) -> Option<PluginConfig> {
+    let obj = fault.as_object()?;
+    let mut config = serde_json::Map::new();
+
+    if let Some(delay) = obj.get("fixedDelay").and_then(Value::as_str)
+        && let Some(ms) = parse_istio_duration_ms(delay)
+    {
+        let percentage = obj
+            .get("percentage")
+            .and_then(|p| p.get("value"))
+            .and_then(Value::as_f64)
+            .or_else(|| obj.get("percent").and_then(Value::as_f64))
+            .unwrap_or(100.0);
+        config.insert(
+            "delay".to_string(),
+            serde_json::json!({
+                "duration_ms": ms,
+                "percentage": percentage,
+            }),
+        );
+    }
+
+    // Also check nested delay object (Istio HTTPFaultInjection.Delay)
+    if !config.contains_key("delay")
+        && let Some(delay_obj) = obj.get("delay").and_then(Value::as_object)
+        && let Some(delay_str) = delay_obj.get("fixedDelay").and_then(Value::as_str)
+        && let Some(ms) = parse_istio_duration_ms(delay_str)
+    {
+        let percentage = delay_obj
+            .get("percentage")
+            .and_then(|p| p.get("value"))
+            .and_then(Value::as_f64)
+            .or_else(|| delay_obj.get("percent").and_then(Value::as_f64))
+            .unwrap_or(100.0);
+        config.insert(
+            "delay".to_string(),
+            serde_json::json!({
+                "duration_ms": ms,
+                "percentage": percentage,
+            }),
+        );
+    }
+
+    // Check for abort at top level or nested
+    let abort_source = obj.get("abort").and_then(Value::as_object).or_else(|| {
+        // Top-level httpStatus + percentage (flat Istio abort)
+        if obj.contains_key("httpStatus") {
+            Some(obj)
+        } else {
+            None
+        }
+    });
+
+    if let Some(abort_obj) = abort_source
+        && let Some(status) = abort_obj.get("httpStatus").and_then(Value::as_u64)
+        && (200..=599).contains(&status)
+    {
+        let percentage = abort_obj
+            .get("percentage")
+            .and_then(|p| p.get("value"))
+            .and_then(Value::as_f64)
+            .or_else(|| abort_obj.get("percent").and_then(Value::as_f64))
+            .unwrap_or(100.0);
+        config.insert(
+            "abort".to_string(),
+            serde_json::json!({
+                "status_code": status,
+                "percentage": percentage,
+            }),
+        );
+    }
+
+    if config.is_empty() {
+        return None;
+    }
+
+    let now = Utc::now();
+    Some(PluginConfig {
+        id: format!("istio-vs-fi-{proxy_id}"),
+        plugin_name: "fault_injection".to_string(),
+        namespace: namespace.to_string(),
+        config: Value::Object(config),
+        scope: PluginScope::Proxy,
+        proxy_id: Some(proxy_id.to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+/// Parse an Istio duration string (e.g., "5s", "100ms", "1.5s") to milliseconds.
+pub(crate) fn parse_istio_duration_ms(duration: &str) -> Option<u64> {
+    let trimmed = duration.trim();
+    if let Some(ms_str) = trimmed.strip_suffix("ms") {
+        return ms_str.trim().parse::<u64>().ok().filter(|&v| v > 0);
+    }
+    if let Some(s_str) = trimmed.strip_suffix('s') {
+        let seconds: f64 = s_str.trim().parse().ok()?;
+        let ms = (seconds * 1000.0) as u64;
+        return if ms > 0 { Some(ms) } else { None };
+    }
+    // Plain numeric string treated as seconds
+    let seconds: f64 = trimmed.parse().ok()?;
+    let ms = (seconds * 1000.0) as u64;
+    if ms > 0 { Some(ms) } else { None }
+}
+
+/// Extract retry config from an Istio VirtualService `retries` object.
+pub(crate) fn extract_retry_config(retries: &Value) -> Option<RetryConfig> {
+    let obj = retries.as_object()?;
+    let attempts = obj.get("attempts").and_then(Value::as_u64)?;
+    if attempts == 0 {
+        return None;
+    }
+
+    let per_try_timeout_ms = obj
+        .get("perTryTimeout")
+        .and_then(Value::as_str)
+        .and_then(parse_istio_duration_ms);
+
+    let retryable_status_codes = obj
+        .get("retryOn")
+        .and_then(Value::as_str)
+        .map(|retry_on| {
+            retry_on
+                .split(',')
+                .filter_map(|token| {
+                    let token = token.trim();
+                    // Istio retryOn uses Envoy retry-on tokens. Some map to status codes.
+                    match token {
+                        "5xx" => Some(vec![500, 502, 503, 504]),
+                        "gateway-error" => Some(vec![502, 503, 504]),
+                        "retriable-4xx" => Some(vec![409]),
+                        "reset" | "connect-failure" | "retriable-status-codes" => None,
+                        _ => token.parse::<u16>().ok().map(|code| vec![code]),
+                    }
+                })
+                .flatten()
+                .collect::<Vec<u16>>()
+        })
+        .unwrap_or_default();
+
+    let retry_on_connect = obj
+        .get("retryOn")
+        .and_then(Value::as_str)
+        .is_some_and(|retry_on| {
+            retry_on.split(',').any(|token| {
+                let token = token.trim();
+                token == "connect-failure" || token == "reset"
+            })
+        });
+
+    let mut config = RetryConfig {
+        max_retries: attempts as u32,
+        retryable_status_codes,
+        retry_on_connect_failure: retry_on_connect,
+        ..RetryConfig::default()
+    };
+
+    // Override per-try timeout if specified — this maps to
+    // backend_read_timeout_ms at the proxy level, but we pass it through
+    // RetryConfig's default retryable_methods since Istio doesn't limit by method.
+    if per_try_timeout_ms.is_some() {
+        // Make all methods retryable, matching Istio's default behavior
+        config.retryable_methods = vec![
+            "GET".to_string(),
+            "HEAD".to_string(),
+            "OPTIONS".to_string(),
+            "PUT".to_string(),
+            "DELETE".to_string(),
+            "POST".to_string(),
+            "PATCH".to_string(),
+        ];
+    }
+
+    Some(config)
 }
 
 pub(crate) struct RouteBackend {

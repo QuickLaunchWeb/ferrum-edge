@@ -14,11 +14,12 @@ use crate::modes::mesh::config::{
 
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions, RouteBackend,
-    RouteProxySpec, SourceKind, exact_path_listen_path, invalid_resource, optional_port_field,
-    port_from_u64, proxy_for_route, resource_id, selector_from_istio, string_array, string_field,
-    string_map, upstream_for_route,
+    RouteProxySpec, SourceKind, exact_path_listen_path, extract_retry_config,
+    fault_injection_plugin_for_proxy, invalid_resource, optional_port_field,
+    parse_istio_duration_ms, port_from_u64, proxy_for_route, resource_id, selector_from_istio,
+    string_array, string_field, string_map, upstream_for_route,
 };
-use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT};
+use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT, PluginConfig};
 
 pub(super) fn translate(
     acc: &mut K8sAccumulator,
@@ -44,12 +45,15 @@ pub(super) fn translate(
             Ok(true)
         }
         "VirtualService" => {
-            let (proxies, upstreams) = virtual_service_routes(object, acc)?;
+            let (proxies, upstreams, plugins) = virtual_service_routes(object, acc)?;
             for upstream in upstreams {
                 acc.upsert_upstream(upstream);
             }
             for proxy in proxies {
                 acc.upsert_proxy(proxy, SourceKind::Istio);
+            }
+            for plugin in plugins {
+                acc.config.plugin_configs.push(plugin);
             }
             Ok(true)
         }
@@ -597,19 +601,20 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
     })
 }
 
+type VsRouteResult = (
+    Vec<crate::config::types::Proxy>,
+    Vec<crate::config::types::Upstream>,
+    Vec<PluginConfig>,
+);
+
 fn virtual_service_routes(
     object: &K8sObject,
     acc: &mut K8sAccumulator,
-) -> Result<
-    (
-        Vec<crate::config::types::Proxy>,
-        Vec<crate::config::types::Upstream>,
-    ),
-    K8sTranslateError,
-> {
+) -> Result<VsRouteResult, K8sTranslateError> {
     let hosts = string_array(&object.spec, "hosts");
     let mut proxies = Vec::new();
     let mut upstreams = Vec::new();
+    let mut plugins = Vec::new();
 
     for (index, http) in object
         .spec
@@ -649,6 +654,15 @@ fn virtual_service_routes(
             (String::new(), 0, Some(upstream_id))
         };
 
+        // Extract per-route retry config from `retries`
+        let retry = http.get("retries").and_then(extract_retry_config);
+
+        // Extract per-route timeout from `timeout` (Istio duration string)
+        let timeout_ms = http
+            .get("timeout")
+            .and_then(Value::as_str)
+            .and_then(parse_istio_duration_ms);
+
         let match_count = match_paths.len();
         for (match_index, listen_path) in match_paths.into_iter().enumerate() {
             let suffix = if match_count == 1 {
@@ -656,13 +670,26 @@ fn virtual_service_routes(
             } else {
                 format!("{index}-{match_index}")
             };
-            proxies.push(proxy_for_route(RouteProxySpec {
-                id: resource_id(
-                    "istio-vs",
+            let proxy_id = resource_id(
+                "istio-vs",
+                &object.metadata.namespace,
+                &object.metadata.name,
+                &suffix,
+            );
+
+            // Extract fault injection config and create a proxy-scoped plugin
+            if let Some(fault_value) = http.get("fault")
+                && let Some(plugin) = fault_injection_plugin_for_proxy(
+                    &proxy_id,
                     &object.metadata.namespace,
-                    &object.metadata.name,
-                    &suffix,
-                ),
+                    fault_value,
+                )
+            {
+                plugins.push(plugin);
+            }
+
+            proxies.push(proxy_for_route(RouteProxySpec {
+                id: proxy_id,
                 namespace: object.metadata.namespace.clone(),
                 hosts: hosts.clone(),
                 listen_path,
@@ -672,11 +699,13 @@ fn virtual_service_routes(
                 upstream_id: upstream_id.clone(),
                 backend_scheme: BackendScheme::Http,
                 listen_port: None,
+                retry: retry.clone(),
+                timeout_ms,
             }));
         }
     }
 
-    Ok((proxies, upstreams))
+    Ok((proxies, upstreams, plugins))
 }
 
 fn match_paths(http: &Value) -> Vec<Option<String>> {
@@ -2435,6 +2464,356 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|w| w.contains("RequestAuthentication"))
+        );
+    }
+
+    // ── VirtualService fault injection / retry / timeout ─────────────
+
+    #[test]
+    fn virtual_service_extracts_fault_injection_abort() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 503,
+                                "percentage": {"value": 50.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.plugin_configs.len(), 1);
+        let plugin = &result.config.plugin_configs[0];
+        assert_eq!(plugin.plugin_name, "fault_injection");
+        assert_eq!(
+            plugin.proxy_id.as_deref(),
+            Some(result.config.proxies[0].id.as_str())
+        );
+        let abort = plugin.config.get("abort").expect("abort config");
+        assert_eq!(abort["status_code"], 503);
+        assert_eq!(abort["percentage"], 50.0);
+    }
+
+    #[test]
+    fn virtual_service_extracts_fault_injection_delay() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "delay": {
+                                "fixedDelay": "5s",
+                                "percentage": {"value": 25.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.plugin_configs.len(), 1);
+        let plugin = &result.config.plugin_configs[0];
+        assert_eq!(plugin.plugin_name, "fault_injection");
+        let delay = plugin.config.get("delay").expect("delay config");
+        assert_eq!(delay["duration_ms"], 5000);
+        assert_eq!(delay["percentage"], 25.0);
+    }
+
+    #[test]
+    fn virtual_service_extracts_fault_injection_abort_and_delay() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 500,
+                                "percentage": {"value": 10.0}
+                            },
+                            "delay": {
+                                "fixedDelay": "2s",
+                                "percentage": {"value": 30.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = &result.config.plugin_configs[0];
+        assert!(plugin.config.get("abort").is_some());
+        assert!(plugin.config.get("delay").is_some());
+        assert_eq!(plugin.config["abort"]["status_code"], 500);
+        assert_eq!(plugin.config["delay"]["duration_ms"], 2000);
+    }
+
+    #[test]
+    fn virtual_service_extracts_timeout() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "timeout": "10s"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].backend_read_timeout_ms, 10_000);
+    }
+
+    #[test]
+    fn virtual_service_extracts_timeout_milliseconds() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "timeout": "500ms"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies[0].backend_read_timeout_ms, 500);
+    }
+
+    #[test]
+    fn virtual_service_extracts_retries() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 3,
+                            "retryOn": "5xx,connect-failure"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let proxy = &result.config.proxies[0];
+        let retry = proxy.retry.as_ref().expect("retry config");
+        assert_eq!(retry.max_retries, 3);
+        assert!(retry.retryable_status_codes.contains(&500));
+        assert!(retry.retryable_status_codes.contains(&502));
+        assert!(retry.retryable_status_codes.contains(&503));
+        assert!(retry.retryable_status_codes.contains(&504));
+        assert!(retry.retry_on_connect_failure);
+    }
+
+    #[test]
+    fn virtual_service_retries_zero_attempts_produces_no_retry() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 0
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.proxies[0].retry.is_none());
+    }
+
+    #[test]
+    fn virtual_service_no_fault_or_retry_or_timeout() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.plugin_configs.is_empty());
+        assert!(result.config.proxies[0].retry.is_none());
+        assert_eq!(result.config.proxies[0].backend_read_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn virtual_service_fault_delay_ms_format() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "delay": {
+                                "fixedDelay": "250ms",
+                                "percent": 100.0
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = &result.config.plugin_configs[0];
+        let delay = plugin.config.get("delay").expect("delay config");
+        assert_eq!(delay["duration_ms"], 250);
+        assert_eq!(delay["percentage"], 100.0);
+    }
+
+    #[test]
+    fn virtual_service_fault_abort_defaults_percentage_100() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 503
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = &result.config.plugin_configs[0];
+        let abort = plugin.config.get("abort").expect("abort config");
+        assert_eq!(abort["percentage"], 100.0);
+    }
+
+    #[test]
+    fn virtual_service_retries_gateway_error_maps_to_status_codes() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 2,
+                            "retryOn": "gateway-error"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let retry = result.config.proxies[0].retry.as_ref().expect("retry");
+        assert_eq!(retry.max_retries, 2);
+        assert!(retry.retryable_status_codes.contains(&502));
+        assert!(retry.retryable_status_codes.contains(&503));
+        assert!(retry.retryable_status_codes.contains(&504));
+        assert!(!retry.retry_on_connect_failure);
+    }
+
+    #[test]
+    fn parse_istio_duration_ms_formats() {
+        assert_eq!(parse_istio_duration_ms("5s"), Some(5000));
+        assert_eq!(parse_istio_duration_ms("1.5s"), Some(1500));
+        assert_eq!(parse_istio_duration_ms("500ms"), Some(500));
+        assert_eq!(parse_istio_duration_ms("0s"), None);
+        assert_eq!(parse_istio_duration_ms("0ms"), None);
+    }
+
+    #[test]
+    fn virtual_service_fault_plugin_scoped_to_proxy() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 503,
+                                "percentage": {"value": 10.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = &result.config.plugin_configs[0];
+        assert!(matches!(
+            plugin.scope,
+            crate::config::types::PluginScope::Proxy
+        ));
+        assert_eq!(
+            plugin.proxy_id.as_deref(),
+            Some(result.config.proxies[0].id.as_str())
         );
     }
 }
