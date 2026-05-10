@@ -36,6 +36,7 @@ pub mod body;
 pub mod client_ip;
 pub mod deferred_log;
 pub mod grpc_proxy;
+pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
 pub mod http2_pool;
@@ -100,6 +101,7 @@ use self::backend_capabilities::{
 };
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
+use self::hbone_pool::{HboneConnectionPool, HbonePoolError};
 use self::http2_pool::Http2ConnectionPool;
 
 /// Static empty HashMap used by rejection responses to avoid allocating a new
@@ -122,6 +124,13 @@ const BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP: u64 = 5_000;
 struct H3ProbeOutcome {
     h3: ProtocolSupport,
     error: Option<String>,
+}
+
+struct HboneProbeTarget<'a> {
+    host: &'a str,
+    port: u16,
+    hbone_port: u16,
+    previous_hbone: Option<ProtocolSupport>,
 }
 
 impl H3ProbeOutcome {
@@ -757,6 +766,35 @@ fn supports_direct_http2_backend(
             .is_some_and(|record| record.plain_http.h2_tls.is_supported())
 }
 
+fn can_use_hbone_pool(
+    retain_request_body: bool,
+    requires_request_body_buffering: bool,
+    stream_request_body: bool,
+) -> bool {
+    !retain_request_body && !requires_request_body_buffering && stream_request_body
+}
+
+fn proxy_can_dispatch_hbone(proxy: &Proxy) -> bool {
+    proxy.dispatch_kind == DispatchKind::HttpPool
+}
+
+fn supports_hbone_backend(
+    state: &ProxyState,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> bool {
+    let Some(target) = upstream_target else {
+        return false;
+    };
+    proxy_can_dispatch_hbone(proxy)
+        && hbone_pool::target_hbone_enabled(target)
+        && state.gateway_svid_bundle.load().is_some()
+        && state
+            .backend_capabilities
+            .get(proxy, Some(target))
+            .is_some_and(|record| record.hbone.is_supported())
+}
+
 fn should_fallback_to_reqwest_after_http2_pool_error(err: &http2_pool::Http2PoolError) -> bool {
     matches!(err, http2_pool::Http2PoolError::BackendSelectedHttp1 { .. })
 }
@@ -1087,6 +1125,8 @@ pub struct ProxyState {
     pub grpc_pool: Arc<GrpcConnectionPool>,
     /// HTTP/2 connection pool for HTTPS backends (proper stream multiplexing)
     pub http2_pool: Arc<Http2ConnectionPool>,
+    /// HBONE connection pool for gateway-to-mesh outbound tunnels.
+    pub hbone_pool: Arc<HboneConnectionPool>,
     /// HTTP/3 connection pool for QUIC backends (reuses QUIC connections)
     pub h3_pool: Arc<Http3ConnectionPool>,
     /// Startup-classified backend protocol capabilities keyed by real backend target identity.
@@ -1180,7 +1220,6 @@ pub struct ProxyState {
     /// Optional gateway SPIFFE identity used by gateway-to-mesh outbound TLS.
     /// The slot shape matches mesh SVID rotation so later trust-bundle updates
     /// can hot-swap without blocking proxy readers.
-    #[allow(dead_code)] // Consumed by gateway-to-mesh HBONE dispatch in the next bridge phase.
     pub gateway_svid_bundle: SharedSvidBundle,
     /// Startup SVID bundle loaded from files. CP-delivered trust bundles are an
     /// override; when a CP snapshot removes them, this restores file trust.
@@ -1384,6 +1423,12 @@ impl ProxyState {
         let gateway_svid_bundle = load_gateway_svid_bundle(&env_config_arc)?;
         let gateway_file_svid_bundle = clone_svid_bundle_slot(&gateway_svid_bundle);
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
+        let hbone_pool = Arc::new(HboneConnectionPool::new(
+            global_pool_config.clone(),
+            dns_cache.clone(),
+            gateway_svid_bundle.clone(),
+            pool_shard_amount,
+        ));
         let h3_pool = Arc::new(Http3ConnectionPool::new(
             env_config_arc.clone(),
             dns_cache.clone(),
@@ -1654,6 +1699,7 @@ impl ProxyState {
             },
             grpc_pool,
             http2_pool,
+            hbone_pool,
             h3_pool,
             backend_capabilities,
             backend_capabilities_refresh,
@@ -1817,6 +1863,10 @@ impl ProxyState {
         let probe_timeout = Duration::from_millis(probe_proxy.backend_connect_timeout_ms);
         let host = target.host();
         let port = target.port();
+        let previous_hbone = self
+            .backend_capabilities
+            .get_by_key(&target.key)
+            .map(|record| record.hbone);
 
         match scheme {
             BackendScheme::Http => {
@@ -1850,6 +1900,20 @@ impl ProxyState {
             }
             BackendScheme::Tcp | BackendScheme::Tcps | BackendScheme::Udp | BackendScheme::Dtls => {
             }
+        }
+        if target.hbone_hint && matches!(scheme, BackendScheme::Http) {
+            self.probe_hbone(
+                &probe_proxy,
+                probe_timeout,
+                HboneProbeTarget {
+                    host,
+                    port,
+                    hbone_port: target.hbone_port,
+                    previous_hbone,
+                },
+                &mut record,
+            )
+            .await;
         }
 
         record.last_probe_at_unix_secs = backend_capabilities::now_unix_secs();
@@ -1942,6 +2006,69 @@ impl ProxyState {
                         "HTTP/2 probe timed out for {}:{} after {}ms",
                         host, port, probe_proxy.backend_connect_timeout_ms
                     ),
+                );
+            }
+        }
+    }
+
+    async fn probe_hbone(
+        &self,
+        probe_proxy: &Proxy,
+        probe_timeout: Duration,
+        target: HboneProbeTarget<'_>,
+        record: &mut BackendCapabilityRecord,
+    ) {
+        let host = target.host;
+        let port = target.port;
+        let hbone_port = target.hbone_port;
+        if self.gateway_svid_bundle.load().is_none() {
+            record.hbone = ProtocolSupport::Unknown;
+            debug!(
+                "HBONE probe for {}:{} skipped: gateway SVID is not configured",
+                host, port
+            );
+            return;
+        }
+
+        match tokio::time::timeout(
+            probe_timeout,
+            self.hbone_pool
+                .warmup_connection(probe_proxy, host, port, hbone_port),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                record.hbone = ProtocolSupport::Supported;
+            }
+            Ok(Err(err)) => {
+                if err.is_capability_failure() {
+                    record.hbone = ProtocolSupport::Unsupported;
+                } else if let Some(previous) = target.previous_hbone {
+                    record.hbone = previous;
+                }
+                append_probe_error(
+                    record,
+                    format!("HBONE probe failed for {host}:{port} via port {hbone_port}: {err}"),
+                );
+                debug!(
+                    "HBONE probe for {}:{} via port {} classified unsupported: {}",
+                    host, port, hbone_port, err
+                );
+            }
+            Err(_) => {
+                if let Some(previous) = target.previous_hbone {
+                    record.hbone = previous;
+                }
+                append_probe_error(
+                    record,
+                    format!(
+                        "HBONE probe timed out for {}:{} via port {} after {}ms",
+                        host, port, hbone_port, probe_proxy.backend_connect_timeout_ms
+                    ),
+                );
+                debug!(
+                    "HBONE probe for {}:{} via port {} timed out after {}ms; leaving unknown",
+                    host, port, hbone_port, probe_proxy.backend_connect_timeout_ms
                 );
             }
         }
@@ -2048,6 +2175,7 @@ impl ProxyState {
         let h2_supported = Arc::new(AtomicU64::new(0));
         let h3_supported = Arc::new(AtomicU64::new(0));
         let h2c_supported = Arc::new(AtomicU64::new(0));
+        let hbone_supported = Arc::new(AtomicU64::new(0));
 
         stream::iter(targets)
             .for_each_concurrent(buffer, |target| {
@@ -2056,6 +2184,7 @@ impl ProxyState {
                 let h2_supported = h2_supported.clone();
                 let h3_supported = h3_supported.clone();
                 let h2c_supported = h2c_supported.clone();
+                let hbone_supported = hbone_supported.clone();
                 let semaphore = semaphore.clone();
                 async move {
                     // Same rule as `run_warmup_task_batch`: prefer
@@ -2084,6 +2213,9 @@ impl ProxyState {
                     if record.grpc_transport.h2c.is_supported() {
                         h2c_supported.fetch_add(1, Ordering::Relaxed);
                     }
+                    if record.hbone.is_supported() {
+                        hbone_supported.fetch_add(1, Ordering::Relaxed);
+                    }
                     state.backend_capabilities.upsert(target.key, record);
                     refreshed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -2091,11 +2223,12 @@ impl ProxyState {
             .await;
 
         info!(
-            "Backend capability refresh complete: {} backends classified (h2_tls={}, h3={}, h2c={})",
+            "Backend capability refresh complete: {} backends classified (h2_tls={}, h3={}, h2c={}, hbone={})",
             refreshed.load(Ordering::Relaxed),
             h2_supported.load(Ordering::Relaxed),
             h3_supported.load(Ordering::Relaxed),
             h2c_supported.load(Ordering::Relaxed),
+            hbone_supported.load(Ordering::Relaxed),
         );
     }
 
@@ -7972,6 +8105,13 @@ async fn handle_proxy_request_inner(
     // pool), and reqwest's client pool is keyed per-target, so a
     // `dispatch_h3=false` rotation already picks up the new target's warmed
     // reqwest client without extra plumbing here.
+    let current_dispatch_hbone = !has_retry
+        && can_use_hbone_pool(
+            has_retry,
+            requires_request_body_buffering,
+            stream_request_body,
+        )
+        && supports_hbone_backend(&state, &proxy, upstream_target.as_deref());
     let mut current_dispatch_h3 =
         supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
@@ -7994,6 +8134,7 @@ async fn handle_proxy_request_inner(
             has_retry,
             &request_client_ip,
             is_tls,
+            false,
             current_dispatch_h3,
             &ctx.request_bytes_observed,
             inbound_version,
@@ -8160,6 +8301,7 @@ async fn handle_proxy_request_inner(
             false, // no retry — don't retain body
             &request_client_ip,
             is_tls,
+            current_dispatch_hbone,
             current_dispatch_h3,
             &ctx.request_bytes_observed,
             inbound_version,
@@ -8656,6 +8798,16 @@ async fn handle_proxy_request_inner(
 
             if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
                 crate::proxy::body::direct_streaming_h2_body(resp.into_body(), cl)
+            } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
+                // No Content-Length — enforce response-size limits while
+                // streaming H2 bodies, including HBONE tunnel responses,
+                // without buffering the whole backend response into memory.
+                crate::proxy::body::size_limited_streaming_h2_body(
+                    resp.into_body(),
+                    state.max_response_body_size_bytes,
+                    cl,
+                    state.h2_coalesce_target_bytes,
+                )
             } else if use_passthrough {
                 // Response too large to benefit from coalescing — stream
                 // direct, let hyper forward 1 MiB frames as-is. Saves the
@@ -9180,6 +9332,7 @@ async fn proxy_to_backend(
     retain_request_body: bool,
     client_ip: &str,
     is_tls: bool,
+    dispatch_hbone: bool,
     dispatch_h3: bool,
     // Shared counter for request body bytes observed on the wire. Populated
     // by the body handling block below via either `fetch_max` (buffered paths)
@@ -9221,6 +9374,25 @@ async fn proxy_to_backend(
         .await
         .ok()
         .map(|ip| ip.to_string());
+
+    if dispatch_hbone {
+        let (backend_resp, body_bytes) = proxy_to_backend_hbone(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            client_request_body,
+            upstream_target,
+            stream_response,
+            client_ip,
+            is_tls,
+            resolved_ip.clone(),
+            ctx_request_bytes_observed,
+        )
+        .await;
+        return (backend_resp, body_bytes);
+    }
 
     // Plain HTTPS requests attempt the native H3 pool only when startup
     // classification has already proved that this concrete backend target
@@ -10441,6 +10613,532 @@ fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
 ///
 /// Uses hyper's HTTP/2 client directly to multiplex concurrent requests over
 /// a single persistent TLS connection, avoiding reqwest's connection-per-burst behavior.
+fn hbone_pool_error_response(
+    state: &ProxyState,
+    proxy: &Proxy,
+    err: &HbonePoolError,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let error_class = err.error_class();
+    if error_class == retry::ErrorClass::PortExhaustion {
+        state.overload.record_port_exhaustion();
+    }
+    let error_body = if error_class == retry::ErrorClass::DnsLookupError {
+        r#"{"error":"DNS resolution for HBONE backend failed"}"#.to_string()
+    } else {
+        format!(r#"{{"error":"HBONE backend unavailable: {}"}}"#, err)
+    };
+    error!(
+        proxy_id = %proxy.id,
+        error_kind = retry::error_class_log_kind(error_class),
+        error = %err,
+        "HBONE backend request failed"
+    );
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(error_body.into_bytes()),
+        headers: HashMap::new(),
+        connection_error: !retry::request_reached_wire(error_class),
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(error_class),
+    }
+}
+
+fn hbone_hyper_error_response(
+    proxy: &Proxy,
+    err: hyper::Error,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    error!(proxy_id = %proxy.id, error = %err, "HBONE tunneled HTTP request failed");
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(r#"{"error":"HBONE backend unavailable"}"#.into()),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ProtocolError),
+    }
+}
+
+enum HyperBodyCollectError {
+    TooLarge,
+    Read(hyper::Error),
+}
+
+async fn collect_hyper_body_with_limit(
+    mut body: Incoming,
+    max_size: usize,
+) -> Result<Vec<u8>, HyperBodyCollectError> {
+    if max_size == 0 {
+        return body
+            .collect()
+            .await
+            .map(|collected| collected.to_bytes().to_vec())
+            .map_err(HyperBodyCollectError::Read);
+    }
+
+    let mut body_bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(HyperBodyCollectError::Read)?;
+        if let Some(data) = frame.data_ref() {
+            if body_bytes.len().saturating_add(data.len()) > max_size {
+                return Err(HyperBodyCollectError::TooLarge);
+            }
+            body_bytes.extend_from_slice(data);
+        }
+    }
+    Ok(body_bytes)
+}
+
+fn hbone_response_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    observed_size: Option<usize>,
+    max_size: usize,
+) -> retry::BackendResponse {
+    match observed_size {
+        Some(size) => warn!(
+            proxy_id = %proxy.id,
+            response_body_bytes = size,
+            max_response_body_size_bytes = max_size,
+            "HBONE backend response body exceeds configured size limit"
+        ),
+        None => warn!(
+            proxy_id = %proxy.id,
+            max_response_body_size_bytes = max_size,
+            "HBONE backend response body exceeded configured size limit while buffering"
+        ),
+    }
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(
+            r#"{"error":"Backend response body exceeds maximum size"}"#
+                .as_bytes()
+                .to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+    }
+}
+
+fn hbone_request_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    observed_size: Option<usize>,
+    max_size: usize,
+) -> retry::BackendResponse {
+    match observed_size {
+        Some(size) => warn!(
+            proxy_id = %proxy.id,
+            request_body_bytes = size,
+            max_request_body_size_bytes = max_size,
+            "HBONE request body exceeds configured size limit"
+        ),
+        None => warn!(
+            proxy_id = %proxy.id,
+            max_request_body_size_bytes = max_size,
+            "HBONE streaming request body exceeded configured size limit"
+        ),
+    }
+    retry::BackendResponse {
+        status_code: 413,
+        body: ResponseBody::Buffered(
+            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_to_backend_hbone(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    client_request_body: ClientRequestBody,
+    upstream_target: Option<&UpstreamTarget>,
+    stream_response: bool,
+    client_ip: &str,
+    is_tls: bool,
+    resolved_ip: Option<String>,
+    ctx_request_bytes_observed: &Arc<std::sync::atomic::AtomicU64>,
+) -> (retry::BackendResponse, Option<Bytes>) {
+    let Some(target) = upstream_target else {
+        return (
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"HBONE target missing"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: true,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ConnectionPoolError),
+            },
+            None,
+        );
+    };
+
+    debug!(
+        proxy_id = %proxy.id,
+        target_host = %target.host,
+        target_port = target.port,
+        "Proxying request via gateway HBONE tunnel"
+    );
+
+    let original_req = match client_request_body {
+        ClientRequestBody::Streaming(request) => *request,
+        ClientRequestBody::Buffered(_) => {
+            debug_assert!(
+                false,
+                "HBONE pool should not be used when request body is pre-buffered"
+            );
+            return (
+                retry::BackendResponse {
+                    status_code: 500,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"HBONE request buffering invariant violated"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+            );
+        }
+    };
+
+    if request_may_have_body(method, headers)
+        && state.max_request_body_size_bytes > 0
+        && let Some(content_length) = headers.get("content-length")
+        && let Ok(len) = content_length.parse::<usize>()
+        && len > state.max_request_body_size_bytes
+    {
+        return (
+            hbone_request_body_too_large_response(
+                proxy,
+                resolved_ip,
+                Some(len),
+                state.max_request_body_size_bytes,
+            ),
+            None,
+        );
+    }
+
+    let hbone_port = hbone_pool::target_hbone_port(target);
+    let tunnel = match state
+        .hbone_pool
+        .get_tunnel(proxy, &target.host, target.port, hbone_port)
+        .await
+    {
+        Ok(tunnel) => tunnel,
+        Err(err) => {
+            if err.is_capability_failure() {
+                debug!(
+                    proxy_id = %proxy.id,
+                    error = %err,
+                    "HBONE capability establishment failed; downgrading cached capability so subsequent requests skip the tunnel"
+                );
+                state
+                    .backend_capabilities
+                    .mark_hbone_unsupported(proxy, Some(target));
+            }
+            return (
+                hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                None,
+            );
+        }
+    };
+
+    let io = TokioIo::new(tunnel);
+    let (mut sender, connection) = match hyper::client::conn::http1::Builder::new()
+        .handshake(io)
+        .await
+    {
+        Ok(parts) => parts,
+        Err(err) => return (hbone_hyper_error_response(proxy, err, resolved_ip), None),
+    };
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            debug!("hbone_pool: tunneled HTTP/1 connection closed: {}", e);
+        }
+    });
+
+    let uri: hyper::Uri = match backend_url.parse() {
+        Ok(uri) => uri,
+        Err(e) => {
+            error!(proxy_id = %proxy.id, error = %e, "Invalid HBONE backend URL");
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+            );
+        }
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .cloned()
+        .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+    let tunneled_uri = hyper::Uri::builder()
+        .path_and_query(path_and_query)
+        .build()
+        .unwrap_or_else(|_| hyper::Uri::from_static("/"));
+
+    let (mut parts, body) = original_req.into_parts();
+    let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let max_request_body_size = if state.max_request_body_size_bytes > 0 {
+        state.max_request_body_size_bytes
+    } else {
+        usize::MAX
+    };
+    let body = body::SizeLimitedIncoming::new_with_counter(
+        body,
+        max_request_body_size,
+        Arc::clone(&body_size_exceeded),
+        Arc::clone(ctx_request_bytes_observed),
+    );
+    parts.uri = tunneled_uri;
+    parts.version = hyper::Version::HTTP_11;
+    parts.method = match parse_hyper_method(method) {
+        Ok(method) => method,
+        Err(()) => {
+            return (
+                retry::BackendResponse {
+                    status_code: 405,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+            );
+        }
+    };
+    parts.headers.clear();
+    let backend_host_header = hbone_pool::authority_for_host_port(&target.host, target.port);
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    for (k, v) in headers {
+        match k.as_str() {
+            "host" => {
+                if proxy.preserve_host_header
+                    && let Ok(val) = hyper::header::HeaderValue::from_str(v)
+                {
+                    parts.headers.insert(hyper::header::HOST, val);
+                }
+            }
+            n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
+            _ => {
+                if let (Ok(name), Ok(val)) = (
+                    hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                    hyper::header::HeaderValue::from_str(v),
+                ) {
+                    parts.headers.insert(name, val);
+                }
+            }
+        }
+    }
+    if (!proxy.preserve_host_header || !parts.headers.contains_key(hyper::header::HOST))
+        && let Ok(val) = hyper::header::HeaderValue::from_str(&backend_host_header)
+    {
+        parts.headers.insert(hyper::header::HOST, val);
+    }
+
+    let xff_val = build_xff_value(
+        headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
+    );
+    if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
+        parts.headers.insert("x-forwarded-for", val);
+    }
+    if let Ok(val) = hyper::header::HeaderValue::from_str(if is_tls { "https" } else { "http" }) {
+        parts.headers.insert("x-forwarded-proto", val);
+    }
+    if let Some(host) = headers.get("host")
+        && let Ok(val) = hyper::header::HeaderValue::from_str(host)
+    {
+        parts.headers.insert("x-forwarded-host", val);
+    }
+    if let Some(ref via) = state.via_header_http2
+        && let Ok(val) = hyper::header::HeaderValue::from_str(via)
+    {
+        parts.headers.insert("via", val);
+    }
+    if state.add_forwarded_header {
+        let proto_str = if is_tls { "https" } else { "http" };
+        let fwd = build_forwarded_value(
+            client_ip,
+            proto_str,
+            headers.get("host").map(|s| s.as_str()),
+        );
+        if let Ok(val) = hyper::header::HeaderValue::from_str(&fwd) {
+            parts.headers.insert("forwarded", val);
+        }
+    }
+
+    let backend_req = Request::from_parts(parts, body);
+    let send_fut = sender.send_request(backend_req);
+    let response = if proxy.backend_read_timeout_ms > 0 {
+        let timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
+        match tokio::time::timeout(timeout, send_fut).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        hbone_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            None,
+                            state.max_request_body_size_bytes,
+                        ),
+                        None,
+                    );
+                }
+                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+            Err(_) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        hbone_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            None,
+                            state.max_request_body_size_bytes,
+                        ),
+                        None,
+                    );
+                }
+                warn!(
+                    proxy_id = %proxy.id,
+                    "HBONE tunneled HTTP read timeout ({}ms) waiting for backend response",
+                    proxy.backend_read_timeout_ms
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                );
+            }
+        }
+    } else {
+        match send_fut.await {
+            Ok(response) => response,
+            Err(err) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        hbone_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            None,
+                            state.max_request_body_size_bytes,
+                        ),
+                        None,
+                    );
+                }
+                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+        }
+    };
+
+    let status = response.status().as_u16();
+    let content_length = response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if state.max_response_body_size_bytes > 0
+        && let Some(len) = content_length
+        && len > state.max_response_body_size_bytes
+    {
+        return (
+            hbone_response_body_too_large_response(
+                proxy,
+                resolved_ip,
+                Some(len),
+                state.max_response_body_size_bytes,
+            ),
+            None,
+        );
+    }
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+    if stream_response {
+        (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::StreamingH2(response),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            None,
+        )
+    } else {
+        let body_bytes = match collect_hyper_body_with_limit(
+            response.into_body(),
+            state.max_response_body_size_bytes,
+        )
+        .await
+        {
+            Ok(body_bytes) => body_bytes,
+            Err(HyperBodyCollectError::TooLarge) => {
+                return (
+                    hbone_response_body_too_large_response(
+                        proxy,
+                        resolved_ip,
+                        None,
+                        state.max_response_body_size_bytes,
+                    ),
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::Read(err)) => {
+                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+        };
+        (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::Buffered(body_bytes),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            None,
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend_http2(
     state: &ProxyState,
@@ -13136,6 +13834,33 @@ mod tests {
         assert!(
             !target_uses_direct_h2_pool(&registry, &proxy, "h3only.test", 443),
             "h3=Supported alone is not sufficient — H1/H2 frontends still need reqwest"
+        );
+    }
+
+    #[test]
+    fn hbone_dispatch_gate_rejects_https_backends() {
+        let http_proxy = warmup_test_proxy("http", BackendScheme::Http, "orders.test", 8080);
+        let https_proxy = warmup_test_proxy("https", BackendScheme::Https, "orders.test", 8443);
+
+        assert!(
+            proxy_can_dispatch_hbone(&http_proxy),
+            "HBONE tunnel currently carries plaintext HTTP to the workload port"
+        );
+        assert!(
+            !proxy_can_dispatch_hbone(&https_proxy),
+            "HTTPS backends require TLS-over-tunnel support before HBONE dispatch is safe"
+        );
+    }
+
+    #[test]
+    fn hbone_http1_host_authority_includes_backend_port() {
+        assert_eq!(
+            hbone_pool::authority_for_host_port("orders.default.svc.cluster.local", 8080),
+            "orders.default.svc.cluster.local:8080"
+        );
+        assert_eq!(
+            hbone_pool::authority_for_host_port("2001:db8::10", 8080),
+            "[2001:db8::10]:8080"
         );
     }
 

@@ -360,8 +360,10 @@ paths:
         Returns every entry in the backend capability registry. Each
         entry describes what transports a particular upstream target
         supports — HTTP/1.1, HTTP/2 over TLS, HTTP/3, gRPC over h2 TLS,
-        gRPC over h2c — keyed by deduplicated target identity (scheme,
-        host, port, `dns_override`, CA, mTLS cert, mTLS key, verify).
+        gRPC over h2c, and gateway-to-mesh HBONE — keyed by deduplicated
+        target identity (scheme, host, port, `dns_override`, CA, mTLS cert,
+        mTLS key, verify, plus HBONE sidecar port for targets tagged
+        `mesh.hbone=true`).
 
         The registry drives the hot-path routing decision for plain
         HTTPS traffic (native H3 pool vs. direct H2 pool vs. reqwest
@@ -395,6 +397,7 @@ paths:
                         grpc_transport:
                           h2_tls: supported
                           h2c: unknown
+                        hbone: unsupported
                         last_probe_at_unix_secs: 1714003200
                         last_probe_error: null
                       - key: "https|legacy.example.internal|443||||0"
@@ -405,6 +408,7 @@ paths:
                         grpc_transport:
                           h2_tls: unsupported
                           h2c: unknown
+                        hbone: unknown
                         last_probe_at_unix_secs: 1714003200
                         last_probe_error: "H2/TLS downgraded after ALPN-negotiated HTTP/1.1 on request path"
         "401":
@@ -432,8 +436,9 @@ paths:
 
         Use cases:
         - Protocol rollouts (e.g., freshly enabled HTTP/3 on a fleet).
-        - Recovery after a live downgrade (`mark_h3_unsupported` /
-          `mark_h2_tls_unsupported`) once the backend is healthy again.
+        - Recovery after a live downgrade (`mark_h3_unsupported`,
+          `mark_h2_tls_unsupported`, `mark_hbone_unsupported`) once the
+          backend or HBONE sidecar capability is healthy again.
         - Rotated TLS material that the previous probe didn't see.
 
         Probe parallelism is bounded by `FERRUM_POOL_WARMUP_CONCURRENCY`;
@@ -7020,13 +7025,15 @@ components:
 
     BackendCapabilityEntry:
       type: object
-      required: [key, plain_http, grpc_transport, last_probe_at_unix_secs]
+      required: [key, plain_http, grpc_transport, hbone, last_probe_at_unix_secs]
       properties:
         key:
           type: string
           description: |
             Deduplicated backend-target identity key:
-            `scheme|host|port|dns_override|ca|mtls_cert|mtls_key|verify`.
+            `scheme|host|port|dns_override|ca|mtls_cert|mtls_key|verify|hbone_port`.
+            The HBONE port field is populated only for targets tagged
+            `mesh.hbone=true`.
             Stable across responses for the same target; safe to match
             for churn detection.
         plain_http:
@@ -7049,13 +7056,22 @@ components:
               $ref: "#/components/schemas/ProtocolSupport"
             h2c:
               $ref: "#/components/schemas/ProtocolSupport"
+        hbone:
+          $ref: "#/components/schemas/ProtocolSupport"
+          description: |
+            Gateway-to-mesh HBONE support for upstream targets tagged
+            `mesh.hbone=true`. `supported` means the gateway can open
+            HTTP/2 CONNECT over SPIFFE mTLS to the sidecar port; `unknown`
+            is used for untagged targets, gateways without SVIDs, or
+            not-yet-probed entries.
         last_probe_at_unix_secs:
           type: integer
           format: int64
           description: |
             Epoch seconds of the most recent classification update.
             Refreshed by periodic probes AND by live-traffic downgrades
-            (`mark_h2_tls_unsupported`, `mark_h3_unsupported`).
+            (`mark_h2_tls_unsupported`, `mark_h3_unsupported`,
+            `mark_hbone_unsupported`).
         last_probe_error:
           type: string
           nullable: true
@@ -7063,7 +7079,8 @@ components:
             Human-readable error from the most recent probe or live
             downgrade. `null` when the latest update classified the
             target cleanly. Expected-unsupported outcomes (h2c on
-            plaintext, H3 on most HTTPS backends) do NOT populate this
+            plaintext, H3 on most HTTPS backends, untagged HBONE,
+            per-request HBONE CONNECT rejection) do NOT populate this
             field — only real connection / TLS-config errors and
             in-flight live downgrades.
 

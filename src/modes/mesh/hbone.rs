@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use http::{HeaderMap, Method, Version};
-use percent_encoding::percent_decode_str;
+use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 
 use crate::identity::SpiffeId;
 
@@ -70,6 +70,14 @@ impl HboneIdentity {
             baggage,
         }
     }
+}
+
+/// Build the outbound W3C baggage header Ferrum uses when a gateway opens an
+/// HBONE tunnel into the mesh. The receiver still validates this against the
+/// authenticated SPIFFE peer before trusting it.
+pub fn baggage_header_for_source(source: &SpiffeId) -> String {
+    let encoded = utf8_percent_encode(source.as_str(), NON_ALPHANUMERIC).to_string();
+    format!("source.principal={encoded}")
 }
 
 /// Detect an HBONE CONNECT stream from request parts.
@@ -350,6 +358,23 @@ mod tests {
         assert_eq!(
             identity.baggage.get("source.principal").map(String::as_str),
             Some("spiffe://cluster.local/ns/default/sa/client")
+        );
+    }
+
+    #[test]
+    fn builds_source_baggage_header() {
+        let id = SpiffeId::new("spiffe://cluster.local/ns/default/sa/gateway").unwrap();
+        let header = baggage_header_for_source(&id);
+        assert_eq!(
+            HboneIdentity::from_baggage_header(&header)
+                .source_principal
+                .as_ref()
+                .map(SpiffeId::as_str),
+            Some("spiffe://cluster.local/ns/default/sa/gateway")
+        );
+        assert!(
+            header.starts_with("source.principal=spiffe%3A%2F%2F"),
+            "SPIFFE URI must be percent encoded for baggage transport"
         );
     }
 

@@ -884,6 +884,43 @@ where
     }
 }
 
+struct SizeLimitedFrameSource<S> {
+    inner: S,
+    max_bytes: usize,
+    bytes_seen: usize,
+}
+
+impl<S> SizeLimitedFrameSource<S> {
+    fn new(inner: S, max_bytes: usize) -> Self {
+        Self {
+            inner,
+            max_bytes,
+            bytes_seen: 0,
+        }
+    }
+}
+
+impl<S: FrameSource + Unpin> FrameSource for SizeLimitedFrameSource<S> {
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.bytes_seen = this.bytes_seen.saturating_add(data.len());
+                    if this.bytes_seen > this.max_bytes {
+                        return Poll::Ready(Some(Err("response body exceeds maximum size".into())));
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+}
+
 /// Default flush target for the [`Coalescing`] adapter when no explicit
 /// target is supplied (HTTP/1.1 + HTTP/2-via-reqwest path).
 const COALESCE_TARGET: usize = 128 * 1024;
@@ -1380,6 +1417,17 @@ pub(crate) fn coalescing_h2_body(
     ProxyBody::streaming(Box::pin(coalescing))
 }
 
+pub(crate) fn size_limited_streaming_h2_body(
+    body: Incoming,
+    max_bytes: usize,
+    content_length: Option<u64>,
+    coalesce_target: usize,
+) -> ProxyBody {
+    let limited = SizeLimitedFrameSource::new(body, max_bytes);
+    let coalescing = Coalescing::new(limited, coalesce_target, content_length);
+    ProxyBody::streaming(Box::pin(coalescing))
+}
+
 pub(crate) fn direct_streaming_h2_body(body: Incoming, content_length: Option<u64>) -> ProxyBody {
     use http_body_util::BodyExt;
 
@@ -1729,6 +1777,32 @@ mod tests {
         }
 
         assert!(matches!(poll_source(&mut source), Poll::Ready(None)));
+    }
+
+    #[test]
+    fn size_limited_frame_source_errors_before_forwarding_oversized_frame() {
+        let mut source = SizeLimitedFrameSource::new(
+            MockSource::new(vec![
+                MockStep::Frame(Ok(Frame::data(Bytes::from_static(b"1234")))),
+                MockStep::Frame(Ok(Frame::data(Bytes::from_static(b"5678")))),
+                MockStep::End,
+            ]),
+            6,
+        );
+
+        match poll_source(&mut source) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(frame.data_ref().unwrap().as_ref(), b"1234");
+            }
+            other => panic!("expected first frame within limit, got {other:?}"),
+        }
+
+        match poll_source(&mut source) {
+            Poll::Ready(Some(Err(err))) => {
+                assert_eq!(err.to_string(), "response body exceeds maximum size");
+            }
+            other => panic!("expected size-limit error before oversized frame, got {other:?}"),
+        }
     }
 
     #[test]
