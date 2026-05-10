@@ -171,17 +171,12 @@ impl DnsResolutionTable {
                 if let Some(suffix) = normalized.strip_prefix("*.") {
                     if !suffix.is_empty() {
                         let authoritative = is_authoritative_mesh_dns_name(suffix, &cluster_domain);
-                        let last_label = suffix.rsplit('.').next().unwrap_or(suffix).to_string();
-                        wildcard_suffixes
-                            .entry(last_label)
-                            .or_default()
-                            .push(WildcardRecordSet {
-                                suffix: suffix.to_string(),
-                                records: DnsRecordSet {
-                                    ips: ips.clone(),
-                                    authoritative,
-                                },
-                            });
+                        extend_wildcard_record_set(
+                            &mut wildcard_suffixes,
+                            suffix.to_string(),
+                            ips.iter().copied(),
+                            authoritative,
+                        );
                     }
                 } else {
                     let authoritative =
@@ -289,6 +284,33 @@ fn extend_record_set(
     });
     records.authoritative |= authoritative;
     records.ips.extend(ips);
+}
+
+fn extend_wildcard_record_set(
+    wildcard_suffixes: &mut HashMap<String, Vec<WildcardRecordSet>>,
+    suffix: String,
+    ips: impl IntoIterator<Item = IpAddr>,
+    authoritative: bool,
+) {
+    let last_label = suffix.rsplit('.').next().unwrap_or(&suffix).to_string();
+    let bucket = wildcard_suffixes.entry(last_label).or_default();
+    let records = bucket
+        .iter_mut()
+        .find(|entry| entry.suffix == suffix)
+        .map(|entry| &mut entry.records);
+    match records {
+        Some(records) => {
+            records.authoritative |= authoritative;
+            records.ips.extend(ips);
+        }
+        None => bucket.push(WildcardRecordSet {
+            suffix,
+            records: DnsRecordSet {
+                ips: ips.into_iter().collect(),
+                authoritative,
+            },
+        }),
+    }
 }
 
 fn single_label_wildcard_matches(name: &str, suffix: &str) -> bool {
@@ -1751,6 +1773,25 @@ mod tests {
 
         // Should NOT match a non-subdomain that merely ends with the suffix
         assert!(table.resolve("fooexample.com").is_none());
+    }
+
+    #[test]
+    fn resolution_table_merges_duplicate_wildcard_suffixes() {
+        let slice = MeshSlice {
+            service_entries: vec![
+                test_service_entry(vec!["*.example.com"], vec!["10.0.0.1"]),
+                test_service_entry(vec!["*.example.com"], vec!["10.0.0.2"]),
+            ],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        assert_eq!(table.wildcard_count(), 1);
+
+        let ips = table.resolve("api.example.com").unwrap();
+        assert_eq!(ips.len(), 2);
+        assert!(ips.contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(ips.contains(&"10.0.0.2".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
