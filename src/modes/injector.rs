@@ -890,6 +890,43 @@ mod tests {
     }
 
     #[test]
+    fn patch_ebpf_mode_skips_init_container() {
+        let pod = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+            "spec": {
+                "serviceAccountName": "api",
+                "containers": [{"name": "app", "image": "app:test"}]
+            }
+        });
+        let patch =
+            build_sidecar_patch_for_namespace(&pod, &test_config(true, CaptureMode::Ebpf), None);
+
+        assert!(patch.iter().any(|op| op.path == "/spec/containers/-"));
+        assert!(
+            !patch.iter().any(|op| op.path == "/spec/initContainers/-"),
+            "ebpf mode should not inject privileged init container"
+        );
+    }
+
+    #[test]
+    fn patch_explicit_mode_skips_init_container() {
+        let pod = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+            "spec": {
+                "containers": [{"name": "app", "image": "app:test"}]
+            }
+        });
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Explicit),
+            None,
+        );
+
+        assert!(patch.iter().any(|op| op.path == "/spec/containers/-"));
+        assert!(!patch.iter().any(|op| op.path == "/spec/initContainers/-"));
+    }
+
+    #[test]
     fn injector_config_defaults_parse_from_env_config() {
         let env = EnvConfig::default();
         let config = InjectorConfig::from_env_config(&env).expect("injector config");
