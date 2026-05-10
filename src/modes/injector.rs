@@ -899,7 +899,8 @@ mod tests {
             }
         });
         let patch =
-            build_sidecar_patch_for_namespace(&pod, &test_config(true, CaptureMode::Ebpf), None);
+            build_sidecar_patch_for_namespace(&pod, &test_config(true, CaptureMode::Ebpf), None)
+                .expect("patch");
 
         assert!(patch.iter().any(|op| op.path == "/spec/containers/-"));
         assert!(
@@ -920,7 +921,8 @@ mod tests {
             &pod,
             &test_config(true, CaptureMode::Explicit),
             None,
-        );
+        )
+        .expect("patch");
 
         assert!(patch.iter().any(|op| op.path == "/spec/containers/-"));
         assert!(!patch.iter().any(|op| op.path == "/spec/initContainers/-"));
