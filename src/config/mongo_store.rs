@@ -1186,9 +1186,9 @@ mod inner {
         ) -> Result<GatewayTrustBundlePoll, anyhow::Error> {
             // Mongo backends currently persist gateway resources as separate
             // collections and do not store top-level GatewayConfig trust
-            // bundles. Report the authoritative absence narrowly instead of
-            // making CP polling reload every collection.
-            Ok(GatewayTrustBundlePoll::Current(None))
+            // bundles. Preserve whatever trust material the initial config load
+            // supplied instead of clearing it on the first empty poll.
+            Ok(GatewayTrustBundlePoll::Unchanged)
         }
 
         async fn load_incremental_config(

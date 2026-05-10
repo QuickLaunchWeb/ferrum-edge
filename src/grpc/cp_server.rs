@@ -364,7 +364,16 @@ impl CpGrpcServer {
                 return;
             }
         };
-        let trust_bundles_json = Self::trust_bundles_json(config.trust_bundles.as_deref());
+        let trust_bundles_json = match Self::trust_bundles_json(config.trust_bundles.as_deref()) {
+            Ok(json) => json,
+            Err(e) => {
+                error!(
+                    "Failed to serialize gateway trust bundles for broadcast; skipping update: {}",
+                    e
+                );
+                return;
+            }
+        };
         let update = ConfigUpdate {
             update_type: 0, // FULL_SNAPSHOT
             config_json,
@@ -408,12 +417,17 @@ impl CpGrpcServer {
         version: &str,
         trust_bundles: Option<&crate::modes::mesh::config::TrustBundleSet>,
     ) {
-        Self::broadcast_delta_with_trust_bundles_json(
-            tx,
-            result,
-            version,
-            Self::trust_bundles_json(trust_bundles),
-        );
+        let trust_bundles_json = match Self::trust_bundles_json(trust_bundles) {
+            Ok(json) => json,
+            Err(e) => {
+                error!(
+                    "Failed to serialize gateway trust bundles for delta broadcast; skipping update: {}",
+                    e
+                );
+                return;
+            }
+        };
+        Self::broadcast_delta_with_trust_bundles_json(tx, result, version, trust_bundles_json);
     }
 
     fn broadcast_delta_with_trust_bundles_json(
@@ -442,7 +456,7 @@ impl CpGrpcServer {
 
     fn trust_bundles_json(
         trust_bundles: Option<&crate::modes::mesh::config::TrustBundleSet>,
-    ) -> String {
+    ) -> Result<String, serde_json::Error> {
         match trust_bundles {
             Some(trust_bundles) => {
                 let validation_errors = crate::modes::mesh::config::validate_mesh_config(
@@ -459,21 +473,12 @@ impl CpGrpcServer {
                         "Clearing invalid gateway trust bundles from CP broadcast: {}",
                         validation_errors.join("; ")
                     );
-                    return "null".to_string();
+                    return Ok("null".to_string());
                 }
 
-                match serde_json::to_string(trust_bundles) {
-                    Ok(json) => json,
-                    Err(e) => {
-                        error!(
-                            "Failed to serialize gateway trust bundles for broadcast; clearing CP trust material: {}",
-                            e
-                        );
-                        "null".to_string()
-                    }
-                }
+                serde_json::to_string(trust_bundles)
             }
-            None => "null".to_string(),
+            None => Ok("null".to_string()),
         }
     }
 
@@ -536,13 +541,21 @@ impl ConfigSync for CpGrpcServer {
             error!("Failed to serialize config in subscribe: {}", e);
             Status::internal("Failed to serialize configuration")
         })?;
+        let trust_bundles_json = Self::trust_bundles_json(config.trust_bundles.as_deref())
+            .map_err(|e| {
+                error!(
+                    "Failed to serialize gateway trust bundles in subscribe: {}",
+                    e
+                );
+                Status::internal("Failed to serialize gateway trust bundles")
+            })?;
         let initial = ConfigUpdate {
             update_type: 0, // FULL_SNAPSHOT
             config_json,
             version: config.loaded_at.to_rfc3339(),
             timestamp: chrono::Utc::now().timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
-            trust_bundles_json: Self::trust_bundles_json(config.trust_bundles.as_deref()),
+            trust_bundles_json,
         };
 
         let config_for_recovery = self.config.clone();
@@ -556,16 +569,28 @@ impl ConfigSync for CpGrpcServer {
                 // Send a full config snapshot so the DP recovers from missed deltas.
                 let current = config_for_recovery.load_full();
                 match Self::config_json_for_dp(current.as_ref()) {
-                    Ok(config_json) => Some(Ok(ConfigUpdate {
-                        update_type: 0, // FULL_SNAPSHOT
-                        config_json,
-                        version: current.loaded_at.to_rfc3339(),
-                        timestamp: chrono::Utc::now().timestamp(),
-                        ferrum_version: FERRUM_VERSION.to_string(),
-                        trust_bundles_json: Self::trust_bundles_json(
+                    Ok(config_json) => {
+                        let trust_bundles_json = match Self::trust_bundles_json(
                             current.trust_bundles.as_deref(),
-                        ),
-                    })),
+                        ) {
+                            Ok(json) => json,
+                            Err(e) => {
+                                error!(
+                                    "Failed to serialize gateway trust bundles for recovery snapshot: {}",
+                                    e
+                                );
+                                return None;
+                            }
+                        };
+                        Some(Ok(ConfigUpdate {
+                            update_type: 0, // FULL_SNAPSHOT
+                            config_json,
+                            version: current.loaded_at.to_rfc3339(),
+                            timestamp: chrono::Utc::now().timestamp(),
+                            ferrum_version: FERRUM_VERSION.to_string(),
+                            trust_bundles_json,
+                        }))
+                    }
                     Err(e) => {
                         error!("Failed to serialize recovery snapshot: {}", e);
                         None
@@ -611,12 +636,20 @@ impl ConfigSync for CpGrpcServer {
             error!("Failed to serialize config in get_full_config: {}", e);
             Status::internal("Failed to serialize configuration")
         })?;
+        let trust_bundles_json = Self::trust_bundles_json(config.trust_bundles.as_deref())
+            .map_err(|e| {
+                error!(
+                    "Failed to serialize gateway trust bundles in get_full_config: {}",
+                    e
+                );
+                Status::internal("Failed to serialize gateway trust bundles")
+            })?;
 
         Ok(Response::new(FullConfigResponse {
             config_json,
             version: config.loaded_at.to_rfc3339(),
             ferrum_version: FERRUM_VERSION.to_string(),
-            trust_bundles_json: Self::trust_bundles_json(config.trust_bundles.as_deref()),
+            trust_bundles_json,
         }))
     }
 }

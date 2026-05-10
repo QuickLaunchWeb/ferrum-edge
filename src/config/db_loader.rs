@@ -4537,10 +4537,9 @@ impl DatabaseBackend for DatabaseStore {
         _namespace: &str,
     ) -> Result<GatewayTrustBundlePoll, anyhow::Error> {
         // SQL backends do not have a dedicated top-level GatewayConfig storage
-        // shape today, so the authoritative narrow value is "no CP-managed
-        // gateway trust bundles." Keep this explicit so empty incremental polls
-        // can clear stale CP trust without reloading every resource.
-        Ok(GatewayTrustBundlePoll::Current(None))
+        // shape today, so preserve whatever trust material the initial config
+        // load supplied instead of clearing it on the first empty poll.
+        Ok(GatewayTrustBundlePoll::Unchanged)
     }
 
     async fn load_incremental_config(

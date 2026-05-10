@@ -519,6 +519,83 @@ async fn test_dp_stores_gateway_trust_bundles_from_delta_side_channel() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_dp_applies_gateway_trust_bundles_from_rejected_delta() {
+    let cp_config = create_test_config(1);
+    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "trust-bundle-rejected-delta-node",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
+    });
+
+    let received_initial = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(received_initial.is_ok(), "DP should receive initial config");
+
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![create_test_proxy("proxy-conflict", "/api-0")],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    let trust_bundles = create_test_trust_bundles();
+    CpGrpcServer::broadcast_delta_with_trust_bundles(
+        &update_tx,
+        &delta,
+        "trust-bundles-rejected-delta",
+        Some(&trust_bundles),
+    );
+
+    let received_trust = timeout(Duration::from_secs(5), async {
+        loop {
+            let loaded = proxy_state.gateway_trust_bundles.load();
+            if loaded
+                .as_ref()
+                .as_ref()
+                .is_some_and(|tb| tb.local.x509_authorities == vec![vec![1, 2, 3, 4]])
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        received_trust.is_ok(),
+        "DP should apply valid gateway trust bundles even when resource delta is rejected"
+    );
+    assert_eq!(
+        proxy_state.config.load().proxies.len(),
+        1,
+        "Rejected resource delta must not mutate the gateway config"
+    );
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_dp_clears_gateway_trust_bundles_from_explicit_side_channel_null() {
     let mut cp_config = create_test_config(1);
     cp_config.trust_bundles = Some(Box::new(create_test_trust_bundles()));

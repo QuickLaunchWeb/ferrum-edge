@@ -765,14 +765,20 @@ pub async fn run(
                                     continue;
                                 }
 
+                                let mut trust_bundles_changed = false;
                                 match db_poll.load_gateway_trust_bundles(&poll_namespace).await {
                                     Ok(GatewayTrustBundlePoll::Unchanged) => {}
                                     Ok(GatewayTrustBundlePoll::Current(trust_bundles)) => {
-                                        new_config.trust_bundles =
+                                        let source_trust_bundles =
                                             sanitize_gateway_trust_bundles_from_source(
-                                                trust_bundles,
-                                                "incremental poll",
-                                            );
+                                            trust_bundles,
+                                            "incremental poll",
+                                        );
+                                        if source_trust_bundles != last_gateway_trust_bundles {
+                                            new_config.trust_bundles =
+                                                source_trust_bundles.clone();
+                                            trust_bundles_changed = true;
+                                        }
                                     }
                                     Err(e) => {
                                         warn!(
@@ -805,15 +811,20 @@ pub async fn run(
                                 // same delta payload. DP and mesh broadcasts are intentionally
                                 // coupled to the same polling cycle so both subscriber types
                                 // converge on the same config version simultaneously.
-                                CpGrpcServer::broadcast_delta_with_registry(
-                                    &update_tx,
-                                    &result,
-                                    &version,
-                                    &dp_registry_poll,
-                                    new_config.trust_bundles.as_deref(),
-                                );
+                                if trust_bundles_changed {
+                                    CpGrpcServer::broadcast_delta_with_registry(
+                                        &update_tx,
+                                        &result,
+                                        &version,
+                                        &dp_registry_poll,
+                                        new_config.trust_bundles.as_deref(),
+                                    );
+                                    last_gateway_trust_bundles = new_config.trust_bundles.clone();
+                                } else {
+                                    CpGrpcServer::broadcast_delta(&update_tx, &result, &version);
+                                    dp_registry_poll.touch_all();
+                                }
                                 MeshGrpcServer::broadcast_delta_with_registry(&mesh_update_tx, result, &version, &mesh_registry_poll);
-                                last_gateway_trust_bundles = new_config.trust_bundles.clone();
 
                                 info!(
                                     "Incremental config update validated and pushed to DPs and mesh nodes (version={})",
