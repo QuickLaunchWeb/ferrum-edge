@@ -943,6 +943,15 @@ pub async fn connect_and_subscribe_with_startup_ready(
                                 }
                             }
                             IncrementalApplyOutcome::Rejected => {
+                                if apply_gateway_trust_bundle_update(
+                                    proxy_state,
+                                    gateway_trust_bundle_update,
+                                ) {
+                                    update_state_config_received(connection_state);
+                                    info!(
+                                        "Gateway trust bundle update applied from rejected CP delta"
+                                    );
+                                }
                                 if was_empty {
                                     tracing::debug!(
                                         "Ignoring rejected empty delta from CP (no resource changes)"
