@@ -1781,7 +1781,7 @@ impl EnvConfig {
             clamped
         };
 
-        let config = Self {
+        let mut config = Self {
             mode: mode.clone(),
             namespace,
             log_level,
@@ -2433,7 +2433,7 @@ impl EnvConfig {
         Ok(())
     }
 
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&mut self) -> Result<(), String> {
         match &self.mode {
             OperatingMode::Database | OperatingMode::ControlPlane => {
                 if self.db_type.is_none() {
@@ -2618,7 +2618,7 @@ impl EnvConfig {
             ));
         }
 
-        // Overload threshold ordering: critical >= pressure for each pair.
+        // Overload threshold ordering: critical > pressure for each pair.
         //
         // The RED probabilistic shedding ramp in src/overload.rs computes
         //   probability = (ratio - pressure) / (critical - pressure) * SCALE
@@ -2627,36 +2627,60 @@ impl EnvConfig {
         // disable_keepalive flag fires at the pressure threshold while the
         // RED ramp silently produces 0% drop probability. critical < pressure
         // is even worse: a negative range yields a negative ratio that also
-        // saturates to 0 on the u32 cast. Reject both at startup so the
-        // disagreement can never reach the hot path.
-        for (pressure_name, pressure_val, critical_name, critical_val) in [
-            (
-                "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD",
-                self.overload_fd_pressure_threshold,
-                "FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD",
-                self.overload_fd_critical_threshold,
-            ),
-            (
-                "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD",
-                self.overload_conn_pressure_threshold,
-                "FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD",
-                self.overload_conn_critical_threshold,
-            ),
-            (
-                "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD",
-                self.overload_req_pressure_threshold,
-                "FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD",
-                self.overload_req_critical_threshold,
-            ),
-        ] {
-            if critical_val <= pressure_val {
-                return Err(format!(
-                    "{critical_name} ({critical_val:.2}) must be greater than {pressure_name} ({pressure_val:.2}). \
-                     The RED probabilistic shedding ramp divides by (critical - pressure); equal or inverted \
-                     thresholds produce NaN/saturated probabilities and cause silent disagreement between the \
-                     binary load-shedding flags and the smooth ramp."
-                ));
-            }
+        // saturates to 0 on the u32 cast. Auto-correct strictly inverted
+        // thresholds by swapping; reject equal thresholds because swapping
+        // equal values cannot create the positive RED ramp width the hot path
+        // requires.
+        if self.overload_fd_pressure_threshold == self.overload_fd_critical_threshold {
+            return Err(format!(
+                "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD ({}) must be less than FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD ({})",
+                self.overload_fd_pressure_threshold, self.overload_fd_critical_threshold
+            ));
+        }
+        if self.overload_fd_pressure_threshold > self.overload_fd_critical_threshold {
+            tracing::warn!(
+                pressure = self.overload_fd_pressure_threshold,
+                critical = self.overload_fd_critical_threshold,
+                "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD is greater than FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD; swapping to correct ordering"
+            );
+            std::mem::swap(
+                &mut self.overload_fd_pressure_threshold,
+                &mut self.overload_fd_critical_threshold,
+            );
+        }
+        if self.overload_conn_pressure_threshold == self.overload_conn_critical_threshold {
+            return Err(format!(
+                "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD ({}) must be less than FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD ({})",
+                self.overload_conn_pressure_threshold, self.overload_conn_critical_threshold
+            ));
+        }
+        if self.overload_conn_pressure_threshold > self.overload_conn_critical_threshold {
+            tracing::warn!(
+                pressure = self.overload_conn_pressure_threshold,
+                critical = self.overload_conn_critical_threshold,
+                "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD is greater than FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD; swapping to correct ordering"
+            );
+            std::mem::swap(
+                &mut self.overload_conn_pressure_threshold,
+                &mut self.overload_conn_critical_threshold,
+            );
+        }
+        if self.overload_req_pressure_threshold == self.overload_req_critical_threshold {
+            return Err(format!(
+                "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD ({}) must be less than FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD ({})",
+                self.overload_req_pressure_threshold, self.overload_req_critical_threshold
+            ));
+        }
+        if self.overload_req_pressure_threshold > self.overload_req_critical_threshold {
+            tracing::warn!(
+                pressure = self.overload_req_pressure_threshold,
+                critical = self.overload_req_critical_threshold,
+                "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD is greater than FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD; swapping to correct ordering"
+            );
+            std::mem::swap(
+                &mut self.overload_req_pressure_threshold,
+                &mut self.overload_req_critical_threshold,
+            );
         }
 
         // Non-fatal configuration warnings
@@ -2745,66 +2769,97 @@ mod tests {
 
     #[test]
     fn validate_accepts_default_overload_thresholds() {
-        let config = file_mode_config();
+        let mut config = file_mode_config();
         // Defaults: pressure 0.80/0.85/0.85 < critical 0.95/0.95/0.95.
         config.validate().expect("default thresholds must validate");
     }
 
     #[test]
-    fn validate_rejects_overload_fd_pressure_above_critical() {
+    fn validate_swaps_overload_fd_pressure_above_critical() {
         let mut config = file_mode_config();
         config.overload_fd_pressure_threshold = 0.85;
         config.overload_fd_critical_threshold = 0.80;
-        let err = config
+        config
             .validate()
-            .expect_err("inverted FD thresholds must be rejected");
+            .expect("inverted FD thresholds should be auto-corrected");
         assert!(
-            err.contains("FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD")
-                && err.contains("FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD"),
-            "error should name both env vars: {err}"
+            config.overload_fd_pressure_threshold < config.overload_fd_critical_threshold,
+            "pressure ({}) must be less than critical ({}) after swap",
+            config.overload_fd_pressure_threshold,
+            config.overload_fd_critical_threshold,
+        );
+        assert!(
+            (config.overload_fd_pressure_threshold - 0.80).abs() < f64::EPSILON,
+            "pressure should be 0.80 after swap"
+        );
+        assert!(
+            (config.overload_fd_critical_threshold - 0.85).abs() < f64::EPSILON,
+            "critical should be 0.85 after swap"
         );
     }
 
     #[test]
     fn validate_rejects_overload_fd_pressure_equals_critical() {
-        // Equal thresholds yield a zero-width RED ramp — divide-by-zero NaN.
         let mut config = file_mode_config();
         config.overload_fd_pressure_threshold = 0.90;
         config.overload_fd_critical_threshold = 0.90;
         let err = config
             .validate()
-            .expect_err("equal FD thresholds must be rejected");
-        assert!(
-            err.contains("FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD"),
-            "error should name FD critical env var: {err}"
-        );
+            .expect_err("equal FD thresholds create a zero-width RED ramp");
+        assert!(err.contains("FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD"));
     }
 
     #[test]
-    fn validate_rejects_overload_conn_pressure_above_critical() {
+    fn validate_rejects_overload_conn_pressure_equals_critical() {
+        let mut config = file_mode_config();
+        config.overload_conn_pressure_threshold = 0.90;
+        config.overload_conn_critical_threshold = 0.90;
+        let err = config
+            .validate()
+            .expect_err("equal connection thresholds create a zero-width RED ramp");
+        assert!(err.contains("FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD"));
+    }
+
+    #[test]
+    fn validate_rejects_overload_req_pressure_equals_critical() {
+        let mut config = file_mode_config();
+        config.overload_req_pressure_threshold = 0.90;
+        config.overload_req_critical_threshold = 0.90;
+        let err = config
+            .validate()
+            .expect_err("equal request thresholds create a zero-width RED ramp");
+        assert!(err.contains("FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD"));
+    }
+
+    #[test]
+    fn validate_swaps_overload_conn_pressure_above_critical() {
         let mut config = file_mode_config();
         config.overload_conn_pressure_threshold = 0.95;
         config.overload_conn_critical_threshold = 0.85;
-        let err = config
+        config
             .validate()
-            .expect_err("inverted connection thresholds must be rejected");
+            .expect("inverted connection thresholds should be auto-corrected");
         assert!(
-            err.contains("FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD"),
-            "error should name connection critical env var: {err}"
+            config.overload_conn_pressure_threshold < config.overload_conn_critical_threshold,
+            "pressure ({}) must be less than critical ({}) after swap",
+            config.overload_conn_pressure_threshold,
+            config.overload_conn_critical_threshold,
         );
     }
 
     #[test]
-    fn validate_rejects_overload_req_pressure_above_critical() {
+    fn validate_swaps_overload_req_pressure_above_critical() {
         let mut config = file_mode_config();
         config.overload_req_pressure_threshold = 0.99;
         config.overload_req_critical_threshold = 0.50;
-        let err = config
+        config
             .validate()
-            .expect_err("inverted request thresholds must be rejected");
+            .expect("inverted request thresholds should be auto-corrected");
         assert!(
-            err.contains("FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD"),
-            "error should name request critical env var: {err}"
+            config.overload_req_pressure_threshold < config.overload_req_critical_threshold,
+            "pressure ({}) must be less than critical ({}) after swap",
+            config.overload_req_pressure_threshold,
+            config.overload_req_critical_threshold,
         );
     }
 

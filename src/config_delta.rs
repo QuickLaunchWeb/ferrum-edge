@@ -8,7 +8,8 @@
 //! Changes are detected by comparing `id` + `updated_at` timestamps.
 //! Resources present in the new config but not the old are additions;
 //! resources in the old but not the new are removals; resources in both
-//! with a newer `updated_at` are modifications.
+//! with a different `updated_at` are modifications (uses `!=` to catch
+//! both forward progress and backward clock skew).
 
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -294,7 +295,13 @@ fn diff_removed_ids<T: HasIdAndTimestamp>(old: &[T], new: &[T]) -> Vec<String> {
         .collect()
 }
 
-/// Resources present in both but with a newer `updated_at` in `new`.
+/// Resources present in both whose `updated_at` changed.
+///
+/// Uses `!=` instead of `>` for snapshot-to-snapshot comparison so a full
+/// snapshot can detect backward timestamp drift once both versions are present
+/// locally. Incremental SQL polling still depends on its `updated_at > cursor`
+/// predicate to fetch candidates in the first place, so this is a defensive
+/// diff guard rather than a substitute for monotonic database timestamps.
 fn diff_modified<T: HasIdAndTimestamp + Clone>(old: &[T], new: &[T]) -> Vec<T> {
     let old_map: HashMap<&str, DateTime<Utc>> =
         old.iter().map(|r| (r.id(), r.updated_at())).collect();
@@ -302,7 +309,7 @@ fn diff_modified<T: HasIdAndTimestamp + Clone>(old: &[T], new: &[T]) -> Vec<T> {
         .filter(|r| {
             old_map
                 .get(r.id())
-                .is_some_and(|&old_ts| r.updated_at() > old_ts)
+                .is_some_and(|&old_ts| r.updated_at() != old_ts)
         })
         .cloned()
         .collect()
