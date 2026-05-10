@@ -235,6 +235,9 @@ pub async fn start_crd_watchers(
         };
 
         let mut watcher_shutdown = shutdown.clone();
+        let cleanup_store_set = store_set.clone();
+        let cleanup_api_version = api_version.clone();
+        let cleanup_kind = kind.clone();
         let watcher_config = watcher::Config::default();
 
         let handle = tokio::spawn(async move {
@@ -257,7 +260,11 @@ pub async fn start_crd_watchers(
                                 change_notifier.notify_change();
                             }
                             Ok(None) => {
-                                info!(kind, "Watch stream ended");
+                                let removed = cleanup_store_set
+                                    .lock()
+                                    .await
+                                    .remove_store(&cleanup_api_version, &cleanup_kind);
+                                info!(kind, removed, "Watch stream ended");
                                 return;
                             }
                             Err(e) => {

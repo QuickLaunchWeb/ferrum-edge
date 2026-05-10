@@ -244,12 +244,7 @@ async fn do_reconcile(
         warn!(warning, "K8s translation warning");
     }
 
-    let old_config = ctx.config_arc.load();
-    let new_config = merge_k8s_translation(old_config.as_ref(), translation.config);
-
-    let changed = gateway_config_content_changed(&new_config, old_config.as_ref());
-
-    if !changed {
+    let Some(new_config) = swap_merged_k8s_translation(ctx.config_arc, &translation.config) else {
         debug!("No config changes detected, skipping swap");
         let elapsed = start.elapsed();
         ctx.metrics.last_reconcile_duration_ms.store(
@@ -257,9 +252,7 @@ async fn do_reconcile(
             std::sync::atomic::Ordering::Relaxed,
         );
         return;
-    }
-
-    ctx.config_arc.store(Arc::new(new_config.clone()));
+    };
 
     // Notify DPs of the config change.
     CpGrpcServer::broadcast_update_with_registry(ctx.update_tx, &new_config, ctx.dp_registry);
@@ -272,11 +265,32 @@ async fn do_reconcile(
 
     info!(
         resource_count,
-        proxies = ctx.config_arc.load().proxies.len(),
-        upstreams = ctx.config_arc.load().upstreams.len(),
+        proxies = new_config.proxies.len(),
+        upstreams = new_config.upstreams.len(),
         elapsed_ms = elapsed.as_millis() as u64,
         "Reconciliation complete"
     );
+}
+
+fn swap_merged_k8s_translation(
+    config_arc: &ArcSwap<GatewayConfig>,
+    k8s_config: &GatewayConfig,
+) -> Option<Arc<GatewayConfig>> {
+    let mut old_config = config_arc.load();
+
+    loop {
+        let new_config = Arc::new(merge_k8s_translation(old_config.as_ref(), k8s_config));
+        if !gateway_config_content_changed(&new_config, old_config.as_ref()) {
+            return None;
+        }
+
+        let previous = config_arc.compare_and_swap(&*old_config, new_config.clone());
+        if Arc::ptr_eq(&*old_config, &*previous) {
+            return Some(new_config);
+        }
+
+        old_config = previous;
+    }
 }
 
 fn gateway_config_content_changed(new_config: &GatewayConfig, old_config: &GatewayConfig) -> bool {
@@ -286,7 +300,7 @@ fn gateway_config_content_changed(new_config: &GatewayConfig, old_config: &Gatew
 const K8S_MANAGED_PROXY_ID_PREFIXES: &[&str] = &["gwapi-route-", "gwapi-l4-", "istio-vs-"];
 const K8S_MANAGED_UPSTREAM_ID_PREFIXES: &[&str] = &["gwapi-route-upstream-", "istio-vs-upstream-"];
 
-fn merge_k8s_translation(active: &GatewayConfig, mut k8s_config: GatewayConfig) -> GatewayConfig {
+fn merge_k8s_translation(active: &GatewayConfig, k8s_config: &GatewayConfig) -> GatewayConfig {
     let mut merged = active.clone();
 
     merged
@@ -296,16 +310,14 @@ fn merge_k8s_translation(active: &GatewayConfig, mut k8s_config: GatewayConfig) 
         .upstreams
         .retain(|upstream| !has_any_prefix(&upstream.id, K8S_MANAGED_UPSTREAM_ID_PREFIXES));
 
-    merged.proxies.append(&mut k8s_config.proxies);
-    merged.upstreams.append(&mut k8s_config.upstreams);
+    merged.proxies.extend(k8s_config.proxies.clone());
+    merged.upstreams.extend(k8s_config.upstreams.clone());
 
     let mut namespaces: BTreeSet<String> = merged.known_namespaces.iter().cloned().collect();
-    namespaces.extend(k8s_config.known_namespaces);
+    namespaces.extend(k8s_config.known_namespaces.iter().cloned());
     merged.known_namespaces = namespaces.into_iter().collect();
 
-    if k8s_config.mesh.is_some() {
-        merged.mesh = k8s_config.mesh;
-    }
+    merged.mesh = k8s_config.mesh.clone();
 
     merged.normalize_fields();
     merged
@@ -377,6 +389,7 @@ fn sort_string_array(value: &mut Value, field: &str) {
 mod tests {
     use super::*;
     use crate::config::types::{PluginConfig, PluginScope, Proxy, Upstream};
+    use crate::modes::mesh::config::MeshConfig;
     use chrono::{Duration as ChronoDuration, Utc};
     use serde_json::json;
 
@@ -486,7 +499,7 @@ mod tests {
         ));
         k8s.known_namespaces.push("k8s".to_string());
 
-        let merged = merge_k8s_translation(&active, k8s);
+        let merged = merge_k8s_translation(&active, &k8s);
 
         assert!(merged.proxies.iter().any(|proxy| proxy.id == "db-proxy"));
         assert!(
@@ -509,6 +522,29 @@ mod tests {
         );
         assert!(merged.known_namespaces.contains(&"db".to_string()));
         assert!(merged.known_namespaces.contains(&"k8s".to_string()));
+    }
+
+    #[test]
+    fn merge_k8s_translation_clears_stale_mesh_overlay() {
+        let mut active = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig::default())),
+            ..GatewayConfig::default()
+        };
+        active.mesh.as_mut().expect("mesh exists").services.push(
+            crate::modes::mesh::config::MeshService {
+                name: "stale".to_string(),
+                namespace: "ferrum".to_string(),
+                ports: Vec::new(),
+                workloads: Vec::new(),
+                protocol_overrides: std::collections::HashMap::new(),
+            },
+        );
+
+        let k8s = GatewayConfig::default();
+
+        let merged = merge_k8s_translation(&active, &k8s);
+
+        assert!(merged.mesh.is_none());
     }
 
     #[test]

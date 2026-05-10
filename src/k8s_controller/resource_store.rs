@@ -94,6 +94,20 @@ impl ResourceStoreSet {
         true
     }
 
+    pub fn remove_store(&mut self, api_version: &str, kind: &str) -> bool {
+        let Some(index) = self
+            .stores
+            .iter()
+            .position(|store| store.api_version == api_version && store.kind == kind)
+        else {
+            return false;
+        };
+
+        self.stores.remove(index);
+        self.notify_change();
+        true
+    }
+
     pub fn has_store(&self, api_version: &str, kind: &str) -> bool {
         self.stores
             .iter()
@@ -126,5 +140,44 @@ impl ResourceStoreSet {
 
     pub fn total_resources(&self) -> usize {
         self.stores.iter().map(|s| s.len()).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kube::api::ApiResource;
+
+    fn test_store(api_version: &str, kind: &str) -> Arc<CrdResourceStore> {
+        let ar = ApiResource {
+            group: "example.com".to_string(),
+            version: "v1".to_string(),
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            plural: format!("{}s", kind.to_ascii_lowercase()),
+        };
+        let writer = reflector::store::Writer::new(ar);
+        let store = writer.as_reader();
+        Arc::new(CrdResourceStore::new(
+            api_version.to_string(),
+            kind.to_string(),
+            store,
+        ))
+    }
+
+    #[test]
+    fn remove_store_deregisters_and_notifies() {
+        let mut set = ResourceStoreSet::new();
+        let rx = set.subscribe();
+        let store = test_store("example.com/v1", "Widget");
+
+        assert!(set.add_store(store));
+        assert!(set.has_store("example.com/v1", "Widget"));
+        assert_eq!(*rx.borrow(), 1);
+
+        assert!(set.remove_store("example.com/v1", "Widget"));
+
+        assert!(!set.has_store("example.com/v1", "Widget"));
+        assert_eq!(*rx.borrow(), 2);
     }
 }
