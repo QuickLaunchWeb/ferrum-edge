@@ -255,9 +255,6 @@ pub async fn start_crd_watchers(
             };
 
             let mut watcher_shutdown = shutdown.clone();
-            let cleanup_store_set = store_set.clone();
-            let cleanup_api_version = api_version.clone();
-            let cleanup_kind = kind.clone();
             let cleanup_scope = scope.clone();
             let task_kind = kind.clone();
             let watcher_config = watcher::Config::default();
@@ -282,19 +279,10 @@ pub async fn start_crd_watchers(
                                     change_notifier.notify_change();
                                 }
                                 Ok(None) => {
-                                    let removed = cleanup_store_set
-                                        .lock()
-                                        .await
-                                        .remove_store_for_scope(
-                                            &cleanup_api_version,
-                                            &cleanup_kind,
-                                            &cleanup_scope,
-                                        );
                                     info!(
                                         kind = %task_kind,
                                         scope = %cleanup_scope,
-                                        removed,
-                                        "Watch stream ended"
+                                        "Watch stream ended; retaining last reflector snapshot"
                                     );
                                     return;
                                 }

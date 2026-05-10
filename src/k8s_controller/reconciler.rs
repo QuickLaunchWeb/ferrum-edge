@@ -446,7 +446,9 @@ fn merge_k8s_translation(
     namespaces.extend(k8s_config.known_namespaces.iter().cloned());
     merged.known_namespaces = namespaces.into_iter().collect();
 
-    merged.mesh = k8s_config.mesh.clone();
+    if k8s_config.mesh.is_some() {
+        merged.mesh = k8s_config.mesh.clone();
+    }
 
     merged.normalize_fields();
     merged
@@ -658,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_k8s_translation_clears_stale_mesh_overlay() {
+    fn merge_k8s_translation_preserves_existing_mesh_when_k8s_has_none() {
         let mut active = GatewayConfig {
             mesh: Some(Box::new(MeshConfig::default())),
             ..GatewayConfig::default()
@@ -678,7 +680,7 @@ mod tests {
         let managed = BTreeSet::from(["ferrum".to_string()]);
         let merged = merge_k8s_translation(&active, &k8s, &managed);
 
-        assert!(merged.mesh.is_none());
+        assert!(merged.mesh.is_some());
     }
 
     #[test]
