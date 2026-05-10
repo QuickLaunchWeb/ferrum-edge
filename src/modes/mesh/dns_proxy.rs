@@ -346,6 +346,11 @@ pub struct MeshDnsProxy {
     cluster_domain: String,
 }
 
+pub struct MeshDnsBoundSockets {
+    udp_socket: Arc<UdpSocket>,
+    tcp_listener: TcpListener,
+}
+
 impl MeshDnsProxy {
     /// Create a new DNS proxy (does not bind yet; call `run()` to start).
     pub fn new(
@@ -365,6 +370,16 @@ impl MeshDnsProxy {
         }
     }
 
+    /// Bind UDP and TCP DNS listeners before spawning the server loop.
+    pub async fn bind(&self) -> std::io::Result<MeshDnsBoundSockets> {
+        let udp_socket = Arc::new(UdpSocket::bind(self.listen_addr).await?);
+        let tcp_listener = TcpListener::bind(self.listen_addr).await?;
+        Ok(MeshDnsBoundSockets {
+            udp_socket,
+            tcp_listener,
+        })
+    }
+
     /// Rebuild the resolution table from a new mesh slice.
     pub fn update_from_slice(&self, slice: &MeshSlice) {
         let new_table =
@@ -379,23 +394,14 @@ impl MeshDnsProxy {
         );
     }
 
-    /// Run the DNS proxy server loop until shutdown.
-    pub async fn run(self: Arc<Self>, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
-        let socket = match UdpSocket::bind(self.listen_addr).await {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                error!(addr = %self.listen_addr, error = %e, "Failed to bind mesh DNS proxy");
-                return;
-            }
-        };
-
-        let tcp_listener = match TcpListener::bind(self.listen_addr).await {
-            Ok(listener) => listener,
-            Err(e) => {
-                error!(addr = %self.listen_addr, error = %e, "Failed to bind mesh DNS TCP listener");
-                return;
-            }
-        };
+    /// Run the DNS proxy server loop with listeners that were bound during startup.
+    pub async fn run_bound(
+        self: Arc<Self>,
+        sockets: MeshDnsBoundSockets,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let socket = sockets.udp_socket;
+        let tcp_listener = sockets.tcp_listener;
 
         let (forward_tx, forward_rx) = mpsc::channel(self.max_concurrent_queries.saturating_mul(2));
         let forward_shutdown = shutdown_rx.clone();
@@ -812,6 +818,26 @@ async fn run_udp_forwarder(
                             warn!(upstream_id, "Ignoring upstream DNS response with unknown transaction ID");
                             continue;
                         };
+                        if !upstream_response_matches_pending_query(
+                            &response_buf[..len],
+                            &pending_request.query,
+                        ) {
+                            warn!(
+                                client = %pending_request.client,
+                                upstream_id,
+                                qname = %pending_request.query.name,
+                                qtype = pending_request.query.qtype,
+                                qclass = pending_request.query.qclass,
+                                "Ignoring upstream DNS response with mismatched question"
+                            );
+                            send_udp_servfail(
+                                &client_socket,
+                                &pending_request.query,
+                                pending_request.client,
+                            )
+                            .await;
+                            continue;
+                        }
                         let mut response = response_buf[..len].to_vec();
                         response[..2].copy_from_slice(&pending_request.original_id.to_be_bytes());
                         let _ = client_socket.send_to(&response, pending_request.client).await;
@@ -853,6 +879,34 @@ fn allocate_upstream_id(next_id: &mut u16, pending: &HashMap<u16, PendingForward
         }
     }
     None
+}
+
+fn upstream_response_matches_pending_query(response: &[u8], pending: &DnsQuery) -> bool {
+    if response.len() < DNS_HEADER_SIZE {
+        return false;
+    }
+
+    let flags = u16::from_be_bytes([response[2], response[3]]);
+    if flags & FLAGS_QR == 0 {
+        return false;
+    }
+
+    let qdcount = u16::from_be_bytes([response[4], response[5]]);
+    if qdcount != 1 {
+        return false;
+    }
+
+    let Some((name, offset)) = parse_dns_name(response, DNS_HEADER_SIZE) else {
+        return false;
+    };
+    if offset + 4 > response.len() {
+        return false;
+    }
+
+    let qtype = u16::from_be_bytes([response[offset], response[offset + 1]]);
+    let qclass = u16::from_be_bytes([response[offset + 2], response[offset + 3]]);
+
+    normalize_dns_name(&name) == pending.name && qtype == pending.qtype && qclass == pending.qclass
 }
 
 async fn send_udp_servfail(socket: &UdpSocket, query: &DnsQuery, client: SocketAddr) {
@@ -1299,6 +1353,12 @@ mod tests {
         packet
     }
 
+    fn build_response_question(name: &str, qtype: u16) -> Vec<u8> {
+        let mut packet = build_query_packet(name, qtype);
+        packet[2..4].copy_from_slice(&(FLAGS_QR | FLAGS_RA | FLAGS_RD).to_be_bytes());
+        packet
+    }
+
     fn build_query_with_opt(name: &str, qtype: u16, udp_payload_size: u16) -> Vec<u8> {
         let mut packet = build_query_packet(name, qtype);
         packet[10..12].copy_from_slice(&1u16.to_be_bytes()); // ARCOUNT
@@ -1326,6 +1386,30 @@ mod tests {
         let query = parse_dns_query(&packet).expect("should parse");
         assert_eq!(query.name, "ipv6.example.com");
         assert_eq!(query.qtype, QTYPE_AAAA);
+    }
+
+    #[test]
+    fn upstream_response_question_must_match_pending_query() {
+        let query_packet = build_a_query("example.com");
+        let pending = parse_dns_query(&query_packet).expect("query parses");
+        let matching = build_response_question("example.com", QTYPE_A);
+        let wrong_name = build_response_question("other.example.com", QTYPE_A);
+        let wrong_type = build_response_question("example.com", QTYPE_AAAA);
+        let not_a_response = build_a_query("example.com");
+
+        assert!(upstream_response_matches_pending_query(&matching, &pending));
+        assert!(!upstream_response_matches_pending_query(
+            &wrong_name,
+            &pending
+        ));
+        assert!(!upstream_response_matches_pending_query(
+            &wrong_type,
+            &pending
+        ));
+        assert!(!upstream_response_matches_pending_query(
+            &not_a_response,
+            &pending
+        ));
     }
 
     #[test]

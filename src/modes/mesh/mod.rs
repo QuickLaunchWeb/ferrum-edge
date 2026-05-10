@@ -819,10 +819,16 @@ async fn serve_mesh_runtime(
         if let Some(ref slice) = initial_applied_mesh_slice {
             dns_proxy.update_from_slice(slice);
         }
+        let dns_sockets = dns_proxy.bind().await.with_context(|| {
+            format!(
+                "failed to bind mesh DNS proxy at {}",
+                runtime.dns_listen_addr
+            )
+        })?;
         let dns_shutdown = shutdown_tx.subscribe();
         let dns_runner = dns_proxy.clone();
         mesh_background_handles.push(tokio::spawn(async move {
-            dns_runner.run(dns_shutdown).await;
+            dns_runner.run_bound(dns_sockets, dns_shutdown).await;
         }));
         info!(
             addr = %runtime.dns_listen_addr,
