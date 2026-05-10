@@ -138,6 +138,7 @@ impl TrustedProxies {
         if let Some((ip_str, prefix_str)) = entry.split_once('/') {
             let ip: IpAddr = ip_str.parse().ok()?;
             let prefix_len: u8 = prefix_str.parse().ok()?;
+            let (ip, prefix_len) = canonicalize_cidr_network(ip, prefix_len)?;
             let max_prefix = match ip {
                 IpAddr::V4(_) => 32,
                 IpAddr::V6(_) => 128,
@@ -152,6 +153,7 @@ impl TrustedProxies {
         } else {
             // Bare IP — treat as /32 or /128
             let ip: IpAddr = entry.parse().ok()?;
+            let ip = canonicalize_ip(ip);
             let prefix_len = match ip {
                 IpAddr::V4(_) => 32,
                 IpAddr::V6(_) => 128,
@@ -164,34 +166,67 @@ impl TrustedProxies {
     }
 }
 
+fn canonicalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        other => other,
+    }
+}
+
+fn canonicalize_cidr_network(ip: IpAddr, prefix_len: u8) -> Option<(IpAddr, u8)> {
+    match ip {
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                if prefix_len < 96 {
+                    return None;
+                }
+                Some((IpAddr::V4(v4), prefix_len - 96))
+            } else {
+                Some((IpAddr::V6(v6), prefix_len))
+            }
+        }
+        other => Some((other, prefix_len)),
+    }
+}
+
 impl CidrEntry {
     fn matches(&self, ip: &IpAddr) -> bool {
         match (&self.network, ip) {
-            (IpAddr::V4(net), IpAddr::V4(addr)) => {
-                if self.prefix_len == 0 {
-                    return true;
+            (IpAddr::V4(net), IpAddr::V4(addr)) => matches_ipv4(*net, *addr, self.prefix_len),
+            (IpAddr::V4(net), IpAddr::V6(addr)) => {
+                if let Some(v4) = addr.to_ipv4_mapped() {
+                    matches_ipv4(*net, v4, self.prefix_len)
+                } else {
+                    false
                 }
-                let net_bits = u32::from(*net);
-                let addr_bits = u32::from(*addr);
-                let mask = u32::MAX
-                    .checked_shl(32 - self.prefix_len as u32)
-                    .unwrap_or(0);
-                (net_bits & mask) == (addr_bits & mask)
             }
-            (IpAddr::V6(net), IpAddr::V6(addr)) => {
-                if self.prefix_len == 0 {
-                    return true;
-                }
-                let net_bits = u128::from(*net);
-                let addr_bits = u128::from(*addr);
-                let mask = u128::MAX
-                    .checked_shl(128 - self.prefix_len as u32)
-                    .unwrap_or(0);
-                (net_bits & mask) == (addr_bits & mask)
-            }
+            (IpAddr::V6(net), IpAddr::V6(addr)) => matches_ipv6(*net, *addr, self.prefix_len),
             _ => false, // v4 vs v6 mismatch
         }
     }
+}
+
+fn matches_ipv4(network: std::net::Ipv4Addr, addr: std::net::Ipv4Addr, prefix_len: u8) -> bool {
+    if prefix_len == 0 {
+        return true;
+    }
+    let net_bits = u32::from(network);
+    let addr_bits = u32::from(addr);
+    let mask = u32::MAX.checked_shl(32 - prefix_len as u32).unwrap_or(0);
+    (net_bits & mask) == (addr_bits & mask)
+}
+
+fn matches_ipv6(network: std::net::Ipv6Addr, addr: std::net::Ipv6Addr, prefix_len: u8) -> bool {
+    if prefix_len == 0 {
+        return true;
+    }
+    let net_bits = u128::from(network);
+    let addr_bits = u128::from(addr);
+    let mask = u128::MAX.checked_shl(128 - prefix_len as u32).unwrap_or(0);
+    (net_bits & mask) == (addr_bits & mask)
 }
 
 /// Resolve the real client IP from the request context.

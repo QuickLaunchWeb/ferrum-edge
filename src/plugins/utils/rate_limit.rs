@@ -475,13 +475,16 @@ impl SlidingWindow {
         }
     }
 
-    pub fn check_and_increment(&mut self, now: Instant) -> bool {
+    /// Check whether the window would allow a request without incrementing.
+    /// Evicts stale entries to ensure an accurate count.
+    pub fn would_allow(&mut self, now: Instant) -> bool {
         self.evict(now);
-        if self.timestamps.len() as u64 >= self.limit {
-            return false;
-        }
+        (self.timestamps.len() as u64) < self.limit
+    }
+
+    /// Record a request in the window (caller must have checked `would_allow` first).
+    pub fn increment(&mut self, now: Instant) {
         self.timestamps.push_back(now);
-        true
     }
 
     pub fn remaining(&self) -> u64 {
@@ -544,6 +547,18 @@ impl TokenBucket {
         } else {
             false
         }
+    }
+
+    /// Check whether the bucket would allow consuming `weight` tokens without
+    /// actually consuming them. Refills first to ensure an accurate count.
+    pub fn would_allow(&mut self, now: Instant, weight: u64) -> bool {
+        self.refill(now);
+        self.tokens >= weight as f64
+    }
+
+    /// Consume `weight` tokens (caller must have checked `would_allow` first).
+    pub fn consume(&mut self, weight: u64) {
+        self.tokens = (self.tokens - weight as f64).max(0.0);
     }
 
     pub fn remaining(&self) -> u64 {
@@ -632,19 +647,32 @@ impl RateLimitAlgorithm for HttpRateLimitAlgorithm {
         _op: &Self::Op,
         now: Instant,
     ) -> RateLimitOutcome {
-        let mut tightest: Option<(u64, u64, u64)> = None;
+        // Two-pass approach to prevent phantom counter increments.
+        // Without this, if window 0 allows+increments but window 1 denies,
+        // window 0's counter is inflated — the request was never served but
+        // the rate limit budget is consumed.
 
+        // First pass: check all windows without modifying counters.
         for (idx, window) in state.iter_mut().enumerate() {
             let spec = &self.specs[idx];
             let allowed = match window {
-                HttpWindowState::Sliding(sliding) => sliding.check_and_increment(now),
-                HttpWindowState::Bucket(bucket) => bucket.check_and_consume(now, 1),
+                HttpWindowState::Sliding(sliding) => sliding.would_allow(now),
+                HttpWindowState::Bucket(bucket) => bucket.would_allow(now, 1),
             };
-
             if !allowed {
                 return RateLimitOutcome::deny()
                     .with_limit(spec.limit)
                     .with_window(spec.duration.as_secs());
+            }
+        }
+
+        // Second pass: all windows allow — now increment all counters.
+        let mut tightest: Option<(u64, u64, u64)> = None;
+        for (idx, window) in state.iter_mut().enumerate() {
+            let spec = &self.specs[idx];
+            match window {
+                HttpWindowState::Sliding(sliding) => sliding.increment(now),
+                HttpWindowState::Bucket(bucket) => bucket.consume(1),
             }
 
             let remaining = window.remaining();
@@ -674,6 +702,10 @@ impl RateLimitAlgorithm for HttpRateLimitAlgorithm {
     ) -> Result<RateLimitOutcome, ()> {
         let mut tightest: Option<(u64, u64, u64)> = None;
 
+        // Redis must couple the admission decision to the increment because
+        // multiple gateway instances can race on the same key. For multi-window
+        // configs this may consume an earlier window before a later window
+        // denies, but it prevents cross-instance over-admission without Lua.
         for spec in self.specs.iter() {
             let window = FixedWindow::new(spec.limit, spec.duration.as_secs());
             let curr_idx = RedisRateLimitClient::window_index(window.window_seconds);
@@ -683,20 +715,22 @@ impl RateLimitAlgorithm for HttpRateLimitAlgorithm {
             let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
             let ttl = window.window_seconds * 2 + 1;
 
-            let result = redis
-                .sliding_window_check(&prev_key, &curr_key, ttl, elapsed_fraction, spec.limit)
+            let (prev_count, curr_count) = redis
+                .sliding_window_increment(&prev_key, &curr_key, ttl)
                 .await?;
-
-            if !result.allowed {
+            let weighted = prev_count as f64 * (1.0 - elapsed_fraction) + curr_count as f64;
+            if weighted > spec.limit as f64 {
                 return Ok(RateLimitOutcome::deny()
                     .with_limit(spec.limit)
                     .with_window(spec.duration.as_secs()));
             }
 
+            let remaining = (spec.limit as f64 - weighted).max(0.0) as u64;
+
             match tightest {
-                Some((current_remaining, _, _)) if result.remaining >= current_remaining => {}
+                Some((current_remaining, _, _)) if remaining >= current_remaining => {}
                 _ => {
-                    tightest = Some((result.remaining, spec.limit, spec.duration.as_secs()));
+                    tightest = Some((remaining, spec.limit, spec.duration.as_secs()));
                 }
             }
         }
@@ -1236,6 +1270,13 @@ mod tests {
         let outcome = window.outcome(8, 4, 0.25);
         assert!(outcome.allowed);
         assert_eq!(outcome.remaining, Some(0));
+    }
+
+    #[test]
+    fn token_bucket_consume_saturates_at_zero() {
+        let mut bucket = TokenBucket::from_window(1, Duration::from_secs(1));
+        bucket.consume(2);
+        assert_eq!(bucket.remaining(), 0);
     }
 
     #[tokio::test]
