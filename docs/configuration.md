@@ -564,7 +564,7 @@ proxies:
 
 ### Service Discovery
 
-Upstreams can discover targets dynamically using a `service_discovery` block. Three providers are supported:
+Upstreams can discover targets dynamically using a `service_discovery` block. Four providers are supported:
 
 **DNS-SD** (DNS Service Discovery):
 ```yaml
@@ -612,6 +612,23 @@ upstreams:
         poll_interval_seconds: 10
         token: "consul-acl-token"
 ```
+
+**Ferrum Mesh**:
+```yaml
+upstreams:
+  - id: "mesh-payments"
+    targets: []
+    algorithm: round_robin
+    service_discovery:
+      provider: mesh
+      mesh:
+        service_name: "payments"
+        namespace: "backend"   # optional; defaults to the upstream namespace
+        port: 8080             # optional; defaults to the first mesh service port
+        poll_interval_seconds: 5
+```
+
+The mesh provider reads the CP-delivered `mesh.services` and `mesh.workloads` snapshot already present in gateway DP config. It converts matching workload addresses into upstream targets tagged with `mesh.spiffe_id`, `mesh.namespace`, and `mesh.hbone=true`, allowing later gateway-to-mesh transport features to select mesh-aware backends without a separate registry.
 
 Discovered targets are merged with any statically defined `targets`. If the provider is unreachable, the upstream keeps its last-known targets to maintain availability.
 
