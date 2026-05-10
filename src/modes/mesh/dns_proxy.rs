@@ -31,7 +31,7 @@ const DNS_UDP_SAFE_PACKET_SIZE: usize = 512;
 const DNS_MAX_TCP_PACKET_SIZE: usize = u16::MAX as usize;
 const DNS_UPSTREAM_TIMEOUT_SECS: u64 = 5;
 const DNS_TCP_QUERY_READ_TIMEOUT_SECS: u64 = 5;
-const DNS_RESPONSE_CACHE_MAX_ENTRIES: usize = 4096;
+pub const DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES: usize = 4096;
 pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
 // QTYPE values
@@ -146,15 +146,21 @@ pub struct DnsResolutionTable {
     /// Per-slice cache of serialized mesh DNS response templates.
     response_cache: DashMap<DnsResponseCacheKey, Vec<u8>>,
     response_cache_entries: AtomicUsize,
+    response_cache_max_entries: usize,
 }
 
 impl DnsResolutionTable {
     fn empty() -> Self {
+        Self::empty_with_response_cache_max_entries(DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES)
+    }
+
+    fn empty_with_response_cache_max_entries(response_cache_max_entries: usize) -> Self {
         Self {
             exact: HashMap::new(),
             wildcard_suffixes: HashMap::new(),
             response_cache: DashMap::new(),
             response_cache_entries: AtomicUsize::new(0),
+            response_cache_max_entries: response_cache_max_entries.max(1),
         }
     }
 
@@ -169,6 +175,18 @@ impl DnsResolutionTable {
     }
 
     pub fn from_mesh_slice_with_cluster_domain(slice: &MeshSlice, cluster_domain: &str) -> Self {
+        Self::from_mesh_slice_with_cluster_domain_and_response_cache_max_entries(
+            slice,
+            cluster_domain,
+            DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
+        )
+    }
+
+    pub fn from_mesh_slice_with_cluster_domain_and_response_cache_max_entries(
+        slice: &MeshSlice,
+        cluster_domain: &str,
+        response_cache_max_entries: usize,
+    ) -> Self {
         let cluster_domain = normalize_dns_name(cluster_domain);
         let mut exact: HashMap<String, DnsRecordSet> = HashMap::new();
         let mut wildcard_suffixes: HashMap<String, Vec<WildcardRecordSet>> = HashMap::new();
@@ -271,6 +289,7 @@ impl DnsResolutionTable {
             wildcard_suffixes,
             response_cache: DashMap::new(),
             response_cache_entries: AtomicUsize::new(0),
+            response_cache_max_entries: response_cache_max_entries.max(1),
         }
     }
 
@@ -330,7 +349,7 @@ impl DnsResolutionTable {
     fn reserve_response_cache_slot(&self) -> bool {
         let mut current = self.response_cache_entries.load(Ordering::Relaxed);
         loop {
-            if current >= DNS_RESPONSE_CACHE_MAX_ENTRIES {
+            if current >= self.response_cache_max_entries {
                 return false;
             }
 
@@ -455,6 +474,7 @@ pub struct MeshDnsProxy {
     upstream_resolver: SocketAddr,
     ttl_seconds: u32,
     max_concurrent_queries: usize,
+    response_cache_max_entries: usize,
     cluster_domain: String,
 }
 
@@ -470,14 +490,21 @@ impl MeshDnsProxy {
         upstream_resolver: SocketAddr,
         ttl_seconds: u32,
         max_concurrent_queries: usize,
+        response_cache_max_entries: usize,
         cluster_domain: String,
     ) -> Self {
+        let response_cache_max_entries = response_cache_max_entries.max(1);
         Self {
             listen_addr,
-            resolution_table: Arc::new(ArcSwap::new(Arc::new(DnsResolutionTable::empty()))),
+            resolution_table: Arc::new(ArcSwap::new(Arc::new(
+                DnsResolutionTable::empty_with_response_cache_max_entries(
+                    response_cache_max_entries,
+                ),
+            ))),
             upstream_resolver,
             ttl_seconds,
             max_concurrent_queries: max_concurrent_queries.max(1),
+            response_cache_max_entries,
             cluster_domain: normalize_dns_name(&cluster_domain),
         }
     }
@@ -495,7 +522,11 @@ impl MeshDnsProxy {
     /// Rebuild the resolution table from a new mesh slice.
     pub fn update_from_slice(&self, slice: &MeshSlice) {
         let new_table =
-            DnsResolutionTable::from_mesh_slice_with_cluster_domain(slice, &self.cluster_domain);
+            DnsResolutionTable::from_mesh_slice_with_cluster_domain_and_response_cache_max_entries(
+                slice,
+                &self.cluster_domain,
+                self.response_cache_max_entries,
+            );
         let exact_count = new_table.exact_count();
         let wildcard_count = new_table.wildcard_count();
         self.resolution_table.store(Arc::new(new_table));
@@ -1890,7 +1921,7 @@ mod tests {
     fn mesh_response_cache_never_exceeds_entry_cap() {
         let table = DnsResolutionTable::empty();
 
-        for index in 0..(DNS_RESPONSE_CACHE_MAX_ENTRIES + 16) {
+        for index in 0..(DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES + 16) {
             let key = DnsResponseCacheKey {
                 name: format!("svc-{index}.example.com"),
                 qtype: QTYPE_A,
@@ -1903,7 +1934,30 @@ mod tests {
             let _ = table.cached_mesh_response(key, 0x1234, || vec![0x12, 0x34, 0x81, 0x80]);
         }
 
-        assert_eq!(table.response_cache_len(), DNS_RESPONSE_CACHE_MAX_ENTRIES);
+        assert_eq!(
+            table.response_cache_len(),
+            DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES
+        );
+    }
+
+    #[test]
+    fn mesh_response_cache_honors_configured_entry_cap() {
+        let table = DnsResolutionTable::empty_with_response_cache_max_entries(2);
+
+        for index in 0..4 {
+            let key = DnsResponseCacheKey {
+                name: format!("svc-{index}.example.com"),
+                qtype: QTYPE_A,
+                qclass: QCLASS_IN,
+                rd: true,
+                ttl: 60,
+                max_response_size: DNS_UDP_SAFE_PACKET_SIZE,
+                opt_record: None,
+            };
+            let _ = table.cached_mesh_response(key, 0x1234, || vec![0x12, 0x34, 0x81, 0x80]);
+        }
+
+        assert_eq!(table.response_cache_len(), 2);
     }
 
     #[tokio::test]

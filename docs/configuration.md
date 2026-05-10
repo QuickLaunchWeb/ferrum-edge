@@ -169,9 +169,10 @@ With the native `MeshSubscribe` protocol, mesh mode waits for the first delivere
 | `FERRUM_MESH_DNS_UPSTREAM_ADDR` | No | `127.0.0.53:53` | Upstream DNS resolver for non-mesh names. The default targets systemd-resolved; set this to your node, pod, or cluster resolver (for example CoreDNS) in non-systemd environments |
 | `FERRUM_MESH_DNS_TTL_SECONDS` | No | `60` | TTL used for synthetic A/AAAA records resolved from mesh ServiceEntry and MeshService state |
 | `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` | No | `1024` | Maximum admitted DNS query tasks and outstanding upstream UDP forwards before the proxy returns SERVFAIL |
+| `FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES` | No | `4096` | Maximum per-slice cached synthetic mesh DNS response templates. Raise for very large meshes with many service names, qtypes, EDNS sizes, or wildcard variants |
 | `FERRUM_MESH_CLUSTER_DOMAIN` | No | `cluster.local` | Kubernetes cluster DNS domain used when synthesizing `{service}.{namespace}.svc.<domain>` names |
 
-Mesh DNS caches up to 4,096 serialized response templates per mesh slice for mesh-owned names. The cache is rebuilt with the slice, excludes the client transaction ID, and patches the caller's ID into each returned response, so repeated A/AAAA and mesh-owned empty responses avoid repeated wire-format serialization without leaking IDs across clients.
+Mesh DNS caches serialized response templates per mesh slice for mesh-owned names, bounded by `FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES` (default 4,096). The cache is rebuilt with the slice, excludes the client transaction ID, and patches the caller's ID into each returned response, so repeated A/AAAA and mesh-owned empty responses avoid repeated wire-format serialization without leaking IDs across clients.
 
 Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Prometheus plugin when mesh metadata is present. The added series are `ferrum_mesh_requests_total` and `ferrum_mesh_request_duration_ms`, labelled with source/destination workload, namespace, principal, app, service, request protocol, response code, response flags, and connection security policy.
 
