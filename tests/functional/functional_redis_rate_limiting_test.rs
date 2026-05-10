@@ -47,30 +47,8 @@ async fn redis_is_available() -> bool {
     }
 }
 
-/// Flush the test Redis database (DB 15) to start clean.
-async fn flush_redis_db() {
-    let Ok(stream) = tokio::net::TcpStream::connect("127.0.0.1:6379").await else {
-        return;
-    };
-    let (reader, mut writer) = tokio::io::split(stream);
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    // SELECT 15
-    writer
-        .write_all(b"*2\r\n$6\r\nSELECT\r\n$2\r\n15\r\n")
-        .await
-        .unwrap();
-    let mut buf = [0u8; 64];
-    let mut reader = reader;
-    let _ = reader.read(&mut buf).await;
-
-    // FLUSHDB
-    writer.write_all(b"*1\r\n$7\r\nFLUSHDB\r\n").await.unwrap();
-    let _ = reader.read(&mut buf).await;
-}
-
 /// Delete only Redis keys matching a specific prefix (DB 15).
-/// Uses SCAN + DEL to avoid cross-test interference from FLUSHDB.
+/// Uses prefix-scoped deletion to avoid cross-test interference from FLUSHDB.
 async fn delete_redis_keys_by_prefix(prefix: &str) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -472,7 +450,6 @@ async fn test_rate_limiting_redis_centralized() {
     if !redis_is_available().await {
         return;
     }
-    flush_redis_db().await;
 
     let harness = RedisRateLimitHarness::new()
         .await
@@ -652,7 +629,6 @@ async fn test_ai_rate_limiter_redis_centralized() {
     if !redis_is_available().await {
         return;
     }
-    flush_redis_db().await;
 
     let harness = RedisRateLimitHarness::new()
         .await
@@ -696,6 +672,7 @@ async fn test_ai_rate_limiter_redis_centralized() {
     .unwrap();
 
     harness.wait_for_poll().await;
+    delete_redis_keys_by_prefix(&unique_prefix).await;
 
     // First 2 requests should succeed (500 + 500 = 1000 tokens)
     for i in 1..=2 {
@@ -747,7 +724,6 @@ async fn test_ai_rate_limiter_redis_shared_across_instances() {
     if !redis_is_available().await {
         return;
     }
-    flush_redis_db().await;
 
     let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -758,6 +734,7 @@ async fn test_ai_rate_limiter_redis_shared_across_instances() {
     let config = |prefix: &str| {
         format!(
             r#"
+version: "1"
 proxies:
   - id: "shared-ai-proxy"
     listen_path: "/shared-ai"
@@ -816,7 +793,7 @@ plugin_configs:
     let client = reqwest::Client::new();
     let request_body = r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#;
 
-    flush_redis_db().await;
+    delete_redis_keys_by_prefix(&unique_prefix).await;
     sleep(Duration::from_millis(200)).await;
 
     let resp = client
@@ -881,7 +858,6 @@ async fn test_ws_rate_limiting_redis_centralized() {
     if !redis_is_available().await {
         return;
     }
-    flush_redis_db().await;
 
     let backend_port = {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -900,9 +876,11 @@ async fn test_ws_rate_limiting_redis_centralized() {
     sleep(Duration::from_millis(300)).await;
 
     let unique_prefix = format!("ferrum:test:ws:{}", Uuid::new_v4().simple());
+    delete_redis_keys_by_prefix(&unique_prefix).await;
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "ws-redis-proxy"
     listen_path: "/ws-redis"
@@ -1006,7 +984,6 @@ async fn test_ws_rate_limiting_redis_namespaces_instance_connections() {
     if !redis_is_available().await {
         return;
     }
-    flush_redis_db().await;
 
     let backend_port = {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1034,6 +1011,7 @@ async fn test_ws_rate_limiting_redis_namespaces_instance_connections() {
     let config = |prefix: &str| {
         format!(
             r#"
+version: "1"
 proxies:
   - id: "ws-shared-redis-proxy"
     listen_path: "/ws-shared"
@@ -1075,7 +1053,7 @@ plugin_configs:
     )
     .await;
 
-    flush_redis_db().await;
+    delete_redis_keys_by_prefix(&unique_prefix).await;
     sleep(Duration::from_millis(200)).await;
 
     let url1 = format!("ws://127.0.0.1:{}/ws-shared", port1);
@@ -1136,7 +1114,6 @@ async fn test_rate_limiting_redis_shared_across_instances() {
     if !redis_is_available().await {
         return;
     }
-    flush_redis_db().await;
 
     // Start a shared backend
     let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1148,6 +1125,7 @@ async fn test_rate_limiting_redis_shared_across_instances() {
     let config = |prefix: &str| {
         format!(
             r#"
+version: "1"
 proxies:
   - id: "shared-rl-proxy"
     listen_path: "/shared-rl"
@@ -1206,8 +1184,9 @@ plugin_configs:
 
     let client = reqwest::Client::new();
 
-    // Flush Redis to start with clean counters (no warmup interference)
-    flush_redis_db().await;
+    // Clear only this test's counters so concurrent Redis tests keep their
+    // own shared-state assertions intact.
+    delete_redis_keys_by_prefix(&unique_prefix).await;
     sleep(Duration::from_millis(200)).await;
 
     // Send 2 requests to gateway 1 — should succeed
@@ -1282,7 +1261,6 @@ async fn test_rate_limiting_redis_namespace_key_prefix_isolation() {
     if !redis_is_available().await {
         return;
     }
-    flush_redis_db().await;
 
     // Shared backend.
     let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1295,10 +1273,13 @@ async fn test_rate_limiting_redis_namespace_key_prefix_isolation() {
     let ns_run = Uuid::new_v4().simple().to_string();
     let ns_a = format!("nsiso-a-{}", ns_run);
     let ns_b = format!("nsiso-b-{}", ns_run);
+    delete_redis_keys_by_prefix(&format!("{}:rate_limiting", ns_a)).await;
+    delete_redis_keys_by_prefix(&format!("{}:rate_limiting", ns_b)).await;
 
     let config = |namespace: &str| {
         format!(
             r#"
+version: "1"
 proxies:
   - id: "ns-iso-proxy"
     namespace: "{namespace}"

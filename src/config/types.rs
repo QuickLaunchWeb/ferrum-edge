@@ -478,6 +478,7 @@ impl BackendTlsConfig {
 
 /// An upstream defines a group of backend targets with load balancing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Upstream {
     #[serde(default)]
     pub id: String,
@@ -755,10 +756,8 @@ fn default_retry_on_connect_failure() -> bool {
 ///   by `listen_port`.
 ///
 /// `Tcps` follows the `http`/`https`, `ws`/`wss`, pattern (serde name `"tcps"`).
-/// Only the canonical six scheme names are accepted on the serde boundary.
-/// Legacy `BackendProtocol` field names and variant spellings are not
-/// supported for file-mode compatibility; operators should migrate configs
-/// to `backend_scheme` before loading them.
+/// Only the canonical six scheme names are accepted on the serde and database
+/// boundaries.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendScheme {
@@ -963,6 +962,7 @@ pub enum PluginScope {
 /// proxies (`tcp`/`tcp_tls`/`udp`/`dtls`) route on `listen_port` and MUST NOT
 /// set `listen_path`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Proxy {
     #[serde(default)]
     pub id: String,
@@ -1179,6 +1179,7 @@ pub struct PluginAssociation {
 
 /// A consumer resource (API user).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Consumer {
     #[serde(default)]
     pub id: String,
@@ -1203,6 +1204,7 @@ pub struct Consumer {
 
 /// A plugin configuration resource.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginConfig {
     #[serde(default)]
     pub id: String,
@@ -1261,6 +1263,7 @@ pub enum SpecFormat {
 /// requiring decompression. See [`crate::admin::spec_codec`] for the
 /// compression + hashing helpers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiSpec {
     #[serde(default)]
     pub id: String,
@@ -1324,10 +1327,9 @@ pub struct ApiSpec {
 
 /// Full gateway configuration snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
-    /// Configuration schema version. Defaults to "1" for backwards compatibility
-    /// with config files that predate the versioning system.
-    #[serde(default = "default_config_version")]
+    /// Configuration schema version.
     pub version: String,
     pub proxies: Vec<Proxy>,
     pub consumers: Vec<Consumer>,
@@ -1348,10 +1350,6 @@ pub struct GatewayConfig {
 
 /// The current config schema version. Increment this when adding config migrations.
 pub const CURRENT_CONFIG_VERSION: &str = "1";
-
-fn default_config_version() -> String {
-    "1".to_string()
-}
 
 /// The default namespace for all resources when `FERRUM_NAMESPACE` is unset.
 pub const DEFAULT_NAMESPACE: &str = "ferrum";
@@ -1677,7 +1675,7 @@ impl GatewayConfig {
         let mut duplicates = Vec::new();
 
         for consumer in &self.consumers {
-            // Check all keyauth entries (supports both single object and array)
+            // Check all keyauth entries.
             for entry in consumer.credential_entries("keyauth") {
                 if let Some(key) = entry.get("key").and_then(|s| s.as_str())
                     && let Some(existing_id) = seen_keyauth.insert(key, &consumer.id)
@@ -1700,7 +1698,7 @@ impl GatewayConfig {
                 ));
             }
 
-            // Check all mTLS entries (supports both single object and array)
+            // Check all mTLS entries.
             for entry in consumer.credential_entries("mtls_auth") {
                 if let Some(identity) = entry.get("identity").and_then(|s| s.as_str())
                     && let Some(existing_id) = seen_mtls.insert(identity, &consumer.id)
@@ -2953,22 +2951,17 @@ impl Proxy {
 }
 
 impl Consumer {
-    /// Normalize a credential value to a list of object entries for backward
-    /// compatibility with both single-object and array-of-objects formats.
+    /// Normalize a credential value to a list of object entries.
     pub(crate) fn credential_entries_from_value(
         credential_value: &serde_json::Value,
     ) -> Vec<&serde_json::Value> {
         match credential_value {
             serde_json::Value::Array(arr) => arr.iter().filter(|v| v.is_object()).collect(),
-            val if val.is_object() => vec![val],
             _ => vec![],
         }
     }
 
-    /// Returns all credential entries for a given type, normalizing both
-    /// single-object and array-of-objects formats for backward compatibility.
-    ///
-    /// - `{"keyauth": {"key": "abc"}}` → `vec![&{"key": "abc"}]`
+    /// Returns all credential entries for a given type.
     /// - `{"keyauth": [{"key": "abc"}, {"key": "def"}]}` → `vec![&{"key": "abc"}, &{"key": "def"}]`
     ///
     /// Called on cold paths (index build) and semi-hot paths (after O(1) consumer
@@ -2984,8 +2977,7 @@ impl Consumer {
     pub fn has_credential(&self, cred_type: &str) -> bool {
         match self.credentials.get(cred_type) {
             Some(serde_json::Value::Array(arr)) => arr.iter().any(|v| v.is_object()),
-            Some(val) => val.is_object(),
-            None => false,
+            _ => false,
         }
     }
 
@@ -3046,15 +3038,14 @@ impl Consumer {
             ));
         }
 
-        // Validate individual credential values (supports both single object and array formats)
+        // Validate individual credential values.
         for (cred_type, cred_value) in &self.credentials {
             if let Err(e) = validate_string_field("credential type", cred_type, 64) {
                 errors.push(e);
             }
-            // Collect objects to validate: either a single object or array elements.
-            // Non-object elements in arrays are rejected — they would be silently
-            // ignored at runtime by credential_entries(), leaving the consumer with
-            // fewer usable credentials than the operator intended.
+            // Collect array entries to validate. Non-object elements are
+            // rejected so operators cannot accidentally configure unusable
+            // credentials.
             let objects: Vec<&serde_json::Map<String, serde_json::Value>> =
                 if let Some(arr) = cred_value.as_array() {
                     let limit = max_credentials_per_type();
@@ -3083,21 +3074,15 @@ impl Consumer {
                         }
                     }
                     arr.iter().filter_map(|v| v.as_object()).collect()
-                } else if let Some(obj) = cred_value.as_object() {
-                    vec![obj]
                 } else {
                     errors.push(format!(
-                        "credentials.{} must be a JSON object or array of objects",
+                        "credentials.{} must be an array of JSON objects",
                         cred_type
                     ));
                     vec![]
                 };
             for (idx, obj) in objects.iter().enumerate() {
-                let prefix = if cred_value.is_array() {
-                    format!("credentials.{}[{}]", cred_type, idx)
-                } else {
-                    format!("credentials.{}", cred_type)
-                };
+                let prefix = format!("credentials.{}[{}]", cred_type, idx);
                 for (key, val) in *obj {
                     if let Some(s) = val.as_str() {
                         if s.len() > MAX_CREDENTIAL_VALUE_LENGTH {
@@ -3172,36 +3157,18 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
 }
 
 pub(crate) fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
-    if let Some(basic) = consumer.credentials.get_mut("basicauth") {
-        match basic {
-            serde_json::Value::Array(arr) => {
-                for entry in arr.iter_mut() {
-                    if let Some(pass) = entry.get("password").and_then(|p| p.as_str()) {
-                        let hash = hash_basic_auth_password(pass).map_err(|e| {
-                            format!(
-                                "Failed to hash password for consumer {}: {}",
-                                consumer.id, e
-                            )
-                        })?;
-                        entry["password_hash"] = serde_json::json!(hash);
-                        if let Some(obj) = entry.as_object_mut() {
-                            obj.remove("password");
-                        }
-                    }
-                }
-            }
-            _ => {
-                if let Some(pass) = basic.get("password").and_then(|p| p.as_str()) {
-                    let hash = hash_basic_auth_password(pass).map_err(|e| {
-                        format!(
-                            "Failed to hash password for consumer {}: {}",
-                            consumer.id, e
-                        )
-                    })?;
-                    basic["password_hash"] = serde_json::json!(hash);
-                    if let Some(obj) = basic.as_object_mut() {
-                        obj.remove("password");
-                    }
+    if let Some(serde_json::Value::Array(arr)) = consumer.credentials.get_mut("basicauth") {
+        for entry in arr.iter_mut() {
+            if let Some(pass) = entry.get("password").and_then(|p| p.as_str()) {
+                let hash = hash_basic_auth_password(pass).map_err(|e| {
+                    format!(
+                        "Failed to hash password for consumer {}: {}",
+                        consumer.id, e
+                    )
+                })?;
+                entry["password_hash"] = serde_json::json!(hash);
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.remove("password");
                 }
             }
         }

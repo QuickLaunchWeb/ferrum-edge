@@ -1,4 +1,5 @@
 ---
+version: "1"
 # gRPC end-to-end TLS performance test config.
 # Client --gRPC+TLS--> gateway --gRPC+TLS--> backend. Every hop encrypted.
 # Used exclusively by gateways-protocol-benchmark.yml for the "grpcs" matrix job.

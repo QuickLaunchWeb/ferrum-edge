@@ -38,7 +38,7 @@ pub struct BodyOutcome {
     /// never yielded an error frame.
     pub body_error_class: Option<ErrorClass>,
     /// Total bytes of body data passed to hyper for the client.
-    pub bytes_streamed_to_client: u64,
+    pub bytes_streamed: u64,
     /// True when the body did not complete because the client stopped
     /// consuming. Also true for the `Drop` safety-net path.
     pub client_disconnected: bool,
@@ -50,7 +50,7 @@ impl BodyOutcome {
         Self {
             body_completed: true,
             body_error_class: None,
-            bytes_streamed_to_client: bytes_streamed,
+            bytes_streamed,
             client_disconnected: false,
         }
     }
@@ -61,7 +61,7 @@ impl BodyOutcome {
         Self {
             body_completed: false,
             body_error_class: Some(class),
-            bytes_streamed_to_client: bytes_streamed,
+            bytes_streamed,
             client_disconnected,
         }
     }
@@ -72,7 +72,7 @@ impl BodyOutcome {
         Self {
             body_completed: false,
             body_error_class: Some(ErrorClass::ClientDisconnect),
-            bytes_streamed_to_client: bytes_streamed,
+            bytes_streamed,
             client_disconnected: true,
         }
     }
@@ -211,14 +211,11 @@ impl DeferredTransactionLogger {
         } = state;
         summary.body_completed = outcome.body_completed;
         summary.body_error_class = outcome.body_error_class;
-        summary.bytes_streamed_to_client = outcome.bytes_streamed_to_client;
         summary.client_disconnected = outcome.client_disconnected;
-        // Mirror the streaming byte count into the unified `response_bytes`
-        // field so log consumers see a non-zero value for streaming responses
-        // without branching on `response_streamed`. Buffered responses
-        // populate `response_bytes` synchronously at their respective summary
-        // sites (they never reach the deferred logger).
-        summary.response_bytes = outcome.bytes_streamed_to_client;
+        // Streaming responses only learn their final byte count when the
+        // body wrapper finishes or is dropped. Buffered responses populate
+        // `response_bytes` synchronously and never reach the deferred logger.
+        summary.response_bytes = outcome.bytes_streamed;
 
         // Re-derive wall-clock latencies so streaming responses report the
         // real body-completion time instead of the header-flush snapshot.
@@ -319,10 +316,8 @@ mod tests {
     #[tokio::test]
     async fn fire_patches_response_bytes_from_outcome() {
         // Regression guard for the unified response_bytes field. When
-        // fire() fires with a streaming outcome carrying N bytes, both
-        // `bytes_streamed_to_client` and `response_bytes` should land at N.
-        // Log consumers that want a single "bytes delivered" field rely on
-        // `response_bytes` being populated here.
+        // fire() fires with a streaming outcome carrying N bytes,
+        // `response_bytes` should land at N.
         let captured = Arc::new(Mutex::new(None::<TransactionSummary>));
         let capturer: Arc<dyn Plugin> = Arc::new(CapturingPlugin(captured.clone()));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![capturer]);
@@ -336,7 +331,6 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
         let summary = captured.lock().unwrap().clone().expect("log fired");
-        assert_eq!(summary.bytes_streamed_to_client, 12345);
         assert_eq!(summary.response_bytes, 12345);
         assert!(summary.body_completed);
     }

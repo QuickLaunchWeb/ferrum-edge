@@ -478,10 +478,9 @@ pub struct EnvConfig {
     /// with this value. Defaults to "ferrum-edge-cp-dp". Operators rotating
     /// the issuer must update CP and all DPs together.
     pub cp_dp_grpc_jwt_issuer: String,
-    pub dp_cp_grpc_url: Option<String>,
     /// Comma-separated, priority-ordered list of CP gRPC URLs for DP failover.
-    /// When set, takes precedence over `dp_cp_grpc_url`. The DP connects to the
-    /// first URL and fails over to subsequent URLs when unreachable.
+    /// The DP connects to the first URL and fails over to subsequent URLs when
+    /// unreachable.
     pub dp_cp_grpc_urls: Vec<String>,
     /// How often (in seconds) the DP retries the primary (first) CP URL while
     /// connected to a fallback CP. Default: 300 (5 minutes). 0 = disabled.
@@ -521,6 +520,35 @@ pub struct EnvConfig {
     /// this to keep mesh-internal identity claims (e.g. `source.`) from
     /// leaking to non-mesh upstream services.
     pub mesh_egress_strip_baggage_keys: Vec<String>,
+
+    // Kubernetes CRD controller (Layer 8)
+    /// Enable the Kubernetes CRD controller in CP mode. When true, the CP
+    /// watches Istio and Gateway API CRDs and reconciles them into Ferrum
+    /// config via `translate_k8s_objects()`. Default: false.
+    pub k8s_controller_enabled: bool,
+    /// Comma-separated namespaces to watch for CRDs. Empty = all namespaces
+    /// (requires ClusterRole). Default: "" (all).
+    pub k8s_watch_namespaces: Vec<String>,
+    /// Override kubeconfig path for out-of-cluster development. Empty = use
+    /// in-cluster config or infer from `~/.kube/config`.
+    pub k8s_kubeconfig_path: Option<String>,
+    /// Debounce window in milliseconds for CRD event coalescing. Events
+    /// arriving within this window are batched into a single reconciliation.
+    /// Default: 500.
+    pub k8s_reconcile_debounce_ms: u64,
+    /// Periodic full re-list interval in seconds. Safety valve against missed
+    /// watch events. Default: 300 (5 minutes).
+    pub k8s_full_sync_interval_secs: u64,
+    /// Enable watching Istio CRDs (security.istio.io, networking.istio.io,
+    /// telemetry.istio.io). Default: true.
+    pub k8s_watch_istio_crds: bool,
+    /// Enable watching Gateway API CRDs (gateway.networking.k8s.io).
+    /// Default: true.
+    pub k8s_watch_gateway_api_crds: bool,
+    /// SPIFFE trust domain for K8s-sourced mesh policies. Used by
+    /// `translate_k8s_objects()` when building SPIFFE IDs from K8s
+    /// ServiceAccount references. Default: "cluster.local".
+    pub k8s_trust_domain: String,
 
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
@@ -907,8 +935,8 @@ pub struct EnvConfig {
     pub real_ip_header: Option<String>,
 
     /// HMAC-SHA256 server secret for the basic_auth plugin. Password hashes
-    /// prefixed with "hmac_sha256:" are verified using this key (~1μs vs ~100ms
-    /// for bcrypt). Must be set to a unique, random value in production.
+    /// prefixed with "hmac_sha256:" are verified using this key. Must be set
+    /// to a unique, random value in production.
     /// If unset, an insecure default is used and a warning is logged at startup.
     /// Note: Also resolved via `resolve_ferrum_var()` in `basic_auth.rs` and
     /// `admin/mod.rs` for use sites that don't have `EnvConfig` in scope.
@@ -1194,7 +1222,6 @@ impl Default for EnvConfig {
             cp_grpc_listen_addr: None,
             cp_dp_grpc_jwt_secret: None,
             cp_dp_grpc_jwt_issuer: "ferrum-edge-cp-dp".to_string(),
-            dp_cp_grpc_url: None,
             dp_cp_grpc_urls: Vec::new(),
             dp_cp_failover_primary_retry_secs: 300,
             cp_grpc_tls_cert_path: None,
@@ -1206,6 +1233,14 @@ impl Default for EnvConfig {
             mesh_config_protocol: "native".to_string(),
             mesh_trust_domain_aliases: Vec::new(),
             mesh_egress_strip_baggage_keys: Vec::new(),
+            k8s_controller_enabled: false,
+            k8s_watch_namespaces: Vec::new(),
+            k8s_kubeconfig_path: None,
+            k8s_reconcile_debounce_ms: 500,
+            k8s_full_sync_interval_secs: 300,
+            k8s_watch_istio_crds: true,
+            k8s_watch_gateway_api_crds: true,
+            k8s_trust_domain: "cluster.local".to_string(),
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -1443,26 +1478,6 @@ impl EnvConfig {
                 "FERRUM_DB_POLL_INTERVAL=0 is clamped to 1 second; set a positive interval to avoid this implicit floor"
             );
         }
-        let db_tls_mode = Self::resolve_db_tls_mode_legacy_alias(conf, db_tls_mode)?;
-        let db_tls_ca_cert_path = Self::resolve_legacy_db_tls_path_alias(
-            conf,
-            db_tls_ca_cert_path,
-            "FERRUM_DB_SSL_ROOT_CERT",
-            "FERRUM_DB_TLS_CA_CERT_PATH",
-        );
-        let db_tls_client_cert_path = Self::resolve_legacy_db_tls_path_alias(
-            conf,
-            db_tls_client_cert_path,
-            "FERRUM_DB_SSL_CLIENT_CERT",
-            "FERRUM_DB_TLS_CLIENT_CERT_PATH",
-        );
-        let db_tls_client_key_path = Self::resolve_legacy_db_tls_path_alias(
-            conf,
-            db_tls_client_key_path,
-            "FERRUM_DB_SSL_CLIENT_KEY",
-            "FERRUM_DB_TLS_CLIENT_KEY_PATH",
-        );
-
         // Clamp statement timeout at parse time so the warning fires once at
         // startup instead of on every new database connection.
         const MAX_STATEMENT_TIMEOUT_SECONDS: u64 = 3600;
@@ -1485,7 +1500,6 @@ impl EnvConfig {
             cp_dp_grpc_jwt_secret: Option<String> = "FERRUM_CP_DP_GRPC_JWT_SECRET"
                 => required_for(["cp", "dp", "mesh"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
             cp_dp_grpc_jwt_issuer: String = "FERRUM_CP_DP_GRPC_JWT_ISSUER" => "ferrum-edge-cp-dp".to_string();
-            dp_cp_grpc_url: Option<String> = "FERRUM_DP_CP_GRPC_URL";
             dp_cp_grpc_urls: Vec<String> = "FERRUM_DP_CP_GRPC_URLS" => Vec::new();
             dp_cp_failover_primary_retry_secs: u64 = "FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS" => 300u64;
             cp_grpc_tls_cert_path: Option<String> = "FERRUM_CP_GRPC_TLS_CERT_PATH";
@@ -1497,6 +1511,14 @@ impl EnvConfig {
             mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
+            k8s_controller_enabled: bool = "FERRUM_K8S_CONTROLLER_ENABLED" => false;
+            k8s_watch_namespaces: Vec<String> = "FERRUM_K8S_WATCH_NAMESPACES" => Vec::new();
+            k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
+            k8s_reconcile_debounce_ms: u64 = "FERRUM_K8S_RECONCILE_DEBOUNCE_MS" => 500u64;
+            k8s_full_sync_interval_secs: u64 = "FERRUM_K8S_FULL_SYNC_INTERVAL_SECS" => 300u64;
+            k8s_watch_istio_crds: bool = "FERRUM_K8S_WATCH_ISTIO_CRDS" => true;
+            k8s_watch_gateway_api_crds: bool = "FERRUM_K8S_WATCH_GATEWAY_API_CRDS" => true;
+            k8s_trust_domain: String = "FERRUM_K8S_TRUST_DOMAIN" => "cluster.local".to_string();
             dp_grpc_tls_ca_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CA_CERT_PATH";
             dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
@@ -1828,7 +1850,6 @@ impl EnvConfig {
             cp_grpc_listen_addr,
             cp_dp_grpc_jwt_secret,
             cp_dp_grpc_jwt_issuer,
-            dp_cp_grpc_url,
             dp_cp_grpc_urls,
             dp_cp_failover_primary_retry_secs,
             cp_grpc_tls_cert_path,
@@ -1840,6 +1861,14 @@ impl EnvConfig {
             mesh_config_protocol,
             mesh_trust_domain_aliases,
             mesh_egress_strip_baggage_keys,
+            k8s_controller_enabled,
+            k8s_watch_namespaces,
+            k8s_kubeconfig_path,
+            k8s_reconcile_debounce_ms,
+            k8s_full_sync_interval_secs,
+            k8s_watch_istio_crds,
+            k8s_watch_gateway_api_crds,
+            k8s_trust_domain,
             dp_grpc_tls_ca_cert_path,
             dp_grpc_tls_client_cert_path,
             dp_grpc_tls_client_key_path,
@@ -2024,17 +2053,8 @@ impl EnvConfig {
     }
 
     /// Returns the resolved list of CP gRPC URLs for DP failover, priority-ordered.
-    ///
-    /// `FERRUM_DP_CP_GRPC_URLS` takes precedence. Falls back to
-    /// `FERRUM_DP_CP_GRPC_URL` as a single-element list.
     pub fn resolved_dp_cp_grpc_urls(&self) -> Vec<String> {
-        if !self.dp_cp_grpc_urls.is_empty() {
-            self.dp_cp_grpc_urls.clone()
-        } else if let Some(ref url) = self.dp_cp_grpc_url {
-            vec![url.clone()]
-        } else {
-            Vec::new()
-        }
+        self.dp_cp_grpc_urls.clone()
     }
 
     /// Collect all ports reserved by the gateway's own listeners.
@@ -2194,107 +2214,6 @@ impl EnvConfig {
         }
     }
 
-    fn resolve_legacy_db_tls_path_alias(
-        conf: &ConfFile,
-        current: Option<String>,
-        legacy_key: &'static str,
-        canonical_key: &'static str,
-    ) -> Option<String> {
-        let Some(legacy_value) = resolve_var(conf, legacy_key) else {
-            return current;
-        };
-
-        if current.is_some() {
-            tracing::warn!(
-                legacy_key,
-                canonical_key,
-                "Deprecated database TLS env var ignored because canonical replacement is set"
-            );
-            return current;
-        }
-
-        tracing::warn!(
-            legacy_key,
-            canonical_key,
-            "Deprecated database TLS env var is still accepted for compatibility; rename it to the canonical replacement"
-        );
-        Some(legacy_value)
-    }
-
-    fn resolve_legacy_db_tls_bool_alias(
-        conf: &ConfFile,
-        legacy_key: &'static str,
-        canonical_key: &'static str,
-    ) -> Result<Option<bool>, String> {
-        resolve_var(conf, legacy_key)
-            .map(|raw| {
-                tracing::warn!(
-                    legacy_key,
-                    canonical_key,
-                    "Deprecated database TLS env var is still accepted for compatibility; rename it to the canonical replacement"
-                );
-                <bool as env_config_macro::EnvValue>::parse_env(&raw, legacy_key)
-            })
-            .transpose()
-    }
-
-    fn warn_legacy_db_tls_mode_alias_ignored(conf: &ConfFile, legacy_key: &'static str) {
-        if resolve_var(conf, legacy_key).is_some() {
-            tracing::warn!(
-                legacy_key,
-                canonical_key = "FERRUM_DB_TLS_MODE",
-                "Deprecated database TLS env var ignored because FERRUM_DB_TLS_MODE is set"
-            );
-        }
-    }
-
-    fn resolve_db_tls_mode_legacy_alias(
-        conf: &ConfFile,
-        current: Option<DbTlsMode>,
-    ) -> Result<Option<DbTlsMode>, String> {
-        if current.is_some() {
-            for legacy_key in [
-                "FERRUM_DB_SSL_MODE",
-                "FERRUM_DB_TLS_ENABLED",
-                "FERRUM_DB_TLS_INSECURE",
-            ] {
-                Self::warn_legacy_db_tls_mode_alias_ignored(conf, legacy_key);
-            }
-            return Ok(current);
-        }
-
-        if let Some(raw) = resolve_var(conf, "FERRUM_DB_SSL_MODE") {
-            tracing::warn!(
-                legacy_key = "FERRUM_DB_SSL_MODE",
-                canonical_key = "FERRUM_DB_TLS_MODE",
-                "Deprecated database TLS env var is still accepted for compatibility; rename it to the canonical replacement"
-            );
-            return <DbTlsMode as env_config_macro::EnvValue>::parse_env(
-                &raw,
-                "FERRUM_DB_SSL_MODE",
-            )
-            .map(Some);
-        }
-
-        let enabled = Self::resolve_legacy_db_tls_bool_alias(
-            conf,
-            "FERRUM_DB_TLS_ENABLED",
-            "FERRUM_DB_TLS_MODE",
-        )?;
-        let insecure = Self::resolve_legacy_db_tls_bool_alias(
-            conf,
-            "FERRUM_DB_TLS_INSECURE",
-            "FERRUM_DB_TLS_MODE",
-        )?;
-
-        let mode = match (enabled, insecure) {
-            (Some(false), _) => Some(DbTlsMode::Disable),
-            (Some(true), _) | (None, Some(true)) => Some(DbTlsMode::Require),
-            _ => None,
-        };
-        Ok(mode)
-    }
-
     pub fn db_tls_enabled(&self) -> bool {
         self.db_tls_mode.is_some_and(DbTlsMode::enables_tls)
     }
@@ -2448,19 +2367,13 @@ impl EnvConfig {
                 }
             }
             OperatingMode::DataPlane => {
-                if self.dp_cp_grpc_url.is_none() && self.dp_cp_grpc_urls.is_empty() {
-                    return Err(
-                        "FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS is required in dp mode"
-                            .into(),
-                    );
+                if self.dp_cp_grpc_urls.is_empty() {
+                    return Err("FERRUM_DP_CP_GRPC_URLS is required in dp mode".into());
                 }
             }
             OperatingMode::Mesh => {
-                if self.dp_cp_grpc_url.is_none() && self.dp_cp_grpc_urls.is_empty() {
-                    return Err(
-                        "FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS is required in mesh mode"
-                            .into(),
-                    );
+                if self.dp_cp_grpc_urls.is_empty() {
+                    return Err("FERRUM_DP_CP_GRPC_URLS is required in mesh mode".into());
                 }
                 match self
                     .mesh_config_protocol

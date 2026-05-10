@@ -42,7 +42,6 @@ fn make_summary(
         error_class: None,
         body_error_class: None,
         body_completed: false,
-        bytes_streamed_to_client: 0,
         request_bytes: 0,
         response_bytes: 0,
         mirror: false,
@@ -613,20 +612,19 @@ async fn test_plugin_config_saturates_extreme_tunables() {
 }
 
 #[tokio::test]
-async fn test_namespace_label_absent_for_default_namespace() {
+async fn test_namespace_label_present_for_default_namespace() {
     let registry = MetricsRegistry::new();
     registry.configure(5, 3600, 0, "ferrum");
     registry.record(&make_summary("ns-default", "GET", 200, 10.0, 5.0));
 
     let output = registry.render_uncached();
-    // Default namespace should NOT produce a namespace label
-    assert!(!output.contains("namespace="));
+    assert!(output.contains(r#"namespace="ferrum""#));
     assert!(output.contains(
-        r#"ferrum_requests_total{proxy_id="ns-default",method="GET",status_code="200"} 1"#
+        r#"ferrum_requests_total{proxy_id="ns-default",method="GET",status_code="200",namespace="ferrum"} 1"#
     ));
-    assert!(
-        output.contains(r#"ferrum_request_duration_ms_bucket{proxy_id="ns-default",le="+Inf"} 1"#)
-    );
+    assert!(output.contains(
+        r#"ferrum_request_duration_ms_bucket{proxy_id="ns-default",le="+Inf",namespace="ferrum"} 1"#
+    ));
 }
 
 #[tokio::test]
@@ -636,7 +634,7 @@ async fn test_namespace_label_present_for_non_default_namespace() {
     registry.record(&make_summary("ns-custom", "POST", 201, 20.0, 15.0));
 
     let output = registry.render_uncached();
-    // Non-default namespace should produce a namespace label on all metrics
+    // Namespace labels are present on all metrics.
     assert!(output.contains(r#"namespace="staging""#));
     assert!(output.contains(
         r#"ferrum_requests_total{proxy_id="ns-custom",method="POST",status_code="201",namespace="staging"} 1"#

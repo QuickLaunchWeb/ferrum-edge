@@ -130,11 +130,16 @@ pub struct MeshPolicy {
     pub rules: Vec<MeshRule>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PolicyScope {
-    WorkloadSelector { selector: WorkloadSelector },
-    Namespace { namespace: String },
+    WorkloadSelector {
+        selector: WorkloadSelector,
+    },
+    Namespace {
+        namespace: String,
+    },
+    #[default]
     MeshWide,
 }
 
@@ -265,6 +270,28 @@ pub fn policy_scope_applies_to_workload<L: WorkloadLabels + ?Sized>(
     }
 }
 
+/// Returns `true` when a [`PolicyScope`] applies to a workload whose
+/// namespace is `proxy_namespace` and whose labels are `proxy_labels`.
+///
+/// Same semantics as [`policy_scope_applies_to_workload`] but accepts a
+/// bare `PolicyScope` instead of a full `MeshPolicy`, making it reusable
+/// for `MeshRequestAuthentication` scope filtering.
+pub fn scope_applies_to_workload<L: WorkloadLabels + ?Sized>(
+    scope: &PolicyScope,
+    proxy_namespace: &str,
+    proxy_labels: &L,
+) -> bool {
+    match scope {
+        PolicyScope::MeshWide => true,
+        PolicyScope::Namespace {
+            namespace: policy_namespace,
+        } => policy_namespace == proxy_namespace,
+        PolicyScope::WorkloadSelector { selector } => {
+            workload_selector_matches(selector, proxy_namespace, proxy_labels)
+        }
+    }
+}
+
 /// Returns `true` when a [`WorkloadSelector`] matches a workload whose
 /// namespace is `proxy_namespace` and whose labels are `proxy_labels`. Same
 /// shape as [`policy_scope_applies_to_workload`]; lifted so PeerAuthentication
@@ -283,6 +310,142 @@ pub fn workload_selector_matches<L: WorkloadLabels + ?Sized>(
         .labels
         .iter()
         .all(|(key, value)| proxy_labels.lookup(key) == Some(value.as_str()))
+}
+
+// ── RequestAuthentication ─────────────────────────────────────────────────
+
+/// Represents an Istio `RequestAuthentication` resource translated into
+/// Ferrum's model. Declares which JWTs are accepted for a workload.
+///
+/// Semantics mirror Istio: RequestAuthentication is **permissive** by
+/// default — it only declares which JWTs are *valid*, not which are
+/// *required*. A request with no JWT passes through. An invalid JWT is
+/// rejected. A valid JWT has its claims extracted and identity propagated.
+/// Enforcement (requiring a JWT) comes from `AuthorizationPolicy`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshRequestAuthentication {
+    pub name: String,
+    pub namespace: String,
+    pub scope: PolicyScope,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jwt_rules: Vec<MeshJwtRule>,
+}
+
+/// A single JWT validation rule within a [`MeshRequestAuthentication`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshJwtRule {
+    pub issuer: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audiences: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_uri: Option<String>,
+    /// Inline JWKS JSON (alternative to `jwks_uri`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub from_headers: Vec<JwtHeader>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub from_params: Vec<String>,
+    #[serde(default)]
+    pub forward_original_token: bool,
+}
+
+/// A header location from which to extract a JWT.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JwtHeader {
+    pub name: String,
+    /// Prefix stripped before validation (e.g., `"Bearer "`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+}
+
+// ── Telemetry ─────────────────────────────────────────────────────────────
+
+/// Raw Telemetry resource from Istio CRD translation (before workload merge).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshTelemetryResource {
+    pub name: String,
+    pub namespace: String,
+    #[serde(default)]
+    pub scope: PolicyScope,
+    pub config: MeshTelemetryConfig,
+}
+
+/// Merged telemetry configuration for a workload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MeshTelemetryConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracing: Option<MeshTracingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<MeshMetricsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_logging: Option<MeshAccessLoggingConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshTracingConfig {
+    /// Sampling percentage 0.0–100.0. `None` inherits from less-specific Telemetry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_percentage: Option<f64>,
+    /// Literal/environment custom tags injected into every span / transaction metadata.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub custom_tags: HashMap<String, String>,
+    /// Custom tags resolved from request headers at runtime.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub custom_header_tags: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshMetricsConfig {
+    /// Tag overrides: rename, remove, or set custom values for metric tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tag_overrides: Vec<MetricTagOverride>,
+    /// Specific metric names to disable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_metrics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricTagOverride {
+    pub name: String,
+    pub operation: TagOverrideOperation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum TagOverrideOperation {
+    Remove,
+    Rename { new_name: String },
+    Set { value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshAccessLoggingConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<AccessLogFilter>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Simple access log filter operating on transaction summary fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccessLogFilter {
+    /// Only log responses with status code >= this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code_min: Option<u16>,
+    /// Only log responses with status code <= this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code_max: Option<u16>,
+    /// Only log requests with latency above this threshold (ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_latency_ms: Option<u64>,
+    /// Only log requests that resulted in an error.
+    #[serde(default)]
+    pub errors_only: bool,
 }
 
 /// Returns true when a ServiceEntry is visible to a workload namespace under
@@ -542,6 +705,10 @@ pub struct MeshConfig {
     pub peer_authentications: Vec<PeerAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_entries: Vec<ServiceEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_authentications: Vec<MeshRequestAuthentication>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub telemetry_resources: Vec<MeshTelemetryResource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -556,6 +723,7 @@ impl MeshConfig {
             &self.mesh_policies,
             &self.peer_authentications,
             &self.service_entries,
+            &self.request_authentications,
             self.trust_bundles.as_ref(),
             self.multi_cluster.as_ref(),
         )
@@ -584,6 +752,7 @@ pub fn validate_mesh_config(
     policies: &[MeshPolicy],
     peer_auths: &[PeerAuthentication],
     service_entries: &[ServiceEntry],
+    request_authentications: &[MeshRequestAuthentication],
     trust_bundles: Option<&TrustBundleSet>,
 ) -> Vec<String> {
     validate_mesh_config_internal(
@@ -592,17 +761,20 @@ pub fn validate_mesh_config(
         policies,
         peer_auths,
         service_entries,
+        request_authentications,
         trust_bundles,
         None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_mesh_config_internal(
     workloads: &[Workload],
     services: &[MeshService],
     policies: &[MeshPolicy],
     peer_auths: &[PeerAuthentication],
     service_entries: &[ServiceEntry],
+    request_authentications: &[MeshRequestAuthentication],
     trust_bundles: Option<&TrustBundleSet>,
     multi_cluster: Option<&MultiClusterConfig>,
 ) -> Vec<String> {
@@ -759,6 +931,51 @@ fn validate_mesh_config_internal(
                 "PeerAuthentication '{}': namespace must not be empty",
                 pa.name
             ));
+        }
+    }
+
+    // RequestAuthentications
+    for ra in request_authentications {
+        if ra.name.is_empty() {
+            errors.push("MeshRequestAuthentication: name must not be empty".to_string());
+        }
+        if ra.namespace.is_empty() {
+            errors.push(format!(
+                "MeshRequestAuthentication '{}': namespace must not be empty",
+                ra.name
+            ));
+        }
+        for (i, rule) in ra.jwt_rules.iter().enumerate() {
+            if rule.issuer.trim().is_empty() {
+                errors.push(format!(
+                    "MeshRequestAuthentication '{}' jwt_rules[{}]: issuer must not be empty",
+                    ra.name, i
+                ));
+            }
+            if rule.jwks_uri.is_none() && rule.jwks.is_none() {
+                errors.push(format!(
+                    "MeshRequestAuthentication '{}' jwt_rules[{}]: one of jwks_uri or jwks is required",
+                    ra.name, i
+                ));
+            }
+            if rule.jwks_uri.is_none() && rule.jwks.is_some() {
+                errors.push(format!(
+                    "MeshRequestAuthentication '{}' jwt_rules[{}]: inline jwks is not supported yet; use jwks_uri",
+                    ra.name, i
+                ));
+            }
+            if rule.audiences.len() > 1 {
+                errors.push(format!(
+                    "MeshRequestAuthentication '{}' jwt_rules[{}]: multiple audiences are not supported yet",
+                    ra.name, i
+                ));
+            }
+            if !rule.from_headers.is_empty() || !rule.from_params.is_empty() {
+                errors.push(format!(
+                    "MeshRequestAuthentication '{}' jwt_rules[{}]: custom token locations are not supported yet",
+                    ra.name, i
+                ));
+            }
         }
     }
 

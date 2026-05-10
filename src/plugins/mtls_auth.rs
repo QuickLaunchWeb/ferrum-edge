@@ -89,26 +89,6 @@ impl IssuerFilter {
         )
     }
 
-    fn from_legacy_json(val: &Value) -> Result<Self, String> {
-        let context = "issuer_verification";
-        let obj = val
-            .as_object()
-            .ok_or_else(|| format!("mtls_auth: '{context}' must be an object, got: {val}"))?;
-        for key in obj.keys() {
-            if !matches!(key.as_str(), "issuer_cn" | "issuer_o" | "issuer_ou") {
-                return Err(format!(
-                    "mtls_auth: '{context}' contains unsupported issuer field '{key}'"
-                ));
-            }
-        }
-        Self::from_fields(
-            string_field(obj, "issuer_cn", context)?,
-            string_field(obj, "issuer_o", context)?,
-            string_field(obj, "issuer_ou", context)?,
-            context,
-        )
-    }
-
     fn from_fields(
         cn: Option<String>,
         o: Option<String>,
@@ -447,6 +427,12 @@ fn parse_cert_field(config: &Value) -> Result<CertField, String> {
 fn parse_allowed_issuers(config: &Value) -> Result<Vec<IssuerFilter>, String> {
     let mut filters = Vec::new();
 
+    if config.get("issuer_verification").is_some() {
+        return Err(
+            "mtls_auth: 'issuer_verification' was removed; use 'allowed_issuers'".to_string(),
+        );
+    }
+
     if let Some(value) = config.get("allowed_issuers")
         && !value.is_null()
     {
@@ -460,12 +446,6 @@ fn parse_allowed_issuers(config: &Value) -> Result<Vec<IssuerFilter>, String> {
                 &format!("allowed_issuers[{idx}]"),
             )?);
         }
-    }
-
-    if let Some(value) = config.get("issuer_verification")
-        && !value.is_null()
-    {
-        filters.push(IssuerFilter::from_legacy_json(value)?);
     }
 
     Ok(filters)

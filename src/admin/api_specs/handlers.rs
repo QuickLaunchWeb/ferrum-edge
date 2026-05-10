@@ -471,8 +471,8 @@ pub(super) fn negotiate_accept_or_406(
     }
 
     if !saw_relevant {
-        // No relevant Accept entries (e.g. `Accept: text/plain`). Default to
-        // stored format — preserves backward-compatible behavior.
+        // No relevant Accept entries (e.g. `Accept: text/plain`). Use the
+        // stored format.
         return Some(stored);
     }
 

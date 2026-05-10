@@ -17,15 +17,21 @@ fn make_consumer(
     if let Some(key) = api_key {
         let mut keyauth_creds = Map::new();
         keyauth_creds.insert("key".to_string(), Value::String(key.to_string()));
-        credentials.insert("keyauth".to_string(), Value::Object(keyauth_creds));
+        credentials.insert(
+            "keyauth".to_string(),
+            Value::Array(vec![Value::Object(keyauth_creds)]),
+        );
     }
 
     let mut basicauth_creds = Map::new();
     basicauth_creds.insert(
         "password_hash".to_string(),
-        Value::String("$2b$12$placeholder".to_string()),
+        Value::String("hmac_sha256:placeholder".to_string()),
     );
-    credentials.insert("basicauth".to_string(), Value::Object(basicauth_creds));
+    credentials.insert(
+        "basicauth".to_string(),
+        Value::Array(vec![Value::Object(basicauth_creds)]),
+    );
 
     Consumer {
         id: id.to_string(),
@@ -173,7 +179,10 @@ fn test_consumer_with_no_keyauth_credentials() {
         "password_hash".to_string(),
         Value::String("hash".to_string()),
     );
-    credentials.insert("basicauth".to_string(), Value::Object(basicauth_creds));
+    credentials.insert(
+        "basicauth".to_string(),
+        Value::Array(vec![Value::Object(basicauth_creds)]),
+    );
 
     let consumer = Consumer {
         id: "c1".to_string(),
@@ -345,8 +354,7 @@ fn test_apply_delta_remove_consumer_with_array_credentials() {
 }
 
 #[test]
-fn test_mixed_single_and_array_credentials() {
-    // c1 uses array format, c2 uses single-object format
+fn test_multiple_array_credentials() {
     let c1 = make_consumer_with_array_keys("c1", "alice", &["key-a1", "key-a2"]);
     let c2 = make_consumer("c2", "bob", Some("key-b"), None);
     let index = ConsumerIndex::new(&[c1, c2]);
@@ -399,7 +407,10 @@ fn make_consumer_with_jwt(id: &str, username: &str) -> Consumer {
         "secret".to_string(),
         Value::String("my-jwt-secret".to_string()),
     );
-    credentials.insert("jwt".to_string(), Value::Object(jwt_creds));
+    credentials.insert(
+        "jwt".to_string(),
+        Value::Array(vec![Value::Object(jwt_creds)]),
+    );
 
     Consumer {
         id: id.to_string(),
@@ -420,7 +431,10 @@ fn make_consumer_with_hmac(id: &str, username: &str) -> Consumer {
         "secret".to_string(),
         Value::String("hmac-secret".to_string()),
     );
-    credentials.insert("hmac_auth".to_string(), Value::Object(hmac_creds));
+    credentials.insert(
+        "hmac_auth".to_string(),
+        Value::Array(vec![Value::Object(hmac_creds)]),
+    );
 
     Consumer {
         id: id.to_string(),

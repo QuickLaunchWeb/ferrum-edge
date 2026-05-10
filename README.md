@@ -99,11 +99,11 @@ See [docs/docker.md](docs/docker.md) for Docker Compose examples and production 
 # Using the CLI (recommended)
 ferrum-edge run --spec tests/config.yaml -v
 
-# Using environment variables (legacy, still fully supported)
+# Using environment variables
 FERRUM_MODE=file \
 FERRUM_FILE_CONFIG_PATH=tests/config.yaml \
 FERRUM_LOG_LEVEL=info \
-cargo run --release
+cargo run --release -- run
 ```
 
 With smart defaults, if `./ferrum.conf` and `./resources.yaml` exist in the current directory:
@@ -122,7 +122,7 @@ FERRUM_DB_TYPE=sqlite \
 FERRUM_DB_URL="sqlite://ferrum.db?mode=rwc" \
 FERRUM_ADMIN_JWT_SECRET="my-super-secret-jwt-key" \
 FERRUM_LOG_LEVEL=info \
-cargo run --release
+cargo run --release -- run
 ```
 
 ### Database Mode (PostgreSQL)
@@ -132,7 +132,7 @@ FERRUM_MODE=database \
 FERRUM_DB_TYPE=postgres \
 FERRUM_DB_URL="postgres://user:pass@localhost/ferrum" \
 FERRUM_ADMIN_JWT_SECRET="my-super-secret-jwt-key" \
-cargo run --release
+cargo run --release -- run
 ```
 
 ### Database Mode (MongoDB)
@@ -143,7 +143,7 @@ FERRUM_DB_TYPE=mongodb \
 FERRUM_DB_URL="mongodb://user:pass@localhost:27017/ferrum?authSource=admin" \
 FERRUM_MONGO_DATABASE=ferrum \
 FERRUM_ADMIN_JWT_SECRET="my-super-secret-jwt-key" \
-cargo run --release
+cargo run --release -- run
 ```
 
 ### Control Plane + Data Plane
@@ -156,19 +156,19 @@ FERRUM_DB_URL="sqlite://ferrum.db?mode=rwc" \
 FERRUM_ADMIN_JWT_SECRET="admin-secret" \
 FERRUM_CP_GRPC_LISTEN_ADDR="0.0.0.0:50051" \
 FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-secret" \
-cargo run --release
+cargo run --release -- run
 
 # Data Plane (single CP)
 FERRUM_MODE=dp \
-FERRUM_DP_CP_GRPC_URL="http://localhost:50051" \
+FERRUM_DP_CP_GRPC_URLS="http://localhost:50051" \
 FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-secret" \
-cargo run --release
+cargo run --release -- run
 
 # Data Plane (multi-CP failover — connects to primary, fails over to secondary)
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URLS="https://cp1:50051,https://cp2:50051,https://cp3:50051" \
 FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-secret" \
-cargo run --release
+cargo run --release -- run
 ```
 
 For production CP/DP with TLS, see [docs/cp_dp_mode.md](docs/cp_dp_mode.md#transport-security-tlsmtls). For multi-region high availability, see [docs/multi_region_ha.md](docs/multi_region_ha.md).
@@ -227,7 +227,7 @@ consumers:
     username: "alice"
     credentials:
       keyauth:
-        key: "alice-api-key"
+        - key: "alice-api-key"
     acl_groups:
       - "engineering"
 

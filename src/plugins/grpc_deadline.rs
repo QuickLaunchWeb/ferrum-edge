@@ -122,10 +122,7 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
 /// non-ASCII value (e.g., a multi-byte UTF-8 sequence) cannot panic on a
 /// char-boundary violation.
 ///
-/// Per gRPC spec the digit portion is at most 8 ASCII digits, but we accept
-/// longer digit strings (within u64 range) for backwards compatibility with
-/// clients that violate the spec — the value is later capped by
-/// `max_deadline_ms` if configured.
+/// Per gRPC spec the digit portion is at most 8 ASCII digits.
 fn parse_grpc_timeout(val: &str) -> Option<Duration> {
     let bytes = val.as_bytes();
     if bytes.is_empty() {
@@ -141,6 +138,9 @@ fn parse_grpc_timeout(val: &str) -> Option<Duration> {
         Err(_) => return None,
     };
     if digits.is_empty() {
+        return None;
+    }
+    if digits.len() > 8 {
         return None;
     }
     if !digits.bytes().all(|b| b.is_ascii_digit()) {

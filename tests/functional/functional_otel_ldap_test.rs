@@ -180,6 +180,7 @@ async fn start_otel_gateway_with_retry(
 #[tokio::test]
 async fn test_otel_tracing_injects_traceparent() {
     let config_template = r#"
+version: "1"
 proxies:
   - id: "traced-proxy"
     listen_path: "/traced"
@@ -264,6 +265,7 @@ plugin_configs:
 #[tokio::test]
 async fn test_otel_tracing_preserves_existing_traceparent() {
     let config_template = r#"
+version: "1"
 proxies:
   - id: "traced-proxy"
     listen_path: "/traced"
@@ -419,6 +421,7 @@ async fn start_ldap_gateway_with_retry(
 #[tokio::test]
 async fn test_ldap_auth_rejects_when_server_unreachable() {
     let config_template = r#"
+version: "1"
 proxies:
   - id: "auth-proxy"
     listen_path: "/secure"
@@ -479,6 +482,7 @@ plugin_configs:
 #[tokio::test]
 async fn test_ldap_auth_rejects_missing_credentials() {
     let config_template = r#"
+version: "1"
 proxies:
   - id: "auth-proxy"
     listen_path: "/secure"

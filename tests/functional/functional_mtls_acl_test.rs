@@ -307,6 +307,7 @@ async fn test_http_mtls_auth_with_acl() {
         |_ports| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "mtls-acl-http"
     listen_path: "/api"
@@ -323,12 +324,12 @@ consumers:
     username: "alice"
     credentials:
       mtls_auth:
-        identity: "alice.client.local"
+        - identity: "alice.client.local"
   - id: "eve"
     username: "eve"
     credentials:
       mtls_auth:
-        identity: "eve.client.local"
+        - identity: "eve.client.local"
 
 plugin_configs:
   - id: "p-mtls"
@@ -491,6 +492,7 @@ async fn test_tcp_mtls_auth_with_acl() {
             let pp = ports.proxy_https;
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "mtls-acl-tcp"
     listen_port: {pp}
@@ -507,12 +509,12 @@ consumers:
     username: "tcp-alice"
     credentials:
       mtls_auth:
-        identity: "tcp-alice"
+        - identity: "tcp-alice"
   - id: "tcp-eve"
     username: "tcp-eve"
     credentials:
       mtls_auth:
-        identity: "tcp-eve"
+        - identity: "tcp-eve"
 
 plugin_configs:
   - id: "p-tcp-mtls"
@@ -671,6 +673,7 @@ async fn test_udp_dtls_mtls_auth_with_acl() {
             let pp = ports.stream_udp;
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "mtls-acl-dtls"
     listen_port: {pp}
@@ -687,12 +690,12 @@ consumers:
     username: "dtls-alice"
     credentials:
       mtls_auth:
-        identity: "dtls-alice"
+        - identity: "dtls-alice"
   - id: "dtls-eve"
     username: "dtls-eve"
     credentials:
       mtls_auth:
-        identity: "dtls-eve"
+        - identity: "dtls-eve"
 
 plugin_configs:
   - id: "p-dtls-mtls"

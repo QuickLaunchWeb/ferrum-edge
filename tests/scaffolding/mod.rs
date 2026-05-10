@@ -131,6 +131,7 @@ pub fn file_mode_yaml_for_backend_with(port: u16, overrides: Value) -> String {
     // present, even if empty. Otherwise startup fails with "missing field
     // `consumers`".
     let config = serde_json::json!({
+        "version": "1",
         "proxies": [proxy],
         "consumers": [],
         "upstreams": [],

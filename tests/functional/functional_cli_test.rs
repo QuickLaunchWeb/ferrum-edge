@@ -156,7 +156,7 @@ async fn functional_cli_validate_valid_spec() {
     let spec_path = temp_dir.path().join("config.yaml");
     std::fs::write(
         &spec_path,
-        "proxies:\n  - id: test\n    listen_path: /test\n    backend_scheme: http\n    backend_host: localhost\n    backend_port: 3000\nconsumers: []\nplugin_configs: []\n",
+        "version: \"1\"\nproxies:\n  - id: test\n    listen_path: /test\n    backend_scheme: http\n    backend_host: localhost\n    backend_port: 3000\nconsumers: []\nplugin_configs: []\n",
     )
     .unwrap();
 
@@ -227,7 +227,7 @@ async fn functional_cli_validate_with_settings() {
     let spec_path = temp_dir.path().join("resources.yaml");
     std::fs::write(
         &spec_path,
-        "proxies: []\nconsumers: []\nplugin_configs: []\n",
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
     )
     .unwrap();
 
@@ -263,7 +263,7 @@ async fn functional_cli_run_starts_and_stops() {
     let spec_path = temp_dir.path().join("config.yaml");
     std::fs::write(
         &spec_path,
-        "proxies: []\nconsumers: []\nplugin_configs: []\n",
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
     )
     .unwrap();
 
@@ -335,7 +335,7 @@ async fn functional_cli_run_with_verbose() {
     let spec_path = temp_dir.path().join("config.yaml");
     std::fs::write(
         &spec_path,
-        "proxies: []\nconsumers: []\nplugin_configs: []\n",
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
     )
     .unwrap();
 
@@ -389,7 +389,7 @@ async fn functional_cli_reload_sends_sighup() {
     let spec_path = temp_dir.path().join("config.yaml");
     std::fs::write(
         &spec_path,
-        "proxies: []\nconsumers: []\nplugin_configs: []\n",
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
     )
     .unwrap();
 
@@ -445,52 +445,6 @@ async fn functional_cli_reload_sends_sighup() {
     let _ = child.wait();
 }
 
-// ── backwards compatibility ─────────────────────────────────────────────────
-
-#[ignore]
-#[tokio::test]
-async fn functional_cli_no_args_legacy_mode() {
-    let temp_dir = TempDir::new().unwrap();
-    let spec_path = temp_dir.path().join("config.yaml");
-    std::fs::write(
-        &spec_path,
-        "proxies: []\nconsumers: []\nplugin_configs: []\n",
-    )
-    .unwrap();
-
-    // No subcommand — legacy env-var-only mode
-    let mut child = Command::new(binary_path())
-        .env("FERRUM_MODE", "file")
-        .env("FERRUM_FILE_CONFIG_PATH", spec_path.to_str().unwrap())
-        .env("FERRUM_PROXY_HTTP_PORT", "18996")
-        .env("FERRUM_ADMIN_HTTP_PORT", "18997")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("Failed to start ferrum-edge in legacy mode");
-
-    sleep(Duration::from_secs(2)).await;
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "Legacy mode gateway exited prematurely"
-    );
-
-    #[cfg(unix)]
-    {
-        let pid = child.id();
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-    }
-    let status = child.wait().expect("Failed to wait");
-    assert!(status.success());
-}
-
 // ── smart path defaults ─────────────────────────────────────────────────────
 
 /// Smart-path discovery: with no `--settings`/`--spec` flags and no env vars
@@ -544,7 +498,8 @@ async fn functional_cli_smart_path_discovery_from_cwd() {
 
         // resources.yaml drives the proxy. Place it at `./resources.yaml`.
         let spec = format!(
-            r#"proxies:
+            r#"version: "1"
+proxies:
   - id: "smart-path-proxy"
     listen_path: "/sp"
     backend_scheme: http
@@ -651,7 +606,8 @@ async fn functional_cli_spec_flag_infers_file_mode() {
 
         let spec_path = temp_dir.path().join("resources.yaml");
         let spec = format!(
-            r#"proxies:
+            r#"version: "1"
+proxies:
   - id: "spec-infer-proxy"
     listen_path: "/si"
     backend_scheme: http
@@ -756,7 +712,8 @@ async fn functional_cli_precedence_flag_beats_env_var() {
 
         let spec_path = temp_dir.path().join("resources.yaml");
         let spec = format!(
-            r#"proxies:
+            r#"version: "1"
+proxies:
   - id: "flag-wins-proxy"
     listen_path: "/fw"
     backend_scheme: http
@@ -857,7 +814,7 @@ async fn functional_cli_precedence_env_beats_conf_file() {
         // Minimal spec — no routing needed; we only check which admin port binds.
         std::fs::write(
             temp_dir.path().join("resources.yaml"),
-            "proxies: []\nconsumers: []\nplugin_configs: []\n",
+            "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
         )
         .unwrap();
 

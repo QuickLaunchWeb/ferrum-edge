@@ -46,15 +46,42 @@ pub struct K8sTranslationOptions {
     pub namespace: String,
     pub trust_domain: TrustDomain,
     pub prefer_istio_on_overlap: bool,
+    pub istio_root_namespace: String,
+    source_namespaces: Option<HashSet<String>>,
 }
 
 impl K8sTranslationOptions {
     pub fn new(namespace: String, trust_domain: TrustDomain) -> Self {
+        let source_namespaces = HashSet::from([namespace.clone()]);
         Self {
             namespace,
             trust_domain,
             prefer_istio_on_overlap: true,
+            istio_root_namespace: "istio-system".to_string(),
+            source_namespaces: Some(source_namespaces),
         }
+    }
+
+    pub fn with_istio_root_namespace(mut self, namespace: String) -> Self {
+        if !namespace.trim().is_empty() {
+            self.istio_root_namespace = namespace;
+        }
+        self
+    }
+
+    pub fn with_source_namespaces(mut self, namespaces: Vec<String>) -> Self {
+        self.source_namespaces = if namespaces.is_empty() {
+            None
+        } else {
+            Some(namespaces.into_iter().collect())
+        };
+        self
+    }
+
+    fn includes_namespace(&self, namespace: &str) -> bool {
+        self.source_namespaces
+            .as_ref()
+            .is_none_or(|namespaces| namespaces.contains(namespace))
     }
 }
 
@@ -120,6 +147,7 @@ pub(crate) struct K8sAccumulator {
     pub warnings: Vec<String>,
     reference_grants: HashSet<ReferenceGrantPermission>,
     proxy_sources: HashMap<String, SourceKind>,
+    known_namespaces: HashSet<String>,
 }
 
 impl K8sAccumulator {
@@ -131,7 +159,12 @@ impl K8sAccumulator {
             warnings: Vec::new(),
             reference_grants: HashSet::new(),
             proxy_sources: HashMap::new(),
+            known_namespaces: HashSet::new(),
         }
+    }
+
+    fn observe_namespace(&mut self, namespace: &str) {
+        self.known_namespaces.insert(namespace.to_string());
     }
 
     pub(crate) fn add_reference_grant(
@@ -217,9 +250,18 @@ impl K8sAccumulator {
 
     fn finish(mut self) -> K8sTranslation {
         self.mesh.normalize();
+        self.mesh.request_authentications.sort_by(|left, right| {
+            (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
+        });
+        self.mesh.telemetry_resources.sort_by(|left, right| {
+            (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
+        });
         if self.mesh != MeshConfig::default() {
             self.config.mesh = Some(Box::new(self.mesh));
         }
+        let mut known_namespaces: Vec<String> = self.known_namespaces.into_iter().collect();
+        known_namespaces.sort();
+        self.config.known_namespaces.extend(known_namespaces);
         self.config.normalize_fields();
         K8sTranslation {
             config: self.config,
@@ -242,18 +284,34 @@ pub fn translate_k8s_objects(
     objects: &[K8sObject],
     options: K8sTranslationOptions,
 ) -> Result<K8sTranslation, K8sTranslateError> {
+    translate_k8s_objects_with_filter(objects, options, |_| true)
+}
+
+pub(crate) fn translate_k8s_objects_with_filter<F>(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+    include: F,
+) -> Result<K8sTranslation, K8sTranslateError>
+where
+    F: Fn(&K8sObject) -> bool,
+{
     let mut acc = K8sAccumulator::new(options);
 
-    for object in objects {
+    for object in objects.iter().filter(|object| include(object)) {
+        if !acc.options.includes_namespace(&object.metadata.namespace) {
+            continue;
+        }
+        acc.observe_namespace(&object.metadata.namespace);
         if object.kind == "ReferenceGrant" {
             gateway_api::collect_reference_grant(&mut acc, object)?;
         }
     }
 
-    for object in objects {
-        if object.metadata.namespace != acc.options.namespace {
+    for object in objects.iter().filter(|object| include(object)) {
+        if !acc.options.includes_namespace(&object.metadata.namespace) {
             continue;
         }
+        acc.observe_namespace(&object.metadata.namespace);
 
         if object.kind == "EnvoyFilter" {
             return Err(K8sTranslateError::Unsupported(UnsupportedK8sResource {
@@ -532,6 +590,56 @@ mod tests {
             translate_k8s_objects(&[ignored], options("prod")).expect("translation should succeed");
 
         assert!(result.config.mesh.is_none());
+    }
+
+    #[test]
+    fn controller_can_disable_source_namespace_filter() {
+        let object = object(
+            "PeerAuthentication",
+            serde_json::json!({"mtls": {"mode": "STRICT"}}),
+        );
+        let options = options("ferrum").with_source_namespaces(Vec::new());
+
+        let result = translate_k8s_objects(&[object], options).expect("translation should succeed");
+
+        assert!(result.config.mesh.is_some());
+    }
+
+    #[test]
+    fn translation_records_included_source_namespaces() {
+        let mut default_object = object(
+            "PeerAuthentication",
+            serde_json::json!({"mtls": {"mode": "STRICT"}}),
+        );
+        default_object.metadata.namespace = "default".to_string();
+        let mut prod_object = default_object.clone();
+        prod_object.metadata.namespace = "prod".to_string();
+        let mut ignored_object = default_object.clone();
+        ignored_object.metadata.namespace = "ignored".to_string();
+        let options = options("ferrum")
+            .with_source_namespaces(vec!["default".to_string(), "prod".to_string()]);
+
+        let result = translate_k8s_objects(&[default_object, prod_object, ignored_object], options)
+            .expect("translation should succeed");
+
+        assert_eq!(
+            result.config.known_namespaces,
+            vec!["default".to_string(), "prod".to_string()]
+        );
+    }
+
+    #[test]
+    fn controller_source_namespace_filter_uses_watch_namespaces() {
+        let object = object(
+            "PeerAuthentication",
+            serde_json::json!({"mtls": {"mode": "STRICT"}}),
+        );
+        let options = options("ferrum")
+            .with_source_namespaces(vec!["default".to_string(), "prod".to_string()]);
+
+        let result = translate_k8s_objects(&[object], options).expect("translation should succeed");
+
+        assert!(result.config.mesh.is_some());
     }
 
     #[test]

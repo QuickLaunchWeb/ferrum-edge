@@ -333,7 +333,7 @@ curl -v http://localhost:8000/api/users
 Enable debug logging to see CORS decisions:
 
 ```bash
-RUST_LOG=debug ./ferrum-edge
+RUST_LOG=debug ./ferrum-edge run
 ```
 
 Look for log lines starting with `cors:` for preflight approvals, rejections, and origin checks.

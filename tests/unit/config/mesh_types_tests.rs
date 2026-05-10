@@ -1,13 +1,13 @@
-//! Layer-2 mesh type tests: serde round-trips, byte-identical
-//! backwards-compat, decode helpers.
+//! Layer-2 mesh type tests: serde round-trips and decode helpers.
 
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, EastWestGateway, MeshConfig, MeshEndpoint, MeshPolicy, MeshRule, MeshService,
-    MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch,
-    RemoteCluster, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
-    TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
+    AppProtocol, EastWestGateway, JwtHeader, MeshConfig, MeshEndpoint, MeshJwtRule, MeshPolicy,
+    MeshRequestAuthentication, MeshRule, MeshService, MtlsMode, MultiClusterConfig,
+    PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, RequestMatch,
+    Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet,
+    Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
 };
 use std::collections::HashMap;
 
@@ -410,4 +410,139 @@ fn mesh_normalize_preserves_policy_header_case_collisions() {
 #[test]
 fn app_protocol_default_is_unknown() {
     assert_eq!(AppProtocol::default(), AppProtocol::Unknown);
+}
+
+// ── MeshRequestAuthentication ────────────────────────────────────────────
+
+#[test]
+fn request_authentication_round_trips_through_serde() {
+    let ra = MeshRequestAuthentication {
+        name: "jwt-auth".to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "httpbin".to_string())]),
+                namespace: Some("default".to_string()),
+            },
+        },
+        jwt_rules: vec![MeshJwtRule {
+            issuer: "https://accounts.google.com".to_string(),
+            audiences: vec!["my-app".to_string()],
+            jwks_uri: Some("https://www.googleapis.com/oauth2/v3/certs".to_string()),
+            jwks: None,
+            from_headers: vec![
+                JwtHeader {
+                    name: "Authorization".to_string(),
+                    prefix: Some("Bearer ".to_string()),
+                },
+                JwtHeader {
+                    name: "X-Custom-Token".to_string(),
+                    prefix: None,
+                },
+            ],
+            from_params: vec!["access_token".to_string()],
+            forward_original_token: true,
+        }],
+    };
+
+    let json = serde_json::to_string(&ra).unwrap();
+    let back: MeshRequestAuthentication = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, ra);
+}
+
+#[test]
+fn request_authentication_empty_jwt_rules_round_trips() {
+    let ra = MeshRequestAuthentication {
+        name: "no-rules".to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::Namespace {
+            namespace: "default".to_string(),
+        },
+        jwt_rules: Vec::new(),
+    };
+
+    let json = serde_json::to_string(&ra).unwrap();
+    let back: MeshRequestAuthentication = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, ra);
+    // Empty jwt_rules should be omitted from serialized output
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(value.get("jwt_rules").is_none());
+}
+
+#[test]
+fn request_authentication_optional_fields_omitted_when_default() {
+    let rule = MeshJwtRule {
+        issuer: "https://auth.example.com".to_string(),
+        audiences: Vec::new(),
+        jwks_uri: None,
+        jwks: None,
+        from_headers: Vec::new(),
+        from_params: Vec::new(),
+        forward_original_token: false,
+    };
+
+    let json = serde_json::to_string(&rule).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    // Only issuer should be present; optional/empty fields should be omitted
+    assert!(value.get("issuer").is_some());
+    assert!(value.get("audiences").is_none());
+    assert!(value.get("jwks_uri").is_none());
+    assert!(value.get("jwks").is_none());
+    assert!(value.get("from_headers").is_none());
+    assert!(value.get("from_params").is_none());
+}
+
+#[test]
+fn request_authentication_meshwide_scope() {
+    let ra = MeshRequestAuthentication {
+        name: "global-jwt".to_string(),
+        namespace: "istio-system".to_string(),
+        scope: PolicyScope::MeshWide,
+        jwt_rules: vec![MeshJwtRule {
+            issuer: "https://global.example.com".to_string(),
+            audiences: Vec::new(),
+            jwks_uri: Some("https://global.example.com/.well-known/jwks.json".to_string()),
+            jwks: None,
+            from_headers: Vec::new(),
+            from_params: Vec::new(),
+            forward_original_token: false,
+        }],
+    };
+
+    let json = serde_json::to_string(&ra).unwrap();
+    let back: MeshRequestAuthentication = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.scope, PolicyScope::MeshWide);
+}
+
+#[test]
+fn mesh_config_with_request_authentications_round_trips() {
+    let cfg = GatewayConfig {
+        mesh: Some(Box::new(MeshConfig {
+            request_authentications: vec![MeshRequestAuthentication {
+                name: "test-ra".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::Namespace {
+                    namespace: "default".to_string(),
+                },
+                jwt_rules: vec![MeshJwtRule {
+                    issuer: "https://issuer.example.com".to_string(),
+                    audiences: vec!["aud1".to_string()],
+                    jwks_uri: Some("https://issuer.example.com/jwks".to_string()),
+                    jwks: None,
+                    from_headers: Vec::new(),
+                    from_params: Vec::new(),
+                    forward_original_token: false,
+                }],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+
+    let json = serde_json::to_string(&cfg).unwrap();
+    let back: GatewayConfig = serde_json::from_str(&json).unwrap();
+    let mesh = back.mesh.as_ref().unwrap();
+    assert_eq!(mesh.request_authentications.len(), 1);
+    assert_eq!(mesh.request_authentications[0].name, "test-ra");
+    assert_eq!(mesh.request_authentications[0].jwt_rules.len(), 1);
 }

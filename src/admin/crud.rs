@@ -43,8 +43,7 @@ pub(crate) enum AfterValidateError {
     Response(Response<Full<Bytes>>),
 }
 
-/// Validation outcomes that preserve legacy plain-message responses for
-/// resource-specific checks while still supporting the generic field wrapper.
+/// Validation outcomes for resource-specific checks and generic field validation.
 pub(crate) enum ValidationError {
     Fields(Vec<String>),
     Message(String),
@@ -84,12 +83,8 @@ pub(crate) trait AdminResource:
     }
 
     /// Inspect the raw request body *before* it is deserialized into `Self`.
-    /// Return `Err` to reject the request with a 400 Bad Request. Used to
-    /// catch renamed / removed fields that `serde(default)` would otherwise
-    /// silently ignore, so operators get a clean migration error instead of
-    /// a confusingly no-op request.
-    ///
-    /// Default is a no-op. Override on resources that have renamed fields.
+    /// Return `Err` to reject the request with a 400 Bad Request. Default is
+    /// a no-op. Override on resources that need schema-specific raw checks.
     fn validate_raw_body(_body: &[u8]) -> Result<(), String> {
         Ok(())
     }
@@ -104,7 +99,7 @@ pub(crate) trait AdminResource:
         match error {
             ValidationError::Fields(errors) => validation_error_response::<Self>(errors),
             ValidationError::Message(message) => {
-                super::json_response(StatusCode::BAD_REQUEST, &json!({"error": message}))
+                validation_error_response::<Self>(&[message.to_string()])
             }
         }
     }
@@ -537,8 +532,12 @@ impl AdminResource for Upstream {
         namespace: &str,
         pagination: &super::PaginationParams,
     ) -> DbResult<PaginatedResult<Self>> {
-        db.list_upstreams_paginated(namespace, pagination.limit as i64, pagination.offset as i64)
-            .await
+        db.list_upstreams_paginated(
+            namespace,
+            pagination.query_limit_i64(),
+            pagination.offset as i64,
+        )
+        .await
     }
 
     async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
@@ -694,7 +693,7 @@ impl AdminResource for PluginConfig {
     ) -> DbResult<PaginatedResult<Self>> {
         db.list_plugin_configs_paginated(
             namespace,
-            pagination.limit as i64,
+            pagination.query_limit_i64(),
             pagination.offset as i64,
         )
         .await
@@ -773,28 +772,6 @@ impl AdminResource for Proxy {
     const RESOURCE_LABEL: &'static str = "Proxy";
     const VALIDATION_ERROR_LABEL: &'static str = "proxy fields";
     const NOT_FOUND_MESSAGE: &'static str = "Proxy not found";
-
-    /// Reject legacy field names that were renamed in the scheme refactor.
-    /// Without this, `#[serde(default)]` would silently ignore a
-    /// `backend_protocol` key and leave the Proxy with its default scheme,
-    /// so operators upgrading from older tooling would see a confusing
-    /// no-op instead of a clear migration message.
-    fn validate_raw_body(body: &[u8]) -> Result<(), String> {
-        // Only inspect the top-level object — don't pay the cost of a full
-        // JSON walk here. A malformed body will be caught by the real
-        // deserialize below.
-        if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(body)
-            && map.contains_key("backend_protocol")
-        {
-            return Err(
-                "Field 'backend_protocol' was renamed to 'backend_scheme' (6-variant enum: \
-                 http, https, tcp, tcps, udp, dtls). gRPC and WebSocket are now detected at \
-                 runtime from the request; HTTPS backends are classified at startup for HTTP/1.1, HTTP/2, and HTTP/3 support."
-                    .to_string(),
-            );
-        }
-        Ok(())
-    }
 
     fn id(&self) -> &str {
         &self.id
@@ -901,8 +878,12 @@ impl AdminResource for Proxy {
         namespace: &str,
         pagination: &super::PaginationParams,
     ) -> DbResult<PaginatedResult<Self>> {
-        db.list_proxies_paginated(namespace, pagination.limit as i64, pagination.offset as i64)
-            .await
+        db.list_proxies_paginated(
+            namespace,
+            pagination.query_limit_i64(),
+            pagination.offset as i64,
+        )
+        .await
     }
 
     async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
@@ -1166,8 +1147,12 @@ impl AdminResource for Consumer {
         namespace: &str,
         pagination: &super::PaginationParams,
     ) -> DbResult<PaginatedResult<Self>> {
-        db.list_consumers_paginated(namespace, pagination.limit as i64, pagination.offset as i64)
-            .await
+        db.list_consumers_paginated(
+            namespace,
+            pagination.query_limit_i64(),
+            pagination.offset as i64,
+        )
+        .await
     }
 
     async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {

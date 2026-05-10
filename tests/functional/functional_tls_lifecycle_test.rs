@@ -283,7 +283,7 @@ fn write_empty_config(dir: &TempDir) -> String {
     let p = dir.path().join("cfg.yaml");
     std::fs::write(
         &p,
-        "proxies: []\nconsumers: []\nupstreams: []\nplugin_configs: []\n",
+        "version: \"1\"\nproxies: []\nconsumers: []\nupstreams: []\nplugin_configs: []\n",
     )
     .unwrap();
     p.to_str().unwrap().to_string()
@@ -602,6 +602,7 @@ async fn test_crl_revoked_backend_cert_rejected() {
         let ports = alloc_ports().await;
         let config_yaml = format!(
             r#"
+version: "1"
 proxies:
   - id: "crl-test"
     listen_path: "/api"
@@ -702,6 +703,7 @@ async fn test_crl_unrelated_issuer_allows_request() {
         let ports = alloc_ports().await;
         let config_yaml = format!(
             r#"
+version: "1"
 proxies:
   - id: "crl-unrelated"
     listen_path: "/api"

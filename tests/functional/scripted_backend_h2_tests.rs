@@ -150,6 +150,7 @@ fn grpc_file_config(port: u16, overrides: Value) -> String {
     // matched ordinary startup / routing logs and would have silently
     // passed against a gateway regression that logged no classifier at all.
     let config = json!({
+        "version": "1",
         "proxies": [proxy],
         "consumers": [],
         "upstreams": [],

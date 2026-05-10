@@ -24,8 +24,8 @@ use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
 use crate::admin::backup::{
-    BackupCounts, BackupPayload, RestorePayload, check_legacy_proxy_fields,
-    filter_config_by_namespace, parse_backup_resources, parse_restore_confirm,
+    BackupCounts, BackupPayload, RestorePayload, filter_config_by_namespace,
+    parse_backup_resources, parse_restore_confirm,
 };
 use crate::admin::jwt_auth::{JwtError, JwtManager};
 use crate::config::db_backend::DatabaseBackend;
@@ -320,18 +320,30 @@ async fn handle_admin_connection(
 /// Pagination parameters parsed from query string.
 pub(crate) struct PaginationParams {
     offset: usize,
-    limit: usize,
-    /// True when caller explicitly provided `limit` or `offset` query params.
-    is_paginated: bool,
+    limit: Option<usize>,
 }
 
 const DEFAULT_PAGE_SIZE: usize = 100;
 const MAX_PAGE_SIZE: usize = 1000;
 
+impl PaginationParams {
+    fn in_memory_limit(&self) -> usize {
+        self.limit.unwrap_or(usize::MAX)
+    }
+
+    pub(crate) fn query_limit_i64(&self) -> i64 {
+        self.limit.map(|limit| limit as i64).unwrap_or(i64::MAX)
+    }
+
+    fn response_limit(&self, total: usize) -> usize {
+        self.limit
+            .unwrap_or_else(|| total.saturating_sub(self.offset))
+    }
+}
+
 fn parse_pagination(uri: &hyper::Uri) -> PaginationParams {
     let mut offset = 0usize;
-    let mut limit = DEFAULT_PAGE_SIZE;
-    let mut is_paginated = false;
+    let mut limit = None;
     if let Some(query) = uri.query() {
         for pair in query.split('&') {
             let mut parts = pair.splitn(2, '=');
@@ -339,34 +351,26 @@ fn parse_pagination(uri: &hyper::Uri) -> PaginationParams {
                 match key {
                     "offset" => {
                         offset = val.parse().unwrap_or(0);
-                        is_paginated = true;
                     }
                     "limit" => {
-                        limit = val.parse().unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE);
-                        if limit == 0 {
-                            limit = DEFAULT_PAGE_SIZE;
-                        }
-                        is_paginated = true;
+                        let parsed = val.parse().unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE);
+                        limit = Some(if parsed == 0 {
+                            DEFAULT_PAGE_SIZE
+                        } else {
+                            parsed
+                        });
                     }
                     _ => {}
                 }
             }
         }
     }
-    PaginationParams {
-        offset,
-        limit,
-        is_paginated,
-    }
+    PaginationParams { offset, limit }
 }
 
 /// Apply pagination to a serializable collection.
-/// When pagination params are present, wraps the response in an envelope with metadata.
-/// Otherwise returns the plain array for backward compatibility.
+/// Always wraps the response in an envelope with metadata.
 fn paginate_response(items: &Value, pagination: &PaginationParams) -> Value {
-    if !pagination.is_paginated {
-        return items.clone();
-    }
     let arr = match items.as_array() {
         Some(a) => a,
         None => return items.clone(),
@@ -375,34 +379,29 @@ fn paginate_response(items: &Value, pagination: &PaginationParams) -> Value {
     let paginated: Vec<_> = arr
         .iter()
         .skip(pagination.offset)
-        .take(pagination.limit)
+        .take(pagination.in_memory_limit())
         .collect();
     json!({
         "data": paginated,
         "pagination": {
             "offset": pagination.offset,
-            "limit": pagination.limit,
+            "limit": pagination.response_limit(total),
             "total": total
         }
     })
 }
 
 /// Build pagination envelope from database-paginated results.
-/// When pagination params are present, wraps items with metadata.
-/// Otherwise returns a plain array for backward compatibility.
 fn paginate_db_response<T: Serialize>(
     items: &[T],
     total: i64,
     pagination: &PaginationParams,
 ) -> Value {
-    if !pagination.is_paginated {
-        return json!(items);
-    }
     json!({
         "data": items,
         "pagination": {
             "offset": pagination.offset,
-            "limit": pagination.limit,
+            "limit": pagination.response_limit(total.max(0) as usize),
             "total": total
         }
     })
@@ -1111,6 +1110,12 @@ async fn handle_update_credentials(
         Ok(value) => value,
         Err(resp) => return Ok(*resp),
     };
+    if !cred_value.is_array() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Credential set must be an array of JSON objects"}),
+        ));
+    }
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut cred_value) {
         return Ok(*resp);
     }
@@ -1196,8 +1201,15 @@ async fn handle_append_credential(
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut new_cred) {
         return Ok(*resp);
     }
-    if let Err(resp) =
-        ensure_credential_unique(db.as_ref(), namespace, consumer_id, cred_type, &new_cred).await
+    let uniqueness_probe = Value::Array(vec![new_cred.clone()]);
+    if let Err(resp) = ensure_credential_unique(
+        db.as_ref(),
+        namespace,
+        consumer_id,
+        cred_type,
+        &uniqueness_probe,
+    )
+    .await
     {
         return Ok(*resp);
     }
@@ -1212,8 +1224,7 @@ async fn handle_append_credential(
             new_arr.push(new_cred);
             Value::Array(new_arr)
         }
-        Some(existing) if existing.is_object() => Value::Array(vec![existing.clone(), new_cred]),
-        _ => new_cred,
+        _ => Value::Array(vec![new_cred]),
     };
 
     let limit = max_credentials_per_type();
@@ -1241,7 +1252,6 @@ async fn handle_append_credential(
 
 /// DELETE /consumers/:id/credentials/:type/:index — Remove a specific credential entry by index.
 ///
-/// When the array has one remaining element after removal, it is collapsed back to a single object.
 async fn handle_delete_credential_by_index(
     state: &AdminState,
     consumer_id: &str,
@@ -1298,24 +1308,9 @@ async fn handle_delete_credential_by_index(
                 ));
             }
             arr.remove(index);
-            if arr.len() == 1 {
-                let single = arr.remove(0);
-                consumer.credentials.insert(cred_type.to_string(), single);
-            } else if arr.is_empty() {
+            if arr.is_empty() {
                 consumer.credentials.remove(cred_type);
             }
-        }
-        Value::Object(_) => {
-            if index != 0 {
-                return Ok(json_response(
-                    StatusCode::NOT_FOUND,
-                    &json!({"error": format!(
-                        "Credential index {} out of range (have 1 entry)",
-                        index
-                    )}),
-                ));
-            }
-            consumer.credentials.remove(cred_type);
         }
         _ => {
             return Ok(json_response(
@@ -1623,13 +1618,6 @@ async fn handle_batch_create(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
-
-    if let Err(message) = check_legacy_proxy_fields(body) {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": message}),
-        ));
-    }
 
     let mut batch: RestorePayload = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -2061,18 +2049,6 @@ async fn handle_restore(
         ));
     }
 
-    // Pre-check: reject legacy `backend_protocol` keys before we touch any
-    // existing config. `/restore` is destructive (deletes before re-inserting)
-    // and the scheme refactor makes `backend_protocol` a silent default
-    // otherwise — operators restoring an old backup would get a different
-    // config shape than the one they exported.
-    if let Err(message) = check_legacy_proxy_fields(body) {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": message}),
-        ));
-    }
-
     // Phase 1: Parse all resources directly into typed structs before deleting
     // anything. This avoids an intermediate serde_json::Value copy (~50% less
     // peak memory at scale).
@@ -2305,8 +2281,7 @@ fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
     crate::config::types::hash_consumer_secrets(consumer)
 }
 
-/// Hash passwords in a basicauth credential value (single object or array).
-/// Used by `handle_update_credentials()` where the credential type is already known.
+/// Hash passwords in basicauth credential payloads where the credential type is known.
 fn hash_credential_passwords(cred: &mut serde_json::Value) -> Result<(), String> {
     crate::config::types::hash_credential_passwords(cred)
 }
@@ -2496,5 +2471,37 @@ fn protocol_support_label(
         ProtocolSupport::Unknown => "unknown",
         ProtocolSupport::Supported => "supported",
         ProtocolSupport::Unsupported => "unsupported",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unpaginated_response_returns_all_items() {
+        let uri: hyper::Uri = "/proxies".parse().unwrap();
+        let pagination = parse_pagination(&uri);
+        let items = json!((0..150).collect::<Vec<_>>());
+
+        let response = paginate_response(&items, &pagination);
+
+        assert_eq!(response["data"].as_array().unwrap().len(), 150);
+        assert_eq!(response["pagination"]["limit"], 150);
+        assert_eq!(pagination.query_limit_i64(), i64::MAX);
+    }
+
+    #[test]
+    fn explicit_limit_still_caps_response() {
+        let uri: hyper::Uri = "/proxies?limit=25&offset=10".parse().unwrap();
+        let pagination = parse_pagination(&uri);
+        let items = json!((0..150).collect::<Vec<_>>());
+
+        let response = paginate_response(&items, &pagination);
+
+        assert_eq!(response["data"].as_array().unwrap().len(), 25);
+        assert_eq!(response["pagination"]["offset"], 10);
+        assert_eq!(response["pagination"]["limit"], 25);
+        assert_eq!(pagination.query_limit_i64(), 25);
     }
 }

@@ -6,7 +6,7 @@ proxies:
   - id: "proxy-health"
     name: "Health Check Proxy"
     listen_path: "/health"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "BACKEND_HOST"
     backend_port: 3001
     strip_listen_path: false
@@ -21,7 +21,7 @@ proxies:
   - id: "proxy-echo-auth"
     name: "Echo API Proxy (Key Auth)"
     listen_path: "/api/echo-auth"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "BACKEND_HOST"
     backend_port: 3001
     strip_listen_path: true
@@ -42,7 +42,7 @@ consumers:
     custom_id: "benchmark"
     credentials:
       keyauth:
-        key: "test-api-key"
+        - key: "test-api-key"
 
 plugin_configs:
   - id: "plugin-keyauth-bench"

@@ -58,9 +58,7 @@ struct LokiFlushConfig {
 struct LabelConfig {
     /// Static labels merged into every entry (e.g., service, env).
     static_labels: BTreeMap<String, String>,
-    /// Whether to add `proxy_id` as a label (default true). Controlled by
-    /// `include_proxy_id_label` (preferred) or the legacy
-    /// `include_listen_path_label` name for backward compatibility.
+    /// Whether to add `proxy_id` as a label (default true).
     include_proxy_id: bool,
     /// Whether to add status class (2xx/3xx/4xx/5xx) as a label (default true).
     include_status_class: bool,
@@ -101,10 +99,13 @@ impl LokiLogging {
             static_labels.insert("service".to_string(), "ferrum-edge".to_string());
         }
 
-        let include_proxy_id = match optional_bool(config, "include_proxy_id_label")? {
-            Some(value) => value,
-            None => optional_bool(config, "include_listen_path_label")?.unwrap_or(true),
-        };
+        if config.get("include_listen_path_label").is_some() {
+            return Err(
+                "loki_logging: 'include_listen_path_label' was removed; use 'include_proxy_id_label'"
+                    .to_string(),
+            );
+        }
+        let include_proxy_id = optional_bool(config, "include_proxy_id_label")?.unwrap_or(true);
         let include_status_class =
             optional_bool(config, "include_status_class_label")?.unwrap_or(true);
 
@@ -503,40 +504,33 @@ mod tests {
     // awaits) but need to execute inside a tokio runtime so `tokio::spawn`
     // can register the flush task — `#[tokio::test]` provides that runtime.
     #[tokio::test]
-    async fn label_legacy_key_controls_proxy_id_label() {
-        // Backward compat: `include_listen_path_label` (old name) must still
-        // suppress the `proxy_id` label when callers explicitly set it false.
+    async fn label_include_proxy_id_key_controls_proxy_id_label() {
         let plugin = LokiLogging::new(
             &json!({
                 "endpoint_url": "http://127.0.0.1:1/loki/api/v1/push",
-                "include_listen_path_label": false,
+                "include_proxy_id_label": false,
                 "include_status_class_label": false,
             }),
             client(),
         );
         let plugin = must(plugin, "loki_logging config should be valid");
-        let summary = make_summary(200, Some("p-1"));
+        let summary = make_summary(500, Some("p-1"));
         let labels = plugin.build_http_labels(&summary);
         assert!(!labels.contains_key("proxy_id"));
         assert!(!labels.contains_key("status_class"));
     }
 
     #[tokio::test]
-    async fn label_new_key_takes_precedence_over_legacy() {
-        // When both keys are set with opposing values, the new
-        // `include_proxy_id_label` wins.
-        let plugin = LokiLogging::new(
+    async fn removed_listen_path_key_is_rejected() {
+        let result = LokiLogging::new(
             &json!({
                 "endpoint_url": "http://127.0.0.1:1/loki/api/v1/push",
-                "include_proxy_id_label": true,
                 "include_listen_path_label": false,
             }),
             client(),
         );
-        let plugin = must(plugin, "loki_logging config should be valid");
-        let summary = make_summary(500, Some("p-2"));
-        let labels = plugin.build_http_labels(&summary);
-        assert_eq!(labels.get("proxy_id").map(String::as_str), Some("p-2"));
+        let err = result.err().expect("removed key should be rejected");
+        assert!(err.contains("include_listen_path_label"), "got: {err}");
     }
 
     #[tokio::test]

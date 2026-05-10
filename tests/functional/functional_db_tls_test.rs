@@ -440,14 +440,10 @@ async fn run_crud_and_proxy_tests(
             "[{db_label}] Failed to list {label}"
         );
         let items: serde_json::Value = response.json().await.expect("Failed to parse");
-        assert!(
-            items.is_array(),
-            "[{db_label}] {label} response should be array"
-        );
-        println!(
-            "  [{db_label}] Listed {} {label}",
-            items.as_array().unwrap().len()
-        );
+        let data = items["data"]
+            .as_array()
+            .unwrap_or_else(|| panic!("[{db_label}] {label} response should include data array"));
+        println!("  [{db_label}] Listed {} {label}", data.len());
     }
 
     // --- Cleanup: delete resources ---

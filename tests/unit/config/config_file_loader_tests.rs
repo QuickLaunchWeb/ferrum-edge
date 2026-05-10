@@ -10,6 +10,7 @@ use tempfile::NamedTempFile;
 #[test]
 fn test_load_yaml_config() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
@@ -35,6 +36,7 @@ plugin_configs: []
 #[test]
 fn test_load_json_config() {
     let json = r#"{
+  "version": "1",
   "proxies": [{
     "id": "proxy-1",
     "listen_path": "/api/v1",
@@ -60,6 +62,7 @@ fn test_load_json_config() {
 #[test]
 fn test_duplicate_listen_path_rejected() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
@@ -94,6 +97,7 @@ plugin_configs: []
 #[test]
 fn test_load_full_config_yaml() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "proxy-httpbin"
     name: "HTTPBin Proxy"
@@ -128,18 +132,18 @@ consumers:
     custom_id: "alice-001"
     credentials:
       keyauth:
-        key: "alice-secret-api-key-12345"
+        - key: "alice-secret-api-key-12345"
       jwt:
-        secret: "alice-jwt-secret-key-1234567890ab"
+        - secret: "alice-jwt-secret-key-1234567890ab"
       basicauth:
-        password_hash: "$2b$12$LJ3m4ys3Lk0TSwHjOHRHOeUK/6Nh1GUz8QLXfYcR8x0e3kYzLhWS"
+        - password_hash: "hmac_sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
   - id: "consumer-bob"
     username: "bob"
     custom_id: "bob-002"
     credentials:
       keyauth:
-        key: "bob-secret-api-key-67890"
+        - key: "bob-secret-api-key-67890"
 
 plugin_configs:
   - id: "plugin-stdout"
@@ -240,9 +244,8 @@ fn test_load_shared_example_config_fixture() {
 // accepts canonical schemes (http, https, tcp, tcps, udp, dtls). Former
 // protocol values (ws, wss, grpc, grpcs) are detected per-request from the
 // incoming traffic (`HttpFlavor`). Backend H3 selection is runtime capability-
-// driven for HTTPS backends. Serde rejects unknown enum values, so legacy
-// aliases are no longer accepted via file loading (the db_loader `parse_scheme`
-// still tolerates them).
+// driven for HTTPS backends. Serde rejects unknown enum values, so old
+// protocol spellings are not accepted via file loading.
 
 #[test]
 fn test_all_backend_schemes() {
@@ -254,6 +257,7 @@ fn test_all_backend_schemes() {
     for (scheme_str, expected) in schemes {
         let yaml = format!(
             r#"
+version: "1"
 proxies:
   - id: "test-proxy"
     listen_path: "/test"
@@ -288,6 +292,7 @@ plugin_configs: []
 #[test]
 fn test_backend_scheme_defaults_to_https_for_http_family_proxy() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "test-proxy"
     listen_path: "/test"
@@ -312,10 +317,11 @@ plugin_configs: []
 }
 
 #[test]
-fn test_legacy_h3_alias_rejected_by_file_loader() {
+fn test_h3_scheme_rejected_by_file_loader() {
     let yaml = r#"
+version: "1"
 proxies:
-  - id: "legacy-h3-alias"
+  - id: "h3-scheme"
     listen_path: "/v1"
     backend_scheme: h3
     backend_host: "localhost"
@@ -332,12 +338,112 @@ plugin_configs: []
         &ferrum_edge::config::BackendAllowIps::Both,
         "ferrum",
     );
-    let err = config.expect_err("legacy h3 alias should be rejected by serde file loading");
+    let err = config.expect_err("h3 scheme should be rejected by serde file loading");
     assert!(
         err.to_string().contains("unknown variant") || err.to_string().contains("h3"),
-        "error should mention the unsupported legacy alias: {}",
+        "error should mention the unsupported scheme: {}",
         err
     );
+}
+
+#[test]
+fn test_unknown_fields_rejected_on_each_resource_type() {
+    // `Proxy`, `Consumer`, `Upstream`, `PluginConfig`, and `GatewayConfig` all
+    // carry `#[serde(deny_unknown_fields)]`. A typo or removed field anywhere
+    // in the tree must surface as a clear deserialize error rather than being
+    // silently dropped.
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "GatewayConfig top-level",
+            r#"
+version: "1"
+extra_top_level_key: 1
+proxies: []
+consumers: []
+plugin_configs: []
+"#,
+            "extra_top_level_key",
+        ),
+        (
+            "Proxy entry",
+            r#"
+version: "1"
+proxies:
+  - id: "p1"
+    listen_path: "/v1"
+    backend_scheme: http
+    backend_host: "localhost"
+    backend_port: 8080
+    backend_protocol: http
+consumers: []
+plugin_configs: []
+"#,
+            "backend_protocol",
+        ),
+        (
+            "Consumer entry",
+            r#"
+version: "1"
+proxies: []
+consumers:
+  - id: "c1"
+    username: "alice"
+    not_a_consumer_field: "x"
+plugin_configs: []
+"#,
+            "not_a_consumer_field",
+        ),
+        (
+            "PluginConfig entry",
+            r#"
+version: "1"
+proxies: []
+consumers: []
+plugin_configs:
+  - id: "pc1"
+    plugin_name: "key_auth"
+    config: {}
+    scope: global
+    bogus_plugin_field: true
+"#,
+            "bogus_plugin_field",
+        ),
+        (
+            "Upstream entry",
+            r#"
+version: "1"
+proxies: []
+consumers: []
+plugin_configs: []
+upstreams:
+  - id: "u1"
+    targets:
+      - host: "localhost"
+        port: 8080
+    bogus_upstream_field: "x"
+"#,
+            "bogus_upstream_field",
+        ),
+    ];
+
+    for (label, yaml, expected_field) in cases {
+        let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+        write!(file, "{}", yaml).unwrap();
+        let result = load_config_from_file(
+            file.path().to_str().unwrap(),
+            30,
+            &ferrum_edge::config::BackendAllowIps::Both,
+            "ferrum",
+        );
+        let err = result.expect_err(&format!(
+            "{label}: unknown field {expected_field:?} should be rejected"
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(expected_field) || msg.contains("unknown field"),
+            "{label}: error should mention the unknown field {expected_field:?}: {msg}"
+        );
+    }
 }
 
 // ============================================================================
@@ -347,6 +453,7 @@ plugin_configs: []
 #[test]
 fn test_auth_mode_single() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
@@ -372,6 +479,7 @@ plugin_configs: []
 #[test]
 fn test_auth_mode_multi() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
@@ -397,6 +505,7 @@ plugin_configs: []
 #[test]
 fn test_auth_mode_defaults_to_single() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
@@ -425,13 +534,14 @@ plugin_configs: []
 #[test]
 fn test_consumer_keyauth_credential() {
     let yaml = r#"
+version: "1"
 proxies: []
 consumers:
   - id: "consumer-1"
     username: "user1"
     credentials:
       keyauth:
-        key: "my-api-key-12345"
+        - key: "my-api-key-12345"
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
@@ -446,21 +556,22 @@ plugin_configs: []
 
     assert_eq!(config.consumers.len(), 1);
     assert!(config.consumers[0].credentials.contains_key("keyauth"));
-    let keyauth = &config.consumers[0].credentials["keyauth"];
+    let keyauth = &config.consumers[0].credentials["keyauth"][0];
     assert_eq!(keyauth["key"].as_str(), Some("my-api-key-12345"));
 }
 
 #[test]
 fn test_consumer_jwt_credential() {
     let yaml = r#"
+version: "1"
 proxies: []
 consumers:
   - id: "consumer-1"
     username: "user1"
     credentials:
       jwt:
-        secret: "jwt-secret-key-padding-1234567890"
-        algorithm: "HS256"
+        - secret: "jwt-secret-key-padding-1234567890"
+          algorithm: "HS256"
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
@@ -475,7 +586,7 @@ plugin_configs: []
 
     assert_eq!(config.consumers.len(), 1);
     assert!(config.consumers[0].credentials.contains_key("jwt"));
-    let jwt = &config.consumers[0].credentials["jwt"];
+    let jwt = &config.consumers[0].credentials["jwt"][0];
     assert_eq!(
         jwt["secret"].as_str(),
         Some("jwt-secret-key-padding-1234567890")
@@ -485,13 +596,14 @@ plugin_configs: []
 #[test]
 fn test_consumer_basicauth_credential() {
     let yaml = r#"
+version: "1"
 proxies: []
 consumers:
   - id: "consumer-1"
     username: "user1"
     credentials:
       basicauth:
-        password_hash: "$2b$12$hashed_password_here"
+        - password_hash: "hmac_sha256:0000000000000000000000000000000000000000000000000000000000000000"
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
@@ -506,27 +618,28 @@ plugin_configs: []
 
     assert_eq!(config.consumers.len(), 1);
     assert!(config.consumers[0].credentials.contains_key("basicauth"));
-    let basicauth = &config.consumers[0].credentials["basicauth"];
+    let basicauth = &config.consumers[0].credentials["basicauth"][0];
     assert_eq!(
         basicauth["password_hash"].as_str(),
-        Some("$2b$12$hashed_password_here")
+        Some("hmac_sha256:0000000000000000000000000000000000000000000000000000000000000000")
     );
 }
 
 #[test]
 fn test_consumer_multiple_credentials() {
     let yaml = r#"
+version: "1"
 proxies: []
 consumers:
   - id: "consumer-1"
     username: "user1"
     credentials:
       keyauth:
-        key: "api-key-123"
+        - key: "api-key-123"
       jwt:
-        secret: "jwt-secret-padding-12345678901234"
+        - secret: "jwt-secret-padding-12345678901234"
       basicauth:
-        password_hash: "$2b$12$hash"
+        - password_hash: "hmac_sha256:0000000000000000000000000000000000000000000000000000000000000000"
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
@@ -554,6 +667,7 @@ plugin_configs: []
 #[test]
 fn test_plugin_config_global_scope() {
     let yaml = r#"
+version: "1"
 proxies: []
 consumers: []
 plugin_configs:
@@ -581,6 +695,7 @@ plugin_configs:
 #[test]
 fn test_plugin_config_proxy_scope() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "proxy-protected"
     listen_path: "/protected"
@@ -618,6 +733,7 @@ plugin_configs:
 #[test]
 fn test_plugin_config_with_complex_config() {
     let yaml = r#"
+version: "1"
 proxies: []
 consumers: []
 plugin_configs:
@@ -667,6 +783,7 @@ fn test_proxy_with_all_optional_fields() {
         .to_string();
     let yaml = format!(
         r#"
+version: "1"
 proxies:
   - id: "proxy-full"
     listen_path: "/api"
@@ -730,6 +847,7 @@ plugin_configs: []
 #[test]
 fn test_proxy_minimal_optional_fields() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "proxy-minimal"
     listen_path: "/api"
@@ -765,6 +883,7 @@ plugin_configs: []
 #[test]
 fn test_reload_config_from_file() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
@@ -790,6 +909,7 @@ plugin_configs: []
 
     // Modify file and reload
     let yaml_updated = r#"
+version: "1"
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
@@ -837,6 +957,7 @@ fn test_missing_config_file() {
 #[test]
 fn test_malformed_yaml() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
@@ -860,6 +981,7 @@ plugin_configs: []
 #[test]
 fn test_malformed_json() {
     let json = r#"{
+  "version": "1",
   "proxies": [{
     "id": "proxy-1",
     "listen_path": "/api/v1",
@@ -880,6 +1002,7 @@ fn test_malformed_json() {
 #[test]
 fn test_empty_config() {
     let yaml = r#"
+version: "1"
 proxies: []
 consumers: []
 plugin_configs: []
@@ -906,6 +1029,7 @@ plugin_configs: []
 #[test]
 fn test_unknown_extension_fallback_to_yaml() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
@@ -930,6 +1054,7 @@ plugin_configs: []
 #[test]
 fn test_unknown_extension_fallback_to_json() {
     let json = r#"{
+  "version": "1",
   "proxies": [{
     "id": "proxy-1",
     "listen_path": "/api/v1",
@@ -959,6 +1084,7 @@ fn test_unknown_extension_fallback_to_json() {
 #[test]
 fn test_proxy_with_multiple_plugins() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "proxy-1"
     listen_path: "/api"
@@ -1017,6 +1143,7 @@ plugin_configs:
 #[test]
 fn test_proxy_with_no_plugins() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "proxy-1"
     listen_path: "/api"
@@ -1053,6 +1180,7 @@ plugin_configs: []
 #[test]
 fn test_load_config_multi_namespace_shared_listen_path() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "prod-proxy"
     namespace: "prod"
@@ -1091,6 +1219,7 @@ plugin_configs: []
 #[test]
 fn test_load_config_same_namespace_duplicate_listen_path_rejected() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "prod-a"
     namespace: "prod"
@@ -1130,6 +1259,7 @@ plugin_configs: []
 #[test]
 fn test_load_config_multi_namespace_shared_listen_port() {
     let yaml = r#"
+version: "1"
 proxies:
   - id: "prod-tcp"
     namespace: "prod"
@@ -1165,6 +1295,7 @@ plugin_configs: []
 #[test]
 fn test_load_config_multi_namespace_shared_consumer_username() {
     let yaml = r#"
+version: "1"
 proxies: []
 consumers:
   - id: "prod-alice"

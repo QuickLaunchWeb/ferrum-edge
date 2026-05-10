@@ -195,7 +195,7 @@ jobs:
 
           ```bash
           chmod +x ferrum-edge-linux-x86_64
-          FERRUM_MODE=file FERRUM_FILE_CONFIG_PATH=config.yaml ./ferrum-edge-linux-x86_64
+          FERRUM_MODE=file FERRUM_FILE_CONFIG_PATH=config.yaml ./ferrum-edge-linux-x86_64 run
           ```
 
           See [README.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/README.md) for configuration and usage instructions.

@@ -358,6 +358,7 @@ async fn test_frontend_mtls_valid_client_cert() {
         |_ports| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "t1"
     listen_path: "/api"
@@ -425,6 +426,7 @@ async fn test_frontend_mtls_no_client_cert_rejected() {
         |_ports| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "t2"
     listen_path: "/api"
@@ -493,6 +495,7 @@ async fn test_frontend_mtls_wrong_ca_rejected() {
         |_ports| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "t3"
     listen_path: "/api"
@@ -557,6 +560,7 @@ async fn test_backend_tls_ca_verification_trusted() {
         |_ports| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "t4"
     listen_path: "/api"
@@ -624,6 +628,7 @@ async fn test_backend_tls_ca_verification_untrusted() {
         |_ports| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "t5"
     listen_path: "/api"
@@ -694,6 +699,7 @@ async fn test_backend_mtls_gateway_presents_client_cert() {
         |_ports| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "t6"
     listen_path: "/api"
@@ -763,6 +769,7 @@ async fn test_backend_mtls_gateway_no_client_cert_rejected() {
         |_ports| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "t7"
     listen_path: "/api"
@@ -833,6 +840,7 @@ async fn test_backend_mtls_global_env_vars() {
         |_ports| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "t8"
     listen_path: "/api"
@@ -904,6 +912,7 @@ async fn test_admin_mtls_authorized_client() {
         |_ports| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "t9"
     listen_path: "/api"
@@ -971,6 +980,7 @@ async fn test_admin_mtls_unauthorized_client_rejected() {
         |_ports| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "t10"
     listen_path: "/api"
@@ -1041,6 +1051,7 @@ async fn test_tcp_frontend_mtls_valid_client() {
             let pp = ports.proxy_https; // reuse proxy_https slot for stream listen_port
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "t11"
     listen_port: {pp}
@@ -1127,6 +1138,7 @@ async fn test_tcp_frontend_mtls_no_client_cert_rejected() {
             let pp = ports.proxy_https; // reuse proxy_https slot for stream listen_port
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "t12"
     listen_port: {pp}
@@ -1209,6 +1221,7 @@ async fn test_backend_tls_global_ca_bundle() {
         |_ports| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "t13"
     listen_path: "/api"

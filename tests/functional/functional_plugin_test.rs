@@ -1162,7 +1162,7 @@ async fn test_plugin_response_size_limiting_fast_path() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/response-sizelimit").await;
 
     let small = client
         .get(format!("{}/response-sizelimit/ok", harness.proxy_base_url))
@@ -1585,11 +1585,13 @@ async fn test_plugin_response_transformer() {
                 "rules": [
                     {
                         "operation": "add",
+                        "target": "header",
                         "key": "X-Gateway-Version",
                         "value": "ferrum-1.0"
                     },
                     {
                         "operation": "add",
+                        "target": "header",
                         "key": "X-Powered-By",
                         "value": "ferrum-edge"
                     }
@@ -1600,7 +1602,7 @@ async fn test_plugin_response_transformer() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/resptransform").await;
 
     let resp = client
         .get(format!("{}/resptransform/test", harness.proxy_base_url))
@@ -1774,7 +1776,7 @@ async fn test_plugin_chain_multiple_plugins() {
             "proxy_id": proxy_id,
             "enabled": true,
             "config": {
-                "rules": [{"operation": "add", "key": "X-Served-By", "value": "ferrum"}]
+                "rules": [{"operation": "add", "target": "header", "key": "X-Served-By", "value": "ferrum"}]
             }
         }),
     ];

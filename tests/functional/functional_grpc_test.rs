@@ -171,6 +171,7 @@ fn start_gateway(
 fn write_grpc_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "grpc-echo-proxy"
     listen_path: "/grpc"
@@ -208,6 +209,7 @@ plugin_configs: []
 fn write_grpc_auth_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "grpc-secured-proxy"
     listen_path: "/grpc-secure"
@@ -224,7 +226,7 @@ consumers:
     username: "grpc-test-service"
     credentials:
       keyauth:
-        key: "grpc-valid-api-key-99887766"
+        - key: "grpc-valid-api-key-99887766"
 
 plugin_configs:
   - id: "plugin-keyauth-grpc"
@@ -247,6 +249,7 @@ plugin_configs:
 fn write_grpc_method_filter_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "grpc-method-filter-proxy"
     listen_path: "/grpc-method-filter"

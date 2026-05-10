@@ -356,6 +356,7 @@ async fn test_tcp_proxy_plain_bidirectional() {
         |proxy_port| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "tcp-echo"
     listen_port: {proxy_port}
@@ -434,6 +435,7 @@ async fn test_tcp_proxy_frontend_tls_termination() {
         |proxy_port| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "tcp-tls-frontend"
     listen_port: {proxy_port}
@@ -500,6 +502,7 @@ async fn test_tcp_proxy_backend_tls_origination() {
         |proxy_port| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "tcp-tls-backend"
     listen_port: {proxy_port}
@@ -563,6 +566,7 @@ async fn test_tcp_proxy_full_tls() {
         |proxy_port| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "tcp-full-tls"
     listen_port: {proxy_port}
@@ -631,6 +635,7 @@ async fn test_tcp_proxy_idle_timeout() {
         |proxy_port| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "tcp-idle-timeout"
     listen_port: {proxy_port}
@@ -709,6 +714,7 @@ async fn test_tcp_proxy_active_connection_survives_config_reload() {
         |proxy_port| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "tcp-reload-active"
     listen_port: {proxy_port}
@@ -733,6 +739,7 @@ plugin_configs: []
 
     let updated = format!(
         r#"
+version: "1"
 proxies:
   - id: "tcp-reload-active"
     listen_port: {proxy_port}
@@ -805,6 +812,7 @@ async fn test_tcp_proxy_backend_unreachable() {
         |proxy_port| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "tcp-unreachable"
     listen_port: {proxy_port}

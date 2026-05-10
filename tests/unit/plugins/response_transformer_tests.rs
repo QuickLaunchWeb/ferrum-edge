@@ -16,7 +16,7 @@ fn make_ctx() -> RequestContext {
 async fn test_response_transformer_creation() {
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "add", "key": "X-Test", "value": "test"}
+            {"operation": "add", "target": "header", "key": "X-Test", "value": "test"}
         ]
     }))
     .unwrap();
@@ -27,7 +27,7 @@ async fn test_response_transformer_creation() {
 async fn test_response_transformer_priority_protocols_and_reject_hook() {
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "add", "key": "X-Test", "value": "test"}
+            {"operation": "add", "target": "header", "key": "X-Test", "value": "test"}
         ]
     }))
     .unwrap();
@@ -53,7 +53,7 @@ async fn test_response_transformer_priority_protocols_and_reject_hook() {
 async fn test_response_transformer_add_header() {
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "add", "key": "X-Response-Id", "value": "abc-123"}
+            {"operation": "add", "target": "header", "key": "X-Response-Id", "value": "abc-123"}
         ]
     }))
     .unwrap();
@@ -73,7 +73,7 @@ async fn test_response_transformer_add_header() {
 async fn test_response_transformer_remove_header() {
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "remove", "key": "X-Internal"}
+            {"operation": "remove", "target": "header", "key": "X-Internal"}
         ]
     }))
     .unwrap();
@@ -96,7 +96,7 @@ async fn test_response_transformer_remove_header() {
 async fn test_response_transformer_update_header() {
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "update", "key": "Server", "value": "Ferrum Edge"}
+            {"operation": "update", "target": "header", "key": "Server", "value": "Ferrum Edge"}
         ]
     }))
     .unwrap();
@@ -117,9 +117,9 @@ async fn test_response_transformer_update_header() {
 async fn test_response_transformer_multiple_rules() {
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "add", "key": "X-Gateway", "value": "ferrum"},
-            {"operation": "remove", "key": "X-Powered-By"},
-            {"operation": "update", "key": "Server", "value": "Ferrum"}
+            {"operation": "add", "target": "header", "key": "X-Gateway", "value": "ferrum"},
+            {"operation": "remove", "target": "header", "key": "X-Powered-By"},
+            {"operation": "update", "target": "header", "key": "Server", "value": "Ferrum"}
         ]
     }))
     .unwrap();
@@ -185,7 +185,7 @@ async fn test_response_transformer_rejects_non_object_rule() {
 async fn test_response_transformer_add_without_value_rejected() {
     let err = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "add", "key": "X-NoValue"}
+            {"operation": "add", "target": "header", "key": "X-NoValue"}
         ]
     }))
     .err()
@@ -197,7 +197,7 @@ async fn test_response_transformer_add_without_value_rejected() {
 async fn test_response_transformer_unknown_operation_rejected() {
     let err = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "prepend", "key": "X-Test", "value": "val"}
+            {"operation": "prepend", "target": "header", "key": "X-Test", "value": "val"}
         ]
     }))
     .err()
@@ -209,7 +209,7 @@ async fn test_response_transformer_unknown_operation_rejected() {
 async fn test_response_transformer_handles_various_status_codes() {
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "add", "key": "X-Processed", "value": "true"}
+            {"operation": "add", "target": "header", "key": "X-Processed", "value": "true"}
         ]
     }))
     .unwrap();
@@ -231,7 +231,7 @@ async fn test_response_transformer_handles_various_status_codes() {
 async fn test_response_transformer_rename_header() {
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "rename", "key": "x-old", "new_key": "x-new"}
+            {"operation": "rename", "target": "header", "key": "x-old", "new_key": "x-new"}
         ]
     }))
     .unwrap();
@@ -253,7 +253,7 @@ async fn test_response_transformer_rename_header() {
 async fn test_response_transformer_rename_header_nonexistent() {
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "rename", "key": "x-missing", "new_key": "x-new"}
+            {"operation": "rename", "target": "header", "key": "x-missing", "new_key": "x-new"}
         ]
     }))
     .unwrap();
@@ -274,7 +274,7 @@ async fn test_response_transformer_rename_header_nonexistent() {
 async fn test_response_transformer_rename_without_new_key_rejected() {
     let err = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "rename", "key": "x-old"}
+            {"operation": "rename", "target": "header", "key": "x-old"}
         ]
     }))
     .err()
@@ -286,7 +286,7 @@ async fn test_response_transformer_rename_without_new_key_rejected() {
 async fn test_response_transformer_header_key_pre_lowercased() {
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "add", "key": "X-UPPER", "value": "lowered"}
+            {"operation": "add", "target": "header", "key": "X-UPPER", "value": "lowered"}
         ]
     }))
     .unwrap();
@@ -426,7 +426,7 @@ async fn test_response_transformer_body_multiple_rules() {
 async fn test_response_transformer_body_mixed_header_and_body_rules() {
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "add", "key": "X-Processed", "value": "true"},
+            {"operation": "add", "target": "header", "key": "X-Processed", "value": "true"},
             {"operation": "rename", "target": "body", "key": "old_field", "new_key": "new_field"}
         ]
     }))
@@ -473,7 +473,7 @@ async fn test_response_transformer_body_non_json_skipped() {
 async fn test_response_transformer_no_body_rules_no_buffering() {
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "add", "key": "X-Header", "value": "yes"}
+            {"operation": "add", "target": "header", "key": "X-Header", "value": "yes"}
         ]
     }))
     .unwrap();
@@ -536,7 +536,7 @@ async fn test_response_transformer_unknown_target_rejected() {
 async fn test_response_transformer_rejects_crlf_in_header_value() {
     let err = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "add", "key": "X-Bad", "value": "x\nSet-Cookie: evil=1"}
+            {"operation": "add", "target": "header", "key": "X-Bad", "value": "x\nSet-Cookie: evil=1"}
         ]
     }))
     .err()
@@ -596,9 +596,8 @@ async fn test_response_transformer_rejects_non_string_target() {
 
 #[tokio::test]
 async fn test_response_transformer_rejects_null_target() {
-    // Explicit `"target": null` must fail config load. Only a completely
-    // absent `target` field may default to "header" for backward-compat.
-    // Silently coercing null would mask misconfiguration.
+    // Explicit `"target": null` must fail config load; silently coercing null
+    // would mask misconfiguration.
     let err = ResponseTransformer::new(&json!({
         "rules": [
             {"operation": "add", "target": null, "key": "X", "value": "v"}
@@ -607,6 +606,18 @@ async fn test_response_transformer_rejects_null_target() {
     .err()
     .expect("expected error for null target");
     assert!(err.contains("'target' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_missing_target() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "key": "X", "value": "v"}
+        ]
+    }))
+    .err()
+    .expect("expected error for missing target");
+    assert!(err.contains("'target' is required"), "got: {err}");
 }
 
 #[tokio::test]
@@ -758,7 +769,7 @@ async fn test_response_transformer_header_only_rules_never_buffer() {
     // Header-only rules (no body_rules) must not buffer regardless of SSE.
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "add", "key": "X-Test", "value": "yes"}
+            {"operation": "add", "target": "header", "key": "X-Test", "value": "yes"}
         ]
     }))
     .unwrap();

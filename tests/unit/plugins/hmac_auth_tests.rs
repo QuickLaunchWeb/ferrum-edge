@@ -19,11 +19,8 @@ type HmacSha512 = Hmac<Sha512>;
 
 const TEST_SECRET: &str = "my-hmac-secret-key";
 
-/// Default config for tests that exercise the legacy 3-field signing string
-/// (no digest verification). Tests that exercise the new digest behavior
-/// build their own config with `require_digest = true`.
-fn legacy_config() -> Value {
-    json!({"require_digest": false})
+fn default_config() -> Value {
+    json!({})
 }
 
 /// Create a consumer with hmac_auth credentials.
@@ -31,7 +28,10 @@ fn create_hmac_consumer() -> Consumer {
     let mut credentials = HashMap::new();
     let mut hmac_creds = Map::new();
     hmac_creds.insert("secret".to_string(), Value::String(TEST_SECRET.to_string()));
-    credentials.insert("hmac_auth".to_string(), Value::Object(hmac_creds));
+    credentials.insert(
+        "hmac_auth".to_string(),
+        Value::Array(vec![Value::Object(hmac_creds)]),
+    );
 
     Consumer {
         id: "hmac-consumer".to_string(),
@@ -50,7 +50,10 @@ fn create_consumer_without_hmac_creds() -> Consumer {
     let mut credentials = HashMap::new();
     let mut keyauth_creds = Map::new();
     keyauth_creds.insert("key".to_string(), Value::String("some-key".to_string()));
-    credentials.insert("keyauth".to_string(), Value::Object(keyauth_creds));
+    credentials.insert(
+        "keyauth".to_string(),
+        Value::Array(vec![Value::Object(keyauth_creds)]),
+    );
 
     Consumer {
         id: "no-hmac-consumer".to_string(),
@@ -65,11 +68,16 @@ fn create_consumer_without_hmac_creds() -> Consumer {
 }
 
 fn make_ctx(method: &str, path: &str) -> RequestContext {
-    RequestContext::new(
+    let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         method.to_string(),
         path.to_string(),
-    )
+    );
+    let empty_body = bytes::Bytes::new();
+    ctx.headers
+        .insert("digest".to_string(), sha256_digest_header(&empty_body));
+    ctx.request_body_bytes = Some(empty_body);
+    ctx
 }
 
 /// Generate a current RFC 2822 date string.
@@ -77,26 +85,22 @@ fn current_date() -> String {
     Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
-/// Compute an HMAC-SHA256 signature over `METHOD\nPATH\nDATE` and return base64.
-/// Used by legacy-mode tests (`require_digest = false`).
+/// Compute an HMAC-SHA256 signature over an empty-body request and return base64.
 fn sign_sha256(secret: &str, method: &str, path: &str, date: &str) -> String {
-    let signing_string = format!("{}\n{}\n{}", method, path, date);
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
-    mac.update(signing_string.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+    sign_sha256_with_digest(secret, method, path, date, &sha256_digest_header(&[]))
 }
 
-/// Compute an HMAC-SHA512 signature over `METHOD\nPATH\nDATE` and return base64.
-/// Used by legacy-mode tests (`require_digest = false`).
+/// Compute an HMAC-SHA512 signature over an empty-body request and return base64.
 fn sign_sha512(secret: &str, method: &str, path: &str, date: &str) -> String {
-    let signing_string = format!("{}\n{}\n{}", method, path, date);
+    let digest_header = sha256_digest_header(&[]);
+    let signing_string = format!("{}\n{}\n{}\n{}", method, path, date, digest_header);
     let mut mac = HmacSha512::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(signing_string.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
 /// Compute an HMAC-SHA256 signature over the new 4-field signing string
-/// (`METHOD\nPATH\nDATE\nDIGEST`) used when `require_digest = true`.
+/// (`METHOD\nPATH\nDATE\nDIGEST`).
 fn sign_sha256_with_digest(
     secret: &str,
     method: &str,
@@ -169,6 +173,7 @@ fn test_hmac_auth_rejects_invalid_config() {
         json!({"clock_skew_seconds": "300"}),
         json!({"clock_skew_seconds": -1}),
         json!({"require_digest": "true"}),
+        json!({"require_digest": false}),
     ];
 
     for config in invalid_configs {
@@ -181,8 +186,6 @@ fn test_hmac_auth_rejects_invalid_config() {
 
 #[tokio::test]
 async fn test_hmac_auth_default_requires_digest() {
-    // Default config (no `require_digest` set) must default to TRUE so the
-    // body is integrity-protected out of the box.
     let plugin = HmacAuth::new(&json!({})).unwrap();
     assert!(plugin.requires_request_body_before_authenticate());
     assert!(plugin.requires_request_body_buffering());
@@ -190,18 +193,18 @@ async fn test_hmac_auth_default_requires_digest() {
 }
 
 #[tokio::test]
-async fn test_hmac_auth_legacy_mode_does_not_require_body() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
-    assert!(!plugin.requires_request_body_before_authenticate());
-    assert!(!plugin.requires_request_body_buffering());
-    assert!(!plugin.needs_request_body_bytes());
+async fn test_hmac_auth_always_requires_body() {
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    assert!(plugin.requires_request_body_before_authenticate());
+    assert!(plugin.requires_request_body_buffering());
+    assert!(plugin.needs_request_body_bytes());
 }
 
-// ── 1. Valid HMAC-SHA256 authentication (legacy 3-field signing) ─────
+// ── 1. Valid HMAC-SHA256 authentication (digest signing) ─────
 
 #[tokio::test]
 async fn test_valid_hmac_sha256() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -227,11 +230,11 @@ async fn test_valid_hmac_sha256() {
     );
 }
 
-// ── 2. Valid HMAC-SHA512 authentication (legacy 3-field signing) ─────
+// ── 2. Valid HMAC-SHA512 authentication (digest signing) ─────
 
 #[tokio::test]
 async fn test_valid_hmac_sha512() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -261,7 +264,7 @@ async fn test_valid_hmac_sha512() {
 
 #[tokio::test]
 async fn test_missing_authorization_header() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
 
     let mut ctx = make_ctx("GET", "/test");
@@ -277,7 +280,7 @@ async fn test_missing_authorization_header() {
 
 #[tokio::test]
 async fn test_invalid_auth_format_bearer() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
 
     let mut ctx = make_ctx("GET", "/test");
@@ -291,7 +294,7 @@ async fn test_invalid_auth_format_bearer() {
 
 #[tokio::test]
 async fn test_invalid_auth_format_basic() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
 
     let mut ctx = make_ctx("GET", "/test");
@@ -309,7 +312,7 @@ async fn test_invalid_auth_format_basic() {
 
 #[tokio::test]
 async fn test_missing_username() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
 
     let mut ctx = make_ctx("GET", "/test");
@@ -327,7 +330,7 @@ async fn test_missing_username() {
 
 #[tokio::test]
 async fn test_missing_signature() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
 
     let mut ctx = make_ctx("GET", "/test");
@@ -346,7 +349,7 @@ async fn test_missing_signature() {
 
 #[tokio::test]
 async fn test_missing_date_header() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -372,7 +375,7 @@ async fn test_missing_date_header() {
 #[tokio::test]
 async fn test_expired_date_header() {
     // Use a very tight clock skew of 1 second
-    let plugin = HmacAuth::new(&json!({"clock_skew_seconds": 1, "require_digest": false})).unwrap();
+    let plugin = HmacAuth::new(&json!({"clock_skew_seconds": 1})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -396,7 +399,7 @@ async fn test_expired_date_header() {
 
 #[tokio::test]
 async fn test_unparseable_date_header() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -421,7 +424,7 @@ async fn test_unparseable_date_header() {
 
 #[tokio::test]
 async fn test_unknown_consumer() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
 
     let method = "GET";
@@ -443,7 +446,7 @@ async fn test_unknown_consumer() {
 
 #[tokio::test]
 async fn test_empty_consumer_index() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer_index = ConsumerIndex::new(&[]);
 
     let method = "GET";
@@ -467,7 +470,7 @@ async fn test_empty_consumer_index() {
 
 #[tokio::test]
 async fn test_consumer_without_hmac_credentials() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_consumer_without_hmac_creds();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -492,7 +495,7 @@ async fn test_consumer_without_hmac_credentials() {
 
 #[tokio::test]
 async fn test_invalid_signature() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -518,7 +521,7 @@ async fn test_invalid_signature() {
 
 #[tokio::test]
 async fn test_malformed_base64_signature_rejected() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -536,7 +539,7 @@ async fn test_malformed_base64_signature_rejected() {
 
 #[tokio::test]
 async fn test_signature_wrong_secret() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -560,7 +563,7 @@ async fn test_signature_wrong_secret() {
 
 #[tokio::test]
 async fn test_signature_wrong_method() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -584,7 +587,7 @@ async fn test_signature_wrong_method() {
 
 #[tokio::test]
 async fn test_signature_wrong_path() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -610,7 +613,7 @@ async fn test_signature_wrong_path() {
 
 #[tokio::test]
 async fn test_default_algorithm_is_sha256() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -642,7 +645,7 @@ async fn test_default_algorithm_is_sha256() {
 
 #[tokio::test]
 async fn test_case_insensitive_hmac_prefix() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -671,7 +674,7 @@ async fn test_case_insensitive_hmac_prefix() {
 
 #[tokio::test]
 async fn test_rfc3339_date_format() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -696,7 +699,7 @@ async fn test_rfc3339_date_format() {
 
 #[tokio::test]
 async fn test_algorithm_name_is_case_insensitive() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -719,7 +722,7 @@ async fn test_algorithm_name_is_case_insensitive() {
 
 #[tokio::test]
 async fn test_unknown_algorithm_rejected() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -742,7 +745,7 @@ async fn test_unknown_algorithm_rejected() {
 
 #[tokio::test]
 async fn test_sha512_with_default_algorithm_fails() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -767,7 +770,7 @@ async fn test_sha512_with_default_algorithm_fails() {
 
 #[tokio::test]
 async fn test_consumer_set_on_successful_auth() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -813,7 +816,7 @@ fn create_hmac_consumer_with_secrets(secrets: &[&str]) -> Consumer {
 
 #[tokio::test]
 async fn test_hmac_multi_secret_old_secret_still_works() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer_with_secrets(&["old-secret", "new-secret"]);
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -837,7 +840,7 @@ async fn test_hmac_multi_secret_old_secret_still_works() {
 
 #[tokio::test]
 async fn test_hmac_multi_secret_new_secret_works() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer_with_secrets(&["old-secret", "new-secret"]);
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -861,7 +864,7 @@ async fn test_hmac_multi_secret_new_secret_works() {
 
 #[tokio::test]
 async fn test_hmac_multi_secret_wrong_secret_rejected() {
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer_with_secrets(&["secret-a", "secret-b"]);
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -883,7 +886,7 @@ async fn test_hmac_multi_secret_wrong_secret_rejected() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Digest verification tests (`require_digest = true`, the new default).
+// Digest verification tests.
 // ────────────────────────────────────────────────────────────────────
 
 /// Helper to populate the buffered request body in a way that mirrors what
@@ -898,7 +901,7 @@ fn set_request_body(ctx: &mut RequestContext, body: &[u8]) {
 
 #[tokio::test]
 async fn test_digest_required_valid_signature_with_correct_body() {
-    // Default config => require_digest = true.
+    // Default config signs and verifies the request body digest.
     let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
@@ -980,6 +983,7 @@ async fn test_digest_required_missing_digest_header_rejected() {
     );
     ctx.headers.insert("date".to_string(), date);
     // Intentionally do not set the digest header.
+    ctx.headers.remove("digest");
     set_request_body(&mut ctx, body);
     ctx.identified_consumer = None;
 
@@ -988,10 +992,8 @@ async fn test_digest_required_missing_digest_header_rejected() {
 }
 
 #[tokio::test]
-async fn test_legacy_mode_no_digest_accepted() {
-    // require_digest = false should preserve the old behavior: no digest
-    // header required, body is not integrity-protected.
-    let plugin = HmacAuth::new(&legacy_config()).unwrap();
+async fn test_missing_digest_rejected() {
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -1006,15 +1008,11 @@ async fn test_legacy_mode_no_digest_accepted() {
         hmac_auth_header("hmacuser", Some("hmac-sha256"), &signature),
     );
     ctx.headers.insert("date".to_string(), date);
-    // No digest header, no body buffered — legacy behavior allows this.
+    ctx.headers.remove("digest");
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_continue(result);
-    assert_eq!(
-        ctx.identified_consumer.as_ref().unwrap().username,
-        "hmacuser"
-    );
+    assert_reject(result, Some(401));
 }
 
 #[tokio::test]
@@ -1112,7 +1110,7 @@ async fn test_digest_required_content_digest_header_accepted() {
 #[tokio::test]
 async fn test_digest_required_empty_body_with_digest() {
     // GET requests with empty body still must include a valid digest header
-    // when require_digest is on.
+    // with digest signing enabled.
     let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);

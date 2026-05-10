@@ -115,6 +115,7 @@ async fn test_udp_proxy_plain_datagram_forwarding() {
         &config_path,
         &format!(
             r#"
+version: "1"
 proxies:
   - id: "udp-echo"
     listen_port: {proxy_port}
@@ -190,6 +191,7 @@ async fn test_udp_proxy_multiple_clients() {
         &config_path,
         &format!(
             r#"
+version: "1"
 proxies:
   - id: "udp-multi-client"
     listen_port: {proxy_port}
@@ -261,6 +263,7 @@ async fn test_udp_proxy_session_timeout() {
         &config_path,
         &format!(
             r#"
+version: "1"
 proxies:
   - id: "udp-timeout"
     listen_port: {proxy_port}
@@ -337,6 +340,7 @@ async fn test_udp_proxy_large_datagram() {
         &config_path,
         &format!(
             r#"
+version: "1"
 proxies:
   - id: "udp-large"
     listen_port: {proxy_port}
@@ -406,6 +410,7 @@ async fn test_udp_proxy_dtls_backend() {
         &config_path,
         &format!(
             r#"
+version: "1"
 proxies:
   - id: "dtls-proxy"
     listen_port: {proxy_port}
@@ -475,6 +480,7 @@ async fn test_udp_proxy_dtls_backend_multiple_clients() {
         &config_path,
         &format!(
             r#"
+version: "1"
 proxies:
   - id: "dtls-multi"
     listen_port: {proxy_port}
@@ -548,6 +554,7 @@ async fn test_udp_proxy_frontend_dtls_termination() {
         &config_path,
         &format!(
             r#"
+version: "1"
 proxies:
   - id: "frontend-dtls"
     listen_port: {proxy_port}
@@ -631,6 +638,7 @@ async fn test_udp_proxy_full_dtls_e2e() {
         &config_path,
         &format!(
             r#"
+version: "1"
 proxies:
   - id: "full-dtls"
     listen_port: {proxy_port}

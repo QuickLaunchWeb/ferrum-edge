@@ -388,9 +388,7 @@ impl PluginHttpClient {
     /// The gateway's namespace (`FERRUM_NAMESPACE`).
     ///
     /// Used by plugins to namespace Redis keys and metric labels when multiple
-    /// gateway instances share a single external backend. When this returns the
-    /// default namespace (`"ferrum"`), plugins use their standard key prefixes
-    /// for backward compatibility.
+    /// gateway instances share a single external backend.
     pub fn namespace(&self) -> &str {
         &self.namespace
     }

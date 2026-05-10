@@ -1,6 +1,7 @@
 ---
 # Ferrum Edge - Example Configuration File
 # Used with FERRUM_MODE=file
+version: "1"
 
 proxies:
   - id: "proxy-httpbin"
@@ -117,11 +118,11 @@ consumers:
     custom_id: "alice-001"
     credentials:
       keyauth:
-        key: "alice-secret-api-key-12345"
+        - key: "alice-secret-api-key-12345"
       jwt:
-        secret: "alice-jwt-secret-key-1234567890ab"
+        - secret: "alice-jwt-secret-key-1234567890ab"
       basicauth:
-        password_hash: "$2b$12$LJ3m4ys3Lk0TSwHjOHRHOeUK/6Nh1GUz8QLXfYcR8x0e3kYzLhWS"
+        - password_hash: "hmac_sha256:0000000000000000000000000000000000000000000000000000000000000000"
     acl_groups:
       - "engineering"
 
@@ -130,9 +131,9 @@ consumers:
     custom_id: "bob-002"
     credentials:
       keyauth:
-        key: "bob-secret-api-key-67890"
+        - key: "bob-secret-api-key-67890"
       jwt:
-        secret: "bob-jwt-secret-key-12345678901234"
+        - secret: "bob-jwt-secret-key-12345678901234"
     acl_groups:
       - "engineering"
       - "platform"

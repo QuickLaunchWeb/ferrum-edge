@@ -74,6 +74,7 @@ async fn test_tcp_logging_sends_to_endpoint() {
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "tcp-log-proxy"
     listen_path: "/tcp-log-test"
@@ -143,6 +144,7 @@ async fn test_udp_logging_sends_to_endpoint() {
 
     let config = format!(
         r#"
+version: "1"
 proxies:
   - id: "udp-log-proxy"
     listen_path: "/udp-log-test"

@@ -334,7 +334,7 @@ impl ConsumerIndex {
             jwt_count += consumer.credential_entries("jwt").len();
             hmac_count += consumer.credential_entries("hmac_auth").len();
 
-            // Index by API key (keyauth credentials — supports single object or array)
+            // Index by API key (keyauth credentials).
             for key_creds in consumer.credential_entries("keyauth") {
                 if let Some(key) = key_creds.get("key").and_then(|s| s.as_str()) {
                     let prev = keyauth.insert(key.to_string(), Arc::clone(&arc_consumer));
@@ -358,7 +358,7 @@ impl ConsumerIndex {
                 }
             }
 
-            // Index by mTLS identity (mtls_auth credentials — supports single object or array)
+            // Index by mTLS identity (mtls_auth credentials).
             for mtls_creds in consumer.credential_entries("mtls_auth") {
                 if let Some(id) = mtls_creds.get("identity").and_then(|s| s.as_str()) {
                     let prev = mtls.insert(id.to_string(), Arc::clone(&arc_consumer));

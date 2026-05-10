@@ -27,6 +27,7 @@ pub mod grpc;
 pub mod health_check;
 pub mod http3;
 pub mod identity;
+pub mod k8s_controller;
 pub mod lazy_timeout;
 pub mod load_balancer;
 pub mod metrics;
@@ -242,7 +243,7 @@ pub mod _test_support {
         crate::config::db_loader::diff_removed(known, current)
     }
 
-    pub fn parse_scheme(s: &str) -> BackendScheme {
+    pub fn parse_scheme(s: &str) -> Result<BackendScheme, String> {
         crate::config::db_loader::parse_scheme(s)
     }
 

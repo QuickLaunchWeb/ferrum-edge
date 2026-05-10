@@ -202,6 +202,7 @@ async fn test_serverless_function_terminate_mode() {
 
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "serverless-proxy"
     listen_path: "/fn"
@@ -289,6 +290,7 @@ async fn test_request_mirror_sends_copy() {
 
     let config_content = format!(
         r#"
+version: "1"
 proxies:
   - id: "mirror-proxy"
     listen_path: "/api"

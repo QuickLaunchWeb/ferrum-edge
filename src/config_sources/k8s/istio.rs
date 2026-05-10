@@ -4,15 +4,19 @@ use serde_json::Value;
 
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
-    AppProtocol, ConditionMatch, MeshEndpoint, MeshPolicy, MeshRule, MtlsMode, PeerAuthentication,
-    PolicyAction, PolicyScope, PrincipalMatch, RequestMatch, Resolution, ServiceEntry,
-    ServiceEntryLocation, ServicePort, Workload, WorkloadPort, WorkloadSelector,
+    AccessLogFilter, AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig, MeshEndpoint,
+    MeshJwtRule, MeshMetricsConfig, MeshPolicy, MeshRequestAuthentication, MeshRule,
+    MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig, MetricTagOverride, MtlsMode,
+    PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch, Resolution,
+    ServiceEntry, ServiceEntryLocation, ServicePort, TagOverrideOperation, Workload, WorkloadPort,
+    WorkloadSelector,
 };
 
 use super::{
-    K8sAccumulator, K8sObject, K8sTranslateError, RouteBackend, RouteProxySpec, SourceKind,
-    exact_path_listen_path, invalid_resource, optional_port_field, port_from_u64, proxy_for_route,
-    resource_id, selector_from_istio, string_array, string_field, string_map, upstream_for_route,
+    K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions, RouteBackend,
+    RouteProxySpec, SourceKind, exact_path_listen_path, invalid_resource, optional_port_field,
+    port_from_u64, proxy_for_route, resource_id, selector_from_istio, string_array, string_field,
+    string_map, upstream_for_route,
 };
 use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT};
 
@@ -57,10 +61,9 @@ pub(super) fn translate(
             Ok(true)
         }
         "RequestAuthentication" => {
-            acc.warnings.push(format!(
-                "RequestAuthentication {}/{} accepted; JWT request identity is kept at the config-source boundary until the canonical request-auth model lands",
-                object.metadata.namespace, object.metadata.name
-            ));
+            acc.mesh
+                .request_authentications
+                .push(request_authentication(acc, object)?);
             Ok(true)
         }
         "Sidecar" => {
@@ -71,10 +74,7 @@ pub(super) fn translate(
             Ok(true)
         }
         "Telemetry" => {
-            acc.warnings.push(format!(
-                "Telemetry {}/{} accepted; observability materialization is additive and remains behind Phase E runtime metrics",
-                object.metadata.namespace, object.metadata.name
-            ));
+            acc.mesh.telemetry_resources.push(telemetry(acc, object)?);
             Ok(true)
         }
         _ => Ok(false),
@@ -323,6 +323,160 @@ fn peer_authentication(object: &K8sObject) -> Result<PeerAuthentication, K8sTran
         mtls_mode: effective_mtls_mode,
         port_overrides,
     })
+}
+
+fn request_authentication(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+) -> Result<MeshRequestAuthentication, K8sTranslateError> {
+    let scope = istio_policy_scope(&acc.options, object, object.spec.get("selector"));
+
+    let jwt_rules: Vec<MeshJwtRule> = object
+        .spec
+        .get("jwtRules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|rule| translate_jwt_rule(object, rule))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(MeshRequestAuthentication {
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        scope,
+        jwt_rules,
+    })
+}
+
+fn translate_jwt_rule(object: &K8sObject, rule: &Value) -> Result<MeshJwtRule, K8sTranslateError> {
+    let issuer = string_field(rule, "issuer")
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                "RequestAuthentication jwtRules[].issuer is required",
+            )
+        })?
+        .to_string();
+
+    let audiences = optional_string_array(
+        object,
+        rule,
+        "audiences",
+        "RequestAuthentication jwtRules[].audiences",
+    )?;
+    let jwks_uri = string_field(rule, "jwksUri").map(ToOwned::to_owned);
+    let jwks = string_field(rule, "jwks").map(ToOwned::to_owned);
+
+    let from_headers = jwt_from_headers(object, rule)?;
+
+    let from_params = optional_string_array(
+        object,
+        rule,
+        "fromParams",
+        "RequestAuthentication jwtRules[].fromParams",
+    )?;
+    let forward_original_token = rule
+        .get("forwardOriginalToken")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    Ok(MeshJwtRule {
+        issuer,
+        audiences,
+        jwks_uri,
+        jwks,
+        from_headers,
+        from_params,
+        forward_original_token,
+    })
+}
+
+fn jwt_from_headers(object: &K8sObject, rule: &Value) -> Result<Vec<JwtHeader>, K8sTranslateError> {
+    let Some(raw) = rule.get("fromHeaders") else {
+        return Ok(Vec::new());
+    };
+    let Some(headers) = raw.as_array() else {
+        return Err(invalid_resource(
+            object,
+            "RequestAuthentication jwtRules[].fromHeaders must be an array of objects",
+        ));
+    };
+
+    headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| {
+            let name = string_field(header, "name").ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    format!(
+                        "RequestAuthentication jwtRules[].fromHeaders[{index}].name is required"
+                    ),
+                )
+            })?;
+            let prefix = match header.get("prefix") {
+                Some(prefix) => Some(prefix.as_str().ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        format!(
+                            "RequestAuthentication jwtRules[].fromHeaders[{index}].prefix must be a string"
+                        ),
+                    )
+                })?),
+                None => None,
+            };
+            Ok(JwtHeader {
+                name: name.to_string(),
+                prefix: prefix.map(ToOwned::to_owned),
+            })
+        })
+        .collect()
+}
+
+fn istio_policy_scope(
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+    selector: Option<&Value>,
+) -> PolicyScope {
+    let is_root_namespace = object.metadata.namespace == options.istio_root_namespace;
+    match selector {
+        Some(selector) => PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: selector_from_istio(Some(selector)),
+                namespace: (!is_root_namespace).then(|| object.metadata.namespace.clone()),
+            },
+        },
+        None if is_root_namespace => PolicyScope::MeshWide,
+        None => PolicyScope::Namespace {
+            namespace: object.metadata.namespace.clone(),
+        },
+    }
+}
+
+fn optional_string_array(
+    object: &K8sObject,
+    value: &Value,
+    key: &str,
+    display_path: &str,
+) -> Result<Vec<String>, K8sTranslateError> {
+    let Some(raw) = value.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = raw.as_array() else {
+        return Err(invalid_resource(
+            object,
+            format!("{display_path} must be an array of strings"),
+        ));
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            item.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                invalid_resource(object, format!("{display_path}[{index}] must be a string"))
+            })
+        })
+        .collect()
 }
 
 fn port_from_string(object: &K8sObject, raw: &str, field: &str) -> Result<u16, K8sTranslateError> {
@@ -696,6 +850,295 @@ fn app_protocol(value: Option<&str>) -> AppProtocol {
     }
 }
 
+fn telemetry(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+) -> Result<MeshTelemetryResource, K8sTranslateError> {
+    let scope = istio_policy_scope(&acc.options, object, object.spec.get("selector"));
+
+    let tracing = object
+        .spec
+        .get("tracing")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .map(|t| {
+            let sampling = t.get("randomSamplingPercentage").and_then(Value::as_f64);
+            let mut custom_header_tags = HashMap::new();
+            let custom_tags = t
+                .get("customTags")
+                .and_then(Value::as_object)
+                .map(|tags| {
+                    tags.iter()
+                        .filter_map(|(key, val)| {
+                            // Istio customTags: { tagName: { literal: { value: "v" } } }
+                            if let Some(header_name) = val
+                                .get("header")
+                                .and_then(|h| h.get("name"))
+                                .and_then(Value::as_str)
+                            {
+                                custom_header_tags.insert(key.clone(), header_name.to_string());
+                                return None;
+                            }
+
+                            let value = val
+                                .get("literal")
+                                .and_then(|l| l.get("value"))
+                                .and_then(Value::as_str)
+                                .or_else(|| {
+                                    val.get("environment")
+                                        .and_then(|e| e.get("name"))
+                                        .and_then(Value::as_str)
+                                });
+                            value.map(|v| (key.clone(), v.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            MeshTracingConfig {
+                sampling_percentage: sampling,
+                custom_tags,
+                custom_header_tags,
+            }
+        });
+
+    let metrics = object
+        .spec
+        .get("metrics")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .map(|m| {
+            let mut tag_overrides = Vec::new();
+            let mut disabled_metrics = Vec::new();
+            if let Some(overrides) = m.get("overrides").and_then(Value::as_array) {
+                for ovr in overrides {
+                    if ovr.get("disabled").and_then(Value::as_bool).unwrap_or(false) {
+                        let metric_name = ovr
+                            .get("match")
+                            .and_then(|m| m.get("metric"))
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                invalid_resource(
+                                    object,
+                                    "Telemetry metrics.overrides[].match.metric is required when disabled=true",
+                                )
+                            })?;
+                        disabled_metrics.push(metric_name.to_string());
+                    }
+                    if let Some(tags) = ovr.get("tagOverrides").and_then(Value::as_object) {
+                        for (tag_name, tag_spec) in tags {
+                            let op = tag_spec
+                                .get("operation")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let operation = match op {
+                                "REMOVE" => TagOverrideOperation::Remove,
+                                "UPSERT" => {
+                                    let value = tag_spec
+                                        .get("value")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string();
+                                    TagOverrideOperation::Set { value }
+                                }
+                                _ => continue,
+                            };
+                            tag_overrides.push(MetricTagOverride {
+                                name: tag_name.clone(),
+                                operation,
+                            });
+                        }
+                    }
+                }
+            }
+            Ok::<_, K8sTranslateError>(MeshMetricsConfig {
+                tag_overrides,
+                disabled_metrics,
+            })
+        })
+        .transpose()?;
+
+    let access_logging = object
+        .spec
+        .get("accessLogging")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .map(|al| {
+            let disabled = al.get("disabled").and_then(Value::as_bool).unwrap_or(false);
+            let filter = al
+                .get("filter")
+                .and_then(|f| f.get("expression"))
+                .and_then(Value::as_str)
+                .map(parse_access_log_filter_expression)
+                .transpose()
+                .map_err(|message| invalid_resource(object, message))?
+                .flatten();
+            Ok::<_, K8sTranslateError>(MeshAccessLoggingConfig {
+                enabled: !disabled,
+                filter,
+            })
+        })
+        .transpose()?;
+
+    Ok(MeshTelemetryResource {
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        scope,
+        config: MeshTelemetryConfig {
+            tracing,
+            metrics,
+            access_logging,
+        },
+    })
+}
+
+/// Parse simple filter expressions like `response.code >= 400` into an
+/// [`AccessLogFilter`]. Returns `Ok(None)` for expressions without supported
+/// access-log predicates and `Err` for malformed supported predicates.
+fn parse_access_log_filter_expression(expr: &str) -> Result<Option<AccessLogFilter>, String> {
+    if expr.contains("||") {
+        return Err(
+            "Telemetry access log filter expressions with '||' are not supported".to_string(),
+        );
+    }
+
+    let mut filter = AccessLogFilter {
+        status_code_min: None,
+        status_code_max: None,
+        min_latency_ms: None,
+        errors_only: false,
+    };
+    let mut matched = false;
+
+    // Split on && to handle compound expressions
+    for part in expr.split("&&") {
+        let part = part.trim();
+        if part.starts_with("response.code") || part.starts_with("response.status") {
+            let Some(val) = extract_numeric_comparison(part) else {
+                return Err(
+                    "Telemetry access log response.code filter must use a numeric comparison"
+                        .to_string(),
+                );
+            };
+            apply_status_code_comparison(&mut filter, val)?;
+            matched = true;
+        } else if part.starts_with("response.duration") {
+            let Some(val) = extract_numeric_comparison(part) else {
+                return Err(
+                    "Telemetry access log response.duration filter must use a numeric comparison"
+                        .to_string(),
+                );
+            };
+            match val {
+                Comparison::Gte(n) => {
+                    merge_min_latency_ms(&mut filter.min_latency_ms, n)?;
+                }
+                Comparison::Gt(n) => {
+                    merge_min_latency_ms(&mut filter.min_latency_ms, comparison_increment(n)?)?;
+                }
+                Comparison::Lte(_) | Comparison::Lt(_) | Comparison::Eq(_) => {
+                    return Err(
+                        "Telemetry access log response.duration filters only support '>' and '>='"
+                            .to_string(),
+                    );
+                }
+            }
+            matched = true;
+        }
+    }
+
+    if matched { Ok(Some(filter)) } else { Ok(None) }
+}
+
+fn apply_status_code_comparison(
+    filter: &mut AccessLogFilter,
+    comparison: Comparison,
+) -> Result<(), String> {
+    match comparison {
+        Comparison::Gte(n) => merge_status_code_min(&mut filter.status_code_min, n)?,
+        Comparison::Gt(n) => {
+            merge_status_code_min(&mut filter.status_code_min, comparison_increment(n)?)?
+        }
+        Comparison::Lte(n) => merge_status_code_max(&mut filter.status_code_max, n)?,
+        Comparison::Lt(n) => {
+            merge_status_code_max(&mut filter.status_code_max, comparison_decrement(n)?)?
+        }
+        Comparison::Eq(n) => {
+            merge_status_code_min(&mut filter.status_code_min, n)?;
+            merge_status_code_max(&mut filter.status_code_max, n)?;
+        }
+    }
+    Ok(())
+}
+
+fn merge_status_code_min(current: &mut Option<u16>, value: i64) -> Result<(), String> {
+    let value = status_code_value(value)?;
+    *current = Some(current.map_or(value, |existing| existing.max(value)));
+    Ok(())
+}
+
+fn merge_status_code_max(current: &mut Option<u16>, value: i64) -> Result<(), String> {
+    let value = status_code_value(value)?;
+    *current = Some(current.map_or(value, |existing| existing.min(value)));
+    Ok(())
+}
+
+fn merge_min_latency_ms(current: &mut Option<u64>, value: i64) -> Result<(), String> {
+    let value = duration_value(value)?;
+    *current = Some(current.map_or(value, |existing| existing.max(value)));
+    Ok(())
+}
+
+fn status_code_value(value: i64) -> Result<u16, String> {
+    u16::try_from(value).map_err(|_| {
+        format!("Telemetry access log response code filter value {value} is outside 0..=65535")
+    })
+}
+
+fn duration_value(value: i64) -> Result<u64, String> {
+    u64::try_from(value).map_err(|_| {
+        format!("Telemetry access log duration filter value {value} must be non-negative")
+    })
+}
+
+fn comparison_increment(value: i64) -> Result<i64, String> {
+    value
+        .checked_add(1)
+        .ok_or_else(|| format!("Telemetry access log comparison value {value} overflows"))
+}
+
+fn comparison_decrement(value: i64) -> Result<i64, String> {
+    value
+        .checked_sub(1)
+        .ok_or_else(|| format!("Telemetry access log comparison value {value} underflows"))
+}
+
+enum Comparison {
+    Gte(i64),
+    Gt(i64),
+    Lte(i64),
+    Lt(i64),
+    Eq(i64),
+}
+
+fn extract_numeric_comparison(expr: &str) -> Option<Comparison> {
+    let ops = [">=", "<=", ">", "<", "=="];
+    for op in ops {
+        if let Some(idx) = expr.find(op) {
+            let val_str = expr[idx + op.len()..].trim();
+            let val: i64 = val_str.parse().ok()?;
+            return match op {
+                ">=" => Some(Comparison::Gte(val)),
+                ">" => Some(Comparison::Gt(val)),
+                "<=" => Some(Comparison::Lte(val)),
+                "<" => Some(Comparison::Lt(val)),
+                "==" => Some(Comparison::Eq(val)),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,6 +1152,13 @@ mod tests {
     fn options() -> K8sTranslationOptions {
         K8sTranslationOptions::new(
             "default".to_string(),
+            TrustDomain::new("cluster.local").expect("test trust domain"),
+        )
+    }
+
+    fn options_for_namespace(namespace: &str) -> K8sTranslationOptions {
+        K8sTranslationOptions::new(
+            namespace.to_string(),
             TrustDomain::new("cluster.local").expect("test trust domain"),
         )
     }
@@ -1552,5 +2002,439 @@ mod tests {
                     .contains("weight must be between 0 and 65535")
             );
         }
+    }
+
+    // ── RequestAuthentication ────────────────────────────────────────────
+
+    #[test]
+    fn translates_request_authentication_with_selector() {
+        let result = translate_k8s_objects(
+            &[object(
+                "RequestAuthentication",
+                serde_json::json!({
+                    "selector": {"matchLabels": {"app": "httpbin"}},
+                    "jwtRules": [{
+                        "issuer": "https://accounts.google.com",
+                        "jwksUri": "https://www.googleapis.com/oauth2/v3/certs",
+                        "audiences": ["my-app"],
+                        "fromHeaders": [
+                            {"name": "Authorization", "prefix": "Bearer "},
+                            {"name": "X-Custom-Token"}
+                        ],
+                        "fromParams": ["access_token"],
+                        "forwardOriginalToken": true
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.request_authentications.len(), 1);
+        let ra = &mesh.request_authentications[0];
+        assert_eq!(ra.name, "sample");
+        assert_eq!(ra.namespace, "default");
+        assert!(
+            matches!(&ra.scope, PolicyScope::WorkloadSelector { selector } if selector.namespace.as_deref() == Some("default") && selector.labels.get("app") == Some(&"httpbin".to_string()))
+        );
+        assert_eq!(ra.jwt_rules.len(), 1);
+        let rule = &ra.jwt_rules[0];
+        assert_eq!(rule.issuer, "https://accounts.google.com");
+        assert_eq!(
+            rule.jwks_uri.as_deref(),
+            Some("https://www.googleapis.com/oauth2/v3/certs")
+        );
+        assert_eq!(rule.audiences, vec!["my-app"]);
+        assert_eq!(rule.from_headers.len(), 2);
+        assert_eq!(rule.from_headers[0].name, "Authorization");
+        assert_eq!(rule.from_headers[0].prefix.as_deref(), Some("Bearer "));
+        assert_eq!(rule.from_headers[1].name, "X-Custom-Token");
+        assert!(rule.from_headers[1].prefix.is_none());
+        assert_eq!(rule.from_params, vec!["access_token"]);
+        assert!(rule.forward_original_token);
+    }
+
+    #[test]
+    fn request_authentication_rejects_malformed_from_headers() {
+        let err = translate_k8s_objects(
+            &[object(
+                "RequestAuthentication",
+                serde_json::json!({
+                    "jwtRules": [{
+                        "issuer": "https://accounts.google.com",
+                        "jwksUri": "https://www.googleapis.com/oauth2/v3/certs",
+                        "fromHeaders": [
+                            {"prefix": "Bearer "}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("malformed fromHeaders should fail translation");
+
+        assert!(
+            err.to_string()
+                .contains("RequestAuthentication jwtRules[].fromHeaders[0].name is required")
+        );
+    }
+
+    #[test]
+    fn request_authentication_rejects_malformed_from_header_prefix() {
+        let err = translate_k8s_objects(
+            &[object(
+                "RequestAuthentication",
+                serde_json::json!({
+                    "jwtRules": [{
+                        "issuer": "https://accounts.google.com",
+                        "jwksUri": "https://www.googleapis.com/oauth2/v3/certs",
+                        "fromHeaders": [
+                            {"name": "Authorization", "prefix": 42}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("malformed fromHeaders prefix should fail translation");
+
+        assert!(
+            err.to_string().contains(
+                "RequestAuthentication jwtRules[].fromHeaders[0].prefix must be a string"
+            )
+        );
+    }
+
+    #[test]
+    fn root_namespace_request_authentication_selector_is_mesh_wide_by_labels() {
+        let mut ra = object(
+            "RequestAuthentication",
+            serde_json::json!({
+                "selector": {"matchLabels": {"app": "httpbin"}},
+                "jwtRules": [{
+                    "issuer": "https://accounts.google.com",
+                    "jwksUri": "https://www.googleapis.com/oauth2/v3/certs"
+                }]
+            }),
+        );
+        ra.metadata.namespace = "istio-config".to_string();
+
+        let result = translate_k8s_objects(
+            &[ra],
+            options_for_namespace("istio-config")
+                .with_istio_root_namespace("istio-config".to_string()),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let scope = &mesh.request_authentications[0].scope;
+        assert!(
+            matches!(scope, PolicyScope::WorkloadSelector { selector } if selector.namespace.is_none() && selector.labels.get("app") == Some(&"httpbin".to_string()))
+        );
+    }
+
+    #[test]
+    fn translates_request_authentication_without_selector_to_namespace_scope() {
+        let result = translate_k8s_objects(
+            &[object(
+                "RequestAuthentication",
+                serde_json::json!({
+                    "jwtRules": [{
+                        "issuer": "https://auth.example.com",
+                        "jwksUri": "https://auth.example.com/.well-known/jwks.json"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let ra = &mesh.request_authentications[0];
+        assert!(matches!(
+            &ra.scope,
+            PolicyScope::Namespace { namespace } if namespace == "default"
+        ));
+    }
+
+    #[test]
+    fn root_namespace_telemetry_selector_is_mesh_wide_by_labels() {
+        let mut telemetry = object(
+            "Telemetry",
+            serde_json::json!({
+                "selector": {"matchLabels": {"app": "gateway"}},
+                "tracing": [{"randomSamplingPercentage": 10.0}]
+            }),
+        );
+        telemetry.metadata.namespace = "istio-config".to_string();
+
+        let result = translate_k8s_objects(
+            &[telemetry],
+            options_for_namespace("istio-config")
+                .with_istio_root_namespace("istio-config".to_string()),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let scope = &mesh.telemetry_resources[0].scope;
+        assert!(
+            matches!(scope, PolicyScope::WorkloadSelector { selector } if selector.namespace.is_none() && selector.labels.get("app") == Some(&"gateway".to_string()))
+        );
+    }
+
+    #[test]
+    fn telemetry_header_tags_are_runtime_header_references() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "customTags": {
+                            "tenant": {"header": {"name": "x-tenant"}},
+                            "region": {"literal": {"value": "us-east"}}
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+
+        assert_eq!(tracing.sampling_percentage, None);
+        assert_eq!(
+            tracing.custom_header_tags.get("tenant").map(String::as_str),
+            Some("x-tenant")
+        );
+        assert_eq!(
+            tracing.custom_tags.get("region").map(String::as_str),
+            Some("us-east")
+        );
+        assert!(!tracing.custom_tags.contains_key("tenant"));
+    }
+
+    #[test]
+    fn telemetry_access_log_filter_with_or_is_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{
+                        "filter": {
+                            "expression": "response.code >= 500 || response.duration >= 1000"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("OR filters should fail closed");
+
+        assert!(err.to_string().contains("with '||' are not supported"));
+    }
+
+    #[test]
+    fn telemetry_access_log_duration_gt_preserves_strict_semantics() {
+        let filter = parse_access_log_filter_expression("response.duration > 100")
+            .expect("filter parses")
+            .expect("filter is present");
+
+        assert_eq!(filter.min_latency_ms, Some(101));
+    }
+
+    #[test]
+    fn telemetry_access_log_duration_unsupported_comparator_is_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{
+                        "filter": {
+                            "expression": "response.duration <= 100"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("unsupported duration comparator should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("response.duration filters only support")
+        );
+    }
+
+    #[test]
+    fn telemetry_access_log_repeated_status_predicates_intersect() {
+        let filter =
+            parse_access_log_filter_expression("response.code >= 500 && response.code >= 400")
+                .expect("filter parses")
+                .expect("filter is present");
+
+        assert_eq!(filter.status_code_min, Some(500));
+        assert_eq!(filter.status_code_max, None);
+
+        let filter =
+            parse_access_log_filter_expression("response.code <= 599 && response.code <= 499")
+                .expect("filter parses")
+                .expect("filter is present");
+
+        assert_eq!(filter.status_code_min, None);
+        assert_eq!(filter.status_code_max, Some(499));
+    }
+
+    #[test]
+    fn telemetry_access_log_repeated_duration_predicates_intersect() {
+        let filter = parse_access_log_filter_expression(
+            "response.duration >= 1000 && response.duration >= 500",
+        )
+        .expect("filter parses")
+        .expect("filter is present");
+
+        assert_eq!(filter.min_latency_ms, Some(1000));
+    }
+
+    #[test]
+    fn telemetry_access_log_malformed_status_filter_is_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{
+                        "filter": {
+                            "expression": "response.code != 500"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("malformed status filter should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("response.code filter must use a numeric comparison")
+        );
+    }
+
+    #[test]
+    fn translates_request_authentication_with_empty_jwt_rules() {
+        let result = translate_k8s_objects(
+            &[object("RequestAuthentication", serde_json::json!({}))],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.request_authentications.len(), 1);
+        assert!(mesh.request_authentications[0].jwt_rules.is_empty());
+    }
+
+    #[test]
+    fn translates_request_authentication_with_inline_jwks() {
+        let result = translate_k8s_objects(
+            &[object(
+                "RequestAuthentication",
+                serde_json::json!({
+                    "jwtRules": [{
+                        "issuer": "https://auth.example.com",
+                        "jwks": "{\"keys\":[{\"kty\":\"RSA\"}]}"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let rule = &mesh.request_authentications[0].jwt_rules[0];
+        assert!(rule.jwks_uri.is_none());
+        assert_eq!(rule.jwks.as_deref(), Some("{\"keys\":[{\"kty\":\"RSA\"}]}"));
+    }
+
+    #[test]
+    fn translates_request_authentication_multiple_jwt_rules() {
+        let result = translate_k8s_objects(
+            &[object(
+                "RequestAuthentication",
+                serde_json::json!({
+                    "jwtRules": [
+                        {
+                            "issuer": "https://first.example.com",
+                            "jwksUri": "https://first.example.com/jwks"
+                        },
+                        {
+                            "issuer": "https://second.example.com",
+                            "jwksUri": "https://second.example.com/jwks",
+                            "audiences": ["aud-a", "aud-b"]
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.request_authentications[0].jwt_rules.len(), 2);
+        assert_eq!(
+            mesh.request_authentications[0].jwt_rules[0].issuer,
+            "https://first.example.com"
+        );
+        assert_eq!(
+            mesh.request_authentications[0].jwt_rules[1].audiences,
+            vec!["aud-a", "aud-b"]
+        );
+    }
+
+    #[test]
+    fn rejects_request_authentication_jwt_rule_without_issuer() {
+        let err = translate_k8s_objects(
+            &[object(
+                "RequestAuthentication",
+                serde_json::json!({
+                    "jwtRules": [{
+                        "jwksUri": "https://example.com/jwks"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("missing issuer must fail");
+
+        assert!(err.to_string().contains("issuer is required"));
+    }
+
+    #[test]
+    fn translates_request_authentication_no_warning_emitted() {
+        let result = translate_k8s_objects(
+            &[object(
+                "RequestAuthentication",
+                serde_json::json!({
+                    "jwtRules": [{
+                        "issuer": "https://auth.example.com",
+                        "jwksUri": "https://auth.example.com/jwks"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        // Should NOT emit a warning now that it's fully translated
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("RequestAuthentication"))
+        );
     }
 }

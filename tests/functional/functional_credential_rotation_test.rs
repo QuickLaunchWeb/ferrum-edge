@@ -11,16 +11,11 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_credential_rotation
 
-use crate::common::TestGateway;
-use base64::Engine;
+use crate::common::{TestGateway, empty_digest_header, generate_hmac_signature};
 use chrono::Utc;
-use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
-use sha2::Sha256;
 use std::time::Duration;
-
-type HmacSha256 = Hmac<Sha256>;
 
 // ============================================================================
 // Test Harness — thin wrapper around TestGateway. Subprocess lifecycle, retry,
@@ -140,13 +135,14 @@ async fn put_credential(
     cred_type: &str,
     cred: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let credential_set = serde_json::Value::Array(vec![cred.clone()]);
     let resp = client
         .put(format!(
             "{}/consumers/{}/credentials/{}",
             admin_url, consumer_id, cred_type
         ))
         .header("Authorization", auth)
-        .json(cred)
+        .json(&credential_set)
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -296,14 +292,6 @@ fn generate_consumer_jwt(consumer_username: &str, secret: &str, exp_offset_secs:
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
     let key = EncodingKey::from_secret(secret.as_bytes());
     encode(&header, &claims, &key).expect("Failed to encode JWT")
-}
-
-fn generate_hmac_signature(method: &str, path: &str, date: &str, secret: &str) -> String {
-    let signing_string = format!("{}\n{}\n{}", method, path, date);
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("Failed to create HMAC instance");
-    mac.update(signing_string.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
 /// Config-poll settle delay. The gateway polls SQLite every 2s
@@ -733,9 +721,7 @@ async fn test_credential_rotation_hmac() {
             "scope": "proxy",
             "proxy_id": "rot-hmac-proxy",
             "enabled": true,
-            // Legacy 3-field signing string preserves the existing test
-            // expectations; the digest path has its own dedicated tests.
-            "config": {"clock_skew_seconds": 300, "require_digest": false}
+            "config": {"clock_skew_seconds": 300}
         }),
     )
     .await
@@ -772,6 +758,7 @@ async fn test_credential_rotation_hmac() {
             .get(url)
             .header("Authorization", header)
             .header("Date", date)
+            .header("Digest", empty_digest_header())
             .send()
             .await
             .expect("hmac request failed")

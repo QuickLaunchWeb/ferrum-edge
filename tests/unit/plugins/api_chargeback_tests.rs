@@ -38,7 +38,6 @@ fn make_summary(
         error_class: None,
         body_error_class: None,
         body_completed: false,
-        bytes_streamed_to_client: 0,
         request_bytes: 0,
         response_bytes: 0,
         mirror: false,
@@ -428,13 +427,13 @@ fn test_multiple_pricing_tiers() {
 }
 
 #[test]
-fn test_prometheus_render_namespace_absent_for_default() {
+fn test_prometheus_render_namespace_present_for_default() {
     let registry = ChargebackRegistry::new();
     registry.configure("USD", 5, 3600, 500, "ferrum");
     registry.record("alice", "proxy-1", "API", 200, 0.001);
 
     let output = registry.render_prometheus_uncached();
-    assert!(!output.contains("namespace="));
+    assert!(output.contains(r#"namespace="ferrum""#));
     assert!(output.contains("consumer=\"alice\""));
 }
 

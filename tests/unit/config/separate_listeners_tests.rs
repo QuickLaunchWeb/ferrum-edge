@@ -32,7 +32,7 @@ fn test_listener_scenarios() {
     println!("   - FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH set");
     println!("   - HTTP listener on port 8000");
     println!("   - HTTPS listener on port 8443");
-    println!("   - Use case: Migration period, legacy clients");
+    println!("   - Use case: Transitional HTTP/HTTPS exposure");
     println!();
     println!("3. mTLS + HTTP:");
     println!("   - All TLS variables including FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH");

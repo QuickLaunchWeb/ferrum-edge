@@ -72,7 +72,11 @@ async fn wait_for_admin_https(admin_https_port: u16) -> bool {
 /// Minimal empty-resources YAML spec for file mode.
 fn write_empty_spec(dir: &TempDir) -> PathBuf {
     let p = dir.path().join("resources.yaml");
-    std::fs::write(&p, "proxies: []\nconsumers: []\nplugin_configs: []\n").unwrap();
+    std::fs::write(
+        &p,
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
+    )
+    .unwrap();
     p
 }
 

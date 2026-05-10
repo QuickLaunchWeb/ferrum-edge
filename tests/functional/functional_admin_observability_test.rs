@@ -64,6 +64,7 @@ async fn spawn_slow_backend(delay_ms: u64) -> (u16, Arc<AtomicBool>, tokio::task
 fn file_config_yaml(backend_port: u16) -> String {
     format!(
         r#"
+version: "1"
 proxies:
   - id: "slow-proxy"
     listen_path: "/slow"

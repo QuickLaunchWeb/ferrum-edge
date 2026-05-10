@@ -132,8 +132,8 @@ fn test_default_exceeds_max_rejected() {
 fn test_subtract_gateway_processing_alone_accepted() {
     // Subtracting gateway processing from client-supplied deadlines is a
     // meaningful rule on its own for deployments where clients reliably send
-    // grpc-timeout. Rejecting this config would be a backward-incompatible
-    // regression.
+    // grpc-timeout. Rejecting this config would disable a useful standalone
+    // rule.
     let result = create_plugin(
         "grpc_deadline",
         &json!({ "subtract_gateway_processing": true }),
@@ -255,17 +255,14 @@ async fn test_parse_nanoseconds() {
     let config = json!({ "max_deadline_ms": 999999999 });
     let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
 
-    let mut ctx = create_grpc_context_with_timeout(Some("1000000000n"));
+    let mut ctx = create_grpc_context_with_timeout(Some("10000000n"));
     let mut headers = HashMap::new();
-    headers.insert("grpc-timeout".to_string(), "1000000000n".to_string());
+    headers.insert("grpc-timeout".to_string(), "10000000n".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
-    // 1,000,000,000 ns = 1,000 ms
-    assert_eq!(
-        ctx.metadata.get("grpc_original_deadline_ms").unwrap(),
-        "1000"
-    );
+    // 10,000,000 ns = 10 ms
+    assert_eq!(ctx.metadata.get("grpc_original_deadline_ms").unwrap(), "10");
 }
 
 // ── Default deadline injection ──
@@ -604,20 +601,19 @@ async fn test_empty_string_timeout_treated_as_missing() {
 // ── Very large timeout values (overflow protection) ──
 
 #[tokio::test]
-async fn test_very_large_hour_timeout_saturates() {
+async fn test_more_than_eight_timeout_digits_is_ignored_without_default() {
     let config = json!({ "max_deadline_ms": 999999999 });
     let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
 
-    // u64::MAX / 3600 would overflow without saturating_mul
     let mut ctx = create_grpc_context_with_timeout(Some("999999999H"));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "999999999H".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
-    // Should not panic — saturating_mul prevents overflow
-    assert!(ctx.metadata.contains_key("grpc_original_deadline_ms"));
-    assert_eq!(headers.get("grpc-timeout").unwrap(), "1000000S");
+    assert!(!ctx.metadata.contains_key("grpc_original_deadline_ms"));
+    assert!(!ctx.metadata.contains_key("grpc_adjusted_deadline_ms"));
+    assert_eq!(headers.get("grpc-timeout").unwrap(), "999999999H");
 }
 
 // ── subtract_gateway_processing + max_deadline_ms combined ──

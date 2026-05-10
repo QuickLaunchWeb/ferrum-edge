@@ -100,16 +100,16 @@ FERRUM_MODE=cp \
 FERRUM_ADMIN_READ_ONLY=true \
 FERRUM_DB_URL="postgres://user:pass@localhost/ferrum" \
 FERRUM_ADMIN_JWT_SECRET="admin-secret" \
-cargo run --release
+cargo run --release -- run
 ```
 
 ### Data Plane (Always Read-Only)
 ```bash
 # Data Plane - Admin API is always read-only
 FERRUM_MODE=dp \
-FERRUM_DP_CP_GRPC_URL="http://control-plane:50051" \
+FERRUM_DP_CP_GRPC_URLS="http://control-plane:50051" \
 FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-shared-secret" \
-cargo run --release
+cargo run --release -- run
 ```
 
 ### Database Mode with Read-Only
@@ -119,7 +119,7 @@ FERRUM_MODE=database \
 FERRUM_ADMIN_READ_ONLY=true \
 FERRUM_DB_URL="sqlite://ferrum.db" \
 FERRUM_ADMIN_JWT_SECRET="admin-secret" \
-cargo run --release
+cargo run --release -- run
 ```
 
 ## Input Validation

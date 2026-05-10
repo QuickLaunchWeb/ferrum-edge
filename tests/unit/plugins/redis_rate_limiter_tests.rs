@@ -112,15 +112,15 @@ fn test_url_userinfo_is_preserved_when_no_explicit_credentials() {
 
 #[test]
 fn test_password_only_credential() {
-    // Common Redis 5/legacy pattern: AUTH with no username, just a password.
+    // Common Redis 5 pattern: AUTH with no username, just a password.
     let mut config = make_config("redis://localhost:6379/0", false);
     config.username = None;
-    config.password = Some("legacy-pw".to_string());
+    config.password = Some("redis-pw".to_string());
 
     let (user, pass) =
         redis_client_credentials(config, "redis://localhost:6379/0").expect("build_client");
     assert_eq!(user, None);
-    assert_eq!(pass.as_deref(), Some("legacy-pw"));
+    assert_eq!(pass.as_deref(), Some("redis-pw"));
 }
 
 #[test]

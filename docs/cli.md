@@ -1,6 +1,6 @@
 # CLI Reference
 
-Ferrum Edge provides a command-line interface for running, validating, and managing the gateway. The CLI is fully backwards compatible — invoking `ferrum-edge` with no arguments uses the existing environment-variable-only startup path.
+Ferrum Edge provides a command-line interface for running, validating, and managing the gateway. A subcommand is required.
 
 ## Making the Binary Available
 
@@ -31,8 +31,6 @@ Alternative approaches:
 | `reload` | Send a reload signal (SIGHUP) to a running gateway instance (Unix only) |
 | `health` | Check gateway health by connecting to the admin API `/health` endpoint |
 | `version` | Print version information |
-
-When no subcommand is given, Ferrum Edge falls through to the legacy env-var-only mode. Every existing deployment (Docker, systemd, CI) continues to work unchanged.
 
 ## run
 
@@ -259,8 +257,6 @@ When using CLI subcommands, the configuration resolution order is (highest prece
 4. **Smart path defaults** (see below)
 5. **Hardcoded defaults**
 
-When invoked with no subcommand (legacy mode), CLI flags are not available and the precedence is: env var > conf file > hardcoded default (unchanged from previous behavior).
-
 ## Smart Path Defaults
 
 When `--settings` or `--spec` are omitted and the corresponding env var is not set, the CLI searches well-known locations:
@@ -287,16 +283,10 @@ The first file that exists in the search order is used. If no file is found, the
 - **Absolute paths** are used as-is
 - **Relative paths** are resolved from the current working directory
 
-## Backwards Compatibility
-
-The CLI is fully backwards compatible with existing deployments:
+## Invocation Examples
 
 | Invocation | Behavior |
 |---|---|
-| `ferrum-edge` | Legacy env-var-only mode, identical to pre-CLI behavior |
-| `FERRUM_MODE=file ferrum-edge` | Legacy mode, unchanged |
-| `ferrum-edge run` | CLI mode with smart defaults |
-| `ferrum-edge run --spec resources.yaml` | CLI mode, file mode inferred |
-| `FERRUM_MODE=database ferrum-edge run` | CLI mode, database mode from env var |
-
-Docker, systemd, and CI/CD scripts that set env vars and invoke `ferrum-edge` with no arguments continue to work without modification.
+| `ferrum-edge run` | Start the gateway with smart defaults |
+| `ferrum-edge run --spec resources.yaml` | Start the gateway with file mode inferred |
+| `FERRUM_MODE=database ferrum-edge run` | Start the gateway in database mode from env vars |

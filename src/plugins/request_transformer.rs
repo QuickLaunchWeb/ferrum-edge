@@ -99,14 +99,13 @@ impl RequestTransformer {
                         "request_transformer: rule[{idx}]: rule must be an object"
                     ));
                 }
-                // `target` defaults to "header" only when the field is
-                // ABSENT (backward compat for terse header-only configs).
-                // An explicit `"target": null` — or any non-string value —
-                // is a configuration error. Silently defaulting an explicit
-                // null would mask typos / misconfiguration.
                 let target = match r.get("target") {
                     Some(Value::String(s)) => s.as_str(),
-                    None => "header",
+                    None => {
+                        return Err(format!(
+                            "request_transformer: rule[{idx}]: 'target' is required (expected header/query/body)"
+                        ));
+                    }
                     Some(_) => {
                         return Err(format!(
                             "request_transformer: rule[{idx}]: 'target' must be a string (expected header/query/body)"

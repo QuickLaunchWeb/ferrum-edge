@@ -727,7 +727,6 @@ const SCRUB_DEFAULTS: &[&str] = &[
     "FERRUM_MODE",
     "FERRUM_FILE_CONFIG_PATH",
     "FERRUM_CP_GRPC_LISTEN_ADDR",
-    "FERRUM_DP_CP_GRPC_URL",
     "FERRUM_DP_CP_GRPC_URLS",
     "FERRUM_PROXY_HTTP_PORT",
     "FERRUM_PROXY_HTTPS_PORT",
@@ -853,11 +852,7 @@ async fn build_env(
             if cp_grpc_urls.is_empty() {
                 return Err("mode_dp requires at least one CP gRPC URL".into());
             }
-            if cp_grpc_urls.len() == 1 {
-                env.insert("FERRUM_DP_CP_GRPC_URL".into(), cp_grpc_urls[0].clone());
-            } else {
-                env.insert("FERRUM_DP_CP_GRPC_URLS".into(), cp_grpc_urls.join(","));
-            }
+            env.insert("FERRUM_DP_CP_GRPC_URLS".into(), cp_grpc_urls.join(","));
         }
     }
 

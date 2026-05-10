@@ -32,7 +32,7 @@ pub(crate) type BoxError = ProxyBodyError;
 /// Optionally also carries a [`DeferredTransactionLogger`] that fires
 /// `log_with_mirror` when the body reaches a terminal state — success
 /// (Ready(None)), streaming error (Ready(Some(Err))), or Drop safety net
-/// (client disconnected before completion). `bytes_streamed_to_client` is
+/// (client disconnected before completion). `bytes_streamed` is
 /// tracked via an atomic counter incremented on each data frame.
 pub struct ProxyBody {
     kind: ProxyBodyKind,
@@ -41,7 +41,7 @@ pub struct ProxyBody {
     _request_guard: Option<crate::overload::RequestGuard>,
     /// Deferred logger that fires after body completion, allowing
     /// `TransactionSummary.body_completed` / `body_error_class` /
-    /// `client_disconnected` / `bytes_streamed_to_client` to reflect the
+    /// `client_disconnected` / `bytes_streamed` to reflect the
     /// client-visible outcome rather than values at header-flush time.
     logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>>,
     /// Monotonic byte count streamed to the client. Updated on each
@@ -56,7 +56,7 @@ pub struct ProxyBody {
     /// `CoalescingH3Body`, `DirectH2Body`, or `DirectH3Body`, those inner
     /// adapters MUST count bytes only on receipt from the backend (never on
     /// the flush side of the coalescing buffer). Double-counting on drain
-    /// inflates `bytes_streamed_to_client` / `response_bytes` by the
+    /// inflates `bytes_streamed` / `response_bytes` by the
     /// coalescing overlap — matches the design rule preserved from the
     /// original deferred-log investigation.
     bytes_streamed: AtomicU64,

@@ -217,6 +217,7 @@ async fn test_tcp_passthrough_plain_echo() {
         start_gateway_with_retry(|stream_port, _dir_path| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "tcp-passthrough"
     backend_scheme: tcp
@@ -274,6 +275,7 @@ async fn test_tcp_tls_passthrough_forwards_encrypted_data() {
         start_gateway_with_retry(|stream_port, _dir_path| {
             format!(
                 r#"
+version: "1"
 proxies:
   - id: "tls-passthrough"
     backend_scheme: tcp
@@ -383,6 +385,7 @@ async fn test_tcp_passthrough_sni_peek_timeout_drops_silent_peer() {
             |stream_port, _dir_path| {
                 format!(
                     r#"
+version: "1"
 proxies:
   - id: "tcp-passthrough-slow-loris"
     backend_scheme: tcp
