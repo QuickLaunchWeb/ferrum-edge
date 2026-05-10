@@ -1368,12 +1368,55 @@ mod tests {
             }),
         );
 
-        let result = translate_k8s_objects(&[route, grant], options())
+        let options =
+            options().with_source_namespaces(vec!["default".to_string(), "backend".to_string()]);
+
+        let result = translate_k8s_objects(&[route, grant], options)
             .expect("ReferenceGrant should authorize backendRef");
 
         assert_eq!(
             result.config.proxies[0].backend_host,
             "api.backend.svc.cluster.local"
+        );
+    }
+
+    #[test]
+    fn excluded_namespace_reference_grant_does_not_authorize_included_route() {
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "backendRefs": [{
+                        "name": "api",
+                        "namespace": "backend",
+                        "port": 8080
+                    }]
+                }]
+            }),
+        );
+        let grant = object_in_namespace(
+            "ReferenceGrant",
+            "backend",
+            serde_json::json!({
+                "from": [{
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "HTTPRoute",
+                    "namespace": "default"
+                }],
+                "to": [{
+                    "group": "",
+                    "kind": "Service"
+                }]
+            }),
+        );
+        let options = options().with_source_namespaces(vec!["default".to_string()]);
+
+        let err = translate_k8s_objects(&[route, grant], options)
+            .expect_err("ReferenceGrant from an excluded namespace must not authorize the route");
+
+        assert!(
+            err.to_string()
+                .contains("requires a matching ReferenceGrant")
         );
     }
 
@@ -1407,7 +1450,10 @@ mod tests {
             }),
         );
 
-        let result = translate_k8s_objects(&[route, grant], options())
+        let options =
+            options().with_source_namespaces(vec!["default".to_string(), "backend".to_string()]);
+
+        let result = translate_k8s_objects(&[route, grant], options)
             .expect("ReferenceGrant should authorize TCPRoute backendRef");
 
         assert_eq!(
