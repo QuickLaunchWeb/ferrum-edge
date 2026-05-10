@@ -792,7 +792,7 @@ impl MetricsRegistry {
                 let key = entry.key();
                 let count = entry.value().value.load(Ordering::Relaxed);
                 let proxy_id = escape_label_value(&key.proxy_id);
-                let error_class = escape_label_value(&key.error_class);
+                let error_class = escape_label_value(key.error_class);
                 output.push_str(&format!(
                     "ferrum_mesh_hbone_relay_failures_total{{proxy_id=\"{}\",direction=\"{}\",error_class=\"{}\"{}}} {}\n",
                     proxy_id, key.direction, error_class, ns_label, count
