@@ -532,9 +532,10 @@ async fn handle_ads_response(
 ) -> Result<Option<PendingXdsSlice>, anyhow::Error> {
     let type_url = response.type_url.clone();
     if !is_known_type_url(&type_url) {
-        subscriptions.record_response(&type_url, &response.version_info, &response.nonce);
         let message = format!("unknown xDS response type_url '{type_url}'");
-        send_ads_request(tx, subscriptions.build_nack(&type_url, message.clone())).await?;
+        let mut nack = subscriptions.build_nack(&type_url, message.clone());
+        nack.response_nonce = response.nonce.clone();
+        send_ads_request(tx, nack).await?;
         warn!(
             node_id = %config.node_id,
             type_url = %type_url,
@@ -1080,6 +1081,11 @@ mod tests {
         );
         assert_eq!(nack.response_nonce, "n1");
         assert!(nack.error_detail.is_some());
+        assert!(
+            !state
+                .subscriptions
+                .contains_key("type.googleapis.com/envoy.config.route.v3.ScopedRouteConfiguration")
+        );
     }
 
     #[test]
