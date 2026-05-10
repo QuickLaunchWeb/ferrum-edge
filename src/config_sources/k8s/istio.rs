@@ -989,14 +989,26 @@ fn parse_access_log_filter_expression(expr: &str) -> Result<Option<AccessLogFilt
                 }
                 matched = true;
             }
-        } else if part.starts_with("response.duration")
-            && let Some(val) = extract_numeric_comparison(part)
-        {
+        } else if part.starts_with("response.duration") {
+            let Some(val) = extract_numeric_comparison(part) else {
+                return Err(
+                    "Telemetry access log response.duration filter must use a numeric comparison"
+                        .to_string(),
+                );
+            };
             match val {
-                Comparison::Gte(n) | Comparison::Gt(n) => {
+                Comparison::Gte(n) => {
                     filter.min_latency_ms = Some(duration_value(n)?);
                 }
-                _ => {}
+                Comparison::Gt(n) => {
+                    filter.min_latency_ms = Some(duration_value(comparison_increment(n)?)?);
+                }
+                Comparison::Lte(_) | Comparison::Lt(_) | Comparison::Eq(_) => {
+                    return Err(
+                        "Telemetry access log response.duration filters only support '>' and '>='"
+                            .to_string(),
+                    );
+                }
             }
             matched = true;
         }
@@ -2104,6 +2116,38 @@ mod tests {
         .expect_err("OR filters should fail closed");
 
         assert!(err.to_string().contains("with '||' are not supported"));
+    }
+
+    #[test]
+    fn telemetry_access_log_duration_gt_preserves_strict_semantics() {
+        let filter = parse_access_log_filter_expression("response.duration > 100")
+            .expect("filter parses")
+            .expect("filter is present");
+
+        assert_eq!(filter.min_latency_ms, Some(101));
+    }
+
+    #[test]
+    fn telemetry_access_log_duration_unsupported_comparator_is_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{
+                        "filter": {
+                            "expression": "response.duration <= 100"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("unsupported duration comparator should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("response.duration filters only support")
+        );
     }
 
     #[test]
