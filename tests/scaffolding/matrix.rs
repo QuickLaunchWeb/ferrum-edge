@@ -416,6 +416,7 @@ impl BackendKind {
             "backend_write_timeout_ms": 5000,
         });
         let config = serde_json::json!({
+            "version": "1",
             "proxies": [proxy],
             "consumers": [],
             "upstreams": [],
