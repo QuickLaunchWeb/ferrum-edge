@@ -6,6 +6,8 @@
 
 use std::net::IpAddr;
 
+use crate::config::conf_file::resolve_ferrum_var;
+
 pub const DEFAULT_PROXY_UID: u32 = 1337;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,25 +56,26 @@ impl CaptureConfig {
 
     pub fn from_env() -> Result<Self, String> {
         let mode = CaptureMode::parse(
-            &std::env::var("FERRUM_MESH_CAPTURE_MODE").unwrap_or_else(|_| "explicit".to_string()),
+            &resolve_ferrum_var("FERRUM_MESH_CAPTURE_MODE")
+                .unwrap_or_else(|| "explicit".to_string()),
         )?;
-        let proxy_uid = std::env::var("FERRUM_MESH_PROXY_UID")
-            .ok()
+        let proxy_uid = resolve_ferrum_var("FERRUM_MESH_PROXY_UID")
             .and_then(|v| v.parse::<u32>().ok())
             .or(Some(DEFAULT_PROXY_UID));
         let include_cidrs = parse_cidr_env(
-            &std::env::var("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS")
-                .unwrap_or_else(|_| "0.0.0.0/0".to_string()),
+            &resolve_ferrum_var("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS")
+                .unwrap_or_else(|| "0.0.0.0/0".to_string()),
         );
         validate_cidr_list(&include_cidrs)?;
-        let exclude_cidrs =
-            parse_cidr_env(&std::env::var("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS").unwrap_or_default());
+        let exclude_cidrs = parse_cidr_env(
+            &resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS").unwrap_or_default(),
+        );
         if !exclude_cidrs.is_empty() {
             validate_cidr_list(&exclude_cidrs)?;
         }
         let exclude_ports = parse_port_list(
-            &std::env::var("FERRUM_MESH_CAPTURE_EXCLUDE_PORTS")
-                .unwrap_or_else(|_| "15001,15006,15008,15020".to_string()),
+            &resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_PORTS")
+                .unwrap_or_else(|| "15001,15006,15008,15020".to_string()),
         )?;
         Ok(Self {
             mode,

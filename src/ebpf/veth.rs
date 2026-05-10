@@ -5,6 +5,9 @@
 //! program to the host-side veth peer to redirect inbound packets. This module
 //! resolves the veth interface name from the pod's network namespace.
 
+#[cfg(target_os = "linux")]
+use std::path::Path;
+
 /// Discover the host-side veth interface for a pod by reading its network
 /// namespace link index from `/proc/{pid}/net/` or sysfs.
 ///
