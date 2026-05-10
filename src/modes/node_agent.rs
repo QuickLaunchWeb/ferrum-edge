@@ -18,7 +18,7 @@ use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::ebpf::kernel_probe::{self, KernelProbeResult};
 use crate::ebpf::pod_watcher;
-use crate::ebpf::{EbpfBackend, FallbackMode, MockEbpfBackend, PodAttachmentState};
+use crate::ebpf::{EbpfBackend, FallbackMode, PodAttachmentState};
 
 const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const DEFAULT_BPF_FS_PATH: &str = "/sys/fs/bpf";
@@ -113,14 +113,14 @@ pub async fn run(
 }
 
 fn create_backend() -> Box<dyn EbpfBackend> {
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     {
         Box::new(crate::ebpf::AyaEbpfBackend::new())
     }
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     {
         info!("ebpf feature not enabled, using mock backend");
-        Box::new(MockEbpfBackend::default())
+        Box::new(crate::ebpf::MockEbpfBackend::default())
     }
 }
 
@@ -245,6 +245,7 @@ fn cleanup_all_pods(
 mod tests {
     use super::*;
     use crate::capture::CaptureMode;
+    use crate::ebpf::MockEbpfBackend;
 
     #[test]
     fn initialize_backend_populates_maps() {

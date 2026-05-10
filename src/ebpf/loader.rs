@@ -6,32 +6,34 @@
 
 #![allow(dead_code)]
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use std::collections::HashMap;
-#[cfg(feature = "ebpf")]
-use std::fs::File;
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+use std::fs::{self, File};
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use std::net::Ipv4Addr;
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use std::os::fd::AsFd;
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::Ebpf;
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::programs::{CgroupSockAddr, SchedClassifier, TcAttachType};
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use tracing::{debug, info, warn};
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::maps::BpfMaps;
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::{EbpfBackend, PodInfo};
 
-#[cfg(feature = "ebpf")]
-const BPF_ELF_BYTES: &[u8] =
-    include_bytes!("../../ebpf/target/bpfel-unknown-none/release/ferrum-ebpf");
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+const DEFAULT_BPF_ELF_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf"
+);
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 const CGROUP_PROGRAMS: &[&str] = &[
     "ferrum_connect4",
     "ferrum_connect6",
@@ -39,25 +41,25 @@ const CGROUP_PROGRAMS: &[&str] = &[
     "ferrum_getpeername6",
 ];
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 const TC_PROGRAM: &str = "ferrum_tc_inbound";
 
 /// Tracks per-pod attachment state for cleanup.
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 struct PodLinks {
     cgroup_link_ids: Vec<aya::programs::CgroupSockAddrLinkId>,
     tc_link_ids: Vec<aya::programs::SchedClassifierLinkId>,
 }
 
 /// Real aya-backed eBPF loader. Only available on Linux with `--features ebpf`.
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub struct AyaEbpfBackend {
     bpf: Option<Ebpf>,
     maps: Option<BpfMaps>,
     pod_links: HashMap<String, PodLinks>,
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 impl AyaEbpfBackend {
     pub fn new() -> Self {
         Self {
@@ -80,11 +82,15 @@ impl AyaEbpfBackend {
     }
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 impl EbpfBackend for AyaEbpfBackend {
     fn load_programs(&mut self) -> Result<(), String> {
-        let mut bpf =
-            Ebpf::load(BPF_ELF_BYTES).map_err(|e| format!("Failed to load BPF ELF: {e}"))?;
+        let bpf_elf_path =
+            crate::config::conf_file::resolve_ferrum_var("FERRUM_NODE_AGENT_BPF_ELF_PATH")
+                .unwrap_or_else(|| DEFAULT_BPF_ELF_PATH.to_string());
+        let bpf_elf = fs::read(&bpf_elf_path)
+            .map_err(|e| format!("Failed to read BPF ELF '{bpf_elf_path}': {e}"))?;
+        let mut bpf = Ebpf::load(&bpf_elf).map_err(|e| format!("Failed to load BPF ELF: {e}"))?;
 
         if let Err(e) = aya_log::EbpfLogger::init(&mut bpf) {
             warn!("Failed to initialize eBPF logger (non-fatal): {e}");

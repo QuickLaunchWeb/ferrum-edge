@@ -6,29 +6,35 @@
 
 #![allow(dead_code)]
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv6Addr};
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::Ebpf;
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+use aya::maps::lpm_trie::Key as LpmKey;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::maps::{HashMap as BpfHashMap, LpmTrie, MapData};
-#[cfg(feature = "ebpf")]
-use ferrum_ebpf_common::{CidrKey4, PodInfo as BpfPodInfo};
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+use ferrum_ebpf_common::PodInfo as BpfPodInfo;
+use ferrum_ebpf_common::{CidrKey4, CidrKey6};
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::PodInfo;
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub struct BpfMaps {
     pod_ips: BpfHashMap<MapData, u32, BpfPodInfo>,
     bypass_uids: BpfHashMap<MapData, u32, u8>,
     cidr_exclude4: LpmTrie<MapData, CidrKey4, u8>,
+    cidr_exclude6: LpmTrie<MapData, CidrKey6, u8>,
     cidr_include4: LpmTrie<MapData, CidrKey4, u8>,
+    cidr_include6: LpmTrie<MapData, CidrKey6, u8>,
     port_exclude: BpfHashMap<MapData, u16, u8>,
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 impl BpfMaps {
     pub fn from_ebpf(bpf: &Ebpf) -> Result<Self, String> {
         let pod_ips = BpfHashMap::try_from(
@@ -52,12 +58,26 @@ impl BpfMaps {
         )
         .map_err(|e| format!("FERRUM_CIDR_EXCLUDE4 type mismatch: {e}"))?;
 
+        let cidr_exclude6 = LpmTrie::try_from(
+            bpf.map("FERRUM_CIDR_EXCLUDE6")
+                .ok_or("FERRUM_CIDR_EXCLUDE6 map not found")?
+                .clone(),
+        )
+        .map_err(|e| format!("FERRUM_CIDR_EXCLUDE6 type mismatch: {e}"))?;
+
         let cidr_include4 = LpmTrie::try_from(
             bpf.map("FERRUM_CIDR_INCLUDE4")
                 .ok_or("FERRUM_CIDR_INCLUDE4 map not found")?
                 .clone(),
         )
         .map_err(|e| format!("FERRUM_CIDR_INCLUDE4 type mismatch: {e}"))?;
+
+        let cidr_include6 = LpmTrie::try_from(
+            bpf.map("FERRUM_CIDR_INCLUDE6")
+                .ok_or("FERRUM_CIDR_INCLUDE6 map not found")?
+                .clone(),
+        )
+        .map_err(|e| format!("FERRUM_CIDR_INCLUDE6 type mismatch: {e}"))?;
 
         let port_exclude = BpfHashMap::try_from(
             bpf.map("FERRUM_PORT_EXCLUDE")
@@ -70,7 +90,9 @@ impl BpfMaps {
             pod_ips,
             bypass_uids,
             cidr_exclude4,
+            cidr_exclude6,
             cidr_include4,
+            cidr_include6,
             port_exclude,
         })
     }
@@ -100,17 +122,33 @@ impl BpfMaps {
     }
 
     pub fn insert_cidr_exclude(&self, cidr: &str) -> Result<(), String> {
-        let key = parse_cidr_to_lpm_key(cidr)?;
-        let mut map = self.cidr_exclude4.clone();
-        map.insert(&key, 1u8, 0)
-            .map_err(|e| format!("Failed to insert exclude CIDR '{cidr}': {e}"))
+        match parse_cidr_to_lpm_key(cidr)? {
+            ParsedLpmKey::V4(key) => {
+                let mut map = self.cidr_exclude4.clone();
+                map.insert(&key, 1u8, 0)
+                    .map_err(|e| format!("Failed to insert exclude CIDR '{cidr}': {e}"))
+            }
+            ParsedLpmKey::V6(key) => {
+                let mut map = self.cidr_exclude6.clone();
+                map.insert(&key, 1u8, 0)
+                    .map_err(|e| format!("Failed to insert exclude CIDR '{cidr}': {e}"))
+            }
+        }
     }
 
     pub fn insert_cidr_include(&self, cidr: &str) -> Result<(), String> {
-        let key = parse_cidr_to_lpm_key(cidr)?;
-        let mut map = self.cidr_include4.clone();
-        map.insert(&key, 1u8, 0)
-            .map_err(|e| format!("Failed to insert include CIDR '{cidr}': {e}"))
+        match parse_cidr_to_lpm_key(cidr)? {
+            ParsedLpmKey::V4(key) => {
+                let mut map = self.cidr_include4.clone();
+                map.insert(&key, 1u8, 0)
+                    .map_err(|e| format!("Failed to insert include CIDR '{cidr}': {e}"))
+            }
+            ParsedLpmKey::V6(key) => {
+                let mut map = self.cidr_include6.clone();
+                map.insert(&key, 1u8, 0)
+                    .map_err(|e| format!("Failed to insert include CIDR '{cidr}': {e}"))
+            }
+        }
     }
 
     pub fn insert_port_exclude(&self, port: u16) -> Result<(), String> {
@@ -121,52 +159,116 @@ impl BpfMaps {
 }
 
 /// Parse a CIDR string (e.g. "10.0.0.0/8") into an LPM trie key.
-#[cfg(feature = "ebpf")]
-fn parse_cidr_to_lpm_key(cidr: &str) -> Result<aya::maps::lpm_trie::Key<CidrKey4>, String> {
-    let (addr_str, prefix_str) = cidr
-        .split_once('/')
-        .ok_or_else(|| format!("CIDR '{cidr}' missing prefix length"))?;
-    let addr: std::net::Ipv4Addr = addr_str
-        .parse()
-        .map_err(|e| format!("CIDR '{cidr}' invalid address: {e}"))?;
-    let prefix_len: u32 = prefix_str
-        .parse()
-        .map_err(|e| format!("CIDR '{cidr}' invalid prefix length: {e}"))?;
-
-    let data = CidrKey4::new(u32::from(addr).to_be(), prefix_len);
-    Ok(aya::maps::lpm_trie::Key::new(data.prefix_len, data.addr))
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+enum ParsedLpmKey {
+    V4(LpmKey<CidrKey4>),
+    V6(LpmKey<CidrKey6>),
 }
 
-use ferrum_ebpf_common::CidrKey4;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn parse_cidr_to_lpm_key(cidr: &str) -> Result<ParsedLpmKey, String> {
+    match parse_cidr_to_lpm_key_data(cidr)? {
+        ParsedCidrKey::V4 { prefix_len, data } => {
+            Ok(ParsedLpmKey::V4(LpmKey::new(prefix_len, data)))
+        }
+        ParsedCidrKey::V6 { prefix_len, data } => {
+            Ok(ParsedLpmKey::V6(LpmKey::new(prefix_len, data)))
+        }
+    }
+}
 
-pub fn parse_cidr_to_lpm_key_data(cidr: &str) -> Result<CidrKey4, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsedCidrKey {
+    V4 { prefix_len: u32, data: CidrKey4 },
+    V6 { prefix_len: u32, data: CidrKey6 },
+}
+
+pub fn parse_cidr_to_lpm_key_data(cidr: &str) -> Result<ParsedCidrKey, String> {
     let (addr_str, prefix_str) = cidr
         .split_once('/')
         .ok_or_else(|| format!("CIDR '{cidr}' missing prefix length"))?;
-    let addr: std::net::Ipv4Addr = addr_str
+    let addr: IpAddr = addr_str
         .parse()
         .map_err(|e| format!("CIDR '{cidr}' invalid address: {e}"))?;
     let prefix_len: u32 = prefix_str
         .parse()
         .map_err(|e| format!("CIDR '{cidr}' invalid prefix length: {e}"))?;
 
-    Ok(CidrKey4::new(u32::from(addr).to_be(), prefix_len))
+    match addr {
+        IpAddr::V4(addr) => {
+            if prefix_len > 32 {
+                return Err(format!(
+                    "CIDR '{cidr}' prefix length {prefix_len} exceeds max 32"
+                ));
+            }
+            Ok(ParsedCidrKey::V4 {
+                prefix_len,
+                data: CidrKey4::new(u32::from(addr).to_be()),
+            })
+        }
+        IpAddr::V6(addr) => {
+            if prefix_len > 128 {
+                return Err(format!(
+                    "CIDR '{cidr}' prefix length {prefix_len} exceeds max 128"
+                ));
+            }
+            Ok(ParsedCidrKey::V6 {
+                prefix_len,
+                data: CidrKey6::new(ipv6_to_nbo_words(addr)),
+            })
+        }
+    }
+}
+
+fn ipv6_to_nbo_words(addr: Ipv6Addr) -> [u32; 4] {
+    let octets = addr.octets();
+    [
+        u32::from_ne_bytes([octets[0], octets[1], octets[2], octets[3]]),
+        u32::from_ne_bytes([octets[4], octets[5], octets[6], octets[7]]),
+        u32::from_ne_bytes([octets[8], octets[9], octets[10], octets[11]]),
+        u32::from_ne_bytes([octets[12], octets[13], octets[14], octets[15]]),
+    ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[test]
-    fn parse_cidr_to_lpm_key_valid() {
+    fn parse_cidr_to_lpm_key_valid_ipv4() {
         let key = parse_cidr_to_lpm_key_data("10.0.0.0/8").unwrap();
-        assert_eq!(key.prefix_len, 8);
+        assert_eq!(
+            key,
+            ParsedCidrKey::V4 {
+                prefix_len: 8,
+                data: CidrKey4::new(u32::from(Ipv4Addr::new(10, 0, 0, 0)).to_be()),
+            }
+        );
     }
 
     #[test]
-    fn parse_cidr_to_lpm_key_host() {
+    fn parse_cidr_to_lpm_key_host_ipv4() {
         let key = parse_cidr_to_lpm_key_data("192.168.1.1/32").unwrap();
-        assert_eq!(key.prefix_len, 32);
+        assert_eq!(
+            key,
+            ParsedCidrKey::V4 {
+                prefix_len: 32,
+                data: CidrKey4::new(u32::from(Ipv4Addr::new(192, 168, 1, 1)).to_be()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_cidr_to_lpm_key_valid_ipv6() {
+        let key = parse_cidr_to_lpm_key_data("2001:db8::/32").unwrap();
+        assert_eq!(
+            key,
+            ParsedCidrKey::V6 {
+                prefix_len: 32,
+                data: CidrKey6::new([u32::from_ne_bytes([0x20, 0x01, 0x0d, 0xb8]), 0, 0, 0,]),
+            }
+        );
     }
 
     #[test]
@@ -182,5 +284,11 @@ mod tests {
     #[test]
     fn parse_cidr_invalid_prefix() {
         assert!(parse_cidr_to_lpm_key_data("10.0.0.0/abc").is_err());
+    }
+
+    #[test]
+    fn parse_cidr_rejects_prefix_above_address_width() {
+        assert!(parse_cidr_to_lpm_key_data("10.0.0.0/33").is_err());
+        assert!(parse_cidr_to_lpm_key_data("2001:db8::/129").is_err());
     }
 }
