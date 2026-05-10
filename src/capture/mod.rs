@@ -115,9 +115,6 @@ impl IptablesPlan {
     }
 }
 
-// Phase D keeps the eBPF planner available for the ambient DaemonSet/node-agent
-// integration while the injector path consumes the iptables fallback first.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EbpfPlan {
     pub enabled: bool,
@@ -125,8 +122,6 @@ pub struct EbpfPlan {
     pub required_kernel: &'static str,
 }
 
-// The sidecar injector only needs the iptables fallback in this slice.
-#[allow(dead_code)]
 impl EbpfPlan {
     pub fn for_config(config: &CaptureConfig) -> Self {
         Self {
@@ -135,6 +130,30 @@ impl EbpfPlan {
             required_kernel: "5.7",
         }
     }
+
+    pub fn fallback_script(&self) -> String {
+        let fallback_cmds = self.fallback.commands.join("\n");
+        let (major, minor) = parse_kernel_requirement(self.required_kernel);
+        format!(
+            "MAJOR=$(uname -r | cut -d. -f1)\n\
+             MINOR=$(uname -r | cut -d. -f2)\n\
+             if [ \"$MAJOR\" -lt {major} ] || \
+             {{ [ \"$MAJOR\" -eq {major} ] && [ \"$MINOR\" -lt {minor} ]; }}; then\n\
+             echo \"Kernel $(uname -r) < {req}, falling back to iptables\"\n\
+             {fallback_cmds}\n\
+             else\n\
+             echo \"Kernel $(uname -r) supports eBPF capture, skipping iptables\"\n\
+             fi",
+            req = self.required_kernel,
+        )
+    }
+}
+
+fn parse_kernel_requirement(version: &str) -> (u32, u32) {
+    let mut parts = version.split('.');
+    let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(5);
+    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(7);
+    (major, minor)
 }
 
 // Used by the eBPF node-agent path once it is wired to runtime kernel probing.
@@ -251,6 +270,23 @@ mod tests {
                 .iter()
                 .any(|cmd| cmd.contains("--to-ports 15001"))
         );
+    }
+
+    #[test]
+    fn ebpf_fallback_script_contains_kernel_check_and_iptables() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Ebpf;
+
+        let plan = EbpfPlan::for_config(&config);
+        let script = plan.fallback_script();
+
+        assert!(script.contains("uname -r"));
+        assert!(script.contains("-lt 5"));
+        assert!(script.contains("-lt 7"));
+        assert!(script.contains("falling back to iptables"));
+        assert!(script.contains("supports eBPF"));
+        assert!(script.contains("--to-ports 15001"));
+        assert!(script.contains("--to-ports 15006"));
     }
 
     #[test]
