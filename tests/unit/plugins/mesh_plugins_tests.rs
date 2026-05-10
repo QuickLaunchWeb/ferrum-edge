@@ -779,6 +779,24 @@ async fn workload_metrics_uses_workload_hint_when_peer_identity_absent() {
         Some("spiffe://cluster.local/ns/default/sa/api")
     );
     assert_eq!(
+        ctx.metadata
+            .get("mesh.source.trust_domain")
+            .map(String::as_str),
+        Some("cluster.local")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.namespace")
+            .map(String::as_str),
+        Some("default")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.service_account")
+            .map(String::as_str),
+        Some("api")
+    );
+    assert_eq!(
         ctx.metadata.get("mesh.source.workload").map(String::as_str),
         Some("api")
     );
