@@ -123,7 +123,12 @@ impl EbpfBackend for AyaEbpfBackend {
         Ok(())
     }
 
-    fn attach_cgroup(&mut self, cgroup_path: &str, program: &str) -> Result<(), String> {
+    fn attach_cgroup(
+        &mut self,
+        pod_uid: &str,
+        cgroup_path: &str,
+        program: &str,
+    ) -> Result<(), String> {
         let cgroup_fd = File::open(cgroup_path)
             .map_err(|e| format!("Failed to open cgroup '{cgroup_path}': {e}"))?;
 
@@ -140,7 +145,7 @@ impl EbpfBackend for AyaEbpfBackend {
 
         let links = self
             .pod_links
-            .entry(cgroup_path.to_string())
+            .entry(pod_uid.to_string())
             .or_insert_with(|| PodLinks {
                 cgroup_link_ids: Vec::new(),
                 tc_link_ids: Vec::new(),
@@ -151,7 +156,7 @@ impl EbpfBackend for AyaEbpfBackend {
         Ok(())
     }
 
-    fn attach_tc(&mut self, iface: &str, program: &str) -> Result<(), String> {
+    fn attach_tc(&mut self, pod_uid: &str, iface: &str, program: &str) -> Result<(), String> {
         let bpf = self.bpf_mut()?;
         let prog: &mut SchedClassifier = bpf
             .program_mut(program)
@@ -165,7 +170,7 @@ impl EbpfBackend for AyaEbpfBackend {
 
         let links = self
             .pod_links
-            .entry(iface.to_string())
+            .entry(pod_uid.to_string())
             .or_insert_with(|| PodLinks {
                 cgroup_link_ids: Vec::new(),
                 tc_link_ids: Vec::new(),

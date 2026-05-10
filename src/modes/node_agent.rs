@@ -12,6 +12,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
+use futures_util::StreamExt;
+use k8s_openapi::api::core::v1::Pod;
+use kube::api::Api;
+use kube::runtime::watcher::{self as kube_watcher, Event};
 use tracing::{debug, error, info, warn};
 
 use crate::capture::CaptureConfig;
@@ -154,12 +158,82 @@ async fn run_with_backend(
     let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
     let metrics = NodeAgentMetrics::default();
 
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    let client = build_node_agent_kube_client().await?;
+    let pods: Api<Pod> = Api::all(client);
+    let watcher_config =
+        kube_watcher::Config::default().fields(&format!("spec.nodeName={}", config.node_name));
+    let mut pod_stream = Box::pin(kube_watcher::watcher(pods, watcher_config));
+    let mut init_seen: Option<HashSet<String>> = None;
+
     info!(
-        "Node agent initialized, waiting for pod events on node {}",
+        "Node agent initialized, watching pod events on node {}",
         config.node_name
     );
 
-    wait_for_shutdown(shutdown_tx).await;
+    if !*shutdown_rx.borrow() {
+        loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            event = pod_stream.next() => {
+                match event {
+                    Some(Ok(Event::Apply(pod))) => {
+                        handle_kube_pod_applied(
+                            backend.as_mut(),
+                            &pod_states,
+                            config,
+                            &metrics,
+                            &pod,
+                        );
+                    }
+                    Some(Ok(Event::Delete(pod))) => {
+                        if let Some(uid) = pod_uid(&pod) {
+                            handle_pod_removed(backend.as_mut(), &pod_states, &metrics, &uid);
+                        }
+                    }
+                    Some(Ok(Event::Init)) => {
+                        init_seen = Some(HashSet::new());
+                    }
+                    Some(Ok(Event::InitApply(pod))) => {
+                        if let Some(uid) = handle_kube_pod_applied(
+                            backend.as_mut(),
+                            &pod_states,
+                            config,
+                            &metrics,
+                            &pod,
+                        ) && let Some(seen) = &mut init_seen {
+                            seen.insert(uid);
+                        }
+                    }
+                    Some(Ok(Event::InitDone)) => {
+                        if let Some(seen) = init_seen.take() {
+                            let stale_uids: Vec<String> = pod_states
+                                .iter()
+                                .filter(|entry| !seen.contains(entry.key().as_str()))
+                                .map(|entry| entry.key().clone())
+                                .collect();
+                            for uid in stale_uids {
+                                handle_pod_removed(backend.as_mut(), &pod_states, &metrics, &uid);
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        warn!(error = %e, "Pod watcher error; kube-rs will retry");
+                        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => {
+                        warn!("Pod watcher ended unexpectedly");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    }
 
     info!(
         pods_enrolled = metrics.pods_enrolled.load(Ordering::Relaxed),
@@ -185,7 +259,71 @@ async fn wait_for_shutdown(shutdown_tx: &tokio::sync::watch::Sender<bool>) {
     }
 }
 
-#[allow(dead_code)]
+async fn build_node_agent_kube_client() -> Result<kube::Client, anyhow::Error> {
+    let config = match kube::Config::incluster() {
+        Ok(config) => config,
+        Err(in_cluster_err) => match kube::Config::infer().await {
+            Ok(config) => config,
+            Err(infer_err) => {
+                anyhow::bail!(
+                    "Failed to build Kubernetes client for node_agent mode: \
+                     incluster={in_cluster_err}; inferred={infer_err}"
+                );
+            }
+        },
+    };
+    Ok(kube::Client::try_from(config)?)
+}
+
+fn pod_uid(pod: &Pod) -> Option<String> {
+    pod.metadata.uid.clone()
+}
+
+fn handle_kube_pod_applied(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    pod: &Pod,
+) -> Option<String> {
+    let pod_uid = pod_uid(pod)?;
+    let pod_name = pod.metadata.name.clone().unwrap_or_else(|| pod_uid.clone());
+    let namespace = pod
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let labels: HashMap<String, String> = pod
+        .metadata
+        .labels
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let annotations: HashMap<String, String> = pod
+        .metadata
+        .annotations
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let pod_ip = pod
+        .status
+        .as_ref()
+        .and_then(|status| status.pod_ip.as_deref());
+    let event = PodEvent {
+        pod_uid: &pod_uid,
+        pod_name: &pod_name,
+        namespace: &namespace,
+        labels: &labels,
+        annotations: &annotations,
+        pod_ip_str: pod_ip,
+        pod_pid: None,
+    };
+    handle_pod_added(backend, pod_states, config, metrics, &event);
+    Some(pod_uid)
+}
+
 /// Describes a pod event for enrollment processing.
 pub struct PodEvent<'a> {
     pub pod_uid: &'a str,
@@ -197,7 +335,6 @@ pub struct PodEvent<'a> {
     pub pod_pid: Option<u32>,
 }
 
-#[allow(dead_code)]
 pub fn handle_pod_added(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
@@ -213,6 +350,9 @@ pub fn handle_pod_added(
         &config.excluded_namespaces,
     );
     if decision != EnrollmentDecision::Enroll {
+        if pod_states.contains_key(pod_uid) {
+            handle_pod_removed(backend, pod_states, metrics, pod_uid);
+        }
         debug!(
             pod_uid,
             pod_name, namespace, "Pod does not meet enrollment criteria"
@@ -249,7 +389,7 @@ pub fn handle_pod_added(
         ];
         let mut attach_ok = true;
         for prog in &programs {
-            if let Err(e) = backend.attach_cgroup(cgroup, prog) {
+            if let Err(e) = backend.attach_cgroup(pod_uid, cgroup, prog) {
                 warn!(pod_uid, program = prog, error = %e, "Failed to attach cgroup program");
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                 attach_ok = false;
@@ -258,7 +398,7 @@ pub fn handle_pod_added(
         }
         if attach_ok {
             if let Some(ref iface) = veth_iface
-                && let Err(e) = backend.attach_tc(iface, "ferrum_tc_inbound")
+                && let Err(e) = backend.attach_tc(pod_uid, iface, "ferrum_tc_inbound")
             {
                 warn!(pod_uid, iface, error = %e, "Failed to attach tc program");
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
@@ -268,7 +408,14 @@ pub fn handle_pod_added(
                     proxy_port: config.capture_config.outbound_port,
                     cgroup_id: 0,
                 };
-                let _ = backend.update_pod_ip(ip, &info);
+                if let Err(e) = backend.update_pod_ip(ip, &info) {
+                    warn!(pod_uid, %ip, error = %e, "Failed to update pod IP map");
+                    metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+                    if let Err(detach_err) = backend.detach_pod(pod_uid) {
+                        warn!(pod_uid, error = %detach_err, "Failed to clean up partially attached pod");
+                    }
+                    return;
+                }
             }
             state.attached = true;
             metrics.pods_enrolled.fetch_add(1, Ordering::Relaxed);
@@ -279,6 +426,8 @@ pub fn handle_pod_added(
                 ?pod_ip,
                 "Pod enrolled for eBPF capture"
             );
+        } else if let Err(e) = backend.detach_pod(pod_uid) {
+            warn!(pod_uid, error = %e, "Failed to clean up partially attached pod");
         }
     } else {
         warn!(
@@ -286,9 +435,12 @@ pub fn handle_pod_added(
             pod_name, "Could not resolve cgroup path, skipping attachment"
         );
         metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+        return;
     }
 
-    pod_states.insert(pod_uid.to_string(), state);
+    if state.attached {
+        pod_states.insert(pod_uid.to_string(), state);
+    }
 }
 
 #[allow(dead_code)]
@@ -497,6 +649,45 @@ mod tests {
         backend.load_programs().unwrap();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "test-pod",
+            namespace: "default",
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert!(pod_states.contains_key("pod-uid-1"));
+        assert_eq!(backend.cgroup_attachments.len(), 4);
+        assert!(
+            backend
+                .pod_ips
+                .contains_key(&std::net::Ipv4Addr::new(10, 0, 0, 5))
+        );
+        assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_pod_added_missing_cgroup_does_not_poison_state() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
             capture_config: CaptureConfig::explicit(15006, 15001),
@@ -518,7 +709,8 @@ mod tests {
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
 
-        assert!(pod_states.contains_key("pod-uid-1"));
+        assert!(!pod_states.contains_key("pod-uid-1"));
+        assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -548,6 +740,48 @@ mod tests {
 
         assert!(!pod_states.contains_key("pod-uid-2"));
         assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn handle_pod_added_unenrolls_existing_pod_when_labels_no_longer_match() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        pod_states.insert(
+            "pod-uid-2".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-2".to_string(),
+                pod_name: "mesh-pod".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: None,
+                cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid2".to_string()),
+                veth_iface: None,
+                attached: true,
+            },
+        );
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+        };
+        let event = PodEvent {
+            pod_uid: "pod-uid-2",
+            pod_name: "mesh-pod",
+            namespace: "default",
+            labels: &HashMap::new(),
+            annotations: &HashMap::new(),
+            pod_ip_str: None,
+            pod_pid: None,
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert!(!pod_states.contains_key("pod-uid-2"));
+        assert_eq!(backend.detached_pods, vec!["pod-uid-2"]);
+        assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 1);
     }
 
     #[test]
