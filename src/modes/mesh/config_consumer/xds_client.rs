@@ -322,7 +322,11 @@ pub async fn start_xds_client_with_shutdown(
         let is_primary = current_cp_index == 0;
         let is_fallback = !is_primary && cp_urls.len() > 1;
         let mut stream_shutdown_rx = shutdown_rx.clone();
-        let should_race_primary = is_fallback && config.primary_retry_secs > 0;
+        let should_race_primary = should_race_primary_retry(
+            is_fallback,
+            config.primary_retry_secs,
+            state.has_first_slice(),
+        );
         let result = if should_race_primary {
             tokio::select! {
                 result = connect_ads(
@@ -395,6 +399,14 @@ pub async fn start_xds_client_with_shutdown(
         }
         backoff_secs = next_backoff_secs(backoff_secs, increase_backoff);
     }
+}
+
+fn should_race_primary_retry(
+    is_fallback: bool,
+    primary_retry_secs: u64,
+    has_first_slice: bool,
+) -> bool {
+    is_fallback && primary_retry_secs > 0 && has_first_slice
 }
 
 async fn connect_ads(
@@ -696,10 +708,22 @@ fn reverse_translate(
         .collect();
 
     let mut trust_domains = Vec::new();
+    let mut ignored_sds_names = Vec::new();
     for resource in accumulator.resources(SDS_TYPE_URL) {
-        trust_domains.push(parse_spiffe_bundle_secret_name(&resource.name)?);
+        match parse_spiffe_bundle_secret_name(&resource.name) {
+            Ok(trust_domain) => trust_domains.push(trust_domain),
+            Err(e) => {
+                debug!(
+                    resource_name = %resource.name,
+                    error = %e,
+                    "Ignoring unsupported xDS SDS secret name"
+                );
+                ignored_sds_names.push(resource.name.clone());
+            }
+        }
     }
     log_omitted_sds_trust_domains(trust_domains);
+    log_ignored_sds_resource_names(ignored_sds_names);
 
     Ok(MeshSlice {
         node_id: config.node_id.clone(),
@@ -841,6 +865,20 @@ fn log_omitted_sds_trust_domains(mut trust_domains: Vec<String>) {
     );
 }
 
+fn log_ignored_sds_resource_names(mut names: Vec<String>) {
+    if names.is_empty() {
+        return;
+    }
+
+    names.sort();
+    names.dedup();
+
+    debug!(
+        resource_names = ?names,
+        "Ignored xDS SDS resources with unsupported secret names"
+    );
+}
+
 fn is_known_type_url(type_url: &str) -> bool {
     XDS_TYPE_URLS.contains(&type_url)
 }
@@ -964,6 +1002,14 @@ mod tests {
         let initial: BTreeSet<_> = INITIAL_TYPE_URL_ORDER.iter().copied().collect();
 
         assert_eq!(initial, supported);
+    }
+
+    #[test]
+    fn primary_retry_waits_for_initial_mesh_slice() {
+        assert!(!should_race_primary_retry(true, 300, false));
+        assert!(should_race_primary_retry(true, 300, true));
+        assert!(!should_race_primary_retry(false, 300, true));
+        assert!(!should_race_primary_retry(true, 0, true));
     }
 
     #[test]
@@ -1268,6 +1314,26 @@ mod tests {
         let slice = accumulator
             .try_build_mesh_slice(&test_config())
             .expect("reverse translate succeeds")
+            .expect("all types are present");
+
+        assert!(slice.trust_bundles.is_none());
+    }
+
+    #[test]
+    fn reverse_translate_ignores_unknown_sds_secret_names() {
+        let mut accumulator = ResourceAccumulator::new();
+        accumulator
+            .apply_sotw_response(
+                SDS_TYPE_URL,
+                &[any_resource(SDS_TYPE_URL, "kubernetes://default/api-token")],
+                "v1",
+            )
+            .expect("SDS response applies");
+        apply_all_empty(&mut accumulator);
+
+        let slice = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("unknown SDS names are ignored")
             .expect("all types are present");
 
         assert!(slice.trust_bundles.is_none());
