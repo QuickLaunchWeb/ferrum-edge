@@ -508,7 +508,7 @@ fn inject_mesh_global_plugins(
         &runtime.namespace,
     );
     // Merge applicable Telemetry resources (most specific scope wins per section).
-    let merged_telemetry = merge_applicable_telemetry(mesh_slice, runtime);
+    let merged_telemetry = merge_applicable_telemetry(mesh_slice);
 
     let mut workload_metrics_config = serde_json::json!({
         "node_id": runtime.node_id.clone(),
@@ -573,18 +573,13 @@ fn inject_mesh_global_plugins(
 /// More specific scopes (WorkloadSelector > Namespace > MeshWide) override
 /// less specific ones per config section (tracing, metrics, access_logging
 /// independently). Within the same scope level, later resources win.
-fn merge_applicable_telemetry(
-    mesh_slice: &MeshSlice,
-    runtime: &MeshRuntimeConfig,
-) -> MeshTelemetryConfig {
+fn merge_applicable_telemetry(mesh_slice: &MeshSlice) -> MeshTelemetryConfig {
     use crate::modes::mesh::config::scope_applies_to_workload;
 
     let mut applicable: Vec<(u8, &str, &str, &MeshTelemetryConfig)> = mesh_slice
         .telemetry_resources
         .iter()
-        .filter(|t| {
-            scope_applies_to_workload(&t.scope, &runtime.namespace, &runtime.workload_labels)
-        })
+        .filter(|t| scope_applies_to_workload(&t.scope, &mesh_slice.namespace, &mesh_slice.labels))
         .map(|t| {
             let specificity = match &t.scope {
                 PolicyScope::MeshWide => 0,
@@ -662,7 +657,7 @@ fn inject_mesh_request_auth_plugin(
         .request_authentications
         .iter()
         .filter(|ra| {
-            scope_applies_to_workload(&ra.scope, &runtime.namespace, &runtime.workload_labels)
+            scope_applies_to_workload(&ra.scope, &mesh_slice.namespace, &mesh_slice.labels)
         })
         .collect();
 
@@ -1328,10 +1323,10 @@ mod tests {
     use crate::dns::{DnsCache, DnsConfig};
     use crate::identity::{SpiffeId, TrustDomain};
     use crate::modes::mesh::config::{
-        AppProtocol, EastWestGateway, MeshConfig, MeshJwtRule, MeshPolicy,
-        MeshRequestAuthentication, MeshRule, MeshService, MeshTelemetryResource, MeshTracingConfig,
-        MultiClusterConfig, PolicyAction, PolicyScope, PrincipalMatch, Workload, WorkloadPort,
-        WorkloadSelector,
+        AccessLogFilter, AppProtocol, EastWestGateway, MeshAccessLoggingConfig, MeshConfig,
+        MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule, MeshService,
+        MeshTelemetryResource, MeshTracingConfig, MultiClusterConfig, PolicyAction, PolicyScope,
+        PrincipalMatch, Workload, WorkloadPort, WorkloadSelector,
     };
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
@@ -1788,10 +1783,6 @@ mod tests {
 
     #[test]
     fn telemetry_tracing_merge_preserves_inherited_sampling_for_tag_only_override() {
-        let runtime = MeshRuntimeConfig {
-            workload_labels: HashMap::from([("app".to_string(), "api".to_string())]),
-            ..test_mesh_runtime_config()
-        };
         let mesh_slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
@@ -1844,7 +1835,7 @@ mod tests {
             multi_cluster: None,
         };
 
-        let merged = merge_applicable_telemetry(&mesh_slice, &runtime);
+        let merged = merge_applicable_telemetry(&mesh_slice);
         let tracing = merged.tracing.expect("tracing merged");
 
         assert_eq!(tracing.sampling_percentage, Some(100.0));
@@ -1856,6 +1847,50 @@ mod tests {
             tracing.custom_header_tags.get("tenant").map(String::as_str),
             Some("x-tenant")
         );
+    }
+
+    #[test]
+    fn mesh_runtime_telemetry_uses_mesh_slice_identity_for_native_slices() {
+        let runtime = test_mesh_runtime_config();
+        let mesh_slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            version: chrono::Utc::now().to_rfc3339(),
+            telemetry_resources: vec![MeshTelemetryResource {
+                name: "api-access-log".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
+                config: MeshTelemetryConfig {
+                    access_logging: Some(MeshAccessLoggingConfig {
+                        enabled: true,
+                        filter: Some(AccessLogFilter {
+                            status_code_min: Some(500),
+                            status_code_max: None,
+                            min_latency_ms: None,
+                            errors_only: false,
+                        }),
+                    }),
+                    ..MeshTelemetryConfig::default()
+                },
+            }],
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+        let access_log = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_ACCESS_LOG_PLUGIN_ID)
+            .expect("access_log plugin injected");
+
+        assert_eq!(access_log.config["filter"]["status_code_min"], 500);
     }
 
     async fn wait_for_mesh_authz_label(proxy_state: &ProxyState, key: &str, expected: &str) {
@@ -2458,6 +2493,45 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("providers array");
         assert_eq!(providers.len(), 1);
+        assert_eq!(
+            providers[0].get("issuer").and_then(|v| v.as_str()),
+            Some("https://api-jwt.example.com")
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_request_auth_uses_mesh_slice_identity_for_native_slices() {
+        let runtime = test_mesh_runtime_config();
+        let mesh_slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            version: chrono::Utc::now().to_rfc3339(),
+            request_authentications: vec![test_request_authentication(
+                "api-jwt",
+                PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
+            )],
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+        let jwks = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID)
+            .expect("jwks_auth plugin injected");
+        let providers = jwks
+            .config
+            .get("providers")
+            .and_then(|v| v.as_array())
+            .expect("providers array");
+
         assert_eq!(
             providers[0].get("issuer").and_then(|v| v.as_str()),
             Some("https://api-jwt.example.com")
