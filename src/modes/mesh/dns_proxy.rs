@@ -150,6 +150,7 @@ pub struct DnsResolutionTable {
 }
 
 impl DnsResolutionTable {
+    #[cfg(test)]
     fn empty() -> Self {
         Self::empty_with_response_cache_max_entries(DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES)
     }
