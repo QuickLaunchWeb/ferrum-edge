@@ -384,16 +384,15 @@ pub struct MeshTelemetryConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshTracingConfig {
-    /// Sampling percentage 0.0–100.0. Default 1.0 (= 1%).
-    #[serde(default = "default_tracing_sampling")]
-    pub sampling_percentage: f64,
-    /// Custom tags injected into every span / transaction metadata.
+    /// Sampling percentage 0.0–100.0. `None` inherits from less-specific Telemetry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_percentage: Option<f64>,
+    /// Literal/environment custom tags injected into every span / transaction metadata.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_tags: HashMap<String, String>,
-}
-
-fn default_tracing_sampling() -> f64 {
-    1.0
+    /// Custom tags resolved from request headers at runtime.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub custom_header_tags: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

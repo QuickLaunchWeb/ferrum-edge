@@ -13,6 +13,7 @@ pub mod policy;
 pub mod runtime;
 pub mod slice;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -519,10 +520,15 @@ fn inject_mesh_global_plugins(
     });
     // Apply tracing config from Telemetry CRD
     if let Some(tracing) = &merged_telemetry.tracing {
-        workload_metrics_config["sampling_percentage"] =
-            serde_json::json!(tracing.sampling_percentage);
+        if let Some(sampling_percentage) = tracing.sampling_percentage {
+            workload_metrics_config["sampling_percentage"] = serde_json::json!(sampling_percentage);
+        }
         if !tracing.custom_tags.is_empty() {
             workload_metrics_config["custom_tags"] = serde_json::json!(tracing.custom_tags);
+        }
+        if !tracing.custom_header_tags.is_empty() {
+            workload_metrics_config["custom_header_tags"] =
+                serde_json::json!(tracing.custom_header_tags);
         }
     }
     if let Some(metrics) = &merged_telemetry.metrics {
@@ -601,8 +607,8 @@ fn merge_applicable_telemetry(
 
     let mut merged = MeshTelemetryConfig::default();
     for (_, _, _, config) in &applicable {
-        if config.tracing.is_some() {
-            merged.tracing.clone_from(&config.tracing);
+        if let Some(tracing) = &config.tracing {
+            merge_tracing_config(&mut merged.tracing, tracing);
         }
         if config.metrics.is_some() {
             merged.metrics.clone_from(&config.metrics);
@@ -612,6 +618,29 @@ fn merge_applicable_telemetry(
         }
     }
     merged
+}
+
+fn merge_tracing_config(
+    merged: &mut Option<crate::modes::mesh::config::MeshTracingConfig>,
+    next: &crate::modes::mesh::config::MeshTracingConfig,
+) {
+    let current = merged.get_or_insert_with(|| crate::modes::mesh::config::MeshTracingConfig {
+        sampling_percentage: None,
+        custom_tags: HashMap::new(),
+        custom_header_tags: HashMap::new(),
+    });
+
+    if next.sampling_percentage.is_some() {
+        current.sampling_percentage = next.sampling_percentage;
+    }
+    if !next.custom_tags.is_empty() {
+        current.custom_tags.clone_from(&next.custom_tags);
+    }
+    if !next.custom_header_tags.is_empty() {
+        current
+            .custom_header_tags
+            .clone_from(&next.custom_header_tags);
+    }
 }
 
 /// Inject a `jwks_auth` global plugin when the mesh slice carries applicable
@@ -1300,10 +1329,11 @@ mod tests {
     use crate::identity::{SpiffeId, TrustDomain};
     use crate::modes::mesh::config::{
         AppProtocol, EastWestGateway, MeshConfig, MeshJwtRule, MeshPolicy,
-        MeshRequestAuthentication, MeshRule, MeshService, MultiClusterConfig, PolicyAction,
-        PolicyScope, PrincipalMatch, Workload, WorkloadPort, WorkloadSelector,
+        MeshRequestAuthentication, MeshRule, MeshService, MeshTelemetryResource, MeshTracingConfig,
+        MultiClusterConfig, PolicyAction, PolicyScope, PrincipalMatch, Workload, WorkloadPort,
+        WorkloadSelector,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1754,6 +1784,78 @@ mod tests {
         )
         .expect("ProxyState construction should succeed in tests")
         .0
+    }
+
+    #[test]
+    fn telemetry_tracing_merge_preserves_inherited_sampling_for_tag_only_override() {
+        let runtime = MeshRuntimeConfig {
+            workload_labels: HashMap::from([("app".to_string(), "api".to_string())]),
+            ..test_mesh_runtime_config()
+        };
+        let mesh_slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            workload_spiffe_id: None,
+            labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            version: "test".to_string(),
+            workloads: Vec::new(),
+            services: Vec::new(),
+            mesh_policies: Vec::new(),
+            peer_authentications: Vec::new(),
+            service_entries: Vec::new(),
+            request_authentications: Vec::new(),
+            telemetry_resources: vec![
+                MeshTelemetryResource {
+                    name: "mesh-defaults".to_string(),
+                    namespace: "default".to_string(),
+                    scope: PolicyScope::MeshWide,
+                    config: MeshTelemetryConfig {
+                        tracing: Some(MeshTracingConfig {
+                            sampling_percentage: Some(100.0),
+                            custom_tags: HashMap::new(),
+                            custom_header_tags: HashMap::new(),
+                        }),
+                        ..MeshTelemetryConfig::default()
+                    },
+                },
+                MeshTelemetryResource {
+                    name: "api-tags".to_string(),
+                    namespace: "default".to_string(),
+                    scope: PolicyScope::WorkloadSelector {
+                        selector: WorkloadSelector {
+                            labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                            namespace: Some("default".to_string()),
+                        },
+                    },
+                    config: MeshTelemetryConfig {
+                        tracing: Some(MeshTracingConfig {
+                            sampling_percentage: None,
+                            custom_tags: HashMap::from([("env".to_string(), "prod".to_string())]),
+                            custom_header_tags: HashMap::from([(
+                                "tenant".to_string(),
+                                "x-tenant".to_string(),
+                            )]),
+                        }),
+                        ..MeshTelemetryConfig::default()
+                    },
+                },
+            ],
+            trust_bundles: None,
+            multi_cluster: None,
+        };
+
+        let merged = merge_applicable_telemetry(&mesh_slice, &runtime);
+        let tracing = merged.tracing.expect("tracing merged");
+
+        assert_eq!(tracing.sampling_percentage, Some(100.0));
+        assert_eq!(
+            tracing.custom_tags.get("env").map(String::as_str),
+            Some("prod")
+        );
+        assert_eq!(
+            tracing.custom_header_tags.get("tenant").map(String::as_str),
+            Some("x-tenant")
+        );
     }
 
     async fn wait_for_mesh_authz_label(proxy_state: &ProxyState, key: &str, expected: &str) {

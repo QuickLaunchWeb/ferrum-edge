@@ -34,6 +34,8 @@ pub struct WorkloadMetrics {
     sampling_percentage: f64,
     /// Custom tags injected into every transaction's metadata.
     custom_tags: HashMap<String, String>,
+    /// Custom tags populated from request headers.
+    custom_header_tags: HashMap<String, String>,
     metric_tag_overrides: Vec<MetricTagOverrideConfig>,
     disabled_metrics: Vec<String>,
     sampling_counter: AtomicU64,
@@ -84,6 +86,17 @@ impl WorkloadMetrics {
                     .collect()
             })
             .unwrap_or_default();
+        let custom_header_tags = config
+            .get("custom_header_tags")
+            .and_then(Value::as_object)
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|value| (key.clone(), value.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let (metric_tag_overrides, disabled_metrics) = parse_metric_config(config.get("metrics"))?;
 
         Ok(Self {
@@ -95,6 +108,7 @@ impl WorkloadMetrics {
             trust_domain_aliases,
             sampling_percentage,
             custom_tags,
+            custom_header_tags,
             metric_tag_overrides,
             disabled_metrics,
             sampling_counter: AtomicU64::new(0),
@@ -103,7 +117,7 @@ impl WorkloadMetrics {
 
     fn annotate_http_context(&self, ctx: &mut RequestContext, headers: &HashMap<String, String>) {
         self.insert_common_metadata(&mut ctx.metadata);
-        self.apply_telemetry_metadata(&mut ctx.metadata);
+        self.apply_telemetry_metadata(&mut ctx.metadata, headers);
         let hbone_identity = authenticated_hbone_identity(ctx, headers);
         // For authenticated ambient HBONE, the peer cert identifies the
         // ztunnel, while baggage identifies the originating workload. If the
@@ -187,7 +201,11 @@ impl WorkloadMetrics {
         }
     }
 
-    fn apply_telemetry_metadata(&self, metadata: &mut HashMap<String, String>) {
+    fn apply_telemetry_metadata(
+        &self,
+        metadata: &mut HashMap<String, String>,
+        headers: &HashMap<String, String>,
+    ) {
         if self.sampling_percentage < 100.0 {
             let n = self.sampling_counter.fetch_add(1, Ordering::Relaxed);
             let hash = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -199,6 +217,11 @@ impl WorkloadMetrics {
         }
         for (key, value) in &self.custom_tags {
             metadata.insert(key.clone(), value.clone());
+        }
+        for (key, header_name) in &self.custom_header_tags {
+            if let Some(value) = header_value(headers, header_name) {
+                metadata.insert(key.clone(), value.to_string());
+            }
         }
         for override_config in &self.metric_tag_overrides {
             match override_config {
@@ -290,7 +313,7 @@ impl Plugin for WorkloadMetrics {
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         let metadata = ctx.metadata.get_or_insert_with(Default::default);
         self.insert_common_metadata(metadata);
-        self.apply_telemetry_metadata(metadata);
+        self.apply_telemetry_metadata(metadata, &HashMap::new());
         metadata.insert(
             "mesh.connection_security_policy".to_string(),
             if ctx.tls_client_cert_der.is_some() {
@@ -476,4 +499,33 @@ fn spiffe_path_value<'a>(identity: &'a SpiffeId, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn custom_header_tags_resolve_request_header_values() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "custom_tags": {
+                "literal": "constant"
+            },
+            "custom_header_tags": {
+                "tenant": "x-tenant"
+            }
+        }))
+        .expect("metrics config");
+        let headers = HashMap::from([("X-Tenant".to_string(), "acme".to_string())]);
+        let mut metadata = HashMap::new();
+
+        metrics.apply_telemetry_metadata(&mut metadata, &headers);
+
+        assert_eq!(
+            metadata.get("literal").map(String::as_str),
+            Some("constant")
+        );
+        assert_eq!(metadata.get("tenant").map(String::as_str), Some("acme"));
+    }
 }

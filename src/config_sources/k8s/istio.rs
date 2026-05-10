@@ -820,10 +820,8 @@ fn telemetry(
         .and_then(Value::as_array)
         .and_then(|arr| arr.first())
         .map(|t| {
-            let sampling = t
-                .get("randomSamplingPercentage")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0);
+            let sampling = t.get("randomSamplingPercentage").and_then(Value::as_f64);
+            let mut custom_header_tags = HashMap::new();
             let custom_tags = t
                 .get("customTags")
                 .and_then(Value::as_object)
@@ -831,6 +829,15 @@ fn telemetry(
                     tags.iter()
                         .filter_map(|(key, val)| {
                             // Istio customTags: { tagName: { literal: { value: "v" } } }
+                            if let Some(header_name) = val
+                                .get("header")
+                                .and_then(|h| h.get("name"))
+                                .and_then(Value::as_str)
+                            {
+                                custom_header_tags.insert(key.clone(), header_name.to_string());
+                                return None;
+                            }
+
                             let value = val
                                 .get("literal")
                                 .and_then(|l| l.get("value"))
@@ -838,11 +845,6 @@ fn telemetry(
                                 .or_else(|| {
                                     val.get("environment")
                                         .and_then(|e| e.get("name"))
-                                        .and_then(Value::as_str)
-                                })
-                                .or_else(|| {
-                                    val.get("header")
-                                        .and_then(|h| h.get("name"))
                                         .and_then(Value::as_str)
                                 });
                             value.map(|v| (key.clone(), v.to_string()))
@@ -853,6 +855,7 @@ fn telemetry(
             MeshTracingConfig {
                 sampling_percentage: sampling,
                 custom_tags,
+                custom_header_tags,
             }
         });
 
@@ -950,6 +953,12 @@ fn telemetry(
 /// [`AccessLogFilter`]. Returns `Ok(None)` for unparseable expressions and
 /// `Err` for numeric values that would truncate or wrap.
 fn parse_access_log_filter_expression(expr: &str) -> Result<Option<AccessLogFilter>, String> {
+    if expr.contains("||") {
+        return Err(
+            "Telemetry access log filter expressions with '||' are not supported".to_string(),
+        );
+    }
+
     let mut filter = AccessLogFilter {
         status_code_min: None,
         status_code_max: None,
@@ -2038,6 +2047,63 @@ mod tests {
         assert!(
             matches!(scope, PolicyScope::WorkloadSelector { selector } if selector.namespace.is_none() && selector.labels.get("app") == Some(&"gateway".to_string()))
         );
+    }
+
+    #[test]
+    fn telemetry_header_tags_are_runtime_header_references() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "customTags": {
+                            "tenant": {"header": {"name": "x-tenant"}},
+                            "region": {"literal": {"value": "us-east"}}
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+
+        assert_eq!(tracing.sampling_percentage, None);
+        assert_eq!(
+            tracing.custom_header_tags.get("tenant").map(String::as_str),
+            Some("x-tenant")
+        );
+        assert_eq!(
+            tracing.custom_tags.get("region").map(String::as_str),
+            Some("us-east")
+        );
+        assert!(!tracing.custom_tags.contains_key("tenant"));
+    }
+
+    #[test]
+    fn telemetry_access_log_filter_with_or_is_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{
+                        "filter": {
+                            "expression": "response.code >= 500 || response.duration >= 1000"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("OR filters should fail closed");
+
+        assert!(err.to_string().contains("with '||' are not supported"));
     }
 
     #[test]
