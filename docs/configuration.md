@@ -210,6 +210,19 @@ The Istio `AuthorizationPolicy` translator only consumes the four positive-match
 
 The injector copies non-secret mesh sidecar control-plane env vars from its own environment into injected containers when set: `FERRUM_DP_CP_GRPC_URLS`, `FERRUM_CP_DP_GRPC_JWT_ISSUER`, DP gRPC TLS vars, and `FERRUM_MESH_CONFIG_PROTOCOL`. It does not copy plaintext `FERRUM_CP_DP_GRPC_JWT_SECRET`; set `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` and `FERRUM_INJECTOR_JWT_SECRET_REF_KEY` to inject that variable via `valueFrom.secretKeyRef`.
 
+### Node Agent
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FERRUM_NODE_AGENT_NODE_NAME` | Yes (node_agent) | — | Kubernetes node name, set via downward API (`spec.nodeName`) |
+| `FERRUM_NODE_AGENT_CGROUP_ROOT` | No | `/sys/fs/cgroup` | cgroup v2 mount point for pod cgroup resolution |
+| `FERRUM_NODE_AGENT_BPF_FS_PATH` | No | `/sys/fs/bpf` | BPF filesystem mount point for pinned maps |
+| `FERRUM_NODE_AGENT_FALLBACK_MODE` | No | `iptables` | Behavior on kernel < 5.7: `iptables` or `fail` |
+| `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES` | No | — | Extra namespaces to exclude from capture (comma-separated; `kube-system`, `kube-public`, `kube-node-lease` always excluded) |
+| `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | No | `0.0.0.0/0` | CIDRs to capture for outbound traffic (comma-separated) |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | No | — | CIDRs to exclude from outbound capture (comma-separated, highest priority) |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | No | `15001,15006,15008,15020` | Destination ports to exclude from capture (comma-separated) |
+
 ### Migration
 
 | Variable | Required | Default | Description |
