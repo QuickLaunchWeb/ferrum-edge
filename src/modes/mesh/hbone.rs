@@ -114,25 +114,113 @@ pub fn parse_baggage_values<'a>(
 }
 
 fn parse_baggage_header_into(raw: &str, baggage: &mut BTreeMap<String, String>) {
-    for member in raw.split(',') {
-        let Some((key, value_and_params)) = member.trim().split_once('=') else {
+    for member in split_baggage_members(raw) {
+        let Some((key, value_and_params)) = split_once_quoted(member.trim(), '=') else {
             continue;
         };
         let key = key.trim();
         if key.is_empty() {
             continue;
         }
-        let value = value_and_params
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .trim_matches('"');
+        let value = unquote_baggage_value(
+            split_once_quoted(value_and_params, ';')
+                .map(|(value, _)| value)
+                .unwrap_or(value_and_params)
+                .trim(),
+        );
         if value.is_empty() {
             continue;
         }
-        baggage.insert(key.to_string(), decode_baggage_value(value));
+        baggage.insert(key.to_string(), decode_baggage_value(&value));
     }
+}
+
+fn split_baggage_members(raw: &str) -> Vec<&str> {
+    split_quoted(raw, ',').unwrap_or_else(|| raw.split(',').collect())
+}
+
+fn split_quoted(raw: &str, delimiter: char) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for (idx, ch) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_quotes && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if ch == delimiter && !in_quotes {
+            parts.push(&raw[start..idx]);
+            start = idx + ch.len_utf8();
+        }
+    }
+
+    if in_quotes || escaped {
+        return None;
+    }
+
+    parts.push(&raw[start..]);
+    Some(parts)
+}
+
+fn split_once_quoted(raw: &str, delimiter: char) -> Option<(&str, &str)> {
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for (idx, ch) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_quotes && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if ch == delimiter && !in_quotes {
+            return Some((&raw[..idx], &raw[idx + ch.len_utf8()..]));
+        }
+    }
+
+    None
+}
+
+fn unquote_baggage_value(value: &str) -> String {
+    let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return value.to_string();
+    };
+
+    let mut unquoted = String::with_capacity(inner.len());
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if escaped {
+            unquoted.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            unquoted.push(ch);
+        }
+    }
+    if escaped {
+        unquoted.push('\\');
+    }
+    unquoted
 }
 
 fn decode_baggage_value(value: &str) -> String {
@@ -245,7 +333,8 @@ pub fn strip_egress_baggage_in_vec(headers: &mut Vec<(String, String)>, key_pref
 /// Filter a W3C `baggage` header value, removing any member whose key starts
 /// with one of the given prefixes. Member text — including any `;props`
 /// segment — is preserved verbatim for survivors so end-to-end tracing
-/// baggage round-trips unchanged.
+/// baggage round-trips unchanged. Splitting is quote-aware, so user-defined
+/// baggage values such as `trace.note="x, y"` survive with their comma intact.
 ///
 /// Returns `Some(filtered)` when at least one member survives. Returns `None`
 /// when every member matched a prefix; the caller should remove the header
@@ -256,22 +345,17 @@ pub fn strip_egress_baggage_in_vec(headers: &mut Vec<(String, String)>, key_pref
 /// case-sensitive on the key, since W3C baggage keys use the `token`
 /// grammar (RFC 7230) which is also case-sensitive in baggage.
 ///
-/// Limitation: members carrying commas inside quoted values (`a="x, y"`) are
-/// split incorrectly — this matches the existing baggage parser's behavior
-/// (it also splits unconditionally on `,`). Operators relying on quoted-comma
-/// values should not configure egress strip until both parsers gain quoted
-/// awareness.
 pub fn filter_baggage_header(raw: &str, key_prefixes: &[String]) -> Option<String> {
     if key_prefixes.is_empty() {
         return Some(raw.to_string());
     }
     let mut survivors: Vec<&str> = Vec::new();
-    for member in raw.split(',') {
+    for member in split_baggage_members(raw) {
         let trimmed = member.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let key = match trimmed.split_once('=') {
+        let key = match split_once_quoted(trimmed, '=') {
             Some((key, _)) => key.trim(),
             None => {
                 // Malformed (no '='). Match the existing parser's
@@ -354,6 +438,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_baggage_quoted_value_with_comma() {
+        let identity = HboneIdentity::from_baggage_header(
+            "trace.note=\"alpha, beta\",source.principal=spiffe://cluster.local/ns/default/sa/client",
+        );
+
+        assert_eq!(
+            identity.baggage.get("trace.note").map(String::as_str),
+            Some("alpha, beta")
+        );
+        assert_eq!(
+            identity.source_principal.as_ref().map(ToString::to_string),
+            Some("spiffe://cluster.local/ns/default/sa/client".to_string())
+        );
+    }
+
+    #[test]
     fn filter_baggage_header_empty_prefixes_returns_input_unchanged() {
         let prefixes: Vec<String> = Vec::new();
         assert_eq!(
@@ -389,6 +489,30 @@ mod tests {
                 &prefixes,
             ),
             Some("userid=alice;ttl=300".to_string())
+        );
+    }
+
+    #[test]
+    fn filter_baggage_header_preserves_quoted_comma_on_survivors() {
+        let prefixes = vec!["source.".to_string()];
+        assert_eq!(
+            filter_baggage_header(
+                "trace.note=\"alpha, beta\",source.principal=spiffe://x",
+                &prefixes,
+            ),
+            Some("trace.note=\"alpha, beta\"".to_string())
+        );
+    }
+
+    #[test]
+    fn filter_baggage_header_strips_after_unterminated_quote() {
+        let prefixes = vec!["source.".to_string()];
+        assert_eq!(
+            filter_baggage_header(
+                "trace.note=\"alpha,source.principal=spiffe://x,userid=alice",
+                &prefixes,
+            ),
+            Some("trace.note=\"alpha,userid=alice".to_string())
         );
     }
 
