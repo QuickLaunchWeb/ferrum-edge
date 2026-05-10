@@ -3,7 +3,9 @@
 //! Same logic as connect4 but for IPv6. Rewrites destination to [::1]:15001.
 
 use aya_ebpf::macros::cgroup_sock_addr;
+use aya_ebpf::maps::lpm_trie::Key as LpmKey;
 use aya_ebpf::programs::SockAddrContext;
+use aya_ebpf::EbpfContext;
 
 use crate::maps::{
     FERRUM_BYPASS_UIDS, FERRUM_CIDR_EXCLUDE6, FERRUM_CIDR_INCLUDE6, FERRUM_ORIG_DST6,
@@ -25,7 +27,7 @@ pub fn ferrum_connect6(ctx: SockAddrContext) -> i32 {
 fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
     let sock_addr = unsafe { &*ctx.sock_addr };
 
-    let uid = (unsafe { aya_ebpf::helpers::bpf_get_current_uid_gid() } & 0xFFFFFFFF) as u32;
+    let uid = (aya_ebpf::helpers::bpf_get_current_uid_gid() & 0xFFFFFFFF) as u32;
     if unsafe { FERRUM_BYPASS_UIDS.get(&uid) }.is_some() {
         return Ok(1);
     }
@@ -37,13 +39,13 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         return Ok(1);
     }
 
-    let exclude_key = CidrKey6::host(dst_ip);
-    if unsafe { FERRUM_CIDR_EXCLUDE6.get(&exclude_key) }.is_some() {
+    let exclude_key = LpmKey::new(128, CidrKey6::host(dst_ip));
+    if FERRUM_CIDR_EXCLUDE6.get(&exclude_key).is_some() {
         return Ok(1);
     }
 
-    let include_key = CidrKey6::host(dst_ip);
-    if unsafe { FERRUM_CIDR_INCLUDE6.get(&include_key) }.is_none() {
+    let include_key = LpmKey::new(128, CidrKey6::host(dst_ip));
+    if FERRUM_CIDR_INCLUDE6.get(&include_key).is_none() {
         return Ok(1);
     }
 
@@ -54,7 +56,7 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         port: dst_port as u32,
         _pad: 0,
     };
-    let _ = unsafe { FERRUM_ORIG_DST6.insert(&key, &orig, 0) };
+    let _ = FERRUM_ORIG_DST6.insert(&key, &orig, 0);
 
     let sock_addr = unsafe { &mut *ctx.sock_addr };
     sock_addr.user_ip6 = IPV6_LOOPBACK_NBO;

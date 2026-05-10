@@ -43,22 +43,21 @@ pub struct PodInfo {
     pub _pad: u32,
 }
 
-/// IPv4 CIDR key for `FERRUM_CIDR_INCLUDE` / `FERRUM_CIDR_EXCLUDE` LPM tries.
+/// IPv4 address payload for `FERRUM_CIDR_INCLUDE` / `FERRUM_CIDR_EXCLUDE`.
 ///
-/// `prefix_len` must be the first field — the BPF LPM trie uses it for
-/// longest-prefix matching.
+/// Aya's LPM trie wrapper stores the leading `prefix_len` separately in
+/// `aya_ebpf::maps::lpm_trie::Key`, so this shared payload intentionally holds
+/// only address bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CidrKey4 {
-    pub prefix_len: u32,
     pub addr: u32,
 }
 
-/// IPv6 CIDR key for LPM tries.
+/// IPv6 address payload for LPM trie keys.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CidrKey6 {
-    pub prefix_len: u32,
     pub addr: [u32; 4],
 }
 
@@ -76,30 +75,24 @@ pub const IPV4_LOOPBACK_NBO: u32 = u32::from_ne_bytes([127, 0, 0, 1]);
 pub const IPV6_LOOPBACK_NBO: [u32; 4] = [0, 0, 0, u32::from_ne_bytes([0, 0, 0, 1])];
 
 impl CidrKey4 {
-    /// Build an LPM key from a host-order IPv4 address and prefix length.
-    pub const fn new(addr_nbo: u32, prefix_len: u32) -> Self {
-        Self {
-            prefix_len,
-            addr: addr_nbo,
-        }
+    /// Build an LPM key payload from a network-byte-order IPv4 address.
+    pub const fn new(addr_nbo: u32) -> Self {
+        Self { addr: addr_nbo }
     }
 
     /// Full /32 match for a single IPv4 address.
     pub const fn host(addr_nbo: u32) -> Self {
-        Self::new(addr_nbo, 32)
+        Self::new(addr_nbo)
     }
 }
 
 impl CidrKey6 {
-    pub const fn new(addr_nbo: [u32; 4], prefix_len: u32) -> Self {
-        Self {
-            prefix_len,
-            addr: addr_nbo,
-        }
+    pub const fn new(addr_nbo: [u32; 4]) -> Self {
+        Self { addr: addr_nbo }
     }
 
     pub const fn host(addr_nbo: [u32; 4]) -> Self {
-        Self::new(addr_nbo, 128)
+        Self::new(addr_nbo)
     }
 }
 
@@ -115,8 +108,8 @@ mod tests {
         assert_eq!(mem::size_of::<OrigDst4>(), 8);
         assert_eq!(mem::size_of::<OrigDst6>(), 24);
         assert_eq!(mem::size_of::<PodInfo>(), 8);
-        assert_eq!(mem::size_of::<CidrKey4>(), 8);
-        assert_eq!(mem::size_of::<CidrKey6>(), 20);
+        assert_eq!(mem::size_of::<CidrKey4>(), 4);
+        assert_eq!(mem::size_of::<CidrKey6>(), 16);
     }
 
     #[test]
@@ -133,20 +126,19 @@ mod tests {
     #[test]
     fn cidr_key4_host() {
         let key = CidrKey4::host(0x0a000001);
-        assert_eq!(key.prefix_len, 32);
         assert_eq!(key.addr, 0x0a000001);
     }
 
     #[test]
     fn cidr_key4_subnet() {
-        let key = CidrKey4::new(0x0a000000, 8);
-        assert_eq!(key.prefix_len, 8);
+        let key = CidrKey4::new(0x0a000000);
+        assert_eq!(key.addr, 0x0a000000);
     }
 
     #[test]
     fn cidr_key6_host() {
         let key = CidrKey6::host([0, 0, 0, u32::from_be(1)]);
-        assert_eq!(key.prefix_len, 128);
+        assert_eq!(key.addr, [0, 0, 0, u32::from_be(1)]);
     }
 
     #[test]
