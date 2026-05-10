@@ -118,7 +118,9 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        pool_max_requests_per_connection: None,
         upstream_id: None,
+        upstream_subset: None,
         api_spec_id: None,
         circuit_breaker: None,
         retry: None,
@@ -191,6 +193,7 @@ fn create_test_upstream(id: &str, name: &str) -> Upstream {
         hash_on_cookie_config: None,
         health_checks: None,
         service_discovery: None,
+        subsets: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
@@ -296,6 +299,7 @@ async fn test_list_proxies_falls_back_to_cached_config() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -340,6 +344,7 @@ async fn test_list_consumers_falls_back_to_cached_config() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -379,6 +384,7 @@ async fn test_list_plugin_configs_falls_back_to_cached_config() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -422,6 +428,7 @@ async fn test_get_proxy_by_id_falls_back_to_cached_config() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -460,6 +467,7 @@ async fn test_get_proxy_not_found_in_cache() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -496,6 +504,7 @@ async fn test_get_consumer_by_id_falls_back_to_cached_config() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -534,6 +543,7 @@ async fn test_get_consumer_not_found_in_cache() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -570,6 +580,7 @@ async fn test_get_plugin_config_by_id_falls_back_to_cached_config() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -609,6 +620,7 @@ async fn test_get_plugin_config_not_found_in_cache() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -645,6 +657,7 @@ async fn test_list_proxies_no_db_no_cache_returns_503() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -684,6 +697,7 @@ async fn test_list_consumers_no_db_no_cache_returns_503() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -723,6 +737,7 @@ async fn test_get_proxy_no_db_no_cache_returns_503() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -766,6 +781,7 @@ async fn test_health_endpoint_shows_cached_config_info() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -810,6 +826,7 @@ async fn test_health_endpoint_shows_no_cached_config() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -852,6 +869,7 @@ async fn test_health_endpoint_returns_503_until_startup_is_ready() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -906,6 +924,7 @@ async fn test_cached_config_reflects_live_updates() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -1009,6 +1028,7 @@ fn create_pagination_admin_state(tc: &TestConfig) -> AdminState {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -1225,6 +1245,7 @@ async fn create_db_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDi
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -1303,6 +1324,7 @@ async fn create_db_admin_state_with_availability(
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -1435,6 +1457,7 @@ async fn test_batch_create_read_only_rejected() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -1754,6 +1777,7 @@ async fn test_restore_read_only_rejected() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -1905,6 +1929,7 @@ async fn test_list_upstreams_falls_back_to_cached_config() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -1949,6 +1974,7 @@ async fn test_get_upstream_by_id_falls_back_to_cached_config() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -1987,6 +2013,7 @@ async fn test_get_upstream_not_found_in_cache() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -2021,6 +2048,7 @@ async fn test_list_upstreams_no_db_no_cache_returns_503() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -2060,6 +2088,7 @@ async fn test_get_upstream_no_db_no_cache_returns_503() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -2226,6 +2255,66 @@ async fn test_upstream_delete_referenced_by_proxy_returns_409() {
     );
 }
 
+#[tokio::test]
+async fn test_upstream_update_rejects_removing_referenced_subset() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "id": "subset-u1",
+        "name": "subset-upstream",
+        "targets": [
+            {"host": "10.0.0.1", "port": 8080, "weight": 100, "tags": {"version": "stable"}},
+            {"host": "10.0.0.2", "port": 8080, "weight": 100, "tags": {"version": "canary"}}
+        ],
+        "subsets": [
+            {"name": "stable", "labels": {"version": "stable"}},
+            {"name": "canary", "labels": {"version": "canary"}}
+        ]
+    });
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201, "Create upstream failed: {:?}", body);
+
+    let proxy = json!({
+        "id": "subset-p1",
+        "listen_path": "/subset-test",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+        "upstream_id": "subset-u1",
+        "upstream_subset": "canary"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create proxy failed: {:?}", body);
+
+    let updated = json!({
+        "id": "subset-u1",
+        "name": "subset-upstream",
+        "targets": [
+            {"host": "10.0.0.1", "port": 8080, "weight": 100, "tags": {"version": "stable"}},
+            {"host": "10.0.0.2", "port": 8080, "weight": 100, "tags": {"version": "canary"}}
+        ],
+        "subsets": [
+            {"name": "stable", "labels": {"version": "stable"}}
+        ]
+    });
+    let (status, body) = admin_put(&base_url, "/upstreams/subset-u1", &token, &updated).await;
+    assert_eq!(
+        status, 400,
+        "Should reject removing a subset referenced by a proxy: {:?}",
+        body
+    );
+    let error = body["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("cannot remove subset 'canary'") && error.contains("subset-p1"),
+        "Error should identify the referenced subset and proxy: {:?}",
+        body
+    );
+}
+
 // ============================================================================
 // DB Outage Write Blocking Tests (503 via db_available flag)
 // ============================================================================
@@ -2377,6 +2466,7 @@ async fn test_backup_falls_back_to_cached_config_when_no_db() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -2420,6 +2510,7 @@ async fn test_backup_no_db_no_cache_returns_503() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -2462,6 +2553,7 @@ async fn test_create_proxy_returns_503_when_no_db() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -2501,6 +2593,7 @@ async fn test_create_upstream_returns_503_when_no_db() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -2586,6 +2679,7 @@ async fn test_cached_config_reflects_upstream_updates() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -2847,6 +2941,7 @@ async fn test_health_endpoint_shows_db_availability() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -3006,6 +3101,7 @@ async fn test_cluster_endpoint_requires_auth() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -3044,6 +3140,7 @@ async fn test_cluster_endpoint_cp_mode_empty_registry() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: Some(registry),
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -3097,6 +3194,7 @@ async fn test_cluster_endpoint_cp_mode_with_connected_dps() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: Some(registry),
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -3150,6 +3248,7 @@ async fn test_cluster_endpoint_dp_mode_connected() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: Some(conn_state),
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -3190,6 +3289,7 @@ async fn test_cluster_endpoint_dp_mode_disconnected() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: Some(conn_state),
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,
@@ -3226,6 +3326,7 @@ async fn test_cluster_endpoint_database_mode() {
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
+        mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
         admin_tls_handshake_timeout_seconds: 10,

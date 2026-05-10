@@ -15,9 +15,6 @@ use tonic::transport::server::ServerTlsConfig;
 use tonic::transport::{Certificate, Identity, Server};
 
 use ferrum_edge::config::db_loader::IncrementalResult;
-use ferrum_edge::config::mesh::{
-    AppProtocol, MeshConfig, MeshService, ServicePort, Workload, WorkloadPort, WorkloadSelector,
-};
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, LoadBalancerAlgorithm, Proxy,
     Upstream, UpstreamTarget,
@@ -25,7 +22,11 @@ use ferrum_edge::config::types::{
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::grpc::cp_server::CpGrpcServer;
 use ferrum_edge::grpc::dp_client::{self, DpGrpcTlsConfig, GrpcJwtSecret};
+use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
+use ferrum_edge::modes::mesh::config::{
+    AppProtocol, MeshConfig, MeshService, ServicePort, Workload, WorkloadPort, WorkloadSelector,
+};
 use ferrum_edge::modes::mesh::config_consumer::native_client::{
     NativeMeshClientConfig, start_native_mesh_client_with_shutdown,
 };
@@ -80,7 +81,9 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        pool_max_requests_per_connection: None,
         upstream_id: None,
+        upstream_subset: None,
         api_spec_id: None,
         circuit_breaker: None,
         retry: None,
@@ -301,7 +304,9 @@ async fn start_test_cp_server(
     tokio::task::JoinHandle<()>,
 ) {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
-    let (server, update_tx) = CpGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
+    let (server, update_tx) = CpGrpcServer::new(config_arc.clone(), TEST_JWT_SECRET.to_string());
+    let (mesh_server, _mesh_update_tx) =
+        MeshGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
 
     // Bind to port 0 to get a random available port
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -311,6 +316,7 @@ async fn start_test_cp_server(
     let handle = tokio::spawn(async move {
         Server::builder()
             .add_service(server.into_service())
+            .add_service(mesh_server.into_service())
             .serve_with_incoming(incoming)
             .await
             .expect("gRPC server failed");
@@ -387,7 +393,7 @@ async fn test_mesh_subscribe_receives_initial_mesh_slice() {
             .await
             .unwrap();
     let mut client =
-        ferrum_edge::grpc::proto::config_sync_client::ConfigSyncClient::with_interceptor(
+        ferrum_edge::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient::with_interceptor(
             channel,
             move |mut req: tonic::Request<()>| {
                 req.metadata_mut().insert(
@@ -407,7 +413,8 @@ async fn test_mesh_subscribe_receives_initial_mesh_slice() {
     });
     let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
     let update = stream.message().await.unwrap().unwrap();
-    let slice: ferrum_edge::xds::MeshSlice = serde_json::from_str(&update.mesh_slice_json).unwrap();
+    let slice: ferrum_edge::modes::mesh::slice::MeshSlice =
+        serde_json::from_str(&update.mesh_slice_json).unwrap();
 
     assert_eq!(slice.node_id, "mesh-node");
     assert_eq!(slice.services.len(), 1);
@@ -723,6 +730,29 @@ macro_rules! connect_client_with_token {
     }};
 }
 
+macro_rules! connect_mesh_client_with_token {
+    ($bound_addr:expr, $token:expr) => {{
+        let channel = tonic::transport::Channel::from_shared(format!(
+            "http://127.0.0.1:{}",
+            $bound_addr.port()
+        ))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+        let token_meta: tonic::metadata::MetadataValue<_> =
+            format!("Bearer {}", $token).parse().unwrap();
+        ferrum_edge::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient::with_interceptor(
+            channel,
+            move |mut req: tonic::Request<()>| {
+                req.metadata_mut()
+                    .insert("authorization", token_meta.clone());
+                Ok(req)
+            },
+        )
+    }};
+}
+
 /// Default issuer used by `start_test_cp_server`'s `CpGrpcServer::new()` path.
 const TEST_DEFAULT_ISSUER: &str = "ferrum-edge-cp-dp";
 
@@ -805,7 +835,7 @@ async fn test_mesh_subscribe_rejects_token_with_wrong_issuer() {
         "some-other-service",
     )
     .unwrap();
-    let mut client = connect_client_with_token!(addr, token);
+    let mut client = connect_mesh_client_with_token!(addr, token);
 
     let request = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
         node_id: "mesh-iss-bad".to_string(),
@@ -2094,6 +2124,7 @@ fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
         hash_on_cookie_config: None,
         health_checks: None,
         service_discovery: None,
+        subsets: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
@@ -2751,12 +2782,21 @@ async fn start_test_cp_server_with_namespace(
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
     let registry = Arc::new(ferrum_edge::grpc::cp_server::DpNodeRegistry::new());
     let (server, update_tx) = CpGrpcServer::with_channel_capacity_registry_and_namespace(
-        config_arc,
+        config_arc.clone(),
         TEST_JWT_SECRET.to_string(),
         128,
         registry,
         cp_namespace.to_string(),
     );
+    let (mesh_server, _mesh_update_tx) =
+        MeshGrpcServer::with_channel_capacity_registry_issuer_and_namespace(
+            config_arc,
+            TEST_JWT_SECRET.to_string(),
+            128,
+            Arc::new(ferrum_edge::grpc::mesh_registry::MeshNodeRegistry::new()),
+            TEST_DEFAULT_ISSUER.to_string(),
+            cp_namespace.to_string(),
+        );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2765,6 +2805,7 @@ async fn start_test_cp_server_with_namespace(
     let handle = tokio::spawn(async move {
         Server::builder()
             .add_service(server.into_service())
+            .add_service(mesh_server.into_service())
             .serve_with_incoming(incoming)
             .await
             .expect("gRPC server failed");
@@ -2838,7 +2879,7 @@ async fn test_cp_rejects_mesh_subscribe_with_mismatched_namespace() {
         start_test_cp_server_with_namespace(cp_config, "production").await;
 
     let generated_token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "test-mesh-dp").unwrap();
-    let mut client = connect_client_with_token!(addr, generated_token);
+    let mut client = connect_mesh_client_with_token!(addr, generated_token);
 
     let request = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
         node_id: "test-mesh-dp".to_string(),

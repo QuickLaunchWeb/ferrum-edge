@@ -1,13 +1,13 @@
 //! `validate_mesh_config()` tests.
 
-use ferrum_edge::config::mesh::{
+use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
+use ferrum_edge::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshEndpoint, MeshPolicy, MeshRule, MeshService,
     MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch,
     RemoteCluster, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, TrustBundle,
     TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
 };
-use ferrum_edge::config::types::GatewayConfig;
-use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use std::collections::HashMap;
 
 fn fresh_workload() -> Workload {
@@ -317,7 +317,7 @@ fn peer_authentication_requires_namespace() {
         name: "pa".into(),
         namespace: String::new(),
         selector: None,
-        mtls_mode: ferrum_edge::config::mesh::MtlsMode::Strict,
+        mtls_mode: ferrum_edge::modes::mesh::config::MtlsMode::Strict,
         port_overrides: HashMap::new(),
     };
     let errors = validate_mesh_config(&[], &[], &[], &[pa], &[], None);
@@ -338,6 +338,8 @@ fn service_entry_requires_hosts() {
         resolution: Resolution::Dns,
         location: ServiceEntryLocation::MeshExternal,
         ports: Vec::new(),
+        export_to: Vec::new(),
+        workload_selector: None,
     };
     let errors = validate_mesh_config(&[], &[], &[], &[], &[se], None);
     assert!(errors.iter().any(|e| e.contains("hosts must not be empty")));
@@ -359,6 +361,8 @@ fn service_entry_endpoints_only_with_static_resolution() {
         resolution: Resolution::Dns,
         location: ServiceEntryLocation::MeshExternal,
         ports: Vec::new(),
+        export_to: Vec::new(),
+        workload_selector: None,
     };
     let errors = validate_mesh_config(&[], &[], &[], &[], &[se], None);
     assert!(

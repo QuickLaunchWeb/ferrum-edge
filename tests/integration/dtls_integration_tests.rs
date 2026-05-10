@@ -757,6 +757,7 @@ async fn test_backend_dtls_verification_rejects_hostname_mismatch() {
         &proxy.backend_host,
         false,
         &std::sync::Arc::new(Vec::new()),
+        None,
     )
     .unwrap();
     let err = match ferrum_edge::dtls::DtlsConnection::connect(client_socket, params).await {

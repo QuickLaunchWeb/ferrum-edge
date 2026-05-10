@@ -277,9 +277,10 @@ paths:
       description: |
         Returns live connection state for CP/DP deployments.
 
-        **CP mode**: Lists all currently connected Data Plane nodes with
-        `node_id`, `version`, `namespace`, `status`, `connected_at`, and
-        `last_sync_at`. Disconnected DPs are automatically removed.
+        **CP mode**: Lists all currently connected Data Plane nodes and
+        Mesh nodes. Each entry includes `node_id`, `version`, `namespace`,
+        `status`, `connected_at`, and `last_sync_at`. Disconnected nodes
+        are automatically removed from their respective registries.
 
         **DP mode**: Shows the connection to the Control Plane — `url`,
         `status` (online/offline), `is_primary` (primary vs fallback CP),
@@ -302,7 +303,7 @@ paths:
                   - $ref: "#/components/schemas/ClusterStatusOther"
               examples:
                 cp_mode:
-                  summary: CP mode with two connected DPs
+                  summary: CP mode with two connected DPs and one mesh node
                   value:
                     mode: cp
                     connected_data_planes: 2
@@ -318,6 +319,14 @@ paths:
                         namespace: staging
                         status: online
                         connected_at: "2025-01-15T10:31:00Z"
+                        last_sync_at: "2025-01-15T10:35:00Z"
+                    connected_mesh_nodes: 1
+                    mesh_nodes:
+                      - node_id: "mesh-789"
+                        version: "0.9.0"
+                        namespace: ferrum
+                        status: online
+                        connected_at: "2025-01-15T10:32:00Z"
                         last_sync_at: "2025-01-15T10:35:00Z"
                 dp_mode_online:
                   summary: DP connected to primary CP
@@ -1140,6 +1149,7 @@ paths:
                 - rate_limiting
                 - request_size_limiting
                 - response_size_limiting
+                - fault_injection
                 - body_validator
                 - request_termination
                 - response_mock
@@ -2390,6 +2400,16 @@ components:
             Number of QUIC connections per HTTP/3 backend (overrides global
             FERRUM_HTTP3_CONNECTIONS_PER_BACKEND). Multiple connections distribute
             QUIC frame processing across driver tasks. Range: 1–256. Default: 4.
+        pool_max_requests_per_connection:
+          type: [integer, "null"]
+          format: uint64
+          minimum: 1
+          description: |
+            Reserved for Istio DestinationRule
+            `connectionPool.http.maxRequestsPerConnection`. The field is
+            validated and persisted for schema compatibility, but currently has
+            no runtime effect because reqwest/hyper do not expose a stable
+            per-connection request cap for the shared client pool.
         upstream_id:
           type: [string, "null"]
           description: |
@@ -2397,6 +2417,15 @@ components:
             `backend_host` and `backend_port` are overridden by the selected
             upstream target. The referenced upstream must exist at creation time.
             Deleting an upstream that is referenced by a proxy is blocked.
+        upstream_subset:
+          type: [string, "null"]
+          maxLength: 128
+          description: |
+            Named subset within `upstream_id` to route to. The subset must be
+            defined in the referenced upstream's `subsets` list; invalid subset
+            references are rejected during config/admin validation. Matching is
+            exact: a target belongs to a subset when its `tags` contain every
+            label in the subset selector with the same value.
         listen_port:
           type: [integer, "null"]
           format: uint16
@@ -3229,6 +3258,16 @@ components:
             Dynamic target discovery configuration. When set, discovered targets
             are merged with any static `targets`. Can be used as the sole target
             source (allowing `targets` to be empty).
+        subsets:
+          type: [array, "null"]
+          items:
+            $ref: "#/components/schemas/SubsetDefinition"
+          description: |
+            Named target subsets for DestinationRule-style routing. A proxy's
+            `upstream_subset` selects one of these names. A target matches a
+            subset when its `tags` are a superset of the subset's labels.
+            Empty arrays are rejected; omit the field when no subsets are
+            configured.
         backend_tls_client_cert_path:
           type: [string, "null"]
           description: >-
@@ -3296,6 +3335,39 @@ components:
             Optional path prefix that overrides the proxy's backend_path when
             this target is selected by the load balancer. If omitted or null,
             the proxy's backend_path is used.
+
+    SubsetDefinition:
+      type: object
+      required: [name, labels]
+      properties:
+        name:
+          type: string
+          maxLength: 128
+          description: Name selected by `Proxy.upstream_subset`.
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Exact label selector. A target matches when its `tags` contain all
+            key/value pairs listed here.
+        traffic_policy:
+          oneOf:
+            - $ref: "#/components/schemas/SubsetTrafficPolicy"
+            - type: "null"
+          description: Optional per-subset traffic policy overrides.
+
+    SubsetTrafficPolicy:
+      type: object
+      properties:
+        load_balancer_algorithm:
+          oneOf:
+            - $ref: "#/components/schemas/LoadBalancerAlgorithm"
+            - type: "null"
+          description: |
+            Optional load-balancer algorithm override for this subset. When set,
+            the subset uses this algorithm instead of the parent upstream's
+            algorithm.
 
     LoadBalancerAlgorithm:
       type: string
@@ -3443,6 +3515,28 @@ components:
             recovery (rely on active health checks or all-unhealthy fallback
             only). On-success recovery is always active in addition to this
             timer.
+        max_ejection_percent:
+          type: [integer, "null"]
+          format: uint8
+          minimum: 0
+          maximum: 100
+          description: |
+            Maximum percentage of targets that may be passively ejected at the
+            same time. When passive ejections exceed this cap, the earliest
+            passive ejections are re-admitted first. Null means no cap.
+        gateway_error_codes:
+          type: [array, "null"]
+          items:
+            type: integer
+            format: uint16
+          description: |
+            Reserved for DestinationRule parity. Validated and persisted, but
+            not yet applied by passive health at runtime.
+        split_external_local_origin_errors:
+          type: [boolean, "null"]
+          description: |
+            Reserved for DestinationRule parity. Validated and persisted, but
+            not yet applied by passive health at runtime.
 
     # ── Service Discovery ──────────────────────────────────────────
     ServiceDiscoveryConfig:
@@ -5482,6 +5576,57 @@ components:
           default: false
           description: Force response body buffering so this plugin can enforce the size limit on chunked/streaming responses without Content-Length.
 
+    FaultInjectionConfig:
+      type: object
+      additionalProperties: false
+      description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; stream faults run on stream connect."
+      properties:
+        abort:
+          type: object
+          additionalProperties: false
+          properties:
+            status_code:
+              type: integer
+              minimum: 200
+              maximum: 599
+              description: Final HTTP status returned when the abort fault triggers
+            percentage:
+              type: number
+              minimum: 0
+              exclusiveMinimum: true
+              maximum: 100
+              description: Abort probability as a percentage
+            grpc_status:
+              type: integer
+              minimum: 0
+              maximum: 16
+              description: Optional gRPC status trailer emitted for gRPC rejects
+            body:
+              type: string
+              default: ""
+              description: HTTP response body returned with the abort
+          required: [status_code, percentage]
+        delay:
+          type: object
+          additionalProperties: false
+          properties:
+            duration_ms:
+              type: integer
+              format: uint64
+              minimum: 1
+              maximum: 3600000
+              description: Delay duration before continuing or aborting
+            percentage:
+              type: number
+              minimum: 0
+              exclusiveMinimum: true
+              maximum: 100
+              description: Delay probability as a percentage
+          required: [duration_ms, percentage]
+      anyOf:
+        - required: [abort]
+        - required: [delay]
+
     BodyValidatorConfig:
       type: object
       description: "Plugin: body_validator — JSON Schema, XML, and gRPC protobuf validation for request/response bodies."
@@ -6750,7 +6895,7 @@ components:
 
     ClusterStatusCp:
       type: object
-      required: [mode, connected_data_planes, data_planes]
+      required: [mode, connected_data_planes, data_planes, connected_mesh_nodes, mesh_nodes]
       properties:
         mode:
           type: string
@@ -6762,6 +6907,39 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ConnectedDpNode"
+        connected_mesh_nodes:
+          type: integer
+          description: Number of currently connected Mesh nodes
+        mesh_nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConnectedMeshNode"
+
+    ConnectedMeshNode:
+      type: object
+      required: [node_id, version, namespace, status, connected_at, last_sync_at]
+      properties:
+        node_id:
+          type: string
+          description: Unique identifier for the mesh node
+        version:
+          type: string
+          description: Ferrum Edge version reported by the mesh node
+        namespace:
+          type: string
+          description: Namespace the mesh node is subscribed to
+        status:
+          type: string
+          enum: [online]
+          description: Always "online" — disconnected mesh nodes are removed from the registry
+        connected_at:
+          type: string
+          format: date-time
+          description: When the mesh node's gRPC stream was established
+        last_sync_at:
+          type: string
+          format: date-time
+          description: When the last config update was broadcast to this mesh node
 
     ConnectedDpNode:
       type: object

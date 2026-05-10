@@ -528,6 +528,18 @@ async fn run_discovery_loop(
 
                     // Clean up stale health state for targets that were removed
                     health_checker.remove_stale_targets(upstream_id, &merged);
+                    if let Some(epoch_store) = &request_epoch {
+                        let epoch = epoch_store.load();
+                        for proxy in epoch
+                            .config
+                            .proxies
+                            .iter()
+                            .filter(|proxy| proxy.upstream_id.as_deref() == Some(upstream_id))
+                        {
+                            health_checker
+                                .remove_stale_passive_targets_for_proxy(&proxy.id, &merged);
+                        }
+                    }
 
                     last_discovered = discovered;
                 }

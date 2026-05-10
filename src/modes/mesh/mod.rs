@@ -6,10 +6,12 @@
 //! boundary. It deliberately keeps the generic proxy/plugin chain unchanged so
 //! existing plugins work in mesh context.
 
+pub mod config;
 pub mod config_consumer;
 pub mod hbone;
 pub mod policy;
 pub mod runtime;
+pub mod slice;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,27 +23,29 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
-use crate::config::mesh::{
-    AppProtocol, EastWestGateway, MeshConfig, Resolution, ServiceEntry, ServiceEntryLocation,
-};
 use crate::config::types::{
-    BackendScheme, BackendTlsConfig, GatewayConfig, LoadBalancerAlgorithm, PluginAssociation,
-    PluginConfig, PluginScope, Proxy, ResponseBodyMode, Upstream, UpstreamTarget,
+    BackendScheme, BackendTlsConfig, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm,
+    PassiveHealthCheck, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,
+    Upstream, UpstreamTarget,
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
+use crate::modes::mesh::config::{
+    AppProtocol, EastWestGateway, MeshConfig, Resolution, ServiceEntry, ServiceEntryLocation,
+    service_entry_exported_to_namespace,
+};
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::runtime::MeshRuntimeState;
+use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
-use crate::xds::slice::{MeshSlice, MeshSliceRequest};
 
 const DEFAULT_INBOUND_LISTEN_ADDR: &str = "0.0.0.0:15006";
 const DEFAULT_OUTBOUND_LISTEN_ADDR: &str = "127.0.0.1:15001";
 const DEFAULT_HBONE_LISTEN_ADDR: &str = "0.0.0.0:15008";
 const DEFAULT_EAST_WEST_LISTEN_PORT: u16 = 15443;
-const DEFAULT_EGRESS_LISTEN_ADDR: &str = "0.0.0.0:15443";
+const DEFAULT_EGRESS_LISTEN_ADDR: &str = "0.0.0.0:15090";
 
 pub const MESH_SPIFFE_IDENTITY_PLUGIN_ID: &str = "__mesh_spiffe_identity";
 pub const MESH_AUTHZ_PLUGIN_ID: &str = "__mesh_authz";
@@ -87,7 +91,7 @@ impl MeshTopology {
             "sidecar" => Ok(Self::Sidecar),
             "ambient" => Ok(Self::Ambient),
             "east_west_gateway" | "east-west-gateway" => Ok(Self::EastWestGateway),
-            "egress_gateway" | "egress-gateway" | "egress" => Ok(Self::EgressGateway),
+            "egress_gateway" | "egress-gateway" => Ok(Self::EgressGateway),
             other => Err(format!(
                 "Invalid FERRUM_MESH_TOPOLOGY '{other}'. Expected: sidecar, ambient, east_west_gateway, or egress_gateway"
             )),
@@ -145,7 +149,7 @@ pub struct MeshRuntimeConfig {
     pub east_west_listen_port: u16,
     /// Address the egress gateway listens on for mesh-internal mTLS traffic
     /// from sidecars. Only used when `topology == EgressGateway`. Parsed from
-    /// `FERRUM_MESH_EGRESS_LISTEN_ADDR`, default `0.0.0.0:15443`.
+    /// `FERRUM_MESH_EGRESS_LISTEN_ADDR`, default `0.0.0.0:15090`.
     pub egress_listen_addr: SocketAddr,
     pub workload_spiffe_id: Option<String>,
     /// Operator-configured trust-domain aliases — additional SPIFFE trust
@@ -481,7 +485,9 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        pool_max_requests_per_connection: None,
         upstream_id: None,
+        upstream_subset: None,
         api_spec_id: None,
         circuit_breaker: None,
         retry: None,
@@ -580,8 +586,14 @@ fn build_egress_proxies_and_upstreams(
 ) -> (Vec<Proxy>, Vec<Upstream>) {
     let mut proxies = Vec::new();
     let mut upstreams = Vec::new();
+    let mut materialized_hosts = std::collections::HashSet::new();
+    let now = chrono::Utc::now();
 
     for entry in service_entries {
+        if !service_entry_exported_to_namespace(entry, namespace) {
+            continue;
+        }
+
         if entry.location != ServiceEntryLocation::MeshExternal {
             continue;
         }
@@ -591,8 +603,31 @@ fn build_egress_proxies_and_upstreams(
         }
 
         for port_spec in &entry.ports {
-            let first_host = entry.hosts.first().map_or("unknown", |h| h.as_str());
-            let upstream_id = mesh_egress_upstream_id(first_host, port_spec.port);
+            let Some(backend_scheme) = egress_backend_scheme(port_spec.protocol) else {
+                warn!(
+                    service_entry = %entry.name,
+                    namespace = %entry.namespace,
+                    port = port_spec.port,
+                    protocol = ?port_spec.protocol,
+                    "Skipping non-HTTP ServiceEntry port for egress gateway materialization"
+                );
+                continue;
+            };
+
+            let proxy_hosts: Vec<&String> = entry
+                .hosts
+                .iter()
+                .filter(|host| !materialized_hosts.contains(*host))
+                .collect();
+            if proxy_hosts.is_empty() {
+                warn!(
+                    service_entry = %entry.name,
+                    namespace = %entry.namespace,
+                    port = port_spec.port,
+                    "Skipping egress ServiceEntry port because its hosts were already materialized"
+                );
+                continue;
+            }
 
             let targets = build_egress_upstream_targets(entry, port_spec.port, &port_spec.name);
 
@@ -605,7 +640,14 @@ fn build_egress_proxies_and_upstreams(
                 continue;
             }
 
-            let now = chrono::Utc::now();
+            for host in &proxy_hosts {
+                materialized_hosts.insert((*host).clone());
+            }
+
+            let first_host = proxy_hosts.first().map_or("unknown", |h| h.as_str());
+            let upstream_id =
+                mesh_egress_upstream_id(&entry.namespace, &entry.name, first_host, port_spec.port);
+
             let upstream = Upstream {
                 id: upstream_id.clone(),
                 name: Some(upstream_id.clone()),
@@ -614,8 +656,9 @@ fn build_egress_proxies_and_upstreams(
                 algorithm: LoadBalancerAlgorithm::RoundRobin,
                 hash_on: None,
                 hash_on_cookie_config: None,
-                health_checks: None,
+                health_checks: egress_health_checks(),
                 service_discovery: None,
+                subsets: None,
                 backend_tls_client_cert_path: None,
                 backend_tls_client_key_path: None,
                 backend_tls_verify_server_cert: true,
@@ -626,20 +669,31 @@ fn build_egress_proxies_and_upstreams(
             };
             upstreams.push(upstream);
 
-            // Determine backend scheme from port protocol.
-            let backend_scheme = egress_backend_scheme(port_spec.protocol);
-
             // One proxy per host per port.
-            for host in &entry.hosts {
-                let proxy_id = mesh_egress_proxy_id(host, port_spec.port);
-                let proxy =
-                    egress_gateway_proxy(&proxy_id, host, namespace, backend_scheme, &upstream_id);
+            for host in proxy_hosts {
+                let proxy_id =
+                    mesh_egress_proxy_id(&entry.namespace, &entry.name, host, port_spec.port);
+                let proxy = egress_gateway_proxy(
+                    &proxy_id,
+                    host,
+                    namespace,
+                    Some(backend_scheme),
+                    &upstream_id,
+                    now,
+                );
                 proxies.push(proxy);
             }
         }
     }
 
     (proxies, upstreams)
+}
+
+fn egress_health_checks() -> Option<HealthCheckConfig> {
+    Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck::default()),
+    })
 }
 
 /// Build upstream targets from a `ServiceEntry`. When the entry uses static
@@ -654,20 +708,22 @@ fn build_egress_upstream_targets(
         entry
             .endpoints
             .iter()
-            .map(|ep| {
-                // Endpoint port: look up by name first, fall back to port number.
-                let target_port = port_name
-                    .as_ref()
-                    .and_then(|name| ep.ports.get(name).copied())
-                    .unwrap_or(port_number);
+            .filter_map(|ep| {
+                // Named endpoint ports must be present on each endpoint. Falling
+                // back to the ServiceEntry port would route to an unrelated
+                // service when endpoint port maps are partial.
+                let target_port = match port_name.as_ref() {
+                    Some(name) => ep.ports.get(name).copied(),
+                    None => Some(port_number),
+                }?;
 
-                UpstreamTarget {
+                Some(UpstreamTarget {
                     host: ep.address.clone(),
                     port: target_port,
                     weight: 1,
                     tags: ep.labels.clone(),
                     path: None,
-                }
+                })
             })
             .collect()
     } else {
@@ -691,26 +747,25 @@ fn egress_backend_scheme(protocol: AppProtocol) -> Option<BackendScheme> {
     match protocol {
         AppProtocol::Tls | AppProtocol::Http2 | AppProtocol::Grpc => Some(BackendScheme::Https),
         AppProtocol::Http | AppProtocol::Unknown => Some(BackendScheme::Http),
-        // L4 protocols use plain TCP backend.
         AppProtocol::Tcp
         | AppProtocol::Mongo
         | AppProtocol::Redis
         | AppProtocol::Mysql
-        | AppProtocol::Postgres => Some(BackendScheme::Http),
+        | AppProtocol::Postgres => None,
     }
 }
 
 /// Construct a single egress gateway proxy. Mirrors `east_west_gateway_proxy`
 /// in struct construction style but uses HTTP-family settings (host-only
-/// routing, no passthrough, frontend_tls for sidecar mTLS termination).
+/// routing, no passthrough; the mesh listener owns frontend mTLS termination.
 fn egress_gateway_proxy(
     id: &str,
     host: &str,
     namespace: &str,
     backend_scheme: Option<BackendScheme>,
     upstream_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Proxy {
-    let now = chrono::Utc::now();
     Proxy {
         id: id.to_string(),
         name: Some(format!("mesh egress {host}")),
@@ -748,13 +803,15 @@ fn egress_gateway_proxy(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        pool_max_requests_per_connection: None,
         upstream_id: Some(upstream_id.to_string()),
+        upstream_subset: None,
         api_spec_id: None,
         circuit_breaker: None,
         retry: None,
         response_body_mode: ResponseBodyMode::Stream,
         listen_port: None,
-        frontend_tls: true,
+        frontend_tls: false,
         passthrough: false,
         udp_idle_timeout_seconds: 60,
         udp_max_response_amplification_factor: None,
@@ -766,12 +823,44 @@ fn egress_gateway_proxy(
     }
 }
 
-fn mesh_egress_proxy_id(host: &str, port: u16) -> String {
-    format!("__mesh-egress-{host}-{port}").replace(['/', '.'], "-")
+fn mesh_egress_proxy_id(namespace: &str, name: &str, host: &str, port: u16) -> String {
+    format!(
+        "mesh-egress-{}-{}-{}-{port}",
+        sanitize_egress_id_part(namespace),
+        sanitize_egress_id_part(name),
+        sanitize_egress_id_part(host)
+    )
 }
 
-fn mesh_egress_upstream_id(host: &str, port: u16) -> String {
-    format!("__mesh-egress-up-{host}-{port}").replace(['/', '.'], "-")
+fn mesh_egress_upstream_id(namespace: &str, name: &str, host: &str, port: u16) -> String {
+    format!(
+        "mesh-egress-up-{}-{}-{}-{port}",
+        sanitize_egress_id_part(namespace),
+        sanitize_egress_id_part(name),
+        sanitize_egress_id_part(host)
+    )
+}
+
+fn sanitize_egress_id_part(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch == '*' {
+            if !sanitized.is_empty() && !sanitized.ends_with('-') {
+                sanitized.push('-');
+            }
+            sanitized.push_str("wildcard");
+        } else if ch.is_ascii_alphanumeric() || ch == '_' {
+            sanitized.push(ch);
+        } else if !sanitized.ends_with('-') {
+            sanitized.push('-');
+        }
+    }
+    let sanitized = sanitized.trim_matches('-');
+    if sanitized.is_empty() {
+        "any".to_string()
+    } else {
+        sanitized.to_string()
+    }
 }
 
 fn inject_mesh_global_plugins(
@@ -1057,6 +1146,7 @@ async fn serve_mesh_runtime(
         shutdown_tx.subscribe(),
     );
 
+    validate_egress_gateway_mtls_config(&runtime, &env_config)?;
     let frontend_tls = load_frontend_tls(&env_config, &tls_policy, &crls)?;
     if let Some(ref tls_config) = frontend_tls {
         proxy_state
@@ -1215,6 +1305,29 @@ fn load_frontend_tls(
         tls::enable_secret_extraction_for_ktls(&mut config);
     }
     Ok(Some(config))
+}
+
+fn validate_egress_gateway_mtls_config(
+    runtime: &MeshRuntimeConfig,
+    env_config: &EnvConfig,
+) -> Result<(), anyhow::Error> {
+    if runtime.topology != MeshTopology::EgressGateway {
+        return Ok(());
+    }
+
+    if env_config.frontend_tls_cert_path.is_none() || env_config.frontend_tls_key_path.is_none() {
+        return Err(anyhow::anyhow!(
+            "FERRUM_MESH_TOPOLOGY=egress_gateway requires FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH for the egress mTLS listener"
+        ));
+    }
+
+    if env_config.frontend_tls_client_ca_bundle_path.is_none() && !env_config.tls_no_verify {
+        return Err(anyhow::anyhow!(
+            "FERRUM_MESH_TOPOLOGY=egress_gateway requires FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH so sidecar client certificates are verified"
+        ));
+    }
+
+    Ok(())
 }
 
 fn listener_tls_config(
@@ -1424,14 +1537,14 @@ fn parse_port(key: &str, raw: &str) -> Result<u16, String> {
 mod tests {
     use super::*;
     use crate::config::EnvConfig;
-    use crate::config::mesh::{
+    use crate::config::types::PluginScope;
+    use crate::dns::{DnsCache, DnsConfig};
+    use crate::identity::{SpiffeId, TrustDomain};
+    use crate::modes::mesh::config::{
         AppProtocol, EastWestGateway, MeshConfig, MeshEndpoint, MeshPolicy, MeshRule, MeshService,
         MultiClusterConfig, PolicyAction, PolicyScope, PrincipalMatch, Resolution, ServiceEntry,
         ServiceEntryLocation, ServicePort, Workload, WorkloadPort, WorkloadSelector,
     };
-    use crate::config::types::PluginScope;
-    use crate::dns::{DnsCache, DnsConfig};
-    use crate::identity::{SpiffeId, TrustDomain};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -2397,13 +2510,10 @@ mod tests {
             MeshTopology::EgressGateway
         );
         assert_eq!(
-            MeshTopology::parse("egress").unwrap(),
-            MeshTopology::EgressGateway
-        );
-        assert_eq!(
             MeshTopology::parse("EGRESS_GATEWAY").unwrap(),
             MeshTopology::EgressGateway
         );
+        assert!(MeshTopology::parse("egress").is_err());
         assert_eq!(MeshTopology::EgressGateway.as_str(), "egress_gateway");
     }
 
@@ -2462,6 +2572,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn egress_gateway_requires_mtls_materials() {
+        let runtime = MeshRuntimeConfig {
+            topology: MeshTopology::EgressGateway,
+            ..test_mesh_runtime_config()
+        };
+        let mut env = EnvConfig::default();
+
+        let err = validate_egress_gateway_mtls_config(&runtime, &env).unwrap_err();
+        assert!(err.to_string().contains("FERRUM_FRONTEND_TLS_CERT_PATH"));
+
+        env.frontend_tls_cert_path = Some("/tmp/server.crt".to_string());
+        env.frontend_tls_key_path = Some("/tmp/server.key".to_string());
+        let err = validate_egress_gateway_mtls_config(&runtime, &env).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH")
+        );
+
+        env.frontend_tls_client_ca_bundle_path = Some("/tmp/client-ca.pem".to_string());
+        validate_egress_gateway_mtls_config(&runtime, &env).expect("mTLS config is complete");
+    }
+
     fn test_external_service_entry(
         name: &str,
         hosts: Vec<String>,
@@ -2480,6 +2613,8 @@ mod tests {
                 protocol,
                 name: Some("http".to_string()),
             }],
+            export_to: Vec::new(),
+            workload_selector: None,
         }
     }
 
@@ -2498,21 +2633,33 @@ mod tests {
         assert_eq!(upstreams.len(), 1);
 
         let proxy = &proxies[0];
-        assert_eq!(proxy.id, "__mesh-egress-api-external-com-443");
+        assert_eq!(
+            proxy.id,
+            "mesh-egress-default-external-api-api-external-com-443"
+        );
         assert_eq!(proxy.hosts, vec!["api.external.com"]);
         assert!(proxy.listen_path.is_none());
         assert!(proxy.listen_port.is_none());
         assert_eq!(proxy.backend_scheme, Some(BackendScheme::Https));
-        assert!(proxy.frontend_tls);
+        assert!(!proxy.frontend_tls);
         assert!(!proxy.passthrough);
         assert_eq!(
             proxy.upstream_id.as_deref(),
-            Some("__mesh-egress-up-api-external-com-443")
+            Some("mesh-egress-up-default-external-api-api-external-com-443")
         );
         assert!(proxy.preserve_host_header);
 
         let upstream = &upstreams[0];
-        assert_eq!(upstream.id, "__mesh-egress-up-api-external-com-443");
+        assert_eq!(
+            upstream.id,
+            "mesh-egress-up-default-external-api-api-external-com-443"
+        );
+        assert!(
+            upstream
+                .health_checks
+                .as_ref()
+                .is_some_and(|checks| { checks.active.is_none() && checks.passive.is_some() })
+        );
         assert_eq!(upstream.targets.len(), 1);
         assert_eq!(upstream.targets[0].host, "api.external.com");
         assert_eq!(upstream.targets[0].port, 443);
@@ -2532,6 +2679,8 @@ mod tests {
                 protocol: AppProtocol::Http,
                 name: None,
             }],
+            export_to: Vec::new(),
+            workload_selector: None,
         }];
 
         let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
@@ -2541,7 +2690,103 @@ mod tests {
     }
 
     #[test]
-    fn egress_creates_proxy_per_host_per_port() {
+    fn egress_skips_mesh_internal_service_entries_with_static_endpoints() {
+        let service_entries = vec![ServiceEntry {
+            name: "internal-static".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["internal.svc.cluster.local".to_string()],
+            endpoints: vec![MeshEndpoint {
+                address: "10.1.0.2".to_string(),
+                ports: HashMap::from([("http".to_string(), 8080)]),
+                labels: HashMap::new(),
+                network: None,
+            }],
+            resolution: Resolution::Static,
+            location: ServiceEntryLocation::MeshInternal,
+            ports: vec![ServicePort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+
+        assert!(proxies.is_empty());
+        assert!(upstreams.is_empty());
+    }
+
+    #[test]
+    fn egress_respects_namespace_and_export_to_visibility() {
+        let mut service_entry = test_external_service_entry(
+            "payments-api",
+            vec!["payments.example.com".to_string()],
+            443,
+            AppProtocol::Tls,
+        );
+        service_entry.namespace = "payments".to_string();
+
+        let (proxies, upstreams) =
+            build_egress_proxies_and_upstreams(&[service_entry.clone()], "default");
+        assert!(proxies.is_empty());
+        assert!(upstreams.is_empty());
+
+        service_entry.export_to = vec!["*".to_string()];
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&[service_entry], "default");
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(upstreams.len(), 1);
+    }
+
+    #[test]
+    fn egress_skips_l4_service_entry_ports() {
+        let service_entries = vec![ServiceEntry {
+            name: "mysql".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["db.external.com".to_string()],
+            endpoints: Vec::new(),
+            resolution: Resolution::Dns,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 3306,
+                protocol: AppProtocol::Mysql,
+                name: Some("mysql".to_string()),
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        assert!(proxies.is_empty());
+        assert!(upstreams.is_empty());
+    }
+
+    #[test]
+    fn egress_sanitizes_wildcard_host_ids_but_preserves_route_host() {
+        let service_entries = vec![test_external_service_entry(
+            "wildcard-api",
+            vec!["*.api.external.com".to_string()],
+            443,
+            AppProtocol::Tls,
+        )];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(
+            proxies[0].id,
+            "mesh-egress-default-wildcard-api-wildcard-api-external-com-443"
+        );
+        assert_eq!(proxies[0].hosts, vec!["*.api.external.com"]);
+        assert_eq!(
+            upstreams[0].id,
+            "mesh-egress-up-default-wildcard-api-wildcard-api-external-com-443"
+        );
+    }
+
+    #[test]
+    fn egress_creates_one_host_only_proxy_per_host() {
         let service_entries = vec![ServiceEntry {
             name: "multi-host".to_string(),
             namespace: "default".to_string(),
@@ -2561,61 +2806,45 @@ mod tests {
                     name: Some("https".to_string()),
                 },
             ],
+            export_to: Vec::new(),
+            workload_selector: None,
         }];
 
         let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
 
-        // 2 hosts * 2 ports = 4 proxies, 2 upstreams (one per port)
-        assert_eq!(proxies.len(), 4);
-        assert_eq!(upstreams.len(), 2);
+        // Host-only HTTP proxies cannot safely distinguish multiple ports for
+        // the same host, so only the first materialized port owns each host.
+        assert_eq!(proxies.len(), 2);
+        assert_eq!(upstreams.len(), 1);
 
-        // Verify each host+port combination has a proxy
         assert!(
             proxies
                 .iter()
-                .any(|p| p.id == "__mesh-egress-api-example-com-80")
+                .any(|p| p.id == "mesh-egress-default-multi-host-api-example-com-80")
         );
         assert!(
             proxies
                 .iter()
-                .any(|p| p.id == "__mesh-egress-api-example-com-443")
-        );
-        assert!(
-            proxies
-                .iter()
-                .any(|p| p.id == "__mesh-egress-cdn-example-com-80")
-        );
-        assert!(
-            proxies
-                .iter()
-                .any(|p| p.id == "__mesh-egress-cdn-example-com-443")
+                .any(|p| p.id == "mesh-egress-default-multi-host-cdn-example-com-80")
         );
 
-        // HTTP port proxies use Http backend
         let http_proxy = proxies
             .iter()
-            .find(|p| p.id == "__mesh-egress-api-example-com-80")
+            .find(|p| p.id == "mesh-egress-default-multi-host-api-example-com-80")
             .unwrap();
         assert_eq!(http_proxy.backend_scheme, Some(BackendScheme::Http));
-
-        // TLS port proxies use Https backend
-        let tls_proxy = proxies
-            .iter()
-            .find(|p| p.id == "__mesh-egress-api-example-com-443")
-            .unwrap();
-        assert_eq!(tls_proxy.backend_scheme, Some(BackendScheme::Https));
     }
 
     #[test]
-    fn egress_uses_static_endpoints_as_targets() {
+    fn egress_uses_static_endpoints_with_named_ports_as_targets() {
         let service_entries = vec![ServiceEntry {
             name: "static-backend".to_string(),
             namespace: "default".to_string(),
-            hosts: vec!["db.external.com".to_string()],
+            hosts: vec!["api.external.com".to_string()],
             endpoints: vec![
                 MeshEndpoint {
                     address: "10.0.0.1".to_string(),
-                    ports: HashMap::from([("mysql".to_string(), 3307)]),
+                    ports: HashMap::from([("http".to_string(), 8080)]),
                     labels: HashMap::from([("az".to_string(), "us-east-1a".to_string())]),
                     network: None,
                 },
@@ -2629,10 +2858,12 @@ mod tests {
             resolution: Resolution::Static,
             location: ServiceEntryLocation::MeshExternal,
             ports: vec![ServicePort {
-                port: 3306,
-                protocol: AppProtocol::Mysql,
-                name: Some("mysql".to_string()),
+                port: 80,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
             }],
+            export_to: Vec::new(),
+            workload_selector: None,
         }];
 
         let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
@@ -2641,19 +2872,14 @@ mod tests {
         assert_eq!(upstreams.len(), 1);
 
         let upstream = &upstreams[0];
-        assert_eq!(upstream.targets.len(), 2);
+        assert_eq!(upstream.targets.len(), 1);
 
-        // First endpoint has named port override
         assert_eq!(upstream.targets[0].host, "10.0.0.1");
-        assert_eq!(upstream.targets[0].port, 3307);
+        assert_eq!(upstream.targets[0].port, 8080);
         assert_eq!(
             upstream.targets[0].tags.get("az").map(String::as_str),
             Some("us-east-1a")
         );
-
-        // Second endpoint falls back to the ServicePort number
-        assert_eq!(upstream.targets[1].host, "10.0.0.2");
-        assert_eq!(upstream.targets[1].port, 3306);
     }
 
     #[test]
@@ -2710,17 +2936,17 @@ mod tests {
         let egress_proxy = prepared
             .proxies
             .iter()
-            .find(|proxy| proxy.id == "__mesh-egress-api-partner-com-443")
+            .find(|proxy| proxy.id == "mesh-egress-default-ext-api-api-partner-com-443")
             .expect("egress proxy should be materialized");
         assert_eq!(egress_proxy.hosts, vec!["api.partner.com"]);
-        assert!(egress_proxy.frontend_tls);
+        assert!(!egress_proxy.frontend_tls);
         assert_eq!(egress_proxy.backend_scheme, Some(BackendScheme::Https));
 
         // Should have the egress upstream
         let egress_upstream = prepared
             .upstreams
             .iter()
-            .find(|upstream| upstream.id == "__mesh-egress-up-api-partner-com-443")
+            .find(|upstream| upstream.id == "mesh-egress-up-default-ext-api-api-partner-com-443")
             .expect("egress upstream should be materialized");
         assert_eq!(egress_upstream.targets.len(), 1);
         assert_eq!(egress_upstream.targets[0].host, "api.partner.com");
@@ -2765,7 +2991,7 @@ mod tests {
             !prepared
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-egress-"))
+                .any(|p| p.id.starts_with("mesh-egress-"))
         );
     }
 
@@ -2791,9 +3017,6 @@ mod tests {
             egress_backend_scheme(AppProtocol::Unknown),
             Some(BackendScheme::Http)
         );
-        assert_eq!(
-            egress_backend_scheme(AppProtocol::Tcp),
-            Some(BackendScheme::Http)
-        );
+        assert_eq!(egress_backend_scheme(AppProtocol::Tcp), None);
     }
 }

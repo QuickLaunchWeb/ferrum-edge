@@ -30,6 +30,7 @@ pub mod bot_detection;
 pub mod compression;
 pub mod correlation_id;
 pub mod cors;
+pub mod fault_injection;
 pub mod geo_restriction;
 pub mod graphql;
 pub mod grpc_deadline;
@@ -45,7 +46,7 @@ pub mod key_auth;
 pub mod ldap_auth;
 pub mod load_testing;
 pub mod loki_logging;
-pub mod mesh_authz;
+pub mod mesh;
 pub mod mtls_auth;
 pub mod otel_tracing;
 pub mod prometheus_metrics;
@@ -62,7 +63,6 @@ pub mod response_transformer;
 pub mod serverless_function;
 pub mod soap_ws_security;
 pub mod spec_expose;
-pub mod spiffe_identity;
 pub mod sse;
 pub mod statsd_logging;
 pub mod stdout_logging;
@@ -72,7 +72,6 @@ pub mod transaction_debugger;
 pub mod udp_logging;
 pub mod udp_rate_limiting;
 pub mod utils;
-pub mod workload_metrics;
 pub mod ws_frame_logging;
 pub mod ws_logging;
 pub mod ws_message_size_limiting;
@@ -1049,6 +1048,7 @@ pub mod priority {
     pub const GRAPHQL: u16 = 2850;
     pub const RATE_LIMITING: u16 = 2900;
     pub const AI_PROMPT_SHIELD: u16 = 2925;
+    pub const FAULT_INJECTION: u16 = 2940;
     pub const BODY_VALIDATOR: u16 = 2950;
     pub const AI_REQUEST_GUARD: u16 = 2975;
     pub const AI_FEDERATION: u16 = 2985;
@@ -1358,6 +1358,16 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` if this plugin participates in the authorization phase.
+    ///
+    /// The gateway uses this to pre-filter authorize callbacks at config
+    /// reload time when a plugin can safely declare it has no authorization
+    /// work. The default stays `true` so existing custom plugins that already
+    /// override `authorize()` keep running after upgrade.
+    fn is_authorize_plugin(&self) -> bool {
+        true
+    }
+
     /// Returns hostnames that this plugin will send traffic to.
     ///
     /// Used during DNS warmup to pre-resolve plugin endpoint hostnames
@@ -1546,7 +1556,7 @@ pub fn create_plugin_with_http_client(
         )?))),
         "hmac_auth" => Ok(Some(Arc::new(hmac_auth::HmacAuth::new(config)?))),
         "mtls_auth" => Ok(Some(Arc::new(mtls_auth::MtlsAuth::new(config)?))),
-        "spiffe_identity" => Ok(Some(Arc::new(spiffe_identity::SpiffeIdentity::new(
+        "spiffe_identity" => Ok(Some(Arc::new(mesh::spiffe_identity::SpiffeIdentity::new(
             config,
         )?))),
         "compression" => Ok(Some(Arc::new(compression::CompressionPlugin::new(config)?))),
@@ -1555,7 +1565,7 @@ pub fn create_plugin_with_http_client(
         "tcp_connection_throttle" => Ok(Some(Arc::new(
             tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
         ))),
-        "mesh_authz" => Ok(Some(Arc::new(mesh_authz::MeshAuthz::new(config)?))),
+        "mesh_authz" => Ok(Some(Arc::new(mesh::authz::MeshAuthz::new(config)?))),
         "ip_restriction" => Ok(Some(Arc::new(ip_restriction::IpRestriction::new(config)?))),
         "geo_restriction" => Ok(Some(Arc::new(geo_restriction::GeoRestriction::new(
             config,
@@ -1604,6 +1614,9 @@ pub fn create_plugin_with_http_client(
             request_termination::RequestTermination::new(config)?,
         ))),
         "response_caching" => Ok(Some(Arc::new(response_caching::ResponseCaching::new(
+            config,
+        )?))),
+        "fault_injection" => Ok(Some(Arc::new(fault_injection::FaultInjectionPlugin::new(
             config,
         )?))),
         "response_mock" => Ok(Some(Arc::new(response_mock::ResponseMock::new(config)?))),
@@ -1662,9 +1675,9 @@ pub fn create_plugin_with_http_client(
             config,
             http_client,
         )?))),
-        "workload_metrics" => Ok(Some(Arc::new(workload_metrics::WorkloadMetrics::new(
-            config,
-        )?))),
+        "workload_metrics" => Ok(Some(Arc::new(
+            mesh::workload_metrics::WorkloadMetrics::new(config)?,
+        ))),
         "access_log" => Ok(Some(Arc::new(access_log::AccessLog::new(config)?))),
         _ => {
             // Fall through to custom plugins registry
@@ -1776,6 +1789,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "spec_expose",
         "api_chargeback",
         "workload_metrics",
+        "fault_injection",
         "access_log",
     ];
     plugins.extend(crate::custom_plugins::custom_plugin_names());

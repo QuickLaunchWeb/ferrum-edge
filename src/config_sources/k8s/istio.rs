@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
-use crate::config::mesh::{
+use crate::identity::spiffe::SpiffeId;
+use crate::modes::mesh::config::{
     AppProtocol, ConditionMatch, MeshEndpoint, MeshPolicy, MeshRule, MtlsMode, PeerAuthentication,
     PolicyAction, PolicyScope, PrincipalMatch, RequestMatch, Resolution, ServiceEntry,
     ServiceEntryLocation, ServicePort, Workload, WorkloadPort, WorkloadSelector,
 };
-use crate::identity::spiffe::SpiffeId;
 
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, RouteBackend, RouteProxySpec, SourceKind,
@@ -397,6 +397,16 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
             _ => ServiceEntryLocation::MeshExternal,
         },
         ports: service_ports(object)?,
+        export_to: string_array(&object.spec, "exportTo"),
+        workload_selector: object
+            .spec
+            .get("workloadSelector")
+            .and_then(|selector| selector.get("labels"))
+            .map(string_map)
+            .map(|labels| WorkloadSelector {
+                namespace: Some(object.metadata.namespace.clone()),
+                labels,
+            }),
     })
 }
 
@@ -694,7 +704,7 @@ mod tests {
     use crate::modes::mesh::policy::{
         MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
     };
-    use crate::xds::slice::MeshSlice;
+    use crate::modes::mesh::slice::MeshSlice;
 
     fn options() -> K8sTranslationOptions {
         K8sTranslationOptions::new(

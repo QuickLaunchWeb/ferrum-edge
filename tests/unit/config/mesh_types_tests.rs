@@ -1,14 +1,14 @@
 //! Layer-2 mesh type tests: serde round-trips, byte-identical
 //! backwards-compat, decode helpers.
 
-use ferrum_edge::config::mesh::{
+use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
+use ferrum_edge::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshEndpoint, MeshPolicy, MeshRule, MeshService,
     MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch,
     RemoteCluster, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
     TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
 };
-use ferrum_edge::config::types::GatewayConfig;
-use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use std::collections::HashMap;
 
 // ── Backwards-compat (byte-identical) ────────────────────────────────────
@@ -169,6 +169,8 @@ fn service_entry_static_resolution_with_endpoints() {
             protocol: AppProtocol::Http2,
             name: Some("https".into()),
         }],
+        export_to: Vec::new(),
+        workload_selector: None,
     };
     let s = serde_json::to_string(&entry).unwrap();
     let back: ServiceEntry = serde_json::from_str(&s).unwrap();

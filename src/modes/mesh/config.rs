@@ -11,6 +11,8 @@
 //! mesh subsystem will share the same `FERRUM_NAMESPACE` mechanism so a
 //! single gateway instance only loads its own namespace's mesh resources.
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -210,7 +212,7 @@ pub struct ConditionMatch {
 /// Abstraction over per-workload label maps.
 ///
 /// `mesh_authz` carries labels in a `BTreeMap<String, String>` (the
-/// canonical [`crate::xds::slice::MeshSlice`] form), the Kubernetes injector
+/// canonical [`crate::modes::mesh::slice::MeshSlice`] form), the Kubernetes injector
 /// keeps them in a `HashMap`, and tests freely build either. This trait lets
 /// the scope-matching helpers below accept any of those without copying.
 pub trait WorkloadLabels {
@@ -235,7 +237,7 @@ impl WorkloadLabels for ::std::collections::BTreeMap<String, String> {
 /// `proxy_namespace` and whose labels are `proxy_labels`.
 ///
 /// This is the **single canonical scope-matching helper** used by both the
-/// xDS / native MeshSubscribe slice builder ([`crate::xds::slice::MeshSlice::from_gateway_config`])
+/// xDS / native MeshSubscribe slice builder ([`crate::modes::mesh::slice::MeshSlice::from_gateway_config`])
 /// and the `mesh_authz` plugin's per-policy filter so that scope semantics
 /// stay byte-identical across the two surfaces.
 ///
@@ -283,6 +285,32 @@ pub fn workload_selector_matches<L: WorkloadLabels + ?Sized>(
         .all(|(key, value)| proxy_labels.lookup(key) == Some(value.as_str()))
 }
 
+/// Returns true when a ServiceEntry is visible to a workload namespace under
+/// Ferrum's egress materialization rules. Empty `export_to` is intentionally
+/// namespace-local to avoid cross-tenant exposure by omission.
+pub fn service_entry_exported_to_namespace(entry: &ServiceEntry, workload_namespace: &str) -> bool {
+    if entry.export_to.is_empty() {
+        return entry.namespace == workload_namespace;
+    }
+
+    entry.export_to.iter().any(|target| {
+        target == "*"
+            || target == workload_namespace
+            || (target == "." && entry.namespace == workload_namespace)
+    })
+}
+
+pub fn service_entry_applies_to_workload<L: WorkloadLabels + ?Sized>(
+    entry: &ServiceEntry,
+    workload_namespace: &str,
+    workload_labels: &L,
+) -> bool {
+    service_entry_exported_to_namespace(entry, workload_namespace)
+        && entry.workload_selector.as_ref().is_none_or(|selector| {
+            workload_selector_matches(selector, workload_namespace, workload_labels)
+        })
+}
+
 // ── PeerAuthentication ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -321,6 +349,13 @@ pub struct ServiceEntry {
     pub location: ServiceEntryLocation,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<ServicePort>,
+    /// Optional Istio-style visibility list. Empty means namespace-local for
+    /// Ferrum's materialization path; `*` exports mesh-wide, `.` exports to
+    /// this entry's namespace, and a namespace value exports there explicitly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub export_to: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_selector: Option<WorkloadSelector>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

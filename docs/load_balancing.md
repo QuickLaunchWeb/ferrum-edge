@@ -8,6 +8,7 @@ Ferrum Edge provides built-in load balancing to distribute traffic across multip
 - [Quick Start](#quick-start)
 - [Upstreams](#upstreams)
 - [Targets](#targets)
+- [Subset Routing](#subset-routing)
 - [Load Balancing Algorithms](#load-balancing-algorithms)
   - [Round Robin](#round-robin)
   - [Weighted Round Robin](#weighted-round-robin)
@@ -88,6 +89,7 @@ An upstream defines a group of backend targets with load balancing configuration
 | `hash_on` | string | No | `ip` | Hash key source for consistent hashing: `ip`, `header:<name>`, or `cookie:<name>` |
 | `hash_on_cookie_config` | object | No | — | Cookie attributes for `cookie:<name>` sticky sessions (see [Consistent Hashing](#consistent-hashing)) |
 | `health_checks` | object | No | — | Health check configuration |
+| `subsets` | array | No | — | Named target subsets selected by a proxy's `upstream_subset` |
 
 ## Targets
 
@@ -118,6 +120,38 @@ targets:
 ### Path
 
 The optional `path` field on a target overrides the proxy's `backend_path` when that target is selected by the load balancer. This allows different targets within the same upstream to serve different backend path prefixes.
+
+## Subset Routing
+
+Upstreams can define named `subsets` for Istio DestinationRule-style routing. A proxy selects a subset with `upstream_subset`; the referenced name must exist on the proxy's `upstream_id`, and the gateway rejects invalid references during config/admin validation.
+
+Subset matching is exact label matching: a target belongs to a subset when its `tags` contain every key/value pair from the subset's `labels`. Subsets can optionally override the parent upstream's load-balancing algorithm with `traffic_policy.load_balancer_algorithm`. Weighted round-robin state and consistent-hash rings are isolated per subset, so subset traffic does not perturb parent or sibling subset selection.
+
+If all targets in a defined subset are unhealthy, Ferrum falls back to the parent upstream and marks the selection degraded. Unknown subset names never silently fall through to the full upstream.
+
+```yaml
+proxies:
+  - id: "reviews-canary"
+    listen_path: "/reviews"
+    upstream_id: "reviews"
+    upstream_subset: "v2"
+
+upstreams:
+  - id: "reviews"
+    algorithm: round_robin
+    targets:
+      - host: "reviews-v1.default.svc"
+        port: 8080
+        tags: {version: "v1"}
+      - host: "reviews-v2.default.svc"
+        port: 8080
+        tags: {version: "v2"}
+    subsets:
+      - name: "v2"
+        labels: {version: "v2"}
+        traffic_policy:
+          load_balancer_algorithm: least_connections
+```
 
 ```yaml
 upstreams:
@@ -516,6 +550,8 @@ Both checks write to the same shared `unhealthy_targets` set. Either check can m
 ### Fallback When All Unhealthy
 
 If all targets in an upstream are marked unhealthy, the load balancer **falls back to routing to all targets** rather than returning errors. This ensures the gateway continues to serve traffic even in degraded conditions — some targets may still be partially functional. If the fallback request succeeds, the target is immediately restored to the healthy rotation via passive health check recovery.
+
+For subset routing, if the selected subset has no healthy targets, the load balancer falls back to the parent upstream and marks the selection degraded. This mirrors DestinationRule fail-open behavior while preserving validation for unknown subset names.
 
 When operating in fallback mode, the gateway sets the `X-Gateway-Upstream-Status: degraded` response header so clients and monitoring systems can detect degraded routing. See [Client Observability Headers](#client-observability-headers) for details.
 

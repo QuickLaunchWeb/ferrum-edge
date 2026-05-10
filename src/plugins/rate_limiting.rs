@@ -256,6 +256,10 @@ impl Plugin for RateLimiting {
         self.check_rate(key, ctx).await
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        self.limit_by == LimitBy::Consumer
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,

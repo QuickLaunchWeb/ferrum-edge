@@ -130,7 +130,7 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | If CP gRPC TLS | — | CP gRPC server TLS certificate |
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | If CP gRPC TLS | — | CP gRPC server TLS private key |
 | `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | No | — | CA bundle for verifying DP client certificates (mTLS) |
-| `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` | No | `128` | CP broadcast channel capacity before lagging DPs receive a full snapshot |
+| `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` | No | `128` | Per-channel capacity for the CP's two independent broadcast channels (one for DP `ConfigSync.Subscribe`, one for mesh `MeshConfigSync.MeshSubscribe`). Lagging subscribers on either channel auto-recover with a full snapshot |
 | `FERRUM_XDS_ENABLED` | No | `false` | Enable Phase B xDS ADS (`StreamAggregatedResources` and `DeltaAggregatedResources`) on the CP gRPC listener |
 | `FERRUM_XDS_STREAM_CHANNEL_CAPACITY` | No | `32` | Per-ADS-stream response queue capacity before slow xDS readers apply backpressure to their own stream task |
 | `FERRUM_DP_CP_GRPC_URL` | DP/mesh mode (unless `_URLS` set) | — | Control Plane gRPC URL |
@@ -153,11 +153,12 @@ With the native `MeshSubscribe` protocol, mesh mode waits for the first delivere
 |---|---|---|---|
 | `FERRUM_MESH_CONFIG_PROTOCOL` | No | `native` | Mesh config source. Mesh runtime currently supports `native` Ferrum `MeshSubscribe`; `xds` is rejected during settings validation until the mesh DP xDS client is wired. `FERRUM_XDS_ENABLED` only exposes CP ADS for Envoy-compatible clients |
 | `FERRUM_MESH_NODE_ID` | No | `$HOSTNAME` or `ferrum-mesh-node` | Stable mesh data-plane node ID used for xDS/MeshSubscribe |
-| `FERRUM_MESH_TOPOLOGY` | No | `sidecar` | Mesh topology flag: `sidecar`, `ambient`, or `east_west_gateway`. All share the same data-plane path |
+| `FERRUM_MESH_TOPOLOGY` | No | `sidecar` | Mesh topology flag: `sidecar`, `ambient`, `east_west_gateway`, or `egress_gateway`. All share the same data-plane path |
 | `FERRUM_MESH_INBOUND_LISTEN_ADDR` | No | `0.0.0.0:15006` | Sidecar inbound mTLS listener address |
 | `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` | No | `127.0.0.1:15001` | Mesh outbound capture listener address for plaintext-in to mTLS-out or HBONE encapsulation |
 | `FERRUM_MESH_HBONE_LISTEN_ADDR` | No | `0.0.0.0:15008` | Ambient HBONE termination listener address (Istio-flavored HBONE over mTLS) |
 | `FERRUM_MESH_EAST_WEST_LISTEN_PORT` | No | `15443` | Shared TCP passthrough listener port for `east_west_gateway` topology; routes by TLS SNI using `mesh.multi_cluster.east_west_gateways` |
+| `FERRUM_MESH_EGRESS_LISTEN_ADDR` | No | `0.0.0.0:15090` | Egress gateway mTLS listener address for `egress_gateway` topology. Requires `FERRUM_FRONTEND_TLS_CERT_PATH`, `FERRUM_FRONTEND_TLS_KEY_PATH`, and `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` |
 | `FERRUM_MESH_WORKLOAD_SPIFFE_ID` | No | — | Optional workload SPIFFE ID hint sent to native MeshSubscribe |
 | `FERRUM_MESH_WORKLOAD_LABELS` | No | — | Workload labels for this mesh data plane (`k1=v1,k2=v2`). Drives `mesh_authz` `PolicyScope` filtering and `PeerAuthentication` selector filtering. For authorization, only policies whose scope (`MeshWide`, `Namespace`, or `WorkloadSelector`) matches these labels apply to this proxy. Set explicitly for current Kubernetes and non-K8s deployments; the injector can later populate this from pod labels via the downward API |
 | `FERRUM_MESH_CAPTURE_MODE` | No | `explicit` | Traffic capture mode used by injector/capture planning: `explicit`, `iptables`, or `ebpf`. eBPF always falls back to iptables when unsupported |
