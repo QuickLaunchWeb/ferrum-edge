@@ -18,6 +18,8 @@ use crate::identity::spiffe::TrustDomain;
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::resource_store::ResourceStoreSet;
 
+const INITIAL_STORE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct ReconcilerConfig {
     pub namespace: String,
     pub trust_domain: String,
@@ -164,7 +166,32 @@ async fn wait_for_initial_store_readiness(
     change_rx: &mut watch::Receiver<u64>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> bool {
+    wait_for_initial_store_readiness_with_timeout(
+        store_set,
+        change_rx,
+        shutdown,
+        INITIAL_STORE_READINESS_TIMEOUT,
+    )
+    .await
+}
+
+async fn wait_for_initial_store_readiness_with_timeout(
+    store_set: &Arc<tokio::sync::Mutex<ResourceStoreSet>>,
+    change_rx: &mut watch::Receiver<u64>,
+    shutdown: &mut watch::Receiver<bool>,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+
     loop {
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                timeout_ms = timeout.as_millis(),
+                "Timed out waiting for initial K8s reflector stores; reconciling available state"
+            );
+            return true;
+        }
+
         let stores = {
             let set = store_set.lock().await;
             set.stores()
@@ -172,11 +199,32 @@ async fn wait_for_initial_store_readiness(
 
         if !stores.is_empty() {
             for store in stores {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    warn!(
+                        timeout_ms = timeout.as_millis(),
+                        "Timed out waiting for initial K8s reflector stores; reconciling available state"
+                    );
+                    return true;
+                }
                 tokio::select! {
-                    result = store.wait_until_ready() => {
-                        if let Err(e) = result {
-                            warn!(error = %e, "K8s reflector store failed before initial readiness");
-                            return false;
+                    result = tokio::time::timeout(remaining, store.wait_until_ready()) => {
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                warn!(
+                                    error = %e,
+                                    "K8s reflector store failed before initial readiness; reconciling available state"
+                                );
+                                return true;
+                            }
+                            Err(_) => {
+                                warn!(
+                                    timeout_ms = timeout.as_millis(),
+                                    "Timed out waiting for initial K8s reflector stores; reconciling available state"
+                                );
+                                return true;
+                            }
                         }
                     }
                     changed = shutdown.changed() => {
@@ -196,6 +244,13 @@ async fn wait_for_initial_store_readiness(
                     info!("K8s reconciler shutting down before any CRD stores became available");
                     return false;
                 }
+            }
+            _ = tokio::time::sleep(deadline.saturating_duration_since(tokio::time::Instant::now())) => {
+                warn!(
+                    timeout_ms = timeout.as_millis(),
+                    "Timed out waiting for initial K8s CRD stores; reconciling available state"
+                );
+                return true;
             }
             changed = change_rx.changed() => {
                 if changed.is_err() {
@@ -389,8 +444,11 @@ fn sort_string_array(value: &mut Value, field: &str) {
 mod tests {
     use super::*;
     use crate::config::types::{PluginConfig, PluginScope, Proxy, Upstream};
+    use crate::k8s_controller::resource_store::CrdResourceStore;
     use crate::modes::mesh::config::MeshConfig;
     use chrono::{Duration as ChronoDuration, Utc};
+    use kube::api::ApiResource;
+    use kube::runtime::reflector;
     use serde_json::json;
 
     fn plugin_config(id: &str, config: Value) -> PluginConfig {
@@ -551,6 +609,45 @@ mod tests {
     fn full_sync_interval_zero_is_clamped_before_timer_creation() {
         assert_eq!(full_sync_interval_duration(0), Duration::from_secs(1));
         assert_eq!(full_sync_interval_duration(300), Duration::from_secs(300));
+    }
+
+    #[tokio::test]
+    async fn initial_readiness_timeout_reconciles_available_state_for_never_ready_store() {
+        let ar = ApiResource {
+            group: "example.com".to_string(),
+            version: "v1".to_string(),
+            api_version: "example.com/v1".to_string(),
+            kind: "Widget".to_string(),
+            plural: "widgets".to_string(),
+        };
+        let writer = reflector::store::Writer::new(ar);
+        let store = Arc::new(CrdResourceStore::new(
+            "example.com/v1".to_string(),
+            "Widget".to_string(),
+            writer.as_reader(),
+        ));
+
+        let mut set = ResourceStoreSet::new();
+        assert!(set.add_store(store));
+        let store_set = Arc::new(tokio::sync::Mutex::new(set));
+        let mut change_rx = {
+            let set = store_set.lock().await;
+            set.subscribe()
+        };
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let ready = wait_for_initial_store_readiness_with_timeout(
+            &store_set,
+            &mut change_rx,
+            &mut shutdown_rx,
+            Duration::from_millis(5),
+        )
+        .await;
+
+        assert!(
+            ready,
+            "timed-out readiness should continue with available stores"
+        );
     }
 }
 
