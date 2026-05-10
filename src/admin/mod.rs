@@ -1734,6 +1734,11 @@ async fn handle_batch_create(
         .iter()
         .map(|upstream| upstream.id.as_str())
         .collect();
+    let batch_upstreams: std::collections::HashMap<&str, &crate::config::types::Upstream> = batch
+        .upstreams
+        .iter()
+        .map(|upstream| (upstream.id.as_str(), upstream))
+        .collect();
     let batch_plugin_configs: std::collections::HashMap<&str, &PluginConfig> = batch
         .plugin_configs
         .iter()
@@ -1765,6 +1770,38 @@ async fn handle_batch_create(
                     "Proxy '{}' upstream reference check failed: {}",
                     proxy.id, err
                 )),
+            }
+        }
+        if let (Some(upstream_id), Some(subset_name)) = (
+            proxy.upstream_id.as_deref(),
+            proxy.upstream_subset.as_deref(),
+        ) {
+            let subset_exists = if let Some(upstream) = batch_upstreams.get(upstream_id) {
+                upstream
+                    .subsets
+                    .as_ref()
+                    .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name))
+            } else {
+                match db.get_upstream(upstream_id).await {
+                    Ok(Some(upstream)) if upstream.namespace == namespace => upstream
+                        .subsets
+                        .as_ref()
+                        .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name)),
+                    Ok(Some(_)) | Ok(None) => false,
+                    Err(err) => {
+                        validation_errors.push(format!(
+                            "Proxy '{}' upstream subset reference check failed: {}",
+                            proxy.id, err
+                        ));
+                        false
+                    }
+                }
+            };
+            if !subset_exists {
+                validation_errors.push(format!(
+                    "Proxy '{}' references upstream_subset '{}' that is not defined on upstream_id '{}'",
+                    proxy.id, subset_name, upstream_id
+                ));
             }
         }
 

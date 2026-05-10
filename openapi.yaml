@@ -2400,6 +2400,16 @@ components:
             Number of QUIC connections per HTTP/3 backend (overrides global
             FERRUM_HTTP3_CONNECTIONS_PER_BACKEND). Multiple connections distribute
             QUIC frame processing across driver tasks. Range: 1–256. Default: 4.
+        pool_max_requests_per_connection:
+          type: [integer, "null"]
+          format: uint64
+          minimum: 1
+          description: |
+            Reserved for Istio DestinationRule
+            `connectionPool.http.maxRequestsPerConnection`. The field is
+            validated and persisted for schema compatibility, but currently has
+            no runtime effect because reqwest/hyper do not expose a stable
+            per-connection request cap for the shared client pool.
         upstream_id:
           type: [string, "null"]
           description: |
@@ -2407,6 +2417,15 @@ components:
             `backend_host` and `backend_port` are overridden by the selected
             upstream target. The referenced upstream must exist at creation time.
             Deleting an upstream that is referenced by a proxy is blocked.
+        upstream_subset:
+          type: [string, "null"]
+          maxLength: 128
+          description: |
+            Named subset within `upstream_id` to route to. The subset must be
+            defined in the referenced upstream's `subsets` list; invalid subset
+            references are rejected during config/admin validation. Matching is
+            exact: a target belongs to a subset when its `tags` contain every
+            label in the subset selector with the same value.
         listen_port:
           type: [integer, "null"]
           format: uint16
@@ -3239,6 +3258,16 @@ components:
             Dynamic target discovery configuration. When set, discovered targets
             are merged with any static `targets`. Can be used as the sole target
             source (allowing `targets` to be empty).
+        subsets:
+          type: [array, "null"]
+          items:
+            $ref: "#/components/schemas/SubsetDefinition"
+          description: |
+            Named target subsets for DestinationRule-style routing. A proxy's
+            `upstream_subset` selects one of these names. A target matches a
+            subset when its `tags` are a superset of the subset's labels.
+            Empty arrays are rejected; omit the field when no subsets are
+            configured.
         backend_tls_client_cert_path:
           type: [string, "null"]
           description: >-
@@ -3306,6 +3335,39 @@ components:
             Optional path prefix that overrides the proxy's backend_path when
             this target is selected by the load balancer. If omitted or null,
             the proxy's backend_path is used.
+
+    SubsetDefinition:
+      type: object
+      required: [name, labels]
+      properties:
+        name:
+          type: string
+          maxLength: 128
+          description: Name selected by `Proxy.upstream_subset`.
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Exact label selector. A target matches when its `tags` contain all
+            key/value pairs listed here.
+        traffic_policy:
+          oneOf:
+            - $ref: "#/components/schemas/SubsetTrafficPolicy"
+            - type: "null"
+          description: Optional per-subset traffic policy overrides.
+
+    SubsetTrafficPolicy:
+      type: object
+      properties:
+        load_balancer_algorithm:
+          oneOf:
+            - $ref: "#/components/schemas/LoadBalancerAlgorithm"
+            - type: "null"
+          description: |
+            Optional load-balancer algorithm override for this subset. When set,
+            the subset uses this algorithm instead of the parent upstream's
+            algorithm.
 
     LoadBalancerAlgorithm:
       type: string
@@ -3453,6 +3515,28 @@ components:
             recovery (rely on active health checks or all-unhealthy fallback
             only). On-success recovery is always active in addition to this
             timer.
+        max_ejection_percent:
+          type: [integer, "null"]
+          format: uint8
+          minimum: 0
+          maximum: 100
+          description: |
+            Maximum percentage of targets that may be passively ejected at the
+            same time. When passive ejections exceed this cap, the earliest
+            passive ejections are re-admitted first. Null means no cap.
+        gateway_error_codes:
+          type: [array, "null"]
+          items:
+            type: integer
+            format: uint16
+          description: |
+            Reserved for DestinationRule parity. Validated and persisted, but
+            not yet applied by passive health at runtime.
+        split_external_local_origin_errors:
+          type: [boolean, "null"]
+          description: |
+            Reserved for DestinationRule parity. Validated and persisted, but
+            not yet applied by passive health at runtime.
 
     # ── Service Discovery ──────────────────────────────────────────
     ServiceDiscoveryConfig:

@@ -15,6 +15,7 @@ fn active_health_ctx(active: &DashMap<String, u64>) -> HealthContext<'_> {
     HealthContext {
         active_unhealthy: active,
         proxy_passive: None,
+        max_ejection_percent: None,
     }
 }
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -223,6 +224,7 @@ fn test_load_balancer_cache() {
             hash_on_cookie_config: None,
             health_checks: None,
             service_discovery: None,
+            subsets: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
@@ -596,6 +598,7 @@ fn test_least_latency_cache_record_and_select() {
             hash_on_cookie_config: None,
             health_checks: None,
             service_discovery: None,
+            subsets: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
@@ -1025,6 +1028,7 @@ fn test_load_balancer_cache_get_hash_on_strategy() {
             hash_on_cookie_config: None,
             health_checks: None,
             service_discovery: None,
+            subsets: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
@@ -1061,6 +1065,7 @@ fn make_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
         hash_on_cookie_config: None,
         health_checks: None,
         service_discovery: None,
+        subsets: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
@@ -1517,6 +1522,9 @@ fn test_passive_health_filters_targets() {
         unhealthy_threshold: 1,
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
     };
 
     // Mark host1 as passively unhealthy
@@ -1528,6 +1536,7 @@ fn test_passive_health_filters_targets() {
     let ctx = HealthContext {
         active_unhealthy: &active,
         proxy_passive,
+        max_ejection_percent: None,
     };
 
     let mut seen = std::collections::HashSet::new();
@@ -1542,4 +1551,576 @@ fn test_passive_health_filters_targets() {
     );
     assert!(seen.contains("host0"));
     assert!(seen.contains("host2"));
+}
+
+// ─── Ejection Cap Tests ──────────────────────────────────────────────────────
+
+#[test]
+fn ejection_cap_readmits_when_too_many_passively_ejected() {
+    use ferrum_edge::config::types::PassiveHealthCheck;
+    use ferrum_edge::health_check::HealthChecker;
+
+    // 4 targets, max_ejection_percent = 50 → at most 2 ejected
+    let targets = make_targets(4);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
+
+    let checker = HealthChecker::new();
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 1,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+    };
+
+    // Eject 3 targets (host0, host1, host2) — exceeds 50% cap (max 2)
+    checker.report_response("test-proxy", &targets[0], 500, false, Some(&config));
+    checker.report_response("test-proxy", &targets[1], 500, false, Some(&config));
+    checker.report_response("test-proxy", &targets[2], 500, false, Some(&config));
+    let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
+    let proxy_passive = proxy_passive.expect("passive state should be created");
+    proxy_passive
+        .unhealthy
+        .insert(target_host_port_key(&targets[0]), 100);
+    proxy_passive
+        .unhealthy
+        .insert(target_host_port_key(&targets[1]), 200);
+    proxy_passive
+        .unhealthy
+        .insert(target_host_port_key(&targets[2]), 300);
+
+    let active: DashMap<String, u64> = DashMap::new();
+
+    let ctx = HealthContext {
+        active_unhealthy: &active,
+        proxy_passive: Some(proxy_passive),
+        max_ejection_percent: Some(50),
+    };
+
+    // With cap=50%, only 2 of 4 targets can be ejected.
+    // The earliest ejection (host0) should be re-admitted first.
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..200 {
+        let sel = lb.select("", Some(&ctx)).unwrap();
+        seen.insert(sel.target.host.clone());
+    }
+
+    assert_eq!(
+        seen,
+        std::collections::HashSet::from(["host0".to_string(), "host3".to_string()]),
+        "host0 should be re-admitted and host3 was never ejected"
+    );
+    assert!(
+        seen.contains("host3"),
+        "host3 was never ejected and should be available"
+    );
+}
+
+#[test]
+fn ejection_cap_zero_percent_readmits_all() {
+    use ferrum_edge::config::types::PassiveHealthCheck;
+    use ferrum_edge::health_check::HealthChecker;
+
+    let targets = make_targets(3);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
+
+    let checker = HealthChecker::new();
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 1,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+    };
+
+    // Eject all 3 targets
+    for t in &targets {
+        checker.report_response("test-proxy", t, 500, false, Some(&config));
+    }
+
+    let active: DashMap<String, u64> = DashMap::new();
+    let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
+
+    let ctx = HealthContext {
+        active_unhealthy: &active,
+        proxy_passive,
+        max_ejection_percent: Some(0), // 0% cap → no ejections allowed
+    };
+
+    // All targets should be re-admitted
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let sel = lb.select("", Some(&ctx)).unwrap();
+        assert!(
+            !sel.is_fallback,
+            "Should not be fallback when cap re-admits all"
+        );
+        seen.insert(sel.target.host.clone());
+    }
+
+    assert_eq!(
+        seen.len(),
+        3,
+        "All 3 targets should be available with 0% ejection cap"
+    );
+}
+
+#[test]
+fn ejection_cap_does_not_affect_active_health_ejections() {
+    use ferrum_edge::config::types::PassiveHealthCheck;
+    use ferrum_edge::health_check::HealthChecker;
+
+    let targets = make_targets(3);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
+
+    // Actively eject host0 (genuine unreachable — not subject to cap)
+    let active: DashMap<String, u64> = DashMap::new();
+    let key = ferrum_edge::load_balancer::target_key(TEST_UPSTREAM, &targets[0]);
+    active.insert(key, 1);
+
+    // Passively eject host1
+    let checker = HealthChecker::new();
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 1,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+    };
+    checker.report_response("test-proxy", &targets[1], 500, false, Some(&config));
+
+    let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
+
+    let ctx = HealthContext {
+        active_unhealthy: &active,
+        proxy_passive,
+        max_ejection_percent: Some(100), // 100% cap for passive → host1 stays ejected
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let sel = lb.select("", Some(&ctx)).unwrap();
+        seen.insert(sel.target.host.clone());
+    }
+
+    // host0 actively ejected, host1 passively ejected
+    assert!(
+        !seen.contains("host0"),
+        "Actively ejected target should remain ejected regardless of cap"
+    );
+    assert!(
+        !seen.contains("host1"),
+        "Passively ejected target within cap should stay ejected"
+    );
+    assert!(seen.contains("host2"));
+}
+
+// ─── Subset Routing Tests ────────────────────────────────────────────────────
+
+fn make_tagged_targets() -> Vec<UpstreamTarget> {
+    vec![
+        UpstreamTarget {
+            host: "v1-a".into(),
+            port: 8080,
+            weight: 1,
+            tags: HashMap::from([("version".to_string(), "v1".to_string())]),
+            path: None,
+        },
+        UpstreamTarget {
+            host: "v1-b".into(),
+            port: 8080,
+            weight: 1,
+            tags: HashMap::from([("version".to_string(), "v1".to_string())]),
+            path: None,
+        },
+        UpstreamTarget {
+            host: "v2-a".into(),
+            port: 8080,
+            weight: 1,
+            tags: HashMap::from([("version".to_string(), "v2".to_string())]),
+            path: None,
+        },
+        UpstreamTarget {
+            host: "v2-b".into(),
+            port: 8080,
+            weight: 1,
+            tags: HashMap::from([
+                ("version".to_string(), "v2".to_string()),
+                ("region".to_string(), "us-east".to_string()),
+            ]),
+            path: None,
+        },
+    ]
+}
+
+#[test]
+fn subset_routing_selects_only_matching_targets() {
+    use ferrum_edge::config::types::SubsetDefinition;
+
+    let targets = make_tagged_targets();
+    let subsets = vec![
+        SubsetDefinition {
+            name: "stable".into(),
+            labels: HashMap::from([("version".into(), "v1".into())]),
+            traffic_policy: None,
+        },
+        SubsetDefinition {
+            name: "canary".into(),
+            labels: HashMap::from([("version".into(), "v2".into())]),
+            traffic_policy: None,
+        },
+    ];
+
+    let lb = LoadBalancer::with_subsets(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+        Some(&subsets),
+    );
+
+    // Select from "stable" subset — should only return v1-a and v1-b
+    let mut seen_stable = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let sel = lb.select_from_subset("", "stable", None).unwrap();
+        seen_stable.insert(sel.target.host.clone());
+    }
+    assert_eq!(seen_stable.len(), 2);
+    assert!(seen_stable.contains("v1-a"));
+    assert!(seen_stable.contains("v1-b"));
+
+    // Select from "canary" subset — should only return v2-a and v2-b
+    let mut seen_canary = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let sel = lb.select_from_subset("", "canary", None).unwrap();
+        seen_canary.insert(sel.target.host.clone());
+    }
+    assert_eq!(seen_canary.len(), 2);
+    assert!(seen_canary.contains("v2-a"));
+    assert!(seen_canary.contains("v2-b"));
+}
+
+#[test]
+fn subset_traffic_policy_overrides_parent_algorithm() {
+    use ferrum_edge::config::types::{SubsetDefinition, SubsetTrafficPolicy};
+
+    let targets = make_tagged_targets();
+    let subsets = vec![SubsetDefinition {
+        name: "canary".into(),
+        labels: HashMap::from([("version".into(), "v2".into())]),
+        traffic_policy: Some(SubsetTrafficPolicy {
+            load_balancer_algorithm: Some(LoadBalancerAlgorithm::LeastConnections),
+        }),
+    }];
+
+    let lb = LoadBalancer::with_subsets(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+        Some(&subsets),
+    );
+
+    lb.active_connections
+        .entry(target_host_port_key(&targets[2]))
+        .or_insert_with(|| AtomicI64::new(0))
+        .store(10, Ordering::Relaxed);
+
+    for _ in 0..20 {
+        let sel = lb.select_from_subset("", "canary", None).unwrap();
+        assert_eq!(
+            sel.target.host, "v2-b",
+            "subset traffic policy should use least-connections instead of parent round-robin"
+        );
+    }
+}
+
+#[test]
+fn subset_routing_multi_label_selector() {
+    use ferrum_edge::config::types::SubsetDefinition;
+
+    let targets = make_tagged_targets();
+    let subsets = vec![SubsetDefinition {
+        name: "v2-east".into(),
+        labels: HashMap::from([
+            ("version".into(), "v2".into()),
+            ("region".into(), "us-east".into()),
+        ]),
+        traffic_policy: None,
+    }];
+
+    let lb = LoadBalancer::with_subsets(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+        Some(&subsets),
+    );
+
+    // Only v2-b has both version=v2 and region=us-east
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..50 {
+        let sel = lb.select_from_subset("", "v2-east", None).unwrap();
+        seen.insert(sel.target.host.clone());
+    }
+    assert_eq!(seen.len(), 1);
+    assert!(seen.contains("v2-b"));
+}
+
+#[test]
+fn subset_routing_undefined_subset_returns_none() {
+    use ferrum_edge::config::types::SubsetDefinition;
+
+    let targets = make_tagged_targets();
+    let subsets = vec![SubsetDefinition {
+        name: "stable".into(),
+        labels: HashMap::from([("version".into(), "v1".into())]),
+        traffic_policy: None,
+    }];
+
+    let lb = LoadBalancer::with_subsets(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+        Some(&subsets),
+    );
+
+    assert!(
+        lb.select_from_subset("", "nonexistent", None).is_none(),
+        "Undefined subset must not silently route to the full upstream"
+    );
+}
+
+#[test]
+fn subset_routing_intersects_with_health() {
+    use ferrum_edge::config::types::SubsetDefinition;
+
+    let targets = make_tagged_targets();
+    let subsets = vec![SubsetDefinition {
+        name: "stable".into(),
+        labels: HashMap::from([("version".into(), "v1".into())]),
+        traffic_policy: None,
+    }];
+
+    let lb = LoadBalancer::with_subsets(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+        Some(&subsets),
+    );
+
+    // Mark v1-a as actively unhealthy
+    let active: DashMap<String, u64> = DashMap::new();
+    let key = target_host_port_key(&targets[0]); // v1-a:8080
+    let full_key = format!("{}::{}", TEST_UPSTREAM, key);
+    active.insert(full_key, 1);
+
+    let ctx = HealthContext {
+        active_unhealthy: &active,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    };
+
+    // "stable" subset has v1-a and v1-b, but v1-a is unhealthy
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..50 {
+        let sel = lb.select_from_subset("", "stable", Some(&ctx)).unwrap();
+        seen.insert(sel.target.host.clone());
+    }
+    assert_eq!(seen.len(), 1);
+    assert!(
+        seen.contains("v1-b"),
+        "Only healthy subset targets should be selected"
+    );
+}
+
+#[test]
+fn subset_routing_all_unhealthy_returns_none() {
+    use ferrum_edge::config::types::SubsetDefinition;
+
+    let targets = make_tagged_targets();
+    let subsets = vec![SubsetDefinition {
+        name: "stable".into(),
+        labels: HashMap::from([("version".into(), "v1".into())]),
+        traffic_policy: None,
+    }];
+
+    let lb = LoadBalancer::with_subsets(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+        Some(&subsets),
+    );
+
+    // Mark both v1-a and v1-b as actively unhealthy
+    let active: DashMap<String, u64> = DashMap::new();
+    for t in &targets[0..2] {
+        let key = format!("{}::{}", TEST_UPSTREAM, target_host_port_key(t));
+        active.insert(key, 1);
+    }
+
+    let ctx = HealthContext {
+        active_unhealthy: &active,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    };
+
+    assert!(
+        lb.select_from_subset("", "stable", Some(&ctx)).is_none(),
+        "All subset targets unhealthy must not route to the parent upstream"
+    );
+}
+
+#[test]
+fn subset_retry_does_not_fall_back_to_parent_upstream() {
+    use ferrum_edge::config::types::SubsetDefinition;
+
+    let targets = make_tagged_targets();
+    let subsets = vec![SubsetDefinition {
+        name: "v2-east".into(),
+        labels: HashMap::from([
+            ("version".into(), "v2".into()),
+            ("region".into(), "us-east".into()),
+        ]),
+        traffic_policy: None,
+    }];
+
+    let lb = LoadBalancer::with_subsets(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+        Some(&subsets),
+    );
+
+    let selected = lb
+        .select_from_subset("", "v2-east", None)
+        .expect("single subset target exists");
+    assert_eq!(selected.target.host, "v2-b");
+
+    assert!(
+        lb.select_excluding_from_subset("", "v2-east", &selected.target, None)
+            .is_none(),
+        "Retry must stay inside the configured subset instead of falling back to parent"
+    );
+}
+
+#[test]
+fn subset_no_subsets_defined_select_from_subset_returns_none() {
+    let targets = make_targets(3);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
+
+    assert!(
+        lb.select_from_subset("", "anything", None).is_none(),
+        "Unknown subset without definitions must not route to the full upstream"
+    );
+}
+
+#[test]
+fn apply_delta_preserves_subset_indices() {
+    use ferrum_edge::config::types::SubsetDefinition;
+
+    let mut upstream = make_upstream("u1", make_tagged_targets());
+    upstream.subsets = Some(vec![SubsetDefinition {
+        name: "canary".into(),
+        labels: HashMap::from([("version".into(), "v2".into())]),
+        traffic_policy: None,
+    }]);
+    let config = GatewayConfig {
+        upstreams: vec![upstream.clone()],
+        ..Default::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+
+    let mut modified = upstream.clone();
+    modified.name = Some("renamed".into());
+    let new_config = GatewayConfig {
+        upstreams: vec![modified.clone()],
+        ..Default::default()
+    };
+    cache.apply_delta(&new_config, &[], &[], &[modified]);
+
+    let snapshot = cache.load();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..50 {
+        let sel = LoadBalancerCache::select_target_subset_from(&snapshot, "u1", "", "canary", None)
+            .unwrap();
+        seen.insert(sel.target.host.clone());
+    }
+    assert_eq!(
+        seen,
+        std::collections::HashSet::from(["v2-a".to_string(), "v2-b".to_string()])
+    );
+}
+
+#[test]
+fn update_targets_preserves_existing_subsets() {
+    use ferrum_edge::config::types::SubsetDefinition;
+
+    let mut upstream = make_upstream("u1", make_tagged_targets());
+    upstream.subsets = Some(vec![SubsetDefinition {
+        name: "canary".into(),
+        labels: HashMap::from([("version".into(), "v2".into())]),
+        traffic_policy: None,
+    }]);
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..Default::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let mut refreshed = make_tagged_targets();
+    refreshed.push(UpstreamTarget {
+        host: "v2-c".into(),
+        port: 8080,
+        weight: 1,
+        tags: HashMap::from([("version".to_string(), "v2".to_string())]),
+        path: None,
+    });
+
+    cache.update_targets("u1", refreshed, LoadBalancerAlgorithm::RoundRobin, None);
+
+    let snapshot = cache.load();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..90 {
+        let sel = LoadBalancerCache::select_target_subset_from(&snapshot, "u1", "", "canary", None)
+            .unwrap();
+        seen.insert(sel.target.host.clone());
+    }
+    assert_eq!(
+        seen,
+        std::collections::HashSet::from([
+            "v2-a".to_string(),
+            "v2-b".to_string(),
+            "v2-c".to_string()
+        ])
+    );
 }

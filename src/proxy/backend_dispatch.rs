@@ -170,22 +170,42 @@ pub(crate) fn select_upstream_target(
         .passive_health
         .get(&proxy.id)
         .map(|r| r.value().clone());
+
+    let balancers = &epoch.load_balancer;
+
+    // Resolve the ejection cap from the upstream's passive health config.
+    let upstream_arc = LoadBalancerCache::get_upstream_from(balancers, upstream_id);
+    let max_ejection_percent = upstream_arc
+        .as_ref()
+        .and_then(|u| u.health_checks.as_ref())
+        .and_then(|hc| hc.passive.as_ref())
+        .and_then(|p| p.max_ejection_percent);
+
     let health_ctx = HealthContext {
         active_unhealthy: &state.health_checker.active_unhealthy_targets,
         proxy_passive: proxy_passive.clone(),
+        max_ejection_percent,
     };
 
-    let balancers = &epoch.load_balancer;
     let strategy = LoadBalancerCache::get_hash_on_strategy_from(balancers, upstream_id);
     let (hash_key, needs_set) = resolve_hash_key(&strategy, client_ip, proxy_headers);
 
     let selected_balancer = balancers.get_balancer(upstream_id);
-    match LoadBalancerCache::select_target_from(
-        balancers,
-        upstream_id,
-        &hash_key,
-        Some(&health_ctx),
-    ) {
+
+    // Use subset routing when the proxy specifies an upstream_subset.
+    let selection_result = if let Some(ref subset_name) = proxy.upstream_subset {
+        LoadBalancerCache::select_target_subset_from(
+            balancers,
+            upstream_id,
+            &hash_key,
+            subset_name,
+            Some(&health_ctx),
+        )
+    } else {
+        LoadBalancerCache::select_target_from(balancers, upstream_id, &hash_key, Some(&health_ctx))
+    };
+
+    match selection_result {
         Some(selection) => {
             if selection.is_fallback {
                 warn!(

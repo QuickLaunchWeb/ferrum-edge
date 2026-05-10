@@ -1429,7 +1429,25 @@ async fn validate_bundle(
                 .as_ref()
                 .map(|u| u.id.as_str() == upstream_id.as_str())
                 .unwrap_or(false);
-            if !bundled_id_matches {
+            if bundled_id_matches {
+                if let Some(subset_name) = proxy.upstream_subset.as_deref() {
+                    let subset_exists = bundle
+                        .upstream
+                        .as_ref()
+                        .and_then(|u| u.subsets.as_ref())
+                        .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name));
+                    if !subset_exists {
+                        failures.push(ValidationFailure {
+                            resource_type: "proxy",
+                            id: proxy.id.clone(),
+                            errors: vec![format!(
+                                "upstream_subset '{}' is not defined on upstream_id '{}'",
+                                subset_name, upstream_id
+                            )],
+                        });
+                    }
+                }
+            } else {
                 match db.get_upstream(upstream_id).await {
                     Ok(Some(existing)) if existing.namespace != namespace => {
                         failures.push(ValidationFailure {
@@ -1452,7 +1470,23 @@ async fn validate_bundle(
                             )],
                         });
                     }
-                    Ok(Some(_)) => {}
+                    Ok(Some(existing)) => {
+                        if let Some(subset_name) = proxy.upstream_subset.as_deref() {
+                            let subset_exists = existing.subsets.as_ref().is_some_and(|subsets| {
+                                subsets.iter().any(|s| s.name == subset_name)
+                            });
+                            if !subset_exists {
+                                failures.push(ValidationFailure {
+                                    resource_type: "proxy",
+                                    id: proxy.id.clone(),
+                                    errors: vec![format!(
+                                        "upstream_subset '{}' is not defined on upstream_id '{}'",
+                                        subset_name, upstream_id
+                                    )],
+                                });
+                            }
+                        }
+                    }
                     Ok(None) => failures.push(ValidationFailure {
                         resource_type: "proxy",
                         id: proxy.id.clone(),

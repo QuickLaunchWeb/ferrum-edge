@@ -32,6 +32,7 @@ fn make_upstream(
         hash_on_cookie_config: None,
         health_checks: None,
         service_discovery: sd,
+        subsets: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
