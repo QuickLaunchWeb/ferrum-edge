@@ -32,6 +32,8 @@ pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
 // QTYPE values
 const QTYPE_A: u16 = 1;
+#[cfg(test)]
+const QTYPE_TXT: u16 = 16;
 const QTYPE_OPT: u16 = 41;
 const QTYPE_AAAA: u16 = 28;
 
@@ -651,12 +653,23 @@ fn evaluate_dns_query(
         }
     };
 
-    // Only handle A/AAAA queries for IN class.
-    if query.qclass != QCLASS_IN || (query.qtype != QTYPE_A && query.qtype != QTYPE_AAAA) {
+    // Only handle IN-class queries locally.
+    if query.qclass != QCLASS_IN {
         return DnsDecision::Forward(query);
     }
 
     let table = table.load();
+    if query.qtype != QTYPE_A && query.qtype != QTYPE_AAAA {
+        return match table.resolve_normalized(&query.name) {
+            Some(records) => DnsDecision::Respond(build_dns_empty_response(
+                &query,
+                records.authoritative,
+                max_response_size,
+            )),
+            None => DnsDecision::Forward(query),
+        };
+    }
+
     match table.resolve_normalized(&query.name) {
         Some(records) => {
             // Filter by query type: A gets IPv4, AAAA gets IPv6
@@ -1632,6 +1645,34 @@ mod tests {
         assert!(flags & FLAGS_AA != 0);
         let ancount = u16::from_be_bytes([response[6], response[7]]);
         assert_eq!(ancount, 0);
+    }
+
+    #[test]
+    fn evaluate_dns_query_returns_empty_for_unsupported_mesh_owned_type() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(vec!["*.example.com"], vec!["10.0.0.1"])],
+            ..MeshSlice::default()
+        };
+        let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
+        let packet = build_query_packet("api.example.com", QTYPE_TXT);
+
+        let response = match evaluate_dns_query(&packet, &table, 60, DNS_UDP_SAFE_PACKET_SIZE) {
+            DnsDecision::Respond(response) => response,
+            DnsDecision::Forward(_) => panic!("mesh-owned unsupported qtype should not forward"),
+            DnsDecision::Drop => panic!("valid DNS query should not drop"),
+        };
+
+        let flags = u16::from_be_bytes([response[2], response[3]]);
+        assert_eq!(flags & 0x000f, 0);
+        let ancount = u16::from_be_bytes([response[6], response[7]]);
+        assert_eq!(ancount, 0);
+        let (name, offset) =
+            parse_dns_name(&response, DNS_HEADER_SIZE).expect("response question should parse");
+        assert_eq!(name, "api.example.com");
+        assert_eq!(
+            u16::from_be_bytes([response[offset], response[offset + 1]]),
+            QTYPE_TXT
+        );
     }
 
     #[test]
