@@ -287,7 +287,10 @@ pub fn workload_selector_matches<L: WorkloadLabels + ?Sized>(
 
 /// Returns true when a ServiceEntry is visible to a workload namespace under
 /// Ferrum's egress materialization rules. Empty `export_to` is intentionally
-/// namespace-local to avoid cross-tenant exposure by omission.
+/// namespace-local to avoid cross-tenant exposure by omission. Istio
+/// `workloadSelector` describes backing workloads/endpoints, not which clients
+/// may consume the service, so it is deliberately not part of this visibility
+/// check.
 pub fn service_entry_exported_to_namespace(entry: &ServiceEntry, workload_namespace: &str) -> bool {
     if entry.export_to.is_empty() {
         return entry.namespace == workload_namespace;
@@ -303,12 +306,9 @@ pub fn service_entry_exported_to_namespace(entry: &ServiceEntry, workload_namesp
 pub fn service_entry_applies_to_workload<L: WorkloadLabels + ?Sized>(
     entry: &ServiceEntry,
     workload_namespace: &str,
-    workload_labels: &L,
+    _workload_labels: &L,
 ) -> bool {
     service_entry_exported_to_namespace(entry, workload_namespace)
-        && entry.workload_selector.as_ref().is_none_or(|selector| {
-            workload_selector_matches(selector, workload_namespace, workload_labels)
-        })
 }
 
 // ── PeerAuthentication ────────────────────────────────────────────────────

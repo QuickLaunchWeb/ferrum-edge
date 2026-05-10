@@ -629,48 +629,47 @@ fn build_egress_proxies_and_upstreams(
                 continue;
             }
 
-            let targets = build_egress_upstream_targets(entry, port_spec.port, &port_spec.name);
-
-            if targets.is_empty() {
-                debug!(
-                    service_entry = %entry.name,
-                    port = port_spec.port,
-                    "Skipping egress port with no resolvable targets"
-                );
-                continue;
-            }
-
-            for host in &proxy_hosts {
-                materialized_hosts.insert((*host).clone());
-            }
-
-            let first_host = proxy_hosts.first().map_or("unknown", |h| h.as_str());
-            let upstream_id =
-                mesh_egress_upstream_id(&entry.namespace, &entry.name, first_host, port_spec.port);
-
-            let upstream = Upstream {
-                id: upstream_id.clone(),
-                name: Some(upstream_id.clone()),
-                namespace: namespace.to_string(),
-                targets,
-                algorithm: LoadBalancerAlgorithm::RoundRobin,
-                hash_on: None,
-                hash_on_cookie_config: None,
-                health_checks: egress_health_checks(),
-                service_discovery: None,
-                subsets: None,
-                backend_tls_client_cert_path: None,
-                backend_tls_client_key_path: None,
-                backend_tls_verify_server_cert: true,
-                backend_tls_server_ca_cert_path: None,
-                api_spec_id: None,
-                created_at: now,
-                updated_at: now,
-            };
-            upstreams.push(upstream);
-
             // One proxy per host per port.
             for host in proxy_hosts {
+                let targets =
+                    build_egress_upstream_targets(entry, host, port_spec.port, &port_spec.name);
+
+                if targets.is_empty() {
+                    debug!(
+                        service_entry = %entry.name,
+                        host = %host,
+                        port = port_spec.port,
+                        "Skipping egress host with no resolvable targets"
+                    );
+                    continue;
+                }
+
+                materialized_hosts.insert(host.clone());
+
+                let upstream_id =
+                    mesh_egress_upstream_id(&entry.namespace, &entry.name, host, port_spec.port);
+
+                let upstream = Upstream {
+                    id: upstream_id.clone(),
+                    name: Some(upstream_id.clone()),
+                    namespace: namespace.to_string(),
+                    targets,
+                    algorithm: LoadBalancerAlgorithm::RoundRobin,
+                    hash_on: None,
+                    hash_on_cookie_config: None,
+                    health_checks: egress_health_checks(),
+                    service_discovery: None,
+                    subsets: None,
+                    backend_tls_client_cert_path: None,
+                    backend_tls_client_key_path: None,
+                    backend_tls_verify_server_cert: true,
+                    backend_tls_server_ca_cert_path: None,
+                    api_spec_id: None,
+                    created_at: now,
+                    updated_at: now,
+                };
+                upstreams.push(upstream);
+
                 let proxy_id =
                     mesh_egress_proxy_id(&entry.namespace, &entry.name, host, port_spec.port);
                 let proxy = egress_gateway_proxy(
@@ -701,6 +700,7 @@ fn egress_health_checks() -> Option<HealthCheckConfig> {
 /// endpoints are empty (DNS or None resolution), each host becomes a target.
 fn build_egress_upstream_targets(
     entry: &ServiceEntry,
+    host: &str,
     port_number: u16,
     port_name: &Option<String>,
 ) -> Vec<UpstreamTarget> {
@@ -727,18 +727,15 @@ fn build_egress_upstream_targets(
             })
             .collect()
     } else {
-        // DNS or None resolution: use hosts as backend targets.
-        entry
-            .hosts
-            .iter()
-            .map(|host| UpstreamTarget {
-                host: host.clone(),
-                port: port_number,
-                weight: 1,
-                tags: std::collections::HashMap::new(),
-                path: None,
-            })
-            .collect()
+        // DNS or None resolution: keep each host's proxy pinned to that host so
+        // SNI/Host expectations cannot be crossed by load balancing.
+        vec![UpstreamTarget {
+            host: host.to_string(),
+            port: port_number,
+            weight: 1,
+            tags: std::collections::HashMap::new(),
+            path: None,
+        }]
     }
 }
 
@@ -2815,7 +2812,7 @@ mod tests {
         // Host-only HTTP proxies cannot safely distinguish multiple ports for
         // the same host, so only the first materialized port owns each host.
         assert_eq!(proxies.len(), 2);
-        assert_eq!(upstreams.len(), 1);
+        assert_eq!(upstreams.len(), 2);
 
         assert!(
             proxies
@@ -2896,12 +2893,22 @@ mod tests {
 
         let (_, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
 
-        assert_eq!(upstreams.len(), 1);
-        assert_eq!(upstreams[0].targets.len(), 2);
-        assert_eq!(upstreams[0].targets[0].host, "primary.external.com");
-        assert_eq!(upstreams[0].targets[0].port, 443);
-        assert_eq!(upstreams[0].targets[1].host, "secondary.external.com");
-        assert_eq!(upstreams[0].targets[1].port, 443);
+        assert_eq!(upstreams.len(), 2);
+        let primary = upstreams
+            .iter()
+            .find(|upstream| upstream.id.contains("primary-external-com"))
+            .expect("primary upstream");
+        assert_eq!(primary.targets.len(), 1);
+        assert_eq!(primary.targets[0].host, "primary.external.com");
+        assert_eq!(primary.targets[0].port, 443);
+
+        let secondary = upstreams
+            .iter()
+            .find(|upstream| upstream.id.contains("secondary-external-com"))
+            .expect("secondary upstream");
+        assert_eq!(secondary.targets.len(), 1);
+        assert_eq!(secondary.targets[0].host, "secondary.external.com");
+        assert_eq!(secondary.targets[0].port, 443);
     }
 
     #[test]
