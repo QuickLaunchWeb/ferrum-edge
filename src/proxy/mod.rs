@@ -6679,7 +6679,10 @@ async fn handle_proxy_request_inner(
         proxy_headers,
     );
     let lb_hash_key = selection.lb_hash_key;
-    let upstream_target = selection.target;
+    let upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
+        selection.target,
+        request_host.as_deref(),
+    );
     let upstream_balancer = selection.balancer;
     let upstream_is_fallback = selection.is_fallback;
     let sticky_cookie_needed = selection.sticky_cookie_needed;

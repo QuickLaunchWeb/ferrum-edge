@@ -245,6 +245,29 @@ pub(crate) fn select_upstream_target(
     }
 }
 
+/// Replace a wildcard upstream target host (for example `*.example.com`) with
+/// the concrete request authority that matched the route. This is used by mesh
+/// egress wildcard ServiceEntries with DNS/None resolution: the proxy route is
+/// wildcard-hosted, but the backend dial target must be the concrete authority.
+pub(crate) fn concretize_wildcard_target_for_request(
+    target: Option<Arc<UpstreamTarget>>,
+    request_host: Option<&str>,
+) -> Option<Arc<UpstreamTarget>> {
+    let target = target?;
+    let Some(request_host) = request_host else {
+        return Some(target);
+    };
+    if !target.host.starts_with("*.")
+        || !crate::config::types::wildcard_matches(&target.host, request_host)
+    {
+        return Some(target);
+    }
+
+    let mut concrete = target.as_ref().clone();
+    concrete.host = request_host.to_string();
+    Some(Arc::new(concrete))
+}
+
 /// Check whether the circuit breaker allows this request to proceed.
 ///
 /// Returns `Ok((cb_target_key, is_half_open_probe))` when the request is allowed,
@@ -395,5 +418,42 @@ pub(crate) fn resolve_hash_key(
             // Cookie not found — use IP and signal that we need to set the cookie
             (client_ip.to_owned(), true)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(host: &str) -> Arc<UpstreamTarget> {
+        Arc::new(UpstreamTarget {
+            host: host.to_string(),
+            port: 443,
+            weight: 1,
+            tags: HashMap::new(),
+            path: None,
+        })
+    }
+
+    #[test]
+    fn wildcard_target_uses_concrete_request_host() {
+        let concrete = concretize_wildcard_target_for_request(
+            Some(target("*.example.com")),
+            Some("api.example.com"),
+        )
+        .expect("target remains");
+
+        assert_eq!(concrete.host, "api.example.com");
+        assert_eq!(concrete.port, 443);
+    }
+
+    #[test]
+    fn wildcard_target_does_not_use_unmatched_request_host() {
+        let original = target("*.example.com");
+        let concrete =
+            concretize_wildcard_target_for_request(Some(original.clone()), Some("example.net"))
+                .expect("target remains");
+
+        assert!(Arc::ptr_eq(&original, &concrete));
     }
 }

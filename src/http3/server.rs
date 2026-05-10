@@ -1372,7 +1372,10 @@ async fn handle_h3_request(
         &proxy_headers,
     );
     let lb_hash_key = selection.lb_hash_key;
-    let upstream_target = selection.target;
+    let upstream_target = crate::proxy::backend_dispatch::concretize_wildcard_target_for_request(
+        selection.target,
+        request_host.as_deref(),
+    );
     let upstream_balancer = selection.balancer;
 
     let (cb_target_key, cb_is_half_open_probe) =
