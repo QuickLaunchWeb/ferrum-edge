@@ -19,9 +19,11 @@ use tracing::{error, info};
 
 use crate::config::types::GatewayConfig;
 use crate::grpc::cp_server::DpNodeRegistry;
+use crate::grpc::mesh_registry::MeshNodeRegistry;
+use crate::grpc::mesh_server::MeshConfigBroadcast;
 use crate::grpc::proto::ConfigUpdate;
 use metrics::ControllerMetrics;
-use reconciler::{ReconcilerConfig, spawn_reconcile_loop};
+use reconciler::{ReconcileBroadcasters, ReconcilerConfig, spawn_reconcile_loop};
 use resource_store::ResourceStoreSet;
 use watcher::{spawn_crd_reprobe_task, start_crd_watchers};
 
@@ -58,6 +60,8 @@ pub async fn start_k8s_controller(
     config_arc: Arc<ArcSwap<GatewayConfig>>,
     update_tx: broadcast::Sender<ConfigUpdate>,
     dp_registry: Arc<DpNodeRegistry>,
+    mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
+    mesh_registry: Arc<MeshNodeRegistry>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<K8sControllerHandle, anyhow::Error> {
     info!(
@@ -96,8 +100,12 @@ pub async fn start_k8s_controller(
     let reconciler_handle = spawn_reconcile_loop(
         store_set.clone(),
         config_arc,
-        update_tx,
-        dp_registry,
+        ReconcileBroadcasters {
+            update_tx,
+            dp_registry,
+            mesh_update_tx,
+            mesh_registry,
+        },
         reconciler_config,
         metrics.clone(),
         shutdown.clone(),

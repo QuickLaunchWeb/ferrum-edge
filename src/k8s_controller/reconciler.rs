@@ -13,6 +13,8 @@ use crate::config_sources::k8s::{
     translate_k8s_objects_with_filter,
 };
 use crate::grpc::cp_server::{CpGrpcServer, DpNodeRegistry};
+use crate::grpc::mesh_registry::MeshNodeRegistry;
+use crate::grpc::mesh_server::{MeshConfigBroadcast, MeshGrpcServer};
 use crate::grpc::proto::ConfigUpdate;
 use crate::identity::spiffe::TrustDomain;
 use crate::k8s_controller::metrics::ControllerMetrics;
@@ -28,11 +30,17 @@ pub struct ReconcilerConfig {
     pub full_sync_interval_secs: u64,
 }
 
+pub struct ReconcileBroadcasters {
+    pub update_tx: broadcast::Sender<ConfigUpdate>,
+    pub dp_registry: Arc<DpNodeRegistry>,
+    pub mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
+    pub mesh_registry: Arc<MeshNodeRegistry>,
+}
+
 pub fn spawn_reconcile_loop(
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     config_arc: Arc<ArcSwap<GatewayConfig>>,
-    update_tx: broadcast::Sender<ConfigUpdate>,
-    dp_registry: Arc<DpNodeRegistry>,
+    broadcasters: ReconcileBroadcasters,
     reconciler_config: ReconcilerConfig,
     metrics: Arc<ControllerMetrics>,
     mut shutdown: watch::Receiver<bool>,
@@ -75,8 +83,10 @@ pub fn spawn_reconcile_loop(
             &store_set,
             ReconcileContext {
                 config_arc: &config_arc,
-                update_tx: &update_tx,
-                dp_registry: &dp_registry,
+                update_tx: &broadcasters.update_tx,
+                dp_registry: &broadcasters.dp_registry,
+                mesh_update_tx: &broadcasters.mesh_update_tx,
+                mesh_registry: &broadcasters.mesh_registry,
                 namespace: &reconciler_config.namespace,
                 watch_namespaces: &reconciler_config.watch_namespaces,
                 trust_domain: &trust_domain,
@@ -101,8 +111,10 @@ pub fn spawn_reconcile_loop(
                         &store_set,
                         ReconcileContext {
                             config_arc: &config_arc,
-                            update_tx: &update_tx,
-                            dp_registry: &dp_registry,
+                            update_tx: &broadcasters.update_tx,
+                            dp_registry: &broadcasters.dp_registry,
+                            mesh_update_tx: &broadcasters.mesh_update_tx,
+                            mesh_registry: &broadcasters.mesh_registry,
                             namespace: &reconciler_config.namespace,
                             watch_namespaces: &reconciler_config.watch_namespaces,
                             trust_domain: &trust_domain,
@@ -121,8 +133,10 @@ pub fn spawn_reconcile_loop(
                         &store_set,
                         ReconcileContext {
                             config_arc: &config_arc,
-                            update_tx: &update_tx,
-                            dp_registry: &dp_registry,
+                            update_tx: &broadcasters.update_tx,
+                            dp_registry: &broadcasters.dp_registry,
+                            mesh_update_tx: &broadcasters.mesh_update_tx,
+                            mesh_registry: &broadcasters.mesh_registry,
                             namespace: &reconciler_config.namespace,
                             watch_namespaces: &reconciler_config.watch_namespaces,
                             trust_domain: &trust_domain,
@@ -266,6 +280,8 @@ struct ReconcileContext<'a> {
     config_arc: &'a Arc<ArcSwap<GatewayConfig>>,
     update_tx: &'a broadcast::Sender<ConfigUpdate>,
     dp_registry: &'a Arc<DpNodeRegistry>,
+    mesh_update_tx: &'a broadcast::Sender<MeshConfigBroadcast>,
+    mesh_registry: &'a Arc<MeshNodeRegistry>,
     namespace: &'a str,
     watch_namespaces: &'a [String],
     trust_domain: &'a TrustDomain,
@@ -299,7 +315,14 @@ async fn do_reconcile(
         warn!(warning, "K8s translation warning");
     }
 
-    let Some(new_config) = swap_merged_k8s_translation(ctx.config_arc, &translation.config) else {
+    let managed_namespaces = managed_k8s_namespaces(
+        ctx.namespace,
+        ctx.watch_namespaces,
+        &translation.config.known_namespaces,
+    );
+    let Some(new_config) =
+        swap_merged_k8s_translation(ctx.config_arc, &translation.config, &managed_namespaces)
+    else {
         debug!("No config changes detected, skipping swap");
         let elapsed = start.elapsed();
         ctx.metrics.last_reconcile_duration_ms.store(
@@ -309,8 +332,13 @@ async fn do_reconcile(
         return;
     };
 
-    // Notify DPs of the config change.
+    // Notify DPs and mesh subscribers of the config change.
     CpGrpcServer::broadcast_update_with_registry(ctx.update_tx, &new_config, ctx.dp_registry);
+    MeshGrpcServer::broadcast_full_with_registry(
+        ctx.mesh_update_tx,
+        new_config.clone(),
+        ctx.mesh_registry,
+    );
 
     let elapsed = start.elapsed();
     ctx.metrics.last_reconcile_duration_ms.store(
@@ -330,11 +358,16 @@ async fn do_reconcile(
 fn swap_merged_k8s_translation(
     config_arc: &ArcSwap<GatewayConfig>,
     k8s_config: &GatewayConfig,
+    managed_namespaces: &BTreeSet<String>,
 ) -> Option<Arc<GatewayConfig>> {
     let mut old_config = config_arc.load();
 
     loop {
-        let new_config = Arc::new(merge_k8s_translation(old_config.as_ref(), k8s_config));
+        let new_config = Arc::new(merge_k8s_translation(
+            old_config.as_ref(),
+            k8s_config,
+            managed_namespaces,
+        ));
         if !gateway_config_content_changed(&new_config, old_config.as_ref()) {
             return None;
         }
@@ -355,15 +388,34 @@ fn gateway_config_content_changed(new_config: &GatewayConfig, old_config: &Gatew
 const K8S_MANAGED_PROXY_ID_PREFIXES: &[&str] = &["gwapi-route-", "gwapi-l4-", "istio-vs-"];
 const K8S_MANAGED_UPSTREAM_ID_PREFIXES: &[&str] = &["gwapi-route-upstream-", "istio-vs-upstream-"];
 
-fn merge_k8s_translation(active: &GatewayConfig, k8s_config: &GatewayConfig) -> GatewayConfig {
+fn managed_k8s_namespaces(
+    namespace: &str,
+    watch_namespaces: &[String],
+    k8s_known_namespaces: &[String],
+) -> BTreeSet<String> {
+    let mut namespaces: BTreeSet<String> = watch_namespaces.iter().cloned().collect();
+    namespaces.extend(k8s_known_namespaces.iter().cloned());
+    if namespaces.is_empty() {
+        namespaces.insert(namespace.to_string());
+    }
+    namespaces
+}
+
+fn merge_k8s_translation(
+    active: &GatewayConfig,
+    k8s_config: &GatewayConfig,
+    managed_namespaces: &BTreeSet<String>,
+) -> GatewayConfig {
     let mut merged = active.clone();
 
-    merged
-        .proxies
-        .retain(|proxy| !has_any_prefix(&proxy.id, K8S_MANAGED_PROXY_ID_PREFIXES));
-    merged
-        .upstreams
-        .retain(|upstream| !has_any_prefix(&upstream.id, K8S_MANAGED_UPSTREAM_ID_PREFIXES));
+    merged.proxies.retain(|proxy| {
+        !(managed_namespaces.contains(&proxy.namespace)
+            && has_any_prefix(&proxy.id, K8S_MANAGED_PROXY_ID_PREFIXES))
+    });
+    merged.upstreams.retain(|upstream| {
+        !(managed_namespaces.contains(&upstream.namespace)
+            && has_any_prefix(&upstream.id, K8S_MANAGED_UPSTREAM_ID_PREFIXES))
+    });
 
     merged.proxies.extend(k8s_config.proxies.clone());
     merged.upstreams.extend(k8s_config.upstreams.clone());
@@ -557,7 +609,8 @@ mod tests {
         ));
         k8s.known_namespaces.push("k8s".to_string());
 
-        let merged = merge_k8s_translation(&active, &k8s);
+        let managed = BTreeSet::from(["ferrum".to_string()]);
+        let merged = merge_k8s_translation(&active, &k8s, &managed);
 
         assert!(merged.proxies.iter().any(|proxy| proxy.id == "db-proxy"));
         assert!(
@@ -600,9 +653,41 @@ mod tests {
 
         let k8s = GatewayConfig::default();
 
-        let merged = merge_k8s_translation(&active, &k8s);
+        let managed = BTreeSet::from(["ferrum".to_string()]);
+        let merged = merge_k8s_translation(&active, &k8s, &managed);
 
         assert!(merged.mesh.is_none());
+    }
+
+    #[test]
+    fn merge_k8s_translation_preserves_prefixed_operator_resources_outside_managed_namespaces() {
+        let mut active = GatewayConfig::default();
+        active
+            .proxies
+            .push(proxy("gwapi-route-operator-owned", "db.internal"));
+        active.proxies[0].namespace = "ops".to_string();
+        active.upstreams.push(upstream(
+            "gwapi-route-upstream-operator-owned",
+            "db.internal",
+        ));
+        active.upstreams[0].namespace = "ops".to_string();
+
+        let k8s = GatewayConfig::default();
+        let managed = BTreeSet::from(["ferrum".to_string()]);
+        let merged = merge_k8s_translation(&active, &k8s, &managed);
+
+        assert!(
+            merged
+                .proxies
+                .iter()
+                .any(|proxy| proxy.id == "gwapi-route-operator-owned")
+        );
+        assert!(
+            merged
+                .upstreams
+                .iter()
+                .any(|upstream| upstream.id == "gwapi-route-upstream-operator-owned")
+        );
     }
 
     #[test]

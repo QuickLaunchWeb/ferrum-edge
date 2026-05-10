@@ -460,6 +460,8 @@ pub async fn run(
             config_arc.clone(),
             update_tx.clone(),
             dp_registry.clone(),
+            mesh_update_tx.clone(),
+            mesh_registry.clone(),
             shutdown_tx.subscribe(),
         )
         .await
