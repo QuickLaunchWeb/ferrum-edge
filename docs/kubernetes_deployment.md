@@ -32,6 +32,10 @@ The injector webhook also ships with a default `namespaceSelector` that excludes
 `kube-system`, `kube-public`, `kube-node-lease`, `istio-system`, and namespaces
 labelled `ferrum.io/injection=disabled`. The injector still requires per-pod
 opt-in by default through `FERRUM_INJECTOR_REQUIRE_ANNOTATION=true`.
+Managed clusters may expose additional platform namespaces such as
+`gke-managed-system`, `openshift-*`, or other `kube-*` names; add those to
+`injector.namespaceSelector` or label them `ferrum.io/injection=disabled` before
+enabling broader injection.
 
 The chart mounts the injector serving certificate through a Secret volume; the
 injector process does not read Kubernetes Secrets through the API, so the default
