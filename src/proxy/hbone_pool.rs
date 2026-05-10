@@ -19,6 +19,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use tracing::debug;
 
@@ -95,8 +96,8 @@ impl HbonePoolError {
                     ErrorClass::PortExhaustion
                 } else {
                     match source.kind() {
-                        std::io::ErrorKind::ConnectionRefused => ErrorClass::ConnectionRefused,
-                        std::io::ErrorKind::ConnectionReset => ErrorClass::ConnectionReset,
+                        std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset => ErrorClass::ConnectionRefused,
                         std::io::ErrorKind::TimedOut => ErrorClass::ConnectionTimeout,
                         std::io::ErrorKind::BrokenPipe => ErrorClass::ConnectionClosed,
                         _ => ErrorClass::RequestError,
@@ -129,6 +130,7 @@ impl HbonePoolError {
 
 pub struct HboneConnectionPool {
     entries: DashMap<String, Vec<HbonePoolEntry>>,
+    pending_creations: DashMap<String, std::sync::Arc<Mutex<()>>>,
     gateway_svid: SharedSvidBundle,
     dns_cache: DnsCache,
     pool_config: PoolConfig,
@@ -144,6 +146,7 @@ impl HboneConnectionPool {
     ) -> Self {
         Self {
             entries: DashMap::with_shard_amount(shard_amount),
+            pending_creations: DashMap::with_shard_amount(shard_amount),
             gateway_svid,
             dns_cache,
             pool_config,
@@ -279,19 +282,83 @@ impl HboneConnectionPool {
             None => {}
         }
 
-        let sender = self
-            .create_sender(proxy, target_host, hbone_port, pool_config)
-            .await?;
+        let creation_lock = self
+            .pending_creations
+            .entry(key.to_string())
+            .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+            .clone();
+        let sender_result = {
+            let _guard = creation_lock.lock().await;
+            // Coalesce first-connection bursts for the same pool key. Another
+            // waiter may have inserted a sender while we were queued on the
+            // per-key creation lock, so re-check before dialing.
+            match self.cached_sender(key, max_entries) {
+                Some(CachedSender::Ready(sender)) => Ok((sender, false)),
+                Some(CachedSender::Pending(sender)) => {
+                    let authority = authority_for_host_port(target_host, target_port);
+                    match tokio::time::timeout(
+                        Duration::from_millis(proxy.backend_connect_timeout_ms),
+                        sender.ready(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(sender)) => Ok((sender, false)),
+                        Ok(Err(err)) => {
+                            debug!(
+                                target_host,
+                                target_port,
+                                hbone_port,
+                                error = %err,
+                                "Cached HBONE HTTP/2 sender closed while waiting for readiness; creating a replacement"
+                            );
+                            let sender = self
+                                .create_sender(proxy, target_host, hbone_port, pool_config)
+                                .await?;
+                            self.insert_sender(key, sender.clone(), pool_config);
+                            Ok((sender, true))
+                        }
+                        Err(_) => Err(HbonePoolError::ConnectStream {
+                            authority,
+                            message: format!(
+                                "timed out after {}ms waiting for cached HBONE HTTP/2 sender readiness",
+                                proxy.backend_connect_timeout_ms
+                            ),
+                        }),
+                    }
+                }
+                None => {
+                    let sender = self
+                        .create_sender(proxy, target_host, hbone_port, pool_config)
+                        .await?;
+                    self.insert_sender(key, sender.clone(), pool_config);
+                    Ok((sender, true))
+                }
+            }
+        };
+        self.pending_creations
+            .remove_if(key, |_, lock| std::sync::Arc::ptr_eq(lock, &creation_lock));
+        let (sender, created) = sender_result?;
+        if created {
+            debug!(
+                target_host,
+                target_port, hbone_port, "Created gateway HBONE HTTP/2 connection"
+            );
+        }
+        Ok(sender)
+    }
+
+    fn insert_sender(&self, key: &str, sender: SendRequest<Bytes>, pool_config: &PoolConfig) {
+        let now = Instant::now();
+        let max_entries = pool_config.http2_connections_per_host.max(1);
         self.entries
             .entry(key.to_string())
             .and_modify(|entries| {
                 prune_pool_entries(entries);
                 entries.push(HbonePoolEntry {
                     sender: sender.clone(),
-                    last_used_at: Instant::now(),
+                    last_used_at: now,
                     idle_timeout_seconds: pool_config.idle_timeout_seconds,
                 });
-                let max_entries = pool_config.http2_connections_per_host.max(1);
                 if entries.len() > max_entries {
                     let overflow = entries.len() - max_entries;
                     entries.drain(0..overflow);
@@ -299,23 +366,17 @@ impl HboneConnectionPool {
             })
             .or_insert_with(|| {
                 vec![HbonePoolEntry {
-                    sender: sender.clone(),
-                    last_used_at: Instant::now(),
+                    sender,
+                    last_used_at: now,
                     idle_timeout_seconds: pool_config.idle_timeout_seconds,
                 }]
             });
-        debug!(
-            target_host,
-            target_port, hbone_port, "Created gateway HBONE HTTP/2 connection"
-        );
-        Ok(sender)
     }
 
     fn cached_sender(&self, key: &str, max_entries: usize) -> Option<CachedSender> {
         let mut entries = self.entries.get_mut(key)?;
         prune_pool_entries(&mut entries);
         let mut pending = None;
-        let mut pending_idx = None;
         let mut idx = 0;
         while idx < entries.len() {
             let entry = &mut entries[idx];
@@ -332,18 +393,12 @@ impl HboneConnectionPool {
                 None => {
                     if pending.is_none() {
                         pending = Some(sender);
-                        pending_idx = Some(idx);
                     }
                 }
             }
             idx += 1;
         }
         if entries.len() >= max_entries {
-            if let Some(idx) = pending_idx
-                && let Some(entry) = entries.get_mut(idx)
-            {
-                entry.last_used_at = Instant::now();
-            }
             pending.map(CachedSender::Pending)
         } else {
             None
@@ -446,6 +501,10 @@ impl HboneConnectionPool {
 
         let (stream_window_size, connection_window_size) = h2_window_sizes(pool_config);
         let mut builder = h2::client::Builder::new();
+        // The lower-level h2 builder does not expose hyper's adaptive-window
+        // toggle. When adaptive sizing is requested, h2_window_sizes() raises
+        // the initial windows to the same high-throughput starting point used
+        // by the direct HTTP/2 pool.
         builder
             .initial_window_size(stream_window_size)
             .initial_connection_window_size(connection_window_size)
@@ -1135,5 +1194,20 @@ mod tests {
             h2_failure.is_capability_failure(),
             "pre-CONNECT HTTP/2 establishment failure is a capability signal"
         );
+    }
+
+    #[test]
+    fn connect_phase_reset_classifies_as_refused() {
+        let reset = HbonePoolError::Connect {
+            addr: "127.0.0.1:15008".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"),
+        };
+        assert_eq!(reset.error_class(), ErrorClass::ConnectionRefused);
+
+        let timed_out = HbonePoolError::Connect {
+            addr: "127.0.0.1:15008".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"),
+        };
+        assert_eq!(timed_out.error_class(), ErrorClass::ConnectionTimeout);
     }
 }

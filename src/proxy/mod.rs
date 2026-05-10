@@ -10940,6 +10940,13 @@ async fn proxy_to_backend_hbone(
     };
     parts.headers.clear();
     let backend_host_header = hbone_pool::authority_for_host_port(&target.host, target.port);
+    let mut owned_hbone_headers = None;
+    hbone_proxy::strip_egress_baggage_in_proxy_headers(
+        &mut owned_hbone_headers,
+        headers,
+        &state.mesh_egress_strip_baggage_keys,
+    );
+    let headers = owned_hbone_headers.as_ref().unwrap_or(headers);
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (k, v) in headers {
         match k.as_str() {
