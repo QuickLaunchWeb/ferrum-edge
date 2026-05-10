@@ -12,6 +12,7 @@
 
 pub mod bootstrap;
 pub mod internal;
+pub mod spire;
 pub mod upstream;
 
 use async_trait::async_trait;
@@ -125,3 +126,45 @@ impl From<std::io::Error> for CaError {
 
 /// Boxed trait object alias used by the workload-API server.
 pub type SharedCa = Arc<dyn CertificateAuthority>;
+
+/// Selects which CA backend to use at startup.
+///
+/// Parsed from `FERRUM_MESH_CA_BACKEND`. The default is `None` (no CA
+/// configured — mesh identity features are disabled).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CaBackend {
+    /// Ferrum's own internal CA (root cert + key on disk).
+    Internal,
+    /// Delegate to a SPIRE Agent over the Workload API UDS.
+    SpireAgent,
+    /// No CA — identity subsystem is inactive.
+    #[default]
+    None,
+}
+
+impl CaBackend {
+    /// Parse from an env-var-style string. Case-insensitive. Returns
+    /// `Err` for unrecognised values so the operator gets a clear error at
+    /// startup.
+    pub fn from_str_lossy(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "internal" => Ok(Self::Internal),
+            "spire" | "spire_agent" | "spire-agent" => Ok(Self::SpireAgent),
+            "none" | "" => Ok(Self::None),
+            other => Err(format!(
+                "unknown FERRUM_MESH_CA_BACKEND '{other}'; \
+                 expected one of: internal, spire, none"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for CaBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Internal => f.write_str("internal"),
+            Self::SpireAgent => f.write_str("spire"),
+            Self::None => f.write_str("none"),
+        }
+    }
+}
