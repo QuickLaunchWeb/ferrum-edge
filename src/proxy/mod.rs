@@ -1278,6 +1278,10 @@ impl ProxyState {
         self.gateway_trust_bundles
             .store(Arc::new(Some(trust_bundles.clone())));
 
+        // SAFETY: the load-modify-store below is valid because CP-delivered
+        // gateway trust changes are applied only by the single DP gRPC apply
+        // loop. If another writer is added, convert this to a compare/swap or
+        // a dedicated synchronized update to avoid losing concurrent SVID edits.
         let current = self.gateway_svid_bundle.load_full();
         if let Some(mut bundle) = current.as_ref().clone() {
             bundle.trust_bundles = trust_bundles;
