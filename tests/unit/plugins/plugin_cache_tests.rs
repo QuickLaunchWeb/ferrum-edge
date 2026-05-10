@@ -1383,12 +1383,11 @@ async fn test_pre_auth_body_buffering_plugins_are_explicitly_tracked_for_hbone()
 
     for name in available_plugins() {
         let config = minimal_plugin_config(name);
-        if let Ok(Some(plugin)) = create_plugin(name, &config) {
-            if plugin.requires_request_body_before_authenticate()
-                && plugin.should_buffer_request_body(&ctx)
-            {
-                pre_auth_body_plugins.push(name);
-            }
+        if let Ok(Some(plugin)) = create_plugin(name, &config)
+            && plugin.requires_request_body_before_authenticate()
+            && plugin.should_buffer_request_body(&ctx)
+        {
+            pre_auth_body_plugins.push(name);
         }
     }
 
