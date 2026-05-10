@@ -295,11 +295,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Check for eBPF changes
         id: changes
         run: |
-          if git diff --name-only origin/main...HEAD | grep -q '^ebpf/'; then
+          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -q '^ebpf/'; then
             echo "ebpf_changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "ebpf_changed=false" >> "$GITHUB_OUTPUT"
@@ -314,6 +316,10 @@ jobs:
       - name: Install stable Rust for shared types
         if: steps.changes.outputs.ebpf_changed == 'true'
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install bpf-linker
+        if: steps.changes.outputs.ebpf_changed == 'true'
+        run: cargo install bpf-linker --locked
 
       - name: Build BPF programs
         if: steps.changes.outputs.ebpf_changed == 'true'

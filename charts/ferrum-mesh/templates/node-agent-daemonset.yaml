@@ -49,6 +49,10 @@ spec:
               value: {{ .Values.nodeAgent.capture.excludePorts | quote }}
             - name: FERRUM_NODE_AGENT_FALLBACK_MODE
               value: {{ .Values.nodeAgent.fallbackMode | quote }}
+            - name: FERRUM_NODE_AGENT_CGROUP_ROOT
+              value: {{ .Values.nodeAgent.cgroupRoot | quote }}
+            - name: FERRUM_NODE_AGENT_BPF_FS_PATH
+              value: {{ .Values.nodeAgent.bpfFsPath | quote }}
             - name: FERRUM_NODE_AGENT_NODE_NAME
               valueFrom:
                 fieldRef:
