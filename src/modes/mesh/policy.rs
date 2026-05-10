@@ -9,12 +9,12 @@
 
 use std::collections::BTreeMap;
 
-use crate::config::mesh::{
+use crate::identity::SpiffeId;
+use crate::modes::mesh::config::{
     ConditionMatch, MeshRule, PolicyAction, PrincipalMatch, RequestMatch,
     normalize_mesh_policy_header_map,
 };
-use crate::identity::SpiffeId;
-use crate::xds::slice::MeshSlice;
+use crate::modes::mesh::slice::MeshSlice;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MeshAuthzRequest {
@@ -191,7 +191,7 @@ struct NormalizedHost {
 
 fn normalized_host_matches(pattern: &str, host: &NormalizedHost) -> bool {
     // Patterns are pre-normalized at config-load time
-    // (see `crate::config::mesh::normalize_request_match_host_pattern`),
+    // (see `crate::modes::mesh::config::normalize_request_match_host_pattern`),
     // so the hot path can match directly against the request authority's
     // bare name (no port) and full authority (host[:port]) forms.
     wildcard_match(pattern, &host.name) || wildcard_match(pattern, &host.authority)
@@ -384,7 +384,9 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
     true
 }
 
-pub(crate) fn normalize_mesh_policy_header_names(policy: &mut crate::config::mesh::MeshPolicy) {
+pub(crate) fn normalize_mesh_policy_header_names(
+    policy: &mut crate::modes::mesh::config::MeshPolicy,
+) {
     for rule in &mut policy.rules {
         for request in &mut rule.to {
             normalize_mesh_policy_header_map(&mut request.headers);
@@ -392,7 +394,9 @@ pub(crate) fn normalize_mesh_policy_header_names(policy: &mut crate::config::mes
     }
 }
 
-pub(crate) fn mesh_policy_has_header_rules(policy: &crate::config::mesh::MeshPolicy) -> bool {
+pub(crate) fn mesh_policy_has_header_rules(
+    policy: &crate::modes::mesh::config::MeshPolicy,
+) -> bool {
     policy
         .rules
         .iter()
@@ -401,7 +405,7 @@ pub(crate) fn mesh_policy_has_header_rules(policy: &crate::config::mesh::MeshPol
 }
 
 pub(crate) fn mesh_policies_have_header_rules(
-    policies: &[crate::config::mesh::MeshPolicy],
+    policies: &[crate::modes::mesh::config::MeshPolicy],
 ) -> bool {
     policies.iter().any(mesh_policy_has_header_rules)
 }
@@ -409,7 +413,7 @@ pub(crate) fn mesh_policies_have_header_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::mesh::{
+    use crate::modes::mesh::config::{
         MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
         WorkloadSelector,
     };
@@ -849,7 +853,7 @@ mod tests {
 
     #[test]
     fn request_match_normalises_trailing_dot_host_pattern_at_config_load() {
-        let mut config = crate::config::mesh::MeshConfig {
+        let mut config = crate::modes::mesh::config::MeshConfig {
             mesh_policies: vec![MeshPolicy {
                 name: "allow-trailing-dot".to_string(),
                 namespace: "default".to_string(),
@@ -865,7 +869,7 @@ mod tests {
                     action: PolicyAction::Allow,
                 }],
             }],
-            ..crate::config::mesh::MeshConfig::default()
+            ..crate::modes::mesh::config::MeshConfig::default()
         };
         config.normalize();
         let slice = MeshSlice {

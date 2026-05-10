@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
-use crate::config::mesh::{
+use crate::identity::spiffe::SpiffeId;
+use crate::modes::mesh::config::{
     AccessLogFilter, AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig, MeshEndpoint,
     MeshJwtRule, MeshMetricsConfig, MeshPolicy, MeshRequestAuthentication, MeshRule,
     MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig, MetricTagOverride, MtlsMode,
@@ -10,7 +11,6 @@ use crate::config::mesh::{
     ServiceEntry, ServiceEntryLocation, ServicePort, TagOverrideOperation, Workload, WorkloadPort,
     WorkloadSelector,
 };
-use crate::identity::spiffe::SpiffeId;
 
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, RouteBackend, RouteProxySpec, SourceKind,
@@ -1047,7 +1047,7 @@ mod tests {
     use crate::modes::mesh::policy::{
         MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
     };
-    use crate::xds::slice::MeshSlice;
+    use crate::modes::mesh::slice::MeshSlice;
 
     fn options() -> K8sTranslationOptions {
         K8sTranslationOptions::new(

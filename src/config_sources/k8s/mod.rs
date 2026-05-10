@@ -13,12 +13,12 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::mesh::MeshConfig;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
     PluginAssociation, Proxy, ResponseBodyMode, Upstream, UpstreamTarget, default_namespace,
 };
 use crate::identity::spiffe::TrustDomain;
+use crate::modes::mesh::config::MeshConfig;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct K8sMetadata {
@@ -403,7 +403,9 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        pool_max_requests_per_connection: None,
         upstream_id: spec.upstream_id,
+        upstream_subset: None,
         api_spec_id: None,
         circuit_breaker: None,
         retry: None,
@@ -460,6 +462,7 @@ pub(crate) fn upstream_for_route(
         hash_on_cookie_config: None,
         health_checks: None,
         service_discovery: None,
+        subsets: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,

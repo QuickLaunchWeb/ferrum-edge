@@ -557,6 +557,7 @@ impl StreamListenerManager {
                 let frontend_tls_handshake_timeout = self.frontend_tls_handshake_timeout_seconds;
                 let udp_cleanup_interval = self.udp_cleanup_interval_seconds;
                 let crls = self.crls.clone();
+                let tls_ca_bundle_path = self.tls_ca_bundle_path.clone();
                 let sni_ids = sni_ids.clone();
                 let adaptive_buf = self.adaptive_buffer.clone();
                 let recvmmsg_batch = self.udp_recvmmsg_batch_size;
@@ -579,6 +580,7 @@ impl StreamListenerManager {
                         metrics,
                         frontend_dtls_config,
                         tls_no_verify,
+                        tls_ca_bundle_path,
                         max_sessions: udp_max_sessions,
                         frontend_tls_handshake_timeout_seconds: frontend_tls_handshake_timeout,
                         cleanup_interval_seconds: udp_cleanup_interval,

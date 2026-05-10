@@ -12,7 +12,6 @@
 pub mod conformance;
 pub mod nonce;
 pub mod server;
-pub mod slice;
 pub mod snapshot;
 pub mod translator;
 
@@ -25,9 +24,10 @@ pub mod proto {
 // Public re-exports are used by library consumers/tests even when the binary
 // target only reaches xDS through narrower module paths.
 #[allow(unused_imports)]
+pub use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+#[allow(unused_imports)]
 pub use nonce::{AckOutcome, XdsNonceTracker};
 pub use server::XdsAdsServer;
-pub use slice::{MeshSlice, MeshSliceRequest};
 #[allow(unused_imports)]
 pub use snapshot::{XdsResource, XdsSnapshot, XdsSnapshotCache};
 #[allow(unused_imports)]

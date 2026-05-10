@@ -3,6 +3,11 @@ use std::fs;
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-changed=proto/ferrum.proto");
+    println!("cargo:rerun-if-changed=proto/envoy/service/discovery/v3/discovery.proto");
+    println!("cargo:rerun-if-changed=proto/health.proto");
+    println!("cargo:rerun-if-changed=proto/workload_api.proto");
+
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)

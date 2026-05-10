@@ -1,15 +1,15 @@
 //! Layer-2 mesh type tests: serde round-trips, byte-identical
 //! backwards-compat, decode helpers.
 
-use ferrum_edge::config::mesh::{
+use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
+use ferrum_edge::modes::mesh::config::{
     AppProtocol, EastWestGateway, JwtHeader, MeshConfig, MeshEndpoint, MeshJwtRule, MeshPolicy,
     MeshRequestAuthentication, MeshRule, MeshService, MtlsMode, MultiClusterConfig,
     PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, RequestMatch,
     Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet,
     Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
 };
-use ferrum_edge::config::types::GatewayConfig;
-use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use std::collections::HashMap;
 
 // ── Backwards-compat (byte-identical) ────────────────────────────────────
