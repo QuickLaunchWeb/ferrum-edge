@@ -496,16 +496,25 @@ fn next_sampling_u64() -> u64 {
 fn random_sampling_seed() -> u64 {
     let mut bytes = [0u8; 8];
     if SystemRandom::new().fill(&mut bytes).is_ok() {
-        let seed = u64::from_ne_bytes(bytes);
-        if seed != 0 {
-            return seed;
-        }
+        return u64::from_ne_bytes(bytes);
     }
 
-    std::time::SystemTime::now()
+    let time_seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(0xA5A5_5A5A_D3C1_B2A0)
+        .unwrap_or(0);
+    let stack_marker = 0u8;
+    let stack_entropy = (&stack_marker as *const u8 as usize) as u64;
+    fallback_sampling_seed(time_seed, stack_entropy)
+}
+
+fn fallback_sampling_seed(time_seed: u64, stack_entropy: u64) -> u64 {
+    splitmix64(
+        0xA5A5_5A5A_D3C1_B2A0
+            ^ time_seed
+            ^ stack_entropy.rotate_left(17)
+            ^ (std::process::id() as u64).rotate_left(32),
+    )
 }
 
 fn splitmix64(mut value: u64) -> u64 {
@@ -583,5 +592,13 @@ mod tests {
             Some("constant")
         );
         assert_eq!(metadata.get("tenant").map(String::as_str), Some("acme"));
+    }
+
+    #[test]
+    fn fallback_sampling_seed_mixes_stack_entropy() {
+        assert_ne!(
+            fallback_sampling_seed(0, 0x1111),
+            fallback_sampling_seed(0, 0x2222)
+        );
     }
 }
