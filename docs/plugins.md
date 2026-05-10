@@ -1674,7 +1674,7 @@ config:
 
 ### `rate_limiting`
 
-Enforces request rate limits per time window. Supports limiting by client IP or authenticated consumer identity.
+Enforces request rate limits per time window. Supports limiting by client IP, authenticated consumer identity, or peer SPIFFE identity.
 
 **Priority:** 2900
 
@@ -1690,7 +1690,7 @@ At least one rate window must be configured (the plugin rejects empty configs at
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer` |
+| `limit_by` | String | `ip` | Rate limit key: `ip`, `consumer`, or `spiffe_identity` (`spiffe` alias accepted) |
 | `expose_headers` | bool | `false` | Inject `x-ratelimit-*` headers |
 | `window_seconds` | u64 (optional) | — | Custom window duration in seconds. Use with `max_requests` as an alternative to the preset per-second/minute/hour fields |
 | `max_requests` | u64 | `10` | Maximum requests allowed within `window_seconds`. Only used when `window_seconds` is set. Must be greater than zero |
@@ -1712,7 +1712,8 @@ At least one rate window must be configured (the plugin rejects empty configs at
 **Behavior by mode:**
 - `limit_by: "ip"` — Enforces in `on_request_received` phase (before auth), keyed by client IP.
 - `limit_by: "consumer"` — Enforces in `authorize` phase (after auth), keyed by the authenticated identity: mapped consumer username when present, otherwise external `authenticated_identity`. Falls back to client IP if neither exists.
-- Stream (`on_stream_connect`) — When `limit_by: "consumer"` and a stream auth plugin has already identified a Consumer, the stream rate-limit key is that consumer username; otherwise it falls back to client IP.
+- `limit_by: "spiffe_identity"` — Enforces in `authorize` phase (after `spiffe_identity`), keyed by `ctx.peer_spiffe_id`. Falls back to client IP if no peer SPIFFE identity exists.
+- Stream (`on_stream_connect`) — `consumer` mode uses the stream Consumer identity when available. `spiffe_identity` mode uses `peer_spiffe_id` metadata written by the stream `spiffe_identity` hook. Both modes fall back to client IP when their identity is absent.
 
 **Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`, `x-ratelimit-identity`
 
