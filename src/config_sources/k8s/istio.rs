@@ -133,11 +133,9 @@ fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateEr
 
 fn allow_nothing_rule() -> MeshRule {
     MeshRule {
-        from: Vec::new(),
-        to: Vec::new(),
-        when: Vec::new(),
         never_matches: true,
         action: PolicyAction::Allow,
+        ..MeshRule::default()
     }
 }
 
@@ -146,13 +144,18 @@ fn mesh_rule(
     rule: &Value,
     action: PolicyAction,
 ) -> Result<MeshRule, K8sTranslateError> {
-    let from = rule
+    let mut from = Vec::new();
+    let mut request_principals = Vec::new();
+    for source_entry in rule
         .get("from")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .flat_map(|from| principal_matches(from.get("source").unwrap_or(&Value::Null)))
-        .collect();
+    {
+        let source = source_entry.get("source").unwrap_or(&Value::Null);
+        from.extend(principal_matches(source));
+        request_principals.extend(string_array(source, "requestPrincipals"));
+    }
     let mut to = Vec::new();
     let mut has_unconstrained_to = false;
     for request in rule
@@ -184,6 +187,7 @@ fn mesh_rule(
         from,
         to,
         when,
+        request_principals,
         never_matches: false,
         action,
     })
@@ -2917,5 +2921,82 @@ mod tests {
     fn parse_istio_duration_positive_sub_millisecond_clamps_to_one() {
         assert_eq!(parse_istio_duration_ms("0.0001s"), Some(1));
         assert_eq!(parse_istio_duration_ms("0s"), Some(0));
+    }
+
+    #[test]
+    fn translates_authorization_policy_request_principals() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "rules": [{
+                "from": [{
+                    "source": {
+                        "requestPrincipals": [
+                            "https://accounts.google.com/*",
+                            "https://auth.example.com/admin"
+                        ]
+                    }
+                }]
+            }]
+        }));
+
+        assert_eq!(policy.rules.len(), 1);
+        assert_eq!(
+            policy.rules[0].request_principals,
+            vec![
+                "https://accounts.google.com/*".to_string(),
+                "https://auth.example.com/admin".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn translates_authorization_policy_request_principals_empty() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "rules": [{
+                "from": [{"source": {"principals": ["spiffe://cluster.local/ns/default/sa/web"]}}]
+            }]
+        }));
+
+        assert!(
+            policy.rules[0].request_principals.is_empty(),
+            "no requestPrincipals should produce empty list"
+        );
+    }
+
+    #[test]
+    fn request_principals_block_anonymous_requests_in_authz_evaluation() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "rules": [{
+                "from": [{
+                    "source": {"requestPrincipals": ["*"]}
+                }]
+            }]
+        }));
+
+        let slice = MeshSlice {
+            mesh_policies: vec![policy],
+            ..MeshSlice::default()
+        };
+
+        // Anonymous request (no JWT) should be denied
+        let anon = MeshAuthzRequest::default();
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &anon),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+
+        // Authenticated request should be allowed
+        let authed = MeshAuthzRequest {
+            request_principal: Some("https://auth.example.com/user".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &authed),
+            MeshAuthzDecision::Allow
+        );
     }
 }

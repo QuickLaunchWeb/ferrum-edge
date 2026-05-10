@@ -218,8 +218,10 @@ impl Plugin for MeshAuthz {
             }
             BTreeMap::new()
         };
+        let request_principal = ctx.metadata.get("jwks_auth.request_principal").cloned();
         let request = MeshAuthzRequest {
             source_principal,
+            request_principal,
             method: Some(ctx.method.clone()),
             path: Some(ctx.path.clone()),
             host,
