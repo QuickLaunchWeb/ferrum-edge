@@ -308,9 +308,7 @@ async fn create_batch(
             "id": consumer_id,
             "username": username,
             "credentials": {
-                "keyauth": {
-                    "key": api_key
-                }
+                "keyauth": [{"key": api_key}]
             }
         }));
 
