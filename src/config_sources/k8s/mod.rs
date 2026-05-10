@@ -138,6 +138,7 @@ pub(crate) struct K8sAccumulator {
     pub warnings: Vec<String>,
     reference_grants: HashSet<ReferenceGrantPermission>,
     proxy_sources: HashMap<String, SourceKind>,
+    known_namespaces: HashSet<String>,
 }
 
 impl K8sAccumulator {
@@ -149,7 +150,12 @@ impl K8sAccumulator {
             warnings: Vec::new(),
             reference_grants: HashSet::new(),
             proxy_sources: HashMap::new(),
+            known_namespaces: HashSet::new(),
         }
+    }
+
+    fn observe_namespace(&mut self, namespace: &str) {
+        self.known_namespaces.insert(namespace.to_string());
     }
 
     pub(crate) fn add_reference_grant(
@@ -238,6 +244,9 @@ impl K8sAccumulator {
         if self.mesh != MeshConfig::default() {
             self.config.mesh = Some(Box::new(self.mesh));
         }
+        let mut known_namespaces: Vec<String> = self.known_namespaces.into_iter().collect();
+        known_namespaces.sort();
+        self.config.known_namespaces.extend(known_namespaces);
         self.config.normalize_fields();
         K8sTranslation {
             config: self.config,
@@ -277,6 +286,7 @@ where
         if !acc.options.includes_namespace(&object.metadata.namespace) {
             continue;
         }
+        acc.observe_namespace(&object.metadata.namespace);
         if object.kind == "ReferenceGrant" {
             gateway_api::collect_reference_grant(&mut acc, object)?;
         }
@@ -286,6 +296,7 @@ where
         if !acc.options.includes_namespace(&object.metadata.namespace) {
             continue;
         }
+        acc.observe_namespace(&object.metadata.namespace);
 
         if object.kind == "EnvoyFilter" {
             return Err(K8sTranslateError::Unsupported(UnsupportedK8sResource {
@@ -574,6 +585,29 @@ mod tests {
         let result = translate_k8s_objects(&[object], options).expect("translation should succeed");
 
         assert!(result.config.mesh.is_some());
+    }
+
+    #[test]
+    fn translation_records_included_source_namespaces() {
+        let mut default_object = object(
+            "PeerAuthentication",
+            serde_json::json!({"mtls": {"mode": "STRICT"}}),
+        );
+        default_object.metadata.namespace = "default".to_string();
+        let mut prod_object = default_object.clone();
+        prod_object.metadata.namespace = "prod".to_string();
+        let mut ignored_object = default_object.clone();
+        ignored_object.metadata.namespace = "ignored".to_string();
+        let options = options("ferrum")
+            .with_source_namespaces(vec!["default".to_string(), "prod".to_string()]);
+
+        let result = translate_k8s_objects(&[default_object, prod_object, ignored_object], options)
+            .expect("translation should succeed");
+
+        assert_eq!(
+            result.config.known_namespaces,
+            vec!["default".to_string(), "prod".to_string()]
+        );
     }
 
     #[test]

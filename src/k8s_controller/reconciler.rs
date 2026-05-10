@@ -393,12 +393,20 @@ fn managed_k8s_namespaces(
     watch_namespaces: &[String],
     k8s_known_namespaces: &[String],
 ) -> BTreeSet<String> {
+    if watch_namespaces.is_empty() {
+        return BTreeSet::new();
+    }
+
     let mut namespaces: BTreeSet<String> = watch_namespaces.iter().cloned().collect();
     namespaces.extend(k8s_known_namespaces.iter().cloned());
     if namespaces.is_empty() {
         namespaces.insert(namespace.to_string());
     }
     namespaces
+}
+
+fn namespace_is_managed(namespace: &str, managed_namespaces: &BTreeSet<String>) -> bool {
+    managed_namespaces.is_empty() || managed_namespaces.contains(namespace)
 }
 
 fn merge_k8s_translation(
@@ -409,11 +417,11 @@ fn merge_k8s_translation(
     let mut merged = active.clone();
 
     merged.proxies.retain(|proxy| {
-        !(managed_namespaces.contains(&proxy.namespace)
+        !(namespace_is_managed(&proxy.namespace, managed_namespaces)
             && has_any_prefix(&proxy.id, K8S_MANAGED_PROXY_ID_PREFIXES))
     });
     merged.upstreams.retain(|upstream| {
-        !(managed_namespaces.contains(&upstream.namespace)
+        !(namespace_is_managed(&upstream.namespace, managed_namespaces)
             && has_any_prefix(&upstream.id, K8S_MANAGED_UPSTREAM_ID_PREFIXES))
     });
 
@@ -688,6 +696,36 @@ mod tests {
                 .iter()
                 .any(|upstream| upstream.id == "gwapi-route-upstream-operator-owned")
         );
+    }
+
+    #[test]
+    fn merge_k8s_translation_prunes_k8s_overlay_from_all_namespaces_when_watch_all() {
+        let mut active = GatewayConfig::default();
+        active
+            .proxies
+            .push(proxy("gwapi-route-default-old-0", "old.default.internal"));
+        active.proxies[0].namespace = "default".to_string();
+        active
+            .proxies
+            .push(proxy("gwapi-route-prod-old-0", "old.prod.internal"));
+        active.proxies[1].namespace = "prod".to_string();
+        active.upstreams.push(upstream(
+            "gwapi-route-upstream-default-old-0",
+            "old.default.internal",
+        ));
+        active.upstreams[0].namespace = "default".to_string();
+        active.upstreams.push(upstream(
+            "gwapi-route-upstream-prod-old-0",
+            "old.prod.internal",
+        ));
+        active.upstreams[1].namespace = "prod".to_string();
+
+        let k8s = GatewayConfig::default();
+        let managed = BTreeSet::new();
+        let merged = merge_k8s_translation(&active, &k8s, &managed);
+
+        assert!(merged.proxies.is_empty());
+        assert!(merged.upstreams.is_empty());
     }
 
     #[test]
