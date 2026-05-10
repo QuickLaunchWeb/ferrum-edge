@@ -28,7 +28,7 @@ const DNS_MAX_UDP_PACKET_SIZE: usize = 4096;
 const DNS_UDP_SAFE_PACKET_SIZE: usize = 512;
 const DNS_MAX_TCP_PACKET_SIZE: usize = u16::MAX as usize;
 const DNS_UPSTREAM_TIMEOUT_SECS: u64 = 5;
-const DNS_TCP_PAYLOAD_READ_TIMEOUT_SECS: u64 = 5;
+const DNS_TCP_QUERY_READ_TIMEOUT_SECS: u64 = 5;
 pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
 // QTYPE values
@@ -572,13 +572,22 @@ async fn handle_dns_tcp_connection(
     semaphore: Arc<Semaphore>,
 ) {
     loop {
-        let mut len_buf = [0u8; 2];
-        if let Err(e) = stream.read_exact(&mut len_buf).await {
-            trace!(client = %src, error = %e, "DNS TCP connection closed");
-            return;
-        }
-
-        let len = u16::from_be_bytes(len_buf) as usize;
+        let len = match read_dns_tcp_length_with_timeout(
+            &mut stream,
+            Duration::from_secs(DNS_TCP_QUERY_READ_TIMEOUT_SECS),
+        )
+        .await
+        {
+            Ok(len) => len,
+            Err(DnsTcpQueryReadError::Io(e)) => {
+                trace!(client = %src, error = %e, "DNS TCP connection closed");
+                return;
+            }
+            Err(DnsTcpQueryReadError::Timeout) => {
+                warn!(client = %src, "Timed out reading DNS TCP query length");
+                return;
+            }
+        };
         if len == 0 {
             continue;
         }
@@ -592,16 +601,16 @@ async fn handle_dns_tcp_connection(
         match read_dns_tcp_payload_with_timeout(
             &mut stream,
             &mut packet,
-            Duration::from_secs(DNS_TCP_PAYLOAD_READ_TIMEOUT_SECS),
+            Duration::from_secs(DNS_TCP_QUERY_READ_TIMEOUT_SECS),
         )
         .await
         {
             Ok(()) => {}
-            Err(DnsTcpPayloadReadError::Io(e)) => {
+            Err(DnsTcpQueryReadError::Io(e)) => {
                 debug!(client = %src, error = %e, "Failed to read DNS TCP query");
                 return;
             }
-            Err(DnsTcpPayloadReadError::Timeout) => {
+            Err(DnsTcpQueryReadError::Timeout) => {
                 warn!(client = %src, payload_bytes = len, "Timed out reading DNS TCP query payload");
                 return;
             }
@@ -629,20 +638,32 @@ async fn handle_dns_tcp_connection(
 }
 
 #[derive(Debug)]
-enum DnsTcpPayloadReadError {
+enum DnsTcpQueryReadError {
     Io(std::io::Error),
     Timeout,
+}
+
+async fn read_dns_tcp_length_with_timeout(
+    stream: &mut TcpStream,
+    timeout: Duration,
+) -> Result<usize, DnsTcpQueryReadError> {
+    let mut len_buf = [0u8; 2];
+    match tokio::time::timeout(timeout, stream.read_exact(&mut len_buf)).await {
+        Ok(Ok(_)) => Ok(u16::from_be_bytes(len_buf) as usize),
+        Ok(Err(e)) => Err(DnsTcpQueryReadError::Io(e)),
+        Err(_) => Err(DnsTcpQueryReadError::Timeout),
+    }
 }
 
 async fn read_dns_tcp_payload_with_timeout(
     stream: &mut TcpStream,
     packet: &mut [u8],
     timeout: Duration,
-) -> Result<(), DnsTcpPayloadReadError> {
+) -> Result<(), DnsTcpQueryReadError> {
     match tokio::time::timeout(timeout, stream.read_exact(packet)).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(DnsTcpPayloadReadError::Io(e)),
-        Err(_) => Err(DnsTcpPayloadReadError::Timeout),
+        Ok(Err(e)) => Err(DnsTcpQueryReadError::Io(e)),
+        Err(_) => Err(DnsTcpQueryReadError::Timeout),
     }
 }
 
@@ -1726,6 +1747,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dns_tcp_length_read_has_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_dns_tcp_length_with_timeout(&mut stream, Duration::from_millis(10)).await
+        });
+
+        let _client = TcpStream::connect(listen_addr).await.unwrap();
+
+        let err = server
+            .await
+            .unwrap()
+            .expect_err("length read should time out");
+        assert!(matches!(err, DnsTcpQueryReadError::Timeout));
+    }
+
+    #[tokio::test]
     async fn dns_tcp_payload_read_has_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen_addr = listener.local_addr().unwrap();
@@ -1743,7 +1783,7 @@ mod tests {
             .await
             .unwrap()
             .expect_err("payload read should time out");
-        assert!(matches!(err, DnsTcpPayloadReadError::Timeout));
+        assert!(matches!(err, DnsTcpQueryReadError::Timeout));
     }
 
     #[test]
