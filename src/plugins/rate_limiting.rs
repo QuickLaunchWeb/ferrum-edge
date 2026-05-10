@@ -135,7 +135,7 @@ impl RateLimiting {
             LimitBy::Ip => {}
         }
 
-        prefixed_key("ip:", &ctx.client_ip)
+        ip_key(&ctx.client_ip)
     }
 
     fn stream_key(&self, ctx: &super::StreamConnectionContext) -> String {
@@ -157,7 +157,7 @@ impl RateLimiting {
             LimitBy::Ip => {}
         }
 
-        prefixed_key("ip:", &ctx.client_ip)
+        ip_key(&ctx.client_ip)
     }
 
     fn reject(&self, key: &str, outcome: &RateLimitOutcome) -> PluginResult {
@@ -357,6 +357,10 @@ fn prefixed_key(prefix: &str, value: &str) -> String {
     key.push_str(prefix);
     key.push_str(value);
     key
+}
+
+fn ip_key(client_ip: &str) -> String {
+    prefixed_key("ip:", client_ip)
 }
 
 fn inject_rate_limit_headers_from_metadata(
