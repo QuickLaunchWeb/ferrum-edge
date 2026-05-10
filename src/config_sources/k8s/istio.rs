@@ -1030,10 +1030,10 @@ fn parse_access_log_filter_expression(expr: &str) -> Result<Option<AccessLogFilt
             };
             match val {
                 Comparison::Gte(n) => {
-                    filter.min_latency_ms = Some(duration_value(n)?);
+                    merge_min_latency_ms(&mut filter.min_latency_ms, n)?;
                 }
                 Comparison::Gt(n) => {
-                    filter.min_latency_ms = Some(duration_value(comparison_increment(n)?)?);
+                    merge_min_latency_ms(&mut filter.min_latency_ms, comparison_increment(n)?)?;
                 }
                 Comparison::Lte(_) | Comparison::Lt(_) | Comparison::Eq(_) => {
                     return Err(
@@ -1079,6 +1079,12 @@ fn merge_status_code_min(current: &mut Option<u16>, value: i64) -> Result<(), St
 fn merge_status_code_max(current: &mut Option<u16>, value: i64) -> Result<(), String> {
     let value = status_code_value(value)?;
     *current = Some(current.map_or(value, |existing| existing.min(value)));
+    Ok(())
+}
+
+fn merge_min_latency_ms(current: &mut Option<u64>, value: i64) -> Result<(), String> {
+    let value = duration_value(value)?;
+    *current = Some(current.map_or(value, |existing| existing.max(value)));
     Ok(())
 }
 
@@ -2283,6 +2289,17 @@ mod tests {
 
         assert_eq!(filter.status_code_min, None);
         assert_eq!(filter.status_code_max, Some(499));
+    }
+
+    #[test]
+    fn telemetry_access_log_repeated_duration_predicates_intersect() {
+        let filter = parse_access_log_filter_expression(
+            "response.duration >= 1000 && response.duration >= 500",
+        )
+        .expect("filter parses")
+        .expect("filter is present");
+
+        assert_eq!(filter.min_latency_ms, Some(1000));
     }
 
     #[test]
