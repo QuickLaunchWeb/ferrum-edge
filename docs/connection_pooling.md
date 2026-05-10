@@ -40,6 +40,8 @@ proxies:
     pool_http2_adaptive_window: true
 ```
 
+`pool_max_requests_per_connection` is accepted on proxies for Istio DestinationRule schema compatibility, but it is currently a no-op at runtime. The shared reqwest/hyper HTTP client pool does not expose a stable per-connection request cap, so Ferrum validates and persists the field without applying it. Omit the field for the current unlimited behavior.
+
 ## Configuration Reference
 
 | Setting | Global Default | Description |

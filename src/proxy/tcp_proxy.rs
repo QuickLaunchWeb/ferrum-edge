@@ -1064,6 +1064,8 @@ struct TcpConnParams {
     retry: Option<crate::config::types::RetryConfig>,
     /// Upstream ID for load-balanced target selection on retry.
     upstream_id: Option<String>,
+    /// Optional upstream subset for DestinationRule-style retry target selection.
+    upstream_subset: Option<String>,
     /// When true, forward encrypted client bytes directly without TLS termination.
     passthrough: bool,
     /// Whether TCP Fast Open is enabled (gated on `FERRUM_TCP_FASTOPEN_ENABLED`).
@@ -1312,6 +1314,7 @@ async fn handle_tcp_connection_inner(
             tcp_half_close_max_wait_seconds,
             retry: proxy.retry.clone(),
             upstream_id: proxy.upstream_id.clone(),
+            upstream_subset: proxy.upstream_subset.clone(),
             passthrough: proxy.passthrough,
             tcp_fastopen_enabled: tcp_fastopen,
         };
@@ -1986,18 +1989,101 @@ fn resolve_backend_target(
     lb_snapshot: &LoadBalancerCacheInner,
 ) -> Result<(String, u16), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
-        let selection =
+        let selection = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
+            LoadBalancerCache::select_target_subset_from(
+                lb_snapshot,
+                upstream_id,
+                &proxy.id,
+                subset_name,
+                None,
+            )
+        } else {
             LoadBalancerCache::select_target_from(lb_snapshot, upstream_id, &proxy.id, None)
-                .ok_or_else(|| -> anyhow::Error {
-                    StreamSetupError::new(
-                        StreamSetupKind::NoHealthyTargets,
-                        format!("for upstream {upstream_id}"),
-                    )
-                    .into()
-                })?;
+        }
+        .ok_or_else(|| -> anyhow::Error {
+            let scope = proxy
+                .upstream_subset
+                .as_deref()
+                .map(|subset| format!("for upstream {upstream_id} subset {subset}"))
+                .unwrap_or_else(|| format!("for upstream {upstream_id}"));
+            StreamSetupError::new(StreamSetupKind::NoHealthyTargets, scope).into()
+        })?;
         Ok((selection.target.host.clone(), selection.target.port))
     } else {
         Ok((proxy.backend_host.clone(), proxy.backend_port))
+    }
+}
+
+#[cfg(test)]
+mod backend_target_selection_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn proxy_with_subset(subset: Option<&str>) -> Proxy {
+        serde_json::from_value(json!({
+            "id": "tcp-proxy",
+            "backend_host": "unused.local",
+            "backend_port": 0,
+            "backend_scheme": "tcp",
+            "listen_port": 7000,
+            "upstream_id": "orders",
+            "upstream_subset": subset,
+        }))
+        .expect("proxy should deserialize")
+    }
+
+    fn config_with_subset() -> GatewayConfig {
+        serde_json::from_value(json!({
+            "version": "1",
+            "proxies": [],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "orders",
+                "targets": [
+                    {
+                        "host": "stable.local",
+                        "port": 1001,
+                        "tags": { "version": "stable" }
+                    },
+                    {
+                        "host": "canary.local",
+                        "port": 1002,
+                        "tags": { "version": "canary" }
+                    }
+                ],
+                "subsets": [{
+                    "name": "canary",
+                    "labels": { "version": "canary" }
+                }]
+            }]
+        }))
+        .expect("gateway config should deserialize")
+    }
+
+    #[test]
+    fn resolve_backend_target_honors_upstream_subset() {
+        let config = config_with_subset();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let proxy = proxy_with_subset(Some("canary"));
+
+        let (host, port) = resolve_backend_target(&proxy, &snapshot).expect("target selected");
+
+        assert_eq!(host, "canary.local");
+        assert_eq!(port, 1002);
+    }
+
+    #[test]
+    fn resolve_backend_target_errors_for_unknown_subset() {
+        let config = config_with_subset();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let proxy = proxy_with_subset(Some("missing"));
+
+        let err = resolve_backend_target(&proxy, &snapshot).expect_err("missing subset rejected");
+
+        assert!(err.to_string().contains("subset missing"));
     }
 }
 
@@ -2031,13 +2117,24 @@ fn try_next_target(
         path: None,
         tags: std::collections::HashMap::new(),
     };
-    let next = LoadBalancerCache::select_next_target_from(
-        lb_snapshot,
-        upstream_id,
-        current_host,
-        &exclude,
-        None,
-    )?;
+    let next = if let Some(subset_name) = params.upstream_subset.as_deref() {
+        LoadBalancerCache::select_next_target_subset_from(
+            lb_snapshot,
+            upstream_id,
+            current_host,
+            subset_name,
+            &exclude,
+            None,
+        )
+    } else {
+        LoadBalancerCache::select_next_target_from(
+            lb_snapshot,
+            upstream_id,
+            current_host,
+            &exclude,
+            None,
+        )
+    }?;
     Some((next.host.clone(), next.port))
 }
 

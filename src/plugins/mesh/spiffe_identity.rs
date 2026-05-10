@@ -8,7 +8,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tracing::debug;
 
-use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
+use crate::plugins::{
+    HTTP_FAMILY_AND_STREAM_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
+    StreamConnectionContext, priority,
+};
 
 pub struct SpiffeIdentity;
 
@@ -34,11 +37,11 @@ impl Plugin for SpiffeIdentity {
     }
 
     fn priority(&self) -> u16 {
-        super::priority::SPIFFE_IDENTITY
+        priority::SPIFFE_IDENTITY
     }
 
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_AND_STREAM_PROTOCOLS
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        HTTP_FAMILY_AND_STREAM_PROTOCOLS
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {

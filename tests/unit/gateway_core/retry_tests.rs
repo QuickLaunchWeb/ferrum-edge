@@ -757,6 +757,22 @@ fn test_classify_body_error_response_size_limit_is_explicit() {
 }
 
 #[test]
+fn test_classify_body_error_bare_canceled_is_not_client_disconnect() {
+    let err: Box<dyn std::error::Error + Send + Sync> = "H2 stream canceled by peer".into();
+    let (class, disconnected) = classify_body_error(&*err);
+    assert_eq!(class, ErrorClass::ConnectionClosed);
+    assert!(!disconnected);
+}
+
+#[test]
+fn test_classify_body_error_client_canceled_token_is_client_disconnect() {
+    let err: Box<dyn std::error::Error + Send + Sync> = "request canceled by client".into();
+    let (class, disconnected) = classify_body_error(&*err);
+    assert_eq!(class, ErrorClass::ClientDisconnect);
+    assert!(disconnected);
+}
+
+#[test]
 fn test_classify_body_error_walks_source_chain_to_io_error() {
     // Wrap an io::Error in a custom error with a `source()` chain — the
     // classifier should walk the chain and find the BrokenPipe underneath.
