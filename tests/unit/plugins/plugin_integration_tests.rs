@@ -245,6 +245,7 @@ async fn test_all_plugins_available() {
         "access_log",
         "ai_federation",
         "api_chargeback",
+        "fault_injection",
     ]
     .into_iter()
     .collect();
@@ -331,6 +332,9 @@ async fn test_plugin_creation_all_plugins() {
             // ai_request_guard rejects no-op configs — supply at least one policy.
             "ai_request_guard" => json!({"max_messages": 100}),
             "request_deduplication" => json!({}),
+            "fault_injection" => {
+                json!({"abort": {"status_code": 503, "percentage": 50.0}})
+            }
             _ => json!({}),
         };
         let plugin = create_plugin(plugin_name, &config);

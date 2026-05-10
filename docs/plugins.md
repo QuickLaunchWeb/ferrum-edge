@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 58 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 59 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -1777,6 +1777,36 @@ config:
   enforce_required: true
   sync_mode: redis
   redis_url: "redis://redis-host:6379/0"
+```
+
+### `fault_injection`
+
+Injects controlled failures for chaos testing. HTTP-family requests run in `before_proxy` after authentication, authorization, and consumer rate limiting; TCP/UDP stream proxies run the same decision in `on_stream_connect`. Stream rejects close the frontend connection/session, so HTTP status/body/grpc-status fields only have downstream meaning for HTTP-family protocols.
+
+**Priority:** 2940
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `abort.status_code` | u16 | required when `abort` is set | Final HTTP status to return, 200-599 |
+| `abort.percentage` | f64 | required when `abort` is set | Abort probability, >0.0 and <=100.0 |
+| `abort.grpc_status` | u32 (optional) | — | gRPC status trailer to emit on gRPC rejects, 0-16 |
+| `abort.body` | String | `""` | HTTP response body for aborts |
+| `delay.duration_ms` | u64 | required when `delay` is set | Delay before continuing or aborting, 1-3,600,000 ms |
+| `delay.percentage` | f64 | required when `delay` is set | Delay probability, >0.0 and <=100.0 |
+
+Each plugin instance owns its own sampling counter, so proxy-scoped and proxy-group-scoped instances make independent decisions. The plugin rejects no-op configs such as `percentage: 0.0`; omit the plugin or disable it instead.
+
+```yaml
+plugin_name: fault_injection
+config:
+  abort:
+    status_code: 503
+    grpc_status: 14
+    percentage: 5.0
+    body: "fault injected"
+  delay:
+    duration_ms: 250
+    percentage: 10.0
 ```
 
 ---

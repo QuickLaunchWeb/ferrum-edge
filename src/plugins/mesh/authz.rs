@@ -250,6 +250,10 @@ impl Plugin for MeshAuthz {
         result
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        true
+    }
+
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         let mut metadata = ctx.metadata.clone().unwrap_or_default();
         let source_principal = metadata

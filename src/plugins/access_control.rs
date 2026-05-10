@@ -253,6 +253,10 @@ impl Plugin for AccessControl {
         )
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        true
+    }
+
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         self.authorize_identity(
             &ctx.client_ip,

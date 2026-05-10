@@ -118,7 +118,9 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        pool_max_requests_per_connection: None,
         upstream_id: None,
+        upstream_subset: None,
         api_spec_id: None,
         circuit_breaker: None,
         retry: None,
@@ -191,6 +193,7 @@ fn create_test_upstream(id: &str, name: &str) -> Upstream {
         hash_on_cookie_config: None,
         health_checks: None,
         service_discovery: None,
+        subsets: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
@@ -2253,6 +2256,66 @@ async fn test_upstream_delete_referenced_by_proxy_returns_409() {
     assert!(
         body["error"].as_str().unwrap_or("").contains("referenced"),
         "Error should mention upstream is referenced: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_upstream_update_rejects_removing_referenced_subset() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "id": "subset-u1",
+        "name": "subset-upstream",
+        "targets": [
+            {"host": "10.0.0.1", "port": 8080, "weight": 100, "tags": {"version": "stable"}},
+            {"host": "10.0.0.2", "port": 8080, "weight": 100, "tags": {"version": "canary"}}
+        ],
+        "subsets": [
+            {"name": "stable", "labels": {"version": "stable"}},
+            {"name": "canary", "labels": {"version": "canary"}}
+        ]
+    });
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201, "Create upstream failed: {:?}", body);
+
+    let proxy = json!({
+        "id": "subset-p1",
+        "listen_path": "/subset-test",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+        "upstream_id": "subset-u1",
+        "upstream_subset": "canary"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create proxy failed: {:?}", body);
+
+    let updated = json!({
+        "id": "subset-u1",
+        "name": "subset-upstream",
+        "targets": [
+            {"host": "10.0.0.1", "port": 8080, "weight": 100, "tags": {"version": "stable"}},
+            {"host": "10.0.0.2", "port": 8080, "weight": 100, "tags": {"version": "canary"}}
+        ],
+        "subsets": [
+            {"name": "stable", "labels": {"version": "stable"}}
+        ]
+    });
+    let (status, body) = admin_put(&base_url, "/upstreams/subset-u1", &token, &updated).await;
+    assert_eq!(
+        status, 400,
+        "Should reject removing a subset referenced by a proxy: {:?}",
+        body
+    );
+    let error = body["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("cannot remove subset 'canary'") && error.contains("subset-p1"),
+        "Error should identify the referenced subset and proxy: {:?}",
         body
     );
 }

@@ -10,6 +10,19 @@ use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
 use std::sync::Arc;
 
+struct LegacyAuthorizePlugin;
+
+#[async_trait::async_trait]
+impl Plugin for LegacyAuthorizePlugin {
+    fn name(&self) -> &str {
+        "legacy_authorize"
+    }
+
+    async fn authorize(&self, _ctx: &mut RequestContext) -> PluginResult {
+        PluginResult::Continue
+    }
+}
+
 /// Returns the minimal valid config for a given plugin name so that `create_plugin` succeeds.
 fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
     match plugin_name {
@@ -95,7 +108,9 @@ fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        pool_max_requests_per_connection: None,
         upstream_id: None,
+        upstream_subset: None,
         api_spec_id: None,
         circuit_breaker: None,
         retry: None,
@@ -327,6 +342,53 @@ fn test_request_view_stays_on_single_generation_after_rebuild() {
             .get_capabilities("p1", ProxyProtocol::Http)
             .has(PluginCapabilities::MODIFIES_REQUEST_HEADERS)
     );
+}
+
+#[test]
+fn test_request_view_precomputes_authorize_plugins() {
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["acl", "rate_ip", "rate_consumer"],
+        )],
+        vec![
+            make_plugin_config(
+                "acl",
+                "access_control",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "rate_ip",
+                "rate_limiting",
+                json!({"window_seconds": 60, "max_requests": 100, "limit_by": "ip"}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "rate_consumer",
+                "rate_limiting",
+                json!({"window_seconds": 60, "max_requests": 100, "limit_by": "consumer"}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let request_view = cache.request_view("p1", ProxyProtocol::Http);
+
+    let authorize_plugins = request_view.authorize_plugins();
+    let names: Vec<&str> = authorize_plugins.iter().map(|p| p.name()).collect();
+    assert_eq!(names, vec!["access_control", "rate_limiting"]);
+}
+
+#[test]
+fn test_authorize_plugin_default_preserves_legacy_custom_plugins() {
+    let plugin: Arc<dyn Plugin> = Arc::new(LegacyAuthorizePlugin);
+
+    assert!(plugin.is_authorize_plugin());
 }
 
 #[test]

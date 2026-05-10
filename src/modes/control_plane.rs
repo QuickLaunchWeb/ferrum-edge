@@ -484,6 +484,8 @@ pub async fn run(
     let replica_url_for_reconnect = effective_replica_url.clone();
     let poll_namespace = env_config.namespace.clone();
     let dp_registry_poll = dp_registry.clone();
+    let poll_cert_expiry_warning_days = env_config.tls_cert_expiry_warning_days;
+    let poll_backend_allow_ips = env_config.backend_allow_ips.clone();
     let mesh_registry_poll = mesh_registry.clone();
 
     let db_poll_handle = tokio::spawn(async move {
@@ -585,27 +587,79 @@ pub async fn run(
                                 }
                                 let poll_ts = result.poll_timestamp;
 
-                                // Update known IDs (add new, remove deleted)
-                                update_known_ids(
-                                    &mut known_proxy_ids,
-                                    &result.added_or_modified_proxies.iter().map(|p| p.id.clone()).collect(),
-                                    &result.removed_proxy_ids,
-                                );
-                                update_known_ids(
-                                    &mut known_consumer_ids,
-                                    &result.added_or_modified_consumers.iter().map(|c| c.id.clone()).collect(),
-                                    &result.removed_consumer_ids,
-                                );
-                                update_known_ids(
-                                    &mut known_plugin_config_ids,
-                                    &result.added_or_modified_plugin_configs.iter().map(|pc| pc.id.clone()).collect(),
-                                    &result.removed_plugin_config_ids,
-                                );
-                                update_known_ids(
-                                    &mut known_upstream_ids,
-                                    &result.added_or_modified_upstreams.iter().map(|u| u.id.clone()).collect(),
-                                    &result.removed_upstream_ids,
-                                );
+                                // Collect ID changes before moving result into
+                                // apply_incremental — needed for known-ID advancement
+                                // after validation passes.
+                                let added_proxy_ids: Vec<String> = result.added_or_modified_proxies.iter().map(|p| p.id.clone()).collect();
+                                let removed_proxy_ids = result.removed_proxy_ids.clone();
+                                let added_consumer_ids: Vec<String> = result.added_or_modified_consumers.iter().map(|c| c.id.clone()).collect();
+                                let removed_consumer_ids = result.removed_consumer_ids.clone();
+                                let added_plugin_config_ids: Vec<String> = result.added_or_modified_plugin_configs.iter().map(|pc| pc.id.clone()).collect();
+                                let removed_plugin_config_ids = result.removed_plugin_config_ids.clone();
+                                let added_upstream_ids: Vec<String> = result.added_or_modified_upstreams.iter().map(|u| u.id.clone()).collect();
+                                let removed_upstream_ids = result.removed_upstream_ids.clone();
+
+                                // Apply delta to a cloned config, then validate
+                                // before broadcasting or advancing known IDs.
+                                // Mirrors database mode's validate-before-swap
+                                // contract via ProxyState::apply_incremental.
+                                let mut new_config = (*config_poll.load_full()).clone();
+                                apply_incremental_to_config(&mut new_config, result.clone());
+                                new_config.normalize_fields();
+                                new_config.resolve_upstream_tls();
+
+                                // Warn-only validators (same as
+                                // ProxyState::validate_full_config).
+                                if let Err(errors) = new_config.validate_all_fields_with_ip_policy(
+                                    poll_cert_expiry_warning_days,
+                                    &poll_backend_allow_ips,
+                                ) {
+                                    for msg in &errors {
+                                        warn!("CP config field validation: {}", msg);
+                                    }
+                                }
+                                if let Err(errors) = new_config.validate_hosts() {
+                                    for msg in &errors {
+                                        warn!("CP config validation: {}", msg);
+                                    }
+                                }
+
+                                // Rejecting validators — collect all failures so
+                                // operators see every reason in a single poll cycle.
+                                let mut validation_errors: Vec<String> = Vec::new();
+                                if let Err(errs) = new_config.validate_regex_listen_paths() {
+                                    validation_errors.extend(errs);
+                                }
+                                if let Err(errs) = new_config.validate_unique_listen_paths() {
+                                    validation_errors.extend(errs);
+                                }
+                                if let Err(errs) = new_config.validate_stream_proxies() {
+                                    validation_errors.extend(errs);
+                                }
+                                if let Err(errs) = new_config.validate_upstream_references() {
+                                    validation_errors.extend(errs);
+                                }
+                                if let Err(errs) = new_config.validate_plugin_references() {
+                                    validation_errors.extend(errs);
+                                }
+                                if !validation_errors.is_empty() {
+                                    for msg in &validation_errors {
+                                        error!("CP incremental config rejected: {}", msg);
+                                    }
+                                    warn!(
+                                        "Incremental config update rejected by validation; \
+                                         leaving last_poll_at unchanged so the next poll \
+                                         retries the same rows"
+                                    );
+                                    continue;
+                                }
+
+                                // Validation passed — advance known IDs, broadcast
+                                // the delta to DPs, and store the new config.
+                                update_known_ids(&mut known_proxy_ids, &added_proxy_ids, &removed_proxy_ids);
+                                update_known_ids(&mut known_consumer_ids, &added_consumer_ids, &removed_consumer_ids);
+                                update_known_ids(&mut known_plugin_config_ids, &added_plugin_config_ids, &removed_plugin_config_ids);
+                                update_known_ids(&mut known_upstream_ids, &added_upstream_ids, &removed_upstream_ids);
 
                                 // Apply to CP's own in-memory config before broadcasting so
                                 // subscribers that connect during this poll either receive the
@@ -615,9 +669,6 @@ pub async fn run(
                                 // (serializes to JSON), and the mesh broadcast consumes the
                                 // original — keeping the per-poll clone count to one.
                                 let version = poll_ts.to_rfc3339();
-                                let mut new_config = (*config_poll.load_full()).clone();
-                                apply_incremental_to_config(&mut new_config, result.clone());
-                                new_config.normalize_fields();
                                 config_poll.store(Arc::new(new_config));
 
                                 // Mesh streams render their per-subscriber slices from the
@@ -627,7 +678,10 @@ pub async fn run(
                                 CpGrpcServer::broadcast_delta_with_registry(&update_tx, &result, &version, &dp_registry_poll);
                                 MeshGrpcServer::broadcast_delta_with_registry(&mesh_update_tx, result, &version, &mesh_registry_poll);
 
-                                info!("Incremental config update pushed to DPs and mesh nodes");
+                                info!(
+                                    "Incremental config update validated and pushed to DPs and mesh nodes (version={})",
+                                    version
+                                );
                                 last_poll_at = Some(poll_ts);
                             }
                             Err(e) => {
@@ -840,7 +894,9 @@ mod tests {
             pool_http2_max_frame_size: None,
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
+            pool_max_requests_per_connection: None,
             upstream_id: None,
+            upstream_subset: None,
             api_spec_id: None,
             circuit_breaker: None,
             retry: None,

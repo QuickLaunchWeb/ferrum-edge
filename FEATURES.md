@@ -65,7 +65,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 58 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 59 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
 - Three plugin scopes: **global** (all proxies), **proxy** (single proxy), **proxy_group** (shared across a subset of proxies) — scoped plugins replace global plugins of the same name. Proxy-group plugins share a single instance across all associated proxies, so stateful plugins (e.g., rate_limiting) share counters across the group
@@ -97,6 +97,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **CORS** — preflight handling with origin, method, and header validation
 - **Body Validator** — JSON Schema, XML, and gRPC protobuf validation
 - **Request Deduplication** — idempotency key-based deduplication for POST/PUT/PATCH requests with local in-memory and centralized Redis storage backends
+- **Fault Injection** — probabilistic HTTP/gRPC aborts and latency injection plus stream connect rejection/delay for chaos testing, with per-instance counters so proxy/group scopes stay independent
 - **GraphQL** — query depth/complexity limiting, alias limiting, introspection control, per-operation rate limiting
 - **gRPC-Web** — bidirectional protocol translation between gRPC-Web (browser) and native gRPC (HTTP/2), supporting binary and base64 text encoding modes with trailer frame embedding
 - **gRPC Method Router** — per-method access control (allow/deny lists) and per-method rate limiting with metadata enrichment

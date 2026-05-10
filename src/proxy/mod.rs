@@ -2784,6 +2784,14 @@ impl ProxyState {
             self.health_checker
                 .prune_removed_proxies(&delta.removed_proxy_ids);
         }
+        for proxy in &new_config.proxies {
+            if let Some(ref upstream_id) = proxy.upstream_id
+                && let Some(upstream) = new_config.upstreams.iter().find(|u| u.id == *upstream_id)
+            {
+                self.health_checker
+                    .remove_stale_passive_targets_for_proxy(&proxy.id, &upstream.targets);
+            }
+        }
 
         // --- DNS warmup for new/modified hostnames ---
         // Collect backend hostnames from added/modified proxies and upstreams
@@ -3126,6 +3134,14 @@ impl ProxyState {
         if !delta.removed_proxy_ids.is_empty() {
             self.health_checker
                 .prune_removed_proxies(&delta.removed_proxy_ids);
+        }
+        for proxy in &new_config.proxies {
+            if let Some(ref upstream_id) = proxy.upstream_id
+                && let Some(upstream) = new_config.upstreams.iter().find(|u| u.id == *upstream_id)
+            {
+                self.health_checker
+                    .remove_stale_passive_targets_for_proxy(&proxy.id, &upstream.targets);
+            }
         }
 
         // --- DNS warmup for new/modified hostnames ---
@@ -3639,20 +3655,38 @@ async fn handle_websocket_request_authenticated(
                     if let (Some(upstream_id), Some(prev_target)) =
                         (&proxy.upstream_id, &current_target)
                         && let Some(ref hash_key) = lb_hash_key
-                        && let Some(next) = LoadBalancerCache::select_next_target_from(
-                            &epoch.load_balancer,
-                            upstream_id,
-                            hash_key,
-                            prev_target,
-                            Some(&crate::load_balancer::HealthContext {
+                        && let Some(next) = {
+                            let health_ctx = crate::load_balancer::HealthContext {
                                 active_unhealthy: &state.health_checker.active_unhealthy_targets,
                                 proxy_passive: state
                                     .health_checker
                                     .passive_health
                                     .get(&proxy.id)
                                     .map(|r| r.value().clone()),
-                            }),
-                        )
+                                max_ejection_percent: LoadBalancerCache::max_ejection_percent_from(
+                                    &epoch.load_balancer,
+                                    upstream_id,
+                                ),
+                            };
+                            if let Some(subset_name) = proxy.upstream_subset.as_deref() {
+                                LoadBalancerCache::select_next_target_subset_from(
+                                    &epoch.load_balancer,
+                                    upstream_id,
+                                    hash_key,
+                                    subset_name,
+                                    prev_target,
+                                    Some(&health_ctx),
+                                )
+                            } else {
+                                LoadBalancerCache::select_next_target_from(
+                                    &epoch.load_balancer,
+                                    upstream_id,
+                                    hash_key,
+                                    prev_target,
+                                    Some(&health_ctx),
+                                )
+                            }
+                        }
                     {
                         current_backend_url = build_websocket_backend_url_with_target(
                             &proxy,
@@ -6400,10 +6434,11 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
     }
 
-    // Authorization phase (access_control, rate_limiting by consumer, etc.)
-    if !plugins.is_empty() {
+    // Authorization phase (pre-computed authorize plugin list — zero allocation)
+    let authorize_plugins = plugin_cache_view.authorize_plugins();
+    if !authorize_plugins.is_empty() {
         let phase_start = Instant::now();
-        for plugin in plugins.iter() {
+        for plugin in authorize_plugins.iter() {
             match plugin.authorize(&mut ctx).await {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
@@ -7018,20 +7053,38 @@ async fn handle_proxy_request_inner(
                 if let (Some(upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &grpc_current_target)
                     && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = LoadBalancerCache::select_next_target_from(
-                        &epoch.load_balancer,
-                        upstream_id,
-                        hash_key,
-                        prev_target,
-                        Some(&crate::load_balancer::HealthContext {
+                    && let Some(next) = {
+                        let health_ctx = crate::load_balancer::HealthContext {
                             active_unhealthy: &state.health_checker.active_unhealthy_targets,
                             proxy_passive: state
                                 .health_checker
                                 .passive_health
                                 .get(&proxy.id)
                                 .map(|r| r.value().clone()),
-                        }),
-                    )
+                            max_ejection_percent: LoadBalancerCache::max_ejection_percent_from(
+                                &epoch.load_balancer,
+                                upstream_id,
+                            ),
+                        };
+                        if let Some(subset_name) = proxy.upstream_subset.as_deref() {
+                            LoadBalancerCache::select_next_target_subset_from(
+                                &epoch.load_balancer,
+                                upstream_id,
+                                hash_key,
+                                subset_name,
+                                prev_target,
+                                Some(&health_ctx),
+                            )
+                        } else {
+                            LoadBalancerCache::select_next_target_from(
+                                &epoch.load_balancer,
+                                upstream_id,
+                                hash_key,
+                                prev_target,
+                                Some(&health_ctx),
+                            )
+                        }
+                    }
                 {
                     grpc_backend_url = build_backend_url_with_target(
                         &proxy,
@@ -7811,20 +7864,38 @@ async fn handle_proxy_request_inner(
             // same protocol.
             if let (Some(upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
                 && let Some(ref hash_key) = lb_hash_key
-                && let Some(next) = LoadBalancerCache::select_next_target_from(
-                    &epoch.load_balancer,
-                    upstream_id,
-                    hash_key,
-                    prev_target,
-                    Some(&crate::load_balancer::HealthContext {
+                && let Some(next) = {
+                    let health_ctx = crate::load_balancer::HealthContext {
                         active_unhealthy: &state.health_checker.active_unhealthy_targets,
                         proxy_passive: state
                             .health_checker
                             .passive_health
                             .get(&proxy.id)
                             .map(|r| r.value().clone()),
-                    }),
-                )
+                        max_ejection_percent: LoadBalancerCache::max_ejection_percent_from(
+                            &epoch.load_balancer,
+                            upstream_id,
+                        ),
+                    };
+                    if let Some(subset_name) = proxy.upstream_subset.as_deref() {
+                        LoadBalancerCache::select_next_target_subset_from(
+                            &epoch.load_balancer,
+                            upstream_id,
+                            hash_key,
+                            subset_name,
+                            prev_target,
+                            Some(&health_ctx),
+                        )
+                    } else {
+                        LoadBalancerCache::select_next_target_from(
+                            &epoch.load_balancer,
+                            upstream_id,
+                            hash_key,
+                            prev_target,
+                            Some(&health_ctx),
+                        )
+                    }
+                }
             {
                 let target_changed = next.host != prev_target.host || next.port != prev_target.port;
                 current_url = build_backend_url_with_target(
@@ -8741,21 +8812,53 @@ pub(crate) async fn proxy_to_backend_retry(
             let status = response.status().as_u16();
             let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
             collect_response_headers(response.headers(), &mut resp_headers);
+
+            // Enforce response body size limit — mirrors the logic in
+            // `proxy_to_backend`. Without this the retry path would accept
+            // arbitrarily large response bodies, bypassing the operator-
+            // configured `max_response_body_size_bytes`.
+            let content_length = response
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<usize>().ok());
+
+            // Fast path: reject immediately when Content-Length exceeds limit.
+            if state.max_response_body_size_bytes > 0
+                && let Some(len) = content_length
+                && len > state.max_response_body_size_bytes
+            {
+                warn!(
+                    "Backend response body ({} bytes) exceeds limit ({} bytes)",
+                    len, state.max_response_body_size_bytes
+                );
+                return retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Backend response body exceeds maximum size"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
+                    error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                };
+            }
+
             if stream_response {
                 // Buffer small responses eagerly: a single `bytes().await`
                 // allocation is cheaper than the async coalescing adapter for
                 // typical JSON API payloads. Skip buffering for SSE (unbounded
                 // streams) and responses without Content-Length (unknown size).
-                let content_length = response
-                    .headers()
-                    .get("content-length")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<usize>().ok());
                 let cutoff = state.response_buffer_cutoff_bytes;
                 if cutoff > 0
                     && content_length.is_some_and(|cl| cl <= cutoff)
                     && !is_streaming_content_type(&resp_headers)
                 {
+                    // Content-Length is within cutoff (and within max_response
+                    // _body_size_bytes if set, checked above), so eager
+                    // collection is bounded.
                     match response.bytes().await {
                         Ok(b) => retry::BackendResponse {
                             status_code: status,
@@ -8782,6 +8885,9 @@ pub(crate) async fn proxy_to_backend_retry(
                         }
                     }
                 } else {
+                    // Streaming path — the downstream body builder applies
+                    // `SizeLimitedStreamingResponse` when CL is absent and a
+                    // size limit is configured, so no enforcement needed here.
                     retry::BackendResponse {
                         status_code: status,
                         body: ResponseBody::Streaming(response),
@@ -8792,20 +8898,45 @@ pub(crate) async fn proxy_to_backend_retry(
                     }
                 }
             } else {
-                let body = match response.bytes().await {
-                    Ok(b) => b.to_vec(),
-                    Err(e) => {
-                        warn!("Failed to read backend response body: {}", e);
-                        Vec::new()
+                // Buffered mode: use size-limited collection when a limit is
+                // configured so an oversized chunked response cannot exhaust
+                // memory.
+                if state.max_response_body_size_bytes > 0 {
+                    let max_size = state.max_response_body_size_bytes;
+                    match collect_response_with_limit(response, max_size).await {
+                        Ok((resp_body, _)) => retry::BackendResponse {
+                            status_code: status,
+                            body: ResponseBody::Buffered(resp_body),
+                            headers: resp_headers,
+                            connection_error: false,
+                            backend_resolved_ip: resolved_ip.clone(),
+                            error_class: None,
+                        },
+                        Err(err_body) => retry::BackendResponse {
+                            status_code: 502,
+                            body: ResponseBody::Buffered(err_body),
+                            headers: HashMap::new(),
+                            connection_error: false,
+                            backend_resolved_ip: resolved_ip.clone(),
+                            error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                        },
                     }
-                };
-                retry::BackendResponse {
-                    status_code: status,
-                    body: ResponseBody::Buffered(body),
-                    headers: resp_headers,
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip.clone(),
-                    error_class: None,
+                } else {
+                    let body = match response.bytes().await {
+                        Ok(b) => b.to_vec(),
+                        Err(e) => {
+                            warn!("Failed to read backend response body: {}", e);
+                            Vec::new()
+                        }
+                    };
+                    retry::BackendResponse {
+                        status_code: status,
+                        body: ResponseBody::Buffered(body),
+                        headers: resp_headers,
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
+                        error_class: None,
+                    }
                 }
             }
         }
@@ -10610,11 +10741,43 @@ async fn proxy_to_backend_http3(
                                 method,
                                 status,
                                 content_length,
+                                state.max_response_body_size_bytes,
                             )
                             .await
                             {
                                 Ok(body) => body,
+                                Err(crate::http3::client::H3BodyDrainError::ResponseTooLarge {
+                                    ..
+                                }) => {
+                                    error!(
+                                        proxy_id = %proxy.id,
+                                        backend_url = %backend_url,
+                                        max_response_body_size_bytes = state.max_response_body_size_bytes,
+                                        "HTTP/3 backend response body exceeded configured maximum"
+                                    );
+                                    return (
+                                        retry::BackendResponse {
+                                            status_code: 502,
+                                            body: ResponseBody::Buffered(
+                                                r#"{"error":"Backend response body exceeds maximum size"}"#
+                                                    .as_bytes()
+                                                    .to_vec(),
+                                            ),
+                                            headers: HashMap::new(),
+                                            connection_error: false,
+                                            backend_resolved_ip: resolved_ip,
+                                            error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                                        },
+                                        None,
+                                    );
+                                }
                                 Err(e) => {
+                                    let crate::http3::client::H3BodyDrainError::Stream(e) = e
+                                    else {
+                                        unreachable!(
+                                            "response-too-large handled by previous match arm"
+                                        );
+                                    };
                                     let (error_kind, error_class) = classify_h3_error(&e);
                                     record_port_exhaustion_if_class(&state.overload, error_class);
                                     // We have already received response headers and
@@ -11254,6 +11417,31 @@ async fn proxy_to_backend_http3_retry(
                 status = response.0,
                 "HTTP/3 backend retry request successful"
             );
+            // Belt-and-suspenders size guard. The H3 pool enforces this while
+            // draining the response body so oversized responses stop before
+            // full buffering; keep this post-return check to protect future
+            // alternate H3 collection paths.
+            if state.max_response_body_size_bytes > 0
+                && response.1.len() > state.max_response_body_size_bytes
+            {
+                warn!(
+                    "Backend response body ({} bytes) exceeds limit ({} bytes)",
+                    response.1.len(),
+                    state.max_response_body_size_bytes
+                );
+                return retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Backend response body exceeds maximum size"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                };
+            }
             retry::BackendResponse {
                 status_code: response.0,
                 body: ResponseBody::Buffered(response.1),

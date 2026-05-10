@@ -4,7 +4,7 @@ use ferrum_edge::ConsumerIndex;
 use ferrum_edge::plugins::{
     HTTP_FAMILY_PROTOCOLS, Plugin, PluginHttpClient, RequestContext, jwks_auth::JwksAuth, priority,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -60,7 +60,16 @@ fn create_consumer_with_custom_id(
     }
 }
 
-fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> String {
+fn claims_with_default_exp(claims: &Value) -> Value {
+    let mut claims = claims.clone();
+    if let Some(obj) = claims.as_object_mut() {
+        obj.entry("exp")
+            .or_insert_with(|| json!(chrono::Utc::now().timestamp() + 3600));
+    }
+    claims
+}
+
+fn create_rs256_token_exact(claims: &Value, private_key_pem: &[u8]) -> String {
     use jsonwebtoken::{EncodingKey, Header, encode};
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some("test-key-1".to_string());
@@ -72,29 +81,32 @@ fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> Str
     .unwrap()
 }
 
+fn create_rs256_token(claims: &Value, private_key_pem: &[u8]) -> String {
+    let claims = claims_with_default_exp(claims);
+    create_rs256_token_exact(&claims, private_key_pem)
+}
+
 #[allow(dead_code)]
-fn create_rs256_token_with_kid(
-    claims: &serde_json::Value,
-    private_key_pem: &[u8],
-    kid: &str,
-) -> String {
+fn create_rs256_token_with_kid(claims: &Value, private_key_pem: &[u8], kid: &str) -> String {
     use jsonwebtoken::{EncodingKey, Header, encode};
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some(kid.to_string());
+    let claims = claims_with_default_exp(claims);
     encode(
         &header,
-        claims,
+        &claims,
         &EncodingKey::from_rsa_pem(private_key_pem).unwrap(),
     )
     .unwrap()
 }
 
-fn create_rs256_token_no_kid(claims: &serde_json::Value, private_key_pem: &[u8]) -> String {
+fn create_rs256_token_no_kid(claims: &Value, private_key_pem: &[u8]) -> String {
     use jsonwebtoken::{EncodingKey, Header, encode};
     let header = Header::new(jsonwebtoken::Algorithm::RS256);
+    let claims = claims_with_default_exp(claims);
     encode(
         &header,
-        claims,
+        &claims,
         &EncodingKey::from_rsa_pem(private_key_pem).unwrap(),
     )
     .unwrap()
@@ -543,6 +555,54 @@ async fn test_jwks_auth_validates_rs256_token() {
     assert_continue(result);
     assert!(ctx.identified_consumer.is_some());
     assert_eq!(ctx.identified_consumer.unwrap().username, "idp-user");
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("idp-user"));
+}
+
+#[tokio::test]
+async fn test_jwks_auth_rejects_missing_exp_by_default() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(&single_provider_config(&jwks_uri), default_client()).unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+    let token = create_rs256_token_exact(&json!({"sub": "idp-user"}), private_key_pem);
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_jwks_auth_allows_missing_exp_when_require_exp_false() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{"jwks_uri": jwks_uri}],
+            "require_exp": false
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+    let token = create_rs256_token_exact(&json!({"sub": "idp-user"}), private_key_pem);
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("idp-user"));
 }
 

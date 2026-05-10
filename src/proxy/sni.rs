@@ -317,7 +317,9 @@ pub fn resolve_proxy_by_sni<'a>(
     let mut fallback: Option<&'a str> = None;
 
     for proxy_id in proxy_ids {
-        let proxy = config.proxies.iter().find(|p| p.id == *proxy_id)?;
+        let Some(proxy) = config.proxies.iter().find(|p| p.id == *proxy_id) else {
+            continue;
+        };
 
         if proxy.hosts.is_empty() {
             // Empty hosts = catch-all, use as fallback
