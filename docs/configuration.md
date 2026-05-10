@@ -243,6 +243,7 @@ Injected sidecars run as the configured mesh proxy UID with `runAsNonRoot=true`,
 | `FERRUM_NODE_AGENT_NODE_NAME` | Yes (node_agent) | — | Kubernetes node name, set via downward API (`spec.nodeName`) |
 | `FERRUM_NODE_AGENT_CGROUP_ROOT` | No | `/sys/fs/cgroup` | cgroup v2 mount point for pod cgroup resolution |
 | `FERRUM_NODE_AGENT_BPF_FS_PATH` | No | `/sys/fs/bpf` | BPF filesystem mount point for pinned maps |
+| `FERRUM_NODE_AGENT_BPF_ELF_PATH` | Linux `ebpf` feature | build-tree eBPF target path | Compiled `ferrum-ebpf` ELF loaded by the aya backend |
 | `FERRUM_NODE_AGENT_FALLBACK_MODE` | No | `iptables` | Behavior on kernel < 5.7: `iptables` or `fail` |
 | `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES` | No | — | Extra namespaces to exclude from capture (comma-separated; `kube-system`, `kube-public`, `kube-node-lease` always excluded) |
 | `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | No | `0.0.0.0/0` | CIDRs to capture for outbound traffic (comma-separated) |
