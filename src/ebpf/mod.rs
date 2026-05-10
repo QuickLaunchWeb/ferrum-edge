@@ -9,8 +9,14 @@
 
 pub mod cgroup;
 pub mod kernel_probe;
+#[cfg(feature = "ebpf")]
+pub mod loader;
+pub mod maps;
 pub mod pod_watcher;
 pub mod veth;
+
+#[cfg(feature = "ebpf")]
+pub use loader::AyaEbpfBackend;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
