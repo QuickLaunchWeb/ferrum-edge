@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use arc_swap::ArcSwap;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -48,6 +47,7 @@ const DEFAULT_DNS_LISTEN_ADDR: &str = "127.0.0.1:15053";
 const DEFAULT_DNS_UPSTREAM_ADDR: &str = "127.0.0.53:53";
 const DEFAULT_DNS_TTL_SECONDS: u32 = 60;
 const DEFAULT_DNS_ENABLED: bool = false;
+const DEFAULT_DNS_MAX_CONCURRENT_QUERIES: usize = 1024;
 
 pub const MESH_SPIFFE_IDENTITY_PLUGIN_ID: &str = "__mesh_spiffe_identity";
 pub const MESH_AUTHZ_PLUGIN_ID: &str = "__mesh_authz";
@@ -171,6 +171,12 @@ pub struct MeshRuntimeConfig {
     /// TTL (seconds) for DNS responses served from the mesh resolution table.
     /// Sourced from `FERRUM_MESH_DNS_TTL_SECONDS` (default 60).
     pub dns_ttl_seconds: u32,
+    /// Maximum concurrent mesh DNS queries / upstream forwards.
+    /// Sourced from `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` (default 1024).
+    pub dns_max_concurrent_queries: usize,
+    /// Kubernetes cluster DNS domain used for synthetic mesh service names.
+    /// Sourced from `FERRUM_MESH_CLUSTER_DOMAIN` (default `cluster.local`).
+    pub cluster_domain: String,
 }
 
 impl MeshRuntimeConfig {
@@ -243,6 +249,14 @@ impl MeshRuntimeConfig {
         let dns_ttl_seconds = resolve_ferrum_var("FERRUM_MESH_DNS_TTL_SECONDS")
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(DEFAULT_DNS_TTL_SECONDS);
+        let dns_max_concurrent_queries =
+            resolve_ferrum_var("FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES")
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_DNS_MAX_CONCURRENT_QUERIES);
+        let cluster_domain = resolve_ferrum_var("FERRUM_MESH_CLUSTER_DOMAIN")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string());
 
         Ok(Self {
             node_id,
@@ -261,6 +275,8 @@ impl MeshRuntimeConfig {
             dns_listen_addr,
             dns_upstream_addr,
             dns_ttl_seconds,
+            dns_max_concurrent_queries,
+            cluster_domain,
         })
     }
 
@@ -791,28 +807,32 @@ async fn serve_mesh_runtime(
         shutdown_tx.subscribe(),
     );
     // Start mesh DNS proxy if enabled
-    let dns_table_handle = if runtime.dns_enabled {
-        let dns_proxy = MeshDnsProxy::new(
+    let dns_proxy_handle = if runtime.dns_enabled {
+        let dns_proxy = Arc::new(MeshDnsProxy::new(
             runtime.dns_listen_addr,
             runtime.dns_upstream_addr,
             runtime.dns_ttl_seconds,
-        );
+            runtime.dns_max_concurrent_queries,
+            runtime.cluster_domain.clone(),
+        ));
         // Build initial resolution table from the applied slice
         if let Some(ref slice) = initial_applied_mesh_slice {
             dns_proxy.update_from_slice(slice);
         }
-        let table_handle = Some(dns_proxy.resolution_table_handle());
         let dns_shutdown = shutdown_tx.subscribe();
+        let dns_runner = dns_proxy.clone();
         mesh_background_handles.push(tokio::spawn(async move {
-            dns_proxy.run(dns_shutdown).await;
+            dns_runner.run(dns_shutdown).await;
         }));
         info!(
             addr = %runtime.dns_listen_addr,
             upstream = %runtime.dns_upstream_addr,
             ttl = runtime.dns_ttl_seconds,
+            max_concurrent_queries = runtime.dns_max_concurrent_queries,
+            cluster_domain = %runtime.cluster_domain,
             "Mesh DNS proxy started"
         );
-        table_handle
+        Some(dns_proxy)
     } else {
         None
     };
@@ -823,7 +843,7 @@ async fn serve_mesh_runtime(
         runtime.clone(),
         initial_applied_mesh_slice,
         shutdown_tx.subscribe(),
-        dns_table_handle,
+        dns_proxy_handle,
     );
 
     let frontend_tls = load_frontend_tls(&env_config, &tls_policy, &crls)?;
@@ -1002,7 +1022,7 @@ fn start_mesh_slice_apply_task(
     runtime: MeshRuntimeConfig,
     initial_applied_mesh_slice: Option<MeshSlice>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    dns_table: Option<Arc<ArcSwap<dns_proxy::DnsResolutionTable>>>,
+    dns_proxy: Option<Arc<MeshDnsProxy>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut updates = mesh_state.subscribe();
@@ -1029,18 +1049,8 @@ fn start_mesh_slice_apply_task(
                             );
                             if applied {
                                 // Update DNS resolution table on successful apply
-                                if let Some(ref dns) = dns_table {
-                                    let new_table =
-                                        dns_proxy::DnsResolutionTable::from_mesh_slice(&slice);
-                                    let exact_count = new_table.exact_count();
-                                    let wildcard_count = new_table.wildcard_count();
-                                    dns.store(Arc::new(new_table));
-                                    debug!(
-                                        exact_entries = exact_count,
-                                        wildcard_entries = wildcard_count,
-                                        mesh_slice_version = %slice.version,
-                                        "DNS resolution table rebuilt from mesh slice update"
-                                    );
+                                if let Some(ref dns_proxy) = dns_proxy {
+                                    dns_proxy.update_from_slice(&slice);
                                 }
                                 info!(
                                     mesh_slice_version = %slice.version,
@@ -1244,6 +1254,8 @@ mod tests {
             "FERRUM_MESH_DNS_LISTEN_ADDR",
             "FERRUM_MESH_DNS_UPSTREAM_ADDR",
             "FERRUM_MESH_DNS_TTL_SECONDS",
+            "FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES",
+            "FERRUM_MESH_CLUSTER_DOMAIN",
             "FERRUM_POOL_WARMUP_ENABLED",
             "FERRUM_SHUTDOWN_DRAIN_SECONDS",
         ];
@@ -1297,6 +1309,11 @@ mod tests {
                     DEFAULT_HBONE_LISTEN_ADDR.parse::<SocketAddr>().unwrap()
                 );
                 assert_eq!(runtime.east_west_listen_port, DEFAULT_EAST_WEST_LISTEN_PORT);
+                assert_eq!(
+                    runtime.dns_max_concurrent_queries,
+                    DEFAULT_DNS_MAX_CONCURRENT_QUERIES
+                );
+                assert_eq!(runtime.cluster_domain, dns_proxy::DEFAULT_CLUSTER_DOMAIN);
             },
         );
     }
@@ -1321,6 +1338,8 @@ mod tests {
                 ("FERRUM_MESH_OUTBOUND_LISTEN_ADDR", "127.0.0.1:16001"),
                 ("FERRUM_MESH_HBONE_LISTEN_ADDR", "127.0.0.1:16008"),
                 ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "16443"),
+                ("FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES", "2048"),
+                ("FERRUM_MESH_CLUSTER_DOMAIN", "corp.local"),
                 (
                     "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
                     "spiffe://cluster.local/ns/default/sa/api",
@@ -1352,6 +1371,8 @@ mod tests {
                     "127.0.0.1:16008".parse::<SocketAddr>().unwrap()
                 );
                 assert_eq!(runtime.east_west_listen_port, 16443);
+                assert_eq!(runtime.dns_max_concurrent_queries, 2048);
+                assert_eq!(runtime.cluster_domain, "corp.local");
             },
         );
     }
@@ -1585,6 +1606,8 @@ mod tests {
             dns_listen_addr: DEFAULT_DNS_LISTEN_ADDR.parse().unwrap(),
             dns_upstream_addr: DEFAULT_DNS_UPSTREAM_ADDR.parse().unwrap(),
             dns_ttl_seconds: DEFAULT_DNS_TTL_SECONDS,
+            dns_max_concurrent_queries: DEFAULT_DNS_MAX_CONCURRENT_QUERIES,
+            cluster_domain: dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
         let mesh_state = MeshRuntimeState::new();
@@ -1662,6 +1685,8 @@ mod tests {
             dns_listen_addr: DEFAULT_DNS_LISTEN_ADDR.parse().unwrap(),
             dns_upstream_addr: DEFAULT_DNS_UPSTREAM_ADDR.parse().unwrap(),
             dns_ttl_seconds: DEFAULT_DNS_TTL_SECONDS,
+            dns_max_concurrent_queries: DEFAULT_DNS_MAX_CONCURRENT_QUERIES,
+            cluster_domain: dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
         }
     }
 
