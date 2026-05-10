@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod config_consumer;
+pub mod dns_proxy;
 pub mod hbone;
 pub mod policy;
 pub mod runtime;
@@ -38,6 +39,7 @@ use crate::modes::mesh::config::{
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
+use crate::modes::mesh::dns_proxy::MeshDnsProxy;
 use crate::modes::mesh::runtime::MeshRuntimeState;
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use crate::proxy::{self, ProxyState};
@@ -48,6 +50,11 @@ const DEFAULT_INBOUND_LISTEN_ADDR: &str = "0.0.0.0:15006";
 const DEFAULT_OUTBOUND_LISTEN_ADDR: &str = "127.0.0.1:15001";
 const DEFAULT_HBONE_LISTEN_ADDR: &str = "0.0.0.0:15008";
 const DEFAULT_EAST_WEST_LISTEN_PORT: u16 = 15443;
+const DEFAULT_DNS_LISTEN_ADDR: &str = "127.0.0.1:15053";
+const DEFAULT_DNS_UPSTREAM_ADDR: &str = "127.0.0.53:53";
+const DEFAULT_DNS_TTL_SECONDS: u32 = 60;
+const DEFAULT_DNS_ENABLED: bool = false;
+const DEFAULT_DNS_MAX_CONCURRENT_QUERIES: usize = 1024;
 const DEFAULT_EGRESS_LISTEN_ADDR: &str = "0.0.0.0:15090";
 
 pub const MESH_SPIFFE_IDENTITY_PLUGIN_ID: &str = "__mesh_spiffe_identity";
@@ -181,6 +188,25 @@ pub struct MeshRuntimeConfig {
     /// (`key1=val1,key2=val2`); empty when unset. The Kubernetes injector
     /// (Phase D) can populate this from pod labels via the downward API.
     pub workload_labels: std::collections::HashMap<String, String>,
+    /// Whether the transparent DNS proxy is enabled. Opt-in because it
+    /// requires iptables/eBPF redirect to be useful.
+    /// Sourced from `FERRUM_MESH_DNS_PROXY_ENABLED` (default false).
+    pub dns_enabled: bool,
+    /// Listen address for the mesh DNS proxy.
+    /// Sourced from `FERRUM_MESH_DNS_LISTEN_ADDR` (default `127.0.0.1:15053`).
+    pub dns_listen_addr: SocketAddr,
+    /// Upstream DNS resolver for non-mesh queries.
+    /// Sourced from `FERRUM_MESH_DNS_UPSTREAM_ADDR` (default `127.0.0.53:53`).
+    pub dns_upstream_addr: SocketAddr,
+    /// TTL (seconds) for DNS responses served from the mesh resolution table.
+    /// Sourced from `FERRUM_MESH_DNS_TTL_SECONDS` (default 60).
+    pub dns_ttl_seconds: u32,
+    /// Maximum concurrent mesh DNS queries / upstream forwards.
+    /// Sourced from `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` (default 1024).
+    pub dns_max_concurrent_queries: usize,
+    /// Kubernetes cluster DNS domain used for synthetic mesh service names.
+    /// Sourced from `FERRUM_MESH_CLUSTER_DOMAIN` (default `cluster.local`).
+    pub cluster_domain: String,
 }
 
 impl MeshRuntimeConfig {
@@ -249,6 +275,33 @@ impl MeshRuntimeConfig {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("FERRUM_MESH_TRUST_DOMAIN_ALIASES: {e}"))?;
 
+        let dns_enabled = resolve_ferrum_var("FERRUM_MESH_DNS_PROXY_ENABLED")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(DEFAULT_DNS_ENABLED);
+        let dns_listen_addr = parse_socket_addr(
+            "FERRUM_MESH_DNS_LISTEN_ADDR",
+            resolve_ferrum_var("FERRUM_MESH_DNS_LISTEN_ADDR")
+                .as_deref()
+                .unwrap_or(DEFAULT_DNS_LISTEN_ADDR),
+        )?;
+        let dns_upstream_addr = parse_socket_addr(
+            "FERRUM_MESH_DNS_UPSTREAM_ADDR",
+            resolve_ferrum_var("FERRUM_MESH_DNS_UPSTREAM_ADDR")
+                .as_deref()
+                .unwrap_or(DEFAULT_DNS_UPSTREAM_ADDR),
+        )?;
+        let dns_ttl_seconds = resolve_ferrum_var("FERRUM_MESH_DNS_TTL_SECONDS")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_DNS_TTL_SECONDS);
+        let dns_max_concurrent_queries =
+            resolve_ferrum_var("FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES")
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_DNS_MAX_CONCURRENT_QUERIES);
+        let cluster_domain = resolve_ferrum_var("FERRUM_MESH_CLUSTER_DOMAIN")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string());
+
         Ok(Self {
             node_id,
             namespace: env_config.namespace.clone(),
@@ -267,6 +320,12 @@ impl MeshRuntimeConfig {
             xds_connect_timeout_seconds,
             trust_domain_aliases,
             workload_labels,
+            dns_enabled,
+            dns_listen_addr,
+            dns_upstream_addr,
+            dns_ttl_seconds,
+            dns_max_concurrent_queries,
+            cluster_domain,
         })
     }
 
@@ -1336,7 +1395,7 @@ async fn serve_mesh_runtime(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     mesh_state: MeshRuntimeState,
     initial_applied_mesh_slice: Option<MeshSlice>,
-    mesh_background_handles: Vec<JoinHandle<()>>,
+    mut mesh_background_handles: Vec<JoinHandle<()>>,
 ) -> Result<(), anyhow::Error> {
     let dns_cache = DnsCache::new(DnsConfig {
         global_overrides: env_config.dns_overrides.clone(),
@@ -1423,12 +1482,50 @@ async fn serve_mesh_runtime(
         env_config.status_metrics_window_seconds,
         shutdown_tx.subscribe(),
     );
+    // Start mesh DNS proxy if enabled
+    let dns_proxy_handle = if runtime.dns_enabled {
+        let dns_proxy = Arc::new(MeshDnsProxy::new(
+            runtime.dns_listen_addr,
+            runtime.dns_upstream_addr,
+            runtime.dns_ttl_seconds,
+            runtime.dns_max_concurrent_queries,
+            runtime.cluster_domain.clone(),
+        ));
+        // Build initial resolution table from the applied slice
+        if let Some(ref slice) = initial_applied_mesh_slice {
+            dns_proxy.update_from_slice(slice);
+        }
+        let dns_sockets = dns_proxy.bind().await.with_context(|| {
+            format!(
+                "failed to bind mesh DNS proxy at {}",
+                runtime.dns_listen_addr
+            )
+        })?;
+        let dns_shutdown = shutdown_tx.subscribe();
+        let dns_runner = dns_proxy.clone();
+        mesh_background_handles.push(tokio::spawn(async move {
+            dns_runner.run_bound(dns_sockets, dns_shutdown).await;
+        }));
+        info!(
+            addr = %runtime.dns_listen_addr,
+            upstream = %runtime.dns_upstream_addr,
+            ttl = runtime.dns_ttl_seconds,
+            max_concurrent_queries = runtime.dns_max_concurrent_queries,
+            cluster_domain = %runtime.cluster_domain,
+            "Mesh DNS proxy started"
+        );
+        Some(dns_proxy)
+    } else {
+        None
+    };
+
     let mesh_apply_handle = start_mesh_slice_apply_task(
         mesh_state,
         proxy_state.clone(),
         runtime.clone(),
         initial_applied_mesh_slice,
         shutdown_tx.subscribe(),
+        dns_proxy_handle,
     );
 
     validate_egress_gateway_mtls_config(&runtime, &env_config)?;
@@ -1637,6 +1734,7 @@ fn start_mesh_slice_apply_task(
     runtime: MeshRuntimeConfig,
     initial_applied_mesh_slice: Option<MeshSlice>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    dns_proxy: Option<Arc<MeshDnsProxy>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut updates = mesh_state.subscribe();
@@ -1655,21 +1753,38 @@ fn start_mesh_slice_apply_task(
                 } else {
                     match gateway_config_from_mesh_slice(&slice, &runtime) {
                         Ok(config) => {
+                            let previous_loaded_at = proxy_state.config.load_full().loaded_at;
+                            let candidate_loaded_at = config.loaded_at;
                             let applied = proxy_state.update_config(config);
+                            let current_loaded_at = proxy_state.config.load_full().loaded_at;
+                            let accepted = mesh_proxy_update_was_accepted(
+                                applied,
+                                previous_loaded_at,
+                                current_loaded_at,
+                                candidate_loaded_at,
+                            );
                             record_mesh_slice_apply_result(
                                 &mut last_applied_slice,
                                 &slice,
-                                applied,
+                                accepted,
                             );
+                            if accepted && let Some(ref dns_proxy) = dns_proxy {
+                                dns_proxy.update_from_slice(&slice);
+                            }
                             if applied {
                                 info!(
                                     mesh_slice_version = %slice.version,
                                     "Applied mesh slice to proxy runtime"
                                 );
+                            } else if accepted {
+                                debug!(
+                                    mesh_slice_version = %slice.version,
+                                    "Accepted mesh slice with no proxy runtime delta"
+                                );
                             } else {
                                 warn!(
                                     mesh_slice_version = %slice.version,
-                                    "Mesh slice was not applied to proxy runtime; retaining last accepted slice"
+                                    "Rejected mesh slice proxy config; leaving last applied slice and DNS table unchanged"
                                 );
                             }
                         }
@@ -1711,6 +1826,15 @@ fn record_mesh_slice_apply_result(
     if applied {
         *last_applied_slice = Some(slice.clone());
     }
+}
+
+fn mesh_proxy_update_was_accepted(
+    applied: bool,
+    previous_loaded_at: chrono::DateTime<chrono::Utc>,
+    current_loaded_at: chrono::DateTime<chrono::Utc>,
+    candidate_loaded_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    applied || (current_loaded_at == candidate_loaded_at && current_loaded_at != previous_loaded_at)
 }
 
 struct MeshBackgroundTasks {
@@ -1868,6 +1992,12 @@ mod tests {
             "FERRUM_MESH_WORKLOAD_LABELS",
             "FERRUM_MESH_TRUST_DOMAIN_ALIASES",
             "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS",
+            "FERRUM_MESH_DNS_PROXY_ENABLED",
+            "FERRUM_MESH_DNS_LISTEN_ADDR",
+            "FERRUM_MESH_DNS_UPSTREAM_ADDR",
+            "FERRUM_MESH_DNS_TTL_SECONDS",
+            "FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES",
+            "FERRUM_MESH_CLUSTER_DOMAIN",
             "FERRUM_XDS_STREAM_CHANNEL_CAPACITY",
             "FERRUM_MESH_XDS_CONNECT_TIMEOUT_SECONDS",
             "FERRUM_POOL_WARMUP_ENABLED",
@@ -1923,6 +2053,11 @@ mod tests {
                     DEFAULT_HBONE_LISTEN_ADDR.parse::<SocketAddr>().unwrap()
                 );
                 assert_eq!(runtime.east_west_listen_port, DEFAULT_EAST_WEST_LISTEN_PORT);
+                assert_eq!(
+                    runtime.dns_max_concurrent_queries,
+                    DEFAULT_DNS_MAX_CONCURRENT_QUERIES
+                );
+                assert_eq!(runtime.cluster_domain, dns_proxy::DEFAULT_CLUSTER_DOMAIN);
             },
         );
     }
@@ -1947,6 +2082,8 @@ mod tests {
                 ("FERRUM_MESH_OUTBOUND_LISTEN_ADDR", "127.0.0.1:16001"),
                 ("FERRUM_MESH_HBONE_LISTEN_ADDR", "127.0.0.1:16008"),
                 ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "16443"),
+                ("FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES", "2048"),
+                ("FERRUM_MESH_CLUSTER_DOMAIN", "corp.local"),
                 (
                     "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
                     "spiffe://cluster.local/ns/default/sa/api",
@@ -1978,6 +2115,8 @@ mod tests {
                     "127.0.0.1:16008".parse::<SocketAddr>().unwrap()
                 );
                 assert_eq!(runtime.east_west_listen_port, 16443);
+                assert_eq!(runtime.dns_max_concurrent_queries, 2048);
+                assert_eq!(runtime.cluster_domain, "corp.local");
             },
         );
     }
@@ -2229,6 +2368,12 @@ mod tests {
             xds_connect_timeout_seconds: 10,
             trust_domain_aliases: Vec::new(),
             workload_labels: HashMap::new(),
+            dns_enabled: false,
+            dns_listen_addr: DEFAULT_DNS_LISTEN_ADDR.parse().unwrap(),
+            dns_upstream_addr: DEFAULT_DNS_UPSTREAM_ADDR.parse().unwrap(),
+            dns_ttl_seconds: DEFAULT_DNS_TTL_SECONDS,
+            dns_max_concurrent_queries: DEFAULT_DNS_MAX_CONCURRENT_QUERIES,
+            cluster_domain: dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
         let mesh_state = MeshRuntimeState::new();
@@ -2307,6 +2452,12 @@ mod tests {
             xds_connect_timeout_seconds: 10,
             trust_domain_aliases: Vec::new(),
             workload_labels: HashMap::new(),
+            dns_enabled: false,
+            dns_listen_addr: DEFAULT_DNS_LISTEN_ADDR.parse().unwrap(),
+            dns_upstream_addr: DEFAULT_DNS_UPSTREAM_ADDR.parse().unwrap(),
+            dns_ttl_seconds: DEFAULT_DNS_TTL_SECONDS,
+            dns_max_concurrent_queries: DEFAULT_DNS_MAX_CONCURRENT_QUERIES,
+            cluster_domain: dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
         }
     }
 
@@ -2809,6 +2960,25 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn mesh_proxy_update_acceptance_distinguishes_no_delta_from_rejection() {
+        let previous = chrono::Utc::now();
+        let candidate = previous + chrono::Duration::milliseconds(1);
+
+        assert!(mesh_proxy_update_was_accepted(
+            true, previous, previous, candidate
+        ));
+        assert!(mesh_proxy_update_was_accepted(
+            false, previous, candidate, candidate
+        ));
+        assert!(!mesh_proxy_update_was_accepted(
+            false, previous, previous, candidate
+        ));
+        assert!(!mesh_proxy_update_was_accepted(
+            false, previous, previous, previous
+        ));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn mesh_runtime_apply_task_propagates_subsequent_native_slices() {
         let runtime = test_mesh_runtime_config();
@@ -2821,6 +2991,7 @@ mod tests {
             runtime,
             None,
             shutdown_rx,
+            None,
         );
 
         mesh_state.install_slice(MeshSlice {

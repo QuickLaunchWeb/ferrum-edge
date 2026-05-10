@@ -164,6 +164,12 @@ With the native `MeshSubscribe` protocol, mesh mode waits for the first delivere
 | `FERRUM_MESH_PROXY_UID` | No | `1337` in injector patches | UID used to exempt Ferrum's own outbound traffic from iptables capture |
 | `FERRUM_MESH_TRUST_DOMAIN_ALIASES` | No | — | Comma-separated SPIFFE trust domains accepted as equivalent to the peer cert's trust domain when validating HBONE baggage `source.principal`. Default empty: strict same-trust-domain match. Mirror of Istio `MeshConfig.trustDomainAliases` for federated multi-cluster setups |
 | `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS` | No | — | Comma-separated W3C `baggage` key prefixes stripped from outbound requests at dispatch. Default empty: forward unchanged. Set to `source.` to keep mesh-stamped identity claims (e.g. `source.principal`) from leaking to non-mesh upstreams |
+| `FERRUM_MESH_DNS_PROXY_ENABLED` | No | `false` | Enable the transparent mesh DNS proxy. Requires traffic capture rules to redirect workload DNS traffic to `FERRUM_MESH_DNS_LISTEN_ADDR` |
+| `FERRUM_MESH_DNS_LISTEN_ADDR` | No | `127.0.0.1:15053` | UDP/TCP listen address for transparent DNS. TCP is used for truncated responses and resolver fallback |
+| `FERRUM_MESH_DNS_UPSTREAM_ADDR` | No | `127.0.0.53:53` | Upstream DNS resolver for non-mesh names. The default targets systemd-resolved; set this to your node, pod, or cluster resolver (for example CoreDNS) in non-systemd environments |
+| `FERRUM_MESH_DNS_TTL_SECONDS` | No | `60` | TTL used for synthetic A/AAAA records resolved from mesh ServiceEntry and MeshService state |
+| `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` | No | `1024` | Maximum admitted DNS query tasks and outstanding upstream UDP forwards before the proxy returns SERVFAIL |
+| `FERRUM_MESH_CLUSTER_DOMAIN` | No | `cluster.local` | Kubernetes cluster DNS domain used when synthesizing `{service}.{namespace}.svc.<domain>` names |
 
 Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Prometheus plugin when mesh metadata is present. The added series are `ferrum_mesh_requests_total` and `ferrum_mesh_request_duration_ms`, labelled with source/destination workload, namespace, principal, app, service, request protocol, response code, response flags, and connection security policy.
 
