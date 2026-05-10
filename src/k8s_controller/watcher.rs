@@ -115,22 +115,36 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
     },
 ];
 
-fn build_api_for_resource(
+fn watch_scopes(namespaces: &[String]) -> Vec<Option<String>> {
+    if namespaces.is_empty() {
+        return vec![None];
+    }
+    namespaces.iter().cloned().map(Some).collect()
+}
+
+fn watch_scope_label(scope: Option<&str>) -> String {
+    match scope {
+        Some(namespace) => format!("namespace:{namespace}"),
+        None => "all".to_string(),
+    }
+}
+
+fn build_apis_for_resource(
     client: &Client,
     ar: &ApiResource,
     namespaces: &[String],
-) -> (Api<DynamicObject>, ApiResource) {
-    let api = if namespaces.is_empty() {
-        Api::all_with(client.clone(), ar)
-    } else if namespaces.len() == 1 {
-        Api::namespaced_with(client.clone(), &namespaces[0], ar)
-    } else {
-        // kube-rs doesn't support multi-namespace in a single Api;
-        // use all-namespace watch and filter in the reconciler.
-        Api::all_with(client.clone(), ar)
-    };
-
-    (api, ar.clone())
+) -> Vec<(Api<DynamicObject>, ApiResource, String)> {
+    watch_scopes(namespaces)
+        .into_iter()
+        .map(|scope| {
+            let api = match scope.as_deref() {
+                Some(namespace) => Api::namespaced_with(client.clone(), namespace, ar),
+                None => Api::all_with(client.clone(), ar),
+            };
+            let scope_label = watch_scope_label(scope.as_deref());
+            (api, ar.clone(), scope_label)
+        })
+        .collect()
 }
 
 fn find_crd_resource(api_group: &discovery::ApiGroup, crd: &CrdSpec) -> Option<ApiResource> {
@@ -192,15 +206,6 @@ pub async fn start_crd_watchers(
         let api_version = format!("{}/{}", crd.group, crd.version);
         let kind = crd.kind.to_string();
 
-        if store_set.lock().await.has_store(&api_version, &kind) {
-            debug!(
-                kind = %kind,
-                api_version = %api_version,
-                "CRD watcher already running, skipping duplicate start"
-            );
-            continue;
-        }
-
         let Some(ar) = find_crd_resource(api_group, crd) else {
             debug!(
                 group = crd.group,
@@ -211,77 +216,110 @@ pub async fn start_crd_watchers(
             continue;
         };
 
-        let (api, ar) = build_api_for_resource(&client, &ar, &namespaces);
-
-        let writer = reflector::store::Writer::new(ar.clone());
-        let store = writer.as_reader();
-        let crd_store = Arc::new(CrdResourceStore::new(
-            api_version.clone(),
-            kind.clone(),
-            store,
-        ));
-
-        let change_notifier = {
-            let mut set = store_set.lock().await;
-            if !set.add_store(crd_store) {
+        for (api, ar, scope) in build_apis_for_resource(&client, &ar, &namespaces) {
+            if store_set
+                .lock()
+                .await
+                .has_store_for_scope(&api_version, &kind, &scope)
+            {
                 debug!(
                     kind = %kind,
                     api_version = %api_version,
+                    scope = %scope,
                     "CRD watcher already running, skipping duplicate start"
                 );
                 continue;
             }
-            set.change_notifier()
-        };
 
-        let mut watcher_shutdown = shutdown.clone();
-        let cleanup_store_set = store_set.clone();
-        let cleanup_api_version = api_version.clone();
-        let cleanup_kind = kind.clone();
-        let watcher_config = watcher::Config::default();
+            let writer = reflector::store::Writer::new(ar.clone());
+            let store = writer.as_reader();
+            let crd_store = Arc::new(CrdResourceStore::new_scoped(
+                api_version.clone(),
+                kind.clone(),
+                scope.clone(),
+                store,
+            ));
 
-        let handle = tokio::spawn(async move {
-            let stream = reflector::reflector(writer, watcher(api, watcher_config));
+            let change_notifier = {
+                let mut set = store_set.lock().await;
+                if !set.add_store(crd_store) {
+                    debug!(
+                        kind = %kind,
+                        api_version = %api_version,
+                        scope = %scope,
+                        "CRD watcher already running, skipping duplicate start"
+                    );
+                    continue;
+                }
+                set.change_notifier()
+            };
 
-            tokio::pin!(stream);
+            let mut watcher_shutdown = shutdown.clone();
+            let cleanup_store_set = store_set.clone();
+            let cleanup_api_version = api_version.clone();
+            let cleanup_kind = kind.clone();
+            let cleanup_scope = scope.clone();
+            let task_kind = kind.clone();
+            let watcher_config = watcher::Config::default();
 
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = watcher_shutdown.changed() => {
-                        if *watcher_shutdown.borrow() {
-                            debug!(kind, "Watcher shutting down");
-                            return;
-                        }
-                    }
-                    item = stream.try_next() => {
-                        match item {
-                            Ok(Some(_event)) => {
-                                change_notifier.notify_change();
-                            }
-                            Ok(None) => {
-                                let removed = cleanup_store_set
-                                    .lock()
-                                    .await
-                                    .remove_store(&cleanup_api_version, &cleanup_kind);
-                                info!(kind, removed, "Watch stream ended");
+            let handle = tokio::spawn(async move {
+                let stream = reflector::reflector(writer, watcher(api, watcher_config));
+
+                tokio::pin!(stream);
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = watcher_shutdown.changed() => {
+                            if *watcher_shutdown.borrow() {
+                                debug!(kind = %task_kind, scope = %cleanup_scope, "Watcher shutting down");
                                 return;
                             }
-                            Err(e) => {
-                                error!(
-                                    kind,
-                                    error = %e,
-                                    "Watch error, kube-rs will retry with backoff"
-                                );
+                        }
+                        item = stream.try_next() => {
+                            match item {
+                                Ok(Some(_event)) => {
+                                    change_notifier.notify_change();
+                                }
+                                Ok(None) => {
+                                    let removed = cleanup_store_set
+                                        .lock()
+                                        .await
+                                        .remove_store_for_scope(
+                                            &cleanup_api_version,
+                                            &cleanup_kind,
+                                            &cleanup_scope,
+                                        );
+                                    info!(
+                                        kind = %task_kind,
+                                        scope = %cleanup_scope,
+                                        removed,
+                                        "Watch stream ended"
+                                    );
+                                    return;
+                                }
+                                Err(e) => {
+                                    error!(
+                                        kind = %task_kind,
+                                        scope = %cleanup_scope,
+                                        error = %e,
+                                        "Watch error, kube-rs will retry with backoff"
+                                    );
+                                }
                             }
                         }
                     }
                 }
-            }
-        });
+            });
 
-        handles.push(handle);
-        info!(kind = crd.kind, group = crd.group, "Started CRD watcher");
+            handles.push(handle);
+            info!(
+                kind = crd.kind,
+                group = crd.group,
+                scope = %scope,
+                "Started CRD watcher"
+            );
+        }
     }
 
     handles
@@ -326,4 +364,26 @@ pub fn spawn_crd_reprobe_task(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watch_scopes_uses_all_namespaces_when_unset() {
+        assert_eq!(watch_scopes(&[]), vec![None]);
+    }
+
+    #[test]
+    fn watch_scopes_preserves_each_configured_namespace() {
+        assert_eq!(
+            watch_scopes(&["default".to_string(), "prod".to_string()]),
+            vec![Some("default".to_string()), Some("prod".to_string())]
+        );
+        assert_eq!(
+            watch_scope_label(Some("prod")),
+            "namespace:prod".to_string()
+        );
+    }
 }

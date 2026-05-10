@@ -11,14 +11,25 @@ use crate::k8s_controller::convert::dynamic_object_to_k8s_object;
 pub struct CrdResourceStore {
     pub api_version: String,
     pub kind: String,
+    pub scope: String,
     store: reflector::Store<DynamicObject>,
 }
 
 impl CrdResourceStore {
     pub fn new(api_version: String, kind: String, store: reflector::Store<DynamicObject>) -> Self {
+        Self::new_scoped(api_version, kind, "all".to_string(), store)
+    }
+
+    pub fn new_scoped(
+        api_version: String,
+        kind: String,
+        scope: String,
+        store: reflector::Store<DynamicObject>,
+    ) -> Self {
         Self {
             api_version,
             kind,
+            scope,
             store,
         }
     }
@@ -86,7 +97,7 @@ impl ResourceStoreSet {
     }
 
     pub fn add_store(&mut self, store: Arc<CrdResourceStore>) -> bool {
-        if self.has_store(&store.api_version, &store.kind) {
+        if self.has_store_for_scope(&store.api_version, &store.kind, &store.scope) {
             return false;
         }
         self.stores.push(store);
@@ -108,10 +119,28 @@ impl ResourceStoreSet {
         true
     }
 
+    pub fn remove_store_for_scope(&mut self, api_version: &str, kind: &str, scope: &str) -> bool {
+        let Some(index) = self.stores.iter().position(|store| {
+            store.api_version == api_version && store.kind == kind && store.scope == scope
+        }) else {
+            return false;
+        };
+
+        self.stores.remove(index);
+        self.notify_change();
+        true
+    }
+
     pub fn has_store(&self, api_version: &str, kind: &str) -> bool {
         self.stores
             .iter()
             .any(|store| store.api_version == api_version && store.kind == kind)
+    }
+
+    pub fn has_store_for_scope(&self, api_version: &str, kind: &str, scope: &str) -> bool {
+        self.stores.iter().any(|store| {
+            store.api_version == api_version && store.kind == kind && store.scope == scope
+        })
     }
 
     pub fn stores(&self) -> Vec<Arc<CrdResourceStore>> {
@@ -165,6 +194,24 @@ mod tests {
         ))
     }
 
+    fn test_scoped_store(api_version: &str, kind: &str, scope: &str) -> Arc<CrdResourceStore> {
+        let ar = ApiResource {
+            group: "example.com".to_string(),
+            version: "v1".to_string(),
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            plural: format!("{}s", kind.to_ascii_lowercase()),
+        };
+        let writer = reflector::store::Writer::new(ar);
+        let store = writer.as_reader();
+        Arc::new(CrdResourceStore::new_scoped(
+            api_version.to_string(),
+            kind.to_string(),
+            scope.to_string(),
+            store,
+        ))
+    }
+
     #[test]
     fn remove_store_deregisters_and_notifies() {
         let mut set = ResourceStoreSet::new();
@@ -179,5 +226,31 @@ mod tests {
 
         assert!(!set.has_store("example.com/v1", "Widget"));
         assert_eq!(*rx.borrow(), 2);
+    }
+
+    #[test]
+    fn duplicate_detection_is_scope_aware() {
+        let mut set = ResourceStoreSet::new();
+
+        assert!(set.add_store(test_scoped_store(
+            "example.com/v1",
+            "Widget",
+            "namespace:default",
+        )));
+        assert!(set.add_store(test_scoped_store(
+            "example.com/v1",
+            "Widget",
+            "namespace:prod",
+        )));
+        assert!(!set.add_store(test_scoped_store(
+            "example.com/v1",
+            "Widget",
+            "namespace:default",
+        )));
+
+        assert!(set.has_store("example.com/v1", "Widget"));
+        assert!(set.has_store_for_scope("example.com/v1", "Widget", "namespace:prod",));
+        assert!(set.remove_store_for_scope("example.com/v1", "Widget", "namespace:default",));
+        assert!(set.has_store_for_scope("example.com/v1", "Widget", "namespace:prod",));
     }
 }

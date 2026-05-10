@@ -150,8 +150,9 @@ pub fn spawn_reconcile_loop(
 }
 
 async fn debounce_events(change_rx: &mut watch::Receiver<u64>, window: Duration) {
-    let deadline = tokio::time::Instant::now() + window;
-    let hard_cap = tokio::time::Instant::now() + window * 4;
+    let started = tokio::time::Instant::now();
+    let mut deadline = started + window;
+    let hard_cap = started + window * 4;
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -165,9 +166,22 @@ async fn debounce_events(change_rx: &mut watch::Receiver<u64>, window: Duration)
                 if result.is_err() {
                     break;
                 }
-                // More events arriving — continue debouncing up to hard cap.
+                deadline = refresh_debounce_deadline(tokio::time::Instant::now(), window, hard_cap);
             }
         }
+    }
+}
+
+fn refresh_debounce_deadline(
+    now: tokio::time::Instant,
+    window: Duration,
+    hard_cap: tokio::time::Instant,
+) -> tokio::time::Instant {
+    let next_deadline = now + window;
+    if next_deadline < hard_cap {
+        next_deadline
+    } else {
+        hard_cap
     }
 }
 
@@ -732,6 +746,22 @@ mod tests {
     fn full_sync_interval_zero_is_clamped_before_timer_creation() {
         assert_eq!(full_sync_interval_duration(0), Duration::from_secs(1));
         assert_eq!(full_sync_interval_duration(300), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn debounce_deadline_refreshes_without_exceeding_hard_cap() {
+        let start = tokio::time::Instant::now();
+        let window = Duration::from_millis(100);
+        let hard_cap = start + Duration::from_millis(250);
+
+        assert_eq!(
+            refresh_debounce_deadline(start + Duration::from_millis(50), window, hard_cap),
+            start + Duration::from_millis(150)
+        );
+        assert_eq!(
+            refresh_debounce_deadline(start + Duration::from_millis(200), window, hard_cap),
+            hard_cap
+        );
     }
 
     #[tokio::test]
