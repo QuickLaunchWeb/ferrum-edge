@@ -1,4 +1,16 @@
 # Multi-stage build for Ferrum Edge
+
+# --- eBPF build stage (nightly, Linux only) ---
+# Uncomment when the eBPF capture mode is fully wired into the main binary.
+# The compiled BPF program is copied into the runtime image at /app/bpf/ and
+# loaded by the node_agent mode at startup via aya.
+#
+# FROM rust:nightly-slim AS ebpf-builder
+# RUN rustup component add rust-src
+# COPY ebpf/ /build/ebpf/
+# WORKDIR /build/ebpf
+# RUN cargo build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
+
 # Stage 1: Builder — rust:latest uses trixie (Debian 13), matching distroless/cc-debian13 glibc
 FROM rust:latest AS builder
 
