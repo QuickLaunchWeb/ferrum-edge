@@ -236,6 +236,19 @@ Outbound capture exclusions can also be set per pod with `traffic.sidecar.istio.
 
 Injected sidecars run as the configured mesh proxy UID with `runAsNonRoot=true`, `allowPrivilegeEscalation=false`, `readOnlyRootFilesystem=true`, `seccompProfile=RuntimeDefault`, and all Linux capabilities dropped. `FERRUM_MESH_PROXY_UID=0` is rejected at injector startup because Kubernetes would reject a sidecar that combines UID 0 with `runAsNonRoot=true`. The iptables init container explicitly sets `runAsUser=0`, `runAsNonRoot=false`, and `seccompProfile=RuntimeDefault`; it runs as root only long enough to program capture rules, drops all capabilities before adding back `NET_ADMIN` and `NET_RAW`, disables privilege escalation, and receives bounded CPU/memory requests and limits. Injector startup validates those resource quantity env vars so malformed values fail before admission requests are served. Its root filesystem remains writable because iptables needs the xtables lock path while programming capture rules.
 
+### Node Agent
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FERRUM_NODE_AGENT_NODE_NAME` | Yes (node_agent) | — | Kubernetes node name, set via downward API (`spec.nodeName`) |
+| `FERRUM_NODE_AGENT_CGROUP_ROOT` | No | `/sys/fs/cgroup` | cgroup v2 mount point for pod cgroup resolution |
+| `FERRUM_NODE_AGENT_BPF_FS_PATH` | No | `/sys/fs/bpf` | BPF filesystem mount point for pinned maps |
+| `FERRUM_NODE_AGENT_FALLBACK_MODE` | No | `iptables` | Behavior on kernel < 5.7: `iptables` or `fail` |
+| `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES` | No | — | Extra namespaces to exclude from capture (comma-separated; `kube-system`, `kube-public`, `kube-node-lease` always excluded) |
+| `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | No | `0.0.0.0/0` | CIDRs to capture for outbound traffic (comma-separated) |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | No | — | CIDRs to exclude from outbound capture (comma-separated, highest priority) |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | No | `15001,15006,15008,15020` | Destination ports to exclude from capture (comma-separated) |
+
 ### Migration
 
 | Variable | Required | Default | Description |
