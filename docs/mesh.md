@@ -849,7 +849,6 @@ The following Istio mesh surfaces are **not yet supported** and should be treate
 | IP-range capture exclusions (`excludeOutboundIPRanges`, `includeOutboundIPRanges`) | Deferred | |
 | `Service.spec.ports[].name` resolution | Deferred | Use numeric ports in backendRefs and VirtualService destinations |
 | `WorkloadEntry` beyond address/labels/network/cluster | Partial | Basic fields supported; full VM lifecycle deferred |
-| `Telemetry` provider-specific config | Partial | Basic tracing/metrics/access-log envelopes supported |
 
 ## Environment Variables
 

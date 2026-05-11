@@ -10,7 +10,7 @@ use crate::modes::mesh::config::{
     MeshSimpleLb, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
     MeshTrafficPolicy, MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope,
     PrincipalMatch, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
-    TagOverrideOperation, Workload, WorkloadPort, WorkloadSelector,
+    TagOverrideOperation, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
 };
 
 use super::{
@@ -1217,12 +1217,15 @@ fn telemetry(
                         .collect()
                 })
                 .unwrap_or_default();
-            MeshTracingConfig {
+            let provider = telemetry_tracing_provider(object, t)?;
+            Ok::<_, K8sTranslateError>(MeshTracingConfig {
                 sampling_percentage: sampling,
                 custom_tags,
                 custom_header_tags,
-            }
-        });
+                provider,
+            })
+        })
+        .transpose()?;
 
     let metrics = object
         .spec
@@ -1312,6 +1315,97 @@ fn telemetry(
             access_logging,
         },
     })
+}
+
+/// Extract the first `tracing[].providers[]` entry as a [`TracingProvider`].
+///
+/// Mirrors Istio's Telemetry CRD: `providers[]` is a list of named provider
+/// references. Today we surface only the first entry; multi-provider fan-out
+/// is deferred. Unknown provider kinds (any string outside the four supported
+/// backends) and provider entries missing their required URL/endpoint field
+/// fail closed with the offending name in the error so operators can fix
+/// their manifests rather than silently dropping observability config.
+fn telemetry_tracing_provider(
+    object: &K8sObject,
+    tracing_entry: &Value,
+) -> Result<Option<TracingProvider>, K8sTranslateError> {
+    let Some(first) = tracing_entry
+        .get("providers")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+    else {
+        return Ok(None);
+    };
+    let name = first
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_resource(object, "Telemetry tracing.providers[].name is required"))?
+        .trim();
+    if name.is_empty() {
+        return Err(invalid_resource(
+            object,
+            "Telemetry tracing.providers[].name must not be empty",
+        ));
+    }
+    let provider = match name {
+        "zipkin" => {
+            let url = telemetry_provider_string_field(object, first, "zipkin", "url")?;
+            TracingProvider::Zipkin { url }
+        }
+        "datadog" => {
+            let agent_url = telemetry_provider_string_field(object, first, "datadog", "agent_url")?;
+            let service = first
+                .get("service")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            TracingProvider::Datadog { agent_url, service }
+        }
+        "lightstep" => {
+            let collector_url =
+                telemetry_provider_string_field(object, first, "lightstep", "collector_url")?;
+            let access_token =
+                telemetry_provider_string_field(object, first, "lightstep", "access_token")?;
+            TracingProvider::Lightstep {
+                collector_url,
+                access_token,
+            }
+        }
+        "opentelemetry" => {
+            let endpoint =
+                telemetry_provider_string_field(object, first, "opentelemetry", "endpoint")?;
+            TracingProvider::OpenTelemetry { endpoint }
+        }
+        other => {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "Telemetry tracing.providers[].name '{other}' is not a supported provider (expected zipkin/datadog/lightstep/opentelemetry)"
+                ),
+            ));
+        }
+    };
+    Ok(Some(provider))
+}
+
+fn telemetry_provider_string_field(
+    object: &K8sObject,
+    entry: &Value,
+    provider_name: &str,
+    field: &str,
+) -> Result<String, K8sTranslateError> {
+    entry
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!(
+                    "Telemetry tracing.providers[] '{provider_name}' is missing required field '{field}'"
+                ),
+            )
+        })
 }
 
 /// Parse simple filter expressions like `response.code >= 400` into an
@@ -2669,6 +2763,198 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("response.code filter must use a numeric comparison")
+        );
+    }
+
+    #[test]
+    fn telemetry_tracing_zipkin_provider_translates() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "zipkin",
+                            "url": "http://zipkin.istio-system:9411/api/v2/spans"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        match tracing.provider.as_ref().expect("provider translated") {
+            TracingProvider::Zipkin { url } => {
+                assert_eq!(url, "http://zipkin.istio-system:9411/api/v2/spans");
+            }
+            other => panic!("expected Zipkin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telemetry_tracing_datadog_provider_translates() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "datadog",
+                            "agent_url": "http://datadog-agent:8126",
+                            "service": "reviews"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        match tracing.provider.as_ref().expect("provider translated") {
+            TracingProvider::Datadog { agent_url, service } => {
+                assert_eq!(agent_url, "http://datadog-agent:8126");
+                assert_eq!(service.as_deref(), Some("reviews"));
+            }
+            other => panic!("expected Datadog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telemetry_tracing_lightstep_provider_translates() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "lightstep",
+                            "collector_url": "https://ingest.lightstep.com:443",
+                            "access_token": "secret-token"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        match tracing.provider.as_ref().expect("provider translated") {
+            TracingProvider::Lightstep {
+                collector_url,
+                access_token,
+            } => {
+                assert_eq!(collector_url, "https://ingest.lightstep.com:443");
+                assert_eq!(access_token, "secret-token");
+            }
+            other => panic!("expected Lightstep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telemetry_tracing_opentelemetry_provider_translates() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "opentelemetry",
+                            "endpoint": "http://otel-collector.istio-system:4317"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        match tracing.provider.as_ref().expect("provider translated") {
+            TracingProvider::OpenTelemetry { endpoint } => {
+                assert_eq!(endpoint, "http://otel-collector.istio-system:4317");
+            }
+            other => panic!("expected OpenTelemetry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telemetry_tracing_without_providers_block_has_no_provider() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "randomSamplingPercentage": 25.0
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        assert_eq!(tracing.sampling_percentage, Some(25.0));
+        assert!(
+            tracing.provider.is_none(),
+            "providers omitted, provider should be None"
+        );
+    }
+
+    #[test]
+    fn telemetry_tracing_unknown_provider_kind_fails_closed() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "stackdriver",
+                            "endpoint": "https://example.com"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("unknown provider kind should fail closed");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stackdriver"),
+            "error must mention offending name: {msg}"
+        );
+        assert!(
+            msg.contains("not a supported provider"),
+            "error must explain the kind is unsupported: {msg}"
         );
     }
 
