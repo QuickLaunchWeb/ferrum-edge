@@ -412,10 +412,13 @@ pub(crate) fn mesh_policies_have_header_rules(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::identity::spiffe::TrustDomain;
     use crate::modes::mesh::config::{
-        MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
-        WorkloadSelector,
+        ConditionMatch, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch,
+        RequestMatch, WorkloadSelector,
     };
 
     fn policy(name: &str, action: PolicyAction, from: Vec<PrincipalMatch>) -> MeshPolicy {
@@ -930,5 +933,1248 @@ mod tests {
             evaluate_mesh_authorization(&slice, &request),
             MeshAuthzDecision::Allow
         );
+    }
+
+    // ── Empty-rule Istio semantics ───────────────────────────────────────
+    //
+    // Istio: ALLOW with no rules = allow-nothing. The Istio K8s translation
+    // layer is responsible for emitting a `never_matches: true` rule so the
+    // evaluator's `saw_allow` fires. An empty `rules` vec at the evaluator
+    // level is a genuine no-op for all action types.
+    //
+    // The `never_match_allow_rule_triggers_implicit_deny_without_matching`
+    // test (above) covers the canonical allow-nothing path.
+
+    #[test]
+    fn allow_policy_with_empty_rules_vec_is_noop() {
+        // An ALLOW policy with a literally empty `rules` vec does not raise
+        // `saw_allow` because the inner `.any()` scan finds nothing. This
+        // is correct at the evaluator layer -- the translation layer emits
+        // a `never_matches` rule for the Istio allow-nothing case.
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-empty".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn deny_policy_with_empty_rules_is_noop() {
+        // Istio: DENY with no rules = no-op (deny nothing). Empty rules
+        // means no DENY rule fires.
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-nothing".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn audit_policy_with_empty_rules_is_noop() {
+        // Istio: AUDIT with no rules = no-op. No audit rule fires.
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "audit-nothing".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn never_matches_allow_is_allow_nothing_semantics() {
+        // Istio allow-nothing: the translation layer emits a never_matches
+        // ALLOW rule. This raises `saw_allow` but never `matched_allow`,
+        // producing implicit deny for all requests.
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-nothing-istio".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: Vec::new(),
+                    when: Vec::new(),
+                    never_matches: true,
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn never_matches_deny_is_noop() {
+        // A never_matches DENY rule never fires. Consistent with Istio
+        // DENY-with-no-rules = no-op semantics.
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-noop".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: Vec::new(),
+                    when: Vec::new(),
+                    never_matches: true,
+                    action: PolicyAction::Deny,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn allow_with_rules_plus_deny_with_empty_rules() {
+        // DENY with empty rules is a no-op, so only the ALLOW policy matters.
+        let slice = MeshSlice {
+            mesh_policies: vec![
+                MeshPolicy {
+                    name: "deny-nothing".to_string(),
+                    namespace: "default".to_string(),
+                    scope: PolicyScope::MeshWide,
+                    rules: Vec::new(),
+                },
+                policy(
+                    "allow-client",
+                    PolicyAction::Allow,
+                    vec![PrincipalMatch {
+                        spiffe_id_pattern: Some(
+                            "spiffe://cluster.local/ns/default/sa/client".into(),
+                        ),
+                        namespace_pattern: None,
+                        trust_domain: None,
+                    }],
+                ),
+            ],
+            ..MeshSlice::default()
+        };
+
+        // Matching source is allowed.
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Allow
+        );
+        // Non-matching source gets implicit deny from the ALLOW policy.
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/other")
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    // ── DENY-first precedence ────────────────────────────────────────────
+
+    #[test]
+    fn first_deny_match_wins_second_deny_not_evaluated() {
+        // Two DENY policies with different names; the first match returns
+        // immediately with its policy name.
+        let slice = MeshSlice {
+            mesh_policies: vec![
+                policy("deny-first", PolicyAction::Deny, Vec::new()),
+                policy("deny-second", PolicyAction::Deny, Vec::new()),
+            ],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "deny-first".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn deny_and_allow_both_match_same_request_deny_wins() {
+        // ALLOW matches the source, but DENY also matches, so DENY wins.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/client";
+        let principal = PrincipalMatch {
+            spiffe_id_pattern: Some(spiffe.into()),
+            namespace_pattern: None,
+            trust_domain: None,
+        };
+        let slice = MeshSlice {
+            mesh_policies: vec![
+                policy("allow-client", PolicyAction::Allow, vec![principal.clone()]),
+                policy("deny-client", PolicyAction::Deny, vec![principal]),
+            ],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request(spiffe)),
+            MeshAuthzDecision::Deny {
+                policy: "deny-client".to_string()
+            }
+        );
+    }
+
+    // ── Implicit deny edge cases ─────────────────────────────────────────
+
+    #[test]
+    fn no_allow_rules_at_all_means_default_allow() {
+        // When no ALLOW rules exist, `saw_allow` stays false and the
+        // default decision is Allow (no implicit deny).
+        let slice = MeshSlice {
+            mesh_policies: Vec::new(),
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn multiple_allow_policies_none_match_implicit_deny() {
+        // Two ALLOW policies, neither matches the source; implicit deny.
+        let slice = MeshSlice {
+            mesh_policies: vec![
+                policy(
+                    "allow-admin",
+                    PolicyAction::Allow,
+                    vec![PrincipalMatch {
+                        spiffe_id_pattern: Some(
+                            "spiffe://cluster.local/ns/default/sa/admin".into(),
+                        ),
+                        namespace_pattern: None,
+                        trust_domain: None,
+                    }],
+                ),
+                policy(
+                    "allow-monitor",
+                    PolicyAction::Allow,
+                    vec![PrincipalMatch {
+                        spiffe_id_pattern: Some(
+                            "spiffe://cluster.local/ns/default/sa/monitor".into(),
+                        ),
+                        namespace_pattern: None,
+                        trust_domain: None,
+                    }],
+                ),
+            ],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    // ── Principal matching edge cases ────────────────────────────────────
+
+    #[test]
+    fn wildcard_principal_matches_any_source() {
+        let slice = MeshSlice {
+            mesh_policies: vec![policy(
+                "allow-any",
+                PolicyAction::Allow,
+                vec![PrincipalMatch {
+                    spiffe_id_pattern: Some("*".into()),
+                    namespace_pattern: None,
+                    trust_domain: None,
+                }],
+            )],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://some-other-domain.com/ns/prod/sa/backend")
+            ),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn namespace_glob_pattern_matches() {
+        let slice = MeshSlice {
+            mesh_policies: vec![policy(
+                "allow-default-ns",
+                PolicyAction::Allow,
+                vec![PrincipalMatch {
+                    spiffe_id_pattern: None,
+                    namespace_pattern: Some("default".into()),
+                    trust_domain: None,
+                }],
+            )],
+            ..MeshSlice::default()
+        };
+
+        // Source in "default" namespace matches.
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Allow
+        );
+        // Source in "prod" namespace does not match.
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/prod/sa/client")
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn namespace_wildcard_glob_matches_any_namespace() {
+        let slice = MeshSlice {
+            mesh_policies: vec![policy(
+                "allow-all-ns",
+                PolicyAction::Allow,
+                vec![PrincipalMatch {
+                    spiffe_id_pattern: None,
+                    namespace_pattern: Some("*".into()),
+                    trust_domain: None,
+                }],
+            )],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/anything/sa/client")
+            ),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn trust_domain_mismatch_rejects() {
+        let slice = MeshSlice {
+            mesh_policies: vec![policy(
+                "allow-prod",
+                PolicyAction::Allow,
+                vec![PrincipalMatch {
+                    spiffe_id_pattern: None,
+                    namespace_pattern: None,
+                    trust_domain: Some(TrustDomain::new("prod.local").unwrap()),
+                }],
+            )],
+            ..MeshSlice::default()
+        };
+
+        // Trust domain is "cluster.local", not "prod.local".
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+        // Correct trust domain matches.
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://prod.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn empty_principals_list_matches_any_source() {
+        // When `from` is empty, any source is accepted (no constraint).
+        let slice = MeshSlice {
+            mesh_policies: vec![policy("allow-no-from", PolicyAction::Allow, Vec::new())],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/anything")
+            ),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn multiple_principals_or_semantics() {
+        // Multiple principal matches use OR: any one matching is enough.
+        let slice = MeshSlice {
+            mesh_policies: vec![policy(
+                "allow-multi",
+                PolicyAction::Allow,
+                vec![
+                    PrincipalMatch {
+                        spiffe_id_pattern: Some(
+                            "spiffe://cluster.local/ns/default/sa/admin".into(),
+                        ),
+                        namespace_pattern: None,
+                        trust_domain: None,
+                    },
+                    PrincipalMatch {
+                        spiffe_id_pattern: Some(
+                            "spiffe://cluster.local/ns/default/sa/client".into(),
+                        ),
+                        namespace_pattern: None,
+                        trust_domain: None,
+                    },
+                ],
+            )],
+            ..MeshSlice::default()
+        };
+
+        // First principal matches.
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/admin")
+            ),
+            MeshAuthzDecision::Allow
+        );
+        // Second principal matches.
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Allow
+        );
+        // Neither matches.
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/other")
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn principal_match_rejects_no_source_principal() {
+        // A rule with principal constraints must reject when the request
+        // has no source_principal at all.
+        let slice = MeshSlice {
+            mesh_policies: vec![policy(
+                "allow-with-principal",
+                PolicyAction::Allow,
+                vec![PrincipalMatch {
+                    spiffe_id_pattern: Some("*".into()),
+                    namespace_pattern: None,
+                    trust_domain: None,
+                }],
+            )],
+            ..MeshSlice::default()
+        };
+
+        let req = MeshAuthzRequest {
+            source_principal: None,
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &req),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    // ── Request matching edge cases ──────────────────────────────────────
+
+    #[test]
+    fn empty_methods_list_matches_any_method() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-any-method".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: vec![RequestMatch {
+                        methods: Vec::new(),
+                        paths: vec!["/api".to_string()],
+                        ..RequestMatch::default()
+                    }],
+                    when: Vec::new(),
+                    never_matches: false,
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        for method in &["GET", "POST", "DELETE", "PATCH"] {
+            let req = MeshAuthzRequest {
+                method: Some(method.to_string()),
+                path: Some("/api".to_string()),
+                ..MeshAuthzRequest::default()
+            };
+            assert_eq!(
+                evaluate_mesh_authorization(&slice, &req),
+                MeshAuthzDecision::Allow,
+                "method {method} should be allowed with empty methods list"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_paths_list_matches_any_path() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-any-path".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: vec![RequestMatch {
+                        methods: vec!["GET".to_string()],
+                        paths: Vec::new(),
+                        ..RequestMatch::default()
+                    }],
+                    when: Vec::new(),
+                    never_matches: false,
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        let req = MeshAuthzRequest {
+            method: Some("GET".to_string()),
+            path: Some("/anything/at/all".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &req),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn method_matching_is_case_insensitive() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-get".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: vec![RequestMatch {
+                        methods: vec!["GET".to_string()],
+                        ..RequestMatch::default()
+                    }],
+                    when: Vec::new(),
+                    never_matches: false,
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        let req = MeshAuthzRequest {
+            method: Some("get".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &req),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn host_wildcard_glob_matches() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-example-hosts".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: vec![RequestMatch {
+                        hosts: vec!["*.example.com".to_string()],
+                        ..RequestMatch::default()
+                    }],
+                    when: Vec::new(),
+                    never_matches: false,
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        let match_req = MeshAuthzRequest {
+            host: Some("api.example.com".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &match_req),
+            MeshAuthzDecision::Allow
+        );
+
+        let no_match_req = MeshAuthzRequest {
+            host: Some("api.other.com".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &no_match_req),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn header_name_lookup_is_case_insensitive() {
+        // Headers stored with mixed case should match rules written lowercase.
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-tenant".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: vec![RequestMatch {
+                        headers: BTreeMap::from([("x-tenant".to_string(), "prod".to_string())])
+                            .into_iter()
+                            .collect(),
+                        ..RequestMatch::default()
+                    }],
+                    when: Vec::new(),
+                    never_matches: false,
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        let mut headers = BTreeMap::new();
+        headers.insert("x-tenant".to_string(), "prod".to_string());
+        let req = MeshAuthzRequest {
+            headers,
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &req),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn multiple_headers_all_must_match() {
+        // Header matching uses AND semantics: every header rule must pass.
+        let mut rule_headers = HashMap::new();
+        rule_headers.insert("x-tenant".to_string(), "prod".to_string());
+        rule_headers.insert("x-env".to_string(), "staging".to_string());
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-multi-header".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: vec![RequestMatch {
+                        headers: rule_headers,
+                        ..RequestMatch::default()
+                    }],
+                    when: Vec::new(),
+                    never_matches: false,
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        // Both headers present and matching.
+        let mut both = BTreeMap::new();
+        both.insert("x-tenant".to_string(), "prod".to_string());
+        both.insert("x-env".to_string(), "staging".to_string());
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    headers: both,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Allow
+        );
+
+        // Only one header present.
+        let mut one_only = BTreeMap::new();
+        one_only.insert("x-tenant".to_string(), "prod".to_string());
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    headers: one_only,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn port_matching_with_explicit_port_values() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-port".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: vec![RequestMatch {
+                        ports: vec![443, 8443],
+                        ..RequestMatch::default()
+                    }],
+                    when: Vec::new(),
+                    never_matches: false,
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    port: Some(443),
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Allow
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    port: Some(80),
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn no_port_on_request_fails_port_rule() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-port".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: vec![RequestMatch {
+                        ports: vec![8080],
+                        ..RequestMatch::default()
+                    }],
+                    when: Vec::new(),
+                    never_matches: false,
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        // Request with no port should not match a port rule.
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    port: None,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    // ── Condition matching ───────────────────────────────────────────────
+
+    #[test]
+    fn condition_values_or_semantics() {
+        // `values` uses OR: any value match is sufficient.
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-region".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: Vec::new(),
+                    when: vec![ConditionMatch {
+                        key: "request.auth.claims[region]".to_string(),
+                        values: vec!["us-east-1".to_string(), "eu-west-1".to_string()],
+                        not_values: Vec::new(),
+                    }],
+                    never_matches: false,
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        let mut attrs_east = BTreeMap::new();
+        attrs_east.insert(
+            "request.auth.claims[region]".to_string(),
+            "us-east-1".to_string(),
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: attrs_east,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Allow
+        );
+
+        let mut attrs_west = BTreeMap::new();
+        attrs_west.insert(
+            "request.auth.claims[region]".to_string(),
+            "eu-west-1".to_string(),
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: attrs_west,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Allow
+        );
+
+        let mut attrs_other = BTreeMap::new();
+        attrs_other.insert(
+            "request.auth.claims[region]".to_string(),
+            "ap-south-1".to_string(),
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: attrs_other,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn condition_not_values_rejects_matching_attribute() {
+        // `not_values`: if the attribute value matches any not_value, reject.
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-internal".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: Vec::new(),
+                    when: vec![ConditionMatch {
+                        key: "source.namespace".to_string(),
+                        values: Vec::new(),
+                        not_values: vec!["internal".to_string()],
+                    }],
+                    never_matches: false,
+                    action: PolicyAction::Deny,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        // Attribute matches not_values: rule does NOT match (condition fails).
+        let mut attrs_internal = BTreeMap::new();
+        attrs_internal.insert("source.namespace".to_string(), "internal".to_string());
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: attrs_internal,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Allow
+        );
+
+        // Attribute does not match not_values: condition passes, DENY fires.
+        let mut attrs_external = BTreeMap::new();
+        attrs_external.insert("source.namespace".to_string(), "external".to_string());
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: attrs_external,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "deny-internal".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn condition_values_and_not_values_combined() {
+        // Both `values` and `not_values` on the same condition: must be
+        // IN values AND NOT IN not_values.
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-region-not-staging".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: Vec::new(),
+                    when: vec![ConditionMatch {
+                        key: "env".to_string(),
+                        values: vec!["prod".to_string(), "staging".to_string(), "dev".to_string()],
+                        not_values: vec!["staging".to_string()],
+                    }],
+                    never_matches: false,
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        // "prod" is in values, not in not_values: match.
+        let mut attrs_prod = BTreeMap::new();
+        attrs_prod.insert("env".to_string(), "prod".to_string());
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: attrs_prod,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Allow
+        );
+
+        // "staging" is in both: not_values blocks it.
+        let mut attrs_staging = BTreeMap::new();
+        attrs_staging.insert("env".to_string(), "staging".to_string());
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: attrs_staging,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn condition_missing_attribute_fails_values_check() {
+        // If the attribute key is absent from the request, `values` check
+        // fails (value.is_some_and(...) returns false).
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-with-attr".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: Vec::new(),
+                    when: vec![ConditionMatch {
+                        key: "some.key".to_string(),
+                        values: vec!["required".to_string()],
+                        not_values: Vec::new(),
+                    }],
+                    never_matches: false,
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        // No attributes at all.
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: BTreeMap::new(),
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn condition_missing_attribute_passes_not_values_check() {
+        // If the attribute key is absent, `not_values` check passes because
+        // `value.is_some_and(...)` returns false.
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-not-blocked".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: Vec::new(),
+                    when: vec![ConditionMatch {
+                        key: "blocked.key".to_string(),
+                        values: Vec::new(),
+                        not_values: vec!["bad".to_string()],
+                    }],
+                    never_matches: false,
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        // Key absent: not_values does not trigger, condition passes.
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: BTreeMap::new(),
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn multiple_conditions_all_must_match() {
+        // Conditions use AND semantics: every condition must pass.
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-multi-cond".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: Vec::new(),
+                    when: vec![
+                        ConditionMatch {
+                            key: "env".to_string(),
+                            values: vec!["prod".to_string()],
+                            not_values: Vec::new(),
+                        },
+                        ConditionMatch {
+                            key: "region".to_string(),
+                            values: vec!["us-east-1".to_string()],
+                            not_values: Vec::new(),
+                        },
+                    ],
+                    never_matches: false,
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        // Both conditions met.
+        let mut attrs_both = BTreeMap::new();
+        attrs_both.insert("env".to_string(), "prod".to_string());
+        attrs_both.insert("region".to_string(), "us-east-1".to_string());
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: attrs_both,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Allow
+        );
+
+        // Only one condition met.
+        let mut attrs_one = BTreeMap::new();
+        attrs_one.insert("env".to_string(), "prod".to_string());
+        attrs_one.insert("region".to_string(), "eu-west-1".to_string());
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: attrs_one,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    // ── Audit decision ───────────────────────────────────────────────────
+
+    #[test]
+    fn audit_rule_returns_audit_decision_when_no_allow_deny() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "audit-all".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: Vec::new(),
+                    when: Vec::new(),
+                    never_matches: false,
+                    action: PolicyAction::Audit,
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Audit {
+                policy: "audit-all".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn deny_takes_precedence_over_audit() {
+        let slice = MeshSlice {
+            mesh_policies: vec![
+                MeshPolicy {
+                    name: "audit-all".to_string(),
+                    namespace: "default".to_string(),
+                    scope: PolicyScope::MeshWide,
+                    rules: vec![MeshRule {
+                        from: Vec::new(),
+                        to: Vec::new(),
+                        when: Vec::new(),
+                        never_matches: false,
+                        action: PolicyAction::Audit,
+                    }],
+                },
+                policy("deny-all", PolicyAction::Deny, Vec::new()),
+            ],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "deny-all".to_string()
+            }
+        );
+    }
+
+    // ── Extract namespace ────────────────────────────────────────────────
+
+    #[test]
+    fn extract_namespace_from_spiffe_id() {
+        assert_eq!(
+            extract_namespace("spiffe://cluster.local/ns/default/sa/client"),
+            Some("default")
+        );
+        assert_eq!(
+            extract_namespace("spiffe://cluster.local/ns/prod/sa/admin"),
+            Some("prod")
+        );
+        // No "/ns/" segment.
+        assert_eq!(extract_namespace("spiffe://cluster.local/sa/client"), None);
+        // "/ns/" at the very end with no following segment.
+        assert_eq!(extract_namespace("spiffe://cluster.local/ns/"), Some(""));
     }
 }
