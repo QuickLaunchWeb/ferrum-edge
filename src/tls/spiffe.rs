@@ -85,7 +85,10 @@ pub fn build_spiffe_inbound_config(
 
     let builder: rustls::ConfigBuilder<ServerConfig, WantsServerCert> =
         builder.with_client_cert_verifier(Arc::new(verifier));
-    let cfg = builder.with_cert_resolver(Arc::new(server_resolver));
+    let mut cfg = builder.with_cert_resolver(Arc::new(server_resolver));
+    // SPIFFE inbound is currently used by HBONE listeners, which require
+    // HTTP/2 over mTLS.
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
     Ok(Arc::new(cfg))
 }
 
@@ -110,10 +113,14 @@ pub fn build_spiffe_outbound_config(
     let verifier = SpiffeServerCertVerifier::new(bundle_slot.clone(), expected_peer);
     let resolver = SpiffeClientCertResolver::new(bundle_slot);
 
-    let cfg: ClientConfig = builder
+    let mut cfg: ClientConfig = builder
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_client_cert_resolver(Arc::new(resolver));
+    // SPIFFE outbound is used for HBONE, which is HTTP/2 CONNECT over mTLS.
+    // Advertising h2 here lets sidecars reject non-HBONE clients at ALPN and
+    // keeps callers from having to clone/mutate rustls configs per tunnel.
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
     Ok(Arc::new(cfg))
 }
 
