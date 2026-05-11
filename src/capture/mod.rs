@@ -59,9 +59,10 @@ impl CaptureConfig {
             &resolve_ferrum_var("FERRUM_MESH_CAPTURE_MODE")
                 .unwrap_or_else(|| "explicit".to_string()),
         )?;
-        let proxy_uid = resolve_ferrum_var("FERRUM_MESH_PROXY_UID")
-            .and_then(|v| v.parse::<u32>().ok())
-            .or(Some(DEFAULT_PROXY_UID));
+        let proxy_uid = match resolve_ferrum_var("FERRUM_MESH_PROXY_UID") {
+            Some(raw) => Some(parse_proxy_uid(&raw)?),
+            None => Some(DEFAULT_PROXY_UID),
+        };
         let include_cidrs = parse_cidr_env(
             &resolve_ferrum_var("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS")
                 .unwrap_or_else(|| "0.0.0.0/0".to_string()),
@@ -106,6 +107,16 @@ fn parse_port_list(raw: &str) -> Result<Vec<u16>, String> {
                 .map_err(|_| format!("Invalid port '{s}' in capture exclude ports"))
         })
         .collect()
+}
+
+fn parse_proxy_uid(raw: &str) -> Result<u32, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_PROXY_UID);
+    }
+    trimmed
+        .parse::<u32>()
+        .map_err(|_| format!("Invalid FERRUM_MESH_PROXY_UID '{raw}'. Expected unsigned integer"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,5 +396,20 @@ mod tests {
     #[test]
     fn parse_port_list_empty_string_returns_empty() {
         assert!(parse_port_list("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_proxy_uid_rejects_invalid_env_value() {
+        assert!(parse_proxy_uid("not-a-uid").is_err());
+    }
+
+    #[test]
+    fn parse_proxy_uid_trims_valid_value() {
+        assert_eq!(parse_proxy_uid(" 1338 ").unwrap(), 1338);
+    }
+
+    #[test]
+    fn parse_proxy_uid_empty_uses_default() {
+        assert_eq!(parse_proxy_uid("").unwrap(), DEFAULT_PROXY_UID);
     }
 }
