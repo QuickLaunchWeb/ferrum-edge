@@ -475,19 +475,22 @@ pub fn load_tls_config_with_client_auth(
 /// - `Required`: `WebPkiClientVerifier` without `.allow_unauthenticated()`
 ///   (TLS handshake fails if no client cert).
 /// - `Optional`: `WebPkiClientVerifier` with `.allow_unauthenticated()`
-///   (client cert verified when present, plaintext clients accepted).
-/// - `None`: `with_no_client_auth()` (no CertificateRequest sent).
+///   (client cert verified when present, TLS clients with no cert accepted).
+/// - `None`: `with_no_client_auth()` (no CertificateRequest sent — server
+///   TLS only). Used when PeerAuthentication is `Permissive` but no client
+///   CA bundle is configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshClientAuth {
     /// Require a valid client certificate (Strict mTLS).
     Required,
-    /// Accept connections with or without a client certificate (Permissive).
+    /// Request a client certificate but accept TLS connections without one
+    /// (Permissive). When the client presents a cert, it is verified against
+    /// the client CA bundle.
     Optional,
-    /// Do not request client certificates at all. The mesh `Disable` mode
-    /// typically bypasses TLS entirely (no `ServerConfig` built), but this
-    /// variant is available for callers that still need a TLS config without
-    /// any client-auth request.
-    #[allow(dead_code)]
+    /// Do not request client certificates at all. Selected when
+    /// PeerAuthentication is Permissive but no `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`
+    /// is configured — the server still terminates TLS, but never asks the
+    /// client to authenticate.
     None,
 }
 
