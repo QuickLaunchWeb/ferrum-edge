@@ -813,8 +813,11 @@ fn route_retry_config(http: &Value) -> Option<RetryConfig> {
 
         for token in retry_on.split(',').map(str::trim) {
             match token {
-                "5xx" | "retriable-status-codes" => {
-                    status_codes.extend_from_slice(&[500, 502, 503, 504]);
+                "5xx" => {
+                    status_codes.extend(500..=599);
+                }
+                "retriable-status-codes" => {
+                    status_codes.extend(retriable_status_codes(retries));
                 }
                 "connect-failure" | "reset" | "refused-stream" => {
                     connect_failure = true;
@@ -823,7 +826,7 @@ fn route_retry_config(http: &Value) -> Option<RetryConfig> {
                     status_codes.extend_from_slice(&[502, 503, 504]);
                 }
                 other => {
-                    if let Ok(code) = other.parse::<u16>() {
+                    if let Ok(code @ 100..=599) = other.parse::<u16>() {
                         status_codes.push(code);
                     }
                 }
@@ -839,6 +842,17 @@ fn route_retry_config(http: &Value) -> Option<RetryConfig> {
     }
 
     Some(retry)
+}
+
+fn retriable_status_codes(retries: &Value) -> impl Iterator<Item = u16> + '_ {
+    retries
+        .get("retriableStatusCodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .filter(|code| (100..=599).contains(code))
+        .map(|code| code as u16)
 }
 
 /// Extract Istio VirtualService `http[].timeout` into milliseconds.
@@ -861,30 +875,34 @@ fn route_timeout_ms(http: &Value) -> Option<u64> {
 fn parse_istio_duration_ms(raw: &str) -> Option<u64> {
     let raw = raw.trim();
     if let Some(ms) = raw.strip_suffix("ms") {
-        return ms.trim().parse::<f64>().ok().map(|v| v as u64);
+        return duration_component_ms(ms, 1.0);
     }
     if let Some(seconds) = raw.strip_suffix('s') {
-        return seconds
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .map(|v| (v * 1000.0) as u64);
+        return duration_component_ms(seconds, 1000.0);
     }
     if let Some(minutes) = raw.strip_suffix('m') {
-        return minutes
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .map(|v| (v * 60_000.0) as u64);
+        return duration_component_ms(minutes, 60_000.0);
     }
     if let Some(hours) = raw.strip_suffix('h') {
-        return hours
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .map(|v| (v * 3_600_000.0) as u64);
+        return duration_component_ms(hours, 3_600_000.0);
     }
     None
+}
+
+fn duration_component_ms(raw: &str, multiplier: f64) -> Option<u64> {
+    let value = raw.trim().parse::<f64>().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let millis = value * multiplier;
+    if !millis.is_finite() || millis > u64::MAX as f64 {
+        return None;
+    }
+    if millis > 0.0 && millis < 1.0 {
+        Some(1)
+    } else {
+        Some(millis as u64)
+    }
 }
 
 fn path_match(uri: &Value) -> Option<String> {
@@ -2612,6 +2630,65 @@ mod tests {
     }
 
     #[test]
+    fn virtual_service_retriable_status_codes_uses_explicit_codes() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 2,
+                            "retryOn": "retriable-status-codes",
+                            "retriableStatusCodes": [409, 425, 503, 700]
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let retry = result.config.proxies[0]
+            .retry
+            .as_ref()
+            .expect("retry config");
+        assert_eq!(retry.retryable_status_codes, vec![409, 425, 503]);
+    }
+
+    #[test]
+    fn virtual_service_retry_5xx_covers_full_server_error_range() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 1,
+                            "retryOn": "5xx"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let retry = result.config.proxies[0]
+            .retry
+            .as_ref()
+            .expect("retry config");
+        assert_eq!(retry.retryable_status_codes.len(), 100);
+        assert!(retry.retryable_status_codes.contains(&500));
+        assert!(retry.retryable_status_codes.contains(&599));
+    }
+
+    #[test]
     fn virtual_service_zero_retry_attempts_produces_no_retry_config() {
         let result = translate_k8s_objects(
             &[object(
@@ -2831,5 +2908,14 @@ mod tests {
         assert_eq!(parse_istio_duration_ms(""), None);
         assert_eq!(parse_istio_duration_ms("5"), None);
         assert_eq!(parse_istio_duration_ms("abc"), None);
+        assert_eq!(parse_istio_duration_ms("-1s"), None);
+        assert_eq!(parse_istio_duration_ms("NaNs"), None);
+        assert_eq!(parse_istio_duration_ms("infs"), None);
+    }
+
+    #[test]
+    fn parse_istio_duration_positive_sub_millisecond_clamps_to_one() {
+        assert_eq!(parse_istio_duration_ms("0.0001s"), Some(1));
+        assert_eq!(parse_istio_duration_ms("0s"), Some(0));
     }
 }
