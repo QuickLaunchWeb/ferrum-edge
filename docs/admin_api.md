@@ -469,7 +469,7 @@ Two JWT-authenticated endpoints let operators inspect and force-refresh the regi
 
 ### `GET /backend-capabilities`
 
-Returns every cached entry keyed by the deduplicated backend-target identity the registry uses internally (scheme + host + port + `dns_override` + CA + mTLS cert + mTLS key + verify flag).
+Returns every cached entry keyed by the deduplicated backend-target identity the registry uses internally (scheme + host + port + `dns_override` + CA + mTLS cert + mTLS key + verify flag, plus HBONE sidecar port for targets tagged `mesh.hbone=true`).
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/backend-capabilities
@@ -491,6 +491,7 @@ Response:
         "h2_tls": "supported",
         "h2c": "unknown"
       },
+      "hbone": "unsupported",
       "last_probe_at_unix_secs": 1714003200,
       "last_probe_error": null
     },
@@ -505,6 +506,7 @@ Response:
         "h2_tls": "unsupported",
         "h2c": "unknown"
       },
+      "hbone": "unknown",
       "last_probe_at_unix_secs": 1714003200,
       "last_probe_error": "H2/TLS downgraded after ALPN-negotiated HTTP/1.1 on request path"
     }
@@ -517,8 +519,9 @@ Field semantics:
 - **`key`** — stable identity used by the router to look up the entry. Safe to match across responses to detect churn.
 - **`plain_http.{h1, h2_tls, h3}`** — whether the native dispatch path for plain HTTP traffic may use HTTP/1.1 (always true for reachable HTTPS backends), the direct HTTP/2 pool (`h2_tls`), or the native HTTP/3 pool (`h3`). Values: `"supported"`, `"unsupported"`, or `"unknown"` (not yet probed). `"unknown"` and `"unsupported"` both cause the hot path to fall back through the reqwest HTTP/1.1+HTTP/2 client.
 - **`grpc_transport.{h2_tls, h2c}`** — same semantics for gRPC. `h2c` is native gRPC over plaintext HTTP/2 prior-knowledge; rarely deployed.
-- **`last_probe_at_unix_secs`** — epoch seconds of the most recent probe or live-traffic downgrade. Updates on every refresh AND on each live `mark_h2_tls_unsupported` / `mark_h3_unsupported` invocation.
-- **`last_probe_error`** — human-readable error string set when the last classification update came from a live-traffic downgrade (ALPN mismatch, QUIC failure) or from a genuine probe failure (TLS config error, connection error on an HTTPS backend). `null` when the most recent update classified the backend cleanly. Expected-unsupported outcomes (h2c on plaintext HTTP, H3 on most HTTPS backends) do NOT populate this field — only genuine errors / live downgrades do.
+- **`hbone`** — gateway-to-mesh HBONE support for upstream targets tagged `mesh.hbone=true`. `"supported"` means the gateway can open HTTP/2 CONNECT over SPIFFE mTLS to the sidecar port, `"unsupported"` skips the tunnel, and `"unknown"` is used when the target is not HBONE-tagged, the gateway has no SVID, or the probe has not completed.
+- **`last_probe_at_unix_secs`** — epoch seconds of the most recent probe or live-traffic downgrade. Updates on every refresh AND on each live `mark_h2_tls_unsupported` / `mark_h3_unsupported` / `mark_hbone_unsupported` invocation.
+- **`last_probe_error`** — human-readable error string set when the last classification update came from a live-traffic downgrade (ALPN mismatch, QUIC failure, HBONE capability-establishment failure) or from a genuine probe failure (TLS config error, connection error on an HTTPS backend). `null` when the most recent update classified the backend cleanly. Expected-unsupported outcomes (h2c on plaintext HTTP, H3 on most HTTPS backends, untagged HBONE, per-request HBONE CONNECT rejection) do NOT populate this field — only genuine errors / live downgrades do.
 
 Use cases:
 
@@ -546,7 +549,7 @@ Use after:
 
 - Deliberately toggling a backend's H3 / H2 support without waiting for the 24h timer.
 - Rotating backend TLS material that the previous probe didn't see.
-- Manually resolving an incident where the cache is known stale (e.g., backend came back online after a QUIC failure downgraded `h3` to `unsupported`).
+- Manually resolving an incident where the cache is known stale (e.g., backend came back online after a QUIC failure downgraded `h3` or an HBONE capability-establishment failure downgraded `hbone` to `unsupported`).
 
 Because this endpoint is **synchronous**, callers can assert on the post-refresh state by immediately issuing `GET /backend-capabilities` afterward. Request body is ignored; no fields are required.
 

@@ -485,6 +485,10 @@ impl JwksAuth {
                         {
                             ctx.auth_method = Some("jwks_auth");
                         }
+                        // Emit `iss/sub` request principal for mesh
+                        // authorization policy `requestPrincipals` matching.
+                        set_request_principal_metadata(&claims, ctx);
+
                         if !provider.forward_original_token {
                             ctx.metadata.insert(
                                 "jwks_auth.strip_authorization".to_string(),
@@ -964,6 +968,21 @@ async fn discover_jwks_uri(
         .as_str()
         .map(|s| s.to_string())
         .ok_or_else(|| "OIDC discovery document missing 'jwks_uri' field".to_string())
+}
+
+/// Set `jwks_auth.request_principal` metadata to `{iss}/{sub}` when both
+/// claims are present. This enables Istio-style `requestPrincipals` matching
+/// in mesh authorization policies without changing the external plugin API.
+fn set_request_principal_metadata(claims: &Value, ctx: &mut RequestContext) {
+    if let (Some(iss), Some(sub)) = (
+        claims.get("iss").and_then(|v| v.as_str()),
+        claims.get("sub").and_then(|v| v.as_str()),
+    ) {
+        ctx.metadata.insert(
+            "jwks_auth.request_principal".to_string(),
+            format!("{iss}/{sub}"),
+        );
+    }
 }
 
 /// Extract the hostname from a URL string, if parseable.

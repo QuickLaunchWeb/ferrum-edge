@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 
 use ferrum_edge::config::EnvConfig;
-use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::config::types::{GatewayConfig, PluginScope, Proxy};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::spiffe::{SpiffeId, spiffe_id_to_san};
+use ferrum_edge::plugins::ProxyProtocol;
 use ferrum_edge::proxy::ProxyState;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, Issuer,
     KeyPair, KeyUsagePurpose,
 };
+use serde_json::json;
 
 struct GeneratedSvid {
     _dir: tempfile::TempDir,
@@ -114,4 +116,56 @@ async fn proxy_state_loads_gateway_svid_bundle_from_env_config() {
         "spiffe://corp.example/ns/gateway/sa/edge"
     );
     assert_eq!(bundle.trust_bundles.local.x509_authorities.len(), 1);
+}
+
+#[tokio::test]
+async fn proxy_state_auto_injects_gateway_workload_metrics_from_svid() {
+    let files = generate_gateway_svid();
+    let env_config = EnvConfig {
+        gateway_svid_cert_path: Some(files.cert_path),
+        gateway_svid_key_path: Some(files.key_path),
+        gateway_svid_trust_bundle_path: Some(files.trust_bundle_path),
+        ..Default::default()
+    };
+    let proxy: Proxy = serde_json::from_value(json!({
+        "id": "edge-proxy",
+        "listen_path": "/",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080
+    }))
+    .expect("proxy fixture");
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..GatewayConfig::default()
+    };
+
+    let (state, _handles) =
+        ProxyState::new(config, test_dns_cache(), env_config, None, None).expect("proxy state");
+
+    let loaded_config = state.config.load_full();
+    let plugin = loaded_config
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.id == "__gateway_workload_metrics")
+        .expect("gateway workload metrics plugin should be auto-injected");
+    assert_eq!(plugin.plugin_name, "workload_metrics");
+    assert_eq!(plugin.scope, PluginScope::Global);
+    assert_eq!(
+        plugin
+            .config
+            .get("workload_spiffe_id")
+            .and_then(serde_json::Value::as_str),
+        Some("spiffe://corp.example/ns/gateway/sa/edge")
+    );
+
+    let plugins = state
+        .plugin_cache
+        .get_plugins_for_protocol("edge-proxy", ProxyProtocol::Http);
+    assert!(
+        plugins
+            .iter()
+            .any(|plugin| plugin.name() == "workload_metrics"),
+        "auto-injected workload_metrics should be active for HTTP proxies"
+    );
 }

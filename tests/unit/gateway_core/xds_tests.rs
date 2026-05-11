@@ -70,6 +70,7 @@ fn mesh_config() -> MeshConfig {
                     from: Vec::new(),
                     to: Vec::new(),
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -91,6 +92,7 @@ fn mesh_config() -> MeshConfig {
         service_entries: Vec::new(),
         request_authentications: Vec::new(),
         telemetry_resources: Vec::new(),
+        destination_rules: Vec::new(),
         trust_bundles: None,
         multi_cluster: None,
     }

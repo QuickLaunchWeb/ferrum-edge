@@ -1,0 +1,14 @@
+[package]
+name = "ferrum-ebpf"
+version = "0.1.0"
+edition = "2021"
+description = "Ferrum Edge eBPF programs for ambient mesh traffic capture"
+
+[dependencies]
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
+ferrum-ebpf-common = { path = "../ferrum-ebpf-common" }
+
+[[bin]]
+name = "ferrum-ebpf"
+path = "src/main.rs"

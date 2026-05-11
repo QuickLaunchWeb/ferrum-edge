@@ -67,6 +67,7 @@ Standard Envoy xDS Aggregated Discovery Service client. Consumes CDS, EDS, LDS, 
 - **Multi-CP failover**: same URL list and backoff as native mode.
 - **Node identity**: `FERRUM_MESH_XDS_NODE_CLUSTER` sets the `node.cluster` field in DiscoveryRequest (defaults to `FERRUM_NAMESPACE`).
 - **Connect timeout**: `FERRUM_MESH_XDS_CONNECT_TIMEOUT_SECONDS` (default 10).
+- **DestinationRule limitation**: standard xDS bakes DestinationRule traffic policy (LB algorithm, outlier detection, connection pool, subsets) into the Envoy `Cluster` resource at the CP, so the original DR is not recoverable from CDS/EDS. Operators relying on Ferrum's DR translation must use `FERRUM_MESH_CONFIG_PROTOCOL=native`. The xDS consumer logs a warning at startup.
 
 ### Bootstrap Behavior
 
@@ -171,6 +172,62 @@ Local and federated X.509/JWT authority bundles for cross-cluster trust.
 
 Multi-cluster settings: local cluster identity, remote clusters, east-west gateways, and SPIFFE federation endpoints.
 
+### MeshDestinationRule
+
+Maps an Istio `DestinationRule` onto Ferrum's existing `Upstream` / `PassiveHealthCheck` / `LoadBalancerAlgorithm` primitives. Applied at slice-apply time in `prepare_normalized_gateway_config_for_mesh()` after upstream materialization.
+
+```yaml
+name: "reviews-policy"
+namespace: "default"
+host: "reviews.default.svc.cluster.local"
+traffic_policy:
+  connect_timeout_ms: 5000
+  outlier_detection:
+    consecutive_errors: 5
+    interval_seconds: 10
+    base_ejection_seconds: 30
+    max_ejection_percent: 50
+  load_balancer:
+    consistent_hash:
+      http_header_name: "x-user-id"
+subsets:
+  - name: "v1"
+    labels:
+      version: "v1"
+```
+
+**Host matching**: the DR `host` is matched against upstream targets, the upstream `name`, and the upstream `id`. Short hostnames are namespace-completed (`reviews` ⇒ `reviews.{namespace}.svc.*`); namespaced (`reviews.ns`) and `.svc`-suffixed forms are also supported. Cross-namespace matches require the FQDN form because slice filtering already restricts DRs to the subscriber's namespace.
+
+**Multiple DRs targeting the same upstream**: applied in deterministic `(namespace, name)` order — the alphabetically last entry wins, last-writer-wins per field. Operators see `debug!` log lines when subsets or proxy `backend_connect_timeout_ms` get overwritten.
+
+**Support matrix** (canonical Istio field → Ferrum target):
+
+| Istio field | Status | Notes |
+|---|---|---|
+| `host` | Supported | Required, lowercased at admission, empty/dot-only rejected |
+| `trafficPolicy.connectionPool.tcp.connectTimeout` | Supported | Applied to `Proxy.backend_connect_timeout_ms` for every proxy referencing the matching upstream |
+| `trafficPolicy.outlierDetection.consecutive5xxErrors` / `consecutiveErrors` | Supported | → `PassiveHealthCheck.unhealthy_threshold` |
+| `trafficPolicy.outlierDetection.interval` | Supported | → `PassiveHealthCheck.unhealthy_window_seconds` (zero filtered out, sub-second rounded up) |
+| `trafficPolicy.outlierDetection.baseEjectionTime` | Supported | → `PassiveHealthCheck.healthy_after_seconds` |
+| `trafficPolicy.outlierDetection.maxEjectionPercent` | Supported | → `PassiveHealthCheck.max_ejection_percent`; values >100 rejected |
+| `trafficPolicy.loadBalancer.simple = ROUND_ROBIN` | Supported | → `LoadBalancerAlgorithm::RoundRobin` |
+| `trafficPolicy.loadBalancer.simple = LEAST_REQUEST` / `LEAST_CONN` | Supported | → `LoadBalancerAlgorithm::LeastConnections` |
+| `trafficPolicy.loadBalancer.simple = RANDOM` | Supported | → `LoadBalancerAlgorithm::Random` |
+| `trafficPolicy.loadBalancer.simple = PASSTHROUGH` | Approximated (warns) | → `RoundRobin`; Ferrum cannot preserve the original destination IP |
+| `trafficPolicy.loadBalancer.simple = MAGLEV` | Rejected | Hard error at translate time |
+| `trafficPolicy.loadBalancer.consistentHash.{httpHeaderName,httpCookie.name,useSourceIp}` | Supported | Exactly one of the three required (rejected otherwise); → `LoadBalancerAlgorithm::ConsistentHashing` + `Upstream.hash_on` |
+| `subsets[].name` / `subsets[].labels` | Supported | → `SubsetDefinition` entries on the upstream; second DR overwrites the first |
+| `subsets[].trafficPolicy.loadBalancer` | Supported | → `SubsetTrafficPolicy.load_balancer_algorithm` |
+| `subsets[].trafficPolicy.connectionPool` | Ignored (warns) | Top-level `trafficPolicy.connectionPool` is the only path to per-upstream connect timeout |
+| `subsets[].trafficPolicy.outlierDetection` | Ignored (warns) | Top-level `trafficPolicy.outlierDetection` is the only path to passive health checks |
+| `trafficPolicy.connectionPool.http.*` | Ignored | Per-protocol connection pool not surfaced |
+| `trafficPolicy.connectionPool.tcp.maxConnections` / `tcpKeepalive` | Ignored | Pool sizing handled globally via `FERRUM_POOL_*` |
+| `trafficPolicy.tls` | Ignored | mTLS posture comes from `PeerAuthentication` |
+| `trafficPolicy.portLevelSettings` | Ignored | Per-port traffic policy not modeled |
+| `exportTo` | Ignored | DRs are scoped to their declared namespace at slice-filter time |
+
+Translator warnings surface in the `K8sTranslation.warnings` returned from `translate_k8s_objects`, so operators see them at apply time.
+
 ## MeshSlice
 
 `MeshSlice` is the per-node filtered view of mesh configuration, built by `MeshSlice::from_gateway_config()`. The CP computes a slice per subscriber; in native mode the slice is pushed directly, in xDS mode the translated resources are sliced locally.
@@ -242,6 +299,10 @@ Detection by `is_hbone_connect()`:
 Identity extraction from W3C Baggage headers:
 - Source principal keys (with fallback aliases): `source.principal`, `source_principal`, `source.identity`, `source_identity`, `src.identity`, `src_identity`.
 - Values are percent-decoded per the Baggage spec.
+
+Gateway DPs can also originate HBONE when they have a gateway SVID loaded and an upstream target is tagged `mesh.hbone=true`. The gateway probes the target's sidecar HBONE port (`15008`, or `mesh.hbone_port`) during backend capability refresh, then sends eligible plain HTTP traffic through HTTP/2 CONNECT over SPIFFE mTLS before trying the ordinary direct backend transports. The HBONE pool honors the proxy's effective `pool_*` overrides, including connection count, idle timeout, TCP keepalive, and HTTP/2 flow-control settings, and coalesces concurrent first connects for the same target/SVID key within the proxy's `backend_connect_timeout_ms` budget. Requests that require replayable retries or request-body buffering continue to use the direct backend transports. The CONNECT request carries `source.principal` baggage derived from the gateway SVID; mesh-side authz still requires the baggage to agree with the authenticated peer identity. The tunneled inner HTTP request strips client-supplied identity baggage (`source.*`, `destination.*`, and aliases) while preserving non-identity baggage, so untrusted client claims cannot reach the mesh backend as application headers.
+
+Gateways with a loaded SVID auto-enable source identity labels for the `workload_metrics` plugin. The runtime injects an internal global `workload_metrics` plugin when none exists, or augments an existing global plugin with `workload_spiffe_id` when the operator has not set one explicitly. Successful HBONE-dispatched transactions are labeled with `mesh.connection_security_policy=mutual_tls` and `mesh.gateway.transport=hbone`; mesh-aware upstream target tags such as `mesh.spiffe_id`, `mesh.namespace`, `mesh.service`, and `mesh.trust_domain` are copied to destination metadata.
 
 ### Trust Domain Aliasing
 
@@ -621,6 +682,12 @@ The CP tracks connected mesh nodes in `MeshNodeRegistry` (DashMap, `src/grpc/mes
 - `touch_all()` updates `last_update_at` on every broadcast.
 - Stale removal uses `remove_if_stale()` with timestamp comparison to handle reconnects that raced with the old stream's drop.
 
+### Gateway Mesh Service Discovery
+
+Gateway database/file/DP modes can resolve mesh services through an upstream `service_discovery` block with `provider: mesh`. The provider reads the current CP-delivered `GatewayConfig.mesh` snapshot, finds a `MeshService` by `service_name` and namespace, resolves its workload SPIFFE references to workload addresses, and publishes ordinary `UpstreamTarget` entries into the existing load balancer cache.
+
+Generated targets are tagged with `mesh.spiffe_id`, `mesh.namespace`, `mesh.service`, `mesh.trust_domain`, and `mesh.hbone=true`. This keeps the north-south gateway on the same discovery model as mesh mode while giving later gateway-to-mesh transport phases enough metadata to prefer HBONE/mTLS paths.
+
 ### Auto-Injected Plugins
 
 Mesh mode automatically injects these global plugins with reserved IDs:
@@ -716,14 +783,15 @@ The node agent exposes atomic counters for operational monitoring:
 
 | Variable | Default | Description |
 |---|---|---|
-| `FERRUM_NODE_AGENT_NODE_NAME` | (required) | Kubernetes node name for pod filtering |
-| `FERRUM_NODE_AGENT_CGROUP_ROOT` | `/sys/fs/cgroup` | Cgroup v2 filesystem root |
-| `FERRUM_NODE_AGENT_BPF_FS_PATH` | `/sys/fs/bpf` | BPF filesystem mount path |
-| `FERRUM_NODE_AGENT_FALLBACK_MODE` | `iptables` | Fallback when eBPF unavailable: `iptables` or `none` |
-| `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES` | `kube-system` | Comma-separated namespaces to skip for capture |
-| `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | (empty) | CIDRs to include in capture (empty = all) |
-| `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | (empty) | CIDRs to exclude from capture |
-| `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | (empty) | Ports to exclude from capture |
+| `FERRUM_NODE_AGENT_NODE_NAME` | (required) | Kubernetes node name, set via downward API (`spec.nodeName`) |
+| `FERRUM_NODE_AGENT_CGROUP_ROOT` | `/sys/fs/cgroup` | cgroup v2 mount point for pod cgroup resolution |
+| `FERRUM_NODE_AGENT_BPF_FS_PATH` | `/sys/fs/bpf` | BPF filesystem mount point for pinned maps |
+| `FERRUM_NODE_AGENT_BPF_ELF_PATH` | build-tree path | Compiled `ferrum-ebpf` ELF loaded by the aya backend (Linux `ebpf` feature only) |
+| `FERRUM_NODE_AGENT_FALLBACK_MODE` | `iptables` | Behavior on kernel < 5.7: `iptables` or `fail` |
+| `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES` | (empty) | Extra namespaces to exclude from capture (`kube-system`, `kube-public`, `kube-node-lease` always excluded) |
+| `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | `0.0.0.0/0` | CIDRs to capture for outbound traffic |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | (empty) | CIDRs to exclude from outbound capture (highest priority) |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | `15001,15006,15008,15020` | Destination ports to exclude from capture |
 
 ## VirtualService Translation
 
@@ -824,14 +892,15 @@ Mesh-specific environment variables are listed below. For the full reference of 
 
 | Variable | Default | Description |
 |---|---|---|
-| `FERRUM_NODE_AGENT_NODE_NAME` | (required) | Kubernetes node name for pod filtering |
-| `FERRUM_NODE_AGENT_CGROUP_ROOT` | `/sys/fs/cgroup` | Cgroup v2 filesystem root |
-| `FERRUM_NODE_AGENT_BPF_FS_PATH` | `/sys/fs/bpf` | BPF filesystem mount path |
-| `FERRUM_NODE_AGENT_FALLBACK_MODE` | `iptables` | Fallback when eBPF unavailable |
-| `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES` | `kube-system` | Namespaces to skip for capture |
-| `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | (empty) | CIDRs to include in capture |
-| `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | (empty) | CIDRs to exclude from capture |
-| `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | (empty) | Ports to exclude from capture |
+| `FERRUM_NODE_AGENT_NODE_NAME` | (required) | Kubernetes node name, set via downward API (`spec.nodeName`) |
+| `FERRUM_NODE_AGENT_CGROUP_ROOT` | `/sys/fs/cgroup` | cgroup v2 mount point for pod cgroup resolution |
+| `FERRUM_NODE_AGENT_BPF_FS_PATH` | `/sys/fs/bpf` | BPF filesystem mount point for pinned maps |
+| `FERRUM_NODE_AGENT_BPF_ELF_PATH` | build-tree path | Compiled `ferrum-ebpf` ELF (Linux `ebpf` feature only) |
+| `FERRUM_NODE_AGENT_FALLBACK_MODE` | `iptables` | Behavior on kernel < 5.7: `iptables` or `fail` |
+| `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES` | (empty) | Extra namespaces to exclude (`kube-system`, `kube-public`, `kube-node-lease` always excluded) |
+| `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | `0.0.0.0/0` | CIDRs to capture for outbound traffic |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | (empty) | CIDRs to exclude from outbound capture (highest priority) |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | `15001,15006,15008,15020` | Destination ports to exclude from capture |
 
 ### Injector
 

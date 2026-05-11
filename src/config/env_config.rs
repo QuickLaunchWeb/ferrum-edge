@@ -27,6 +27,7 @@ pub enum OperatingMode {
     DataPlane,
     Mesh,
     Injector,
+    NodeAgent,
     Migrate,
 }
 
@@ -45,9 +46,10 @@ impl OperatingMode {
             "dp" => Ok(Self::DataPlane),
             "mesh" => Ok(Self::Mesh),
             "injector" => Ok(Self::Injector),
+            "node_agent" => Ok(Self::NodeAgent),
             "migrate" => Ok(Self::Migrate),
             other => Err(format!(
-                "Invalid FERRUM_MODE '{}'. Expected: database, file, cp, dp, mesh, injector, migrate",
+                "Invalid FERRUM_MODE '{}'. Expected: database, file, cp, dp, mesh, injector, node_agent, migrate",
                 other
             )),
         }
@@ -507,6 +509,16 @@ pub struct EnvConfig {
     /// Capacity of the per-ADS-stream response queue between the request
     /// reader task and tonic response stream. Default: 32.
     pub xds_stream_channel_capacity: usize,
+    /// Mesh CA backend. `internal` uses Ferrum's own CA (root cert+key on
+    /// disk); `spire` delegates to a SPIRE Agent over UDS; `none` (default)
+    /// disables mesh identity features.
+    pub mesh_ca_backend: String,
+    /// Path to the SPIRE Agent's Workload API Unix domain socket. Only used
+    /// when `mesh_ca_backend` is `spire`.
+    pub mesh_spire_agent_socket: String,
+    /// SVID lifetime hint (seconds) passed to the CA backend. The CA may
+    /// clamp or ignore this value.
+    pub mesh_cert_ttl_seconds: u64,
     /// Mesh runtime config source. `native` consumes Ferrum MeshSubscribe;
     /// `xds` consumes Envoy-compatible ADS.
     pub mesh_config_protocol: String,
@@ -1238,6 +1250,9 @@ impl Default for EnvConfig {
             cp_broadcast_channel_capacity: 128,
             xds_enabled: false,
             xds_stream_channel_capacity: 32,
+            mesh_ca_backend: "none".to_string(),
+            mesh_spire_agent_socket: "/run/spire/sockets/agent.sock".to_string(),
+            mesh_cert_ttl_seconds: 3600,
             mesh_config_protocol: "native".to_string(),
             mesh_trust_domain_aliases: Vec::new(),
             mesh_egress_strip_baggage_keys: Vec::new(),
@@ -1520,6 +1535,9 @@ impl EnvConfig {
             cp_broadcast_channel_capacity: usize = "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY" => 128usize;
             xds_enabled: bool = "FERRUM_XDS_ENABLED" => false;
             xds_stream_channel_capacity: usize = "FERRUM_XDS_STREAM_CHANNEL_CAPACITY" => 32usize;
+            mesh_ca_backend: String = "FERRUM_MESH_CA_BACKEND" => "none".to_string();
+            mesh_spire_agent_socket: String = "FERRUM_MESH_SPIRE_AGENT_SOCKET" => "/run/spire/sockets/agent.sock".to_string();
+            mesh_cert_ttl_seconds: u64 = "FERRUM_MESH_CERT_TTL_SECONDS" => 3600u64;
             mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
@@ -1874,6 +1892,9 @@ impl EnvConfig {
             cp_broadcast_channel_capacity,
             xds_enabled,
             xds_stream_channel_capacity,
+            mesh_ca_backend,
+            mesh_spire_agent_socket,
+            mesh_cert_ttl_seconds,
             mesh_config_protocol,
             mesh_trust_domain_aliases,
             mesh_egress_strip_baggage_keys,
@@ -2395,6 +2416,12 @@ impl EnvConfig {
                 if self.dp_cp_grpc_urls.is_empty() {
                     return Err("FERRUM_DP_CP_GRPC_URLS is required in mesh mode".into());
                 }
+                // Validate mesh CA backend.
+                if let Err(e) =
+                    crate::identity::ca::CaBackend::from_str_lossy(&self.mesh_ca_backend)
+                {
+                    return Err(format!("Invalid FERRUM_MESH_CA_BACKEND: {e}"));
+                }
                 match self
                     .mesh_config_protocol
                     .trim()
@@ -2409,7 +2436,7 @@ impl EnvConfig {
                     }
                 }
             }
-            OperatingMode::Injector => {}
+            OperatingMode::Injector | OperatingMode::NodeAgent => {}
             OperatingMode::Migrate => {
                 // Migrate mode: validation depends on FERRUM_MIGRATE_ACTION.
                 // For "config", FERRUM_FILE_CONFIG_PATH is required.

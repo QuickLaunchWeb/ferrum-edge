@@ -61,6 +61,7 @@ fn mode_matches_any(mode: &OperatingMode, candidates: &[&str]) -> bool {
         OperatingMode::DataPlane => "dp",
         OperatingMode::Mesh => "mesh",
         OperatingMode::Injector => "injector",
+        OperatingMode::NodeAgent => "node_agent",
         OperatingMode::Migrate => "migrate",
     };
 

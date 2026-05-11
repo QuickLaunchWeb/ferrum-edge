@@ -1,4 +1,16 @@
 # Multi-stage build for Ferrum Edge
+
+# --- eBPF build stage (nightly, Linux only) ---
+# Uncomment when the eBPF capture mode is fully wired into the main binary.
+# The compiled BPF program is copied into the runtime image at /app/bpf/ and
+# loaded by the node_agent mode at startup via aya.
+#
+# FROM rust:nightly-slim AS ebpf-builder
+# RUN rustup component add rust-src
+# COPY ebpf/ /build/ebpf/
+# WORKDIR /build/ebpf
+# RUN cargo build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
+
 # Stage 1: Builder — rust:latest uses trixie (Debian 13), matching distroless/cc-debian13 glibc
 FROM rust:latest AS builder
 
@@ -27,6 +39,9 @@ COPY custom_plugins ./custom_plugins
 # below) — Cargo resolves patch paths during manifest load, not just at
 # compile time.
 COPY vendor ./vendor
+# The main crate depends on shared no_std eBPF ABI types via a path dependency,
+# so the Docker build context must include ebpf/ before any Cargo metadata load.
+COPY ebpf ./ebpf
 
 # Create a dummy main.rs to build dependencies only
 RUN mkdir src && \

@@ -7,7 +7,7 @@ use ferrum_edge::config::types::{
     MAX_HTTP2_MAX_FRAME_SIZE, MAX_HTTP3_CONNECTIONS_PER_BACKEND, MAX_LISTEN_PATH_LENGTH,
     MAX_NAME_LENGTH, MAX_PLUGIN_CONFIG_SIZE, MAX_SD_STRING_LENGTH, MAX_TARGETS_PER_UPSTREAM,
     MAX_TIMEOUT_MS, MAX_USERNAME_LENGTH, MIN_HTTP2_MAX_FRAME_SIZE, MIN_HTTP2_WINDOW_SIZE,
-    PassiveHealthCheck, PluginConfig, PluginScope, Proxy, RetryConfig, SdProvider,
+    MeshSdConfig, PassiveHealthCheck, PluginConfig, PluginScope, Proxy, RetryConfig, SdProvider,
     ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
 use std::collections::HashMap;
@@ -704,10 +704,26 @@ fn test_upstream_service_discovery_dns_sd_validated() {
         dns_sd: None, // Missing required config
         kubernetes: None,
         consul: None,
+        mesh: None,
         default_weight: 1,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(errs.iter().any(|e| e.contains("dns_sd config is required")));
+}
+
+#[test]
+fn test_upstream_service_discovery_mesh_validated() {
+    let mut upstream = make_upstream("test");
+    upstream.service_discovery = Some(ServiceDiscoveryConfig {
+        provider: SdProvider::Mesh,
+        dns_sd: None,
+        kubernetes: None,
+        consul: None,
+        mesh: None,
+        default_weight: 1,
+    });
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("mesh config is required")));
 }
 
 // ---- PluginConfig field validation tests ----
@@ -1316,6 +1332,7 @@ fn test_k8s_port_name_too_long() {
             poll_interval_seconds: 30,
         }),
         consul: None,
+        mesh: None,
         default_weight: 1,
     });
     let errs = upstream.validate_fields().unwrap_err();
@@ -1339,6 +1356,7 @@ fn test_k8s_label_selector_too_long() {
             poll_interval_seconds: 30,
         }),
         consul: None,
+        mesh: None,
         default_weight: 1,
     });
     let errs = upstream.validate_fields().unwrap_err();
@@ -1364,6 +1382,7 @@ fn test_consul_datacenter_too_long() {
             token: None,
             poll_interval_seconds: 30,
         }),
+        mesh: None,
         default_weight: 1,
     });
     let errs = upstream.validate_fields().unwrap_err();
@@ -1389,6 +1408,7 @@ fn test_consul_tag_too_long() {
             token: None,
             poll_interval_seconds: 30,
         }),
+        mesh: None,
         default_weight: 1,
     });
     let errs = upstream.validate_fields().unwrap_err();
@@ -1414,6 +1434,7 @@ fn test_consul_token_control_chars() {
             token: Some("secret\x00token".into()),
             poll_interval_seconds: 30,
         }),
+        mesh: None,
         default_weight: 1,
     });
     let errs = upstream.validate_fields().unwrap_err();
@@ -1439,6 +1460,7 @@ fn test_consul_valid_optional_fields() {
             token: Some("my-acl-token-abc123".into()),
             poll_interval_seconds: 30,
         }),
+        mesh: None,
         default_weight: 1,
     });
     assert!(upstream.validate_fields().is_ok());
@@ -1458,6 +1480,69 @@ fn test_k8s_valid_optional_fields() {
             poll_interval_seconds: 30,
         }),
         consul: None,
+        mesh: None,
+        default_weight: 1,
+    });
+    assert!(upstream.validate_fields().is_ok());
+}
+
+#[test]
+fn test_mesh_service_name_required() {
+    let mut upstream = make_upstream("test");
+    upstream.service_discovery = Some(ServiceDiscoveryConfig {
+        provider: SdProvider::Mesh,
+        dns_sd: None,
+        kubernetes: None,
+        consul: None,
+        mesh: Some(MeshSdConfig {
+            service_name: String::new(),
+            namespace: None,
+            port: Some(8080),
+            poll_interval_seconds: 30,
+        }),
+        default_weight: 1,
+    });
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("mesh.service_name must not be empty"))
+    );
+}
+
+#[test]
+fn test_mesh_port_zero_rejected() {
+    let mut upstream = make_upstream("test");
+    upstream.service_discovery = Some(ServiceDiscoveryConfig {
+        provider: SdProvider::Mesh,
+        dns_sd: None,
+        kubernetes: None,
+        consul: None,
+        mesh: Some(MeshSdConfig {
+            service_name: "api".into(),
+            namespace: Some("default".into()),
+            port: Some(0),
+            poll_interval_seconds: 30,
+        }),
+        default_weight: 1,
+    });
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("mesh.port")));
+}
+
+#[test]
+fn test_mesh_valid_optional_fields() {
+    let mut upstream = make_upstream("test");
+    upstream.service_discovery = Some(ServiceDiscoveryConfig {
+        provider: SdProvider::Mesh,
+        dns_sd: None,
+        kubernetes: None,
+        consul: None,
+        mesh: Some(MeshSdConfig {
+            service_name: "api".into(),
+            namespace: Some("production".into()),
+            port: Some(8080),
+            poll_interval_seconds: 30,
+        }),
         default_weight: 1,
     });
     assert!(upstream.validate_fields().is_ok());

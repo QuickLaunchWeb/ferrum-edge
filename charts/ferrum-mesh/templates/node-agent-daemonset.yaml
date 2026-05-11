@@ -1,0 +1,79 @@
+{{- if .Values.nodeAgent.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ferrum-mesh-node-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-node-agent
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-mesh-node-agent
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-mesh-node-agent
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: ferrum-node-agent
+      hostPID: true
+      hostNetwork: true
+      containers:
+        - name: ferrum-edge
+          image: "{{ .Values.nodeAgent.image.repository }}:{{ .Values.nodeAgent.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["run"]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            privileged: false
+            capabilities:
+              add:
+                - BPF
+                - NET_ADMIN
+                - SYS_ADMIN
+                - SYS_PTRACE
+          env:
+            - name: FERRUM_MODE
+              value: "node_agent"
+            - name: FERRUM_MESH_CAPTURE_MODE
+              value: {{ .Values.nodeAgent.captureMode | quote }}
+            - name: FERRUM_MESH_PROXY_UID
+              value: {{ .Values.nodeAgent.proxyUid | quote }}
+            - name: FERRUM_MESH_CAPTURE_INCLUDE_CIDRS
+              value: {{ .Values.nodeAgent.capture.includeCidrs | quote }}
+            - name: FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS
+              value: {{ .Values.nodeAgent.capture.excludeCidrs | quote }}
+            - name: FERRUM_MESH_CAPTURE_EXCLUDE_PORTS
+              value: {{ .Values.nodeAgent.capture.excludePorts | quote }}
+            - name: FERRUM_NODE_AGENT_FALLBACK_MODE
+              value: {{ .Values.nodeAgent.fallbackMode | quote }}
+            - name: FERRUM_NODE_AGENT_CGROUP_ROOT
+              value: {{ .Values.nodeAgent.cgroupRoot | quote }}
+            - name: FERRUM_NODE_AGENT_BPF_FS_PATH
+              value: {{ .Values.nodeAgent.bpfFsPath | quote }}
+            - name: FERRUM_NODE_AGENT_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: bpf-fs
+              mountPath: {{ .Values.nodeAgent.bpfFsPath }}
+            - name: cgroup
+              mountPath: {{ .Values.nodeAgent.cgroupRoot }}
+              readOnly: true
+          resources:
+            {{- toYaml .Values.nodeAgent.resources | nindent 12 }}
+      volumes:
+        - name: bpf-fs
+          hostPath:
+            path: {{ .Values.nodeAgent.bpfFsPath }}
+            type: DirectoryOrCreate
+        - name: cgroup
+          hostPath:
+            path: {{ .Values.nodeAgent.cgroupRoot }}
+            type: Directory
+{{- end }}

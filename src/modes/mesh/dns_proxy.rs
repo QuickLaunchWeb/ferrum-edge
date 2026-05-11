@@ -11,9 +11,11 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -28,7 +30,9 @@ const DNS_MAX_UDP_PACKET_SIZE: usize = 4096;
 const DNS_UDP_SAFE_PACKET_SIZE: usize = 512;
 const DNS_MAX_TCP_PACKET_SIZE: usize = u16::MAX as usize;
 const DNS_UPSTREAM_TIMEOUT_SECS: u64 = 5;
+const DNS_UPSTREAM_ID_SPACE: usize = u16::MAX as usize + 1;
 const DNS_TCP_QUERY_READ_TIMEOUT_SECS: u64 = 5;
+pub const DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES: usize = 4096;
 pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
 // QTYPE values
@@ -61,13 +65,13 @@ struct DnsQuery {
     /// Original flags from the query (we copy RD etc.).
     flags: u16,
     /// Normalized hostname: lowercase, trailing dot stripped.
-    name: String,
+    name: Arc<str>,
     /// Query type (1 = A, 28 = AAAA).
     qtype: u16,
     /// Query class (1 = IN).
     qclass: u16,
     /// EDNS(0) OPT pseudo-record from the query, echoed when it fits.
-    opt_record: Option<Vec<u8>>,
+    opt_record: Option<Arc<[u8]>>,
     /// Client-advertised UDP response size from EDNS(0), clamped at response time.
     udp_payload_size: usize,
 }
@@ -80,6 +84,38 @@ struct DnsRecordSet {
 struct WildcardRecordSet {
     suffix: String,
     records: DnsRecordSet,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct DnsResponseCacheKey {
+    name: Arc<str>,
+    qtype: u16,
+    qclass: u16,
+    rd: bool,
+    cd: bool,
+    ad: bool,
+    ttl: u32,
+    max_response_size: usize,
+    opt_record: Option<Arc<[u8]>>,
+}
+
+const FLAGS_CD: u16 = 0x0010;
+const FLAGS_AD: u16 = 0x0020;
+
+impl DnsResponseCacheKey {
+    fn from_query(query: &DnsQuery, ttl: u32, max_response_size: usize) -> Self {
+        Self {
+            name: Arc::clone(&query.name),
+            qtype: query.qtype,
+            qclass: query.qclass,
+            rd: query.flags & FLAGS_RD != 0,
+            cd: query.flags & FLAGS_CD != 0,
+            ad: query.flags & FLAGS_AD != 0,
+            ttl,
+            max_response_size,
+            opt_record: query.opt_record.clone(),
+        }
+    }
 }
 
 pub struct ResolvedDnsRecords<'a> {
@@ -115,13 +151,25 @@ pub struct DnsResolutionTable {
     exact: HashMap<String, DnsRecordSet>,
     /// Wildcard matches bucketed by final suffix label for bounded lookup.
     wildcard_suffixes: HashMap<String, Vec<WildcardRecordSet>>,
+    /// Per-slice cache of serialized mesh DNS response templates.
+    response_cache: DashMap<DnsResponseCacheKey, Vec<u8>>,
+    response_cache_entries: AtomicUsize,
+    response_cache_max_entries: usize,
 }
 
 impl DnsResolutionTable {
+    #[cfg(test)]
     fn empty() -> Self {
+        Self::empty_with_response_cache_max_entries(DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES)
+    }
+
+    fn empty_with_response_cache_max_entries(response_cache_max_entries: usize) -> Self {
         Self {
             exact: HashMap::new(),
             wildcard_suffixes: HashMap::new(),
+            response_cache: DashMap::new(),
+            response_cache_entries: AtomicUsize::new(0),
+            response_cache_max_entries: response_cache_max_entries.max(1),
         }
     }
 
@@ -136,6 +184,18 @@ impl DnsResolutionTable {
     }
 
     pub fn from_mesh_slice_with_cluster_domain(slice: &MeshSlice, cluster_domain: &str) -> Self {
+        Self::from_mesh_slice_with_cluster_domain_and_response_cache_max_entries(
+            slice,
+            cluster_domain,
+            DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
+        )
+    }
+
+    pub fn from_mesh_slice_with_cluster_domain_and_response_cache_max_entries(
+        slice: &MeshSlice,
+        cluster_domain: &str,
+        response_cache_max_entries: usize,
+    ) -> Self {
         let cluster_domain = normalize_dns_name(cluster_domain);
         let mut exact: HashMap<String, DnsRecordSet> = HashMap::new();
         let mut wildcard_suffixes: HashMap<String, Vec<WildcardRecordSet>> = HashMap::new();
@@ -236,6 +296,9 @@ impl DnsResolutionTable {
         Self {
             exact,
             wildcard_suffixes,
+            response_cache: DashMap::new(),
+            response_cache_entries: AtomicUsize::new(0),
+            response_cache_max_entries: response_cache_max_entries.max(1),
         }
     }
 
@@ -267,6 +330,53 @@ impl DnsResolutionTable {
         }
 
         None
+    }
+
+    fn cached_mesh_response<F>(
+        &self,
+        key: DnsResponseCacheKey,
+        query_id: u16,
+        build_response: F,
+    ) -> Vec<u8>
+    where
+        F: FnOnce() -> Vec<u8>,
+    {
+        if let Some(template) = self.response_cache.get(&key) {
+            return response_from_cached_template(template.value(), query_id);
+        }
+
+        let mut template = build_response();
+        clear_response_transaction_id(&mut template);
+        let response = response_from_cached_template(&template, query_id);
+        if self.reserve_response_cache_slot() && self.response_cache.insert(key, template).is_some()
+        {
+            self.response_cache_entries.fetch_sub(1, Ordering::Relaxed);
+        }
+        response
+    }
+
+    fn reserve_response_cache_slot(&self) -> bool {
+        let mut current = self.response_cache_entries.load(Ordering::Relaxed);
+        loop {
+            if current >= self.response_cache_max_entries {
+                return false;
+            }
+
+            match self.response_cache_entries.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn response_cache_len(&self) -> usize {
+        self.response_cache.len()
     }
 
     /// Number of exact entries in the table.
@@ -373,6 +483,7 @@ pub struct MeshDnsProxy {
     upstream_resolver: SocketAddr,
     ttl_seconds: u32,
     max_concurrent_queries: usize,
+    response_cache_max_entries: usize,
     cluster_domain: String,
 }
 
@@ -388,14 +499,21 @@ impl MeshDnsProxy {
         upstream_resolver: SocketAddr,
         ttl_seconds: u32,
         max_concurrent_queries: usize,
+        response_cache_max_entries: usize,
         cluster_domain: String,
     ) -> Self {
+        let response_cache_max_entries = response_cache_max_entries.max(1);
         Self {
             listen_addr,
-            resolution_table: Arc::new(ArcSwap::new(Arc::new(DnsResolutionTable::empty()))),
+            resolution_table: Arc::new(ArcSwap::new(Arc::new(
+                DnsResolutionTable::empty_with_response_cache_max_entries(
+                    response_cache_max_entries,
+                ),
+            ))),
             upstream_resolver,
             ttl_seconds,
             max_concurrent_queries: max_concurrent_queries.max(1),
+            response_cache_max_entries,
             cluster_domain: normalize_dns_name(&cluster_domain),
         }
     }
@@ -413,7 +531,11 @@ impl MeshDnsProxy {
     /// Rebuild the resolution table from a new mesh slice.
     pub fn update_from_slice(&self, slice: &MeshSlice) {
         let new_table =
-            DnsResolutionTable::from_mesh_slice_with_cluster_domain(slice, &self.cluster_domain);
+            DnsResolutionTable::from_mesh_slice_with_cluster_domain_and_response_cache_max_entries(
+                slice,
+                &self.cluster_domain,
+                self.response_cache_max_entries,
+            );
         let exact_count = new_table.exact_count();
         let wildcard_count = new_table.wildcard_count();
         self.resolution_table.store(Arc::new(new_table));
@@ -735,11 +857,12 @@ fn evaluate_dns_query(
     let table = table.load();
     if query.qtype != QTYPE_A && query.qtype != QTYPE_AAAA {
         return match table.resolve_normalized(&query.name) {
-            Some(records) => DnsDecision::Respond(build_dns_empty_response(
-                &query,
-                records.authoritative,
-                max_response_size,
-            )),
+            Some(records) => {
+                let cache_key = DnsResponseCacheKey::from_query(&query, ttl, max_response_size);
+                DnsDecision::Respond(table.cached_mesh_response(cache_key, query.id, || {
+                    build_dns_empty_response(&query, records.authoritative, max_response_size)
+                }))
+            }
             None => DnsDecision::Forward(query),
         };
     }
@@ -760,17 +883,22 @@ fn evaluate_dns_query(
 
             if filtered.is_empty() {
                 // Have the name but no matching record type -- return empty (not NXDOMAIN)
-                let response =
-                    build_dns_empty_response(&query, records.authoritative, max_response_size);
+                let cache_key = DnsResponseCacheKey::from_query(&query, ttl, max_response_size);
+                let response = table.cached_mesh_response(cache_key, query.id, || {
+                    build_dns_empty_response(&query, records.authoritative, max_response_size)
+                });
                 DnsDecision::Respond(response)
             } else {
-                let response = build_dns_response(
-                    &query,
-                    &filtered,
-                    ttl,
-                    records.authoritative,
-                    max_response_size,
-                );
+                let cache_key = DnsResponseCacheKey::from_query(&query, ttl, max_response_size);
+                let response = table.cached_mesh_response(cache_key, query.id, || {
+                    build_dns_response(
+                        &query,
+                        &filtered,
+                        ttl,
+                        records.authoritative,
+                        max_response_size,
+                    )
+                });
                 trace!(
                     name = %query.name,
                     qtype = query.qtype,
@@ -912,12 +1040,18 @@ async fn run_udp_forwarder(
                     break;
                 };
                 if pending.len() >= max_outstanding {
-                    warn!(client = %request.src, outstanding = pending.len(), "DNS upstream forward limit reached");
+                    if upstream_id_space_exhausted(pending.len()) {
+                        record_upstream_id_exhaustion();
+                        warn!("DNS upstream transaction ID space exhausted");
+                    } else {
+                        warn!(client = %request.src, outstanding = pending.len(), "DNS upstream forward limit reached");
+                    }
                     send_udp_servfail(&client_socket, &request.query, request.src).await;
                     continue;
                 }
 
                 let Some(upstream_id) = allocate_upstream_id(&mut next_id, &pending) else {
+                    record_upstream_id_exhaustion();
                     warn!("DNS upstream transaction ID space exhausted");
                     send_udp_servfail(&client_socket, &request.query, request.src).await;
                     continue;
@@ -1015,6 +1149,14 @@ fn allocate_upstream_id(next_id: &mut u16, pending: &HashMap<u16, PendingForward
     None
 }
 
+fn upstream_id_space_exhausted(pending_len: usize) -> bool {
+    pending_len >= DNS_UPSTREAM_ID_SPACE
+}
+
+fn record_upstream_id_exhaustion() {
+    crate::plugins::prometheus_metrics::global_registry().record_mesh_dns_upstream_id_exhaustion();
+}
+
 fn upstream_response_matches_pending_query(response: &[u8], pending: &DnsQuery) -> bool {
     if response.len() < DNS_HEADER_SIZE {
         return false;
@@ -1040,7 +1182,9 @@ fn upstream_response_matches_pending_query(response: &[u8], pending: &DnsQuery) 
     let qtype = u16::from_be_bytes([response[offset], response[offset + 1]]);
     let qclass = u16::from_be_bytes([response[offset + 2], response[offset + 3]]);
 
-    normalize_dns_name(&name) == pending.name && qtype == pending.qtype && qclass == pending.qclass
+    *normalize_dns_name(&name) == *pending.name
+        && qtype == pending.qtype
+        && qclass == pending.qclass
 }
 
 async fn send_udp_servfail(socket: &UdpSocket, query: &DnsQuery, client: SocketAddr) {
@@ -1143,10 +1287,10 @@ fn parse_dns_query(packet: &[u8]) -> Option<DnsQuery> {
     Some(DnsQuery {
         id,
         flags,
-        name: normalized,
+        name: Arc::from(normalized.as_str()),
         qtype,
         qclass,
-        opt_record,
+        opt_record: opt_record.map(|v| Arc::from(v.into_boxed_slice())),
         udp_payload_size,
     })
 }
@@ -1244,7 +1388,7 @@ fn build_dns_response(
     response.extend_from_slice(&query.qtype.to_be_bytes());
     response.extend_from_slice(&query.qclass.to_be_bytes());
 
-    let opt_len = query.opt_record.as_ref().map_or(0, Vec::len);
+    let opt_len = query.opt_record.as_ref().map_or(0, |r| r.len());
     let mut answer_count = 0u16;
     let mut truncated = false;
 
@@ -1334,6 +1478,20 @@ fn build_dns_error_response_from_packet(
     response.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
     response.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
     Some(response)
+}
+
+fn clear_response_transaction_id(response: &mut [u8]) {
+    if response.len() >= 2 {
+        response[..2].copy_from_slice(&0u16.to_be_bytes());
+    }
+}
+
+fn response_from_cached_template(template: &[u8], query_id: u16) -> Vec<u8> {
+    let mut response = template.to_vec();
+    if response.len() >= 2 {
+        response[..2].copy_from_slice(&query_id.to_be_bytes());
+    }
+    response
 }
 
 fn write_dns_response_header(
@@ -1509,7 +1667,7 @@ mod tests {
         let packet = build_a_query("example.com");
         let query = parse_dns_query(&packet).expect("should parse");
         assert_eq!(query.id, 0x1234);
-        assert_eq!(query.name, "example.com");
+        assert_eq!(&*query.name, "example.com");
         assert_eq!(query.qtype, QTYPE_A);
         assert_eq!(query.qclass, QCLASS_IN);
     }
@@ -1518,7 +1676,7 @@ mod tests {
     fn parse_dns_query_valid_aaaa_query() {
         let packet = build_aaaa_query("ipv6.example.com");
         let query = parse_dns_query(&packet).expect("should parse");
-        assert_eq!(query.name, "ipv6.example.com");
+        assert_eq!(&*query.name, "ipv6.example.com");
         assert_eq!(query.qtype, QTYPE_AAAA);
     }
 
@@ -1544,6 +1702,36 @@ mod tests {
             &not_a_response,
             &pending
         ));
+    }
+
+    #[test]
+    fn allocate_upstream_id_reports_exhaustion_when_all_ids_pending() {
+        let query_packet = build_a_query("example.com");
+        let query = parse_dns_query(&query_packet).expect("query parses");
+        let mut pending = HashMap::with_capacity(u16::MAX as usize + 1);
+        let client = "127.0.0.1:53000".parse().expect("client addr");
+        let expires_at = Instant::now() + Duration::from_secs(1);
+        for id in 0..=u16::MAX {
+            pending.insert(
+                id,
+                PendingForward {
+                    client,
+                    original_id: id,
+                    query: query.clone(),
+                    expires_at,
+                },
+            );
+        }
+        let mut next_id = 0u16;
+
+        assert!(allocate_upstream_id(&mut next_id, &pending).is_none());
+    }
+
+    #[test]
+    fn upstream_id_space_exhaustion_is_only_full_16_bit_occupancy() {
+        assert!(!upstream_id_space_exhausted(1024));
+        assert!(!upstream_id_space_exhausted(DNS_UPSTREAM_ID_SPACE - 1));
+        assert!(upstream_id_space_exhausted(DNS_UPSTREAM_ID_SPACE));
     }
 
     #[test]
@@ -1747,6 +1935,116 @@ mod tests {
             u16::from_be_bytes([response[offset], response[offset + 1]]),
             QTYPE_TXT
         );
+    }
+
+    #[test]
+    fn evaluate_dns_query_caches_mesh_response_templates_without_query_id() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(
+                vec!["api.example.com"],
+                vec!["10.0.0.1"],
+            )],
+            ..MeshSlice::default()
+        };
+        let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
+        let first_packet = build_a_query("api.example.com");
+        let mut second_packet = build_a_query("api.example.com");
+        second_packet[..2].copy_from_slice(&0x5678u16.to_be_bytes());
+
+        let first_response =
+            match evaluate_dns_query(&first_packet, &table, 60, DNS_UDP_SAFE_PACKET_SIZE) {
+                DnsDecision::Respond(response) => response,
+                DnsDecision::Forward(_) => panic!("mesh name should not forward"),
+                DnsDecision::Drop => panic!("valid DNS query should not drop"),
+            };
+        assert_eq!(table.load().response_cache_len(), 1);
+
+        let second_response =
+            match evaluate_dns_query(&second_packet, &table, 60, DNS_UDP_SAFE_PACKET_SIZE) {
+                DnsDecision::Respond(response) => response,
+                DnsDecision::Forward(_) => panic!("mesh name should not forward"),
+                DnsDecision::Drop => panic!("valid DNS query should not drop"),
+            };
+
+        assert_eq!(table.load().response_cache_len(), 1);
+        assert_eq!(&first_response[..2], &0x1234u16.to_be_bytes());
+        assert_eq!(&second_response[..2], &0x5678u16.to_be_bytes());
+        assert_eq!(&first_response[2..], &second_response[2..]);
+    }
+
+    #[test]
+    fn mesh_response_cache_never_exceeds_entry_cap() {
+        let table = DnsResolutionTable::empty();
+
+        for index in 0..(DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES + 16) {
+            let key = DnsResponseCacheKey {
+                name: Arc::from(format!("svc-{index}.example.com").as_str()),
+                qtype: QTYPE_A,
+                qclass: QCLASS_IN,
+                rd: true,
+                cd: false,
+                ad: false,
+                ttl: 60,
+                max_response_size: DNS_UDP_SAFE_PACKET_SIZE,
+                opt_record: None,
+            };
+            let _ = table.cached_mesh_response(key, 0x1234, || vec![0x12, 0x34, 0x81, 0x80]);
+        }
+
+        assert_eq!(
+            table.response_cache_len(),
+            DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES
+        );
+    }
+
+    #[test]
+    fn mesh_response_cache_honors_configured_entry_cap() {
+        let table = DnsResolutionTable::empty_with_response_cache_max_entries(2);
+
+        for index in 0..4 {
+            let key = DnsResponseCacheKey {
+                name: Arc::from(format!("svc-{index}.example.com").as_str()),
+                qtype: QTYPE_A,
+                qclass: QCLASS_IN,
+                rd: true,
+                cd: false,
+                ad: false,
+                ttl: 60,
+                max_response_size: DNS_UDP_SAFE_PACKET_SIZE,
+                opt_record: None,
+            };
+            let _ = table.cached_mesh_response(key, 0x1234, || vec![0x12, 0x34, 0x81, 0x80]);
+        }
+
+        assert_eq!(table.response_cache_len(), 2);
+    }
+
+    #[test]
+    fn mesh_response_cache_differentiates_cd_ad_flags() {
+        let table = DnsResolutionTable::empty();
+        let base = || DnsResponseCacheKey {
+            name: Arc::from("svc.example.com"),
+            qtype: QTYPE_A,
+            qclass: QCLASS_IN,
+            rd: true,
+            cd: false,
+            ad: false,
+            ttl: 60,
+            max_response_size: DNS_UDP_SAFE_PACKET_SIZE,
+            opt_record: None,
+        };
+
+        let _ = table.cached_mesh_response(base(), 0x1234, || vec![0x00, 0x00, 0xAA]);
+
+        let mut cd_key = base();
+        cd_key.cd = true;
+        let _ = table.cached_mesh_response(cd_key, 0x1234, || vec![0x00, 0x00, 0xBB]);
+
+        let mut ad_key = base();
+        ad_key.ad = true;
+        let _ = table.cached_mesh_response(ad_key, 0x1234, || vec![0x00, 0x00, 0xCC]);
+
+        assert_eq!(table.response_cache_len(), 3);
     }
 
     #[tokio::test]
@@ -2162,5 +2460,677 @@ mod tests {
         let v6_count = ips.iter().filter(|ip| ip.is_ipv6()).count();
         assert_eq!(v4_count, 1);
         assert_eq!(v6_count, 1);
+    }
+
+    // ── Resolution table construction edge cases ────────────────────────
+
+    #[test]
+    fn resolution_table_service_entry_multiple_hosts_share_endpoints() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(
+                vec![
+                    "primary.example.com",
+                    "alias.example.com",
+                    "backup.example.com",
+                ],
+                vec!["10.0.0.1", "10.0.0.2"],
+            )],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        assert_eq!(table.exact_count(), 3);
+
+        for host in &[
+            "primary.example.com",
+            "alias.example.com",
+            "backup.example.com",
+        ] {
+            let resolved = table.resolve(host).expect("each host should resolve");
+            assert_eq!(resolved.len(), 2);
+            assert!(resolved.contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+            assert!(resolved.contains(&"10.0.0.2".parse::<IpAddr>().unwrap()));
+        }
+    }
+
+    #[test]
+    fn resolution_table_service_entry_empty_endpoints_skips_host() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(vec!["empty-ep.example.com"], vec![])],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        assert_eq!(table.exact_count(), 0);
+        assert!(table.resolve("empty-ep.example.com").is_none());
+    }
+
+    #[test]
+    fn resolution_table_mesh_service_produces_fqdn_and_short_name() {
+        let spiffe = "spiffe://cluster.local/ns/production/sa/web";
+        let slice = MeshSlice {
+            workloads: vec![test_workload(spiffe, vec!["10.2.0.1"])],
+            services: vec![test_mesh_service(
+                "web-frontend",
+                "production",
+                vec![spiffe],
+            )],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+
+        // FQDN entry
+        let fqdn_ips = table
+            .resolve("web-frontend.production.svc.cluster.local")
+            .expect("FQDN should resolve");
+        assert_eq!(fqdn_ips.len(), 1);
+        assert!(fqdn_ips.contains(&"10.2.0.1".parse::<IpAddr>().unwrap()));
+
+        // Short name entry
+        let short_ips = table
+            .resolve("web-frontend.production")
+            .expect("short name should resolve");
+        assert_eq!(short_ips.len(), 1);
+        assert!(short_ips.contains(&"10.2.0.1".parse::<IpAddr>().unwrap()));
+
+        // Both entries should be exact entries
+        assert!(table.exact_count() >= 2);
+    }
+
+    #[test]
+    fn resolution_table_custom_cluster_domain_fqdn_format() {
+        let spiffe = "spiffe://corp.local/ns/staging/sa/api";
+        let slice = MeshSlice {
+            workloads: vec![test_workload(spiffe, vec!["10.3.0.1"])],
+            services: vec![test_mesh_service("payments", "staging", vec![spiffe])],
+            ..MeshSlice::default()
+        };
+
+        let table =
+            DnsResolutionTable::from_mesh_slice_with_cluster_domain(&slice, "my-org.internal");
+
+        // Custom cluster domain should produce the correct FQDN
+        assert!(
+            table
+                .resolve("payments.staging.svc.my-org.internal")
+                .is_some()
+        );
+        // Short name is independent of cluster domain
+        assert!(table.resolve("payments.staging").is_some());
+        // Default cluster domain should NOT match
+        assert!(
+            table
+                .resolve("payments.staging.svc.cluster.local")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolution_table_service_entry_and_mesh_service_duplicate_host() {
+        // When a ServiceEntry and MeshService would resolve to the same hostname,
+        // both contribute IPs to the same record set.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/api";
+        let slice = MeshSlice {
+            workloads: vec![test_workload(spiffe, vec!["10.1.0.1"])],
+            services: vec![test_mesh_service("api", "default", vec![spiffe])],
+            service_entries: vec![test_service_entry(
+                vec!["api.default.svc.cluster.local"],
+                vec!["10.9.0.1"],
+            )],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        let resolved = table
+            .resolve("api.default.svc.cluster.local")
+            .expect("hostname should resolve");
+        // Both sources contribute IPs to the same record
+        assert!(resolved.contains(&"10.9.0.1".parse::<IpAddr>().unwrap()));
+        assert!(resolved.contains(&"10.1.0.1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn resolution_table_service_entry_resolution_types_all_resolve() {
+        // The DNS resolution table indexes endpoint IPs regardless of the
+        // ServiceEntry resolution type (Static, Dns, None).
+        for resolution in [Resolution::Static, Resolution::Dns, Resolution::None] {
+            let se = ServiceEntry {
+                name: "test-se".to_string(),
+                namespace: "default".to_string(),
+                hosts: vec!["res-test.example.com".to_string()],
+                endpoints: vec![MeshEndpoint {
+                    address: "10.0.0.5".to_string(),
+                    ports: HashMap::new(),
+                    labels: HashMap::new(),
+                    network: None,
+                }],
+                resolution,
+                location: ServiceEntryLocation::MeshExternal,
+                ports: vec![],
+                export_to: Vec::new(),
+                workload_selector: None,
+            };
+            let slice = MeshSlice {
+                service_entries: vec![se],
+                ..MeshSlice::default()
+            };
+
+            let table = DnsResolutionTable::from_mesh_slice(&slice);
+            assert!(
+                table.resolve("res-test.example.com").is_some(),
+                "resolution type {resolution:?} should still produce a table entry"
+            );
+        }
+    }
+
+    // ── Wildcard resolution edge cases ──────────────────────────────────
+
+    #[test]
+    fn wildcard_does_not_match_base_domain() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(vec!["*.corp.io"], vec!["10.0.0.1"])],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        assert!(table.resolve("corp.io").is_none());
+    }
+
+    #[test]
+    fn wildcard_does_not_match_multi_level_subdomain() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(vec!["*.example.com"], vec!["10.0.0.1"])],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        // Multi-level subdomain should NOT match a single-label wildcard
+        assert!(table.resolve("deep.sub.example.com").is_none());
+        // Single-level subdomain should match
+        assert!(table.resolve("api.example.com").is_some());
+    }
+
+    #[test]
+    fn wildcard_multiple_overlapping_suffixes() {
+        let slice = MeshSlice {
+            service_entries: vec![
+                test_service_entry(vec!["*.example.com"], vec!["10.0.0.1"]),
+                test_service_entry(vec!["*.internal.example.com"], vec!["10.0.0.2"]),
+            ],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        assert_eq!(table.wildcard_count(), 2);
+
+        // api.example.com matches *.example.com
+        let ips = table.resolve("api.example.com").unwrap();
+        assert!(ips.contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+
+        // db.internal.example.com matches *.internal.example.com (most specific)
+        let ips = table.resolve("db.internal.example.com").unwrap();
+        assert!(ips.contains(&"10.0.0.2".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn wildcard_single_label_suffix() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(vec!["*.local"], vec!["10.0.0.1"])],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        assert_eq!(table.wildcard_count(), 1);
+
+        assert!(table.resolve("myhost.local").is_some());
+        assert!(table.resolve("local").is_none());
+        assert!(table.resolve("deep.sub.local").is_none());
+    }
+
+    #[test]
+    fn wildcard_case_insensitive_matching() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(vec!["*.Example.COM"], vec!["10.0.0.1"])],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        assert!(table.resolve("API.EXAMPLE.COM").is_some());
+        assert!(table.resolve("api.example.com").is_some());
+    }
+
+    // ── IPv6 endpoint edge cases ────────────────────────────────────────
+
+    #[test]
+    fn resolution_table_ipv6_only_endpoints() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(
+                vec!["v6only.example.com"],
+                vec!["fd00::1", "fd00::2", "2001:db8::1"],
+            )],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        let ips = table.resolve("v6only.example.com").unwrap();
+        assert_eq!(ips.len(), 3);
+        assert!(ips.iter().all(|ip| ip.is_ipv6()));
+    }
+
+    #[test]
+    fn resolution_table_mixed_v4_v6_a_vs_aaaa_filtering() {
+        // Verifies that evaluate_dns_query correctly filters A vs AAAA
+        // from a record set containing both IPv4 and IPv6 addresses.
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(
+                vec!["dualstack.example.com"],
+                vec!["10.0.0.1", "fd00::1", "10.0.0.2", "fd00::2"],
+            )],
+            ..MeshSlice::default()
+        };
+
+        let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
+
+        // A query should get only IPv4
+        let a_packet = build_a_query("dualstack.example.com");
+        let a_response = match evaluate_dns_query(&a_packet, &table, 60, DNS_MAX_UDP_PACKET_SIZE) {
+            DnsDecision::Respond(r) => r,
+            _ => panic!("A query for mesh name should produce a response"),
+        };
+        let a_ancount = u16::from_be_bytes([a_response[6], a_response[7]]);
+        assert_eq!(a_ancount, 2, "A query should return 2 IPv4 answers");
+
+        // AAAA query should get only IPv6
+        let aaaa_packet = build_aaaa_query("dualstack.example.com");
+        let aaaa_response =
+            match evaluate_dns_query(&aaaa_packet, &table, 60, DNS_MAX_UDP_PACKET_SIZE) {
+                DnsDecision::Respond(r) => r,
+                _ => panic!("AAAA query for mesh name should produce a response"),
+            };
+        let aaaa_ancount = u16::from_be_bytes([aaaa_response[6], aaaa_response[7]]);
+        assert_eq!(aaaa_ancount, 2, "AAAA query should return 2 IPv6 answers");
+    }
+
+    #[test]
+    fn resolution_table_a_query_on_ipv6_only_returns_empty() {
+        // A record set with only IPv6 addresses should produce an empty
+        // (not NXDOMAIN) response for an A query.
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(
+                vec!["v6only.example.com"],
+                vec!["fd00::1"],
+            )],
+            ..MeshSlice::default()
+        };
+
+        let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
+        let packet = build_a_query("v6only.example.com");
+        let response = match evaluate_dns_query(&packet, &table, 60, DNS_MAX_UDP_PACKET_SIZE) {
+            DnsDecision::Respond(r) => r,
+            _ => panic!("mesh-owned name should produce a response, not forward"),
+        };
+
+        let ancount = u16::from_be_bytes([response[6], response[7]]);
+        assert_eq!(
+            ancount, 0,
+            "A query for IPv6-only entry should return 0 answers"
+        );
+        let rcode = u16::from_be_bytes([response[2], response[3]]) & 0x000F;
+        assert_eq!(rcode, 0, "should be NOERROR, not NXDOMAIN");
+    }
+
+    #[test]
+    fn resolution_table_aaaa_query_on_ipv4_only_returns_empty() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(
+                vec!["v4only.example.com"],
+                vec!["10.0.0.1"],
+            )],
+            ..MeshSlice::default()
+        };
+
+        let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
+        let packet = build_aaaa_query("v4only.example.com");
+        let response = match evaluate_dns_query(&packet, &table, 60, DNS_MAX_UDP_PACKET_SIZE) {
+            DnsDecision::Respond(r) => r,
+            _ => panic!("mesh-owned name should produce a response"),
+        };
+
+        let ancount = u16::from_be_bytes([response[6], response[7]]);
+        assert_eq!(
+            ancount, 0,
+            "AAAA query for IPv4-only entry should return 0 answers"
+        );
+    }
+
+    // ── Query resolution edge cases ─────────────────────────────────────
+
+    #[test]
+    fn resolution_table_non_mesh_query_returns_none() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(
+                vec!["known.internal.io"],
+                vec!["10.0.0.1"],
+            )],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        assert!(table.resolve("completely-different.org").is_none());
+        assert!(table.resolve("not-known.internal.io").is_none());
+        assert!(table.resolve("sub.known.internal.io").is_none());
+    }
+
+    #[test]
+    fn resolution_table_query_forwards_non_mesh_name() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(
+                vec!["mesh.example.com"],
+                vec!["10.0.0.1"],
+            )],
+            ..MeshSlice::default()
+        };
+
+        let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
+        let packet = build_a_query("google.com");
+        match evaluate_dns_query(&packet, &table, 60, DNS_MAX_UDP_PACKET_SIZE) {
+            DnsDecision::Forward(_) => {} // expected
+            DnsDecision::Respond(_) => panic!("non-mesh name should be forwarded"),
+            DnsDecision::Drop => panic!("valid query should not be dropped"),
+        }
+    }
+
+    #[test]
+    fn resolution_table_case_insensitive_query() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(
+                vec!["my-service.example.com"],
+                vec!["10.0.0.1"],
+            )],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        assert!(table.resolve("MY-SERVICE.EXAMPLE.COM").is_some());
+        assert!(table.resolve("My-Service.Example.Com").is_some());
+        assert!(table.resolve("my-service.example.com").is_some());
+    }
+
+    #[test]
+    fn resolution_table_empty_mesh_slice_produces_empty_table() {
+        let table = DnsResolutionTable::from_mesh_slice(&MeshSlice::default());
+        assert_eq!(table.exact_count(), 0);
+        assert_eq!(table.wildcard_count(), 0);
+        assert!(table.resolve("anything.example.com").is_none());
+    }
+
+    // ── Authoritative flag edge cases ───────────────────────────────────
+
+    #[test]
+    fn resolution_table_mesh_service_fqdn_is_authoritative() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/api";
+        let slice = MeshSlice {
+            workloads: vec![test_workload(spiffe, vec!["10.1.0.1"])],
+            services: vec![test_mesh_service("api-svc", "default", vec![spiffe])],
+            ..MeshSlice::default()
+        };
+
+        let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
+        let packet = build_a_query("api-svc.default.svc.cluster.local");
+        let response = match evaluate_dns_query(&packet, &table, 60, DNS_MAX_UDP_PACKET_SIZE) {
+            DnsDecision::Respond(r) => r,
+            _ => panic!("mesh service FQDN should produce a response"),
+        };
+
+        let flags = u16::from_be_bytes([response[2], response[3]]);
+        assert!(
+            flags & FLAGS_AA != 0,
+            "mesh svc.cluster.local should be authoritative"
+        );
+    }
+
+    #[test]
+    fn resolution_table_external_service_entry_is_not_authoritative() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(
+                vec!["external.third-party.com"],
+                vec!["10.0.0.1"],
+            )],
+            ..MeshSlice::default()
+        };
+
+        let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
+        let packet = build_a_query("external.third-party.com");
+        let response = match evaluate_dns_query(&packet, &table, 60, DNS_MAX_UDP_PACKET_SIZE) {
+            DnsDecision::Respond(r) => r,
+            _ => panic!("service entry host should produce a response"),
+        };
+
+        let flags = u16::from_be_bytes([response[2], response[3]]);
+        assert_eq!(
+            flags & FLAGS_AA,
+            0,
+            "external host should not be authoritative"
+        );
+    }
+
+    // ── Workload address filtering edge cases ───────────────────────────
+
+    #[test]
+    fn resolution_table_mesh_service_skips_unresolvable_spiffe_refs() {
+        // A MeshService referencing a SPIFFE ID that has no workload
+        // should still work for the references that do resolve.
+        let spiffe_good = "spiffe://cluster.local/ns/default/sa/good";
+        let spiffe_missing = "spiffe://cluster.local/ns/default/sa/missing";
+        let slice = MeshSlice {
+            workloads: vec![test_workload(spiffe_good, vec!["10.1.0.1"])],
+            services: vec![test_mesh_service(
+                "partial-svc",
+                "default",
+                vec![spiffe_good, spiffe_missing],
+            )],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        let ips = table
+            .resolve("partial-svc.default.svc.cluster.local")
+            .expect("should resolve with available workloads");
+        assert_eq!(ips.len(), 1);
+        assert!(ips.contains(&"10.1.0.1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn resolution_table_mesh_service_with_no_resolvable_workloads_skipped() {
+        let spiffe_missing = "spiffe://cluster.local/ns/default/sa/missing";
+        let slice = MeshSlice {
+            workloads: vec![],
+            services: vec![test_mesh_service(
+                "no-workloads",
+                "default",
+                vec![spiffe_missing],
+            )],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        assert!(
+            table
+                .resolve("no-workloads.default.svc.cluster.local")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolution_table_workload_non_routable_addresses_filtered() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/mixed";
+        let slice = MeshSlice {
+            workloads: vec![test_workload(
+                spiffe,
+                vec!["10.1.0.1", "127.0.0.1", "0.0.0.0", "::1", "fe80::1"],
+            )],
+            services: vec![test_mesh_service("filtered-svc", "default", vec![spiffe])],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        let ips = table
+            .resolve("filtered-svc.default.svc.cluster.local")
+            .expect("should resolve with routable addresses only");
+        assert_eq!(ips.len(), 1);
+        assert!(ips.contains(&"10.1.0.1".parse::<IpAddr>().unwrap()));
+    }
+
+    // ── single_label_wildcard_matches helper ────────────────────────────
+
+    #[test]
+    fn single_label_wildcard_matches_basic() {
+        assert!(single_label_wildcard_matches(
+            "foo.example.com",
+            "example.com"
+        ));
+        assert!(single_label_wildcard_matches(
+            "bar.example.com",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn single_label_wildcard_rejects_base_domain() {
+        assert!(!single_label_wildcard_matches("example.com", "example.com"));
+    }
+
+    #[test]
+    fn single_label_wildcard_rejects_multi_level() {
+        assert!(!single_label_wildcard_matches(
+            "a.b.example.com",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn single_label_wildcard_rejects_suffix_only_match() {
+        // "fooexample.com" should not match suffix "example.com"
+        assert!(!single_label_wildcard_matches(
+            "fooexample.com",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn single_label_wildcard_rejects_shorter_name() {
+        assert!(!single_label_wildcard_matches("com", "example.com"));
+    }
+
+    // ── normalize_dns_name helper ───────────────────────────────────────
+
+    #[test]
+    fn normalize_dns_name_lowercases_and_strips_dot() {
+        assert_eq!(normalize_dns_name("API.Example.COM."), "api.example.com");
+        assert_eq!(normalize_dns_name("already.lower"), "already.lower");
+        assert_eq!(normalize_dns_name("trailing."), "trailing");
+    }
+
+    // ── is_routable_mesh_dns_ip helper ──────────────────────────────────
+
+    #[test]
+    fn routable_ip_rejects_non_routable_addresses() {
+        assert!(!is_routable_mesh_dns_ip(&"0.0.0.0".parse().unwrap()));
+        assert!(!is_routable_mesh_dns_ip(&"127.0.0.1".parse().unwrap()));
+        assert!(!is_routable_mesh_dns_ip(&"169.254.1.1".parse().unwrap()));
+        assert!(!is_routable_mesh_dns_ip(
+            &"255.255.255.255".parse().unwrap()
+        ));
+        assert!(!is_routable_mesh_dns_ip(&"224.0.0.1".parse().unwrap()));
+        assert!(!is_routable_mesh_dns_ip(&"::".parse().unwrap()));
+        assert!(!is_routable_mesh_dns_ip(&"::1".parse().unwrap()));
+        assert!(!is_routable_mesh_dns_ip(&"fe80::1".parse().unwrap()));
+        assert!(!is_routable_mesh_dns_ip(&"ff02::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn routable_ip_accepts_routable_addresses() {
+        assert!(is_routable_mesh_dns_ip(&"10.0.0.1".parse().unwrap()));
+        assert!(is_routable_mesh_dns_ip(&"192.168.1.1".parse().unwrap()));
+        assert!(is_routable_mesh_dns_ip(&"8.8.8.8".parse().unwrap()));
+        assert!(is_routable_mesh_dns_ip(&"fd00::1".parse().unwrap()));
+        assert!(is_routable_mesh_dns_ip(&"2001:db8::1".parse().unwrap()));
+    }
+
+    // ── is_authoritative_mesh_dns_name helper ───────────────────────────
+
+    #[test]
+    fn authoritative_mesh_name_detects_svc_cluster_local() {
+        assert!(is_authoritative_mesh_dns_name(
+            "my-svc.default.svc.cluster.local",
+            "cluster.local"
+        ));
+        assert!(is_authoritative_mesh_dns_name(
+            "svc.cluster.local",
+            "cluster.local"
+        ));
+    }
+
+    #[test]
+    fn authoritative_mesh_name_rejects_external() {
+        assert!(!is_authoritative_mesh_dns_name(
+            "api.example.com",
+            "cluster.local"
+        ));
+        assert!(!is_authoritative_mesh_dns_name(
+            "cluster.local",
+            "cluster.local"
+        ));
+    }
+
+    #[test]
+    fn authoritative_mesh_name_custom_cluster_domain() {
+        assert!(is_authoritative_mesh_dns_name(
+            "my-svc.ns.svc.corp.internal",
+            "corp.internal"
+        ));
+        assert!(!is_authoritative_mesh_dns_name(
+            "my-svc.ns.svc.cluster.local",
+            "corp.internal"
+        ));
+    }
+
+    // ── Multiple MeshServices in different namespaces ────────────────────
+
+    #[test]
+    fn resolution_table_same_service_name_different_namespaces() {
+        let spiffe_a = "spiffe://cluster.local/ns/ns-a/sa/api";
+        let spiffe_b = "spiffe://cluster.local/ns/ns-b/sa/api";
+        let slice = MeshSlice {
+            workloads: vec![
+                test_workload(spiffe_a, vec!["10.1.0.1"]),
+                test_workload(spiffe_b, vec!["10.2.0.1"]),
+            ],
+            services: vec![
+                test_mesh_service("api", "ns-a", vec![spiffe_a]),
+                test_mesh_service("api", "ns-b", vec![spiffe_b]),
+            ],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+
+        let ips_a = table
+            .resolve("api.ns-a.svc.cluster.local")
+            .expect("namespace A FQDN should resolve");
+        assert!(ips_a.contains(&"10.1.0.1".parse::<IpAddr>().unwrap()));
+
+        let ips_b = table
+            .resolve("api.ns-b.svc.cluster.local")
+            .expect("namespace B FQDN should resolve");
+        assert!(ips_b.contains(&"10.2.0.1".parse::<IpAddr>().unwrap()));
+
+        // Short names also separate by namespace
+        let short_a = table.resolve("api.ns-a").expect("short name A");
+        assert!(short_a.contains(&"10.1.0.1".parse::<IpAddr>().unwrap()));
+
+        let short_b = table.resolve("api.ns-b").expect("short name B");
+        assert!(short_b.contains(&"10.2.0.1".parse::<IpAddr>().unwrap()));
     }
 }

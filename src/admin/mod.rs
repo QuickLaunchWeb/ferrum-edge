@@ -2429,6 +2429,7 @@ async fn handle_backend_capabilities_get(
                     "h2_tls": protocol_support_label(record.grpc_transport.h2_tls),
                     "h2c": protocol_support_label(record.grpc_transport.h2c),
                 },
+                "hbone": protocol_support_label(record.hbone),
                 "last_probe_at_unix_secs": record.last_probe_at_unix_secs,
                 "last_probe_error": record.last_probe_error.clone(),
             })
