@@ -14,7 +14,14 @@ use ferrum_edge::config_sources::k8s::{
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{MeshTrafficPolicyTls, MtlsMode};
-use ferrum_edge::modes::mesh::slice::MeshSlice;
+use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+
+fn slice_request_for_default_ns() -> MeshSliceRequest {
+    MeshSliceRequest {
+        namespace: "default".to_string(),
+        ..Default::default()
+    }
+}
 
 fn istio_object(kind: &str, name: &str, spec: serde_json::Value) -> K8sObject {
     K8sObject {
@@ -109,7 +116,7 @@ fn dr_tls_simple_flows_through_to_upstream_backend_tls() {
     ));
 
     // ── 3. Run slice projection + cold-path DR apply via the public API. ──
-    let slice = MeshSlice::from_gateway_config(&config, Default::default());
+    let slice = MeshSlice::from_gateway_config(&config, slice_request_for_default_ns());
     // The CP applies DRs onto the GatewayConfig at slice projection time; we
     // simulate that here by walking the slice's destination_rules and running
     // the same projection through the runtime's public preparation entry
@@ -188,7 +195,7 @@ fn dr_without_tls_block_yields_none_on_slice() {
         "reviews.default.svc.cluster.local",
     ));
 
-    let slice = MeshSlice::from_gateway_config(&config, Default::default());
+    let slice = MeshSlice::from_gateway_config(&config, slice_request_for_default_ns());
     assert_eq!(slice.destination_rules.len(), 1);
     assert!(
         slice.destination_rules[0]
