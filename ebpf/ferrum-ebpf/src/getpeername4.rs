@@ -7,6 +7,7 @@
 
 use aya_ebpf::macros::cgroup_sock_addr;
 use aya_ebpf::programs::SockAddrContext;
+use aya_ebpf::EbpfContext;
 
 use crate::maps::FERRUM_ORIG_DST4;
 use ferrum_ebpf_common::OrigDstKey;

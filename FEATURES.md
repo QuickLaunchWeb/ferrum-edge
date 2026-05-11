@@ -19,8 +19,8 @@ A comprehensive feature list for Ferrum Edge.
 - **File** — single-instance with YAML/JSON config, SIGHUP reload (Unix only; restart required on other platforms)
 - **Control Plane (CP)** — centralized config authority, gRPC distribution to DPs
 - **Data Plane (DP)** — horizontally scalable traffic processing nodes with multi-CP failover (`FERRUM_DP_CP_GRPC_URLS`)
-- **Mesh** — service-mesh data plane that consumes native `MeshSubscribe` slices, waits for an initial valid slice, and hot-applies later valid mesh updates atomically
-- **Injector** — Kubernetes admission webhook that injects Ferrum mesh sidecars/init capture into opted-in workloads
+- **Mesh** — service-mesh data plane with four topologies (sidecar, ambient, east-west gateway, egress gateway). Consumes native `MeshSubscribe` slices or standard xDS ADS, waits for an initial valid slice, and hot-applies later valid mesh updates atomically. SPIFFE-identity-aware authorization, HBONE termination (HTTP/2 CONNECT over mTLS), transparent DNS proxy for ServiceEntry resolution, Istio/GAMMA RED metrics, RequestAuthentication JWT validation, Telemetry API per-scope configuration, multi-cluster east-west routing, and trust domain federation. See [docs/mesh.md](docs/mesh.md)
+- **Injector** — Kubernetes admission webhook that injects Ferrum mesh sidecars and init capture containers into opted-in workloads. Derives SPIFFE IDs from pod service accounts, supports iptables/eBPF capture modes, and injects JWT secrets via Kubernetes SecretKeyRef
 
 ## Routing
 
@@ -43,13 +43,14 @@ A comprehensive feature list for Ferrum Edge.
 
 ## Service Discovery
 
-Ferrum supports dynamic upstream target discovery through three providers, configured via the `service_discovery` block on an upstream.
+Ferrum supports dynamic upstream target discovery through four providers, configured via the `service_discovery` block on an upstream.
 
 ### Providers
 
 - **DNS-SD** — discovers targets via DNS SRV record lookups. Suitable for environments using mDNS or service-aware DNS infrastructure. Configurable service name and poll interval.
 - **Kubernetes** — queries the Kubernetes API for endpoint addresses backing a named Service. Supports namespace scoping and named port selection. Requires in-cluster credentials or a configured kubeconfig.
 - **Consul** — queries a Consul agent or server for healthy service instances. Supports datacenter selection and ACL token authentication.
+- **Ferrum Mesh** — resolves CP-delivered mesh services and workload SPIFFE references into gateway upstream targets tagged with mesh identity metadata.
 
 ### Behavior
 
@@ -58,10 +59,26 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **Resilience** — if a provider becomes unreachable (DNS timeout, Kubernetes API error, Consul agent down), the upstream retains its last-known target list and continues routing normally. A warning is logged on each failed poll. Normal updates resume automatically when the provider recovers.
 - **Per-target path override** — each upstream target may specify an optional `path` field that overrides the proxy's `backend_path` when that target is selected by the load balancer, enabling different backend path prefixes per target.
 
-## Kubernetes Mesh Translation
+## Service Mesh
+
+- **Four topologies** — `sidecar` (inbound mTLS on 15006 + outbound capture on 15001), `ambient` (HBONE termination on 15008), `east_west_gateway` (SNI-routed passthrough on 15443), `egress_gateway` (mTLS inbound on 15090 → external ServiceEntry backends)
+- **Config consumption** — native `MeshSubscribe` gRPC (Ferrum-native) or standard xDS ADS (CDS/EDS/LDS/RDS/SDS) with multi-CP failover and jittered exponential backoff
+- **SPIFFE identity** — extracted from mTLS peer certificates and HBONE W3C Baggage headers with trust-domain aliasing for federated multi-cluster
+- **Mesh authorization** — identity-based `MeshPolicy` with `PolicyScope` filtering (MeshWide / Namespace / WorkloadSelector), DENY-first evaluation, Istio-compatible implicit deny semantics, principal/request/condition matching with glob patterns
+- **RequestAuthentication** — declares valid JWTs per workload scope (permissive: valid-not-required, matching Istio semantics). Auto-injects `jwks_auth` plugin from `MeshJwtRule` definitions
+- **PeerAuthentication** — per-workload mTLS mode (strict/permissive/disable) with per-port overrides
+- **Transparent DNS proxy** — resolves mesh ServiceEntry hosts and MeshService names to workload IPs, supports wildcard hosts, forwards non-mesh queries upstream (UDP/TCP, A/AAAA, EDNS(0))
+- **Multi-cluster** — east-west gateways with SNI-routed passthrough, remote cluster trust federation via `TrustBundleSet`, cross-cluster SPIFFE identity validation
+- **Egress gateway** — materializes HTTP-family proxies from `ServiceEntry` resources with `mesh_external` location and baggage stripping at egress
+- **Istio/GAMMA observability** — RED metrics (`ferrum_mesh_requests_total`, `ferrum_mesh_request_duration_ms`) with source/destination workload labels, Telemetry API with per-scope tracing sampling, metric tag overrides, and access log filtering
+- **HBONE protocol** — HTTP/2 CONNECT over mTLS for ambient topology with W3C Baggage identity propagation and percent-decoded SPIFFE principal extraction
+
+### Kubernetes Mesh Translation
 
 - **Gateway API route splits** — translates `HTTPRoute.backendRefs` and `GRPCRoute.backendRefs` into direct backends or generated weighted upstreams while preserving zero-weight rule capture semantics.
 - **Istio VirtualService route splits** — translates `VirtualService.http[].route` into direct backends or generated upstreams, including prefix, exact, and regex URI matches.
+- **Istio AuthorizationPolicy** — translates ALLOW/DENY/AUDIT policies with Istio-compatible empty-rule semantics (ALLOW with no rules = allow-nothing)
+- **Kubernetes sidecar injector** — admission webhook with annotation-controlled opt-in, SPIFFE ID derivation from pod namespace/service account, iptables/eBPF capture init containers
 
 ## Plugin System
 

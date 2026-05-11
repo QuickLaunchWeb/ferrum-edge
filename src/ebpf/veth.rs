@@ -5,6 +5,9 @@
 //! program to the host-side veth peer to redirect inbound packets. This module
 //! resolves the veth interface name from the pod's network namespace.
 
+#[cfg(target_os = "linux")]
+use std::path::Path;
+
 /// Discover the host-side veth interface for a pod by reading its network
 /// namespace link index from `/proc/{pid}/net/` or sysfs.
 ///
@@ -52,18 +55,16 @@ fn read_pod_peer_ifindex(pid: u32) -> Option<u32> {
 /// Resolve a network interface name by its ifindex from sysfs.
 #[cfg(target_os = "linux")]
 fn resolve_iface_by_index(ifindex: u32) -> Option<String> {
-    use std::path::Path;
     let sysfs_net = Path::new("/sys/class/net");
     let entries = std::fs::read_dir(sysfs_net).ok()?;
     for entry in entries.flatten() {
         let iface_name = entry.file_name().to_string_lossy().to_string();
         let index_path = entry.path().join("ifindex");
-        if let Ok(index_str) = std::fs::read_to_string(&index_path) {
-            if let Ok(idx) = index_str.trim().parse::<u32>() {
-                if idx == ifindex {
-                    return Some(iface_name);
-                }
-            }
+        if let Ok(index_str) = std::fs::read_to_string(&index_path)
+            && let Ok(idx) = index_str.trim().parse::<u32>()
+            && idx == ifindex
+        {
+            return Some(iface_name);
         }
     }
     None

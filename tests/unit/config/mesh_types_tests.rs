@@ -129,6 +129,7 @@ fn mesh_policy_serializes_with_oneof_scope() {
                 ..Default::default()
             }],
             when: Vec::new(),
+            request_principals: Vec::new(),
             never_matches: false,
             action: PolicyAction::Deny,
         }],
@@ -260,6 +261,7 @@ fn mesh_normalize_strips_trailing_dot_from_request_match_hosts() {
                     ..RequestMatch::default()
                 }],
                 when: Vec::new(),
+                request_principals: Vec::new(),
                 never_matches: false,
                 action: PolicyAction::Allow,
             }],
@@ -286,6 +288,7 @@ fn mesh_normalize_preserves_request_match_host_port() {
                     ..RequestMatch::default()
                 }],
                 when: Vec::new(),
+                request_principals: Vec::new(),
                 never_matches: false,
                 action: PolicyAction::Allow,
             }],
@@ -312,6 +315,7 @@ fn mesh_normalize_trims_request_match_port_pattern_whitespace() {
                     ..RequestMatch::default()
                 }],
                 when: Vec::new(),
+                request_principals: Vec::new(),
                 never_matches: false,
                 action: PolicyAction::Allow,
             }],
@@ -362,6 +366,7 @@ fn mesh_normalize_lowercases_policy_header_names() {
                     ..RequestMatch::default()
                 }],
                 when: Vec::new(),
+                request_principals: Vec::new(),
                 never_matches: false,
                 action: PolicyAction::Allow,
             }],
@@ -393,6 +398,7 @@ fn mesh_normalize_preserves_policy_header_case_collisions() {
                     ..RequestMatch::default()
                 }],
                 when: Vec::new(),
+                request_principals: Vec::new(),
                 never_matches: false,
                 action: PolicyAction::Allow,
             }],

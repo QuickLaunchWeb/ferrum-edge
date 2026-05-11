@@ -3,19 +3,19 @@
 //!
 //! This module owns the trait surface, shared types, and mock backend for
 //! managing BPF program attachment to pod cgroups and veth interfaces.
-//! The real aya-based loader will land behind `#[cfg(feature = "ebpf")]` in a
-//! future phase; Phase 1 uses `MockEbpfBackend` for the full lifecycle without
-//! kernel interaction.
+//! The real aya-based loader lives behind
+//! `#[cfg(all(feature = "ebpf", target_os = "linux"))]`; default and non-Linux
+//! builds use `MockEbpfBackend` for lifecycle tests without kernel interaction.
 
 pub mod cgroup;
 pub mod kernel_probe;
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub mod loader;
 pub mod maps;
 pub mod pod_watcher;
 pub mod veth;
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub use loader::AyaEbpfBackend;
 
 use std::collections::HashMap;
@@ -61,8 +61,9 @@ impl FallbackMode {
 
 /// Abstraction over BPF program management for testability.
 ///
-/// The real implementation will use `aya` to load and attach programs;
-/// `MockEbpfBackend` provides an in-memory substitute for Phase 1 and tests.
+/// `AyaEbpfBackend` uses `aya` to load and attach programs on Linux when the
+/// `ebpf` feature is enabled; `MockEbpfBackend` is the in-memory test
+/// substitute.
 pub trait EbpfBackend: Send + Sync {
     fn load_programs(&mut self) -> Result<(), String>;
     fn attach_cgroup(

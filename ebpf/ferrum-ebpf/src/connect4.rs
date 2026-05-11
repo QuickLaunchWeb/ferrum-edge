@@ -9,7 +9,9 @@
 //! 6. Rewrite destination to 127.0.0.1:15001 (outbound capture port)
 
 use aya_ebpf::macros::cgroup_sock_addr;
+use aya_ebpf::maps::lpm_trie::Key as LpmKey;
 use aya_ebpf::programs::SockAddrContext;
+use aya_ebpf::EbpfContext;
 
 use crate::maps::{
     FERRUM_BYPASS_UIDS, FERRUM_CIDR_EXCLUDE4, FERRUM_CIDR_INCLUDE4, FERRUM_ORIG_DST4,
@@ -31,7 +33,7 @@ pub fn ferrum_connect4(ctx: SockAddrContext) -> i32 {
 fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
     let sock_addr = unsafe { &*ctx.sock_addr };
 
-    let uid = (unsafe { aya_ebpf::helpers::bpf_get_current_uid_gid() } & 0xFFFFFFFF) as u32;
+    let uid = (aya_ebpf::helpers::bpf_get_current_uid_gid() & 0xFFFFFFFF) as u32;
     if unsafe { FERRUM_BYPASS_UIDS.get(&uid) }.is_some() {
         return Ok(1);
     }
@@ -43,13 +45,13 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
         return Ok(1);
     }
 
-    let exclude_key = CidrKey4::host(dst_ip);
-    if unsafe { FERRUM_CIDR_EXCLUDE4.get(&exclude_key) }.is_some() {
+    let exclude_key = LpmKey::new(32, CidrKey4::host(dst_ip));
+    if FERRUM_CIDR_EXCLUDE4.get(&exclude_key).is_some() {
         return Ok(1);
     }
 
-    let include_key = CidrKey4::host(dst_ip);
-    if unsafe { FERRUM_CIDR_INCLUDE4.get(&include_key) }.is_none() {
+    let include_key = LpmKey::new(32, CidrKey4::host(dst_ip));
+    if FERRUM_CIDR_INCLUDE4.get(&include_key).is_none() {
         return Ok(1);
     }
 
@@ -59,7 +61,7 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
         addr: dst_ip,
         port: dst_port as u32,
     };
-    let _ = unsafe { FERRUM_ORIG_DST4.insert(&key, &orig, 0) };
+    let _ = FERRUM_ORIG_DST4.insert(&key, &orig, 0);
 
     let sock_addr = unsafe { &mut *ctx.sock_addr };
     sock_addr.user_ip4 = IPV4_LOOPBACK_NBO;

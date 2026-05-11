@@ -143,7 +143,7 @@ pub enum PolicyScope {
     MeshWide,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MeshRule {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub from: Vec<PrincipalMatch>,
@@ -151,6 +151,14 @@ pub struct MeshRule {
     pub to: Vec<RequestMatch>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub when: Vec<ConditionMatch>,
+    /// Glob patterns over JWT-derived request principals (`iss/sub`).
+    ///
+    /// Mirrors Istio AuthorizationPolicy `from[].source.requestPrincipals`.
+    /// A request matches when its `request_principal` (set by `jwks_auth`
+    /// from the validated JWT's `iss/sub`) matches any pattern in this list.
+    /// An empty list means "any request principal" (no filter).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_principals: Vec<String>,
     /// Synthetic marker for rules that should affect policy accounting but
     /// never match traffic, e.g. Istio ALLOW-without-rules allow-nothing.
     #[serde(default, skip_serializing_if = "is_false")]

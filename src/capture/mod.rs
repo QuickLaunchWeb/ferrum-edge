@@ -98,16 +98,6 @@ fn parse_cidr_env(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_proxy_uid(raw: &str) -> Result<u32, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(DEFAULT_PROXY_UID);
-    }
-    trimmed
-        .parse::<u32>()
-        .map_err(|_| format!("Invalid FERRUM_MESH_PROXY_UID '{raw}'. Expected unsigned integer"))
-}
-
 fn parse_port_list(raw: &str) -> Result<Vec<u16>, String> {
     raw.split(',')
         .map(str::trim)
@@ -117,6 +107,16 @@ fn parse_port_list(raw: &str) -> Result<Vec<u16>, String> {
                 .map_err(|_| format!("Invalid port '{s}' in capture exclude ports"))
         })
         .collect()
+}
+
+fn parse_proxy_uid(raw: &str) -> Result<u32, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_PROXY_UID);
+    }
+    trimmed
+        .parse::<u32>()
+        .map_err(|_| format!("Invalid FERRUM_MESH_PROXY_UID '{raw}'. Expected unsigned integer"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +206,11 @@ impl IptablesPlan {
     }
 }
 
+// EbpfPlan and helpers are consumed by the node-agent eBPF capture path
+// (ambient DaemonSet integration). The sidecar injector deliberately does NOT
+// inject an init container for eBPF mode — privileged capabilities would cause
+// Pod Security Baseline/Restricted admission rejection on every pod, even when
+// the script does nothing on 5.7+ kernels.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EbpfPlan {
@@ -223,6 +228,31 @@ impl EbpfPlan {
             required_kernel: "5.7",
         }
     }
+
+    pub fn fallback_script(&self) -> String {
+        let fallback_cmds = self.fallback.commands.join("\n");
+        let (major, minor) = parse_kernel_requirement(self.required_kernel);
+        format!(
+            "MAJOR=$(uname -r | cut -d. -f1)\n\
+             MINOR=$(uname -r | cut -d. -f2)\n\
+             if [ \"$MAJOR\" -lt {major} ] || \
+             {{ [ \"$MAJOR\" -eq {major} ] && [ \"$MINOR\" -lt {minor} ]; }}; then\n\
+             echo \"Kernel $(uname -r) < {req}, falling back to iptables\"\n\
+             {fallback_cmds}\n\
+             else\n\
+             echo \"Kernel $(uname -r) supports eBPF capture, skipping iptables\"\n\
+             fi",
+            req = self.required_kernel,
+        )
+    }
+}
+
+#[allow(dead_code)]
+fn parse_kernel_requirement(version: &str) -> (u32, u32) {
+    let mut parts = version.split('.');
+    let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(5);
+    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(7);
+    (major, minor)
 }
 
 pub fn should_fallback_to_iptables(kernel_release: &str) -> bool {
@@ -346,6 +376,29 @@ mod tests {
                 .iter()
                 .any(|cmd| cmd.contains("--to-ports 15001"))
         );
+    }
+
+    #[test]
+    fn ebpf_fallback_script_contains_kernel_check_and_iptables() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Ebpf;
+
+        let plan = EbpfPlan::for_config(&config);
+        let script = plan.fallback_script();
+
+        assert!(script.contains("uname -r"));
+        assert!(script.contains("-lt 5"));
+        assert!(script.contains("-lt 7"));
+        assert!(script.contains("falling back to iptables"));
+        assert!(script.contains("supports eBPF"));
+        assert!(script.contains("--to-ports 15001"));
+        assert!(script.contains("--to-ports 15006"));
+    }
+
+    #[test]
+    fn cidr_validation_checks_prefix_range() {
+        assert!(validate_cidr_list(&["10.0.0.0/8".to_string()]).is_ok());
+        assert!(validate_cidr_list(&["10.0.0.0/64".to_string()]).is_err());
     }
 
     #[test]
@@ -503,12 +556,6 @@ mod tests {
     }
 
     #[test]
-    fn cidr_validation_checks_prefix_range() {
-        assert!(validate_cidr_list(&["10.0.0.0/8".to_string()]).is_ok());
-        assert!(validate_cidr_list(&["10.0.0.0/64".to_string()]).is_err());
-    }
-
-    #[test]
     fn parse_cidr_env_splits_and_trims() {
         let result = parse_cidr_env("10.0.0.0/8, 172.16.0.0/12 , 192.168.0.0/16");
         assert_eq!(
@@ -540,5 +587,20 @@ mod tests {
     #[test]
     fn parse_port_list_empty_string_returns_empty() {
         assert!(parse_port_list("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_proxy_uid_rejects_invalid_env_value() {
+        assert!(parse_proxy_uid("not-a-uid").is_err());
+    }
+
+    #[test]
+    fn parse_proxy_uid_trims_valid_value() {
+        assert_eq!(parse_proxy_uid(" 1338 ").unwrap(), 1338);
+    }
+
+    #[test]
+    fn parse_proxy_uid_empty_uses_default() {
+        assert_eq!(parse_proxy_uid("").unwrap(), DEFAULT_PROXY_UID);
     }
 }

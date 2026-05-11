@@ -36,6 +36,7 @@ pub mod body;
 pub mod client_ip;
 pub mod deferred_log;
 pub mod grpc_proxy;
+pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
 pub mod http2_pool;
@@ -70,8 +71,8 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::types::{
-    AuthMode, BackendScheme, DispatchKind, GatewayConfig, HttpFlavor, Proxy, ResponseBodyMode,
-    UpstreamTarget,
+    AuthMode, BackendScheme, DispatchKind, GatewayConfig, HttpFlavor, PluginConfig, PluginScope,
+    Proxy, ResponseBodyMode, UpstreamTarget,
 };
 use crate::config::{EnvConfig, PoolConfig};
 use crate::connection_pool::ConnectionPool;
@@ -79,6 +80,7 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
+use crate::identity::{SharedSvidBundle, TrustBundleSet as RuntimeTrustBundleSet};
 use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
@@ -99,6 +101,7 @@ use self::backend_capabilities::{
 };
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
+use self::hbone_pool::{HboneConnectionPool, HbonePoolError};
 use self::http2_pool::Http2ConnectionPool;
 
 /// Static empty HashMap used by rejection responses to avoid allocating a new
@@ -112,6 +115,18 @@ const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 /// Capability probes run during startup and background refresh, so they should
 /// not inherit long per-request connect timeouts that could hold readiness.
 const BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP: u64 = 5_000;
+const GATEWAY_WORKLOAD_METRICS_PLUGIN_ID: &str = "__gateway_workload_metrics";
+const WORKLOAD_METRICS_PLUGIN_NAME: &str = "workload_metrics";
+const HBONE_INNER_IDENTITY_BAGGAGE_PREFIXES: &[&str] = &[
+    "source.",
+    "source_",
+    "src.",
+    "src_",
+    "destination.",
+    "destination_",
+    "dst.",
+    "dst_",
+];
 
 /// Partial outcome of a single H3 capability probe. `probe_h2_tls` writes
 /// directly into `record` (it owns `&mut record`), but `probe_h3` runs in
@@ -121,6 +136,209 @@ const BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP: u64 = 5_000;
 struct H3ProbeOutcome {
     h3: ProtocolSupport,
     error: Option<String>,
+}
+
+struct HboneProbeTarget<'a> {
+    host: &'a str,
+    port: u16,
+    hbone_port: u16,
+    previous_hbone: Option<ProtocolSupport>,
+}
+
+fn gateway_managed_plugin_timestamp() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(0, 0).unwrap_or_else(chrono::Utc::now)
+}
+
+fn gateway_svid_spiffe_id(slot: &SharedSvidBundle) -> Option<String> {
+    let snapshot = slot.load_full();
+    snapshot
+        .as_ref()
+        .as_ref()
+        .map(|bundle| bundle.spiffe_id.as_str().to_string())
+}
+
+fn ensure_workload_spiffe_id_config(config: &mut serde_json::Value, spiffe_id: &str) {
+    if !config.is_object() {
+        *config = serde_json::json!({});
+    }
+    let Some(object) = config.as_object_mut() else {
+        return;
+    };
+    if object
+        .get("workload_spiffe_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return;
+    }
+    object.insert(
+        "workload_spiffe_id".to_string(),
+        serde_json::Value::String(spiffe_id.to_string()),
+    );
+}
+
+fn inject_gateway_workload_metrics_if_svid(
+    config: &mut GatewayConfig,
+    gateway_svid: &SharedSvidBundle,
+    namespace: &str,
+) {
+    let Some(spiffe_id) = gateway_svid_spiffe_id(gateway_svid) else {
+        return;
+    };
+
+    let operator_idx = config
+        .plugin_configs
+        .iter()
+        .position(|plugin| {
+            plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+                && plugin.enabled
+                && plugin.scope == PluginScope::Global
+                && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
+                && plugin.namespace == namespace
+        })
+        .or_else(|| {
+            config.plugin_configs.iter().position(|plugin| {
+                plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+                    && plugin.scope == PluginScope::Global
+                    && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
+                    && plugin.namespace == namespace
+            })
+        });
+
+    if let Some(operator_idx) = operator_idx {
+        ensure_workload_spiffe_id_config(
+            &mut config.plugin_configs[operator_idx].config,
+            &spiffe_id,
+        );
+        config
+            .plugin_configs
+            .retain(|plugin| plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID);
+        return;
+    }
+
+    if let Some(existing) = config
+        .plugin_configs
+        .iter_mut()
+        .find(|plugin| plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID)
+    {
+        existing.plugin_name = WORKLOAD_METRICS_PLUGIN_NAME.to_string();
+        existing.namespace = namespace.to_string();
+        existing.scope = PluginScope::Global;
+        existing.proxy_id = None;
+        existing.enabled = true;
+        existing.priority_override = None;
+        existing.api_spec_id = None;
+        existing.config = serde_json::json!({
+            "workload_spiffe_id": spiffe_id,
+        });
+        return;
+    }
+
+    let timestamp = gateway_managed_plugin_timestamp();
+    config.plugin_configs.push(PluginConfig {
+        id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+        plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+        namespace: namespace.to_string(),
+        config: serde_json::json!({
+            "workload_spiffe_id": spiffe_id,
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: timestamp,
+        updated_at: timestamp,
+    });
+}
+
+fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig) -> bool {
+    config.proxies.is_empty()
+        && config.consumers.is_empty()
+        && config.upstreams.is_empty()
+        && config
+            .plugin_configs
+            .iter()
+            .all(|plugin| plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID)
+}
+
+fn gateway_hbone_mtls_observed(
+    dispatch_hbone: bool,
+    error_class: Option<retry::ErrorClass>,
+) -> bool {
+    dispatch_hbone
+        && !matches!(
+            error_class,
+            Some(
+                retry::ErrorClass::ConnectionTimeout
+                    | retry::ErrorClass::ConnectionRefused
+                    | retry::ErrorClass::ConnectionReset
+                    | retry::ErrorClass::ConnectionClosed
+                    | retry::ErrorClass::DnsLookupError
+                    | retry::ErrorClass::TlsError
+                    | retry::ErrorClass::ConnectionPoolError
+                    | retry::ErrorClass::PortExhaustion
+                    | retry::ErrorClass::ProtocolError
+                    | retry::ErrorClass::RequestError
+                    | retry::ErrorClass::RequestBodyTooLarge
+            )
+        )
+}
+
+fn annotate_gateway_hbone_metadata(
+    ctx: &mut RequestContext,
+    target: Option<&UpstreamTarget>,
+    dispatch_hbone: bool,
+    error_class: Option<retry::ErrorClass>,
+) {
+    if !gateway_hbone_mtls_observed(dispatch_hbone, error_class) {
+        return;
+    }
+
+    ctx.metadata.insert(
+        "mesh.connection_security_policy".to_string(),
+        "mutual_tls".to_string(),
+    );
+    ctx.metadata
+        .insert("mesh.gateway.transport".to_string(), "hbone".to_string());
+
+    let Some(target) = target else {
+        return;
+    };
+    for (tag, metadata_key) in [
+        ("mesh.spiffe_id", "mesh.destination.principal"),
+        ("mesh.namespace", "mesh.destination.namespace"),
+        ("mesh.service", "mesh.destination.service"),
+        ("mesh.trust_domain", "mesh.destination.trust_domain"),
+    ] {
+        if let Some(value) = target.tags.get(tag) {
+            ctx.metadata.insert(metadata_key.to_string(), value.clone());
+        }
+    }
+}
+
+fn hbone_inner_baggage_strip_prefixes(configured_prefixes: &[String]) -> Vec<String> {
+    let mut prefixes = configured_prefixes.to_vec();
+    for prefix in HBONE_INNER_IDENTITY_BAGGAGE_PREFIXES {
+        if !prefixes.iter().any(|existing| existing == prefix) {
+            prefixes.push((*prefix).to_string());
+        }
+    }
+    prefixes
+}
+
+fn hbone_inner_headers_with_stripped_baggage(
+    headers: &HashMap<String, String>,
+    configured_prefixes: &[String],
+) -> Option<HashMap<String, String>> {
+    if !crate::modes::mesh::hbone::has_baggage_header_in_map(headers) {
+        return None;
+    }
+
+    let mut owned = headers.clone();
+    let prefixes = hbone_inner_baggage_strip_prefixes(configured_prefixes);
+    crate::modes::mesh::hbone::strip_egress_baggage_in_map(&mut owned, &prefixes);
+    Some(owned)
 }
 
 impl H3ProbeOutcome {
@@ -756,6 +974,35 @@ fn supports_direct_http2_backend(
             .is_some_and(|record| record.plain_http.h2_tls.is_supported())
 }
 
+fn can_use_hbone_pool(
+    retain_request_body: bool,
+    requires_request_body_buffering: bool,
+    stream_request_body: bool,
+) -> bool {
+    !retain_request_body && !requires_request_body_buffering && stream_request_body
+}
+
+fn proxy_can_dispatch_hbone(proxy: &Proxy) -> bool {
+    proxy.dispatch_kind == DispatchKind::HttpPool
+}
+
+fn supports_hbone_backend(
+    state: &ProxyState,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> bool {
+    let Some(target) = upstream_target else {
+        return false;
+    };
+    proxy_can_dispatch_hbone(proxy)
+        && hbone_pool::target_hbone_enabled(target)
+        && state.gateway_svid_bundle.load().is_some()
+        && state
+            .backend_capabilities
+            .get(proxy, Some(target))
+            .is_some_and(|record| record.hbone.is_supported())
+}
+
 fn should_fallback_to_reqwest_after_http2_pool_error(err: &http2_pool::Http2PoolError) -> bool {
     matches!(err, http2_pool::Http2PoolError::BackendSelectedHttp1 { .. })
 }
@@ -1086,6 +1333,8 @@ pub struct ProxyState {
     pub grpc_pool: Arc<GrpcConnectionPool>,
     /// HTTP/2 connection pool for HTTPS backends (proper stream multiplexing)
     pub http2_pool: Arc<Http2ConnectionPool>,
+    /// HBONE connection pool for gateway-to-mesh outbound tunnels.
+    pub hbone_pool: Arc<HboneConnectionPool>,
     /// HTTP/3 connection pool for QUIC backends (reuses QUIC connections)
     pub h3_pool: Arc<Http3ConnectionPool>,
     /// Startup-classified backend protocol capabilities keyed by real backend target identity.
@@ -1176,6 +1425,17 @@ pub struct ProxyState {
     /// mesh-internal identity claims (e.g. `source.principal`) from leaking
     /// to non-mesh upstream services.
     pub mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
+    /// Optional gateway SPIFFE identity used by gateway-to-mesh outbound TLS.
+    /// The slot shape matches mesh SVID rotation so later trust-bundle updates
+    /// can hot-swap without blocking proxy readers.
+    #[allow(dead_code)] // Consumed by gateway-to-mesh HBONE dispatch in the next bridge phase.
+    pub gateway_svid_bundle: SharedSvidBundle,
+    /// Startup SVID bundle loaded from files. CP-delivered trust bundles are an
+    /// override; when a CP snapshot removes them, this restores file trust.
+    pub gateway_file_svid_bundle: SharedSvidBundle,
+    /// Latest CP-delivered gateway trust bundles, stored even when this DP has
+    /// no local SVID so later bridge phases can verify mesh peers from CP state.
+    pub gateway_trust_bundles: SharedGatewayTrustBundles,
 }
 
 #[inline]
@@ -1202,7 +1462,92 @@ fn via_header_for_backend_response_body<'a>(
     }
 }
 
+fn empty_svid_bundle_slot() -> SharedSvidBundle {
+    Arc::new(ArcSwap::new(Arc::new(None)))
+}
+
+fn clone_svid_bundle_slot(slot: &SharedSvidBundle) -> SharedSvidBundle {
+    Arc::new(ArcSwap::new(slot.load_full()))
+}
+
+pub type SharedGatewayTrustBundles = Arc<ArcSwap<Option<RuntimeTrustBundleSet>>>;
+
+fn empty_gateway_trust_bundle_slot() -> SharedGatewayTrustBundles {
+    Arc::new(ArcSwap::new(Arc::new(None)))
+}
+
+fn load_gateway_svid_bundle(env_config: &EnvConfig) -> Result<SharedSvidBundle, anyhow::Error> {
+    let configured = (
+        env_config.gateway_svid_cert_path.as_deref(),
+        env_config.gateway_svid_key_path.as_deref(),
+        env_config.gateway_svid_trust_bundle_path.as_deref(),
+    );
+    let (cert_path, key_path, trust_bundle_path) = match configured {
+        (None, None, None) => return Ok(empty_svid_bundle_slot()),
+        (Some(cert_path), Some(key_path), Some(trust_bundle_path)) => {
+            (cert_path, key_path, trust_bundle_path)
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "gateway SVID configuration requires FERRUM_GATEWAY_SVID_CERT_PATH, \
+             FERRUM_GATEWAY_SVID_KEY_PATH, and FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH together"
+            ));
+        }
+    };
+
+    let cert_path = std::path::Path::new(cert_path);
+    let key_path = std::path::Path::new(key_path);
+    let trust_bundle_path = std::path::Path::new(trust_bundle_path);
+    let bundle = crate::identity::file_loader::load_svid_bundle_from_files(
+        cert_path,
+        key_path,
+        trust_bundle_path,
+        env_config.gateway_spiffe_id.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to load gateway SVID bundle: {e}"))?;
+
+    info!(
+        spiffe_id = %bundle.spiffe_id,
+        trust_domain = %bundle.trust_domain(),
+        trust_anchors = bundle.trust_bundles.local.x509_authorities.len(),
+        "Loaded gateway SPIFFE SVID bundle"
+    );
+    Ok(Arc::new(ArcSwap::new(Arc::new(Some(bundle)))))
+}
+
 impl ProxyState {
+    /// Install CP-delivered trust bundles for gateway-to-mesh TLS.
+    ///
+    /// If the gateway already has a file-loaded SVID, rebuild the SVID bundle
+    /// with the new trust material so TLS builders see the update through the
+    /// same lock-free slot. If there is no SVID, keep the bundles separately
+    /// for future gateway-mesh features.
+    ///
+    /// This is called from the DP config-apply loop, which is single-writer for
+    /// CP-delivered gateway trust. If another writer is introduced later, this
+    /// load/modify/store needs to become an atomic compare-and-swap update.
+    pub fn update_gateway_trust_bundles(&self, trust_bundles: RuntimeTrustBundleSet) {
+        self.gateway_trust_bundles
+            .store(Arc::new(Some(trust_bundles.clone())));
+
+        // SAFETY: the load-modify-store below is valid because CP-delivered
+        // gateway trust changes are applied only by the single DP gRPC apply
+        // loop. If another writer is added, convert this to a compare/swap or
+        // a dedicated synchronized update to avoid losing concurrent SVID edits.
+        let current = self.gateway_svid_bundle.load_full();
+        if let Some(mut bundle) = current.as_ref().clone() {
+            bundle.trust_bundles = trust_bundles;
+            self.gateway_svid_bundle.store(Arc::new(Some(bundle)));
+        }
+    }
+
+    /// Clear CP-delivered trust bundles and restore the startup file SVID.
+    pub fn clear_gateway_trust_bundles(&self) {
+        self.gateway_trust_bundles.store(Arc::new(None));
+        self.gateway_svid_bundle
+            .store(self.gateway_file_svid_bundle.load_full());
+    }
+
     /// Construct the gateway state and start the health checker.
     ///
     /// `health_check_shutdown_rx` is forwarded to
@@ -1222,7 +1567,7 @@ impl ProxyState {
     /// mid-`http_probe` finish its TCP / TLS / HTTP round-trip and emit
     /// a misleading "unhealthy" log line right before tear-down.
     pub fn new(
-        config: GatewayConfig,
+        mut config: GatewayConfig,
         dns_cache: DnsCache,
         env_config: crate::config::EnvConfig,
         tls_policy: Option<TlsPolicy>,
@@ -1292,6 +1637,20 @@ impl ProxyState {
             crls.clone(),
         ));
         let env_config_arc = Arc::new(env_config.clone());
+        let gateway_svid_bundle = load_gateway_svid_bundle(&env_config_arc)?;
+        inject_gateway_workload_metrics_if_svid(
+            &mut config,
+            &gateway_svid_bundle,
+            &env_config_arc.namespace,
+        );
+        let gateway_file_svid_bundle = clone_svid_bundle_slot(&gateway_svid_bundle);
+        let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
+        let hbone_pool = Arc::new(HboneConnectionPool::new(
+            global_pool_config.clone(),
+            dns_cache.clone(),
+            gateway_svid_bundle.clone(),
+            pool_shard_amount,
+        ));
         let h3_pool = Arc::new(Http3ConnectionPool::new(
             env_config_arc.clone(),
             dns_cache.clone(),
@@ -1562,6 +1921,7 @@ impl ProxyState {
             },
             grpc_pool,
             http2_pool,
+            hbone_pool,
             h3_pool,
             backend_capabilities,
             backend_capabilities_refresh,
@@ -1606,6 +1966,9 @@ impl ProxyState {
             overload,
             adaptive_buffer,
             mesh_egress_strip_baggage_keys,
+            gateway_svid_bundle,
+            gateway_file_svid_bundle,
+            gateway_trust_bundles,
         };
         Ok((state, health_check_handles))
     }
@@ -1722,6 +2085,10 @@ impl ProxyState {
         let probe_timeout = Duration::from_millis(probe_proxy.backend_connect_timeout_ms);
         let host = target.host();
         let port = target.port();
+        let previous_hbone = self
+            .backend_capabilities
+            .get_by_key(&target.key)
+            .map(|record| record.hbone);
 
         match scheme {
             BackendScheme::Http => {
@@ -1755,6 +2122,20 @@ impl ProxyState {
             }
             BackendScheme::Tcp | BackendScheme::Tcps | BackendScheme::Udp | BackendScheme::Dtls => {
             }
+        }
+        if target.hbone_hint && matches!(scheme, BackendScheme::Http) {
+            self.probe_hbone(
+                &probe_proxy,
+                probe_timeout,
+                HboneProbeTarget {
+                    host,
+                    port,
+                    hbone_port: target.hbone_port,
+                    previous_hbone,
+                },
+                &mut record,
+            )
+            .await;
         }
 
         record.last_probe_at_unix_secs = backend_capabilities::now_unix_secs();
@@ -1847,6 +2228,69 @@ impl ProxyState {
                         "HTTP/2 probe timed out for {}:{} after {}ms",
                         host, port, probe_proxy.backend_connect_timeout_ms
                     ),
+                );
+            }
+        }
+    }
+
+    async fn probe_hbone(
+        &self,
+        probe_proxy: &Proxy,
+        probe_timeout: Duration,
+        target: HboneProbeTarget<'_>,
+        record: &mut BackendCapabilityRecord,
+    ) {
+        let host = target.host;
+        let port = target.port;
+        let hbone_port = target.hbone_port;
+        if self.gateway_svid_bundle.load().is_none() {
+            record.hbone = ProtocolSupport::Unknown;
+            debug!(
+                "HBONE probe for {}:{} skipped: gateway SVID is not configured",
+                host, port
+            );
+            return;
+        }
+
+        match tokio::time::timeout(
+            probe_timeout,
+            self.hbone_pool
+                .warmup_connection(probe_proxy, host, port, hbone_port),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                record.hbone = ProtocolSupport::Supported;
+            }
+            Ok(Err(err)) => {
+                if err.is_capability_failure() {
+                    record.hbone = ProtocolSupport::Unsupported;
+                } else if let Some(previous) = target.previous_hbone {
+                    record.hbone = previous;
+                }
+                append_probe_error(
+                    record,
+                    format!("HBONE probe failed for {host}:{port} via port {hbone_port}: {err}"),
+                );
+                debug!(
+                    "HBONE probe for {}:{} via port {} classified unsupported: {}",
+                    host, port, hbone_port, err
+                );
+            }
+            Err(_) => {
+                if let Some(previous) = target.previous_hbone {
+                    record.hbone = previous;
+                }
+                append_probe_error(
+                    record,
+                    format!(
+                        "HBONE probe timed out for {}:{} via port {} after {}ms",
+                        host, port, hbone_port, probe_proxy.backend_connect_timeout_ms
+                    ),
+                );
+                debug!(
+                    "HBONE probe for {}:{} via port {} timed out after {}ms; leaving unknown",
+                    host, port, hbone_port, probe_proxy.backend_connect_timeout_ms
                 );
             }
         }
@@ -1953,6 +2397,7 @@ impl ProxyState {
         let h2_supported = Arc::new(AtomicU64::new(0));
         let h3_supported = Arc::new(AtomicU64::new(0));
         let h2c_supported = Arc::new(AtomicU64::new(0));
+        let hbone_supported = Arc::new(AtomicU64::new(0));
 
         stream::iter(targets)
             .for_each_concurrent(buffer, |target| {
@@ -1961,6 +2406,7 @@ impl ProxyState {
                 let h2_supported = h2_supported.clone();
                 let h3_supported = h3_supported.clone();
                 let h2c_supported = h2c_supported.clone();
+                let hbone_supported = hbone_supported.clone();
                 let semaphore = semaphore.clone();
                 async move {
                     // Same rule as `run_warmup_task_batch`: prefer
@@ -1989,6 +2435,9 @@ impl ProxyState {
                     if record.grpc_transport.h2c.is_supported() {
                         h2c_supported.fetch_add(1, Ordering::Relaxed);
                     }
+                    if record.hbone.is_supported() {
+                        hbone_supported.fetch_add(1, Ordering::Relaxed);
+                    }
                     state.backend_capabilities.upsert(target.key, record);
                     refreshed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1996,11 +2445,12 @@ impl ProxyState {
             .await;
 
         info!(
-            "Backend capability refresh complete: {} backends classified (h2_tls={}, h3={}, h2c={})",
+            "Backend capability refresh complete: {} backends classified (h2_tls={}, h3={}, h2c={}, hbone={})",
             refreshed.load(Ordering::Relaxed),
             h2_supported.load(Ordering::Relaxed),
             h3_supported.load(Ordering::Relaxed),
             h2c_supported.load(Ordering::Relaxed),
+            hbone_supported.load(Ordering::Relaxed),
         );
     }
 
@@ -2601,6 +3051,11 @@ impl ProxyState {
         new_config.normalize_fields();
         // Resolve upstream TLS into each proxy's resolved_tls before applying.
         new_config.resolve_upstream_tls();
+        inject_gateway_workload_metrics_if_svid(
+            &mut new_config,
+            &self.gateway_svid_bundle,
+            &self.env_config.namespace,
+        );
 
         // Run the full validation pipeline before swapping. Existing call
         // sites (`file_loader`, `db_loader`, `dp_client`) validate first, so
@@ -2619,14 +3074,8 @@ impl ProxyState {
 
         // If this is the initial load (old config empty, new config has data),
         // do a full rebuild of all caches instead of computing a delta.
-        let old_is_empty = old_config.proxies.is_empty()
-            && old_config.consumers.is_empty()
-            && old_config.plugin_configs.is_empty()
-            && old_config.upstreams.is_empty();
-        let new_is_empty = new_config.proxies.is_empty()
-            && new_config.consumers.is_empty()
-            && new_config.plugin_configs.is_empty()
-            && new_config.upstreams.is_empty();
+        let old_is_empty = config_empty_ignoring_gateway_managed_plugins(&old_config);
+        let new_is_empty = config_empty_ignoring_gateway_managed_plugins(&new_config);
 
         if old_is_empty && !new_is_empty {
             let route_table = RouterCache::build_route_table_snapshot(&new_config);
@@ -3091,6 +3540,11 @@ impl ProxyState {
         // canonicalized fields.
         new_config.normalize_fields();
         new_config.resolve_upstream_tls();
+        inject_gateway_workload_metrics_if_svid(
+            &mut new_config,
+            &self.gateway_svid_bundle,
+            &self.env_config.namespace,
+        );
         if let Err(errors) = self.validate_full_config(&new_config) {
             for msg in &errors {
                 error!("Incremental config rejected: {}", msg);
@@ -6404,8 +6858,10 @@ async fn handle_proxy_request_inner(
     // Some auth plugins (for example `hmac_auth`) verify request body integrity
     // at authenticate time. Buffer the body before the auth phase runs so those
     // plugins can read `ctx.request_body_bytes`.
-    let requires_body_before_authenticate = capabilities
-        .has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
+    // HBONE CONNECT must keep hyper's upgrade handle in the streaming request
+    // body. Pre-auth body buffering would consume it and make the relay fail.
+    let requires_body_before_authenticate = !is_hbone_connect
+        && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
         && plugins.iter().any(|plugin| {
             plugin.requires_request_body_before_authenticate()
                 && plugin.should_buffer_request_body(&ctx)
@@ -7877,6 +8333,13 @@ async fn handle_proxy_request_inner(
     // pool), and reqwest's client pool is keyed per-target, so a
     // `dispatch_h3=false` rotation already picks up the new target's warmed
     // reqwest client without extra plumbing here.
+    let current_dispatch_hbone = !has_retry
+        && can_use_hbone_pool(
+            has_retry,
+            requires_request_body_buffering,
+            stream_request_body,
+        )
+        && supports_hbone_backend(&state, &proxy, upstream_target.as_deref());
     let mut current_dispatch_h3 =
         supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
@@ -7899,6 +8362,7 @@ async fn handle_proxy_request_inner(
             has_retry,
             &request_client_ip,
             is_tls,
+            false,
             current_dispatch_h3,
             &ctx.request_bytes_observed,
             inbound_version,
@@ -8065,6 +8529,7 @@ async fn handle_proxy_request_inner(
             false, // no retry — don't retain body
             &request_client_ip,
             is_tls,
+            current_dispatch_hbone,
             current_dispatch_h3,
             &ctx.request_bytes_observed,
             inbound_version,
@@ -8078,6 +8543,12 @@ async fn handle_proxy_request_inner(
     let mut response_headers = backend_resp.headers;
     let backend_resolved_ip = backend_resp.backend_resolved_ip;
     let backend_error_class = backend_resp.error_class;
+    annotate_gateway_hbone_metadata(
+        &mut ctx,
+        upstream_target.as_deref(),
+        current_dispatch_hbone,
+        backend_error_class,
+    );
 
     debug!(
         proxy_id = %proxy.id,
@@ -8561,6 +9032,16 @@ async fn handle_proxy_request_inner(
 
             if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
                 crate::proxy::body::direct_streaming_h2_body(resp.into_body(), cl)
+            } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
+                // No Content-Length — enforce response-size limits while
+                // streaming H2 bodies, including HBONE tunnel responses,
+                // without buffering the whole backend response into memory.
+                crate::proxy::body::size_limited_streaming_h2_body(
+                    resp.into_body(),
+                    state.max_response_body_size_bytes,
+                    cl,
+                    state.h2_coalesce_target_bytes,
+                )
             } else if use_passthrough {
                 // Response too large to benefit from coalescing — stream
                 // direct, let hyper forward 1 MiB frames as-is. Saves the
@@ -9085,6 +9566,7 @@ async fn proxy_to_backend(
     retain_request_body: bool,
     client_ip: &str,
     is_tls: bool,
+    dispatch_hbone: bool,
     dispatch_h3: bool,
     // Shared counter for request body bytes observed on the wire. Populated
     // by the body handling block below via either `fetch_max` (buffered paths)
@@ -9126,6 +9608,25 @@ async fn proxy_to_backend(
         .await
         .ok()
         .map(|ip| ip.to_string());
+
+    if dispatch_hbone {
+        let (backend_resp, body_bytes) = proxy_to_backend_hbone(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            client_request_body,
+            upstream_target,
+            stream_response,
+            client_ip,
+            is_tls,
+            resolved_ip.clone(),
+            ctx_request_bytes_observed,
+        )
+        .await;
+        return (backend_resp, body_bytes);
+    }
 
     // Plain HTTPS requests attempt the native H3 pool only when startup
     // classification has already proved that this concrete backend target
@@ -10346,6 +10847,535 @@ fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
 ///
 /// Uses hyper's HTTP/2 client directly to multiplex concurrent requests over
 /// a single persistent TLS connection, avoiding reqwest's connection-per-burst behavior.
+fn hbone_pool_error_response(
+    state: &ProxyState,
+    proxy: &Proxy,
+    err: &HbonePoolError,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let error_class = err.error_class();
+    if error_class == retry::ErrorClass::PortExhaustion {
+        state.overload.record_port_exhaustion();
+    }
+    let error_body = if error_class == retry::ErrorClass::DnsLookupError {
+        r#"{"error":"DNS resolution for HBONE backend failed"}"#.to_string()
+    } else {
+        format!(r#"{{"error":"HBONE backend unavailable: {}"}}"#, err)
+    };
+    error!(
+        proxy_id = %proxy.id,
+        error_kind = retry::error_class_log_kind(error_class),
+        error = %err,
+        "HBONE backend request failed"
+    );
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(error_body.into_bytes()),
+        headers: HashMap::new(),
+        connection_error: !retry::request_reached_wire(error_class),
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(error_class),
+    }
+}
+
+fn hbone_hyper_error_response(
+    proxy: &Proxy,
+    err: hyper::Error,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    error!(proxy_id = %proxy.id, error = %err, "HBONE tunneled HTTP request failed");
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(r#"{"error":"HBONE backend unavailable"}"#.into()),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ProtocolError),
+    }
+}
+
+enum HyperBodyCollectError {
+    TooLarge,
+    Read(hyper::Error),
+}
+
+async fn collect_hyper_body_with_limit(
+    mut body: Incoming,
+    max_size: usize,
+) -> Result<Vec<u8>, HyperBodyCollectError> {
+    if max_size == 0 {
+        return body
+            .collect()
+            .await
+            .map(|collected| collected.to_bytes().to_vec())
+            .map_err(HyperBodyCollectError::Read);
+    }
+
+    let mut body_bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(HyperBodyCollectError::Read)?;
+        if let Some(data) = frame.data_ref() {
+            if body_bytes.len().saturating_add(data.len()) > max_size {
+                return Err(HyperBodyCollectError::TooLarge);
+            }
+            body_bytes.extend_from_slice(data);
+        }
+    }
+    Ok(body_bytes)
+}
+
+fn hbone_response_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    observed_size: Option<usize>,
+    max_size: usize,
+) -> retry::BackendResponse {
+    match observed_size {
+        Some(size) => warn!(
+            proxy_id = %proxy.id,
+            response_body_bytes = size,
+            max_response_body_size_bytes = max_size,
+            "HBONE backend response body exceeds configured size limit"
+        ),
+        None => warn!(
+            proxy_id = %proxy.id,
+            max_response_body_size_bytes = max_size,
+            "HBONE backend response body exceeded configured size limit while buffering"
+        ),
+    }
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(
+            r#"{"error":"Backend response body exceeds maximum size"}"#
+                .as_bytes()
+                .to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+    }
+}
+
+fn hbone_request_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    observed_size: Option<usize>,
+    max_size: usize,
+) -> retry::BackendResponse {
+    match observed_size {
+        Some(size) => warn!(
+            proxy_id = %proxy.id,
+            request_body_bytes = size,
+            max_request_body_size_bytes = max_size,
+            "HBONE request body exceeds configured size limit"
+        ),
+        None => warn!(
+            proxy_id = %proxy.id,
+            max_request_body_size_bytes = max_size,
+            "HBONE streaming request body exceeded configured size limit"
+        ),
+    }
+    retry::BackendResponse {
+        status_code: 413,
+        body: ResponseBody::Buffered(
+            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_to_backend_hbone(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    client_request_body: ClientRequestBody,
+    upstream_target: Option<&UpstreamTarget>,
+    stream_response: bool,
+    client_ip: &str,
+    is_tls: bool,
+    resolved_ip: Option<String>,
+    ctx_request_bytes_observed: &Arc<std::sync::atomic::AtomicU64>,
+) -> (retry::BackendResponse, Option<Bytes>) {
+    let Some(target) = upstream_target else {
+        return (
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"HBONE target missing"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: true,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ConnectionPoolError),
+            },
+            None,
+        );
+    };
+
+    debug!(
+        proxy_id = %proxy.id,
+        target_host = %target.host,
+        target_port = target.port,
+        "Proxying request via gateway HBONE tunnel"
+    );
+
+    let original_req = match client_request_body {
+        ClientRequestBody::Streaming(request) => *request,
+        ClientRequestBody::Buffered(_) => {
+            debug_assert!(
+                false,
+                "HBONE pool should not be used when request body is pre-buffered"
+            );
+            return (
+                retry::BackendResponse {
+                    status_code: 500,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"HBONE request buffering invariant violated"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+            );
+        }
+    };
+
+    if request_may_have_body(method, headers)
+        && state.max_request_body_size_bytes > 0
+        && let Some(content_length) = headers.get("content-length")
+        && let Ok(len) = content_length.parse::<usize>()
+        && len > state.max_request_body_size_bytes
+    {
+        return (
+            hbone_request_body_too_large_response(
+                proxy,
+                resolved_ip,
+                Some(len),
+                state.max_request_body_size_bytes,
+            ),
+            None,
+        );
+    }
+
+    let hbone_port = hbone_pool::target_hbone_port(target);
+    let tunnel = match state
+        .hbone_pool
+        .get_tunnel(proxy, &target.host, target.port, hbone_port)
+        .await
+    {
+        Ok(tunnel) => tunnel,
+        Err(err) => {
+            if err.is_capability_failure() {
+                debug!(
+                    proxy_id = %proxy.id,
+                    error = %err,
+                    "HBONE capability establishment failed; downgrading cached capability so subsequent requests skip the tunnel"
+                );
+                state
+                    .backend_capabilities
+                    .mark_hbone_unsupported(proxy, Some(target));
+            }
+            return (
+                hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                None,
+            );
+        }
+    };
+
+    let io = TokioIo::new(tunnel);
+    let (mut sender, connection) = match hyper::client::conn::http1::Builder::new()
+        .handshake(io)
+        .await
+    {
+        Ok(parts) => parts,
+        Err(err) => return (hbone_hyper_error_response(proxy, err, resolved_ip), None),
+    };
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            debug!("hbone_pool: tunneled HTTP/1 connection closed: {}", e);
+        }
+    });
+
+    let uri: hyper::Uri = match backend_url.parse() {
+        Ok(uri) => uri,
+        Err(e) => {
+            error!(proxy_id = %proxy.id, error = %e, "Invalid HBONE backend URL");
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+            );
+        }
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .cloned()
+        .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+    let tunneled_uri = hyper::Uri::builder()
+        .path_and_query(path_and_query)
+        .build()
+        .unwrap_or_else(|_| hyper::Uri::from_static("/"));
+
+    let (mut parts, body) = original_req.into_parts();
+    let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let max_request_body_size = if state.max_request_body_size_bytes > 0 {
+        state.max_request_body_size_bytes
+    } else {
+        usize::MAX
+    };
+    let body = body::SizeLimitedIncoming::new_with_counter(
+        body,
+        max_request_body_size,
+        Arc::clone(&body_size_exceeded),
+        Arc::clone(ctx_request_bytes_observed),
+    );
+    parts.uri = tunneled_uri;
+    parts.version = hyper::Version::HTTP_11;
+    parts.method = match parse_hyper_method(method) {
+        Ok(method) => method,
+        Err(()) => {
+            return (
+                retry::BackendResponse {
+                    status_code: 405,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+            );
+        }
+    };
+    parts.headers.clear();
+    let backend_host_header = hbone_pool::authority_for_host_port(&target.host, target.port);
+    let owned_hbone_headers =
+        hbone_inner_headers_with_stripped_baggage(headers, &state.mesh_egress_strip_baggage_keys);
+    let headers = owned_hbone_headers.as_ref().unwrap_or(headers);
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    for (k, v) in headers {
+        match k.as_str() {
+            "host" => {
+                if proxy.preserve_host_header
+                    && let Ok(val) = hyper::header::HeaderValue::from_str(v)
+                {
+                    parts.headers.insert(hyper::header::HOST, val);
+                }
+            }
+            n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
+            _ => {
+                if let (Ok(name), Ok(val)) = (
+                    hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                    hyper::header::HeaderValue::from_str(v),
+                ) {
+                    parts.headers.insert(name, val);
+                }
+            }
+        }
+    }
+    if (!proxy.preserve_host_header || !parts.headers.contains_key(hyper::header::HOST))
+        && let Ok(val) = hyper::header::HeaderValue::from_str(&backend_host_header)
+    {
+        parts.headers.insert(hyper::header::HOST, val);
+    }
+
+    let xff_val = build_xff_value(
+        headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
+    );
+    if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
+        parts.headers.insert("x-forwarded-for", val);
+    }
+    if let Ok(val) = hyper::header::HeaderValue::from_str(if is_tls { "https" } else { "http" }) {
+        parts.headers.insert("x-forwarded-proto", val);
+    }
+    if let Some(host) = headers.get("host")
+        && let Ok(val) = hyper::header::HeaderValue::from_str(host)
+    {
+        parts.headers.insert("x-forwarded-host", val);
+    }
+    if let Some(ref via) = state.via_header_http2
+        && let Ok(val) = hyper::header::HeaderValue::from_str(via)
+    {
+        parts.headers.insert("via", val);
+    }
+    if state.add_forwarded_header {
+        let proto_str = if is_tls { "https" } else { "http" };
+        let fwd = build_forwarded_value(
+            client_ip,
+            proto_str,
+            headers.get("host").map(|s| s.as_str()),
+        );
+        if let Ok(val) = hyper::header::HeaderValue::from_str(&fwd) {
+            parts.headers.insert("forwarded", val);
+        }
+    }
+
+    let backend_req = Request::from_parts(parts, body);
+    let send_fut = sender.send_request(backend_req);
+    let response = if proxy.backend_read_timeout_ms > 0 {
+        let timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
+        match tokio::time::timeout(timeout, send_fut).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        hbone_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            None,
+                            state.max_request_body_size_bytes,
+                        ),
+                        None,
+                    );
+                }
+                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+            Err(_) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        hbone_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            None,
+                            state.max_request_body_size_bytes,
+                        ),
+                        None,
+                    );
+                }
+                warn!(
+                    proxy_id = %proxy.id,
+                    "HBONE tunneled HTTP read timeout ({}ms) waiting for backend response",
+                    proxy.backend_read_timeout_ms
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                );
+            }
+        }
+    } else {
+        match send_fut.await {
+            Ok(response) => response,
+            Err(err) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        hbone_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            None,
+                            state.max_request_body_size_bytes,
+                        ),
+                        None,
+                    );
+                }
+                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+        }
+    };
+
+    let status = response.status().as_u16();
+    let content_length = response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if state.max_response_body_size_bytes > 0
+        && let Some(len) = content_length
+        && len > state.max_response_body_size_bytes
+    {
+        return (
+            hbone_response_body_too_large_response(
+                proxy,
+                resolved_ip,
+                Some(len),
+                state.max_response_body_size_bytes,
+            ),
+            None,
+        );
+    }
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+    if stream_response {
+        (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::StreamingH2(response),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            None,
+        )
+    } else {
+        let body_bytes = match collect_hyper_body_with_limit(
+            response.into_body(),
+            state.max_response_body_size_bytes,
+        )
+        .await
+        {
+            Ok(body_bytes) => body_bytes,
+            Err(HyperBodyCollectError::TooLarge) => {
+                return (
+                    hbone_response_body_too_large_response(
+                        proxy,
+                        resolved_ip,
+                        None,
+                        state.max_response_body_size_bytes,
+                    ),
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::Read(err)) => {
+                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+        };
+        (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::Buffered(body_bytes),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            None,
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend_http2(
     state: &ProxyState,
@@ -13044,6 +14074,169 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hbone_dispatch_gate_rejects_https_backends() {
+        let http_proxy = warmup_test_proxy("http", BackendScheme::Http, "orders.test", 8080);
+        let https_proxy = warmup_test_proxy("https", BackendScheme::Https, "orders.test", 8443);
+
+        assert!(
+            proxy_can_dispatch_hbone(&http_proxy),
+            "HBONE tunnel currently carries plaintext HTTP to the workload port"
+        );
+        assert!(
+            !proxy_can_dispatch_hbone(&https_proxy),
+            "HTTPS backends require TLS-over-tunnel support before HBONE dispatch is safe"
+        );
+    }
+
+    #[test]
+    fn hbone_http1_host_authority_includes_backend_port() {
+        assert_eq!(
+            hbone_pool::authority_for_host_port("orders.default.svc.cluster.local", 8080),
+            "orders.default.svc.cluster.local:8080"
+        );
+        assert_eq!(
+            hbone_pool::authority_for_host_port("2001:db8::10", 8080),
+            "[2001:db8::10]:8080"
+        );
+    }
+
+    #[test]
+    fn gateway_hbone_metadata_marks_mtls_and_mesh_destination() {
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        let target = UpstreamTarget {
+            host: "10.0.0.8".to_string(),
+            port: 8080,
+            weight: 1,
+            tags: HashMap::from([
+                (
+                    "mesh.spiffe_id".to_string(),
+                    "spiffe://cluster.local/ns/default/sa/api".to_string(),
+                ),
+                ("mesh.namespace".to_string(), "default".to_string()),
+                ("mesh.service".to_string(), "payments".to_string()),
+                ("mesh.trust_domain".to_string(), "cluster.local".to_string()),
+            ]),
+            path: None,
+        };
+        ctx.metadata.insert(
+            "mesh.destination.service".to_string(),
+            "edge-proxy-default".to_string(),
+        );
+
+        annotate_gateway_hbone_metadata(&mut ctx, Some(&target), true, None);
+
+        assert_eq!(
+            ctx.metadata
+                .get("mesh.connection_security_policy")
+                .map(String::as_str),
+            Some("mutual_tls")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mesh.gateway.transport")
+                .map(String::as_str),
+            Some("hbone")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mesh.destination.principal")
+                .map(String::as_str),
+            Some("spiffe://cluster.local/ns/default/sa/api")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mesh.destination.service")
+                .map(String::as_str),
+            Some("payments")
+        );
+    }
+
+    #[test]
+    fn gateway_hbone_metadata_skips_pre_mtls_failures() {
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+
+        annotate_gateway_hbone_metadata(&mut ctx, None, true, Some(retry::ErrorClass::TlsError));
+
+        assert!(!ctx.metadata.contains_key("mesh.connection_security_policy"));
+        assert!(!ctx.metadata.contains_key("mesh.gateway.transport"));
+    }
+
+    #[test]
+    fn gateway_hbone_metadata_skips_unclassified_connect_failures() {
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+
+        annotate_gateway_hbone_metadata(
+            &mut ctx,
+            None,
+            true,
+            Some(retry::ErrorClass::RequestError),
+        );
+
+        assert!(!ctx.metadata.contains_key("mesh.connection_security_policy"));
+        assert!(!ctx.metadata.contains_key("mesh.gateway.transport"));
+    }
+
+    #[test]
+    fn gateway_hbone_metadata_skips_pre_tunnel_body_limit_failures() {
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "POST".to_string(), "/".to_string());
+
+        annotate_gateway_hbone_metadata(
+            &mut ctx,
+            None,
+            true,
+            Some(retry::ErrorClass::RequestBodyTooLarge),
+        );
+
+        assert!(!ctx.metadata.contains_key("mesh.connection_security_policy"));
+        assert!(!ctx.metadata.contains_key("mesh.gateway.transport"));
+    }
+
+    #[test]
+    fn gateway_hbone_metadata_skips_connect_rejection_protocol_errors() {
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+
+        annotate_gateway_hbone_metadata(
+            &mut ctx,
+            None,
+            true,
+            Some(retry::ErrorClass::ProtocolError),
+        );
+
+        assert!(!ctx.metadata.contains_key("mesh.connection_security_policy"));
+        assert!(!ctx.metadata.contains_key("mesh.gateway.transport"));
+    }
+
+    #[test]
+    fn hbone_inner_baggage_strips_identity_members() {
+        let headers = HashMap::from([(
+            "baggage".to_string(),
+            "trace_id=abc,source.principal=spiffe%3A%2F%2Fattacker,destination_identity=spiffe%3A%2F%2Ftarget,custom.token=secret"
+                .to_string(),
+        )]);
+
+        let filtered =
+            hbone_inner_headers_with_stripped_baggage(&headers, &["custom.".to_string()])
+                .expect("baggage should produce an owned filtered header map");
+
+        assert_eq!(
+            filtered.get("baggage").map(String::as_str),
+            Some("trace_id=abc")
+        );
+    }
+
+    #[test]
+    fn hbone_inner_baggage_skips_clone_when_absent() {
+        let headers = HashMap::from([("x-request-id".to_string(), "abc".to_string())]);
+
+        assert!(hbone_inner_headers_with_stripped_baggage(&headers, &[]).is_none());
+    }
+
     // ----- Per-IP cleanup task shutdown wiring ---------------------------
     //
     // The cleanup loop must honour the global shutdown watch channel so the
@@ -13140,8 +14333,213 @@ mod tests {
             upstreams: vec![],
             loaded_at: chrono::Utc::now(),
             known_namespaces: Vec::new(),
+            trust_bundles: None,
             mesh: None,
         }
+    }
+
+    fn test_runtime_trust_bundles(
+        trust_domain: &str,
+        x509_authorities: Vec<Vec<u8>>,
+    ) -> RuntimeTrustBundleSet {
+        let trust_domain = crate::identity::TrustDomain::new(trust_domain)
+            .expect("test trust domain should be valid");
+        RuntimeTrustBundleSet {
+            local: crate::identity::TrustBundle {
+                trust_domain,
+                x509_authorities,
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: HashMap::new(),
+        }
+    }
+
+    fn test_svid_bundle(trust_bundles: RuntimeTrustBundleSet) -> crate::identity::SvidBundle {
+        let spiffe_id = crate::identity::SpiffeId::new("spiffe://file.local/ns/default/sa/gateway")
+            .expect("test SPIFFE ID should be valid");
+        crate::identity::SvidBundle {
+            spiffe_id,
+            cert_chain_der: vec![vec![42]],
+            private_key_pkcs8_der: Vec::new(),
+            trust_bundles,
+        }
+    }
+
+    #[test]
+    fn gateway_workload_metrics_operator_global_replaces_managed_plugin() {
+        let svid_slot = Arc::new(ArcSwap::new(Arc::new(Some(test_svid_bundle(
+            test_runtime_trust_bundles("file.local", vec![vec![1]]),
+        )))));
+        let timestamp = gateway_managed_plugin_timestamp();
+        let mut config = make_validation_config(vec![]);
+        config.plugin_configs = vec![
+            PluginConfig {
+                id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+                plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+                namespace: "ferrum".to_string(),
+                config: json!({ "workload_spiffe_id": "spiffe://old.example/ns/old/sa/old" }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            PluginConfig {
+                id: "operator-metrics".to_string(),
+                plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+                namespace: "ferrum".to_string(),
+                config: json!({ "custom": true }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: false,
+                priority_override: Some(2100),
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+        ];
+
+        inject_gateway_workload_metrics_if_svid(&mut config, &svid_slot, "ferrum");
+
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID)
+        );
+        let plugin = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == "operator-metrics")
+            .expect("operator plugin should remain");
+        assert!(!plugin.enabled);
+        assert_eq!(plugin.priority_override, Some(2100));
+        assert_eq!(
+            plugin
+                .config
+                .get("workload_spiffe_id")
+                .and_then(serde_json::Value::as_str),
+            Some("spiffe://file.local/ns/default/sa/gateway")
+        );
+        assert_eq!(plugin.config.get("custom"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn gateway_workload_metrics_prefers_enabled_operator_global() {
+        let svid_slot = Arc::new(ArcSwap::new(Arc::new(Some(test_svid_bundle(
+            test_runtime_trust_bundles("file.local", vec![vec![1]]),
+        )))));
+        let timestamp = gateway_managed_plugin_timestamp();
+        let mut config = make_validation_config(vec![]);
+        config.plugin_configs = vec![
+            PluginConfig {
+                id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+                plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+                namespace: "ferrum".to_string(),
+                config: json!({ "workload_spiffe_id": "spiffe://old.example/ns/old/sa/old" }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            PluginConfig {
+                id: "operator-disabled".to_string(),
+                plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+                namespace: "ferrum".to_string(),
+                config: json!({ "disabled": true }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: false,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            PluginConfig {
+                id: "operator-enabled".to_string(),
+                plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+                namespace: "ferrum".to_string(),
+                config: json!({ "enabled": true }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+        ];
+
+        inject_gateway_workload_metrics_if_svid(&mut config, &svid_slot, "ferrum");
+
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID)
+        );
+        let disabled = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == "operator-disabled")
+            .expect("disabled operator plugin should remain");
+        assert!(
+            disabled.config.get("workload_spiffe_id").is_none(),
+            "disabled duplicate should not consume the gateway identity when an enabled plugin exists"
+        );
+        let enabled = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == "operator-enabled")
+            .expect("enabled operator plugin should remain");
+        assert_eq!(
+            enabled
+                .config
+                .get("workload_spiffe_id")
+                .and_then(serde_json::Value::as_str),
+            Some("spiffe://file.local/ns/default/sa/gateway")
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_gateway_trust_bundles_restores_startup_svid_trust() {
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let file_trust = test_runtime_trust_bundles("file.local", vec![vec![1, 2, 3]]);
+        let cp_trust = test_runtime_trust_bundles("cp.local", vec![vec![4, 5, 6]]);
+        let file_svid = test_svid_bundle(file_trust);
+
+        state
+            .gateway_file_svid_bundle
+            .store(Arc::new(Some(file_svid.clone())));
+        state.gateway_svid_bundle.store(Arc::new(Some(file_svid)));
+
+        state.update_gateway_trust_bundles(cp_trust);
+        {
+            let loaded = state.gateway_svid_bundle.load_full();
+            let svid = loaded.as_ref().as_ref().expect("SVID should be present");
+            assert_eq!(svid.trust_bundles.local.trust_domain.as_str(), "cp.local");
+            assert_eq!(
+                svid.trust_bundles.local.x509_authorities,
+                vec![vec![4, 5, 6]]
+            );
+        }
+
+        state.clear_gateway_trust_bundles();
+
+        assert!(state.gateway_trust_bundles.load().is_none());
+        let loaded = state.gateway_svid_bundle.load_full();
+        let svid = loaded.as_ref().as_ref().expect("SVID should be restored");
+        assert_eq!(svid.trust_bundles.local.trust_domain.as_str(), "file.local");
+        assert_eq!(
+            svid.trust_bundles.local.x509_authorities,
+            vec![vec![1, 2, 3]]
+        );
     }
 
     #[tokio::test]

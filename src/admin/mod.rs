@@ -2342,6 +2342,7 @@ async fn handle_cluster_status(state: &AdminState) -> Result<Response<Full<Bytes
                         "namespace": n.namespace,
                         "status": "online",
                         "connected_at": n.connected_at.to_rfc3339(),
+                        "last_heartbeat_at": n.last_heartbeat_at.to_rfc3339(),
                         "last_sync_at": n.last_update_at.to_rfc3339(),
                     })
                 })
@@ -2428,6 +2429,7 @@ async fn handle_backend_capabilities_get(
                     "h2_tls": protocol_support_label(record.grpc_transport.h2_tls),
                     "h2c": protocol_support_label(record.grpc_transport.h2c),
                 },
+                "hbone": protocol_support_label(record.hbone),
                 "last_probe_at_unix_secs": record.last_probe_at_unix_secs,
                 "last_probe_error": record.last_probe_error.clone(),
             })

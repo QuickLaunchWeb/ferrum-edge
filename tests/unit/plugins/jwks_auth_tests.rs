@@ -1523,3 +1523,78 @@ async fn test_jwks_auth_provider_without_override_uses_global() {
         Some("user@example.com")
     );
 }
+
+// ─── Request Principal Metadata (Istio iss/sub) ──────────────────────
+
+#[tokio::test]
+async fn test_jwks_auth_sets_request_principal_metadata() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(&single_provider_config(&jwks_uri), default_client()).unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    let token = create_rs256_token(
+        &json!({"sub": "user-42", "iss": "https://auth.example.com"}),
+        private_key_pem,
+    );
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("jwks_auth.request_principal")
+            .map(String::as_str),
+        Some("https://auth.example.com/user-42")
+    );
+}
+
+#[tokio::test]
+async fn test_jwks_auth_request_principal_not_set_without_iss() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(&single_provider_config(&jwks_uri), default_client()).unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    // Token without iss claim — request_principal should not be set
+    let token = create_rs256_token(&json!({"sub": "user-42"}), private_key_pem);
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert!(
+        !ctx.metadata.contains_key("jwks_auth.request_principal"),
+        "request_principal should not be set without iss claim"
+    );
+}
+
+#[tokio::test]
+async fn test_jwks_auth_no_request_principal_when_no_token() {
+    let (_server, jwks_uri) = start_jwks_server(include_bytes!(
+        "../../../tests/fixtures/test_rsa_public.pem"
+    ))
+    .await;
+    let plugin = JwksAuth::new(&single_provider_config(&jwks_uri), default_client()).unwrap();
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    let mut ctx = make_ctx();
+    // No Authorization header
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert!(
+        !ctx.metadata.contains_key("jwks_auth.request_principal"),
+        "request_principal should not be set for anonymous requests"
+    );
+}

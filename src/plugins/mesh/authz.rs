@@ -185,16 +185,18 @@ impl Plugin for MeshAuthz {
             && has_baggage_header_from_request(ctx)
             && !is_authenticated_hbone_request(ctx);
         if unauthenticated_hbone_baggage {
+            record_ignored_baggage_reason(&mut ctx.metadata, "unauthenticated_hbone");
             ctx.metadata.insert(
-                "mesh_authz.ignored_baggage".to_string(),
-                "unauthenticated_hbone".to_string(),
+                "mesh_authz.ignored_baggage.unauthenticated".to_string(),
+                "true".to_string(),
             );
         }
         let (source_principal, trust_domain_mismatch) = self.resolve_source_principal(ctx);
         if trust_domain_mismatch {
+            record_ignored_baggage_reason(&mut ctx.metadata, "trust_domain_mismatch");
             ctx.metadata.insert(
-                "mesh_authz.ignored_baggage".to_string(),
-                "trust_domain_mismatch".to_string(),
+                "mesh_authz.ignored_baggage.trust_domain_mismatch".to_string(),
+                "true".to_string(),
             );
         }
         let mut host = ctx
@@ -216,8 +218,10 @@ impl Plugin for MeshAuthz {
             }
             BTreeMap::new()
         };
+        let request_principal = ctx.metadata.get("jwks_auth.request_principal").cloned();
         let request = MeshAuthzRequest {
             source_principal,
+            request_principal,
             method: Some(ctx.method.clone()),
             path: Some(ctx.path.clone()),
             host,
@@ -344,6 +348,18 @@ fn is_hbone_request(ctx: &RequestContext) -> bool {
     ctx.metadata
         .get("request_protocol")
         .is_some_and(|value| value == "hbone")
+}
+
+fn record_ignored_baggage_reason(metadata: &mut HashMap<String, String>, reason: &'static str) {
+    metadata
+        .entry("mesh_authz.ignored_baggage".to_string())
+        .and_modify(|existing| {
+            if !existing.split(',').any(|item| item == reason) {
+                existing.push(',');
+                existing.push_str(reason);
+            }
+        })
+        .or_insert_with(|| reason.to_string());
 }
 
 fn has_baggage_header_from_request(ctx: &RequestContext) -> bool {
