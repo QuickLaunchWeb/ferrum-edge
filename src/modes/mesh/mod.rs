@@ -28,14 +28,14 @@ use crate::config::conf_file::resolve_ferrum_var;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm,
     PassiveHealthCheck, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,
-    Upstream, UpstreamTarget,
+    SubsetDefinition, SubsetTrafficPolicy, Upstream, UpstreamTarget,
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
 use crate::modes::mesh::config::{
-    AppProtocol, EastWestGateway, MeshConfig, MeshJwtRule, MeshRequestAuthentication,
-    MeshTelemetryConfig, PolicyScope, Resolution, ServiceEntry, ServiceEntryLocation,
-    service_entry_exported_to_namespace,
+    AppProtocol, EastWestGateway, MeshConfig, MeshDestinationRule, MeshJwtRule, MeshLoadBalancer,
+    MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig, MeshTrafficPolicy, PolicyScope,
+    Resolution, ServiceEntry, ServiceEntryLocation, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
@@ -466,6 +466,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     inject_mesh_global_plugins(&mut config, runtime, mesh_slice);
     materialize_east_west_gateway_proxies(&mut config, runtime, mesh_slice);
     materialize_egress_gateway_proxies(&mut config, runtime, mesh_slice);
+    apply_destination_rules(&mut config, mesh_slice);
     config.normalize_fields();
     Ok(config)
 }
@@ -486,6 +487,7 @@ fn gateway_config_from_mesh_slice(
             service_entries: slice.service_entries.clone(),
             request_authentications: slice.request_authentications.clone(),
             telemetry_resources: slice.telemetry_resources.clone(),
+            destination_rules: slice.destination_rules.clone(),
             trust_bundles: slice.trust_bundles.clone(),
             multi_cluster: slice.multi_cluster.clone(),
         })),
@@ -886,6 +888,192 @@ fn mesh_east_west_service_proxy_id(namespace: &str, name: &str) -> String {
 
 fn mesh_east_west_service_upstream_id(namespace: &str, name: &str) -> String {
     format!("__mesh-ew-upstream-{namespace}-{name}").replace(['/', '.'], "-")
+}
+
+// ── DestinationRule application ────────────────────────────────────────
+
+/// Apply DestinationRule traffic policies onto matching upstreams.
+///
+/// For each DestinationRule, we find upstreams whose targets match the DR
+/// host and apply:
+/// - `connectionPool.tcp.connectTimeout` onto proxies referencing the upstream
+/// - `outlierDetection` onto the upstream's passive health check
+/// - `loadBalancer` onto the upstream's algorithm
+/// - `subsets` as `SubsetDefinition` entries on the upstream
+///
+/// Multiple DRs targeting the same upstream are applied in a deterministic
+/// order — sorted by `(namespace, name)` — so the last-writer-wins outcome
+/// is reproducible across CP restarts and DP subscribers.
+fn apply_destination_rules(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
+    let mut sorted_destination_rules: Vec<&MeshDestinationRule> =
+        mesh_slice.destination_rules.iter().collect();
+    sorted_destination_rules.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+
+    for dr in sorted_destination_rules {
+        let matching_upstream_indices: Vec<usize> = config
+            .upstreams
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, upstream)| {
+                destination_rule_matches_upstream(dr, upstream).then_some(idx)
+            })
+            .collect();
+
+        if matching_upstream_indices.is_empty() {
+            debug!(
+                host = %dr.host,
+                rule = %dr.name,
+                "DestinationRule has no matching upstream; skipping"
+            );
+            continue;
+        };
+
+        let connect_timeout_ms = dr
+            .traffic_policy
+            .as_ref()
+            .and_then(|tp| tp.connect_timeout_ms);
+
+        for idx in matching_upstream_indices {
+            let upstream = &mut config.upstreams[idx];
+
+            if let Some(ref policy) = dr.traffic_policy {
+                apply_traffic_policy_to_upstream(upstream, policy);
+            }
+
+            if !dr.subsets.is_empty() {
+                if upstream.subsets.is_some() {
+                    debug!(
+                        rule = %dr.name,
+                        upstream = %upstream.id,
+                        "DestinationRule subsets overwriting existing upstream.subsets"
+                    );
+                }
+                let subset_defs: Vec<SubsetDefinition> = dr
+                    .subsets
+                    .iter()
+                    .map(|subset| SubsetDefinition {
+                        name: subset.name.clone(),
+                        labels: subset.labels.clone(),
+                        traffic_policy: subset.traffic_policy.as_ref().map(|sp| {
+                            SubsetTrafficPolicy {
+                                load_balancer_algorithm: mesh_lb_to_ferrum(&sp.load_balancer),
+                            }
+                        }),
+                    })
+                    .collect();
+                upstream.subsets = Some(subset_defs);
+            }
+
+            if let Some(timeout_ms) = connect_timeout_ms {
+                let upstream_id = config.upstreams[idx].id.clone();
+                for proxy in &mut config.proxies {
+                    if proxy.upstream_id.as_deref() == Some(upstream_id.as_str())
+                        && proxy.backend_connect_timeout_ms != timeout_ms
+                    {
+                        debug!(
+                            proxy = %proxy.id,
+                            upstream = %upstream_id,
+                            previous_ms = proxy.backend_connect_timeout_ms,
+                            new_ms = timeout_ms,
+                            rule = %dr.name,
+                            "DestinationRule overriding proxy backend_connect_timeout_ms"
+                        );
+                        proxy.backend_connect_timeout_ms = timeout_ms;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn destination_rule_matches_upstream(dr: &MeshDestinationRule, upstream: &Upstream) -> bool {
+    upstream
+        .targets
+        .iter()
+        .any(|target| destination_rule_host_matches(&dr.host, &dr.namespace, &target.host))
+        || upstream
+            .name
+            .as_deref()
+            .is_some_and(|name| destination_rule_host_matches(&dr.host, &dr.namespace, name))
+        || destination_rule_host_matches(&dr.host, &dr.namespace, &upstream.id)
+}
+
+fn destination_rule_host_matches(rule_host: &str, namespace: &str, candidate: &str) -> bool {
+    let rule_host = rule_host.trim_end_matches('.').to_ascii_lowercase();
+    let candidate = candidate.trim_end_matches('.').to_ascii_lowercase();
+    if candidate == rule_host {
+        return true;
+    }
+
+    if !rule_host.contains('.') {
+        let namespaced = format!("{rule_host}.{namespace}");
+        return candidate == namespaced || candidate.starts_with(&format!("{namespaced}.svc."));
+    }
+
+    let dot_count = rule_host.bytes().filter(|byte| *byte == b'.').count();
+    if dot_count == 1 {
+        return candidate.starts_with(&format!("{rule_host}.svc."));
+    }
+    if rule_host.ends_with(".svc") {
+        return candidate.starts_with(&format!("{rule_host}."));
+    }
+
+    false
+}
+
+/// Apply a `MeshTrafficPolicy` onto a Ferrum `Upstream`.
+fn apply_traffic_policy_to_upstream(upstream: &mut Upstream, policy: &MeshTrafficPolicy) {
+    if let Some(lb) = &policy.load_balancer {
+        if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
+            upstream.algorithm = algorithm;
+        }
+        if let MeshLoadBalancer::ConsistentHash(ch) = lb {
+            if let Some(header) = &ch.http_header_name {
+                upstream.hash_on = Some(format!("header:{header}"));
+            } else if let Some(cookie) = &ch.http_cookie_name {
+                upstream.hash_on = Some(format!("cookie:{cookie}"));
+            } else if ch.use_source_ip {
+                upstream.hash_on = Some("ip".to_string());
+            }
+        }
+    }
+
+    // Outlier detection -> passive health check.
+    if let Some(ref od) = policy.outlier_detection {
+        let passive = upstream
+            .health_checks
+            .get_or_insert_with(HealthCheckConfig::default)
+            .passive
+            .get_or_insert_with(PassiveHealthCheck::default);
+
+        if let Some(consecutive) = od.consecutive_errors {
+            passive.unhealthy_threshold = consecutive;
+        }
+        if let Some(interval) = od.interval_seconds {
+            passive.unhealthy_window_seconds = interval;
+        }
+        if let Some(ejection) = od.base_ejection_seconds {
+            passive.healthy_after_seconds = ejection;
+        }
+        if let Some(max_pct) = od.max_ejection_percent {
+            passive.max_ejection_percent = Some(max_pct);
+        }
+    }
+}
+
+/// Convert a mesh LB config to a Ferrum `LoadBalancerAlgorithm`.
+fn mesh_lb_to_ferrum(lb: &Option<MeshLoadBalancer>) -> Option<LoadBalancerAlgorithm> {
+    match lb {
+        Some(MeshLoadBalancer::Simple(simple)) => match simple {
+            MeshSimpleLb::RoundRobin => Some(LoadBalancerAlgorithm::RoundRobin),
+            MeshSimpleLb::LeastRequest => Some(LoadBalancerAlgorithm::LeastConnections),
+            MeshSimpleLb::Random => Some(LoadBalancerAlgorithm::Random),
+            // Istio PASSTHROUGH means direct-to-original-IP; Ferrum always routes via upstreams so RoundRobin is the closest approximation.
+            MeshSimpleLb::Passthrough => Some(LoadBalancerAlgorithm::RoundRobin),
+        },
+        Some(MeshLoadBalancer::ConsistentHash(_)) => Some(LoadBalancerAlgorithm::ConsistentHashing),
+        None => None,
+    }
 }
 
 // ── Egress gateway proxy materialization ─────────────────────────────────
@@ -2767,6 +2955,136 @@ mod tests {
         .0
     }
 
+    fn destination_rule_test_upstream(id: &str, host: &str) -> Upstream {
+        let now = chrono::Utc::now();
+        Upstream {
+            id: id.to_string(),
+            namespace: "default".to_string(),
+            name: Some(id.to_string()),
+            targets: vec![UpstreamTarget {
+                host: host.to_string(),
+                port: 8080,
+                weight: 1,
+                tags: HashMap::new(),
+                path: None,
+            }],
+            algorithm: LoadBalancerAlgorithm::RoundRobin,
+            hash_on: None,
+            hash_on_cookie_config: None,
+            health_checks: None,
+            service_discovery: None,
+            subsets: None,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn destination_rule_test_proxy(id: &str, upstream_id: &str) -> Proxy {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "hosts": [format!("{id}.example.com")],
+            "backend_host": "",
+            "backend_port": 0,
+            "upstream_id": upstream_id
+        }))
+        .expect("test proxy")
+    }
+
+    #[test]
+    fn destination_rule_applies_short_host_to_all_matching_upstreams() {
+        let mut config = GatewayConfig {
+            proxies: vec![
+                destination_rule_test_proxy("p1", "u1"),
+                destination_rule_test_proxy("p2", "u2"),
+            ],
+            upstreams: vec![
+                destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local"),
+                destination_rule_test_upstream("u2", "reviews.default.svc.cluster.local"),
+            ],
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connect_timeout_ms: Some(1234),
+                    load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                    ..MeshTrafficPolicy::default()
+                }),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &slice);
+
+        assert!(
+            config
+                .upstreams
+                .iter()
+                .all(|upstream| upstream.algorithm == LoadBalancerAlgorithm::Random)
+        );
+        assert!(
+            config
+                .proxies
+                .iter()
+                .all(|proxy| proxy.backend_connect_timeout_ms == 1234)
+        );
+    }
+
+    #[test]
+    fn destination_rule_apply_order_is_deterministic_by_namespace_then_name() {
+        let mut config = GatewayConfig {
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        // Insert in reverse alphabetical order; sort by (namespace, name) means
+        // "default/a-first" applies first and "default/z-last" wins.
+        let slice = MeshSlice {
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "z-last".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connect_timeout_ms: Some(9999),
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "a-first".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connect_timeout_ms: Some(1111),
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &slice);
+
+        assert_eq!(config.upstreams[0].algorithm, LoadBalancerAlgorithm::Random);
+        assert_eq!(config.proxies[0].backend_connect_timeout_ms, 9999);
+    }
+
     #[test]
     fn telemetry_tracing_merge_preserves_inherited_sampling_for_tag_only_override() {
         let mesh_slice = MeshSlice {
@@ -2817,6 +3135,7 @@ mod tests {
                     },
                 },
             ],
+            destination_rules: Vec::new(),
             trust_bundles: None,
             multi_cluster: None,
         };
@@ -4513,6 +4832,17 @@ mod tests {
                     443,
                     AppProtocol::Tls,
                 )],
+                destination_rules: vec![MeshDestinationRule {
+                    name: "partner-policy".to_string(),
+                    namespace: "default".to_string(),
+                    host: "api.partner.com".to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connect_timeout_ms: Some(1234),
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    subsets: Vec::new(),
+                }],
                 ..MeshConfig::default()
             })),
             ..GatewayConfig::default()
@@ -4529,6 +4859,7 @@ mod tests {
         assert_eq!(egress_proxy.hosts, vec!["api.partner.com"]);
         assert!(!egress_proxy.frontend_tls);
         assert_eq!(egress_proxy.backend_scheme, Some(BackendScheme::Https));
+        assert_eq!(egress_proxy.backend_connect_timeout_ms, 1234);
 
         // Should have the egress upstream
         let egress_upstream = prepared
@@ -4540,6 +4871,7 @@ mod tests {
             .expect("egress upstream should be materialized");
         assert_eq!(egress_upstream.targets.len(), 1);
         assert_eq!(egress_upstream.targets[0].host, "api.partner.com");
+        assert_eq!(egress_upstream.algorithm, LoadBalancerAlgorithm::Random);
 
         // Mesh plugins should be injected
         assert!(

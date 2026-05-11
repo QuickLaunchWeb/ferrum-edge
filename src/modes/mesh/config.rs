@@ -695,6 +695,102 @@ pub struct EastWestGateway {
     pub network: Option<String>,
 }
 
+// ── DestinationRule ──────────────────────────────────────────────────────
+
+/// Istio DestinationRule traffic policy mapped onto Ferrum primitives.
+///
+/// Each DestinationRule targets a service host and carries connection pool
+/// settings, outlier detection, load balancer config, and optional subsets.
+/// The mesh runtime applies these onto matching `Upstream` entries during
+/// `prepare_gateway_config_for_mesh()`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshDestinationRule {
+    pub name: String,
+    pub namespace: String,
+    /// Target service host (e.g., `reviews.default.svc.cluster.local`).
+    pub host: String,
+    /// Top-level traffic policy applied to all targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_policy: Option<MeshTrafficPolicy>,
+    /// Named subsets with per-subset label selectors and optional policy
+    /// overrides. Proxies reference these via `upstream_subset`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subsets: Vec<MeshSubset>,
+}
+
+/// Traffic policy controlling connection pool, outlier detection, and LB.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MeshTrafficPolicy {
+    /// Backend connect timeout in milliseconds
+    /// (from `connectionPool.tcp.connectTimeout`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    /// Outlier detection (maps to Ferrum PassiveHealthCheck).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outlier_detection: Option<MeshOutlierDetection>,
+    /// Load balancer configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_balancer: Option<MeshLoadBalancer>,
+}
+
+/// Outlier detection settings from Istio DestinationRule.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshOutlierDetection {
+    /// Number of consecutive errors before ejecting a target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consecutive_errors: Option<u32>,
+    /// Detection interval in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_seconds: Option<u64>,
+    /// Base ejection duration in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ejection_seconds: Option<u64>,
+    /// Maximum percentage of hosts that can be ejected (0-100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ejection_percent: Option<u8>,
+}
+
+/// Load balancer configuration from Istio DestinationRule.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshLoadBalancer {
+    /// Simple algorithm selection.
+    Simple(MeshSimpleLb),
+    /// Consistent hash configuration.
+    ConsistentHash(MeshConsistentHash),
+}
+
+/// Simple LB algorithm names matching Istio's enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MeshSimpleLb {
+    RoundRobin,
+    LeastRequest,
+    Random,
+    Passthrough,
+}
+
+/// Consistent hash key source.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshConsistentHash {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_header_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_cookie_name: Option<String>,
+    #[serde(default)]
+    pub use_source_ip: bool,
+}
+
+/// Named subset of targets with label selectors and optional policy override.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshSubset {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub labels: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_policy: Option<MeshTrafficPolicy>,
+}
+
 // ── Top-level mesh config container ───────────────────────────────────────
 
 /// All mesh-specific configuration, kept in a single container so the
@@ -717,6 +813,8 @@ pub struct MeshConfig {
     pub request_authentications: Vec<MeshRequestAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub telemetry_resources: Vec<MeshTelemetryResource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destination_rules: Vec<MeshDestinationRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

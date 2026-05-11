@@ -3,9 +3,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::config::types::GatewayConfig;
 use crate::modes::mesh::config::{
-    MeshPolicy, MeshRequestAuthentication, MeshService, MeshTelemetryResource, MultiClusterConfig,
-    PeerAuthentication, ServiceEntry, TrustBundleSet, Workload, policy_scope_applies_to_workload,
-    scope_applies_to_workload, service_entry_applies_to_workload, workload_selector_matches,
+    MeshDestinationRule, MeshPolicy, MeshRequestAuthentication, MeshService, MeshTelemetryResource,
+    MultiClusterConfig, PeerAuthentication, ServiceEntry, TrustBundleSet, Workload,
+    policy_scope_applies_to_workload, scope_applies_to_workload, service_entry_applies_to_workload,
+    workload_selector_matches,
 };
 
 /// Node/workload selector used by both ADS and native `MeshSubscribe`.
@@ -72,6 +73,8 @@ pub struct MeshSlice {
     pub request_authentications: Vec<MeshRequestAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub telemetry_resources: Vec<MeshTelemetryResource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destination_rules: Vec<MeshDestinationRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +98,7 @@ impl MeshSlice {
             && self.service_entries == other.service_entries
             && self.request_authentications == other.request_authentications
             && self.telemetry_resources == other.telemetry_resources
+            && self.destination_rules == other.destination_rules
             && self.trust_bundles == other.trust_bundles
             && self.multi_cluster == other.multi_cluster
     }
@@ -187,6 +191,12 @@ impl MeshSlice {
             .filter(|t| scope_applies_to_workload(&t.scope, effective_namespace, &effective_labels))
             .cloned()
             .collect();
+        let destination_rules: Vec<MeshDestinationRule> = mesh
+            .destination_rules
+            .iter()
+            .filter(|dr| dr.namespace == namespace)
+            .cloned()
+            .collect();
 
         Self {
             node_id: request.node_id,
@@ -201,6 +211,7 @@ impl MeshSlice {
             service_entries,
             request_authentications,
             telemetry_resources,
+            destination_rules,
             trust_bundles: mesh.trust_bundles.clone(),
             multi_cluster: mesh.multi_cluster.clone(),
         }
@@ -422,6 +433,7 @@ mod tests {
             mesh_policies: vec![make_policy("p1", "ns", PolicyScope::MeshWide)],
             peer_authentications: vec![make_peer_auth("pa1", "ns", None)],
             service_entries: vec![make_service_entry("se1", "ns", vec!["*".into()])],
+            destination_rules: Vec::new(),
             request_authentications: vec![make_request_auth("ra1", "ns", PolicyScope::MeshWide)],
             telemetry_resources: vec![make_telemetry("t1", "ns", PolicyScope::MeshWide)],
             trust_bundles: Some(make_trust_bundle_set()),
@@ -1222,5 +1234,38 @@ mod tests {
     fn labels_to_btree_empty_map() {
         let bt = labels_to_btree(&HashMap::new());
         assert!(bt.is_empty());
+    }
+
+    // ── DestinationRule slice filtering ──────────────────────────────────
+
+    #[test]
+    fn from_gateway_config_filters_destination_rules_by_namespace() {
+        use crate::modes::mesh::config::MeshDestinationRule;
+
+        let mesh = MeshConfig {
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "in-ns".into(),
+                    namespace: "ns".into(),
+                    host: "reviews.ns.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "other-ns".into(),
+                    namespace: "other".into(),
+                    host: "reviews.other.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let cfg = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&cfg, slice_request("ns"));
+
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].namespace, "ns");
+        assert_eq!(slice.destination_rules[0].name, "in-ns");
     }
 }
