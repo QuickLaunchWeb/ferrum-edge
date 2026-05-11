@@ -6,11 +6,12 @@ use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
     AccessLogFilter, AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig,
     MeshConsistentHash, MeshDestinationRule, MeshEndpoint, MeshJwtRule, MeshLoadBalancer,
-    MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshRequestAuthentication, MeshRule,
-    MeshSimpleLb, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
-    MeshTrafficPolicy, MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope,
-    PrincipalMatch, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
-    TagOverrideOperation, Workload, WorkloadPort, WorkloadSelector,
+    MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshProxyConfig,
+    MeshRequestAuthentication, MeshRule, MeshSimpleLb, MeshSubset, MeshTelemetryConfig,
+    MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy, MetricTagOverride, MtlsMode,
+    PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch, Resolution,
+    ServiceEntry, ServiceEntryLocation, ServicePort, TagOverrideOperation, Workload, WorkloadPort,
+    WorkloadSelector,
 };
 
 use super::{
@@ -73,6 +74,10 @@ pub(super) fn translate(
         }
         "Telemetry" => {
             acc.mesh.telemetry_resources.push(telemetry(acc, object)?);
+            Ok(true)
+        }
+        "ProxyConfig" => {
+            acc.mesh.proxy_configs.push(proxy_config(object)?);
             Ok(true)
         }
         _ => Ok(false),
@@ -1340,6 +1345,60 @@ fn telemetry(
             metrics,
             access_logging,
         },
+    })
+}
+
+/// Translate an Istio `ProxyConfig` (`networking.istio.io/v1beta1`) CRD into a
+/// [`MeshProxyConfig`].
+///
+/// ProxyConfig fields are config-time only — they shape the data plane's
+/// startup posture (concurrency, image) and tracing sampling but do not
+/// affect the request path. Fields:
+///
+/// - `metadata.name` -> `name`
+/// - `metadata.namespace` -> `namespace`
+/// - `spec.selector.matchLabels` -> `selector_labels` (empty = namespace default)
+/// - `spec.concurrency` -> `concurrency`
+/// - `spec.image.imageType` -> `image` (informational)
+/// - `spec.environmentVariables` -> `environment`
+/// - `spec.tracing.sampling` -> `tracing_sampling` (percentage 0-100,
+///   merged into `workload_metrics.sampling_percentage` at slice-apply time)
+fn proxy_config(object: &K8sObject) -> Result<MeshProxyConfig, K8sTranslateError> {
+    let selector_labels = selector_from_istio(object.spec.get("selector"));
+
+    let concurrency = object
+        .spec
+        .get("concurrency")
+        .and_then(Value::as_u64)
+        .map(|raw| u32::try_from(raw).unwrap_or(u32::MAX));
+
+    let image = object
+        .spec
+        .get("image")
+        .and_then(|img| img.get("imageType"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    let environment = object
+        .spec
+        .get("environmentVariables")
+        .map(string_map)
+        .unwrap_or_default();
+
+    let tracing_sampling = object
+        .spec
+        .get("tracing")
+        .and_then(|tracing| tracing.get("sampling"))
+        .and_then(Value::as_f64);
+
+    Ok(MeshProxyConfig {
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        selector_labels,
+        concurrency,
+        image,
+        environment,
+        tracing_sampling,
     })
 }
 
@@ -4001,5 +4060,141 @@ mod tests {
                 .and_then(|outlier| outlier.interval_seconds),
             Some(1)
         );
+    }
+
+    // ── ProxyConfig translation ─────────────────────────────────────────
+
+    #[test]
+    fn translates_proxy_config_with_all_fields_populated() {
+        let result = translate_k8s_objects(
+            &[object(
+                "ProxyConfig",
+                serde_json::json!({
+                    "selector": {"matchLabels": {"app": "api"}},
+                    "concurrency": 4,
+                    "image": {"imageType": "distroless"},
+                    "environmentVariables": {
+                        "GOMAXPROCS": "4",
+                        "PILOT_ENABLE_FOO": "true"
+                    },
+                    "tracing": {"sampling": 42.5}
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.proxy_configs.len(), 1);
+        let pc = &mesh.proxy_configs[0];
+        assert_eq!(pc.name, "sample");
+        assert_eq!(pc.namespace, "default");
+        assert_eq!(
+            pc.selector_labels.get("app").map(String::as_str),
+            Some("api")
+        );
+        assert_eq!(pc.concurrency, Some(4));
+        assert_eq!(pc.image.as_deref(), Some("distroless"));
+        assert_eq!(
+            pc.environment.get("GOMAXPROCS").map(String::as_str),
+            Some("4")
+        );
+        assert_eq!(
+            pc.environment.get("PILOT_ENABLE_FOO").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(pc.tracing_sampling, Some(42.5));
+    }
+
+    #[test]
+    fn translates_proxy_config_without_selector_is_namespace_default() {
+        let result = translate_k8s_objects(
+            &[object(
+                "ProxyConfig",
+                serde_json::json!({
+                    "concurrency": 2
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.proxy_configs.len(), 1);
+        let pc = &mesh.proxy_configs[0];
+        assert!(
+            pc.selector_labels.is_empty(),
+            "missing selector should yield namespace-default scope (empty selector_labels)"
+        );
+        assert_eq!(pc.namespace, "default");
+        assert_eq!(pc.concurrency, Some(2));
+    }
+
+    #[test]
+    fn translates_proxy_config_omits_unset_fields() {
+        let result =
+            translate_k8s_objects(&[object("ProxyConfig", serde_json::json!({}))], options())
+                .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.proxy_configs.len(), 1);
+        let pc = &mesh.proxy_configs[0];
+        assert!(pc.selector_labels.is_empty());
+        assert!(pc.concurrency.is_none());
+        assert!(pc.image.is_none());
+        assert!(pc.environment.is_empty());
+        assert!(pc.tracing_sampling.is_none());
+    }
+
+    #[test]
+    fn proxy_config_workload_selector_wins_over_namespace_default() {
+        // Two ProxyConfigs in same namespace: one namespace-default (no
+        // selector), one with a workload selector. Slice resolution must
+        // prefer the workload-scoped one for a matching workload.
+        use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+        use std::collections::BTreeMap;
+
+        let result = translate_k8s_objects(
+            &[
+                object(
+                    "ProxyConfig",
+                    serde_json::json!({"tracing": {"sampling": 10.0}}),
+                ),
+                K8sObject {
+                    api_version: "networking.istio.io/v1beta1".to_string(),
+                    kind: "ProxyConfig".to_string(),
+                    metadata: K8sMetadata {
+                        name: "api-overrides".to_string(),
+                        namespace: "default".to_string(),
+                        labels: HashMap::new(),
+                    },
+                    spec: serde_json::json!({
+                        "selector": {"matchLabels": {"app": "api"}},
+                        "tracing": {"sampling": 99.0}
+                    }),
+                },
+            ],
+            options(),
+        )
+        .expect("translation succeeds");
+        let gateway_config = result.config;
+        assert_eq!(gateway_config.mesh.as_ref().unwrap().proxy_configs.len(), 2);
+
+        let request = MeshSliceRequest {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            workload_spiffe_id: None,
+            labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+        };
+        let slice = MeshSlice::from_gateway_config(&gateway_config, request);
+        // Both should match — namespace-default applies to any workload, and
+        // the workload-scoped one applies to `app=api`.
+        assert_eq!(slice.proxy_configs.len(), 2);
+
+        let resolved = slice
+            .resolved_proxy_config()
+            .expect("expected resolved proxy_config");
+        assert_eq!(resolved.tracing_sampling, Some(99.0));
+        assert_eq!(resolved.name, "api-overrides");
     }
 }

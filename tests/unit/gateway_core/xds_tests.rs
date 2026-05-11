@@ -94,6 +94,7 @@ fn mesh_config() -> MeshConfig {
         request_authentications: Vec::new(),
         telemetry_resources: Vec::new(),
         destination_rules: Vec::new(),
+        proxy_configs: Vec::new(),
         trust_bundles: None,
         multi_cluster: None,
     }

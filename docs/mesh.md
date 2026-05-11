@@ -164,6 +164,43 @@ Declares valid JWTs for a workload scope. Permissive by default (see [RequestAut
 
 Per-scope telemetry configuration for tracing, metrics, and access logging (see [Observability](#observability)).
 
+### MeshProxyConfig (Istio ProxyConfig)
+
+Maps an Istio `ProxyConfig` (`networking.istio.io/v1beta1`) onto a config-time, read-only data structure consumed by the mesh runtime at slice-apply time. ProxyConfig has **no data-plane request-path impact** — it shapes startup posture (concurrency, image, environment variables) and tracing sampling.
+
+```yaml
+name: "api-defaults"
+namespace: "default"
+selector_labels:        # spec.selector.matchLabels
+  app: "api"
+concurrency: 4          # spec.concurrency (informational)
+image: "distroless"     # spec.image.imageType (informational)
+environment:            # spec.environmentVariables (informational)
+  GOMAXPROCS: "4"
+tracing_sampling: 42.5  # spec.tracing.sampling — percentage 0-100
+```
+
+**Honored fields**:
+
+| Istio field | MeshProxyConfig field | Notes |
+|---|---|---|
+| `metadata.name` | `name` | |
+| `metadata.namespace` | `namespace` | |
+| `spec.selector.matchLabels` | `selector_labels` | Empty selector = namespace-default |
+| `spec.concurrency` | `concurrency` | Informational; surfaced to operator tooling |
+| `spec.image.imageType` | `image` | Informational; surfaced to operator tooling |
+| `spec.environmentVariables` | `environment` | Informational; surfaced to operator tooling |
+| `spec.tracing.sampling` | `tracing_sampling` | Percentage 0-100; merged into the injected `workload_metrics` plugin's `sampling_percentage` |
+
+**Scope resolution**: ProxyConfigs are filtered to the subscriber's namespace at slice-construction time. Within the resolved slice, [`MeshSlice::resolved_proxy_config()`](../src/modes/mesh/slice.rs) returns the most-specific applicable entry:
+
+1. Resources with non-empty `selector_labels` (workload-scoped) outrank namespace-default resources (`selector_labels.is_empty()`).
+2. Among same-specificity matches, the ASCII-smallest `name` wins (deterministic tiebreaker mirroring the accumulator's `(namespace, name)` sort).
+
+**`tracing.sampling` merge with `Telemetry`**: ProxyConfig `tracing_sampling` is applied first as a baseline, then `Telemetry.tracing.randomSamplingPercentage` overrides on the same `sampling_percentage` key when both are present. The more granular Telemetry API wins because it can be per-section scoped; ProxyConfig provides a per-workload-config-level default.
+
+**xDS protocol**: ProxyConfig is config-time and not exposed via standard xDS. Operators relying on ProxyConfig translation must use `FERRUM_MESH_CONFIG_PROTOCOL=native`.
+
 ### TrustBundleSet
 
 Local and federated X.509/JWT authority bundles for cross-cluster trust.
@@ -241,6 +278,7 @@ The slice builder:
 5. Filters `ServiceEntry` entries by `export_to` visibility.
 6. Filters `MeshRequestAuthentication` entries by scope.
 7. Filters `MeshTelemetryResource` entries by scope.
+8. Filters `MeshProxyConfig` entries by namespace and `selector_labels` (workload superset match).
 
 ## Authorization
 
@@ -838,7 +876,6 @@ The following Istio mesh surfaces are **not yet supported** and should be treate
 |---|---|---|
 | `Sidecar` (egress scoping) | Deferred | Use Ferrum proxy routing and upstream configuration |
 | `EnvoyFilter` | Not planned | Use Ferrum custom plugins |
-| `ProxyConfig` | Deferred | Configure via `FERRUM_*` environment variables |
 | `WasmPlugin` | Not planned | Use Ferrum custom plugins (`custom_plugins/`) |
 | `DestinationRule.trafficPolicy.tls` | Deferred | Use per-proxy `backend_tls_*` fields |
 | `DestinationRule` port-level traffic policy | Deferred | Top-level traffic policy applies to all ports |

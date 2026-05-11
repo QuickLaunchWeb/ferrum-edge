@@ -18,6 +18,7 @@ mod grpc_proxy_tests;
 mod http2_pool_tests;
 mod http3_integration_tests;
 mod mesh_hbone_tests;
+mod mesh_proxy_config_tests;
 mod scripted_backend_smoke_tests;
 mod tcp_fast_path_l4_plugins_tests;
 mod tcp_frontend_tls_order_tests;

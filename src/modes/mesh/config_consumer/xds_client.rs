@@ -840,6 +840,11 @@ fn reverse_translate(
         // on DR translation must use `FERRUM_MESH_CONFIG_PROTOCOL=native`;
         // see docs/mesh.md ("DestinationRule support matrix").
         destination_rules: Vec::new(),
+        // ProxyConfig is config-time and not exposed via standard xDS — the
+        // CP would have already applied concurrency/image/env-var changes
+        // before emitting CDS, so it cannot be round-tripped here. Operators
+        // relying on ProxyConfig translation must use the native protocol.
+        proxy_configs: Vec::new(),
         trust_bundles: None,
         multi_cluster: None,
     })

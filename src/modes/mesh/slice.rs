@@ -3,10 +3,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::config::types::GatewayConfig;
 use crate::modes::mesh::config::{
-    MeshDestinationRule, MeshPolicy, MeshRequestAuthentication, MeshService, MeshTelemetryResource,
-    MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyScope, ServiceEntry, TrustBundleSet,
-    Workload, WorkloadLabels, policy_scope_applies_to_workload, scope_applies_to_workload,
-    service_entry_applies_to_workload, workload_selector_matches,
+    MeshDestinationRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshService,
+    MeshTelemetryResource, MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyScope,
+    ServiceEntry, TrustBundleSet, Workload, WorkloadLabels, policy_scope_applies_to_workload,
+    proxy_config_applies_to_workload, scope_applies_to_workload, service_entry_applies_to_workload,
+    workload_selector_matches,
 };
 
 /// Node/workload selector used by both ADS and native `MeshSubscribe`.
@@ -75,6 +76,8 @@ pub struct MeshSlice {
     pub telemetry_resources: Vec<MeshTelemetryResource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub destination_rules: Vec<MeshDestinationRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_configs: Vec<MeshProxyConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,6 +102,7 @@ impl MeshSlice {
             && self.request_authentications == other.request_authentications
             && self.telemetry_resources == other.telemetry_resources
             && self.destination_rules == other.destination_rules
+            && self.proxy_configs == other.proxy_configs
             && self.trust_bundles == other.trust_bundles
             && self.multi_cluster == other.multi_cluster
     }
@@ -123,6 +127,34 @@ impl MeshSlice {
             &self.labels,
             port,
         )
+    }
+
+    /// Returns the most-specific applicable [`MeshProxyConfig`] for this slice's
+    /// workload, or `None` when no `ProxyConfig` applies.
+    ///
+    /// Specificity ordering:
+    /// 1. Resources with non-empty `selector_labels` (workload-scoped) outrank
+    ///    namespace-default resources (`selector_labels.is_empty()`).
+    /// 2. Among same-specificity matches, the ASCII-smallest `name` wins —
+    ///    deterministic tiebreaker that mirrors the accumulator's
+    ///    `(namespace, name)` sort so consumers see a stable choice
+    ///    regardless of informer delivery order.
+    ///
+    /// Slice construction in [`Self::from_gateway_config`] already filters
+    /// `proxy_configs` down to those visible to the current node, so this
+    /// method just resolves specificity among matched entries.
+    pub fn resolved_proxy_config(&self) -> Option<&MeshProxyConfig> {
+        self.proxy_configs.iter().min_by(|a, b| {
+            let a_specificity: u8 = if a.selector_labels.is_empty() { 0 } else { 1 };
+            let b_specificity: u8 = if b.selector_labels.is_empty() { 0 } else { 1 };
+            // Higher specificity first (reverse cmp), then smaller name first.
+            // `min_by` picks the comparator's smallest, so:
+            //   - workload-scoped (1) < namespace-default (0) after reverse
+            //   - within same specificity, the ASCII-smallest name wins
+            b_specificity
+                .cmp(&a_specificity)
+                .then_with(|| a.name.as_str().cmp(b.name.as_str()))
+        })
     }
 
     pub fn from_gateway_config(config: &GatewayConfig, request: MeshSliceRequest) -> Self {
@@ -216,6 +248,14 @@ impl MeshSlice {
             .filter(|dr| dr.namespace == namespace)
             .cloned()
             .collect();
+        let proxy_configs: Vec<MeshProxyConfig> = mesh
+            .proxy_configs
+            .iter()
+            .filter(|pc| {
+                proxy_config_applies_to_workload(pc, effective_namespace, &effective_labels)
+            })
+            .cloned()
+            .collect();
 
         Self {
             node_id: request.node_id,
@@ -231,6 +271,7 @@ impl MeshSlice {
             request_authentications,
             telemetry_resources,
             destination_rules,
+            proxy_configs,
             trust_bundles: mesh.trust_bundles.clone(),
             multi_cluster: mesh.multi_cluster.clone(),
         }
@@ -337,11 +378,11 @@ mod tests {
     use crate::config::types::GatewayConfig;
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
     use crate::modes::mesh::config::{
-        AppProtocol, MeshAccessLoggingConfig, MeshConfig, MeshPolicy, MeshRequestAuthentication,
-        MeshRule, MeshService, MeshTelemetryConfig, MeshTelemetryResource, MtlsMode,
-        MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope, RemoteCluster,
-        ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet, Workload,
-        WorkloadPort, WorkloadSelector,
+        AppProtocol, MeshAccessLoggingConfig, MeshConfig, MeshPolicy, MeshProxyConfig,
+        MeshRequestAuthentication, MeshRule, MeshService, MeshTelemetryConfig,
+        MeshTelemetryResource, MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyAction,
+        PolicyScope, RemoteCluster, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle,
+        TrustBundleSet, Workload, WorkloadPort, WorkloadSelector,
     };
     use std::collections::HashMap;
 
@@ -537,6 +578,7 @@ mod tests {
             peer_authentications: vec![make_peer_auth("pa1", "ns", None)],
             service_entries: vec![make_service_entry("se1", "ns", vec!["*".into()])],
             destination_rules: Vec::new(),
+            proxy_configs: Vec::new(),
             request_authentications: vec![make_request_auth("ra1", "ns", PolicyScope::MeshWide)],
             telemetry_resources: vec![make_telemetry("t1", "ns", PolicyScope::MeshWide)],
             trust_bundles: Some(make_trust_bundle_set()),
@@ -1409,6 +1451,25 @@ mod tests {
         }
     }
 
+    // ── MeshProxyConfig slice/resolution tests ──────────────────────────
+
+    fn make_proxy_config(
+        name: &str,
+        namespace: &str,
+        selector_labels: HashMap<String, String>,
+        tracing_sampling: Option<f64>,
+    ) -> MeshProxyConfig {
+        MeshProxyConfig {
+            name: name.into(),
+            namespace: namespace.into(),
+            selector_labels,
+            concurrency: None,
+            image: None,
+            environment: HashMap::new(),
+            tracing_sampling,
+        }
+    }
+
     #[test]
     fn no_peer_auth_defaults_to_permissive() {
         let mode =
@@ -1646,5 +1707,137 @@ mod tests {
     fn classify_peer_auth_scope_ordering() {
         assert!(PeerAuthScope::WorkloadSelector > PeerAuthScope::Namespace);
         assert!(PeerAuthScope::Namespace > PeerAuthScope::MeshWide);
+    }
+
+    #[test]
+    fn proxy_configs_filter_by_namespace_and_selector() {
+        let mesh = MeshConfig {
+            proxy_configs: vec![
+                // In-namespace, no selector — applies to any workload in ns
+                make_proxy_config("ns-default", "ns", HashMap::new(), Some(10.0)),
+                // In-namespace, selector matches
+                make_proxy_config(
+                    "api-only",
+                    "ns",
+                    HashMap::from([("app".into(), "api".into())]),
+                    Some(50.0),
+                ),
+                // In-namespace, selector does NOT match
+                make_proxy_config(
+                    "worker-only",
+                    "ns",
+                    HashMap::from([("app".into(), "worker".into())]),
+                    Some(75.0),
+                ),
+                // Different namespace — filtered out
+                make_proxy_config("other-ns", "other", HashMap::new(), Some(99.0)),
+            ],
+            ..MeshConfig::default()
+        };
+        let cfg = config_with_mesh(mesh);
+        let request =
+            slice_request_with_labels("ns", BTreeMap::from([("app".into(), "api".into())]));
+        let slice = MeshSlice::from_gateway_config(&cfg, request);
+
+        assert_eq!(slice.proxy_configs.len(), 2);
+        let names: Vec<&str> = slice
+            .proxy_configs
+            .iter()
+            .map(|pc| pc.name.as_str())
+            .collect();
+        assert!(names.contains(&"ns-default"));
+        assert!(names.contains(&"api-only"));
+    }
+
+    #[test]
+    fn resolved_proxy_config_prefers_workload_selector_over_namespace_default() {
+        let mesh = MeshConfig {
+            proxy_configs: vec![
+                make_proxy_config("ns-default", "ns", HashMap::new(), Some(10.0)),
+                make_proxy_config(
+                    "api-only",
+                    "ns",
+                    HashMap::from([("app".into(), "api".into())]),
+                    Some(50.0),
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let cfg = config_with_mesh(mesh);
+        let request =
+            slice_request_with_labels("ns", BTreeMap::from([("app".into(), "api".into())]));
+        let slice = MeshSlice::from_gateway_config(&cfg, request);
+
+        let resolved = slice.resolved_proxy_config().expect("resolved present");
+        assert_eq!(resolved.name, "api-only");
+        assert_eq!(resolved.tracing_sampling, Some(50.0));
+    }
+
+    #[test]
+    fn resolved_proxy_config_returns_none_when_no_match() {
+        let mesh = MeshConfig {
+            proxy_configs: vec![make_proxy_config(
+                "api-only",
+                "ns",
+                HashMap::from([("app".into(), "api".into())]),
+                Some(50.0),
+            )],
+            ..MeshConfig::default()
+        };
+        let cfg = config_with_mesh(mesh);
+        let request =
+            slice_request_with_labels("ns", BTreeMap::from([("app".into(), "worker".into())]));
+        let slice = MeshSlice::from_gateway_config(&cfg, request);
+
+        assert!(slice.proxy_configs.is_empty());
+        assert!(slice.resolved_proxy_config().is_none());
+    }
+
+    #[test]
+    fn resolved_proxy_config_ascii_smallest_name_breaks_tie() {
+        // Two workload-scoped ProxyConfigs that both match: tiebreaker must
+        // be deterministic on the ASCII-smallest name.
+        let mesh = MeshConfig {
+            proxy_configs: vec![
+                make_proxy_config(
+                    "zzz-late",
+                    "ns",
+                    HashMap::from([("app".into(), "api".into())]),
+                    Some(99.0),
+                ),
+                make_proxy_config(
+                    "aaa-early",
+                    "ns",
+                    HashMap::from([("app".into(), "api".into())]),
+                    Some(5.0),
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let cfg = config_with_mesh(mesh);
+        let request =
+            slice_request_with_labels("ns", BTreeMap::from([("app".into(), "api".into())]));
+        let slice = MeshSlice::from_gateway_config(&cfg, request);
+
+        // Both apply.
+        assert_eq!(slice.proxy_configs.len(), 2);
+        let resolved = slice.resolved_proxy_config().expect("resolved present");
+        assert_eq!(resolved.name, "aaa-early");
+        assert_eq!(resolved.tracing_sampling, Some(5.0));
+    }
+
+    #[test]
+    fn content_eq_detects_proxy_configs_change() {
+        let a = MeshSlice {
+            proxy_configs: vec![make_proxy_config("p1", "ns", HashMap::new(), Some(10.0))],
+            ..MeshSlice::default()
+        };
+        let mut b = a.clone();
+        b.proxy_configs
+            .push(make_proxy_config("p2", "ns", HashMap::new(), Some(50.0)));
+        assert!(
+            !a.content_eq(&b),
+            "proxy_configs difference should be detected"
+        );
     }
 }
