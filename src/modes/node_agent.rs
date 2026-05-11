@@ -129,8 +129,13 @@ pub async fn run(
 
 async fn wait_for_shutdown(shutdown_tx: &tokio::sync::watch::Sender<bool>) {
     let mut shutdown_rx = shutdown_tx.subscribe();
-    if !*shutdown_rx.borrow() {
-        shutdown_rx.changed().await.ok();
+    if *shutdown_rx.borrow() {
+        return;
+    }
+    while shutdown_rx.changed().await.is_ok() {
+        if *shutdown_rx.borrow() {
+            return;
+        }
     }
 }
 
@@ -329,22 +334,20 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_shutdown_blocks_until_signal() {
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-        let task_tx = shutdown_tx.clone();
-        let task = tokio::spawn(async move {
-            wait_for_shutdown(&task_tx).await;
-        });
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let wait = wait_for_shutdown(&shutdown_tx);
+        tokio::pin!(wait);
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        assert!(
-            !task.is_finished(),
-            "node agent should stay alive until shutdown is signaled"
-        );
+        tokio::select! {
+            _ = &mut wait => panic!("wait_for_shutdown returned before shutdown was signalled"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+        }
 
-        shutdown_tx.send(true).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        shutdown_tx
+            .send(true)
+            .expect("shutdown receiver should be live");
+        tokio::time::timeout(std::time::Duration::from_secs(1), wait)
             .await
-            .expect("shutdown wait should finish after signal")
-            .unwrap();
+            .expect("shutdown wait should resolve after signal");
     }
 }

@@ -61,8 +61,8 @@ fn check_kernel_version(release: &str) -> bool {
 
 fn check_cgroup_v2(cgroup_root: &str) -> bool {
     let cgroup_type_path = Path::new(cgroup_root).join("cgroup.type");
-    let cgroup_procs_path = Path::new(cgroup_root).join("cgroup.procs");
-    cgroup_type_path.exists() || cgroup_procs_path.exists()
+    let cgroup_controllers_path = Path::new(cgroup_root).join("cgroup.controllers");
+    cgroup_type_path.exists() || cgroup_controllers_path.exists()
 }
 
 fn check_bpf_fs(bpf_fs_path: &str) -> bool {
@@ -124,6 +124,21 @@ mod tests {
     #[test]
     fn check_cgroup_v2_nonexistent_path() {
         assert!(!check_cgroup_v2("/nonexistent/cgroup/path"));
+    }
+
+    #[test]
+    fn check_cgroup_v2_ignores_v1_cgroup_procs_only() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("cgroup.procs"), b"").expect("write cgroup.procs");
+        assert!(!check_cgroup_v2(dir.path().to_str().expect("utf8 path")));
+    }
+
+    #[test]
+    fn check_cgroup_v2_accepts_controllers_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("cgroup.controllers"), b"cpu io memory")
+            .expect("write cgroup.controllers");
+        assert!(check_cgroup_v2(dir.path().to_str().expect("utf8 path")));
     }
 
     #[test]
