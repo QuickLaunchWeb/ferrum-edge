@@ -67,6 +67,7 @@ Standard Envoy xDS Aggregated Discovery Service client. Consumes CDS, EDS, LDS, 
 - **Multi-CP failover**: same URL list and backoff as native mode.
 - **Node identity**: `FERRUM_MESH_XDS_NODE_CLUSTER` sets the `node.cluster` field in DiscoveryRequest (defaults to `FERRUM_NAMESPACE`).
 - **Connect timeout**: `FERRUM_MESH_XDS_CONNECT_TIMEOUT_SECONDS` (default 10).
+- **DestinationRule limitation**: standard xDS bakes DestinationRule traffic policy (LB algorithm, outlier detection, connection pool, subsets) into the Envoy `Cluster` resource at the CP, so the original DR is not recoverable from CDS/EDS. Operators relying on Ferrum's DR translation must use `FERRUM_MESH_CONFIG_PROTOCOL=native`. The xDS consumer logs a warning at startup.
 
 ### Bootstrap Behavior
 
@@ -170,6 +171,62 @@ Local and federated X.509/JWT authority bundles for cross-cluster trust.
 ### MultiClusterConfig
 
 Multi-cluster settings: local cluster identity, remote clusters, east-west gateways, and SPIFFE federation endpoints.
+
+### MeshDestinationRule
+
+Maps an Istio `DestinationRule` onto Ferrum's existing `Upstream` / `PassiveHealthCheck` / `LoadBalancerAlgorithm` primitives. Applied at slice-apply time in `prepare_normalized_gateway_config_for_mesh()` after upstream materialization.
+
+```yaml
+name: "reviews-policy"
+namespace: "default"
+host: "reviews.default.svc.cluster.local"
+traffic_policy:
+  connect_timeout_ms: 5000
+  outlier_detection:
+    consecutive_errors: 5
+    interval_seconds: 10
+    base_ejection_seconds: 30
+    max_ejection_percent: 50
+  load_balancer:
+    consistent_hash:
+      http_header_name: "x-user-id"
+subsets:
+  - name: "v1"
+    labels:
+      version: "v1"
+```
+
+**Host matching**: the DR `host` is matched against upstream targets, the upstream `name`, and the upstream `id`. Short hostnames are namespace-completed (`reviews` ⇒ `reviews.{namespace}.svc.*`); namespaced (`reviews.ns`) and `.svc`-suffixed forms are also supported. Cross-namespace matches require the FQDN form because slice filtering already restricts DRs to the subscriber's namespace.
+
+**Multiple DRs targeting the same upstream**: applied in deterministic `(namespace, name)` order — the alphabetically last entry wins, last-writer-wins per field. Operators see `debug!` log lines when subsets or proxy `backend_connect_timeout_ms` get overwritten.
+
+**Support matrix** (canonical Istio field → Ferrum target):
+
+| Istio field | Status | Notes |
+|---|---|---|
+| `host` | Supported | Required, lowercased at admission, empty/dot-only rejected |
+| `trafficPolicy.connectionPool.tcp.connectTimeout` | Supported | Applied to `Proxy.backend_connect_timeout_ms` for every proxy referencing the matching upstream |
+| `trafficPolicy.outlierDetection.consecutive5xxErrors` / `consecutiveErrors` | Supported | → `PassiveHealthCheck.unhealthy_threshold` |
+| `trafficPolicy.outlierDetection.interval` | Supported | → `PassiveHealthCheck.unhealthy_window_seconds` (zero filtered out, sub-second rounded up) |
+| `trafficPolicy.outlierDetection.baseEjectionTime` | Supported | → `PassiveHealthCheck.healthy_after_seconds` |
+| `trafficPolicy.outlierDetection.maxEjectionPercent` | Supported | → `PassiveHealthCheck.max_ejection_percent`; values >100 rejected |
+| `trafficPolicy.loadBalancer.simple = ROUND_ROBIN` | Supported | → `LoadBalancerAlgorithm::RoundRobin` |
+| `trafficPolicy.loadBalancer.simple = LEAST_REQUEST` / `LEAST_CONN` | Supported | → `LoadBalancerAlgorithm::LeastConnections` |
+| `trafficPolicy.loadBalancer.simple = RANDOM` | Supported | → `LoadBalancerAlgorithm::Random` |
+| `trafficPolicy.loadBalancer.simple = PASSTHROUGH` | Approximated (warns) | → `RoundRobin`; Ferrum cannot preserve the original destination IP |
+| `trafficPolicy.loadBalancer.simple = MAGLEV` | Rejected | Hard error at translate time |
+| `trafficPolicy.loadBalancer.consistentHash.{httpHeaderName,httpCookie.name,useSourceIp}` | Supported | Exactly one of the three required (rejected otherwise); → `LoadBalancerAlgorithm::ConsistentHashing` + `Upstream.hash_on` |
+| `subsets[].name` / `subsets[].labels` | Supported | → `SubsetDefinition` entries on the upstream; second DR overwrites the first |
+| `subsets[].trafficPolicy.loadBalancer` | Supported | → `SubsetTrafficPolicy.load_balancer_algorithm` |
+| `subsets[].trafficPolicy.connectionPool` | Ignored (warns) | Top-level `trafficPolicy.connectionPool` is the only path to per-upstream connect timeout |
+| `subsets[].trafficPolicy.outlierDetection` | Ignored (warns) | Top-level `trafficPolicy.outlierDetection` is the only path to passive health checks |
+| `trafficPolicy.connectionPool.http.*` | Ignored | Per-protocol connection pool not surfaced |
+| `trafficPolicy.connectionPool.tcp.maxConnections` / `tcpKeepalive` | Ignored | Pool sizing handled globally via `FERRUM_POOL_*` |
+| `trafficPolicy.tls` | Ignored | mTLS posture comes from `PeerAuthentication` |
+| `trafficPolicy.portLevelSettings` | Ignored | Per-port traffic policy not modeled |
+| `exportTo` | Ignored | DRs are scoped to their declared namespace at slice-filter time |
+
+Translator warnings surface in the `K8sTranslation.warnings` returned from `translate_k8s_objects`, so operators see them at apply time.
 
 ## MeshSlice
 

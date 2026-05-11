@@ -1235,4 +1235,37 @@ mod tests {
         let bt = labels_to_btree(&HashMap::new());
         assert!(bt.is_empty());
     }
+
+    // ── DestinationRule slice filtering ──────────────────────────────────
+
+    #[test]
+    fn from_gateway_config_filters_destination_rules_by_namespace() {
+        use crate::modes::mesh::config::MeshDestinationRule;
+
+        let mesh = MeshConfig {
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "in-ns".into(),
+                    namespace: "ns".into(),
+                    host: "reviews.ns.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "other-ns".into(),
+                    namespace: "other".into(),
+                    host: "reviews.other.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let cfg = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&cfg, slice_request("ns"));
+
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].namespace, "ns");
+        assert_eq!(slice.destination_rules[0].name, "in-ns");
+    }
 }

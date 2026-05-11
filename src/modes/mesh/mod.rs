@@ -900,8 +900,16 @@ fn mesh_east_west_service_upstream_id(namespace: &str, name: &str) -> String {
 /// - `outlierDetection` onto the upstream's passive health check
 /// - `loadBalancer` onto the upstream's algorithm
 /// - `subsets` as `SubsetDefinition` entries on the upstream
+///
+/// Multiple DRs targeting the same upstream are applied in a deterministic
+/// order — sorted by `(namespace, name)` — so the last-writer-wins outcome
+/// is reproducible across CP restarts and DP subscribers.
 fn apply_destination_rules(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
-    for dr in &mesh_slice.destination_rules {
+    let mut sorted_destination_rules: Vec<&MeshDestinationRule> =
+        mesh_slice.destination_rules.iter().collect();
+    sorted_destination_rules.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+
+    for dr in sorted_destination_rules {
         let matching_upstream_indices: Vec<usize> = config
             .upstreams
             .iter()
@@ -933,6 +941,13 @@ fn apply_destination_rules(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
             }
 
             if !dr.subsets.is_empty() {
+                if upstream.subsets.is_some() {
+                    debug!(
+                        rule = %dr.name,
+                        upstream = %upstream.id,
+                        "DestinationRule subsets overwriting existing upstream.subsets"
+                    );
+                }
                 let subset_defs: Vec<SubsetDefinition> = dr
                     .subsets
                     .iter()
@@ -950,9 +965,19 @@ fn apply_destination_rules(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
             }
 
             if let Some(timeout_ms) = connect_timeout_ms {
-                let upstream_id = &config.upstreams[idx].id;
+                let upstream_id = config.upstreams[idx].id.clone();
                 for proxy in &mut config.proxies {
-                    if proxy.upstream_id.as_deref() == Some(upstream_id.as_str()) {
+                    if proxy.upstream_id.as_deref() == Some(upstream_id.as_str())
+                        && proxy.backend_connect_timeout_ms != timeout_ms
+                    {
+                        debug!(
+                            proxy = %proxy.id,
+                            upstream = %upstream_id,
+                            previous_ms = proxy.backend_connect_timeout_ms,
+                            new_ms = timeout_ms,
+                            rule = %dr.name,
+                            "DestinationRule overriding proxy backend_connect_timeout_ms"
+                        );
                         proxy.backend_connect_timeout_ms = timeout_ms;
                     }
                 }
@@ -3012,6 +3037,52 @@ mod tests {
                 .iter()
                 .all(|proxy| proxy.backend_connect_timeout_ms == 1234)
         );
+    }
+
+    #[test]
+    fn destination_rule_apply_order_is_deterministic_by_namespace_then_name() {
+        let mut config = GatewayConfig {
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        // Insert in reverse alphabetical order; sort by (namespace, name) means
+        // "default/a-first" applies first and "default/z-last" wins.
+        let slice = MeshSlice {
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "z-last".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connect_timeout_ms: Some(9999),
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "a-first".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connect_timeout_ms: Some(1111),
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &slice);
+
+        assert_eq!(config.upstreams[0].algorithm, LoadBalancerAlgorithm::Random);
+        assert_eq!(config.proxies[0].backend_connect_timeout_ms, 9999);
     }
 
     #[test]

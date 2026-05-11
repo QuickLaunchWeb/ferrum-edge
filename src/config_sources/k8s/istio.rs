@@ -55,7 +55,8 @@ pub(super) fn translate(
             Ok(true)
         }
         "DestinationRule" => {
-            acc.mesh.destination_rules.push(destination_rule(object)?);
+            let dr = destination_rule(acc, object)?;
+            acc.mesh.destination_rules.push(dr);
             Ok(true)
         }
         "RequestAuthentication" => {
@@ -502,14 +503,24 @@ fn port_from_string(object: &K8sObject, raw: &str, field: &str) -> Result<u16, K
     port_from_u64(object, parsed, field)
 }
 
-fn destination_rule(object: &K8sObject) -> Result<MeshDestinationRule, K8sTranslateError> {
-    let host = string_field(&object.spec, "host")
+fn destination_rule(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+) -> Result<MeshDestinationRule, K8sTranslateError> {
+    let host_raw = string_field(&object.spec, "host")
         .ok_or_else(|| invalid_resource(object, "DestinationRule requires spec.host"))?;
+    let host = host_raw.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return Err(invalid_resource(
+            object,
+            "DestinationRule spec.host must be a non-empty hostname",
+        ));
+    }
 
     let traffic_policy = object
         .spec
         .get("trafficPolicy")
-        .map(|tp| translate_traffic_policy(object, tp))
+        .map(|tp| translate_traffic_policy(acc, object, tp))
         .transpose()?;
 
     let subsets = object
@@ -518,19 +529,20 @@ fn destination_rule(object: &K8sObject) -> Result<MeshDestinationRule, K8sTransl
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|subset| translate_subset(object, subset))
+        .map(|subset| translate_subset(acc, object, subset))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(MeshDestinationRule {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
-        host: host.to_ascii_lowercase(),
+        host,
         traffic_policy,
         subsets,
     })
 }
 
 fn translate_traffic_policy(
+    acc: &mut K8sAccumulator,
     object: &K8sObject,
     value: &Value,
 ) -> Result<MeshTrafficPolicy, K8sTranslateError> {
@@ -547,7 +559,7 @@ fn translate_traffic_policy(
 
     let load_balancer = value
         .get("loadBalancer")
-        .map(|lb| translate_load_balancer(object, lb))
+        .map(|lb| translate_load_balancer(acc, object, lb))
         .transpose()?;
 
     Ok(MeshTrafficPolicy {
@@ -598,6 +610,7 @@ fn translate_outlier_detection(
 }
 
 fn translate_load_balancer(
+    acc: &mut K8sAccumulator,
     object: &K8sObject,
     value: &Value,
 ) -> Result<MeshLoadBalancer, K8sTranslateError> {
@@ -606,7 +619,13 @@ fn translate_load_balancer(
             "ROUND_ROBIN" => MeshSimpleLb::RoundRobin,
             "LEAST_REQUEST" | "LEAST_CONN" => MeshSimpleLb::LeastRequest,
             "RANDOM" => MeshSimpleLb::Random,
-            "PASSTHROUGH" => MeshSimpleLb::Passthrough,
+            "PASSTHROUGH" => {
+                acc.warnings.push(format!(
+                    "DestinationRule {}/{} loadBalancer.simple=PASSTHROUGH is approximated as ROUND_ROBIN; Ferrum always routes via configured upstream targets and cannot preserve the original destination IP",
+                    object.metadata.namespace, object.metadata.name
+                ));
+                MeshSimpleLb::Passthrough
+            }
             other => {
                 return Err(invalid_resource(
                     object,
@@ -627,6 +646,21 @@ fn translate_load_balancer(
             .get("useSourceIp")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let set_count = u8::from(http_header_name.is_some())
+            + u8::from(http_cookie_name.is_some())
+            + u8::from(use_source_ip);
+        if set_count > 1 {
+            return Err(invalid_resource(
+                object,
+                "loadBalancer.consistentHash must set exactly one of httpHeaderName, httpCookie, or useSourceIp",
+            ));
+        }
+        if set_count == 0 {
+            return Err(invalid_resource(
+                object,
+                "loadBalancer.consistentHash requires one of httpHeaderName, httpCookie, or useSourceIp",
+            ));
+        }
         return Ok(MeshLoadBalancer::ConsistentHash(MeshConsistentHash {
             http_header_name,
             http_cookie_name,
@@ -638,15 +672,34 @@ fn translate_load_balancer(
     Ok(MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin))
 }
 
-fn translate_subset(object: &K8sObject, value: &Value) -> Result<MeshSubset, K8sTranslateError> {
+fn translate_subset(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+    value: &Value,
+) -> Result<MeshSubset, K8sTranslateError> {
     let name = string_field(value, "name")
         .ok_or_else(|| invalid_resource(object, "DestinationRule subset requires a name"))?
         .to_string();
     let labels = string_map(value.get("labels").unwrap_or(&Value::Null));
     let traffic_policy = value
         .get("trafficPolicy")
-        .map(|tp| translate_traffic_policy(object, tp))
+        .map(|tp| translate_traffic_policy(acc, object, tp))
         .transpose()?;
+
+    if let Some(ref policy) = traffic_policy {
+        if policy.connect_timeout_ms.is_some() {
+            acc.warnings.push(format!(
+                "DestinationRule {}/{} subset '{}' connectionPool.tcp.connectTimeout is currently ignored; only the top-level trafficPolicy connectTimeout applies",
+                object.metadata.namespace, object.metadata.name, name
+            ));
+        }
+        if policy.outlier_detection.is_some() {
+            acc.warnings.push(format!(
+                "DestinationRule {}/{} subset '{}' outlierDetection is currently ignored; only the top-level trafficPolicy outlierDetection applies",
+                object.metadata.namespace, object.metadata.name, name
+            ));
+        }
+    }
 
     Ok(MeshSubset {
         name,
@@ -3155,6 +3208,161 @@ mod tests {
             .as_ref()
             .expect("traffic policy");
         assert_eq!(tp.connect_timeout_ms, Some(100));
+    }
+
+    #[test]
+    fn destination_rule_rejects_empty_host() {
+        let err = translate_k8s_objects(
+            &[object("DestinationRule", serde_json::json!({"host": ""}))],
+            options(),
+        )
+        .expect_err("empty host must fail");
+        assert!(err.to_string().contains("non-empty hostname"));
+    }
+
+    #[test]
+    fn destination_rule_rejects_dot_only_host() {
+        let err = translate_k8s_objects(
+            &[object("DestinationRule", serde_json::json!({"host": "."}))],
+            options(),
+        )
+        .expect_err("dot-only host must fail");
+        assert!(err.to_string().contains("non-empty hostname"));
+    }
+
+    #[test]
+    fn destination_rule_lb_least_conn_alias_translates() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {"simple": "LEAST_CONN"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let mesh = result.config.mesh.expect("mesh config");
+        let lb = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .load_balancer
+            .as_ref()
+            .expect("load balancer");
+        assert!(matches!(
+            lb,
+            MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)
+        ));
+    }
+
+    #[test]
+    fn destination_rule_consistent_hash_rejects_multiple_options() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {
+                            "consistentHash": {
+                                "httpHeaderName": "x-user-id",
+                                "useSourceIp": true
+                            }
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("multi-option consistentHash must fail");
+        assert!(err.to_string().contains("must set exactly one"));
+    }
+
+    #[test]
+    fn destination_rule_consistent_hash_rejects_no_options() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {
+                            "consistentHash": {}
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("empty consistentHash must fail");
+        assert!(err.to_string().contains("requires one of"));
+    }
+
+    #[test]
+    fn destination_rule_passthrough_emits_warning() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {"simple": "PASSTHROUGH"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("PASSTHROUGH translates with warning");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("PASSTHROUGH") && w.contains("ROUND_ROBIN")),
+            "expected PASSTHROUGH approximation warning, got {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn destination_rule_subset_unsupported_fields_warn() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "subsets": [{
+                        "name": "v1",
+                        "labels": {"version": "v1"},
+                        "trafficPolicy": {
+                            "connectionPool": {"tcp": {"connectTimeout": "5s"}},
+                            "outlierDetection": {"consecutive5xxErrors": 3}
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("subset with unsupported fields still translates");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("subset 'v1'") && w.contains("connectTimeout")),
+            "expected subset connectTimeout warning, got {:?}",
+            result.warnings
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("subset 'v1'") && w.contains("outlierDetection")),
+            "expected subset outlierDetection warning, got {:?}",
+            result.warnings
+        );
     }
 
     // -- VirtualService retry / timeout --------------------------------
