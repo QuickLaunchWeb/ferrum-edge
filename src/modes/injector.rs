@@ -32,6 +32,17 @@ use crate::tls::{self, TlsPolicy};
 const DEFAULT_INJECTOR_LISTEN_ADDR: &str = "0.0.0.0:9443";
 const DEFAULT_SIDECAR_IMAGE: &str = "ferrum-edge:latest";
 const DEFAULT_INJECTOR_TRUST_DOMAIN: &str = "cluster.local";
+const ISTIO_EXCLUDE_OUTBOUND_PORTS_ANNOTATION: &str =
+    "traffic.sidecar.istio.io/excludeOutboundPorts";
+const FERRUM_EXCLUDE_OUTBOUND_PORTS_ANNOTATION: &str = "ferrum.io/excludeOutboundPorts";
+const DEFAULT_SIDECAR_CPU_REQUEST: &str = "25m";
+const DEFAULT_SIDECAR_MEMORY_REQUEST: &str = "64Mi";
+const DEFAULT_SIDECAR_CPU_LIMIT: &str = "250m";
+const DEFAULT_SIDECAR_MEMORY_LIMIT: &str = "256Mi";
+const DEFAULT_INIT_CPU_REQUEST: &str = "10m";
+const DEFAULT_INIT_MEMORY_REQUEST: &str = "32Mi";
+const DEFAULT_INIT_CPU_LIMIT: &str = "100m";
+const DEFAULT_INIT_MEMORY_LIMIT: &str = "128Mi";
 const SIDECAR_ENV_KEYS: &[&str] = &[
     "FERRUM_DP_CP_GRPC_URLS",
     "FERRUM_CP_DP_GRPC_JWT_ISSUER",
@@ -49,15 +60,42 @@ pub struct SecretKeyRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerResourceConfig {
+    pub cpu_request: String,
+    pub memory_request: String,
+    pub cpu_limit: String,
+    pub memory_limit: String,
+}
+
+impl ContainerResourceConfig {
+    fn new(
+        cpu_request: impl Into<String>,
+        memory_request: impl Into<String>,
+        cpu_limit: impl Into<String>,
+        memory_limit: impl Into<String>,
+    ) -> Self {
+        Self {
+            cpu_request: cpu_request.into(),
+            memory_request: memory_request.into(),
+            cpu_limit: cpu_limit.into(),
+            memory_limit: memory_limit.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InjectorConfig {
     pub listen_addr: SocketAddr,
     pub namespace: String,
     pub sidecar_image: String,
     pub sidecar_env: Vec<(String, String)>,
     pub jwt_secret_ref: Option<SecretKeyRef>,
+    pub sidecar_resources: ContainerResourceConfig,
+    pub init_resources: ContainerResourceConfig,
     pub require_annotation: bool,
     pub capture_mode: CaptureMode,
     pub proxy_uid: Option<u32>,
+    pub exclude_outbound_ports: Vec<u16>,
     pub trust_domain: String,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
@@ -74,6 +112,12 @@ impl InjectorConfig {
             .unwrap_or_else(|| DEFAULT_SIDECAR_IMAGE.to_string());
         let sidecar_env = sidecar_env_from_runtime();
         let jwt_secret_ref = jwt_secret_ref_from_runtime()?;
+        let sidecar_resources = container_resources_from_runtime(
+            "FERRUM_INJECTOR_SIDECAR",
+            default_sidecar_resources(),
+        )?;
+        let init_resources =
+            container_resources_from_runtime("FERRUM_INJECTOR_INIT", default_init_resources())?;
         let require_annotation = resolve_ferrum_var("FERRUM_INJECTOR_REQUIRE_ANNOTATION")
             .and_then(|value| value.parse::<bool>().ok())
             .unwrap_or(true);
@@ -81,8 +125,9 @@ impl InjectorConfig {
             &resolve_ferrum_var("FERRUM_MESH_CAPTURE_MODE")
                 .unwrap_or_else(|| "explicit".to_string()),
         )?;
-        let proxy_uid =
-            resolve_ferrum_var("FERRUM_MESH_PROXY_UID").and_then(|value| value.parse::<u32>().ok());
+        let proxy_uid = parse_injector_proxy_uid(resolve_ferrum_var("FERRUM_MESH_PROXY_UID"))?;
+        let exclude_outbound_ports =
+            parse_port_list(resolve_ferrum_var("FERRUM_MESH_EXCLUDE_OUTBOUND_PORTS").as_deref())?;
         let trust_domain = resolve_ferrum_var("FERRUM_INJECTOR_TRUST_DOMAIN")
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_INJECTOR_TRUST_DOMAIN.to_string());
@@ -111,9 +156,12 @@ impl InjectorConfig {
             sidecar_image,
             sidecar_env,
             jwt_secret_ref,
+            sidecar_resources,
+            init_resources,
             require_annotation,
             capture_mode,
             proxy_uid,
+            exclude_outbound_ports,
             trust_domain,
             tls_cert_path,
             tls_key_path,
@@ -126,6 +174,51 @@ fn validate_injector_trust_domain(value: &str) -> Result<(), String> {
     TrustDomain::new(value.to_string())
         .map(|_| ())
         .map_err(|e| format!("Invalid FERRUM_INJECTOR_TRUST_DOMAIN: {e}"))
+}
+
+fn parse_port_list(raw: Option<&str>) -> Result<Vec<u16>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+
+    let mut ports = Vec::new();
+    for token in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        let port = token
+            .parse::<u16>()
+            .map_err(|e| format!("mesh outbound port exclusion '{token}': {e}"))?;
+        if port == 0 {
+            return Err("mesh outbound port exclusion '0': port must be 1-65535".to_string());
+        }
+        ports.push(port);
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    Ok(ports)
+}
+
+fn parse_injector_proxy_uid(value: Option<String>) -> Result<Option<u32>, String> {
+    let Some(value) = value.map(|value| value.trim().to_string()) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    let uid = value
+        .parse::<u32>()
+        .map_err(|e| format!("Invalid FERRUM_MESH_PROXY_UID '{value}': {e}"))?;
+    if uid == 0 {
+        return Err(
+            "Invalid FERRUM_MESH_PROXY_UID: injected sidecars set runAsNonRoot=true, so the proxy UID must be non-zero"
+                .to_string(),
+        );
+    }
+
+    Ok(Some(uid))
 }
 
 fn jwt_secret_ref_from_runtime() -> Result<Option<SecretKeyRef>, String> {
@@ -146,6 +239,88 @@ fn jwt_secret_ref_from_runtime() -> Result<Option<SecretKeyRef>, String> {
                 .to_string(),
         ),
     }
+}
+
+fn default_sidecar_resources() -> ContainerResourceConfig {
+    ContainerResourceConfig::new(
+        DEFAULT_SIDECAR_CPU_REQUEST,
+        DEFAULT_SIDECAR_MEMORY_REQUEST,
+        DEFAULT_SIDECAR_CPU_LIMIT,
+        DEFAULT_SIDECAR_MEMORY_LIMIT,
+    )
+}
+
+fn default_init_resources() -> ContainerResourceConfig {
+    ContainerResourceConfig::new(
+        DEFAULT_INIT_CPU_REQUEST,
+        DEFAULT_INIT_MEMORY_REQUEST,
+        DEFAULT_INIT_CPU_LIMIT,
+        DEFAULT_INIT_MEMORY_LIMIT,
+    )
+}
+
+fn container_resources_from_runtime(
+    key_prefix: &str,
+    defaults: ContainerResourceConfig,
+) -> Result<ContainerResourceConfig, String> {
+    let cpu_request_key = format!("{key_prefix}_CPU_REQUEST");
+    let memory_request_key = format!("{key_prefix}_MEMORY_REQUEST");
+    let cpu_limit_key = format!("{key_prefix}_CPU_LIMIT");
+    let memory_limit_key = format!("{key_prefix}_MEMORY_LIMIT");
+
+    Ok(ContainerResourceConfig {
+        cpu_request: resolve_resource_quantity(&cpu_request_key, &defaults.cpu_request)?,
+        memory_request: resolve_resource_quantity(&memory_request_key, &defaults.memory_request)?,
+        cpu_limit: resolve_resource_quantity(&cpu_limit_key, &defaults.cpu_limit)?,
+        memory_limit: resolve_resource_quantity(&memory_limit_key, &defaults.memory_limit)?,
+    })
+}
+
+fn resolve_resource_quantity(key: &str, default: &str) -> Result<String, String> {
+    let value = resolve_ferrum_var(key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_string());
+    if is_valid_kubernetes_quantity(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "Invalid {key}: '{value}' is not a valid Kubernetes resource quantity"
+        ))
+    }
+}
+
+fn is_valid_kubernetes_quantity(value: &str) -> bool {
+    if value.is_empty() || value.starts_with('-') || value.starts_with('+') {
+        return false;
+    }
+
+    let numeric = if let Some(prefix) = value.strip_suffix("Ki") {
+        prefix
+    } else if let Some(prefix) = value.strip_suffix("Mi") {
+        prefix
+    } else if let Some(prefix) = value.strip_suffix("Gi") {
+        prefix
+    } else if let Some(prefix) = value.strip_suffix("Ti") {
+        prefix
+    } else if let Some(prefix) = value.strip_suffix("Pi") {
+        prefix
+    } else if let Some(prefix) = value.strip_suffix("Ei") {
+        prefix
+    } else if let Some(last) = value.chars().last() {
+        if matches!(
+            last,
+            'n' | 'u' | 'm' | 'k' | 'K' | 'M' | 'G' | 'T' | 'P' | 'E'
+        ) {
+            &value[..value.len() - last.len_utf8()]
+        } else {
+            value
+        }
+    } else {
+        value
+    };
+
+    !numeric.is_empty() && numeric.parse::<f64>().is_ok_and(f64::is_finite)
 }
 
 fn sidecar_env_from_runtime() -> Vec<(String, String)> {
@@ -315,9 +490,6 @@ pub fn admission_response(body: &[u8], config: &InjectorConfig) -> Result<Value,
     let Some(request) = review.request else {
         return Err("AdmissionReview.request is required".to_string());
     };
-    let patches =
-        build_sidecar_patch_for_namespace(&request.object, config, request.namespace.as_deref());
-
     let mut response = json!({
         "apiVersion": api_version,
         "kind": kind,
@@ -326,6 +498,27 @@ pub fn admission_response(body: &[u8], config: &InjectorConfig) -> Result<Value,
             "allowed": true
         }
     });
+
+    let patches = match build_sidecar_patch_for_namespace(
+        &request.object,
+        config,
+        request.namespace.as_deref(),
+    ) {
+        Ok(patches) => patches,
+        Err(message) => {
+            if let Some(resp) = response.get_mut("response").and_then(Value::as_object_mut) {
+                resp.insert("allowed".to_string(), Value::Bool(false));
+                resp.insert(
+                    "status".to_string(),
+                    json!({
+                        "code": 400,
+                        "message": message,
+                    }),
+                );
+            }
+            return Ok(response);
+        }
+    };
 
     if !patches.is_empty() {
         let patch_json =
@@ -347,9 +540,9 @@ fn build_sidecar_patch_for_namespace(
     pod: &Value,
     config: &InjectorConfig,
     admission_namespace: Option<&str>,
-) -> Vec<JsonPatchOperation> {
+) -> Result<Vec<JsonPatchOperation>, String> {
     if !should_inject(pod, config) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut patch = Vec::new();
@@ -366,16 +559,24 @@ fn build_sidecar_patch_for_namespace(
         value: Some(sidecar_container(config, pod, &pod_namespace)),
     });
 
+    if config.capture_mode == CaptureMode::Ebpf {
+        patch.push(JsonPatchOperation {
+            op: "add",
+            path: "/metadata/annotations/ferrum.io~1capture-mode".to_string(),
+            value: Some(Value::String("ebpf".to_string())),
+        });
+    }
+
     if config.capture_mode == CaptureMode::Iptables {
         ensure_init_containers(pod, &mut patch);
         patch.push(JsonPatchOperation {
             op: "add",
             path: "/spec/initContainers/-".to_string(),
-            value: Some(init_container(config)),
+            value: Some(init_container(config, pod)?),
         });
     }
 
-    patch
+    Ok(patch)
 }
 
 fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
@@ -504,7 +705,21 @@ fn sidecar_container(config: &InjectorConfig, pod: &Value, namespace: &str) -> V
         "args": ["run"],
         "securityContext": {
             "runAsUser": config.proxy_uid.unwrap_or(DEFAULT_PROXY_UID),
-            "allowPrivilegeEscalation": false
+            "runAsNonRoot": true,
+            "allowPrivilegeEscalation": false,
+            "readOnlyRootFilesystem": true,
+            "capabilities": {"drop": ["ALL"]},
+            "seccompProfile": {"type": "RuntimeDefault"}
+        },
+        "resources": {
+            "requests": {
+                "cpu": config.sidecar_resources.cpu_request.as_str(),
+                "memory": config.sidecar_resources.memory_request.as_str()
+            },
+            "limits": {
+                "cpu": config.sidecar_resources.cpu_limit.as_str(),
+                "memory": config.sidecar_resources.memory_limit.as_str()
+            }
         },
         "ports": [
             {"containerPort": 15001, "name": "outbound"},
@@ -514,15 +729,31 @@ fn sidecar_container(config: &InjectorConfig, pod: &Value, namespace: &str) -> V
     })
 }
 
-fn init_container(config: &InjectorConfig) -> Value {
-    let plan = IptablesPlan::for_config(&capture_config(config));
-    json!({
+fn init_container(config: &InjectorConfig, pod: &Value) -> Result<Value, String> {
+    let plan = IptablesPlan::for_config(&capture_config(config, pod)?);
+    Ok(json!({
         "name": "ferrum-edge-init",
         "image": config.sidecar_image,
         "imagePullPolicy": "IfNotPresent",
         "securityContext": {
-            "capabilities": {"add": ["NET_ADMIN", "NET_RAW"]},
-            "runAsUser": 0
+            "runAsUser": 0,
+            "runAsNonRoot": false,
+            "allowPrivilegeEscalation": false,
+            "capabilities": {
+                "drop": ["ALL"],
+                "add": ["NET_ADMIN", "NET_RAW"]
+            },
+            "seccompProfile": {"type": "RuntimeDefault"}
+        },
+        "resources": {
+            "requests": {
+                "cpu": config.init_resources.cpu_request.as_str(),
+                "memory": config.init_resources.memory_request.as_str()
+            },
+            "limits": {
+                "cpu": config.init_resources.cpu_limit.as_str(),
+                "memory": config.init_resources.memory_limit.as_str()
+            }
         },
         "env": [
             {"name": "FERRUM_MESH_CAPTURE_MODE", "value": "iptables"},
@@ -530,14 +761,40 @@ fn init_container(config: &InjectorConfig) -> Value {
         ],
         "command": ["/bin/sh", "-c"],
         "args": [plan.commands.join("\n")]
-    })
+    }))
 }
 
-fn capture_config(config: &InjectorConfig) -> CaptureConfig {
+fn capture_config(config: &InjectorConfig, pod: &Value) -> Result<CaptureConfig, String> {
     let mut capture = CaptureConfig::explicit(15006, 15001);
     capture.mode = config.capture_mode;
     capture.proxy_uid = Some(config.proxy_uid.unwrap_or(DEFAULT_PROXY_UID));
-    capture
+    capture.exclude_ports = exclude_outbound_ports_for_pod(config, pod)?;
+    Ok(capture)
+}
+
+fn exclude_outbound_ports_for_pod(
+    config: &InjectorConfig,
+    pod: &Value,
+) -> Result<Vec<u16>, String> {
+    let annotations = pod
+        .pointer("/metadata/annotations")
+        .and_then(Value::as_object);
+    let mut ports = config.exclude_outbound_ports.clone();
+    for key in [
+        ISTIO_EXCLUDE_OUTBOUND_PORTS_ANNOTATION,
+        FERRUM_EXCLUDE_OUTBOUND_PORTS_ANNOTATION,
+    ] {
+        let annotation_ports = parse_port_list(
+            annotations
+                .and_then(|annotations| annotations.get(key))
+                .and_then(Value::as_str),
+        )
+        .map_err(|e| format!("invalid {key}: {e}"))?;
+        ports.extend(annotation_ports);
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    Ok(ports)
 }
 
 fn json_response(status: StatusCode, value: Value) -> Response<Full<Bytes>> {
@@ -561,6 +818,15 @@ mod tests {
     use super::*;
     use crate::config::EnvConfig;
 
+    fn test_resources(
+        cpu_request: &str,
+        memory_request: &str,
+        cpu_limit: &str,
+        memory_limit: &str,
+    ) -> ContainerResourceConfig {
+        ContainerResourceConfig::new(cpu_request, memory_request, cpu_limit, memory_limit)
+    }
+
     fn test_config(require_annotation: bool, capture_mode: CaptureMode) -> InjectorConfig {
         InjectorConfig {
             listen_addr: "127.0.0.1:9443".parse().expect("test addr"),
@@ -574,9 +840,12 @@ mod tests {
                 name: "ferrum-edge-secrets".to_string(),
                 key: "cp-dp-grpc-jwt-secret".to_string(),
             }),
+            sidecar_resources: default_sidecar_resources(),
+            init_resources: default_init_resources(),
             require_annotation,
             capture_mode,
             proxy_uid: Some(1337),
+            exclude_outbound_ports: Vec::new(),
             trust_domain: "cluster.local".to_string(),
             tls_cert_path: None,
             tls_key_path: None,
@@ -591,7 +860,8 @@ mod tests {
             &pod,
             &test_config(true, CaptureMode::Explicit),
             None,
-        );
+        )
+        .expect("patch");
         assert!(patch.is_empty());
     }
 
@@ -608,7 +878,8 @@ mod tests {
             &pod,
             &test_config(true, CaptureMode::Explicit),
             None,
-        );
+        )
+        .expect("patch");
         assert!(patch.is_empty());
     }
 
@@ -625,7 +896,8 @@ mod tests {
             &pod,
             &test_config(true, CaptureMode::Iptables),
             None,
-        );
+        )
+        .expect("patch");
 
         assert!(patch.iter().any(|op| op.path == "/spec/containers/-"));
         assert!(patch.iter().any(|op| op.path == "/spec/initContainers/-"));
@@ -634,11 +906,52 @@ mod tests {
             .find(|op| op.path == "/spec/containers/-")
             .and_then(|op| op.value.as_ref())
             .expect("sidecar container");
+        let init = patch
+            .iter()
+            .find(|op| op.path == "/spec/initContainers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("init container");
         let env = sidecar
             .get("env")
             .and_then(Value::as_array)
             .expect("sidecar env");
         assert_eq!(sidecar.get("args"), Some(&json!(["run"])));
+        assert_eq!(
+            sidecar.pointer("/securityContext/capabilities/drop"),
+            Some(&json!(["ALL"]))
+        );
+        assert_eq!(
+            sidecar.pointer("/securityContext/readOnlyRootFilesystem"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            sidecar.pointer("/securityContext/seccompProfile/type"),
+            Some(&Value::String("RuntimeDefault".to_string()))
+        );
+        assert_eq!(
+            sidecar.pointer("/resources/limits/memory"),
+            Some(&Value::String("256Mi".to_string()))
+        );
+        assert_eq!(
+            init.pointer("/securityContext/runAsNonRoot"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            init.pointer("/securityContext/capabilities/drop"),
+            Some(&json!(["ALL"]))
+        );
+        assert_eq!(
+            init.pointer("/securityContext/capabilities/add"),
+            Some(&json!(["NET_ADMIN", "NET_RAW"]))
+        );
+        assert_eq!(
+            init.pointer("/securityContext/seccompProfile/type"),
+            Some(&Value::String("RuntimeDefault".to_string()))
+        );
+        assert_eq!(
+            init.pointer("/resources/limits/memory"),
+            Some(&Value::String("128Mi".to_string()))
+        );
         assert!(env.iter().any(|entry| {
             entry.get("name").and_then(Value::as_str) == Some("FERRUM_DP_CP_GRPC_URLS")
                 && entry.get("value").and_then(Value::as_str) == Some("http://cp:50051")
@@ -663,6 +976,135 @@ mod tests {
             jwt_secret.pointer("/valueFrom/secretKeyRef/key"),
             Some(&Value::String("cp-dp-grpc-jwt-secret".to_string()))
         );
+    }
+
+    #[test]
+    fn patch_excludes_configured_and_annotated_outbound_ports() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/excludeOutboundPorts": "5432, 9092",
+                    "ferrum.io/excludeOutboundPorts": "15020"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let mut config = test_config(true, CaptureMode::Iptables);
+        config.exclude_outbound_ports = vec![3306, 5432];
+
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+        let init = patch
+            .iter()
+            .find(|op| op.path == "/spec/initContainers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("init container");
+        let commands = init
+            .pointer("/args/0")
+            .and_then(Value::as_str)
+            .expect("iptables plan");
+
+        for port in [3306, 5432, 9092, 15020] {
+            assert!(commands.contains(&format!("--dport {port} -j RETURN")));
+        }
+    }
+
+    #[test]
+    fn patch_uses_configurable_container_resources() {
+        let pod = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let mut config = test_config(true, CaptureMode::Iptables);
+        config.sidecar_resources = test_resources("5m", "16Mi", "50m", "96Mi");
+        config.init_resources = test_resources("2m", "8Mi", "20m", "32Mi");
+
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+        let sidecar = patch
+            .iter()
+            .find(|op| op.path == "/spec/containers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("sidecar container");
+        let init = patch
+            .iter()
+            .find(|op| op.path == "/spec/initContainers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("init container");
+
+        assert_eq!(
+            sidecar.pointer("/resources/requests/cpu"),
+            Some(&Value::String("5m".to_string()))
+        );
+        assert_eq!(
+            sidecar.pointer("/resources/limits/memory"),
+            Some(&Value::String("96Mi".to_string()))
+        );
+        assert_eq!(
+            init.pointer("/resources/requests/memory"),
+            Some(&Value::String("8Mi".to_string()))
+        );
+        assert_eq!(
+            init.pointer("/resources/limits/cpu"),
+            Some(&Value::String("20m".to_string()))
+        );
+    }
+
+    #[test]
+    fn patch_rejects_invalid_exclude_outbound_ports_annotation() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/excludeOutboundPorts": "not-a-port"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+
+        let err = build_sidecar_patch_for_namespace(&pod, &config, None)
+            .expect_err("invalid annotation rejected");
+
+        assert!(err.contains("traffic.sidecar.istio.io/excludeOutboundPorts"));
+        assert!(!err.contains(": invalid mesh outbound port exclusion"));
+    }
+
+    #[test]
+    fn admission_response_denies_invalid_exclude_outbound_ports_annotation() {
+        let review = json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "bad-ports",
+                "namespace": "payments",
+                "object": {
+                    "metadata": {
+                        "labels": {"ferrum.io/mesh": "enabled"},
+                        "annotations": {
+                            "traffic.sidecar.istio.io/excludeOutboundPorts": "not-a-port"
+                        }
+                    },
+                    "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+                }
+            }
+        });
+        let response = admission_response(
+            review.to_string().as_bytes(),
+            &test_config(true, CaptureMode::Iptables),
+        )
+        .expect("admission denial");
+
+        assert_eq!(
+            response.pointer("/response/allowed"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(response.pointer("/response/patch"), None);
+        let message = response
+            .pointer("/response/status/message")
+            .and_then(Value::as_str)
+            .expect("denial message");
+        assert!(message.contains("traffic.sidecar.istio.io/excludeOutboundPorts"));
+        assert!(!message.contains(": invalid mesh outbound port exclusion"));
     }
 
     #[test]
@@ -731,7 +1173,8 @@ mod tests {
             }
         });
         let patch =
-            build_sidecar_patch_for_namespace(&pod, &test_config(true, CaptureMode::Ebpf), None);
+            build_sidecar_patch_for_namespace(&pod, &test_config(true, CaptureMode::Ebpf), None)
+                .expect("patch");
 
         assert!(patch.iter().any(|op| op.path == "/spec/containers/-"));
         assert!(
@@ -752,7 +1195,8 @@ mod tests {
             &pod,
             &test_config(true, CaptureMode::Explicit),
             None,
-        );
+        )
+        .expect("patch");
 
         assert!(patch.iter().any(|op| op.path == "/spec/containers/-"));
         assert!(!patch.iter().any(|op| op.path == "/spec/initContainers/-"));
@@ -773,5 +1217,29 @@ mod tests {
         let err =
             validate_injector_trust_domain("CLUSTER.LOCAL").expect_err("invalid trust domain");
         assert!(err.contains("FERRUM_INJECTOR_TRUST_DOMAIN"));
+    }
+
+    #[test]
+    fn injector_config_rejects_root_proxy_uid() {
+        let err = parse_injector_proxy_uid(Some("0".to_string())).expect_err("root UID rejected");
+
+        assert!(err.contains("FERRUM_MESH_PROXY_UID"));
+        assert!(err.contains("non-zero"));
+    }
+
+    #[test]
+    fn injector_config_rejects_invalid_resource_quantity() {
+        let err =
+            resolve_resource_quantity("FERRUM_INJECTOR_SIDECAR_CPU_REQUEST", "not-a-quantity")
+                .expect_err("invalid quantity rejected");
+
+        assert!(err.contains("FERRUM_INJECTOR_SIDECAR_CPU_REQUEST"));
+    }
+
+    #[test]
+    fn injector_config_parses_non_root_proxy_uid() {
+        let uid = parse_injector_proxy_uid(Some("1337".to_string())).expect("valid UID");
+
+        assert_eq!(uid, Some(1337));
     }
 }

@@ -20,13 +20,44 @@ injector:
   requireAnnotation: true
   failurePolicy: Fail
   caBundle: ""
+  namespaceSelector:
+    matchExpressions:
+      - key: kubernetes.io/metadata.name
+        operator: NotIn
+        values:
+          - kube-system
+          - kube-public
+          - kube-node-lease
+          - istio-system
+      - key: ferrum.io/injection
+        operator: NotIn
+        values:
+          - disabled
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
   tls:
     secretName: ferrum-mesh-injector-tls
     certPath: /etc/ferrum/injector/tls/tls.crt
     keyPath: /etc/ferrum/injector/tls/tls.key
   env:
     FERRUM_MODE: injector
-    FERRUM_INJECTOR_REQUIRE_ANNOTATION: "true"
 
 ambient:
   enabled: false
@@ -56,3 +87,25 @@ observability:
   enabled: false
   dashboards:
     enabled: true
+
+nodeAgent:
+  enabled: false
+  image:
+    repository: ferrumedge/ferrum-edge
+    tag: latest
+  captureMode: ebpf
+  proxyUid: 1337
+  cgroupRoot: /sys/fs/cgroup
+  bpfFsPath: /sys/fs/bpf
+  fallbackMode: iptables
+  capture:
+    includeCidrs: "0.0.0.0/0"
+    excludeCidrs: ""
+    excludePorts: "15001,15006,15008,15020"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi

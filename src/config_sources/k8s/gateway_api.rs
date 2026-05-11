@@ -197,7 +197,7 @@ fn http_route_proxies(
                 backend_scheme: BackendScheme::Http,
                 listen_port: None,
                 retry: None,
-                timeout_ms: None,
+                backend_read_timeout_ms: None,
             }));
         }
     }
@@ -382,7 +382,7 @@ fn l4_route_proxies(
             backend_scheme: scheme,
             listen_port: Some(backend_port),
             retry: None,
-            timeout_ms: None,
+            backend_read_timeout_ms: None,
         }));
     }
     Ok(proxies)

@@ -463,4 +463,440 @@ mod tests {
             serialize_redacted_metadata(self.0, s)
         }
     }
+
+    // ── contains_ascii_case_insensitive edge cases ───────────────────────
+
+    #[test]
+    fn contains_ascii_case_insensitive_empty_needle_returns_false() {
+        assert!(!contains_ascii_case_insensitive("anything", ""));
+    }
+
+    #[test]
+    fn contains_ascii_case_insensitive_needle_longer_than_haystack() {
+        assert!(!contains_ascii_case_insensitive("ab", "abc"));
+    }
+
+    #[test]
+    fn contains_ascii_case_insensitive_exact_match() {
+        assert!(contains_ascii_case_insensitive("secret", "secret"));
+        assert!(contains_ascii_case_insensitive("SECRET", "secret"));
+        assert!(contains_ascii_case_insensitive("Secret", "secret"));
+    }
+
+    #[test]
+    fn contains_ascii_case_insensitive_partial_match() {
+        assert!(contains_ascii_case_insensitive("my_secret_key", "secret"));
+        assert!(contains_ascii_case_insensitive("MY_SECRET_KEY", "secret"));
+    }
+
+    #[test]
+    fn contains_ascii_case_insensitive_no_match() {
+        assert!(!contains_ascii_case_insensitive("request_id", "secret"));
+    }
+
+    #[test]
+    fn contains_ascii_case_insensitive_both_empty() {
+        // Empty needle is always false by design (nothing to match).
+        assert!(!contains_ascii_case_insensitive("", ""));
+    }
+
+    // ── key segmentation direct tests ────────────────────────────────────
+
+    #[test]
+    fn segments_camel_case_correctly() {
+        let mut segments = Vec::new();
+        for_each_metadata_key_segment("refreshToken", |s| segments.push(s.to_string()));
+        assert_eq!(segments, vec!["refresh", "Token"]);
+    }
+
+    #[test]
+    fn segments_underscore_delimited_key() {
+        let mut segments = Vec::new();
+        for_each_metadata_key_segment("api_key_value", |s| segments.push(s.to_string()));
+        assert_eq!(segments, vec!["api", "key", "value"]);
+    }
+
+    #[test]
+    fn segments_hyphen_delimited_key() {
+        let mut segments = Vec::new();
+        for_each_metadata_key_segment("x-auth-token", |s| segments.push(s.to_string()));
+        assert_eq!(segments, vec!["x", "auth", "token"]);
+    }
+
+    #[test]
+    fn segments_dot_delimited_key() {
+        let mut segments = Vec::new();
+        for_each_metadata_key_segment("auth.session.token", |s| segments.push(s.to_string()));
+        assert_eq!(segments, vec!["auth", "session", "token"]);
+    }
+
+    #[test]
+    fn segments_mixed_delimiters() {
+        let mut segments = Vec::new();
+        for_each_metadata_key_segment("ns.myToken_value", |s| segments.push(s.to_string()));
+        assert_eq!(segments, vec!["ns", "my", "Token", "value"]);
+    }
+
+    #[test]
+    fn segments_consecutive_uppercase_stays_together() {
+        // "APIToken" -> "APIToken" as one segment because the camelCase
+        // split only fires when previousWasLowerOrDigit; all-caps does not
+        // trigger a split until a lowercase follows.
+        let mut segments = Vec::new();
+        for_each_metadata_key_segment("APIToken", |s| segments.push(s.to_string()));
+        assert_eq!(segments, vec!["APIToken"]);
+    }
+
+    #[test]
+    fn segments_single_character_key() {
+        let mut segments = Vec::new();
+        for_each_metadata_key_segment("a", |s| segments.push(s.to_string()));
+        assert_eq!(segments, vec!["a"]);
+    }
+
+    #[test]
+    fn segments_empty_key() {
+        let mut segments = Vec::new();
+        for_each_metadata_key_segment("", |s| segments.push(s.to_string()));
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn segments_only_delimiters() {
+        let mut segments = Vec::new();
+        for_each_metadata_key_segment("---___...", |s| segments.push(s.to_string()));
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn segments_non_ascii_boundary() {
+        // Non-ASCII chars act as delimiters between ASCII segments.
+        let mut segments = Vec::new();
+        for_each_metadata_key_segment("sessionétoken", |s| segments.push(s.to_string()));
+        assert_eq!(segments, vec!["session", "token"]);
+    }
+
+    #[test]
+    fn segments_trailing_non_ascii() {
+        let mut segments = Vec::new();
+        for_each_metadata_key_segment("tokenü", |s| segments.push(s.to_string()));
+        assert_eq!(segments, vec!["token"]);
+    }
+
+    #[test]
+    fn segments_leading_non_ascii() {
+        let mut segments = Vec::new();
+        for_each_metadata_key_segment("ütokené", |s| segments.push(s.to_string()));
+        assert_eq!(segments, vec!["token"]);
+    }
+
+    #[test]
+    fn segments_digits_treated_as_lowercase() {
+        // Digit → uppercase transition splits, matching camelCase behavior.
+        let mut segments = Vec::new();
+        for_each_metadata_key_segment("token2Value", |s| segments.push(s.to_string()));
+        assert_eq!(segments, vec!["token2", "Value"]);
+    }
+
+    // ── is_sensitive_token_metadata_key direct tests ─────────────────────
+
+    #[test]
+    fn bare_token_is_sensitive() {
+        assert!(is_sensitive_token_metadata_key("token"));
+    }
+
+    #[test]
+    fn token_with_value_descriptor_is_sensitive() {
+        // "value" is a TOKEN_VALUE_SEGMENTS entry, so token+value is still
+        // sensitive (single token segment + all others are value descriptors).
+        assert!(is_sensitive_token_metadata_key("token_value"));
+        assert!(is_sensitive_token_metadata_key("token_hash"));
+        assert!(is_sensitive_token_metadata_key("token_sha256"));
+    }
+
+    #[test]
+    fn token_with_context_segment_is_sensitive() {
+        for ctx in SENSITIVE_TOKEN_CONTEXT_SEGMENTS {
+            let key = format!("{ctx}_token");
+            assert!(
+                is_sensitive_token_metadata_key(&key),
+                "{key} should be sensitive"
+            );
+        }
+    }
+
+    #[test]
+    fn token_with_non_sensitive_context_is_not_sensitive() {
+        // "total" is neither a context segment nor a value descriptor.
+        assert!(!is_sensitive_token_metadata_key("total_tokens"));
+        assert!(!is_sensitive_token_metadata_key("ai_completion_tokens"));
+        assert!(!is_sensitive_token_metadata_key("prompt_tokens"));
+    }
+
+    #[test]
+    fn no_token_segment_is_not_sensitive() {
+        assert!(!is_sensitive_token_metadata_key("password"));
+        assert!(!is_sensitive_token_metadata_key("secret_key"));
+        assert!(!is_sensitive_token_metadata_key(""));
+    }
+
+    // ── each default key substring individually ──────────────────────────
+
+    #[test]
+    fn each_default_sensitive_key_individually_redacts() {
+        let extras: Vec<String> = Vec::new();
+        for default_key in DEFAULT_SENSITIVE_METADATA_KEYS {
+            assert!(
+                is_sensitive_metadata_key_with_extras(default_key, &extras),
+                "bare default key {default_key:?} should be sensitive"
+            );
+            // Prefixed
+            let prefixed = format!("my_{default_key}");
+            assert!(
+                is_sensitive_metadata_key_with_extras(&prefixed, &extras),
+                "prefixed key {prefixed:?} should be sensitive"
+            );
+            // Suffixed
+            let suffixed = format!("{default_key}_value");
+            assert!(
+                is_sensitive_metadata_key_with_extras(&suffixed, &extras),
+                "suffixed key {suffixed:?} should be sensitive"
+            );
+            // Uppercased
+            let upper = default_key.to_ascii_uppercase();
+            assert!(
+                is_sensitive_metadata_key_with_extras(&upper, &extras),
+                "uppercased key {upper:?} should be sensitive"
+            );
+        }
+    }
+
+    // ── additional case-insensitivity tests ──────────────────────────────
+
+    #[test]
+    fn title_case_x_api_key_redacts() {
+        let extras: Vec<String> = Vec::new();
+        assert!(is_sensitive_metadata_key_with_extras("X-Api-Key", &extras));
+    }
+
+    #[test]
+    fn mixed_case_bearer_redacts() {
+        let extras: Vec<String> = Vec::new();
+        assert!(is_sensitive_metadata_key_with_extras("bEaReR", &extras));
+    }
+
+    // ── operator-supplied extras ─────────────────────────────────────────
+
+    #[test]
+    fn multiple_comma_separated_extras_all_redact() {
+        let extras = parse_extras_list("corp-key, internal-id, x-trace");
+        assert!(is_sensitive_metadata_key_with_extras("corp-key", &extras));
+        assert!(is_sensitive_metadata_key_with_extras(
+            "internal-id",
+            &extras
+        ));
+        assert!(is_sensitive_metadata_key_with_extras("x-trace", &extras));
+    }
+
+    #[test]
+    fn extras_are_case_insensitive_on_match() {
+        let extras = parse_extras_list("MyCustom");
+        assert!(is_sensitive_metadata_key_with_extras("mycustom", &extras));
+        assert!(is_sensitive_metadata_key_with_extras("MYCUSTOM", &extras));
+        assert!(is_sensitive_metadata_key_with_extras(
+            "prefix_MyCustom_suffix",
+            &extras
+        ));
+    }
+
+    #[test]
+    fn extras_do_not_interfere_with_defaults() {
+        let extras = parse_extras_list("custom1");
+        // Defaults still work with extras present.
+        assert!(is_sensitive_metadata_key_with_extras(
+            "authorization",
+            &extras
+        ));
+        assert!(is_sensitive_metadata_key_with_extras("password", &extras));
+        // And the custom still works.
+        assert!(is_sensitive_metadata_key_with_extras("custom1", &extras));
+    }
+
+    // ── edge cases: empty and degenerate inputs ─────────────────────────
+
+    #[test]
+    fn empty_key_is_not_sensitive() {
+        let extras: Vec<String> = Vec::new();
+        assert!(!is_sensitive_metadata_key_with_extras("", &extras));
+    }
+
+    #[test]
+    fn key_is_only_the_sensitive_substring() {
+        let extras: Vec<String> = Vec::new();
+        assert!(is_sensitive_metadata_key_with_extras("secret", &extras));
+        assert!(is_sensitive_metadata_key_with_extras("password", &extras));
+        assert!(is_sensitive_metadata_key_with_extras("bearer", &extras));
+        assert!(is_sensitive_metadata_key_with_extras("cookie", &extras));
+        assert!(is_sensitive_metadata_key_with_extras("token", &extras));
+    }
+
+    #[test]
+    fn sensitive_key_with_empty_value_still_redacted_in_serialization() {
+        let mut metadata = HashMap::new();
+        metadata.insert("authorization".to_string(), String::new());
+
+        let json = serde_json::to_string(&MetadataWrapper(&metadata)).unwrap();
+        assert!(
+            json.contains(r#""authorization":"[REDACTED]""#),
+            "even an empty value should be replaced with [REDACTED], got: {}",
+            json
+        );
+        // The empty string should NOT appear as the value.
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["authorization"], "[REDACTED]");
+    }
+
+    #[test]
+    fn request_metadata_is_not_sensitive() {
+        // "requestMetadata" segments to ["request", "Metadata"], neither of
+        // which is a default sensitive substring nor a token context segment.
+        let extras: Vec<String> = Vec::new();
+        assert!(!is_sensitive_metadata_key_with_extras(
+            "requestMetadata",
+            &extras
+        ));
+    }
+
+    // ── serialization: multiple sensitive keys ───────────────────────────
+
+    #[test]
+    fn multiple_sensitive_keys_all_redacted_independently() {
+        let mut metadata = HashMap::new();
+        metadata.insert("authorization".to_string(), "Bearer secret-1".to_string());
+        metadata.insert("cookie".to_string(), "sid=abc".to_string());
+        metadata.insert("password".to_string(), "hunter2".to_string());
+        metadata.insert("safe_key".to_string(), "visible".to_string());
+
+        let json = serde_json::to_string(&MetadataWrapper(&metadata)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["authorization"], "[REDACTED]");
+        assert_eq!(parsed["cookie"], "[REDACTED]");
+        assert_eq!(parsed["password"], "[REDACTED]");
+        assert_eq!(parsed["safe_key"], "visible");
+
+        for leaked in ["secret-1", "sid=abc", "hunter2"] {
+            assert!(
+                !json.contains(leaked),
+                "sensitive value {leaked:?} leaked: {json}"
+            );
+        }
+    }
+
+    // ── serialization: empty metadata map ────────────────────────────────
+
+    #[test]
+    fn serialize_empty_metadata_map() {
+        let metadata: HashMap<String, String> = HashMap::new();
+        let json = serde_json::to_string(&MetadataWrapper(&metadata)).unwrap();
+        assert_eq!(json, "{}");
+    }
+
+    // ── serialization: original map not modified ─────────────────────────
+
+    #[test]
+    fn serialize_does_not_modify_original_map() {
+        let mut metadata = HashMap::new();
+        metadata.insert("authorization".to_string(), "Bearer leak-me".to_string());
+        metadata.insert("trace_id".to_string(), "t-1".to_string());
+
+        // Serialize (which redacts).
+        let _json = serde_json::to_string(&MetadataWrapper(&metadata)).unwrap();
+
+        // Original map must be untouched.
+        assert_eq!(metadata["authorization"], "Bearer leak-me");
+        assert_eq!(metadata["trace_id"], "t-1");
+    }
+
+    // ── parse_extras_list edge cases ─────────────────────────────────────
+
+    #[test]
+    fn parse_extras_empty_string() {
+        let extras = parse_extras_list("");
+        assert!(extras.is_empty());
+    }
+
+    #[test]
+    fn parse_extras_single_entry() {
+        let extras = parse_extras_list("custom");
+        assert_eq!(extras, vec!["custom".to_string()]);
+    }
+
+    #[test]
+    fn parse_extras_preserves_hyphens_and_underscores() {
+        let extras = parse_extras_list("my-key, my_key");
+        assert_eq!(extras, vec!["my-key".to_string(), "my_key".to_string()]);
+    }
+
+    // ── delimiter-based segmentation for token detection ─────────────────
+
+    #[test]
+    fn underscore_delimited_token_key_is_sensitive() {
+        let extras: Vec<String> = Vec::new();
+        assert!(is_sensitive_metadata_key_with_extras(
+            "access_token",
+            &extras
+        ));
+        assert!(is_sensitive_metadata_key_with_extras("csrf_token", &extras));
+    }
+
+    #[test]
+    fn hyphen_delimited_token_key_is_sensitive() {
+        let extras: Vec<String> = Vec::new();
+        assert!(is_sensitive_metadata_key_with_extras("id-token", &extras));
+        assert!(is_sensitive_metadata_key_with_extras("auth-token", &extras));
+    }
+
+    #[test]
+    fn dot_delimited_token_key_is_sensitive() {
+        let extras: Vec<String> = Vec::new();
+        assert!(is_sensitive_metadata_key_with_extras(
+            "auth.session.token",
+            &extras
+        ));
+    }
+
+    #[test]
+    fn camel_case_token_key_is_sensitive() {
+        let extras: Vec<String> = Vec::new();
+        assert!(is_sensitive_metadata_key_with_extras(
+            "refreshToken",
+            &extras
+        ));
+        assert!(is_sensitive_metadata_key_with_extras(
+            "accessToken",
+            &extras
+        ));
+        assert!(is_sensitive_metadata_key_with_extras(
+            "sessionToken",
+            &extras
+        ));
+    }
+
+    #[test]
+    fn all_caps_token_not_split_so_not_sensitive_unless_substring() {
+        // "APIToken" is one segment "APIToken", which is not "token" exactly
+        // and does not contain any default sensitive substring. The token
+        // context check does not fire because it needs a separate "token"
+        // segment.
+        let extras: Vec<String> = Vec::new();
+        assert!(!is_sensitive_metadata_key_with_extras("APIToken", &extras));
+    }
+
+    // ── REDACTED_PLACEHOLDER value ───────────────────────────────────────
+
+    #[test]
+    fn redacted_placeholder_is_expected_string() {
+        assert_eq!(REDACTED_PLACEHOLDER, "[REDACTED]");
+    }
 }

@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 pub mod attestation;
 pub mod ca;
+pub mod file_loader;
 pub mod rotation;
 pub mod spiffe;
 pub mod workload_api;
@@ -30,7 +31,7 @@ pub mod workload_api;
 #[allow(unused_imports)]
 pub use attestation::{Attestor, PeerInfo, WorkloadIdentity};
 #[allow(unused_imports)]
-pub use ca::{CertificateAuthority, SharedCa};
+pub use ca::{CaBackend, CertificateAuthority, SharedCa};
 #[allow(unused_imports)]
 pub use spiffe::{SpiffeId, SpiffeIdError, TrustDomain, TrustDomainError};
 

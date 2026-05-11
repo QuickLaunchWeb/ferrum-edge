@@ -32,6 +32,7 @@ fn allow_client_policy(action: PolicyAction) -> MeshPolicy {
             }],
             to: Vec::new(),
             when: Vec::new(),
+            request_principals: Vec::new(),
             never_matches: false,
             action,
         }],
@@ -53,6 +54,7 @@ fn allow_ztunnel_policy() -> MeshPolicy {
             }],
             to: Vec::new(),
             when: Vec::new(),
+            request_principals: Vec::new(),
             never_matches: false,
             action: PolicyAction::Allow,
         }],
@@ -73,6 +75,7 @@ fn allow_host_policy(host: &str) -> MeshPolicy {
                 ..RequestMatch::default()
             }],
             when: Vec::new(),
+            request_principals: Vec::new(),
             never_matches: false,
             action: PolicyAction::Allow,
         }],
@@ -779,6 +782,24 @@ async fn workload_metrics_uses_workload_hint_when_peer_identity_absent() {
         Some("spiffe://cluster.local/ns/default/sa/api")
     );
     assert_eq!(
+        ctx.metadata
+            .get("mesh.source.trust_domain")
+            .map(String::as_str),
+        Some("cluster.local")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.namespace")
+            .map(String::as_str),
+        Some("default")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.service_account")
+            .map(String::as_str),
+        Some("api")
+    );
+    assert_eq!(
         ctx.metadata.get("mesh.source.workload").map(String::as_str),
         Some("api")
     );
@@ -1084,6 +1105,7 @@ fn policy_with_scope(name: &str, scope: PolicyScope, action: PolicyAction) -> Me
             from: Vec::new(),
             to: Vec::new(),
             when: Vec::new(),
+            request_principals: Vec::new(),
             never_matches: false,
             action,
         }],
@@ -1379,4 +1401,207 @@ async fn mesh_authz_slice_embedded_identity_drives_scope_filter() {
 
     // Pre-fix: team-a-deny would deny team-b traffic. Post-fix: filtered out.
     assert!(matches!(result, PluginResult::Continue));
+}
+
+// ── requestPrincipals JWT enforcement (Phase C) ─────────────────────────────
+//
+// These tests pin the Istio-compatible `requestPrincipals` semantics:
+//
+// 1. `jwks_auth` sets `ctx.metadata["jwks_auth.request_principal"]` = `{iss}/{sub}`.
+// 2. `mesh_authz` passes that metadata value as `MeshAuthzRequest.request_principal`.
+// 3. `MeshRule.request_principals` (from `from[].source.requestPrincipals`)
+//    filters rules by glob-matching the request principal.
+// 4. Empty `request_principals` means "any" (no filter).
+// 5. Non-empty `request_principals` + no JWT (`None`) fails the match.
+
+fn request_principal_policy(name: &str, action: PolicyAction, patterns: Vec<String>) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector::default(),
+        },
+        rules: vec![MeshRule {
+            request_principals: patterns,
+            action,
+            ..MeshRule::default()
+        }],
+    }
+}
+
+#[tokio::test]
+async fn mesh_authz_request_principals_allow_matching_jwt() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [request_principal_policy(
+            "require-jwt",
+            PolicyAction::Allow,
+            vec!["https://auth.example.com/user-123".to_string()],
+        )]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(None);
+    ctx.metadata.insert(
+        "jwks_auth.request_principal".to_string(),
+        "https://auth.example.com/user-123".to_string(),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "matching request principal should be allowed, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_request_principals_deny_non_matching_jwt() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [request_principal_policy(
+            "require-jwt",
+            PolicyAction::Allow,
+            vec!["https://auth.example.com/admin-*".to_string()],
+        )]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(None);
+    ctx.metadata.insert(
+        "jwks_auth.request_principal".to_string(),
+        "https://auth.example.com/user-123".to_string(),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("non-matching request principal should be denied, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("implicit-deny")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_request_principals_deny_missing_jwt() {
+    // A rule requiring requestPrincipals must reject anonymous (no-JWT) requests.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [request_principal_policy(
+            "require-any-jwt",
+            PolicyAction::Allow,
+            vec!["*".to_string()],
+        )]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(None);
+    // No jwks_auth.request_principal metadata — anonymous request
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("missing JWT should trigger implicit deny, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mesh_authz_request_principals_wildcard_matches_any_jwt() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [request_principal_policy(
+            "require-any-jwt",
+            PolicyAction::Allow,
+            vec!["*".to_string()],
+        )]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(None);
+    ctx.metadata.insert(
+        "jwks_auth.request_principal".to_string(),
+        "https://any-issuer.example.com/any-subject".to_string(),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "wildcard should match any JWT principal, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_empty_request_principals_allows_anonymous() {
+    // An empty request_principals list means "no filter" — anonymous is fine.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [request_principal_policy(
+            "no-jwt-constraint",
+            PolicyAction::Allow,
+            vec![],
+        )]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(None);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "empty request_principals should allow anonymous, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_request_principals_deny_rule_blocks_jwt() {
+    // A DENY rule with requestPrincipals should block matching JWTs.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [request_principal_policy(
+            "deny-admin",
+            PolicyAction::Deny,
+            vec!["https://auth.example.com/admin-*".to_string()],
+        )]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(None);
+    ctx.metadata.insert(
+        "jwks_auth.request_principal".to_string(),
+        "https://auth.example.com/admin-root".to_string(),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("deny rule should block matching JWT, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("deny-admin")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_request_principals_deny_rule_skips_non_matching_jwt() {
+    // A DENY rule with requestPrincipals should NOT block non-matching JWTs.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [request_principal_policy(
+            "deny-admin",
+            PolicyAction::Deny,
+            vec!["https://auth.example.com/admin-*".to_string()],
+        )]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(None);
+    ctx.metadata.insert(
+        "jwks_auth.request_principal".to_string(),
+        "https://auth.example.com/user-123".to_string(),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "deny rule should not block non-matching JWT, got {result:?}"
+    );
 }

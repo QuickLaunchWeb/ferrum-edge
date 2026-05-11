@@ -289,6 +289,54 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  build-ebpf:
+    name: Build eBPF Programs
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check for eBPF changes
+        id: changes
+        run: |
+          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -q '^ebpf/'; then
+            echo "ebpf_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ebpf_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install nightly Rust with rust-src
+        if: steps.changes.outputs.ebpf_changed == 'true'
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install stable Rust for shared types
+        if: steps.changes.outputs.ebpf_changed == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install bpf-linker
+        if: steps.changes.outputs.ebpf_changed == 'true'
+        run: cargo install bpf-linker --locked
+
+      - name: Build BPF programs
+        if: steps.changes.outputs.ebpf_changed == 'true'
+        run: cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
+
+      - name: Test shared types
+        if: steps.changes.outputs.ebpf_changed == 'true'
+        run: cd ebpf && cargo test -p ferrum-ebpf-common
+
+      - name: Upload BPF artifact
+        if: steps.changes.outputs.ebpf_changed == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ebpf-programs
+          path: ebpf/target/bpfel-unknown-none/release/ferrum-ebpf
+          retention-days: 14
+
   performance-regression:
     name: Performance Regression Check
     if: github.event_name == 'pull_request'

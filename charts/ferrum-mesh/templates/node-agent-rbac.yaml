@@ -1,0 +1,41 @@
+{{- if .Values.nodeAgent.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ferrum-node-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-node-agent
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ferrum-node-agent-{{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-node-agent
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ferrum-node-agent-{{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-node-agent
+    app.kubernetes.io/instance: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ferrum-node-agent-{{ .Release.Name }}
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-node-agent
+    namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -98,6 +98,7 @@ fn mesh_policy_principal_must_have_at_least_one_field() {
                 ..Default::default()
             }],
             when: Vec::new(),
+            request_principals: Vec::new(),
             never_matches: false,
             action: PolicyAction::Allow,
         }],
@@ -124,6 +125,7 @@ fn mesh_policy_request_match_must_have_at_least_one_constraint() {
             }],
             to: vec![RequestMatch::default()],
             when: Vec::new(),
+            request_principals: Vec::new(),
             never_matches: false,
             action: PolicyAction::Allow,
         }],
@@ -154,6 +156,7 @@ fn mesh_policy_glob_pattern_must_be_valid() {
                 ..Default::default()
             }],
             when: Vec::new(),
+            request_principals: Vec::new(),
             never_matches: false,
             action: PolicyAction::Allow,
         }],
@@ -179,6 +182,7 @@ fn policy_with_request_match(request: RequestMatch) -> MeshPolicy {
             }],
             to: vec![request],
             when: Vec::new(),
+            request_principals: Vec::new(),
             never_matches: false,
             action: PolicyAction::Allow,
         }],

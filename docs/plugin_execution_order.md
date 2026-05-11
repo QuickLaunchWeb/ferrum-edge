@@ -338,11 +338,12 @@ After all plugin phases complete, the gateway automatically injects `X-Consumer-
 
 ### Rate limiting runs after auth (priority 2900)
 
-Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforce limits by **authenticated identity**, not just by IP address. When `limit_by: "consumer"`, the plugin uses the mapped Consumer username when available, otherwise external `ctx.authenticated_identity`; those values only exist after the authenticate phase.
+Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforce limits by **authenticated identity**, not just by IP address. When `limit_by: "consumer"`, the plugin uses the mapped Consumer username when available, otherwise external `ctx.authenticated_identity`; those values only exist after the authenticate phase. When `limit_by: "spiffe_identity"`, the plugin uses `ctx.peer_spiffe_id`, populated earlier by the `spiffe_identity` plugin.
 
 **Dual-phase behavior:**
 - `limit_by: "ip"` — enforces IP-based limits in `on_request_received` (phase 1, before auth). This protects auth endpoints from brute-force attacks.
 - `limit_by: "consumer"` — enforces identity-based limits in `authorize` (phase 3, after auth). Uses mapped Consumer username first, then external `authenticated_identity`, and falls back to IP-based keying only when no authenticated identity exists.
+- `limit_by: "spiffe_identity"` — enforces SPIFFE-based limits in `authorize` (phase 3, after `spiffe_identity`). Uses the peer SPIFFE URI and falls back to IP-based keying when no SPIFFE identity exists. The shorter alias `spiffe` is accepted.
 
 **Header exposure** (`expose_headers: true`): When enabled, the plugin injects `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`, and `x-ratelimit-identity` headers on both upstream requests (`before_proxy`) and downstream responses (`after_proxy`). This lets backends and clients see current rate-limit state without additional lookups. Disabled by default so gateway admins control whether limit details are exposed.
 

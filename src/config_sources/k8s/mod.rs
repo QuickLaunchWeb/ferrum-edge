@@ -415,15 +415,12 @@ pub(crate) struct RouteProxySpec {
     pub upstream_id: Option<String>,
     pub backend_scheme: BackendScheme,
     pub listen_port: Option<u16>,
-    /// Per-route retry config extracted from VirtualService `retries`.
     pub retry: Option<RetryConfig>,
-    /// Per-route backend read timeout in ms extracted from VirtualService `timeout`.
-    pub timeout_ms: Option<u64>,
+    pub backend_read_timeout_ms: Option<u64>,
 }
 
 pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
     let now = Utc::now();
-    let backend_read_timeout_ms = spec.timeout_ms.unwrap_or(30_000);
     Proxy {
         id: spec.id,
         name: None,
@@ -438,7 +435,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         strip_listen_path: spec.strip_listen_path,
         preserve_host_header: false,
         backend_connect_timeout_ms: 30_000,
-        backend_read_timeout_ms,
+        backend_read_timeout_ms: spec.backend_read_timeout_ms.unwrap_or(30_000),
         backend_write_timeout_ms: 30_000,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -647,77 +644,6 @@ fn parse_istio_grpc_status(value: &Value) -> Option<u32> {
         "UNAUTHENTICATED" => Some(16),
         _ => None,
     }
-}
-
-/// Extract retry config from an Istio VirtualService `retries` object.
-pub(crate) fn extract_retry_config(retries: &Value) -> Option<RetryConfig> {
-    let obj = retries.as_object()?;
-    let attempts = obj.get("attempts").and_then(Value::as_u64)?;
-    if attempts == 0 {
-        return None;
-    }
-
-    let retry_on = obj.get("retryOn").and_then(Value::as_str);
-
-    let mut retryable_status_codes = retry_on
-        .map(|retry_on| {
-            retry_on
-                .split(',')
-                .filter_map(|token| {
-                    let token = token.trim();
-                    match token {
-                        "5xx" => Some(vec![500, 502, 503, 504]),
-                        "gateway-error" => Some(vec![502, 503, 504]),
-                        "retriable-4xx" => Some(vec![409]),
-                        "reset"
-                        | "connect-failure"
-                        | "refused-stream"
-                        | "retriable-status-codes" => None,
-                        _ => token
-                            .parse::<u16>()
-                            .ok()
-                            .filter(|code| (100..=599).contains(code))
-                            .map(|code| vec![code]),
-                    }
-                })
-                .flatten()
-                .collect::<Vec<u16>>()
-        })
-        .unwrap_or_default();
-
-    retryable_status_codes.sort_unstable();
-    retryable_status_codes.dedup();
-
-    // Istio's effective default `retryOn` (applied when the field is unset on
-    // a VirtualService that does configure `retries`) is
-    // `connect-failure,refused-stream,unavailable,cancelled,retriable-status-codes`
-    // — so an omitted token list still implies retry on transport-level
-    // failures. When the operator does set `retryOn` we honor it verbatim.
-    let retry_on_connect = match retry_on {
-        Some(tokens) => tokens.split(',').any(|token| {
-            let token = token.trim();
-            token == "connect-failure" || token == "reset" || token == "refused-stream"
-        }),
-        None => true,
-    };
-
-    // Istio retries all HTTP methods by default (unlike Ferrum's default which
-    // excludes POST/PATCH), so unconditionally include every standard method.
-    Some(RetryConfig {
-        max_retries: attempts as u32,
-        retryable_status_codes,
-        retry_on_connect_failure: retry_on_connect,
-        retryable_methods: vec![
-            "GET".to_string(),
-            "HEAD".to_string(),
-            "OPTIONS".to_string(),
-            "PUT".to_string(),
-            "DELETE".to_string(),
-            "POST".to_string(),
-            "PATCH".to_string(),
-        ],
-        ..RetryConfig::default()
-    })
 }
 
 pub(crate) struct RouteBackend {
