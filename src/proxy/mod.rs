@@ -71,8 +71,8 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::types::{
-    AuthMode, BackendScheme, DispatchKind, GatewayConfig, HttpFlavor, Proxy, ResponseBodyMode,
-    UpstreamTarget,
+    AuthMode, BackendScheme, DispatchKind, GatewayConfig, HttpFlavor, PluginConfig, PluginScope,
+    Proxy, ResponseBodyMode, UpstreamTarget,
 };
 use crate::config::{EnvConfig, PoolConfig};
 use crate::connection_pool::ConnectionPool;
@@ -115,6 +115,8 @@ const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 /// Capability probes run during startup and background refresh, so they should
 /// not inherit long per-request connect timeouts that could hold readiness.
 const BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP: u64 = 5_000;
+const GATEWAY_WORKLOAD_METRICS_PLUGIN_ID: &str = "__gateway_workload_metrics";
+const WORKLOAD_METRICS_PLUGIN_NAME: &str = "workload_metrics";
 
 /// Partial outcome of a single H3 capability probe. `probe_h2_tls` writes
 /// directly into `record` (it owns `&mut record`), but `probe_h3` runs in
@@ -131,6 +133,178 @@ struct HboneProbeTarget<'a> {
     port: u16,
     hbone_port: u16,
     previous_hbone: Option<ProtocolSupport>,
+}
+
+fn gateway_managed_plugin_timestamp() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(0, 0).unwrap_or_else(chrono::Utc::now)
+}
+
+fn gateway_svid_spiffe_id(slot: &SharedSvidBundle) -> Option<String> {
+    let snapshot = slot.load_full();
+    snapshot
+        .as_ref()
+        .as_ref()
+        .map(|bundle| bundle.spiffe_id.as_str().to_string())
+}
+
+fn ensure_workload_spiffe_id_config(config: &mut serde_json::Value, spiffe_id: &str) {
+    if !config.is_object() {
+        *config = serde_json::json!({});
+    }
+    let Some(object) = config.as_object_mut() else {
+        return;
+    };
+    if object
+        .get("workload_spiffe_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return;
+    }
+    object.insert(
+        "workload_spiffe_id".to_string(),
+        serde_json::Value::String(spiffe_id.to_string()),
+    );
+}
+
+fn inject_gateway_workload_metrics_if_svid(
+    config: &mut GatewayConfig,
+    gateway_svid: &SharedSvidBundle,
+    namespace: &str,
+) {
+    let Some(spiffe_id) = gateway_svid_spiffe_id(gateway_svid) else {
+        return;
+    };
+
+    let operator_idx = config
+        .plugin_configs
+        .iter()
+        .position(|plugin| {
+            plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+                && plugin.enabled
+                && plugin.scope == PluginScope::Global
+                && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
+                && plugin.namespace == namespace
+        })
+        .or_else(|| {
+            config.plugin_configs.iter().position(|plugin| {
+                plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+                    && plugin.scope == PluginScope::Global
+                    && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
+                    && plugin.namespace == namespace
+            })
+        });
+
+    if let Some(operator_idx) = operator_idx {
+        ensure_workload_spiffe_id_config(
+            &mut config.plugin_configs[operator_idx].config,
+            &spiffe_id,
+        );
+        config
+            .plugin_configs
+            .retain(|plugin| plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID);
+        return;
+    }
+
+    if let Some(existing) = config
+        .plugin_configs
+        .iter_mut()
+        .find(|plugin| plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID)
+    {
+        existing.plugin_name = WORKLOAD_METRICS_PLUGIN_NAME.to_string();
+        existing.namespace = namespace.to_string();
+        existing.scope = PluginScope::Global;
+        existing.proxy_id = None;
+        existing.enabled = true;
+        existing.priority_override = None;
+        existing.api_spec_id = None;
+        existing.config = serde_json::json!({
+            "workload_spiffe_id": spiffe_id,
+        });
+        return;
+    }
+
+    let timestamp = gateway_managed_plugin_timestamp();
+    config.plugin_configs.push(PluginConfig {
+        id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+        plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+        namespace: namespace.to_string(),
+        config: serde_json::json!({
+            "workload_spiffe_id": spiffe_id,
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: timestamp,
+        updated_at: timestamp,
+    });
+}
+
+fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig) -> bool {
+    config.proxies.is_empty()
+        && config.consumers.is_empty()
+        && config.upstreams.is_empty()
+        && config
+            .plugin_configs
+            .iter()
+            .all(|plugin| plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID)
+}
+
+fn gateway_hbone_mtls_observed(
+    dispatch_hbone: bool,
+    error_class: Option<retry::ErrorClass>,
+) -> bool {
+    dispatch_hbone
+        && !matches!(
+            error_class,
+            Some(
+                retry::ErrorClass::ConnectionTimeout
+                    | retry::ErrorClass::ConnectionRefused
+                    | retry::ErrorClass::ConnectionReset
+                    | retry::ErrorClass::ConnectionClosed
+                    | retry::ErrorClass::DnsLookupError
+                    | retry::ErrorClass::TlsError
+                    | retry::ErrorClass::ConnectionPoolError
+                    | retry::ErrorClass::PortExhaustion
+                    | retry::ErrorClass::ProtocolError
+                    | retry::ErrorClass::RequestError
+                    | retry::ErrorClass::RequestBodyTooLarge
+            )
+        )
+}
+
+fn annotate_gateway_hbone_metadata(
+    ctx: &mut RequestContext,
+    target: Option<&UpstreamTarget>,
+    dispatch_hbone: bool,
+    error_class: Option<retry::ErrorClass>,
+) {
+    if !gateway_hbone_mtls_observed(dispatch_hbone, error_class) {
+        return;
+    }
+
+    ctx.metadata.insert(
+        "mesh.connection_security_policy".to_string(),
+        "mutual_tls".to_string(),
+    );
+    ctx.metadata
+        .insert("mesh.gateway.transport".to_string(), "hbone".to_string());
+
+    let Some(target) = target else {
+        return;
+    };
+    for (tag, metadata_key) in [
+        ("mesh.spiffe_id", "mesh.destination.principal"),
+        ("mesh.namespace", "mesh.destination.namespace"),
+        ("mesh.service", "mesh.destination.service"),
+        ("mesh.trust_domain", "mesh.destination.trust_domain"),
+    ] {
+        if let Some(value) = target.tags.get(tag) {
+            ctx.metadata.insert(metadata_key.to_string(), value.clone());
+        }
+    }
 }
 
 impl H3ProbeOutcome {
@@ -1355,7 +1529,7 @@ impl ProxyState {
     /// mid-`http_probe` finish its TCP / TLS / HTTP round-trip and emit
     /// a misleading "unhealthy" log line right before tear-down.
     pub fn new(
-        config: GatewayConfig,
+        mut config: GatewayConfig,
         dns_cache: DnsCache,
         env_config: crate::config::EnvConfig,
         tls_policy: Option<TlsPolicy>,
@@ -1426,6 +1600,11 @@ impl ProxyState {
         ));
         let env_config_arc = Arc::new(env_config.clone());
         let gateway_svid_bundle = load_gateway_svid_bundle(&env_config_arc)?;
+        inject_gateway_workload_metrics_if_svid(
+            &mut config,
+            &gateway_svid_bundle,
+            &env_config_arc.namespace,
+        );
         let gateway_file_svid_bundle = clone_svid_bundle_slot(&gateway_svid_bundle);
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
         let hbone_pool = Arc::new(HboneConnectionPool::new(
@@ -2834,6 +3013,11 @@ impl ProxyState {
         new_config.normalize_fields();
         // Resolve upstream TLS into each proxy's resolved_tls before applying.
         new_config.resolve_upstream_tls();
+        inject_gateway_workload_metrics_if_svid(
+            &mut new_config,
+            &self.gateway_svid_bundle,
+            &self.env_config.namespace,
+        );
 
         // Run the full validation pipeline before swapping. Existing call
         // sites (`file_loader`, `db_loader`, `dp_client`) validate first, so
@@ -2852,14 +3036,8 @@ impl ProxyState {
 
         // If this is the initial load (old config empty, new config has data),
         // do a full rebuild of all caches instead of computing a delta.
-        let old_is_empty = old_config.proxies.is_empty()
-            && old_config.consumers.is_empty()
-            && old_config.plugin_configs.is_empty()
-            && old_config.upstreams.is_empty();
-        let new_is_empty = new_config.proxies.is_empty()
-            && new_config.consumers.is_empty()
-            && new_config.plugin_configs.is_empty()
-            && new_config.upstreams.is_empty();
+        let old_is_empty = config_empty_ignoring_gateway_managed_plugins(&old_config);
+        let new_is_empty = config_empty_ignoring_gateway_managed_plugins(&new_config);
 
         if old_is_empty && !new_is_empty {
             let route_table = RouterCache::build_route_table_snapshot(&new_config);
@@ -3324,6 +3502,11 @@ impl ProxyState {
         // canonicalized fields.
         new_config.normalize_fields();
         new_config.resolve_upstream_tls();
+        inject_gateway_workload_metrics_if_svid(
+            &mut new_config,
+            &self.gateway_svid_bundle,
+            &self.env_config.namespace,
+        );
         if let Err(errors) = self.validate_full_config(&new_config) {
             for msg in &errors {
                 error!("Incremental config rejected: {}", msg);
@@ -8322,6 +8505,12 @@ async fn handle_proxy_request_inner(
     let mut response_headers = backend_resp.headers;
     let backend_resolved_ip = backend_resp.backend_resolved_ip;
     let backend_error_class = backend_resp.error_class;
+    annotate_gateway_hbone_metadata(
+        &mut ctx,
+        upstream_target.as_deref(),
+        current_dispatch_hbone,
+        backend_error_class,
+    );
 
     debug!(
         proxy_id = %proxy.id,
@@ -13878,6 +14067,117 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gateway_hbone_metadata_marks_mtls_and_mesh_destination() {
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        let target = UpstreamTarget {
+            host: "10.0.0.8".to_string(),
+            port: 8080,
+            weight: 1,
+            tags: HashMap::from([
+                (
+                    "mesh.spiffe_id".to_string(),
+                    "spiffe://cluster.local/ns/default/sa/api".to_string(),
+                ),
+                ("mesh.namespace".to_string(), "default".to_string()),
+                ("mesh.service".to_string(), "payments".to_string()),
+                ("mesh.trust_domain".to_string(), "cluster.local".to_string()),
+            ]),
+            path: None,
+        };
+        ctx.metadata.insert(
+            "mesh.destination.service".to_string(),
+            "edge-proxy-default".to_string(),
+        );
+
+        annotate_gateway_hbone_metadata(&mut ctx, Some(&target), true, None);
+
+        assert_eq!(
+            ctx.metadata
+                .get("mesh.connection_security_policy")
+                .map(String::as_str),
+            Some("mutual_tls")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mesh.gateway.transport")
+                .map(String::as_str),
+            Some("hbone")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mesh.destination.principal")
+                .map(String::as_str),
+            Some("spiffe://cluster.local/ns/default/sa/api")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mesh.destination.service")
+                .map(String::as_str),
+            Some("payments")
+        );
+    }
+
+    #[test]
+    fn gateway_hbone_metadata_skips_pre_mtls_failures() {
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+
+        annotate_gateway_hbone_metadata(&mut ctx, None, true, Some(retry::ErrorClass::TlsError));
+
+        assert!(!ctx.metadata.contains_key("mesh.connection_security_policy"));
+        assert!(!ctx.metadata.contains_key("mesh.gateway.transport"));
+    }
+
+    #[test]
+    fn gateway_hbone_metadata_skips_unclassified_connect_failures() {
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+
+        annotate_gateway_hbone_metadata(
+            &mut ctx,
+            None,
+            true,
+            Some(retry::ErrorClass::RequestError),
+        );
+
+        assert!(!ctx.metadata.contains_key("mesh.connection_security_policy"));
+        assert!(!ctx.metadata.contains_key("mesh.gateway.transport"));
+    }
+
+    #[test]
+    fn gateway_hbone_metadata_skips_pre_tunnel_body_limit_failures() {
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "POST".to_string(), "/".to_string());
+
+        annotate_gateway_hbone_metadata(
+            &mut ctx,
+            None,
+            true,
+            Some(retry::ErrorClass::RequestBodyTooLarge),
+        );
+
+        assert!(!ctx.metadata.contains_key("mesh.connection_security_policy"));
+        assert!(!ctx.metadata.contains_key("mesh.gateway.transport"));
+    }
+
+    #[test]
+    fn gateway_hbone_metadata_skips_connect_rejection_protocol_errors() {
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+
+        annotate_gateway_hbone_metadata(
+            &mut ctx,
+            None,
+            true,
+            Some(retry::ErrorClass::ProtocolError),
+        );
+
+        assert!(!ctx.metadata.contains_key("mesh.connection_security_policy"));
+        assert!(!ctx.metadata.contains_key("mesh.gateway.transport"));
+    }
+
     // ----- Per-IP cleanup task shutdown wiring ---------------------------
     //
     // The cleanup loop must honour the global shutdown watch channel so the
@@ -14005,6 +14305,147 @@ mod tests {
             private_key_pkcs8_der: Vec::new(),
             trust_bundles,
         }
+    }
+
+    #[test]
+    fn gateway_workload_metrics_operator_global_replaces_managed_plugin() {
+        let svid_slot = Arc::new(ArcSwap::new(Arc::new(Some(test_svid_bundle(
+            test_runtime_trust_bundles("file.local", vec![vec![1]]),
+        )))));
+        let timestamp = gateway_managed_plugin_timestamp();
+        let mut config = make_validation_config(vec![]);
+        config.plugin_configs = vec![
+            PluginConfig {
+                id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+                plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+                namespace: "ferrum".to_string(),
+                config: json!({ "workload_spiffe_id": "spiffe://old.example/ns/old/sa/old" }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            PluginConfig {
+                id: "operator-metrics".to_string(),
+                plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+                namespace: "ferrum".to_string(),
+                config: json!({ "custom": true }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: false,
+                priority_override: Some(2100),
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+        ];
+
+        inject_gateway_workload_metrics_if_svid(&mut config, &svid_slot, "ferrum");
+
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID)
+        );
+        let plugin = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == "operator-metrics")
+            .expect("operator plugin should remain");
+        assert!(!plugin.enabled);
+        assert_eq!(plugin.priority_override, Some(2100));
+        assert_eq!(
+            plugin
+                .config
+                .get("workload_spiffe_id")
+                .and_then(serde_json::Value::as_str),
+            Some("spiffe://file.local/ns/default/sa/gateway")
+        );
+        assert_eq!(plugin.config.get("custom"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn gateway_workload_metrics_prefers_enabled_operator_global() {
+        let svid_slot = Arc::new(ArcSwap::new(Arc::new(Some(test_svid_bundle(
+            test_runtime_trust_bundles("file.local", vec![vec![1]]),
+        )))));
+        let timestamp = gateway_managed_plugin_timestamp();
+        let mut config = make_validation_config(vec![]);
+        config.plugin_configs = vec![
+            PluginConfig {
+                id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+                plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+                namespace: "ferrum".to_string(),
+                config: json!({ "workload_spiffe_id": "spiffe://old.example/ns/old/sa/old" }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            PluginConfig {
+                id: "operator-disabled".to_string(),
+                plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+                namespace: "ferrum".to_string(),
+                config: json!({ "disabled": true }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: false,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            PluginConfig {
+                id: "operator-enabled".to_string(),
+                plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+                namespace: "ferrum".to_string(),
+                config: json!({ "enabled": true }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+        ];
+
+        inject_gateway_workload_metrics_if_svid(&mut config, &svid_slot, "ferrum");
+
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID)
+        );
+        let disabled = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == "operator-disabled")
+            .expect("disabled operator plugin should remain");
+        assert!(
+            disabled.config.get("workload_spiffe_id").is_none(),
+            "disabled duplicate should not consume the gateway identity when an enabled plugin exists"
+        );
+        let enabled = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == "operator-enabled")
+            .expect("enabled operator plugin should remain");
+        assert_eq!(
+            enabled
+                .config
+                .get("workload_spiffe_id")
+                .and_then(serde_json::Value::as_str),
+            Some("spiffe://file.local/ns/default/sa/gateway")
+        );
     }
 
     #[tokio::test]
