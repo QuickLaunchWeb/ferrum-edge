@@ -7,8 +7,11 @@
 //! The inner map is wholly replaced on config reload via [`begin_reload`] +
 //! [`commit_reload`] so renamed/removed schemas don't leak.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{
+    Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 
 use super::SummarySchema;
 
@@ -26,13 +29,110 @@ fn registry() -> &'static RwLock<RegistryState> {
     REGISTRY.get_or_init(|| RwLock::new(RegistryState::default()))
 }
 
+// Lock helpers recover from poisoning by extracting the inner guard.
+// A panic in a thread holding the registry lock is rare (no fallible work
+// happens while held), but if it ever occurs the registry data itself is
+// still valid — the bool poison flag is the only thing wrong. Treating
+// poison as fatal would brick every future `schema_ref` lookup across the
+// process; recovering keeps the gateway serving from cached state.
+fn read_lock() -> RwLockReadGuard<'static, RegistryState> {
+    registry().read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write_lock() -> RwLockWriteGuard<'static, RegistryState> {
+    registry().write().unwrap_or_else(PoisonError::into_inner)
+}
+
+// Process-wide reload-bracket serializer.
+//
+// Concurrent reload brackets would interleave: thread A's `begin_reload`
+// clobbers thread B's just-built staging map, B's `register_named` writes
+// into A's empty staging, and whichever commits last drops the other's
+// schemas. plugin_cache reloads always run on the same thread in
+// production, but parallel integration tests routinely race: any test
+// that starts a gateway drives its own reload bracket on its test
+// thread, and absent a process-wide lock those brackets clobber each
+// other (and any in-flight test that's mid-bracket on another thread).
+//
+// `begin_reload` enters the bracket; `commit_reload` leaves it. A
+// thread-local depth counter makes the pair reentrant on the same
+// thread, so tests can `lock_for_tests()` to hold the bracket across
+// their own assertions (which read the live map after committing).
+fn reload_serializer() -> &'static Mutex<()> {
+    static RELOAD: OnceLock<Mutex<()>> = OnceLock::new();
+    RELOAD.get_or_init(|| Mutex::new(()))
+}
+
+struct BracketKeeper {
+    /// Outermost holder's mutex guard. `Some` iff this thread currently
+    /// holds the serializer; the inner `MutexGuard` is dropped when the
+    /// outermost bracket leaves (depth → 0), releasing the mutex.
+    outer_guard: Option<MutexGuard<'static, ()>>,
+    /// Nesting depth — incremented by every `enter_bracket()` on this
+    /// thread, decremented by every `leave_bracket()`.
+    depth: u32,
+}
+
+thread_local! {
+    static KEEPER: RefCell<BracketKeeper> = const { RefCell::new(BracketKeeper {
+        outer_guard: None,
+        depth: 0,
+    }) };
+}
+
+/// Increment the bracket depth on the current thread, acquiring the
+/// process-wide serializer if this is the outermost entry.
+fn enter_bracket() {
+    let need_acquire = KEEPER.with(|k| k.borrow().depth == 0);
+    let guard = if need_acquire {
+        // Acquire WITHOUT holding the RefCell borrow — `lock()` may block.
+        Some(
+            reload_serializer()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    } else {
+        None
+    };
+    KEEPER.with(|k| {
+        let mut k = k.borrow_mut();
+        if let Some(g) = guard {
+            k.outer_guard = Some(g);
+        }
+        k.depth += 1;
+    });
+}
+
+/// Decrement the bracket depth on the current thread, releasing the
+/// process-wide serializer if this is the outermost exit.
+fn leave_bracket() {
+    KEEPER.with(|k| {
+        let mut k = k.borrow_mut();
+        if k.depth > 0 {
+            k.depth -= 1;
+            if k.depth == 0 {
+                k.outer_guard = None;
+            }
+        }
+    });
+}
+
 /// Begin building a fresh named-schema map. Called once per config-load
 /// pass before any `transaction_log_schema` plugin's `new()` runs.
 ///
-/// If a previous reload was started but never committed, its staging is
-/// discarded.
+/// Acquires the process-wide reload-bracket lock so two concurrent
+/// reloads serialize at the bracket boundary (without serializing reads
+/// against `lookup_named`). The lock is released by [`commit_reload`].
+/// Reentrant on the same thread — a test can hold the bracket open via
+/// [`lock_for_tests`] and still call begin/commit normally within.
+///
+/// **Threading invariant:** `begin_reload` / `register_named` /
+/// `commit_reload` for one reload pass must all run on the same thread.
+/// The serializer guard is stored thread-local; cross-thread brackets
+/// leak the guard. plugin_cache and tests both satisfy this naturally.
 pub fn begin_reload() {
-    let mut state = registry().write().expect("log_schema registry poisoned");
+    enter_bracket();
+    let mut state = write_lock();
     state.staging = Some(HashMap::new());
 }
 
@@ -46,7 +146,7 @@ pub fn begin_reload() {
 /// just needs `SummarySchema::compile` to succeed; the registry stays
 /// untouched and will be re-populated by the next config-reload pass.
 pub fn register_named(name: &str, schema: Arc<SummarySchema>) -> Result<(), String> {
-    let mut state = registry().write().expect("log_schema registry poisoned");
+    let mut state = write_lock();
     let Some(staging) = state.staging.as_mut() else {
         return Ok(()); // validation-mode no-op
     };
@@ -61,24 +161,58 @@ pub fn register_named(name: &str, schema: Arc<SummarySchema>) -> Result<(), Stri
 
 /// Promote the staging area to be the live map. Called after all
 /// `transaction_log_schema` plugins for this reload pass have constructed.
+/// Decrements the bracket depth (releases the serializer on outermost
+/// exit).
 pub fn commit_reload() {
-    let mut state = registry().write().expect("log_schema registry poisoned");
-    if let Some(staging) = state.staging.take() {
-        state.schemas = staging;
+    {
+        let mut state = write_lock();
+        if let Some(staging) = state.staging.take() {
+            state.schemas = staging;
+        }
+    }
+    leave_bracket();
+}
+
+/// Test-only: hold the reload-bracket serializer across an arbitrary
+/// section of test code so the registry's `schemas` map doesn't get
+/// stomped by a parallel test's gateway-startup reload between the
+/// returned guard's creation and its drop. Inner `begin_reload` /
+/// `commit_reload` calls on the same thread are reentrant.
+///
+/// The returned guard releases the serializer on `Drop`. Tests should
+/// scope it to cover both their writes (begin/register/commit) and any
+/// `lookup_named` assertions that follow the commit.
+#[doc(hidden)]
+#[allow(dead_code)]
+#[must_use = "drop the guard to release the reload-bracket serializer"]
+pub fn lock_for_tests() -> ReloadBracketTestGuard {
+    enter_bracket();
+    ReloadBracketTestGuard { _private: () }
+}
+
+/// RAII handle returned by [`lock_for_tests`].
+#[doc(hidden)]
+pub struct ReloadBracketTestGuard {
+    _private: (),
+}
+
+impl Drop for ReloadBracketTestGuard {
+    fn drop(&mut self) {
+        leave_bracket();
     }
 }
 
 /// Look up a named schema. Returns `None` if no schema with this name
 /// is registered (either never registered, or removed by a reload).
 pub fn lookup_named(name: &str) -> Option<Arc<SummarySchema>> {
-    let state = registry().read().expect("log_schema registry poisoned");
+    let state = read_lock();
     state.schemas.get(name).cloned()
 }
 
 /// Snapshot of the registered names (for diagnostics / admin endpoints).
 #[allow(dead_code)]
 pub fn registered_names() -> Vec<String> {
-    let state = registry().read().expect("log_schema registry poisoned");
+    let state = read_lock();
     let mut names: Vec<String> = state.schemas.keys().cloned().collect();
     names.sort();
     names
@@ -90,10 +224,13 @@ pub fn registered_names() -> Vec<String> {
 /// `commit_reload`. Exposed (not `#[cfg(test)]`) because integration
 /// tests in `tests/integration/` are a separate crate and cannot see
 /// items gated on the library's `cfg(test)`.
+///
+/// Does NOT touch the thread-local bracket keeper — tests holding
+/// `lock_for_tests()` continue to own the serializer across this call.
 #[doc(hidden)]
 #[allow(dead_code)]
 pub fn reset_for_tests() {
-    let mut state = registry().write().expect("log_schema registry poisoned");
+    let mut state = write_lock();
     state.schemas.clear();
     state.staging = None;
 }
@@ -104,15 +241,12 @@ mod tests {
     use crate::plugins::utils::log_schema::{
         FieldSpec, MetadataPolicy, SummarySchema, SummaryType, TimestampFormat,
     };
-    use std::sync::Mutex;
 
-    // The registry is process-global; serialize tests that touch it so they
-    // don't race each other under `cargo test --test`.
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        static M: OnceLock<Mutex<()>> = OnceLock::new();
-        M.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+    // The registry is process-global; serialize tests via the same
+    // reentrant reload-bracket lock that production callers use, so the
+    // bracket stays open across the test's writes AND its assertions.
+    fn lock() -> ReloadBracketTestGuard {
+        lock_for_tests()
     }
 
     fn empty_schema() -> Arc<SummarySchema> {

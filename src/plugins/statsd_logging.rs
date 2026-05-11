@@ -262,6 +262,8 @@ fn format_http_metrics(
     schema: Option<&SummarySchema>,
     buf: &mut String,
 ) {
+    use std::fmt::Write;
+
     // Only consult HTTP schemas for HTTP metrics — a stream-only schema
     // is unrelated.
     let effective_schema = schema.filter(|s| s.applies_to_http());
@@ -275,22 +277,24 @@ fn format_http_metrics(
         .unwrap_or("none");
     let proxy_tag = sanitize_tag_value(proxy_raw);
 
-    let mut tag_pairs: Vec<String> = Vec::with_capacity(4);
+    // Build the trailing `|#k:v,k:v,...` block directly into a reusable
+    // String, avoiding the Vec<String> + per-tag format! + join pattern
+    // (one small heap allocation per tag → one allocation total).
+    let mut builder = TagBlockBuilder::new();
     if let Some(k) = resolve_tag_key(effective_schema, "method", HTTP_TAG_NATIVE) {
-        tag_pairs.push(format!("{k}:{method}"));
+        let _ = builder.push(k, format_args!("{method}"));
     }
     if let Some(k) = resolve_tag_key(effective_schema, "status", HTTP_TAG_NATIVE) {
-        tag_pairs.push(format!("{k}:{status}"));
+        let _ = builder.push(k, format_args!("{status}"));
     }
     if let Some(k) = resolve_tag_key(effective_schema, "status_class", HTTP_TAG_NATIVE) {
-        tag_pairs.push(format!("{k}:{status_class}"));
+        let _ = builder.push(k, format_args!("{status_class}"));
     }
     if let Some(k) = resolve_tag_key(effective_schema, "proxy", HTTP_TAG_NATIVE) {
-        tag_pairs.push(format!("{k}:{proxy_tag}"));
+        let _ = builder.push(k, format_args!("{proxy_tag}"));
     }
-    let tags = format_tag_block(&tag_pairs, global_tags);
+    let tags = builder.finish(global_tags);
 
-    use std::fmt::Write;
     let _ = writeln!(buf, "{prefix}.request.count:1|c{tags}");
     let _ = writeln!(
         buf,
@@ -326,6 +330,8 @@ fn format_stream_metrics(
     schema: Option<&SummarySchema>,
     buf: &mut String,
 ) {
+    use std::fmt::Write;
+
     let effective_schema = schema.filter(|s| s.applies_to_stream());
     let protocol = sanitize_tag_value(&summary.protocol);
     let proxy_raw = summary.proxy_name.as_deref().unwrap_or(&summary.proxy_id);
@@ -350,25 +356,24 @@ fn format_stream_metrics(
         None => "unknown",
     };
 
-    let mut tag_pairs: Vec<String> = Vec::with_capacity(5);
+    let mut builder = TagBlockBuilder::new();
     if let Some(k) = resolve_tag_key(effective_schema, "protocol", STREAM_TAG_NATIVE) {
-        tag_pairs.push(format!("{k}:{protocol}"));
+        let _ = builder.push(k, format_args!("{protocol}"));
     }
     if let Some(k) = resolve_tag_key(effective_schema, "proxy", STREAM_TAG_NATIVE) {
-        tag_pairs.push(format!("{k}:{proxy_tag}"));
+        let _ = builder.push(k, format_args!("{proxy_tag}"));
     }
     if let Some(k) = resolve_tag_key(effective_schema, "error", STREAM_TAG_NATIVE) {
-        tag_pairs.push(format!("{k}:{has_error}"));
+        let _ = builder.push(k, format_args!("{has_error}"));
     }
     if let Some(k) = resolve_tag_key(effective_schema, "cause", STREAM_TAG_NATIVE) {
-        tag_pairs.push(format!("{k}:{cause_tag}"));
+        let _ = builder.push(k, format_args!("{cause_tag}"));
     }
     if let Some(k) = resolve_tag_key(effective_schema, "direction", STREAM_TAG_NATIVE) {
-        tag_pairs.push(format!("{k}:{direction_tag}"));
+        let _ = builder.push(k, format_args!("{direction_tag}"));
     }
-    let tags = format_tag_block(&tag_pairs, global_tags);
+    let tags = builder.finish(global_tags);
 
-    use std::fmt::Write;
     let _ = writeln!(buf, "{prefix}.stream.count:1|c{tags}");
     let _ = writeln!(
         buf,
@@ -388,24 +393,54 @@ fn format_stream_metrics(
     let _ = writeln!(buf, "{prefix}.stream.disconnect:1|c{tags}");
 }
 
-/// Build the trailing `|#tag1:v1,tag2:v2,global1:gv1` block, or an empty
-/// string when there are no per-entry tags and no global tags.
-fn format_tag_block(pairs: &[String], global_tags: &str) -> String {
-    if pairs.is_empty() && global_tags.is_empty() {
-        return String::new();
+/// Single-allocation builder for the trailing `|#k:v,k:v,…` block.
+///
+/// Replaces the prior `Vec<String> + per-tag format! + join` pattern,
+/// which allocated once per tag plus once for the joined string. Tags are
+/// written directly into one growing `String` via `fmt::Write`, so the
+/// total allocation count is bounded by `String`'s growth strategy —
+/// effectively one allocation per call site (the buffer reservation),
+/// regardless of tag count.
+struct TagBlockBuilder {
+    out: String,
+    has_entries: bool,
+}
+
+impl TagBlockBuilder {
+    fn new() -> Self {
+        Self {
+            out: String::new(),
+            has_entries: false,
+        }
     }
-    let mut out = String::from("|#");
-    out.push_str(&pairs.join(","));
-    if !global_tags.is_empty() {
+
+    fn push(&mut self, key: &str, value: std::fmt::Arguments<'_>) -> std::fmt::Result {
+        use std::fmt::Write;
+        if !self.has_entries {
+            self.out.push_str("|#");
+            self.has_entries = true;
+        } else {
+            self.out.push(',');
+        }
+        write!(self.out, "{key}:")?;
+        self.out.write_fmt(value)
+    }
+
+    fn finish(mut self, global_tags: &str) -> String {
+        if global_tags.is_empty() {
+            return self.out;
+        }
         // `global_tags` begins with "|#"; skip those when we already have
         // an open block.
         let stripped = &global_tags[2..];
-        if !pairs.is_empty() && !stripped.is_empty() {
-            out.push(',');
+        if !self.has_entries {
+            self.out.push_str("|#");
+        } else if !stripped.is_empty() {
+            self.out.push(',');
         }
-        out.push_str(stripped);
+        self.out.push_str(stripped);
+        self.out
     }
-    out
 }
 
 async fn send_batch(

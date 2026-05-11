@@ -73,7 +73,18 @@ impl<'a, T: SchemaSerializable> Serialize for SchemaView<'a, T> {
         S: Serializer,
     {
         let mut map = ser.serialize_map(None)?;
-        let mut emitted: HashSet<String> = HashSet::with_capacity(self.schema.fields.len() + 8);
+
+        // The emitted-key set is ONLY consulted by `flatten_metadata` for
+        // collision detection. For `Nested` / `Omit` policies it is dead
+        // weight — populating it for every native / static / derived
+        // entry would force a `String` clone per field on every log call
+        // and a per-call `HashSet` allocation. Gate it.
+        let track_emitted = matches!(self.schema.metadata, MetadataPolicy::Flatten { .. });
+        let mut emitted: HashSet<String> = if track_emitted {
+            HashSet::with_capacity(self.schema.fields.len() + 8)
+        } else {
+            HashSet::new()
+        };
 
         for spec in &self.schema.fields {
             match spec {
@@ -89,15 +100,19 @@ impl<'a, T: SchemaSerializable> Serialize for SchemaView<'a, T> {
                     };
                     self.summary
                         .serialize_native(source, out_key, ts_format, &mut map)?;
-                    emitted.insert(out_key.clone());
+                    if track_emitted {
+                        emitted.insert(out_key.clone());
+                    }
                 }
                 FieldSpec::Static { out_key, value } => {
                     map.serialize_entry(out_key, value)?;
-                    emitted.insert(out_key.clone());
+                    if track_emitted {
+                        emitted.insert(out_key.clone());
+                    }
                 }
                 FieldSpec::Derived { out_key, kind } => {
                     let emitted_now = self.summary.serialize_derived(*kind, out_key, &mut map)?;
-                    if emitted_now {
+                    if track_emitted && emitted_now {
                         emitted.insert(out_key.clone());
                     }
                 }

@@ -114,14 +114,11 @@ mod tests {
     use crate::plugins::utils::log_schema::registry;
     use serde_json::json;
 
-    // Tests that touch the registry serialize via a process-wide lock so
-    // they don't race each other.
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static M: OnceLock<Mutex<()>> = OnceLock::new();
-        M.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+    // Tests that touch the registry hold the reload-bracket serializer
+    // for their entire scope (reentrant with the internal begin/commit
+    // calls inside the plugin construction).
+    fn lock() -> registry::ReloadBracketTestGuard {
+        registry::lock_for_tests()
     }
 
     #[test]

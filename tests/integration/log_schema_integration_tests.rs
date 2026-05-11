@@ -13,8 +13,6 @@
 //! * `transaction_log_schema` rejects non-global scopes via
 //!   `GatewayConfig::validate_plugin_references`.
 
-use std::sync::{Mutex, MutexGuard, OnceLock};
-
 use ferrum_edge::plugins::create_plugin;
 use ferrum_edge::plugins::utils::log_schema::registry;
 use serde_json::{Value, json};
@@ -37,13 +35,15 @@ fn create_ok(name: &str, config: Value) {
     }
 }
 
-/// Tests that touch the process-global named-schemas registry serialize
-/// via this mutex so concurrent test runs don't race each other.
-fn registry_lock() -> MutexGuard<'static, ()> {
-    static M: OnceLock<Mutex<()>> = OnceLock::new();
-    M.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+/// Tests that touch the process-global named-schemas registry hold the
+/// reload-bracket serializer for their entire scope (writes AND
+/// assertions). This protects against parallel sibling tests booting
+/// gateways whose plugin-cache reloads would otherwise stomp the
+/// registry's `schemas` map between commit and lookup. Reentrant —
+/// `begin_reload` / `commit_reload` inside the scope are no-ops on the
+/// mutex.
+fn registry_lock() -> registry::ReloadBracketTestGuard {
+    registry::lock_for_tests()
 }
 
 #[test]

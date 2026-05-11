@@ -230,6 +230,17 @@ impl SummarySchema {
                     "{plugin_name}: schema rename target for '{source}' must be a non-empty string"
                 ));
             }
+            // The rename target is the operator-visible JSON key. If it
+            // matches a sensitive-data substring, downstream log
+            // redactors keyed on field name will silently drop legitimate
+            // (non-sensitive) values. Reject so the operator picks a
+            // different name. Mirrors the static_fields / derived_fields
+            // check.
+            if is_sensitive_metadata_key(target) {
+                return Err(format!(
+                    "{plugin_name}: schema rename target '{target}' (for source '{source}') matches a sensitive-data substring; pick a different name"
+                ));
+            }
         }
 
         let static_fields = parse_static_fields(raw.get("static_fields"), plugin_name)?;
@@ -675,7 +686,11 @@ fn apply_order(
     }
 
     // Build final ordered vec. To allow ownership transfer from `all`,
-    // we move into `Option<FieldSpec>` slots.
+    // we move into `Option<FieldSpec>` slots. The `listed` bitmap is the
+    // authoritative "explicitly placed elsewhere" signal — wildcard
+    // expansion must consult it rather than relying on `slot.is_some()`,
+    // because listed entries appearing AFTER the wildcard are still
+    // un-taken when the wildcard iteration runs.
     let mut slots: Vec<Option<FieldSpec>> = all.into_iter().map(Some).collect();
     let mut out: Vec<FieldSpec> = Vec::with_capacity(slots.len());
     for entry in output_indices {
@@ -684,12 +699,14 @@ fn apply_order(
                 out.push(slots[i].take().expect("listed index moved twice"));
             }
             None => {
-                // Wildcard — append remaining unlisted entries in natural
-                // order.
-                for slot in slots.iter_mut() {
+                // Wildcard — append entries that are neither explicitly
+                // listed (handled by their own Some(i) iteration) nor
+                // already taken.
+                for (i, slot) in slots.iter_mut().enumerate() {
+                    if listed[i] {
+                        continue;
+                    }
                     if let Some(spec) = slot.take() {
-                        // Only take entries that weren't explicitly listed
-                        // (already taken means listed).
                         out.push(spec);
                     }
                 }
@@ -891,6 +908,65 @@ mod tests {
     }
 
     #[test]
+    fn order_with_wildcard_followed_by_listed_keys() {
+        // Regression for a bug where wildcard expansion consumed every
+        // still-Some slot, including entries explicitly listed AFTER `*`,
+        // causing the next listed-index `.take()` to panic.
+        let s = ok(json!({
+            "summary_type": "http",
+            "order": ["namespace", "*", "response_status_code"]
+        }));
+        // First key must be the explicitly-placed leading entry.
+        assert!(matches!(
+            &s.fields[0],
+            FieldSpec::Native {
+                source: "namespace",
+                ..
+            }
+        ));
+        // Last key must be the explicitly-placed trailing entry.
+        assert!(matches!(
+            s.fields.last(),
+            Some(FieldSpec::Native {
+                source: "response_status_code",
+                ..
+            })
+        ));
+        // The wildcard span must not include either pinned entry — they
+        // appear exactly once at their pinned positions.
+        let ns_count = s
+            .fields
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f,
+                    FieldSpec::Native {
+                        source: "namespace",
+                        ..
+                    }
+                )
+            })
+            .count();
+        let status_count = s
+            .fields
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f,
+                    FieldSpec::Native {
+                        source: "response_status_code",
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(ns_count, 1, "namespace appears exactly once");
+        assert_eq!(status_count, 1, "response_status_code appears exactly once");
+        // And the schema must still cover every native HTTP field.
+        assert_eq!(s.fields.len(), fields::HTTP_FIELDS.len());
+    }
+
+    #[test]
     fn order_without_wildcard_must_be_complete() {
         let e = err(json!({
             "summary_type": "http",
@@ -927,6 +1003,15 @@ mod tests {
     fn static_field_sensitive_name_rejected() {
         let e = err(json!({
             "static_fields": { "x_authorization_copy": "redacted-please" }
+        }));
+        assert!(e.contains("matches a sensitive-data substring"), "got: {e}");
+    }
+
+    #[test]
+    fn rename_target_sensitive_name_rejected() {
+        let e = err(json!({
+            "summary_type": "http",
+            "rename": { "proxy_id": "x-auth-token" }
         }));
         assert!(e.contains("matches a sensitive-data substring"), "got: {e}");
     }
