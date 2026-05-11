@@ -14,7 +14,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use super::mesh::prometheus_helpers::{self, MeshRequestKey};
-use super::{Plugin, StreamTransactionSummary, TransactionSummary};
+use super::{Direction, Plugin, StreamTransactionSummary, TransactionSummary};
+use crate::retry::ErrorClass;
 
 /// Global metrics registry (singleton per process).
 static METRICS_REGISTRY: OnceLock<Arc<MetricsRegistry>> = OnceLock::new();
@@ -81,6 +82,18 @@ pub struct StreamDisconnectKey {
     pub protocol: Arc<str>,
     pub cause: &'static str,
     pub direction: &'static str,
+}
+
+/// Composite key for HBONE tunnel relay failures.
+///
+/// HBONE CONNECT responds with `200 OK` before the tunneled TCP relay runs,
+/// so post-upgrade copy failures need a side-channel metric instead of an
+/// HTTP status code.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HboneRelayFailureKey {
+    pub proxy_id: Arc<str>,
+    pub direction: &'static str,
+    pub error_class: &'static str,
 }
 
 /// Map a `DisconnectCause` variant to its snake_case label, reusing static
@@ -238,6 +251,13 @@ pub struct MetricsRegistry {
     /// idle timeouts from genuine errors and see which side initiated the
     /// disconnect.
     pub stream_disconnect_counter: DashMap<StreamDisconnectKey, TimestampedCounter>,
+    /// Mesh DNS upstream transaction-ID exhaustion events. This is process-wide
+    /// because the transparent mesh DNS proxy uses one shared upstream socket.
+    pub mesh_dns_upstream_id_exhaustions: AtomicU64,
+    /// HBONE tunnel relay failures keyed by (proxy_id, direction, error_class).
+    /// Incremented when the background CONNECT relay observes a copy failure
+    /// after the client already received `200 OK`.
+    pub hbone_relay_failure_counter: DashMap<HboneRelayFailureKey, TimestampedCounter>,
     /// Cached render output with generation timestamp
     render_cache: ArcSwap<Option<(Instant, String)>>,
     /// Configurable render cache TTL in seconds
@@ -274,6 +294,8 @@ impl MetricsRegistry {
             stream_duration_buckets: DashMap::new(),
             client_disconnect_counter: DashMap::new(),
             stream_disconnect_counter: DashMap::new(),
+            mesh_dns_upstream_id_exhaustions: AtomicU64::new(0),
+            hbone_relay_failure_counter: DashMap::new(),
             render_cache: ArcSwap::from_pointee(None),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
             stale_entry_ttl_nanos: AtomicU64::new(DEFAULT_STALE_TTL_NANOS),
@@ -338,6 +360,31 @@ impl MetricsRegistry {
         };
         self.stream_disconnect_counter
             .entry(disconnect_key)
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
+
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_mesh_dns_upstream_id_exhaustion(&self) {
+        self.mesh_dns_upstream_id_exhaustions
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_hbone_relay_failure(
+        &self,
+        proxy_id: &str,
+        direction: Direction,
+        error_class: ErrorClass,
+    ) {
+        let key = HboneRelayFailureKey {
+            proxy_id: Arc::from(proxy_id),
+            direction: direction_label(Some(direction)),
+            error_class: error_class.as_str(),
+        };
+        self.hbone_relay_failure_counter
+            .entry(key)
             .or_insert_with(|| TimestampedCounter::new(self.epoch))
             .increment(self.epoch);
 
@@ -507,6 +554,14 @@ impl MetricsRegistry {
             keep
         });
 
+        self.hbone_relay_failure_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
         if evicted > 0 {
             // Invalidate render cache after eviction
             self.render_cache.store(Arc::new(None));
@@ -551,7 +606,8 @@ impl MetricsRegistry {
             + self.mesh_request_counter.len() * 600
             + self.mesh_request_duration_buckets.len() * 1800
             + self.stream_connection_counter.len() * 200
-            + self.stream_duration_buckets.len() * 800;
+            + self.stream_duration_buckets.len() * 800
+            + self.hbone_relay_failure_counter.len() * 240;
         let mut output = String::with_capacity(estimated_cap);
 
         // Read namespace label fragment once for the render pass.
@@ -733,6 +789,43 @@ impl MetricsRegistry {
                 output.push_str(&format!(
                     "ferrum_stream_disconnects_total{{proxy_id=\"{}\",protocol=\"{}\",cause=\"{}\",direction=\"{}\"{}}} {}\n",
                     proxy_id, protocol, key.cause, key.direction, ns_label, count
+                ));
+            }
+        }
+
+        let mesh_dns_exhaustions = self
+            .mesh_dns_upstream_id_exhaustions
+            .load(Ordering::Relaxed);
+        output.push_str(
+            "# HELP ferrum_mesh_dns_upstream_id_exhaustions_total Mesh DNS upstream transaction ID exhaustion events.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_dns_upstream_id_exhaustions_total counter\n");
+        if ns_label.is_empty() {
+            output.push_str(&format!(
+                "ferrum_mesh_dns_upstream_id_exhaustions_total {}\n",
+                mesh_dns_exhaustions
+            ));
+        } else {
+            output.push_str(&format!(
+                "ferrum_mesh_dns_upstream_id_exhaustions_total{{{}}} {}\n",
+                &ns_label[1..],
+                mesh_dns_exhaustions
+            ));
+        }
+
+        if !self.hbone_relay_failure_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_mesh_hbone_relay_failures_total HBONE CONNECT tunnel relay failures after the 200 response has been sent.\n",
+            );
+            output.push_str("# TYPE ferrum_mesh_hbone_relay_failures_total counter\n");
+            for entry in self.hbone_relay_failure_counter.iter() {
+                let key = entry.key();
+                let count = entry.value().value.load(Ordering::Relaxed);
+                let proxy_id = escape_label_value(&key.proxy_id);
+                let error_class = escape_label_value(key.error_class);
+                output.push_str(&format!(
+                    "ferrum_mesh_hbone_relay_failures_total{{proxy_id=\"{}\",direction=\"{}\",error_class=\"{}\"{}}} {}\n",
+                    proxy_id, key.direction, error_class, ns_label, count
                 ));
             }
         }

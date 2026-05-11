@@ -39,8 +39,8 @@ use tracing::{debug, error, info, warn};
 // Re-export trait types so existing `use crate::config::db_loader::{IncrementalResult, ...}` works.
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
-    ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult, PaginatedResult,
-    SortOrder, extract_db_hostname, extract_known_ids, redact_url,
+    ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, GatewayTrustBundlePoll, IncrementalResult,
+    PaginatedResult, SortOrder, extract_db_hostname, extract_known_ids, redact_url,
 };
 
 struct PluginConfigRef {
@@ -4530,6 +4530,16 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error> {
         DatabaseStore::load_full_config(self, namespace).await
+    }
+
+    async fn load_gateway_trust_bundles(
+        &self,
+        _namespace: &str,
+    ) -> Result<GatewayTrustBundlePoll, anyhow::Error> {
+        // SQL backends do not have a dedicated top-level GatewayConfig storage
+        // shape today, so preserve whatever trust material the initial config
+        // load supplied instead of clearing it on the first empty poll.
+        Ok(GatewayTrustBundlePoll::Unchanged)
     }
 
     async fn load_incremental_config(

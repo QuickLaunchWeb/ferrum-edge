@@ -335,6 +335,7 @@ fn test_error_class_serializes_all_variants() {
         (ErrorClass::ResponseBodyTooLarge, "response_body_too_large"),
         (ErrorClass::RequestBodyTooLarge, "request_body_too_large"),
         (ErrorClass::ConnectionPoolError, "connection_pool_error"),
+        (ErrorClass::PortExhaustion, "port_exhaustion"),
         (ErrorClass::GracefulRemoteClose, "graceful_remote_close"),
         (ErrorClass::RequestError, "request_error"),
     ];
@@ -355,6 +356,13 @@ fn test_error_class_serializes_all_variants() {
             variant.to_string(),
             expected_str,
             "ErrorClass::{:?} Display should be {:?}",
+            variant,
+            expected_str
+        );
+        assert_eq!(
+            variant.as_str(),
+            expected_str,
+            "ErrorClass::{:?} as_str should be {:?}",
             variant,
             expected_str
         );

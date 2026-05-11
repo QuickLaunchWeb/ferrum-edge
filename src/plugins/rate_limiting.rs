@@ -17,6 +17,7 @@ const MAX_STATE_ENTRIES: usize = 100_000;
 enum LimitBy {
     Ip,
     Consumer,
+    SpiffeIdentity,
 }
 
 pub struct RateLimiting {
@@ -120,23 +121,43 @@ impl RateLimiting {
     }
 
     fn request_key(&self, ctx: &RequestContext) -> String {
-        if self.limit_by == LimitBy::Consumer
-            && let Some(identity) = ctx.effective_identity()
-        {
-            return prefixed_key("consumer:", identity);
+        match self.limit_by {
+            LimitBy::Consumer => {
+                if let Some(identity) = ctx.effective_identity() {
+                    return prefixed_key("consumer:", identity);
+                }
+            }
+            LimitBy::SpiffeIdentity => {
+                if let Some(spiffe_id) = ctx.peer_spiffe_id.as_ref() {
+                    return prefixed_key("spiffe:", spiffe_id.as_str());
+                }
+            }
+            LimitBy::Ip => {}
         }
 
-        prefixed_key("ip:", &ctx.client_ip)
+        ip_key(&ctx.client_ip)
     }
 
     fn stream_key(&self, ctx: &super::StreamConnectionContext) -> String {
-        if self.limit_by == LimitBy::Consumer
-            && let Some(identity) = ctx.effective_identity()
-        {
-            return prefixed_key("consumer:", identity);
+        match self.limit_by {
+            LimitBy::Consumer => {
+                if let Some(identity) = ctx.effective_identity() {
+                    return prefixed_key("consumer:", identity);
+                }
+            }
+            LimitBy::SpiffeIdentity => {
+                if let Some(spiffe_id) = ctx
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("peer_spiffe_id"))
+                {
+                    return prefixed_key("spiffe:", spiffe_id);
+                }
+            }
+            LimitBy::Ip => {}
         }
 
-        prefixed_key("ip:", &ctx.client_ip)
+        ip_key(&ctx.client_ip)
     }
 
     fn reject(&self, key: &str, outcome: &RateLimitOutcome) -> PluginResult {
@@ -248,7 +269,7 @@ impl Plugin for RateLimiting {
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
-        if self.limit_by != LimitBy::Consumer {
+        if !matches!(self.limit_by, LimitBy::Consumer | LimitBy::SpiffeIdentity) {
             return PluginResult::Continue;
         }
 
@@ -257,7 +278,7 @@ impl Plugin for RateLimiting {
     }
 
     fn is_authorize_plugin(&self) -> bool {
-        self.limit_by == LimitBy::Consumer
+        matches!(self.limit_by, LimitBy::Consumer | LimitBy::SpiffeIdentity)
     }
 
     async fn before_proxy(
@@ -292,8 +313,9 @@ fn parse_limit_by(object: &serde_json::Map<String, Value>) -> Result<LimitBy, St
         Some(Value::String(value)) => match value.to_ascii_lowercase().as_str() {
             "ip" => Ok(LimitBy::Ip),
             "consumer" => Ok(LimitBy::Consumer),
+            "spiffe" | "spiffe_identity" => Ok(LimitBy::SpiffeIdentity),
             _ => Err(format!(
-                "rate_limiting: 'limit_by' must be one of 'ip' or 'consumer', got: {value:?}"
+                "rate_limiting: 'limit_by' must be one of 'ip', 'consumer', or 'spiffe_identity', got: {value:?}"
             )),
         },
         Some(other) => Err(format!(
@@ -335,6 +357,10 @@ fn prefixed_key(prefix: &str, value: &str) -> String {
     key.push_str(prefix);
     key.push_str(value);
     key
+}
+
+fn ip_key(client_ip: &str) -> String {
+    prefixed_key("ip:", client_ip)
 }
 
 fn inject_rate_limit_headers_from_metadata(

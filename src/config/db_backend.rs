@@ -141,6 +141,17 @@ pub struct DbPoolStatsInner {
     pub active: u32,
 }
 
+/// Result of a narrow gateway trust-bundle poll.
+#[allow(dead_code)] // `Unchanged` is for backends with a narrow change detector.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayTrustBundlePoll {
+    /// The backend knows the authoritative trust-bundle source has not changed.
+    Unchanged,
+    /// The backend has the current authoritative value. `None` explicitly clears
+    /// previously delivered CP trust material.
+    Current(Option<Box<crate::modes::mesh::config::TrustBundleSet>>),
+}
+
 /// Unified database backend trait.
 ///
 /// This trait defines all operations needed by the admin API, operating modes,
@@ -198,6 +209,16 @@ pub trait DatabaseBackend: Send + Sync {
 
     /// Load the full gateway configuration from the database.
     async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error>;
+
+    /// Poll gateway-to-mesh trust bundles from the authoritative config source.
+    ///
+    /// This must stay narrow: the common empty incremental-poll path calls it so
+    /// trust-bundle-only changes can be detected without reloading all gateway
+    /// resources.
+    async fn load_gateway_trust_bundles(
+        &self,
+        namespace: &str,
+    ) -> Result<GatewayTrustBundlePoll, anyhow::Error>;
 
     // -----------------------------------------------------------------------
     // Incremental polling
