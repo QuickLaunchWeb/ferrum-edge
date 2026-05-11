@@ -11,9 +11,11 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -30,6 +32,7 @@ const DNS_MAX_TCP_PACKET_SIZE: usize = u16::MAX as usize;
 const DNS_UPSTREAM_TIMEOUT_SECS: u64 = 5;
 const DNS_UPSTREAM_ID_SPACE: usize = u16::MAX as usize + 1;
 const DNS_TCP_QUERY_READ_TIMEOUT_SECS: u64 = 5;
+pub const DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES: usize = 4096;
 pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
 // QTYPE values
@@ -62,13 +65,13 @@ struct DnsQuery {
     /// Original flags from the query (we copy RD etc.).
     flags: u16,
     /// Normalized hostname: lowercase, trailing dot stripped.
-    name: String,
+    name: Arc<str>,
     /// Query type (1 = A, 28 = AAAA).
     qtype: u16,
     /// Query class (1 = IN).
     qclass: u16,
     /// EDNS(0) OPT pseudo-record from the query, echoed when it fits.
-    opt_record: Option<Vec<u8>>,
+    opt_record: Option<Arc<[u8]>>,
     /// Client-advertised UDP response size from EDNS(0), clamped at response time.
     udp_payload_size: usize,
 }
@@ -81,6 +84,38 @@ struct DnsRecordSet {
 struct WildcardRecordSet {
     suffix: String,
     records: DnsRecordSet,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct DnsResponseCacheKey {
+    name: Arc<str>,
+    qtype: u16,
+    qclass: u16,
+    rd: bool,
+    cd: bool,
+    ad: bool,
+    ttl: u32,
+    max_response_size: usize,
+    opt_record: Option<Arc<[u8]>>,
+}
+
+const FLAGS_CD: u16 = 0x0010;
+const FLAGS_AD: u16 = 0x0020;
+
+impl DnsResponseCacheKey {
+    fn from_query(query: &DnsQuery, ttl: u32, max_response_size: usize) -> Self {
+        Self {
+            name: Arc::clone(&query.name),
+            qtype: query.qtype,
+            qclass: query.qclass,
+            rd: query.flags & FLAGS_RD != 0,
+            cd: query.flags & FLAGS_CD != 0,
+            ad: query.flags & FLAGS_AD != 0,
+            ttl,
+            max_response_size,
+            opt_record: query.opt_record.clone(),
+        }
+    }
 }
 
 pub struct ResolvedDnsRecords<'a> {
@@ -116,13 +151,25 @@ pub struct DnsResolutionTable {
     exact: HashMap<String, DnsRecordSet>,
     /// Wildcard matches bucketed by final suffix label for bounded lookup.
     wildcard_suffixes: HashMap<String, Vec<WildcardRecordSet>>,
+    /// Per-slice cache of serialized mesh DNS response templates.
+    response_cache: DashMap<DnsResponseCacheKey, Vec<u8>>,
+    response_cache_entries: AtomicUsize,
+    response_cache_max_entries: usize,
 }
 
 impl DnsResolutionTable {
+    #[cfg(test)]
     fn empty() -> Self {
+        Self::empty_with_response_cache_max_entries(DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES)
+    }
+
+    fn empty_with_response_cache_max_entries(response_cache_max_entries: usize) -> Self {
         Self {
             exact: HashMap::new(),
             wildcard_suffixes: HashMap::new(),
+            response_cache: DashMap::new(),
+            response_cache_entries: AtomicUsize::new(0),
+            response_cache_max_entries: response_cache_max_entries.max(1),
         }
     }
 
@@ -137,6 +184,18 @@ impl DnsResolutionTable {
     }
 
     pub fn from_mesh_slice_with_cluster_domain(slice: &MeshSlice, cluster_domain: &str) -> Self {
+        Self::from_mesh_slice_with_cluster_domain_and_response_cache_max_entries(
+            slice,
+            cluster_domain,
+            DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
+        )
+    }
+
+    pub fn from_mesh_slice_with_cluster_domain_and_response_cache_max_entries(
+        slice: &MeshSlice,
+        cluster_domain: &str,
+        response_cache_max_entries: usize,
+    ) -> Self {
         let cluster_domain = normalize_dns_name(cluster_domain);
         let mut exact: HashMap<String, DnsRecordSet> = HashMap::new();
         let mut wildcard_suffixes: HashMap<String, Vec<WildcardRecordSet>> = HashMap::new();
@@ -237,6 +296,9 @@ impl DnsResolutionTable {
         Self {
             exact,
             wildcard_suffixes,
+            response_cache: DashMap::new(),
+            response_cache_entries: AtomicUsize::new(0),
+            response_cache_max_entries: response_cache_max_entries.max(1),
         }
     }
 
@@ -268,6 +330,53 @@ impl DnsResolutionTable {
         }
 
         None
+    }
+
+    fn cached_mesh_response<F>(
+        &self,
+        key: DnsResponseCacheKey,
+        query_id: u16,
+        build_response: F,
+    ) -> Vec<u8>
+    where
+        F: FnOnce() -> Vec<u8>,
+    {
+        if let Some(template) = self.response_cache.get(&key) {
+            return response_from_cached_template(template.value(), query_id);
+        }
+
+        let mut template = build_response();
+        clear_response_transaction_id(&mut template);
+        let response = response_from_cached_template(&template, query_id);
+        if self.reserve_response_cache_slot() && self.response_cache.insert(key, template).is_some()
+        {
+            self.response_cache_entries.fetch_sub(1, Ordering::Relaxed);
+        }
+        response
+    }
+
+    fn reserve_response_cache_slot(&self) -> bool {
+        let mut current = self.response_cache_entries.load(Ordering::Relaxed);
+        loop {
+            if current >= self.response_cache_max_entries {
+                return false;
+            }
+
+            match self.response_cache_entries.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn response_cache_len(&self) -> usize {
+        self.response_cache.len()
     }
 
     /// Number of exact entries in the table.
@@ -374,6 +483,7 @@ pub struct MeshDnsProxy {
     upstream_resolver: SocketAddr,
     ttl_seconds: u32,
     max_concurrent_queries: usize,
+    response_cache_max_entries: usize,
     cluster_domain: String,
 }
 
@@ -389,14 +499,21 @@ impl MeshDnsProxy {
         upstream_resolver: SocketAddr,
         ttl_seconds: u32,
         max_concurrent_queries: usize,
+        response_cache_max_entries: usize,
         cluster_domain: String,
     ) -> Self {
+        let response_cache_max_entries = response_cache_max_entries.max(1);
         Self {
             listen_addr,
-            resolution_table: Arc::new(ArcSwap::new(Arc::new(DnsResolutionTable::empty()))),
+            resolution_table: Arc::new(ArcSwap::new(Arc::new(
+                DnsResolutionTable::empty_with_response_cache_max_entries(
+                    response_cache_max_entries,
+                ),
+            ))),
             upstream_resolver,
             ttl_seconds,
             max_concurrent_queries: max_concurrent_queries.max(1),
+            response_cache_max_entries,
             cluster_domain: normalize_dns_name(&cluster_domain),
         }
     }
@@ -414,7 +531,11 @@ impl MeshDnsProxy {
     /// Rebuild the resolution table from a new mesh slice.
     pub fn update_from_slice(&self, slice: &MeshSlice) {
         let new_table =
-            DnsResolutionTable::from_mesh_slice_with_cluster_domain(slice, &self.cluster_domain);
+            DnsResolutionTable::from_mesh_slice_with_cluster_domain_and_response_cache_max_entries(
+                slice,
+                &self.cluster_domain,
+                self.response_cache_max_entries,
+            );
         let exact_count = new_table.exact_count();
         let wildcard_count = new_table.wildcard_count();
         self.resolution_table.store(Arc::new(new_table));
@@ -736,11 +857,12 @@ fn evaluate_dns_query(
     let table = table.load();
     if query.qtype != QTYPE_A && query.qtype != QTYPE_AAAA {
         return match table.resolve_normalized(&query.name) {
-            Some(records) => DnsDecision::Respond(build_dns_empty_response(
-                &query,
-                records.authoritative,
-                max_response_size,
-            )),
+            Some(records) => {
+                let cache_key = DnsResponseCacheKey::from_query(&query, ttl, max_response_size);
+                DnsDecision::Respond(table.cached_mesh_response(cache_key, query.id, || {
+                    build_dns_empty_response(&query, records.authoritative, max_response_size)
+                }))
+            }
             None => DnsDecision::Forward(query),
         };
     }
@@ -761,17 +883,22 @@ fn evaluate_dns_query(
 
             if filtered.is_empty() {
                 // Have the name but no matching record type -- return empty (not NXDOMAIN)
-                let response =
-                    build_dns_empty_response(&query, records.authoritative, max_response_size);
+                let cache_key = DnsResponseCacheKey::from_query(&query, ttl, max_response_size);
+                let response = table.cached_mesh_response(cache_key, query.id, || {
+                    build_dns_empty_response(&query, records.authoritative, max_response_size)
+                });
                 DnsDecision::Respond(response)
             } else {
-                let response = build_dns_response(
-                    &query,
-                    &filtered,
-                    ttl,
-                    records.authoritative,
-                    max_response_size,
-                );
+                let cache_key = DnsResponseCacheKey::from_query(&query, ttl, max_response_size);
+                let response = table.cached_mesh_response(cache_key, query.id, || {
+                    build_dns_response(
+                        &query,
+                        &filtered,
+                        ttl,
+                        records.authoritative,
+                        max_response_size,
+                    )
+                });
                 trace!(
                     name = %query.name,
                     qtype = query.qtype,
@@ -1055,7 +1182,9 @@ fn upstream_response_matches_pending_query(response: &[u8], pending: &DnsQuery) 
     let qtype = u16::from_be_bytes([response[offset], response[offset + 1]]);
     let qclass = u16::from_be_bytes([response[offset + 2], response[offset + 3]]);
 
-    normalize_dns_name(&name) == pending.name && qtype == pending.qtype && qclass == pending.qclass
+    *normalize_dns_name(&name) == *pending.name
+        && qtype == pending.qtype
+        && qclass == pending.qclass
 }
 
 async fn send_udp_servfail(socket: &UdpSocket, query: &DnsQuery, client: SocketAddr) {
@@ -1158,10 +1287,10 @@ fn parse_dns_query(packet: &[u8]) -> Option<DnsQuery> {
     Some(DnsQuery {
         id,
         flags,
-        name: normalized,
+        name: Arc::from(normalized.as_str()),
         qtype,
         qclass,
-        opt_record,
+        opt_record: opt_record.map(|v| Arc::from(v.into_boxed_slice())),
         udp_payload_size,
     })
 }
@@ -1259,7 +1388,7 @@ fn build_dns_response(
     response.extend_from_slice(&query.qtype.to_be_bytes());
     response.extend_from_slice(&query.qclass.to_be_bytes());
 
-    let opt_len = query.opt_record.as_ref().map_or(0, Vec::len);
+    let opt_len = query.opt_record.as_ref().map_or(0, |r| r.len());
     let mut answer_count = 0u16;
     let mut truncated = false;
 
@@ -1349,6 +1478,20 @@ fn build_dns_error_response_from_packet(
     response.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
     response.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
     Some(response)
+}
+
+fn clear_response_transaction_id(response: &mut [u8]) {
+    if response.len() >= 2 {
+        response[..2].copy_from_slice(&0u16.to_be_bytes());
+    }
+}
+
+fn response_from_cached_template(template: &[u8], query_id: u16) -> Vec<u8> {
+    let mut response = template.to_vec();
+    if response.len() >= 2 {
+        response[..2].copy_from_slice(&query_id.to_be_bytes());
+    }
+    response
 }
 
 fn write_dns_response_header(
@@ -1524,7 +1667,7 @@ mod tests {
         let packet = build_a_query("example.com");
         let query = parse_dns_query(&packet).expect("should parse");
         assert_eq!(query.id, 0x1234);
-        assert_eq!(query.name, "example.com");
+        assert_eq!(&*query.name, "example.com");
         assert_eq!(query.qtype, QTYPE_A);
         assert_eq!(query.qclass, QCLASS_IN);
     }
@@ -1533,7 +1676,7 @@ mod tests {
     fn parse_dns_query_valid_aaaa_query() {
         let packet = build_aaaa_query("ipv6.example.com");
         let query = parse_dns_query(&packet).expect("should parse");
-        assert_eq!(query.name, "ipv6.example.com");
+        assert_eq!(&*query.name, "ipv6.example.com");
         assert_eq!(query.qtype, QTYPE_AAAA);
     }
 
@@ -1792,6 +1935,116 @@ mod tests {
             u16::from_be_bytes([response[offset], response[offset + 1]]),
             QTYPE_TXT
         );
+    }
+
+    #[test]
+    fn evaluate_dns_query_caches_mesh_response_templates_without_query_id() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(
+                vec!["api.example.com"],
+                vec!["10.0.0.1"],
+            )],
+            ..MeshSlice::default()
+        };
+        let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
+        let first_packet = build_a_query("api.example.com");
+        let mut second_packet = build_a_query("api.example.com");
+        second_packet[..2].copy_from_slice(&0x5678u16.to_be_bytes());
+
+        let first_response =
+            match evaluate_dns_query(&first_packet, &table, 60, DNS_UDP_SAFE_PACKET_SIZE) {
+                DnsDecision::Respond(response) => response,
+                DnsDecision::Forward(_) => panic!("mesh name should not forward"),
+                DnsDecision::Drop => panic!("valid DNS query should not drop"),
+            };
+        assert_eq!(table.load().response_cache_len(), 1);
+
+        let second_response =
+            match evaluate_dns_query(&second_packet, &table, 60, DNS_UDP_SAFE_PACKET_SIZE) {
+                DnsDecision::Respond(response) => response,
+                DnsDecision::Forward(_) => panic!("mesh name should not forward"),
+                DnsDecision::Drop => panic!("valid DNS query should not drop"),
+            };
+
+        assert_eq!(table.load().response_cache_len(), 1);
+        assert_eq!(&first_response[..2], &0x1234u16.to_be_bytes());
+        assert_eq!(&second_response[..2], &0x5678u16.to_be_bytes());
+        assert_eq!(&first_response[2..], &second_response[2..]);
+    }
+
+    #[test]
+    fn mesh_response_cache_never_exceeds_entry_cap() {
+        let table = DnsResolutionTable::empty();
+
+        for index in 0..(DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES + 16) {
+            let key = DnsResponseCacheKey {
+                name: Arc::from(format!("svc-{index}.example.com").as_str()),
+                qtype: QTYPE_A,
+                qclass: QCLASS_IN,
+                rd: true,
+                cd: false,
+                ad: false,
+                ttl: 60,
+                max_response_size: DNS_UDP_SAFE_PACKET_SIZE,
+                opt_record: None,
+            };
+            let _ = table.cached_mesh_response(key, 0x1234, || vec![0x12, 0x34, 0x81, 0x80]);
+        }
+
+        assert_eq!(
+            table.response_cache_len(),
+            DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES
+        );
+    }
+
+    #[test]
+    fn mesh_response_cache_honors_configured_entry_cap() {
+        let table = DnsResolutionTable::empty_with_response_cache_max_entries(2);
+
+        for index in 0..4 {
+            let key = DnsResponseCacheKey {
+                name: Arc::from(format!("svc-{index}.example.com").as_str()),
+                qtype: QTYPE_A,
+                qclass: QCLASS_IN,
+                rd: true,
+                cd: false,
+                ad: false,
+                ttl: 60,
+                max_response_size: DNS_UDP_SAFE_PACKET_SIZE,
+                opt_record: None,
+            };
+            let _ = table.cached_mesh_response(key, 0x1234, || vec![0x12, 0x34, 0x81, 0x80]);
+        }
+
+        assert_eq!(table.response_cache_len(), 2);
+    }
+
+    #[test]
+    fn mesh_response_cache_differentiates_cd_ad_flags() {
+        let table = DnsResolutionTable::empty();
+        let base = || DnsResponseCacheKey {
+            name: Arc::from("svc.example.com"),
+            qtype: QTYPE_A,
+            qclass: QCLASS_IN,
+            rd: true,
+            cd: false,
+            ad: false,
+            ttl: 60,
+            max_response_size: DNS_UDP_SAFE_PACKET_SIZE,
+            opt_record: None,
+        };
+
+        let _ = table.cached_mesh_response(base(), 0x1234, || vec![0x00, 0x00, 0xAA]);
+
+        let mut cd_key = base();
+        cd_key.cd = true;
+        let _ = table.cached_mesh_response(cd_key, 0x1234, || vec![0x00, 0x00, 0xBB]);
+
+        let mut ad_key = base();
+        ad_key.ad = true;
+        let _ = table.cached_mesh_response(ad_key, 0x1234, || vec![0x00, 0x00, 0xCC]);
+
+        assert_eq!(table.response_cache_len(), 3);
     }
 
     #[tokio::test]

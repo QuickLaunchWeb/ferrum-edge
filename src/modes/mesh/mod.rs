@@ -204,6 +204,9 @@ pub struct MeshRuntimeConfig {
     /// Maximum concurrent mesh DNS queries / upstream forwards.
     /// Sourced from `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` (default 1024).
     pub dns_max_concurrent_queries: usize,
+    /// Maximum per-slice cached mesh DNS response templates.
+    /// Sourced from `FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES` (default 4096).
+    pub dns_response_cache_max_entries: usize,
     /// Kubernetes cluster DNS domain used for synthetic mesh service names.
     /// Sourced from `FERRUM_MESH_CLUSTER_DOMAIN` (default `cluster.local`).
     pub cluster_domain: String,
@@ -298,6 +301,11 @@ impl MeshRuntimeConfig {
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|value| *value > 0)
                 .unwrap_or(DEFAULT_DNS_MAX_CONCURRENT_QUERIES);
+        let dns_response_cache_max_entries =
+            resolve_ferrum_var("FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES")
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES);
         let cluster_domain = resolve_ferrum_var("FERRUM_MESH_CLUSTER_DOMAIN")
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string());
@@ -325,6 +333,7 @@ impl MeshRuntimeConfig {
             dns_upstream_addr,
             dns_ttl_seconds,
             dns_max_concurrent_queries,
+            dns_response_cache_max_entries,
             cluster_domain,
         })
     }
@@ -1490,6 +1499,7 @@ async fn serve_mesh_runtime(
             runtime.dns_upstream_addr,
             runtime.dns_ttl_seconds,
             runtime.dns_max_concurrent_queries,
+            runtime.dns_response_cache_max_entries,
             runtime.cluster_domain.clone(),
         ));
         // Build initial resolution table from the applied slice
@@ -1512,6 +1522,7 @@ async fn serve_mesh_runtime(
             upstream = %runtime.dns_upstream_addr,
             ttl = runtime.dns_ttl_seconds,
             max_concurrent_queries = runtime.dns_max_concurrent_queries,
+            response_cache_max_entries = runtime.dns_response_cache_max_entries,
             cluster_domain = %runtime.cluster_domain,
             "Mesh DNS proxy started"
         );
@@ -1999,6 +2010,7 @@ mod tests {
             "FERRUM_MESH_DNS_UPSTREAM_ADDR",
             "FERRUM_MESH_DNS_TTL_SECONDS",
             "FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES",
+            "FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES",
             "FERRUM_MESH_CLUSTER_DOMAIN",
             "FERRUM_XDS_STREAM_CHANNEL_CAPACITY",
             "FERRUM_MESH_XDS_CONNECT_TIMEOUT_SECONDS",
@@ -2059,6 +2071,10 @@ mod tests {
                     runtime.dns_max_concurrent_queries,
                     DEFAULT_DNS_MAX_CONCURRENT_QUERIES
                 );
+                assert_eq!(
+                    runtime.dns_response_cache_max_entries,
+                    dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES
+                );
                 assert_eq!(runtime.cluster_domain, dns_proxy::DEFAULT_CLUSTER_DOMAIN);
             },
         );
@@ -2085,6 +2101,7 @@ mod tests {
                 ("FERRUM_MESH_HBONE_LISTEN_ADDR", "127.0.0.1:16008"),
                 ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "16443"),
                 ("FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES", "2048"),
+                ("FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES", "8192"),
                 ("FERRUM_MESH_CLUSTER_DOMAIN", "corp.local"),
                 (
                     "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
@@ -2118,6 +2135,7 @@ mod tests {
                 );
                 assert_eq!(runtime.east_west_listen_port, 16443);
                 assert_eq!(runtime.dns_max_concurrent_queries, 2048);
+                assert_eq!(runtime.dns_response_cache_max_entries, 8192);
                 assert_eq!(runtime.cluster_domain, "corp.local");
             },
         );
@@ -2375,6 +2393,7 @@ mod tests {
             dns_upstream_addr: DEFAULT_DNS_UPSTREAM_ADDR.parse().unwrap(),
             dns_ttl_seconds: DEFAULT_DNS_TTL_SECONDS,
             dns_max_concurrent_queries: DEFAULT_DNS_MAX_CONCURRENT_QUERIES,
+            dns_response_cache_max_entries: dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
             cluster_domain: dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
@@ -2459,6 +2478,7 @@ mod tests {
             dns_upstream_addr: DEFAULT_DNS_UPSTREAM_ADDR.parse().unwrap(),
             dns_ttl_seconds: DEFAULT_DNS_TTL_SECONDS,
             dns_max_concurrent_queries: DEFAULT_DNS_MAX_CONCURRENT_QUERIES,
+            dns_response_cache_max_entries: dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
             cluster_domain: dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
         }
     }

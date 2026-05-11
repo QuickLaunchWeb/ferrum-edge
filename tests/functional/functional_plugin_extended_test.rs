@@ -548,13 +548,21 @@ async fn test_plugin_graphql_depth_limiting_reject() {
         "query": "{ user { posts { comments { author { name } } } } }"
     });
 
-    let resp = client
-        .post(format!("{}/graphql", harness.proxy_base_url))
-        .header("Content-Type", "application/json")
-        .json(&deep_query)
-        .send()
-        .await
-        .expect("Request failed");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let resp = loop {
+        let resp = client
+            .post(format!("{}/graphql", harness.proxy_base_url))
+            .header("Content-Type", "application/json")
+            .json(&deep_query)
+            .send()
+            .await
+            .expect("Request failed");
+
+        if resp.status().as_u16() != 404 || tokio::time::Instant::now() >= deadline {
+            break resp;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
 
     assert!(
         resp.status().as_u16() == 400 || resp.status().as_u16() == 403,
