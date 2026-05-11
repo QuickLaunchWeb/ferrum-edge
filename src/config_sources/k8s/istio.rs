@@ -2788,6 +2788,278 @@ mod tests {
         assert_eq!(parse_istio_duration_ms("-500ms"), None);
         assert_eq!(parse_istio_duration_ms("NaN s"), None);
         assert_eq!(parse_istio_duration_ms("10"), None);
+        // Extended Istio/Go duration units
+        assert_eq!(parse_istio_duration_ms("30m"), Some(1_800_000));
+        assert_eq!(parse_istio_duration_ms("2h"), Some(7_200_000));
+        assert_eq!(parse_istio_duration_ms("1.5h"), Some(5_400_000));
+        assert_eq!(parse_istio_duration_ms("5000us"), Some(5));
+        // Sub-millisecond inputs round to zero -> None
+        assert_eq!(parse_istio_duration_ms("100us"), None);
+        assert_eq!(parse_istio_duration_ms("999ns"), None);
+    }
+
+    #[test]
+    fn virtual_service_retries_without_retry_on_defaults_to_connect_retry() {
+        // Istio's effective default retryOn (when unset on a VS with retries)
+        // is "connect-failure,refused-stream,unavailable,cancelled,
+        // retriable-status-codes" — so the translator must default
+        // retry_on_connect_failure to true.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 3
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let retry = result.config.proxies[0].retry.as_ref().expect("retry");
+        assert_eq!(retry.max_retries, 3);
+        assert!(retry.retry_on_connect_failure);
+        assert!(retry.retryable_status_codes.is_empty());
+    }
+
+    #[test]
+    fn virtual_service_retries_refused_stream_sets_connect_retry() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 2,
+                            "retryOn": "refused-stream"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let retry = result.config.proxies[0].retry.as_ref().expect("retry");
+        assert!(retry.retry_on_connect_failure);
+        assert!(retry.retryable_status_codes.is_empty());
+    }
+
+    #[test]
+    fn virtual_service_retries_numeric_code_out_of_range_filtered() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 1,
+                            "retryOn": "503,9999,42,418"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let retry = result.config.proxies[0].retry.as_ref().expect("retry");
+        // Only HTTP-range codes (100..=599) survive
+        assert!(retry.retryable_status_codes.contains(&503));
+        assert!(retry.retryable_status_codes.contains(&418));
+        assert!(!retry.retryable_status_codes.contains(&9999));
+        assert!(!retry.retryable_status_codes.contains(&42));
+    }
+
+    #[test]
+    fn virtual_service_fault_abort_zero_percentage_skips_subfield() {
+        // Istio percent=0 semantically disables the fault. The plugin's
+        // parse_percentage rejects 0.0, so the translator must skip the
+        // sub-field rather than emit a config that fails at construction.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 503,
+                                "percentage": {"value": 0.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        // No plugin emitted because the only sub-field was disabled
+        assert!(result.config.plugin_configs.is_empty());
+    }
+
+    #[test]
+    fn virtual_service_fault_zero_abort_keeps_valid_delay() {
+        // If abort is disabled (0%) but delay is valid, the plugin still
+        // emits with just the delay sub-field.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 503,
+                                "percentage": {"value": 0.0}
+                            },
+                            "delay": {
+                                "fixedDelay": "100ms",
+                                "percentage": {"value": 25.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.plugin_configs.len(), 1);
+        let plugin = &result.config.plugin_configs[0];
+        assert!(plugin.config.get("abort").is_none());
+        let delay = plugin.config.get("delay").expect("delay config");
+        assert_eq!(delay["duration_ms"], 100);
+        assert_eq!(delay["percentage"], 25.0);
+    }
+
+    #[test]
+    fn virtual_service_fault_abort_grpc_status_string() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["grpc.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/"}}],
+                        "route": [{"destination": {"host": "svc.default.svc.cluster.local", "port": {"number": 50051}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 200,
+                                "grpcStatus": "UNAVAILABLE",
+                                "percentage": {"value": 30.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = &result.config.plugin_configs[0];
+        let abort = plugin.config.get("abort").expect("abort config");
+        assert_eq!(abort["grpc_status"], 14);
+        assert_eq!(abort["status_code"], 200);
+    }
+
+    #[test]
+    fn virtual_service_fault_abort_grpc_status_numeric() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["grpc.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/"}}],
+                        "route": [{"destination": {"host": "svc.default.svc.cluster.local", "port": {"number": 50051}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 200,
+                                "grpcStatus": 13,
+                                "percentage": {"value": 10.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = &result.config.plugin_configs[0];
+        let abort = plugin.config.get("abort").expect("abort config");
+        assert_eq!(abort["grpc_status"], 13);
+    }
+
+    #[test]
+    fn virtual_service_fault_abort_invalid_grpc_status_dropped() {
+        // Unknown name / out-of-range code is dropped silently — the abort
+        // sub-field still emits with just the http status_code.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["grpc.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/"}}],
+                        "route": [{"destination": {"host": "svc.default.svc.cluster.local", "port": {"number": 50051}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 503,
+                                "grpcStatus": "NOT_A_REAL_CODE",
+                                "percentage": {"value": 10.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = &result.config.plugin_configs[0];
+        let abort = plugin.config.get("abort").expect("abort config");
+        assert!(abort.get("grpc_status").is_none());
+        assert_eq!(abort["status_code"], 503);
+    }
+
+    #[test]
+    fn virtual_service_timeout_extended_units() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "timeout": "2m"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies[0].backend_read_timeout_ms, 120_000);
     }
 
     #[test]

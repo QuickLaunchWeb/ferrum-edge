@@ -493,13 +493,8 @@ pub(crate) fn fault_injection_plugin_for_proxy(
     if let Some(delay_obj) = obj.get("delay").and_then(Value::as_object)
         && let Some(delay_str) = delay_obj.get("fixedDelay").and_then(Value::as_str)
         && let Some(ms) = parse_istio_duration_ms(delay_str)
+        && let Some(percentage) = istio_fault_percentage(delay_obj)
     {
-        let percentage = delay_obj
-            .get("percentage")
-            .and_then(|p| p.get("value"))
-            .and_then(Value::as_f64)
-            .or_else(|| delay_obj.get("percent").and_then(Value::as_f64))
-            .unwrap_or(100.0);
         config.insert(
             "delay".to_string(),
             serde_json::json!({
@@ -509,25 +504,29 @@ pub(crate) fn fault_injection_plugin_for_proxy(
         );
     }
 
-    let abort_source = obj.get("abort").and_then(Value::as_object);
-
-    if let Some(abort_obj) = abort_source
-        && let Some(status) = abort_obj.get("httpStatus").and_then(Value::as_u64)
-        && (200..=599).contains(&status)
+    if let Some(abort_obj) = obj.get("abort").and_then(Value::as_object)
+        && let Some(percentage) = istio_fault_percentage(abort_obj)
     {
-        let percentage = abort_obj
-            .get("percentage")
-            .and_then(|p| p.get("value"))
-            .and_then(Value::as_f64)
-            .or_else(|| abort_obj.get("percent").and_then(Value::as_f64))
-            .unwrap_or(100.0);
-        config.insert(
-            "abort".to_string(),
-            serde_json::json!({
-                "status_code": status,
-                "percentage": percentage,
-            }),
-        );
+        let mut abort_value = serde_json::Map::new();
+        abort_value.insert("percentage".to_string(), serde_json::json!(percentage));
+
+        if let Some(status) = abort_obj.get("httpStatus").and_then(Value::as_u64)
+            && (200..=599).contains(&status)
+        {
+            abort_value.insert("status_code".to_string(), serde_json::json!(status));
+        }
+
+        if let Some(grpc) = abort_obj
+            .get("grpcStatus")
+            .and_then(parse_istio_grpc_status)
+        {
+            abort_value.insert("grpc_status".to_string(), serde_json::json!(grpc));
+        }
+
+        // Plugin requires status_code; skip the abort sub-field if absent.
+        if abort_value.contains_key("status_code") {
+            config.insert("abort".to_string(), Value::Object(abort_value));
+        }
     }
 
     if config.is_empty() {
@@ -550,14 +549,32 @@ pub(crate) fn fault_injection_plugin_for_proxy(
     })
 }
 
-/// Parse an Istio duration string (e.g., "5s", "100ms", "1.5s") to milliseconds.
+/// Parse an Istio duration string to milliseconds. Supports the same suffix
+/// set as Go's `time.ParseDuration` (`ns`, `us`, `ms`, `s`, `m`, `h`); Istio's
+/// CRDs expose this format via `google.protobuf.Duration`'s string form
+/// (e.g., `"5s"`, `"500ms"`, `"30m"`, `"1.5h"`). Sub-millisecond inputs that
+/// round down to zero return `None` because the target plugins require
+/// `duration_ms > 0`.
 pub(crate) fn parse_istio_duration_ms(duration: &str) -> Option<u64> {
     let trimmed = duration.trim();
-    if let Some(ms_str) = trimmed.strip_suffix("ms") {
-        return duration_component_ms(ms_str, 1.0);
+    // 2-char suffixes first so they aren't shadowed by the trailing `s` or `m`.
+    if let Some(s) = trimmed.strip_suffix("ms") {
+        return duration_component_ms(s, 1.0);
     }
-    if let Some(s_str) = trimmed.strip_suffix('s') {
-        return duration_component_ms(s_str, 1000.0);
+    if let Some(s) = trimmed.strip_suffix("us") {
+        return duration_component_ms(s, 0.001);
+    }
+    if let Some(s) = trimmed.strip_suffix("ns") {
+        return duration_component_ms(s, 0.000_001);
+    }
+    if let Some(s) = trimmed.strip_suffix('s') {
+        return duration_component_ms(s, 1000.0);
+    }
+    if let Some(s) = trimmed.strip_suffix('m') {
+        return duration_component_ms(s, 60_000.0);
+    }
+    if let Some(s) = trimmed.strip_suffix('h') {
+        return duration_component_ms(s, 3_600_000.0);
     }
     None
 }
@@ -575,6 +592,63 @@ fn duration_component_ms(raw: &str, multiplier: f64) -> Option<u64> {
     if result > 0 { Some(result) } else { None }
 }
 
+/// Extract an Istio fault percentage in the range (0.0, 100.0]. Accepts both
+/// the nested `percentage.value` (Istio's `Percent` message) and the legacy
+/// `percent` integer field. Returns `None` for omitted, zero, or out-of-range
+/// values so the caller can skip emitting a sub-field that the
+/// `fault_injection` plugin would reject (`parse_percentage` rejects 0.0 and
+/// anything outside 0–100 inclusive).
+fn istio_fault_percentage(obj: &serde_json::Map<String, Value>) -> Option<f64> {
+    let raw = obj
+        .get("percentage")
+        .and_then(|p| p.get("value"))
+        .and_then(Value::as_f64)
+        .or_else(|| obj.get("percent").and_then(Value::as_f64));
+    let pct = raw.unwrap_or(100.0);
+    if pct.is_finite() && pct > 0.0 && pct <= 100.0 {
+        Some(pct)
+    } else {
+        None
+    }
+}
+
+/// Translate Istio's `grpcStatus` field (per
+/// <https://github.com/grpc/grpc/blob/master/doc/statuscodes.md>) into the
+/// numeric `0..=16` form expected by the `fault_injection` plugin. Accepts the
+/// canonical string name (`"UNAVAILABLE"`), the same name with hyphens, or a
+/// numeric literal. Returns `None` for unknown / out-of-range input rather
+/// than emitting a plugin config the plugin constructor would reject.
+fn parse_istio_grpc_status(value: &Value) -> Option<u32> {
+    if let Some(code) = value.as_u64() {
+        return u32::try_from(code).ok().filter(|c| *c <= 16);
+    }
+    let raw = value.as_str()?.trim();
+    if let Ok(code) = raw.parse::<u32>() {
+        return if code <= 16 { Some(code) } else { None };
+    }
+    let normalized = raw.replace('-', "_").to_ascii_uppercase();
+    match normalized.as_str() {
+        "OK" => Some(0),
+        "CANCELLED" | "CANCELED" => Some(1),
+        "UNKNOWN" => Some(2),
+        "INVALID_ARGUMENT" => Some(3),
+        "DEADLINE_EXCEEDED" => Some(4),
+        "NOT_FOUND" => Some(5),
+        "ALREADY_EXISTS" => Some(6),
+        "PERMISSION_DENIED" => Some(7),
+        "RESOURCE_EXHAUSTED" => Some(8),
+        "FAILED_PRECONDITION" => Some(9),
+        "ABORTED" => Some(10),
+        "OUT_OF_RANGE" => Some(11),
+        "UNIMPLEMENTED" => Some(12),
+        "INTERNAL" => Some(13),
+        "UNAVAILABLE" => Some(14),
+        "DATA_LOSS" => Some(15),
+        "UNAUTHENTICATED" => Some(16),
+        _ => None,
+    }
+}
+
 /// Extract retry config from an Istio VirtualService `retries` object.
 pub(crate) fn extract_retry_config(retries: &Value) -> Option<RetryConfig> {
     let obj = retries.as_object()?;
@@ -583,9 +657,9 @@ pub(crate) fn extract_retry_config(retries: &Value) -> Option<RetryConfig> {
         return None;
     }
 
-    let mut retryable_status_codes = obj
-        .get("retryOn")
-        .and_then(Value::as_str)
+    let retry_on = obj.get("retryOn").and_then(Value::as_str);
+
+    let mut retryable_status_codes = retry_on
         .map(|retry_on| {
             retry_on
                 .split(',')
@@ -595,8 +669,15 @@ pub(crate) fn extract_retry_config(retries: &Value) -> Option<RetryConfig> {
                         "5xx" => Some(vec![500, 502, 503, 504]),
                         "gateway-error" => Some(vec![502, 503, 504]),
                         "retriable-4xx" => Some(vec![409]),
-                        "reset" | "connect-failure" | "retriable-status-codes" => None,
-                        _ => token.parse::<u16>().ok().map(|code| vec![code]),
+                        "reset"
+                        | "connect-failure"
+                        | "refused-stream"
+                        | "retriable-status-codes" => None,
+                        _ => token
+                            .parse::<u16>()
+                            .ok()
+                            .filter(|code| (100..=599).contains(code))
+                            .map(|code| vec![code]),
                     }
                 })
                 .flatten()
@@ -607,15 +688,18 @@ pub(crate) fn extract_retry_config(retries: &Value) -> Option<RetryConfig> {
     retryable_status_codes.sort_unstable();
     retryable_status_codes.dedup();
 
-    let retry_on_connect = obj
-        .get("retryOn")
-        .and_then(Value::as_str)
-        .is_some_and(|retry_on| {
-            retry_on.split(',').any(|token| {
-                let token = token.trim();
-                token == "connect-failure" || token == "reset"
-            })
-        });
+    // Istio's effective default `retryOn` (applied when the field is unset on
+    // a VirtualService that does configure `retries`) is
+    // `connect-failure,refused-stream,unavailable,cancelled,retriable-status-codes`
+    // — so an omitted token list still implies retry on transport-level
+    // failures. When the operator does set `retryOn` we honor it verbatim.
+    let retry_on_connect = match retry_on {
+        Some(tokens) => tokens.split(',').any(|token| {
+            let token = token.trim();
+            token == "connect-failure" || token == "reset" || token == "refused-stream"
+        }),
+        None => true,
+    };
 
     // Istio retries all HTTP methods by default (unlike Ferrum's default which
     // excludes POST/PATCH), so unconditionally include every standard method.
