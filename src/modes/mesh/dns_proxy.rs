@@ -28,6 +28,7 @@ const DNS_MAX_UDP_PACKET_SIZE: usize = 4096;
 const DNS_UDP_SAFE_PACKET_SIZE: usize = 512;
 const DNS_MAX_TCP_PACKET_SIZE: usize = u16::MAX as usize;
 const DNS_UPSTREAM_TIMEOUT_SECS: u64 = 5;
+const DNS_UPSTREAM_ID_SPACE: usize = u16::MAX as usize + 1;
 const DNS_TCP_QUERY_READ_TIMEOUT_SECS: u64 = 5;
 pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
@@ -912,12 +913,18 @@ async fn run_udp_forwarder(
                     break;
                 };
                 if pending.len() >= max_outstanding {
-                    warn!(client = %request.src, outstanding = pending.len(), "DNS upstream forward limit reached");
+                    if upstream_id_space_exhausted(pending.len()) {
+                        record_upstream_id_exhaustion();
+                        warn!("DNS upstream transaction ID space exhausted");
+                    } else {
+                        warn!(client = %request.src, outstanding = pending.len(), "DNS upstream forward limit reached");
+                    }
                     send_udp_servfail(&client_socket, &request.query, request.src).await;
                     continue;
                 }
 
                 let Some(upstream_id) = allocate_upstream_id(&mut next_id, &pending) else {
+                    record_upstream_id_exhaustion();
                     warn!("DNS upstream transaction ID space exhausted");
                     send_udp_servfail(&client_socket, &request.query, request.src).await;
                     continue;
@@ -1013,6 +1020,14 @@ fn allocate_upstream_id(next_id: &mut u16, pending: &HashMap<u16, PendingForward
         }
     }
     None
+}
+
+fn upstream_id_space_exhausted(pending_len: usize) -> bool {
+    pending_len >= DNS_UPSTREAM_ID_SPACE
+}
+
+fn record_upstream_id_exhaustion() {
+    crate::plugins::prometheus_metrics::global_registry().record_mesh_dns_upstream_id_exhaustion();
 }
 
 fn upstream_response_matches_pending_query(response: &[u8], pending: &DnsQuery) -> bool {
@@ -1544,6 +1559,36 @@ mod tests {
             &not_a_response,
             &pending
         ));
+    }
+
+    #[test]
+    fn allocate_upstream_id_reports_exhaustion_when_all_ids_pending() {
+        let query_packet = build_a_query("example.com");
+        let query = parse_dns_query(&query_packet).expect("query parses");
+        let mut pending = HashMap::with_capacity(u16::MAX as usize + 1);
+        let client = "127.0.0.1:53000".parse().expect("client addr");
+        let expires_at = Instant::now() + Duration::from_secs(1);
+        for id in 0..=u16::MAX {
+            pending.insert(
+                id,
+                PendingForward {
+                    client,
+                    original_id: id,
+                    query: query.clone(),
+                    expires_at,
+                },
+            );
+        }
+        let mut next_id = 0u16;
+
+        assert!(allocate_upstream_id(&mut next_id, &pending).is_none());
+    }
+
+    #[test]
+    fn upstream_id_space_exhaustion_is_only_full_16_bit_occupancy() {
+        assert!(!upstream_id_space_exhausted(1024));
+        assert!(!upstream_id_space_exhausted(DNS_UPSTREAM_ID_SPACE - 1));
+        assert!(upstream_id_space_exhausted(DNS_UPSTREAM_ID_SPACE));
     }
 
     #[test]

@@ -1344,6 +1344,13 @@ pub struct GatewayConfig {
     /// resources. DB-backed modes use `list_namespaces()` instead.
     #[serde(default)]
     pub known_namespaces: Vec<String>,
+    /// Gateway-consumable mesh trust material delivered by CPs to DPs.
+    ///
+    /// This mirrors the mesh config trust-bundle shape, but sits at the
+    /// gateway config top level so non-mesh gateway DPs can verify mesh peer
+    /// certificates without loading the entire mesh model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_bundles: Option<Box<crate::modes::mesh::config::TrustBundleSet>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
 }

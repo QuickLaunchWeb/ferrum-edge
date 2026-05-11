@@ -75,8 +75,9 @@ The gRPC channel between CP and DP supports three security modes:
 2. CP sends an immediate `ConfigUpdate` with the full current config (type=FULL_SNAPSHOT)
 3. CP polls the database incrementally at `FERRUM_DB_POLL_INTERVAL` seconds using indexed `updated_at` queries
 4. When changes are detected, CP broadcasts a `ConfigUpdate` with type=DELTA containing only the added/modified/removed resources
-5. DPs apply the delta surgically — only affected caches (router, plugin, consumer, load balancer) are updated
-6. If the incremental poll fails, CP falls back to a full database reload and broadcasts a FULL_SNAPSHOT
+5. If gateway-to-mesh trust bundles are configured, the CP includes them in the `trust_bundles_json` side channel on both stream updates and unary full snapshots so DPs can refresh mesh peer trust without placing trust material in the DP-facing `GatewayConfig` JSON
+6. DPs apply the delta surgically — only affected caches (router, plugin, consumer, load balancer) are updated
+7. If the incremental poll fails, CP falls back to a full database reload and broadcasts a FULL_SNAPSHOT
 
 ### Update Types
 
@@ -86,6 +87,10 @@ The `ConfigUpdate` proto message carries an `UpdateType` discriminator:
 |------|-------|------|---------|
 | `FULL_SNAPSHOT` | 0 | Initial subscription, fallback | Entire `GatewayConfig` as JSON |
 | `DELTA` | 1 | Incremental database changes | `IncrementalResult` with only changed resources |
+
+`ConfigUpdate.trust_bundles_json` and `FullConfigResponse.trust_bundles_json` carry the serializable mesh `TrustBundleSet` used by gateway DPs for gateway-to-mesh SPIFFE TLS, or JSON `null` when the CP is explicitly clearing previously delivered trust material. The CP also emits `null` instead of "unchanged" when configured trust bundles fail semantic validation, so DPs revoke stale CP trust anchors rather than preserving them. The CP strips `GatewayConfig.trust_bundles` from DP-facing full snapshot JSON and uses only this side channel, preserving compatibility with older DPs whose config deserializer rejects unknown fields. An empty or missing side channel is treated as "unchanged" for mixed-version CP/DP rollouts. New DPs hot-swap this trust material into the gateway SVID slot when an SVID is loaded, restore startup file trust when the CP clears it, and also retain CP-delivered bundles separately when no local SVID is configured. Older DPs ignore the field.
+
+Gateway trust bundles are CP-level trust roots, not namespace-scoped resources. They are sent to every DP connected to that CP namespace; deployments that need tenant-isolated mesh trust roots should run separate CP/config-store instances. Built-in SQL and MongoDB config stores do not yet persist top-level `GatewayConfig.trust_bundles`, so their narrow trust-bundle poll reports `Unchanged` and preserves trust material supplied by the initial config load. Backends that add a dedicated trust-bundle storage shape must implement `load_gateway_trust_bundles()` with a narrow query or change detector rather than relying on full config reloads.
 
 DPs handle both types transparently: full snapshots replace the entire config; deltas are applied via `ProxyState::apply_incremental()` which patches the in-memory config and performs surgical cache updates.
 
