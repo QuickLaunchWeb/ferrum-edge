@@ -4,12 +4,13 @@ use serde_json::Value;
 
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
-    AccessLogFilter, AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig, MeshEndpoint,
-    MeshJwtRule, MeshMetricsConfig, MeshPolicy, MeshRequestAuthentication, MeshRule,
-    MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig, MetricTagOverride, MtlsMode,
-    PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch, Resolution,
-    ServiceEntry, ServiceEntryLocation, ServicePort, TagOverrideOperation, Workload, WorkloadPort,
-    WorkloadSelector,
+    AccessLogFilter, AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig,
+    MeshConsistentHash, MeshDestinationRule, MeshEndpoint, MeshJwtRule, MeshLoadBalancer,
+    MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshRequestAuthentication, MeshRule,
+    MeshSimpleLb, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
+    MeshTrafficPolicy, MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope,
+    PrincipalMatch, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+    TagOverrideOperation, Workload, WorkloadPort, WorkloadSelector,
 };
 
 use super::{
@@ -30,9 +31,8 @@ pub(super) fn translate(
             Ok(true)
         }
         "PeerAuthentication" => {
-            acc.mesh
-                .peer_authentications
-                .push(peer_authentication(object)?);
+            let peer_auth = peer_authentication(&acc.options, object)?;
+            acc.mesh.peer_authentications.push(peer_auth);
             Ok(true)
         }
         "ServiceEntry" => {
@@ -54,10 +54,8 @@ pub(super) fn translate(
             Ok(true)
         }
         "DestinationRule" => {
-            acc.warnings.push(format!(
-                "DestinationRule {}/{} accepted; traffic-policy details will map onto Ferrum upstream policy in a follow-up Phase D slice",
-                object.metadata.namespace, object.metadata.name
-            ));
+            let dr = destination_rule(acc, object)?;
+            acc.mesh.destination_rules.push(dr);
             Ok(true)
         }
         "RequestAuthentication" => {
@@ -309,7 +307,10 @@ fn condition_match(value: &Value) -> Option<ConditionMatch> {
     })
 }
 
-fn peer_authentication(object: &K8sObject) -> Result<PeerAuthentication, K8sTranslateError> {
+fn peer_authentication(
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+) -> Result<PeerAuthentication, K8sTranslateError> {
     let mtls = object.spec.get("mtls").unwrap_or(&Value::Null);
     let effective_mtls_mode = mtls_mode(string_field(mtls, "mode").unwrap_or("PERMISSIVE"));
     let mut port_overrides = HashMap::new();
@@ -325,16 +326,18 @@ fn peer_authentication(object: &K8sObject) -> Result<PeerAuthentication, K8sTran
         port_overrides.insert(port, mode);
     }
 
+    let selector = object.spec.get("selector");
+    let scope = istio_policy_scope(options, object, selector);
+    let selector = match &scope {
+        PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
+        PolicyScope::MeshWide | PolicyScope::Namespace { .. } => None,
+    };
+
     Ok(PeerAuthentication {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
-        selector: object
-            .spec
-            .get("selector")
-            .map(|selector| WorkloadSelector {
-                labels: selector_from_istio(Some(selector)),
-                namespace: Some(object.metadata.namespace.clone()),
-            }),
+        scope: Some(scope),
+        selector,
         mtls_mode: effective_mtls_mode,
         port_overrides,
     })
@@ -502,6 +505,211 @@ fn port_from_string(object: &K8sObject, raw: &str, field: &str) -> Result<u16, K
         )
     })?;
     port_from_u64(object, parsed, field)
+}
+
+fn destination_rule(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+) -> Result<MeshDestinationRule, K8sTranslateError> {
+    let host_raw = string_field(&object.spec, "host")
+        .ok_or_else(|| invalid_resource(object, "DestinationRule requires spec.host"))?;
+    let host = host_raw.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return Err(invalid_resource(
+            object,
+            "DestinationRule spec.host must be a non-empty hostname",
+        ));
+    }
+
+    let traffic_policy = object
+        .spec
+        .get("trafficPolicy")
+        .map(|tp| translate_traffic_policy(acc, object, tp))
+        .transpose()?;
+
+    let subsets = object
+        .spec
+        .get("subsets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|subset| translate_subset(acc, object, subset))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(MeshDestinationRule {
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        host,
+        traffic_policy,
+        subsets,
+    })
+}
+
+fn translate_traffic_policy(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+    value: &Value,
+) -> Result<MeshTrafficPolicy, K8sTranslateError> {
+    let connect_timeout_ms = value
+        .get("connectionPool")
+        .and_then(|cp| cp.get("tcp"))
+        .and_then(|tcp| string_field(tcp, "connectTimeout"))
+        .and_then(parse_istio_duration_ms);
+
+    let outlier_detection = value
+        .get("outlierDetection")
+        .map(|od| translate_outlier_detection(object, od))
+        .transpose()?;
+
+    let load_balancer = value
+        .get("loadBalancer")
+        .map(|lb| translate_load_balancer(acc, object, lb))
+        .transpose()?;
+
+    Ok(MeshTrafficPolicy {
+        connect_timeout_ms,
+        outlier_detection,
+        load_balancer,
+    })
+}
+
+fn translate_outlier_detection(
+    object: &K8sObject,
+    value: &Value,
+) -> Result<MeshOutlierDetection, K8sTranslateError> {
+    let consecutive_errors = value
+        .get("consecutive5xxErrors")
+        .or_else(|| value.get("consecutiveErrors"))
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok());
+
+    let interval_seconds = string_field(value, "interval")
+        .and_then(parse_istio_duration_secs)
+        .filter(|seconds| *seconds > 0);
+
+    let base_ejection_seconds =
+        string_field(value, "baseEjectionTime").and_then(parse_istio_duration_secs);
+
+    let max_ejection_percent = value
+        .get("maxEjectionPercent")
+        .and_then(Value::as_u64)
+        .map(|v| {
+            if v <= 100 {
+                Ok(v as u8)
+            } else {
+                Err(invalid_resource(
+                    object,
+                    format!("outlierDetection.maxEjectionPercent must be 0-100 (got {v})"),
+                ))
+            }
+        })
+        .transpose()?;
+
+    Ok(MeshOutlierDetection {
+        consecutive_errors,
+        interval_seconds,
+        base_ejection_seconds,
+        max_ejection_percent,
+    })
+}
+
+fn translate_load_balancer(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+    value: &Value,
+) -> Result<MeshLoadBalancer, K8sTranslateError> {
+    if let Some(simple) = string_field(value, "simple") {
+        let algorithm = match simple {
+            "ROUND_ROBIN" => MeshSimpleLb::RoundRobin,
+            "LEAST_REQUEST" | "LEAST_CONN" => MeshSimpleLb::LeastRequest,
+            "RANDOM" => MeshSimpleLb::Random,
+            "PASSTHROUGH" => {
+                acc.warnings.push(format!(
+                    "DestinationRule {}/{} loadBalancer.simple=PASSTHROUGH is approximated as ROUND_ROBIN; Ferrum always routes via configured upstream targets and cannot preserve the original destination IP",
+                    object.metadata.namespace, object.metadata.name
+                ));
+                MeshSimpleLb::Passthrough
+            }
+            other => {
+                return Err(invalid_resource(
+                    object,
+                    format!("loadBalancer.simple '{other}' is unsupported"),
+                ));
+            }
+        };
+        return Ok(MeshLoadBalancer::Simple(algorithm));
+    }
+
+    if let Some(ch) = value.get("consistentHash") {
+        let http_header_name = string_field(ch, "httpHeaderName").map(ToOwned::to_owned);
+        let http_cookie_name = ch
+            .get("httpCookie")
+            .and_then(|cookie| string_field(cookie, "name"))
+            .map(ToOwned::to_owned);
+        let use_source_ip = ch
+            .get("useSourceIp")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let set_count = u8::from(http_header_name.is_some())
+            + u8::from(http_cookie_name.is_some())
+            + u8::from(use_source_ip);
+        if set_count > 1 {
+            return Err(invalid_resource(
+                object,
+                "loadBalancer.consistentHash must set exactly one of httpHeaderName, httpCookie, or useSourceIp",
+            ));
+        }
+        if set_count == 0 {
+            return Err(invalid_resource(
+                object,
+                "loadBalancer.consistentHash requires one of httpHeaderName, httpCookie, or useSourceIp",
+            ));
+        }
+        return Ok(MeshLoadBalancer::ConsistentHash(MeshConsistentHash {
+            http_header_name,
+            http_cookie_name,
+            use_source_ip,
+        }));
+    }
+
+    // Default to RoundRobin when loadBalancer is present but empty
+    Ok(MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin))
+}
+
+fn translate_subset(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+    value: &Value,
+) -> Result<MeshSubset, K8sTranslateError> {
+    let name = string_field(value, "name")
+        .ok_or_else(|| invalid_resource(object, "DestinationRule subset requires a name"))?
+        .to_string();
+    let labels = string_map(value.get("labels").unwrap_or(&Value::Null));
+    let traffic_policy = value
+        .get("trafficPolicy")
+        .map(|tp| translate_traffic_policy(acc, object, tp))
+        .transpose()?;
+
+    if let Some(ref policy) = traffic_policy {
+        if policy.connect_timeout_ms.is_some() {
+            acc.warnings.push(format!(
+                "DestinationRule {}/{} subset '{}' connectionPool.tcp.connectTimeout is currently ignored; only the top-level trafficPolicy connectTimeout applies",
+                object.metadata.namespace, object.metadata.name, name
+            ));
+        }
+        if policy.outlier_detection.is_some() {
+            acc.warnings.push(format!(
+                "DestinationRule {}/{} subset '{}' outlierDetection is currently ignored; only the top-level trafficPolicy outlierDetection applies",
+                object.metadata.namespace, object.metadata.name, name
+            ));
+        }
+    }
+
+    Ok(MeshSubset {
+        name,
+        labels,
+        traffic_policy,
+    })
 }
 
 fn mtls_mode(value: &str) -> MtlsMode {
@@ -918,6 +1126,11 @@ fn duration_component_ms(raw: &str, multiplier: f64) -> Option<u64> {
     } else {
         Some(millis as u64)
     }
+}
+
+/// Parse Istio/Go-style duration strings into whole seconds.
+fn parse_istio_duration_secs(raw: &str) -> Option<u64> {
+    parse_istio_duration_ms(raw).map(|ms| if ms == 0 { 0 } else { ms.div_ceil(1000) })
 }
 
 fn path_match(uri: &Value) -> Option<String> {
@@ -1648,6 +1861,30 @@ mod tests {
 
         assert!(err.to_string().contains("portLevelMtls"));
         assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn root_namespace_peer_authentication_without_selector_is_mesh_wide() {
+        let mut peer_auth = object(
+            "PeerAuthentication",
+            serde_json::json!({
+                "mtls": {"mode": "STRICT"}
+            }),
+        );
+        peer_auth.metadata.namespace = "istio-config".to_string();
+
+        let result = translate_k8s_objects(
+            &[peer_auth],
+            options_for_namespace("istio-config")
+                .with_istio_root_namespace("istio-config".to_string()),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert!(matches!(
+            mesh.peer_authentications[0].scope,
+            Some(PolicyScope::MeshWide)
+        ));
     }
 
     #[test]
@@ -2577,6 +2814,585 @@ mod tests {
         );
     }
 
+    // ── DestinationRule ────────────────────────────────────────────────
+
+    #[test]
+    fn translates_destination_rule_connection_pool() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "tcp": {
+                                "connectTimeout": "5s"
+                            }
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.destination_rules.len(), 1);
+        let dr = &mesh.destination_rules[0];
+        assert_eq!(dr.host, "reviews.default.svc.cluster.local");
+        let tp = dr.traffic_policy.as_ref().expect("traffic policy");
+        assert_eq!(tp.connect_timeout_ms, Some(5000));
+    }
+
+    #[test]
+    fn translates_destination_rule_outlier_detection() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "outlierDetection": {
+                            "consecutive5xxErrors": 5,
+                            "interval": "10s",
+                            "baseEjectionTime": "30s",
+                            "maxEjectionPercent": 50
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let od = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .outlier_detection
+            .as_ref()
+            .expect("outlier detection");
+        assert_eq!(od.consecutive_errors, Some(5));
+        assert_eq!(od.interval_seconds, Some(10));
+        assert_eq!(od.base_ejection_seconds, Some(30));
+        assert_eq!(od.max_ejection_percent, Some(50));
+    }
+
+    #[test]
+    fn translates_destination_rule_lb_round_robin() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {
+                            "simple": "ROUND_ROBIN"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let lb = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .load_balancer
+            .as_ref()
+            .expect("load balancer");
+        assert!(matches!(
+            lb,
+            MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin)
+        ));
+    }
+
+    #[test]
+    fn translates_destination_rule_lb_least_request() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {
+                            "simple": "LEAST_REQUEST"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let lb = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .load_balancer
+            .as_ref()
+            .expect("load balancer");
+        assert!(matches!(
+            lb,
+            MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)
+        ));
+    }
+
+    #[test]
+    fn translates_destination_rule_lb_random() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {
+                            "simple": "RANDOM"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let lb = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .load_balancer
+            .as_ref()
+            .expect("load balancer");
+        assert!(matches!(lb, MeshLoadBalancer::Simple(MeshSimpleLb::Random)));
+    }
+
+    #[test]
+    fn translates_destination_rule_consistent_hash_header() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {
+                            "consistentHash": {
+                                "httpHeaderName": "x-user-id"
+                            }
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let lb = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .load_balancer
+            .as_ref()
+            .expect("load balancer");
+        match lb {
+            MeshLoadBalancer::ConsistentHash(ch) => {
+                assert_eq!(ch.http_header_name.as_deref(), Some("x-user-id"));
+                assert!(!ch.use_source_ip);
+            }
+            _ => panic!("expected consistent hash"),
+        }
+    }
+
+    #[test]
+    fn translates_destination_rule_consistent_hash_source_ip() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {
+                            "consistentHash": {
+                                "useSourceIp": true
+                            }
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let lb = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .load_balancer
+            .as_ref()
+            .expect("load balancer");
+        match lb {
+            MeshLoadBalancer::ConsistentHash(ch) => {
+                assert!(ch.use_source_ip);
+            }
+            _ => panic!("expected consistent hash"),
+        }
+    }
+
+    #[test]
+    fn translates_destination_rule_subsets() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "subsets": [
+                        {
+                            "name": "v1",
+                            "labels": {"version": "v1"}
+                        },
+                        {
+                            "name": "v2",
+                            "labels": {"version": "v2"},
+                            "trafficPolicy": {
+                                "loadBalancer": {"simple": "RANDOM"}
+                            }
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.destination_rules[0].subsets.len(), 2);
+        assert_eq!(mesh.destination_rules[0].subsets[0].name, "v1");
+        assert_eq!(
+            mesh.destination_rules[0].subsets[0].labels.get("version"),
+            Some(&"v1".to_string())
+        );
+        assert!(
+            mesh.destination_rules[0].subsets[0]
+                .traffic_policy
+                .is_none()
+        );
+        assert_eq!(mesh.destination_rules[0].subsets[1].name, "v2");
+        assert!(
+            mesh.destination_rules[0].subsets[1]
+                .traffic_policy
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_missing_host() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "trafficPolicy": {
+                        "loadBalancer": {"simple": "RANDOM"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("missing host must fail");
+
+        assert!(err.to_string().contains("requires spec.host"));
+    }
+
+    #[test]
+    fn destination_rule_rejects_unsupported_lb() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {"simple": "MAGLEV"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("unsupported LB must fail");
+
+        assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn destination_rule_rejects_outlier_ejection_percent_above_100() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "outlierDetection": {
+                            "maxEjectionPercent": 101
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid max ejection percent must fail");
+
+        assert!(
+            err.to_string()
+                .contains("outlierDetection.maxEjectionPercent must be 0-100")
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_subset_without_name() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "subsets": [{"labels": {"version": "v1"}}]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("subset without name must fail");
+
+        assert!(err.to_string().contains("subset requires a name"));
+    }
+
+    #[test]
+    fn destination_rule_no_warning_emitted() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local"
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("DestinationRule"))
+        );
+    }
+
+    #[test]
+    fn destination_rule_host_is_lowercased() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "Reviews.Default.SVC.Cluster.Local"
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(
+            mesh.destination_rules[0].host,
+            "reviews.default.svc.cluster.local"
+        );
+    }
+
+    #[test]
+    fn destination_rule_connect_timeout_ms_format() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "api.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "tcp": {
+                                "connectTimeout": "100ms"
+                            }
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tp = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy");
+        assert_eq!(tp.connect_timeout_ms, Some(100));
+    }
+
+    #[test]
+    fn destination_rule_rejects_empty_host() {
+        let err = translate_k8s_objects(
+            &[object("DestinationRule", serde_json::json!({"host": ""}))],
+            options(),
+        )
+        .expect_err("empty host must fail");
+        assert!(err.to_string().contains("non-empty hostname"));
+    }
+
+    #[test]
+    fn destination_rule_rejects_dot_only_host() {
+        let err = translate_k8s_objects(
+            &[object("DestinationRule", serde_json::json!({"host": "."}))],
+            options(),
+        )
+        .expect_err("dot-only host must fail");
+        assert!(err.to_string().contains("non-empty hostname"));
+    }
+
+    #[test]
+    fn destination_rule_lb_least_conn_alias_translates() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {"simple": "LEAST_CONN"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let mesh = result.config.mesh.expect("mesh config");
+        let lb = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .load_balancer
+            .as_ref()
+            .expect("load balancer");
+        assert!(matches!(
+            lb,
+            MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)
+        ));
+    }
+
+    #[test]
+    fn destination_rule_consistent_hash_rejects_multiple_options() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {
+                            "consistentHash": {
+                                "httpHeaderName": "x-user-id",
+                                "useSourceIp": true
+                            }
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("multi-option consistentHash must fail");
+        assert!(err.to_string().contains("must set exactly one"));
+    }
+
+    #[test]
+    fn destination_rule_consistent_hash_rejects_no_options() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {
+                            "consistentHash": {}
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("empty consistentHash must fail");
+        assert!(err.to_string().contains("requires one of"));
+    }
+
+    #[test]
+    fn destination_rule_passthrough_emits_warning() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {"simple": "PASSTHROUGH"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("PASSTHROUGH translates with warning");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("PASSTHROUGH") && w.contains("ROUND_ROBIN")),
+            "expected PASSTHROUGH approximation warning, got {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn destination_rule_subset_unsupported_fields_warn() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "subsets": [{
+                        "name": "v1",
+                        "labels": {"version": "v1"},
+                        "trafficPolicy": {
+                            "connectionPool": {"tcp": {"connectTimeout": "5s"}},
+                            "outlierDetection": {"consecutive5xxErrors": 3}
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("subset with unsupported fields still translates");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("subset 'v1'") && w.contains("connectTimeout")),
+            "expected subset connectTimeout warning, got {:?}",
+            result.warnings
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("subset 'v1'") && w.contains("outlierDetection")),
+            "expected subset outlierDetection warning, got {:?}",
+            result.warnings
+        );
+    }
+
     // -- VirtualService retry / timeout --------------------------------
 
     #[test]
@@ -2931,6 +3747,8 @@ mod tests {
     #[test]
     fn parse_istio_duration_positive_sub_millisecond_clamps_to_one() {
         assert_eq!(parse_istio_duration_ms("0.0001s"), Some(1));
+        assert_eq!(parse_istio_duration_ms("0.1ms"), Some(1));
+        assert_eq!(parse_istio_duration_ms("0.0005s"), Some(1));
         assert_eq!(parse_istio_duration_ms("0s"), Some(0));
     }
 
@@ -3111,6 +3929,77 @@ mod tests {
         assert_eq!(
             evaluate_mesh_authorization(&slice, &authed),
             MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn parse_istio_duration_rejects_negative_non_finite_and_overflow() {
+        assert_eq!(parse_istio_duration_ms("-1s"), None);
+        assert_eq!(parse_istio_duration_ms("NaNs"), None);
+        assert_eq!(parse_istio_duration_ms("infms"), None);
+        assert_eq!(
+            parse_istio_duration_ms("999999999999999999999999999999m"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_istio_duration_secs_rounds_positive_subseconds_up() {
+        assert_eq!(parse_istio_duration_secs("0.5s"), Some(1));
+        assert_eq!(parse_istio_duration_secs("1.1s"), Some(2));
+        assert_eq!(parse_istio_duration_secs("0s"), Some(0));
+    }
+
+    #[test]
+    fn destination_rule_outlier_interval_ignores_zero_and_rounds_subsecond() {
+        let zero_interval = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "outlierDetection": {
+                            "interval": "0s"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let mesh = zero_interval.config.mesh.expect("mesh config");
+        assert_eq!(
+            mesh.destination_rules[0]
+                .traffic_policy
+                .as_ref()
+                .and_then(|policy| policy.outlier_detection.as_ref())
+                .and_then(|outlier| outlier.interval_seconds),
+            None
+        );
+
+        let subsecond_interval = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "outlierDetection": {
+                            "interval": "0.5s"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let mesh = subsecond_interval.config.mesh.expect("mesh config");
+        assert_eq!(
+            mesh.destination_rules[0]
+                .traffic_policy
+                .as_ref()
+                .and_then(|policy| policy.outlier_detection.as_ref())
+                .and_then(|outlier| outlier.interval_seconds),
+            Some(1)
         );
     }
 }

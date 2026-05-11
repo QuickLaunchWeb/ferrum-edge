@@ -721,6 +721,12 @@ pub struct XdsConfigConsumer {
 
 impl XdsConfigConsumer {
     pub fn new(config: XdsClientConfig, state: MeshRuntimeState) -> Self {
+        warn!(
+            node_id = %config.node_id,
+            "xDS config protocol cannot recover Istio DestinationRule traffic policy from CDS/EDS; \
+             outlier detection, connection pool, load balancer, and subsets configured via DRs will not be applied. \
+             Use FERRUM_MESH_CONFIG_PROTOCOL=native if DR translation is required."
+        );
         Self { config, state }
     }
 
@@ -827,6 +833,13 @@ fn reverse_translate(
         // External ServiceEntry shape is not recoverable from the minimal
         // CDS/EDS names consumed here; richer xDS metadata will fill this in.
         service_entries: Vec::new(),
+        // DestinationRule traffic policy is not exposed via standard xDS — its
+        // semantics are baked into Envoy Cluster (LB algorithm, outlier
+        // detection, connection pool) before the CP emits CDS, so we cannot
+        // round-trip it back into a `MeshDestinationRule`. Operators relying
+        // on DR translation must use `FERRUM_MESH_CONFIG_PROTOCOL=native`;
+        // see docs/mesh.md ("DestinationRule support matrix").
+        destination_rules: Vec::new(),
         trust_bundles: None,
         multi_cluster: None,
     })

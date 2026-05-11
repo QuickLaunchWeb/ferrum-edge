@@ -85,6 +85,7 @@ fn mesh_config() -> MeshConfig {
         peer_authentications: vec![PeerAuthentication {
             name: "default-mtls".to_string(),
             namespace: "default".to_string(),
+            scope: None,
             selector: None,
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
@@ -92,6 +93,7 @@ fn mesh_config() -> MeshConfig {
         service_entries: Vec::new(),
         request_authentications: Vec::new(),
         telemetry_resources: Vec::new(),
+        destination_rules: Vec::new(),
         trust_bundles: None,
         multi_cluster: None,
     }
