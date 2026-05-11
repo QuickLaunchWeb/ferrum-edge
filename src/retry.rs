@@ -64,25 +64,32 @@ pub enum ErrorClass {
     RequestError,
 }
 
+impl ErrorClass {
+    /// Stable snake_case label for metrics, logs, and serialized summaries.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ConnectionTimeout => "connection_timeout",
+            Self::ConnectionRefused => "connection_refused",
+            Self::ConnectionReset => "connection_reset",
+            Self::ConnectionClosed => "connection_closed",
+            Self::DnsLookupError => "dns_lookup_error",
+            Self::TlsError => "tls_error",
+            Self::ReadWriteTimeout => "read_write_timeout",
+            Self::ClientDisconnect => "client_disconnect",
+            Self::ProtocolError => "protocol_error",
+            Self::ResponseBodyTooLarge => "response_body_too_large",
+            Self::RequestBodyTooLarge => "request_body_too_large",
+            Self::ConnectionPoolError => "connection_pool_error",
+            Self::PortExhaustion => "port_exhaustion",
+            Self::GracefulRemoteClose => "graceful_remote_close",
+            Self::RequestError => "request_error",
+        }
+    }
+}
+
 impl std::fmt::Display for ErrorClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ConnectionTimeout => write!(f, "connection_timeout"),
-            Self::ConnectionRefused => write!(f, "connection_refused"),
-            Self::ConnectionReset => write!(f, "connection_reset"),
-            Self::ConnectionClosed => write!(f, "connection_closed"),
-            Self::DnsLookupError => write!(f, "dns_lookup_error"),
-            Self::TlsError => write!(f, "tls_error"),
-            Self::ReadWriteTimeout => write!(f, "read_write_timeout"),
-            Self::ClientDisconnect => write!(f, "client_disconnect"),
-            Self::ProtocolError => write!(f, "protocol_error"),
-            Self::ResponseBodyTooLarge => write!(f, "response_body_too_large"),
-            Self::RequestBodyTooLarge => write!(f, "request_body_too_large"),
-            Self::ConnectionPoolError => write!(f, "connection_pool_error"),
-            Self::PortExhaustion => write!(f, "port_exhaustion"),
-            Self::GracefulRemoteClose => write!(f, "graceful_remote_close"),
-            Self::RequestError => write!(f, "request_error"),
-        }
+        f.write_str(self.as_str())
     }
 }
 

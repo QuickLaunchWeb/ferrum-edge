@@ -1064,7 +1064,10 @@ The plugin runs across all protocols (HTTP, gRPC, WebSocket, TCP, UDP). For stre
 ### `prometheus_metrics`
 
 Records gateway metrics in Prometheus exposition format. The admin API serves
-the `/metrics` endpoint; this plugin only records request and stream metrics.
+the `/metrics` endpoint; this plugin records request and stream metrics.
+Mesh deployments also get `ferrum_mesh_hbone_relay_failures_total` for HBONE
+CONNECT tunnels that fail after the `200 OK` response has already been sent,
+labelled by `proxy_id`, relay `direction`, and `error_class`.
 
 **Priority:** 9300
 
