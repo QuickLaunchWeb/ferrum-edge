@@ -770,6 +770,13 @@ pub struct MeshTrafficPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshTrafficPolicyTls {
     /// DR client-side TLS mode: `Disable` / `Simple` / `Mutual` / `IstioMutual`.
+    ///
+    /// Defaults to `Simple` when omitted, matching Istio's `ClientTLSSettings.mode`
+    /// default and the `translate_client_tls_settings` translator behavior. Without
+    /// this default, a hand-authored or partially-updated slice such as
+    /// `{ "tls": { "sni": "..." } }` would fail to deserialize even though Istio
+    /// defaulting semantics treat it as `SIMPLE`.
+    #[serde(default = "default_client_tls_mode")]
     pub mode: MtlsMode,
     /// Optional Server Name Indication value sent on the backend handshake.
     /// Today this is a schema-compatibility field — `Upstream` does not yet
@@ -810,6 +817,10 @@ fn default_insecure_skip_verify() -> bool {
     false
 }
 
+fn default_client_tls_mode() -> MtlsMode {
+    MtlsMode::Simple
+}
+
 impl Default for MeshTrafficPolicyTls {
     fn default() -> Self {
         // Use a client-side default (`Simple`) instead of the derived
@@ -817,9 +828,10 @@ impl Default for MeshTrafficPolicyTls {
         // in callers / tests always produces a value that the cold-path
         // apply treats as a valid DR.tls mode. `Simple` also matches Istio's
         // own `ClientTLSSettings.mode` default when the block is present but
-        // `mode` is omitted.
+        // `mode` is omitted. Shares the `default_client_tls_mode` helper with
+        // the serde field default so the two cannot drift.
         Self {
-            mode: MtlsMode::Simple,
+            mode: default_client_tls_mode(),
             sni: None,
             ca_certificates: None,
             client_certificate: None,

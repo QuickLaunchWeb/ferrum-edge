@@ -286,8 +286,9 @@ fn mesh_traffic_policy_with_tls_none_omits_tls_key_from_json() {
 #[test]
 fn mesh_traffic_policy_tls_optional_sub_fields_skip_when_none() {
     // Sub-field wire-compatibility: every `Option<String>` / `Vec<String>`
-    // field skips when empty. Only the mandatory `mode` (and any
-    // explicitly-set extras) appears in the JSON.
+    // field skips when empty. `mode` always serializes (no
+    // `skip_serializing_if`); only it and any explicitly-set extras
+    // appear in the JSON.
     let tls = MeshTrafficPolicyTls {
         mode: MtlsMode::Simple,
         ..MeshTrafficPolicyTls::default()
@@ -328,6 +329,24 @@ fn mesh_traffic_policy_tls_round_trips_through_serde() {
     let json = serde_json::to_string(&original).expect("serialize");
     let parsed: MeshTrafficPolicyTls = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(parsed, original);
+}
+
+#[test]
+fn mesh_traffic_policy_tls_defaults_mode_to_simple_when_omitted() {
+    // Hand-authored or partially-updated TLS blocks may omit `mode`. The
+    // serde default must match Istio's `ClientTLSSettings.mode` default
+    // (SIMPLE) and the `translate_client_tls_settings` translator, otherwise
+    // a JSON payload like `{ "tls": { "sni": "reviews.example.com" } }`
+    // fails to load even though Istio semantics treat it as SIMPLE.
+    let parsed: MeshTrafficPolicyTls =
+        serde_json::from_str(r#"{"sni":"reviews.example.com"}"#).expect("deserialize");
+    assert_eq!(parsed.mode, MtlsMode::Simple);
+    assert_eq!(parsed.sni.as_deref(), Some("reviews.example.com"));
+
+    // Empty object is also valid and produces the full default.
+    let empty: MeshTrafficPolicyTls = serde_json::from_str("{}").expect("deserialize empty");
+    assert_eq!(empty, MeshTrafficPolicyTls::default());
+    assert_eq!(empty.mode, MtlsMode::Simple);
 }
 
 #[test]
