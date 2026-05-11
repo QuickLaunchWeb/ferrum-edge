@@ -9,8 +9,9 @@
 //! | `cp`       | No    | Read/Write  | DB polling + gRPC broadcast to DPs |
 //! | `dp`       | Yes   | Read-only   | gRPC stream from CP              |
 //! | `mesh`     | Yes   | Read-only   | xDS or native MeshSubscribe      |
-//! | `injector` | No    | No          | Kubernetes admission webhook     |
-//! | `migrate`  | No    | No          | Runs DB migrations then exits    |
+//! | `injector`   | No    | No          | Kubernetes admission webhook     |
+//! | `node_agent` | No    | No          | Per-node eBPF/iptables capture   |
+//! | `migrate`    | No    | No          | Runs DB migrations then exits    |
 //!
 //! All modes share the same `ProxyState` and atomic config swap mechanism.
 //! Config changes (from any source) are validated, then swapped atomically
@@ -23,6 +24,7 @@ pub mod file;
 pub mod injector;
 pub mod mesh;
 pub mod migrate;
+pub mod node_agent;
 
 use std::sync::Arc;
 

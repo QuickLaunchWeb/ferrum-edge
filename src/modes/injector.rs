@@ -559,6 +559,14 @@ fn build_sidecar_patch_for_namespace(
         value: Some(sidecar_container(config, pod, &pod_namespace)),
     });
 
+    if config.capture_mode == CaptureMode::Ebpf {
+        patch.push(JsonPatchOperation {
+            op: "add",
+            path: "/metadata/annotations/ferrum.io~1capture-mode".to_string(),
+            value: Some(Value::String("ebpf".to_string())),
+        });
+    }
+
     if config.capture_mode == CaptureMode::Iptables {
         ensure_init_containers(pod, &mut patch);
         patch.push(JsonPatchOperation {

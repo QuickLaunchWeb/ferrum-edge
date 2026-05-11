@@ -22,6 +22,7 @@ mod custom_plugins;
 mod date_cache;
 mod dns;
 mod dtls;
+mod ebpf;
 mod grpc;
 mod health_check;
 mod http3;
@@ -419,6 +420,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             OperatingMode::DataPlane => modes::data_plane::run(env_config, shutdown_tx).await,
             OperatingMode::Mesh => modes::mesh::run(env_config, shutdown_tx).await,
             OperatingMode::Injector => modes::injector::run(env_config, shutdown_tx).await,
+            OperatingMode::NodeAgent => modes::node_agent::run(env_config, shutdown_tx).await,
             OperatingMode::Migrate => modes::migrate::run(env_config, shutdown_tx).await,
         };
 
