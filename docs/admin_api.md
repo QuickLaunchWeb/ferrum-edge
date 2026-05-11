@@ -255,14 +255,16 @@ Returns all currently connected Data Plane nodes and Mesh nodes. Each registry i
       "namespace": "ferrum",
       "status": "online",
       "connected_at": "2025-01-15T10:32:00Z",
+      "last_heartbeat_at": "2025-01-15T10:34:30Z",
       "last_sync_at": "2025-01-15T10:35:00Z"
     }
   ]
 }
 ```
 
-- **`status`** is always `online` — disconnected DPs and mesh nodes are automatically removed from their registries when their gRPC stream drops.
+- **`status`** is always `online` — disconnected DPs and mesh nodes are automatically removed from their registries when their gRPC stream drops. Mesh nodes also send lightweight `MeshSubscribe` heartbeats; the CP reaps entries that stop producing stream activity for 5 minutes.
 - **`last_sync_at`** updates whenever the CP broadcasts a config update (full snapshot or delta) to that registry. DP and mesh broadcasts share the same database polling cycle, so the timestamps converge on every successful poll.
+- **`last_heartbeat_at`** is mesh-only and updates whenever the CP produces a mesh stream item for that node: the initial snapshot, a config delta/full snapshot, or a heartbeat.
 
 ### DP Mode Response
 

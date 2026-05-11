@@ -79,6 +79,7 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
+use crate::identity::SharedSvidBundle;
 use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
@@ -1176,6 +1177,11 @@ pub struct ProxyState {
     /// mesh-internal identity claims (e.g. `source.principal`) from leaking
     /// to non-mesh upstream services.
     pub mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
+    /// Optional gateway SPIFFE identity used by gateway-to-mesh outbound TLS.
+    /// The slot shape matches mesh SVID rotation so later trust-bundle updates
+    /// can hot-swap without blocking proxy readers.
+    #[allow(dead_code)] // Consumed by gateway-to-mesh HBONE dispatch in the next bridge phase.
+    pub gateway_svid_bundle: SharedSvidBundle,
 }
 
 #[inline]
@@ -1200,6 +1206,49 @@ fn via_header_for_backend_response_body<'a>(
         ResponseBody::StreamingH3(_) => &state.via_header_http3,
         ResponseBody::Buffered(_) => &state.via_header_http11,
     }
+}
+
+fn empty_svid_bundle_slot() -> SharedSvidBundle {
+    Arc::new(ArcSwap::new(Arc::new(None)))
+}
+
+fn load_gateway_svid_bundle(env_config: &EnvConfig) -> Result<SharedSvidBundle, anyhow::Error> {
+    let configured = (
+        env_config.gateway_svid_cert_path.as_deref(),
+        env_config.gateway_svid_key_path.as_deref(),
+        env_config.gateway_svid_trust_bundle_path.as_deref(),
+    );
+    let (cert_path, key_path, trust_bundle_path) = match configured {
+        (None, None, None) => return Ok(empty_svid_bundle_slot()),
+        (Some(cert_path), Some(key_path), Some(trust_bundle_path)) => {
+            (cert_path, key_path, trust_bundle_path)
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "gateway SVID configuration requires FERRUM_GATEWAY_SVID_CERT_PATH, \
+             FERRUM_GATEWAY_SVID_KEY_PATH, and FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH together"
+            ));
+        }
+    };
+
+    let cert_path = std::path::Path::new(cert_path);
+    let key_path = std::path::Path::new(key_path);
+    let trust_bundle_path = std::path::Path::new(trust_bundle_path);
+    let bundle = crate::identity::file_loader::load_svid_bundle_from_files(
+        cert_path,
+        key_path,
+        trust_bundle_path,
+        env_config.gateway_spiffe_id.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to load gateway SVID bundle: {e}"))?;
+
+    info!(
+        spiffe_id = %bundle.spiffe_id,
+        trust_domain = %bundle.trust_domain(),
+        trust_anchors = bundle.trust_bundles.local.x509_authorities.len(),
+        "Loaded gateway SPIFFE SVID bundle"
+    );
+    Ok(Arc::new(ArcSwap::new(Arc::new(Some(bundle)))))
 }
 
 impl ProxyState {
@@ -1292,6 +1341,7 @@ impl ProxyState {
             crls.clone(),
         ));
         let env_config_arc = Arc::new(env_config.clone());
+        let gateway_svid_bundle = load_gateway_svid_bundle(&env_config_arc)?;
         let h3_pool = Arc::new(Http3ConnectionPool::new(
             env_config_arc.clone(),
             dns_cache.clone(),
@@ -1606,6 +1656,7 @@ impl ProxyState {
             overload,
             adaptive_buffer,
             mesh_egress_strip_baggage_keys,
+            gateway_svid_bundle,
         };
         Ok((state, health_check_handles))
     }
@@ -6404,8 +6455,10 @@ async fn handle_proxy_request_inner(
     // Some auth plugins (for example `hmac_auth`) verify request body integrity
     // at authenticate time. Buffer the body before the auth phase runs so those
     // plugins can read `ctx.request_body_bytes`.
-    let requires_body_before_authenticate = capabilities
-        .has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
+    // HBONE CONNECT must keep hyper's upgrade handle in the streaming request
+    // body. Pre-auth body buffering would consume it and make the relay fail.
+    let requires_body_before_authenticate = !is_hbone_connect
+        && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
         && plugins.iter().any(|plugin| {
             plugin.requires_request_body_before_authenticate()
                 && plugin.should_buffer_request_body(&ctx)
