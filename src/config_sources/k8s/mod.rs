@@ -414,6 +414,10 @@ pub(crate) struct RouteProxySpec {
     pub upstream_id: Option<String>,
     pub backend_scheme: BackendScheme,
     pub listen_port: Option<u16>,
+    /// Optional retry configuration (from Istio VirtualService retries).
+    pub retry: Option<crate::config::types::RetryConfig>,
+    /// Optional backend read timeout override in milliseconds.
+    pub backend_read_timeout_ms: Option<u64>,
 }
 
 pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
@@ -432,7 +436,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         strip_listen_path: spec.strip_listen_path,
         preserve_host_header: false,
         backend_connect_timeout_ms: 30_000,
-        backend_read_timeout_ms: 30_000,
+        backend_read_timeout_ms: spec.backend_read_timeout_ms.unwrap_or(30_000),
         backend_write_timeout_ms: 30_000,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -460,7 +464,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         upstream_subset: None,
         api_spec_id: None,
         circuit_breaker: None,
-        retry: None,
+        retry: spec.retry,
         response_body_mode: ResponseBodyMode::Stream,
         listen_port: spec.listen_port,
         frontend_tls: false,

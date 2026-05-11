@@ -18,7 +18,7 @@ use super::{
     port_from_u64, proxy_for_route, resource_id, selector_from_istio, string_array, string_field,
     string_map, upstream_for_route,
 };
-use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT};
+use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT, RetryConfig};
 
 pub(super) fn translate(
     acc: &mut K8sAccumulator,
@@ -649,6 +649,9 @@ fn virtual_service_routes(
             (String::new(), 0, Some(upstream_id))
         };
 
+        let retry = route_retry_config(http);
+        let timeout_ms = route_timeout_ms(http);
+
         let match_count = match_paths.len();
         for (match_index, listen_path) in match_paths.into_iter().enumerate() {
             let suffix = if match_count == 1 {
@@ -672,6 +675,8 @@ fn virtual_service_routes(
                 upstream_id: upstream_id.clone(),
                 backend_scheme: BackendScheme::Http,
                 listen_port: None,
+                retry: retry.clone(),
+                backend_read_timeout_ms: timeout_ms,
             }));
         }
     }
@@ -779,6 +784,125 @@ fn route_weight(object: &K8sObject, route: &Value) -> Result<u32, K8sTranslateEr
         ));
     }
     Ok(weight as u32)
+}
+
+/// Extract Istio VirtualService `http[].retries` into a Ferrum [`RetryConfig`].
+///
+/// Maps:
+///   - `retries.attempts` -> `max_retries`
+///   - `retries.retryOn` -> `retryable_status_codes` (from `5xx`, `gateway-error`,
+///     or bare numeric codes) and `retry_on_connect_failure` (from `connect-failure`,
+///     `reset`, `refused-stream`)
+///
+/// Returns `None` when no `retries` block is present or when `attempts` is zero.
+fn route_retry_config(http: &Value) -> Option<RetryConfig> {
+    let retries = http.get("retries")?;
+    let attempts = retries.get("attempts").and_then(Value::as_u64).unwrap_or(0);
+    if attempts == 0 {
+        return None;
+    }
+
+    let mut retry = RetryConfig {
+        max_retries: attempts.min(u64::from(u32::MAX)) as u32,
+        ..RetryConfig::default()
+    };
+
+    if let Some(retry_on) = string_field(retries, "retryOn") {
+        let mut status_codes = Vec::new();
+        let mut connect_failure = false;
+
+        for token in retry_on.split(',').map(str::trim) {
+            match token {
+                "5xx" => {
+                    status_codes.extend(500..=599);
+                }
+                "retriable-status-codes" => {
+                    status_codes.extend(retriable_status_codes(retries));
+                }
+                "connect-failure" | "reset" | "refused-stream" => {
+                    connect_failure = true;
+                }
+                "gateway-error" => {
+                    status_codes.extend_from_slice(&[502, 503, 504]);
+                }
+                other => {
+                    if let Ok(code @ 100..=599) = other.parse::<u16>() {
+                        status_codes.push(code);
+                    }
+                }
+            }
+        }
+
+        status_codes.sort_unstable();
+        status_codes.dedup();
+        if !status_codes.is_empty() {
+            retry.retryable_status_codes = status_codes;
+        }
+        retry.retry_on_connect_failure = connect_failure;
+    }
+
+    Some(retry)
+}
+
+fn retriable_status_codes(retries: &Value) -> impl Iterator<Item = u16> + '_ {
+    retries
+        .get("retriableStatusCodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .filter(|code| (100..=599).contains(code))
+        .map(|code| code as u16)
+}
+
+/// Extract Istio VirtualService `http[].timeout` into milliseconds.
+///
+/// Istio timeout is a Go-duration string (e.g. `"5s"`, `"1.5s"`, `"500ms"`,
+/// `"1m"`). Returns `None` when no `timeout` field is present or when the
+/// value is not a recognized duration format.
+fn route_timeout_ms(http: &Value) -> Option<u64> {
+    let raw = string_field(http, "timeout")?;
+    parse_istio_duration_ms(raw)
+}
+
+/// Parse a simplified Go-duration string into milliseconds.
+///
+/// Supports:
+///   - `"<number>s"` and `"<float>s"` (seconds)
+///   - `"<number>ms"` (milliseconds)
+///   - `"<number>m"` (minutes)
+///   - `"<number>h"` (hours)
+fn parse_istio_duration_ms(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if let Some(ms) = raw.strip_suffix("ms") {
+        return duration_component_ms(ms, 1.0);
+    }
+    if let Some(seconds) = raw.strip_suffix('s') {
+        return duration_component_ms(seconds, 1000.0);
+    }
+    if let Some(minutes) = raw.strip_suffix('m') {
+        return duration_component_ms(minutes, 60_000.0);
+    }
+    if let Some(hours) = raw.strip_suffix('h') {
+        return duration_component_ms(hours, 3_600_000.0);
+    }
+    None
+}
+
+fn duration_component_ms(raw: &str, multiplier: f64) -> Option<u64> {
+    let value = raw.trim().parse::<f64>().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let millis = value * multiplier;
+    if !millis.is_finite() || millis > u64::MAX as f64 {
+        return None;
+    }
+    if millis > 0.0 && millis < 1.0 {
+        Some(1)
+    } else {
+        Some(millis as u64)
+    }
 }
 
 fn path_match(uri: &Value) -> Option<String> {
@@ -2436,5 +2560,362 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("RequestAuthentication"))
         );
+    }
+
+    // -- VirtualService retry / timeout --------------------------------
+
+    #[test]
+    fn virtual_service_maps_retries_to_proxy_retry_config() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 3,
+                            "retryOn": "5xx,connect-failure"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        let proxy = &result.config.proxies[0];
+        let retry = proxy.retry.as_ref().expect("retry config should be set");
+        assert_eq!(retry.max_retries, 3);
+        assert!(retry.retry_on_connect_failure);
+        assert!(retry.retryable_status_codes.contains(&500));
+        assert!(retry.retryable_status_codes.contains(&502));
+        assert!(retry.retryable_status_codes.contains(&503));
+        assert!(retry.retryable_status_codes.contains(&504));
+    }
+
+    #[test]
+    fn virtual_service_maps_gateway_error_retry_on() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 2,
+                            "retryOn": "gateway-error"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let retry = result.config.proxies[0]
+            .retry
+            .as_ref()
+            .expect("retry config");
+        assert_eq!(retry.max_retries, 2);
+        assert!(retry.retryable_status_codes.contains(&502));
+        assert!(retry.retryable_status_codes.contains(&503));
+        assert!(retry.retryable_status_codes.contains(&504));
+        assert!(!retry.retryable_status_codes.contains(&500));
+        assert!(!retry.retry_on_connect_failure);
+    }
+
+    #[test]
+    fn virtual_service_retriable_status_codes_uses_explicit_codes() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 2,
+                            "retryOn": "retriable-status-codes",
+                            "retriableStatusCodes": [409, 425, 503, 700]
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let retry = result.config.proxies[0]
+            .retry
+            .as_ref()
+            .expect("retry config");
+        assert_eq!(retry.retryable_status_codes, vec![409, 425, 503]);
+    }
+
+    #[test]
+    fn virtual_service_retry_5xx_covers_full_server_error_range() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 1,
+                            "retryOn": "5xx"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let retry = result.config.proxies[0]
+            .retry
+            .as_ref()
+            .expect("retry config");
+        assert_eq!(retry.retryable_status_codes.len(), 100);
+        assert!(retry.retryable_status_codes.contains(&500));
+        assert!(retry.retryable_status_codes.contains(&599));
+    }
+
+    #[test]
+    fn virtual_service_zero_retry_attempts_produces_no_retry_config() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {"attempts": 0}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.proxies[0].retry.is_none());
+    }
+
+    #[test]
+    fn virtual_service_maps_timeout_to_backend_read_timeout() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "timeout": "5s"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies[0].backend_read_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn virtual_service_maps_millisecond_timeout() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "timeout": "500ms"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies[0].backend_read_timeout_ms, 500);
+    }
+
+    #[test]
+    fn virtual_service_maps_fractional_second_timeout() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "timeout": "1.5s"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies[0].backend_read_timeout_ms, 1500);
+    }
+
+    #[test]
+    fn virtual_service_timeout_and_retry_combined() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "timeout": "10s",
+                        "retries": {"attempts": 2, "retryOn": "connect-failure,reset"}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let proxy = &result.config.proxies[0];
+        assert_eq!(proxy.backend_read_timeout_ms, 10_000);
+        let retry = proxy.retry.as_ref().expect("retry config");
+        assert_eq!(retry.max_retries, 2);
+        assert!(retry.retry_on_connect_failure);
+    }
+
+    #[test]
+    fn virtual_service_retry_shared_across_multiple_uri_matches() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/v1"}},
+                            {"uri": {"prefix": "/v2"}}
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {"attempts": 3, "retryOn": "5xx"},
+                        "timeout": "3s"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 2);
+        for proxy in &result.config.proxies {
+            assert_eq!(proxy.backend_read_timeout_ms, 3000);
+            let retry = proxy.retry.as_ref().expect("retry config");
+            assert_eq!(retry.max_retries, 3);
+        }
+    }
+
+    #[test]
+    fn virtual_service_no_retry_without_retries_block() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.proxies[0].retry.is_none());
+        assert_eq!(result.config.proxies[0].backend_read_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn virtual_service_weighted_destinations_with_retry() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [
+                            {"destination": {"host": "api-v1.default.svc.cluster.local", "port": {"number": 8080}}, "weight": 80},
+                            {"destination": {"host": "api-v2.default.svc.cluster.local", "port": {"number": 8081}}, "weight": 20}
+                        ],
+                        "retries": {"attempts": 2, "retryOn": "5xx"}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.upstreams.len(), 1);
+        let retry = result.config.proxies[0]
+            .retry
+            .as_ref()
+            .expect("retry config");
+        assert_eq!(retry.max_retries, 2);
+    }
+
+    #[test]
+    fn parse_istio_duration_seconds() {
+        assert_eq!(parse_istio_duration_ms("5s"), Some(5000));
+        assert_eq!(parse_istio_duration_ms("1.5s"), Some(1500));
+        assert_eq!(parse_istio_duration_ms("0.1s"), Some(100));
+    }
+
+    #[test]
+    fn parse_istio_duration_milliseconds() {
+        assert_eq!(parse_istio_duration_ms("500ms"), Some(500));
+        assert_eq!(parse_istio_duration_ms("100ms"), Some(100));
+    }
+
+    #[test]
+    fn parse_istio_duration_minutes() {
+        assert_eq!(parse_istio_duration_ms("1m"), Some(60_000));
+        assert_eq!(parse_istio_duration_ms("2m"), Some(120_000));
+    }
+
+    #[test]
+    fn parse_istio_duration_hours() {
+        assert_eq!(parse_istio_duration_ms("1h"), Some(3_600_000));
+    }
+
+    #[test]
+    fn parse_istio_duration_invalid_returns_none() {
+        assert_eq!(parse_istio_duration_ms(""), None);
+        assert_eq!(parse_istio_duration_ms("5"), None);
+        assert_eq!(parse_istio_duration_ms("abc"), None);
+        assert_eq!(parse_istio_duration_ms("-1s"), None);
+        assert_eq!(parse_istio_duration_ms("NaNs"), None);
+        assert_eq!(parse_istio_duration_ms("infs"), None);
+    }
+
+    #[test]
+    fn parse_istio_duration_positive_sub_millisecond_clamps_to_one() {
+        assert_eq!(parse_istio_duration_ms("0.0001s"), Some(1));
+        assert_eq!(parse_istio_duration_ms("0s"), Some(0));
     }
 }
