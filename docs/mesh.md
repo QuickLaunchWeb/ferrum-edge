@@ -925,7 +925,7 @@ The following Istio mesh surfaces are **not yet supported** and should be treate
 | `WasmPlugin` | Not planned | Use Ferrum custom plugins (`custom_plugins/`) |
 | `DestinationRule` port-level traffic policy | Deferred | Top-level traffic policy applies to all ports |
 | Outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`) | Deferred | Unknown outbound destinations are not blocked today |
-| `VirtualService` header/method-only matches | Skipped | Ferrum route proxies do not encode header/method predicates |
+| `VirtualService` header/method/queryParam predicates beyond plugin capture | Partial | Plumbing in place via `mesh_route_dispatch` plugin (`FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL=true`); predicates captured as plugin config. Routing-decision rewrites via `RequestContext.route_override_*` flow through all dispatch sites (pool keys, capability registry, circuit breaker). Multi-destination canary routing (collapsing overlapping `http[]` entries into one Proxy + multi-rule plugin) is a follow-up. |
 | Inbound port exclusions (`excludeInboundPorts`) | Deferred | |
 | IP-range capture exclusions (`excludeOutboundIPRanges`, `includeOutboundIPRanges`) | Deferred | |
 | `WorkloadEntry` beyond address/labels/network/cluster | Partial | Basic fields supported; full VM lifecycle deferred |

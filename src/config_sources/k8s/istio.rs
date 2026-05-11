@@ -17,8 +17,9 @@ use crate::modes::mesh::config::{
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions, RouteBackend,
     RouteProxySpec, SourceKind, exact_path_listen_path, fault_injection_plugin_for_proxy,
-    invalid_resource, optional_port_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
-    resource_id, selector_from_istio, string_array, string_field, string_map, upstream_for_route,
+    invalid_resource, mesh_route_dispatch_plugin_for_proxy, optional_port_field,
+    parse_istio_duration_ms, port_from_u64, proxy_for_route, resource_id, selector_from_istio,
+    string_array, string_field, string_map, upstream_for_route,
 };
 use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT, PluginConfig, RetryConfig};
 
@@ -1024,6 +1025,28 @@ fn virtual_service_routes(
                     &proxy_id,
                     &object.metadata.namespace,
                     fault_value,
+                )
+            {
+                plugins.push(plugin);
+            }
+
+            // `mesh_route_dispatch`: per-route header/method/queryParam
+            // matching. Gated behind `vs_header_routing_experimental`
+            // (`FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL`) so existing
+            // deployments see zero behavior change on upgrade. The plugin
+            // surfaces the predicates via `route_override_*` on the request
+            // context; the dispatcher shadows the matched `Proxy` with the
+            // overrides applied via `apply_route_overrides` so downstream
+            // pool keys, capability-registry lookups, circuit-breaker keys,
+            // and URL construction all derive from the effective destination.
+            if acc.options.vs_header_routing_experimental
+                && let Some(plugin) = mesh_route_dispatch_plugin_for_proxy(
+                    &proxy_id,
+                    &object.metadata.namespace,
+                    http,
+                    backend_host.as_str(),
+                    backend_port,
+                    upstream_id.as_deref(),
                 )
             {
                 plugins.push(plugin);
@@ -5193,6 +5216,137 @@ mod tests {
             plugin.proxy_id.as_deref(),
             Some(result.config.proxies[0].id.as_str())
         );
+    }
+
+    // -- mesh_route_dispatch ----------------------------------------------
+
+    #[test]
+    fn virtual_service_method_match_dropped_without_experimental_flag() {
+        // env var OFF (default): predicates silently dropped, no plugin emitted.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "method": {"exact": "GET"}
+                        }],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        assert!(
+            result
+                .config
+                .plugin_configs
+                .iter()
+                .all(|p| p.plugin_name != "mesh_route_dispatch"),
+            "no mesh_route_dispatch plugin should be emitted when env var is off"
+        );
+    }
+
+    #[test]
+    fn virtual_service_method_match_emits_plugin_with_experimental_flag() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "method": {"exact": "GET"}
+                        }],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin should be emitted");
+        assert!(matches!(
+            plugin.scope,
+            crate::config::types::PluginScope::Proxy
+        ));
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules array");
+        assert_eq!(rules.len(), 1);
+        let methods = rules[0]["match"]["methods"]
+            .as_array()
+            .expect("methods array");
+        assert_eq!(methods[0].as_str(), Some("GET"));
+    }
+
+    #[test]
+    fn virtual_service_uri_only_match_does_not_emit_plugin() {
+        // URI-only matches still get the env-var path translated, but no
+        // mesh_route_dispatch plugin is emitted because there are no
+        // non-URI predicates.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/api"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+        assert!(
+            result
+                .config
+                .plugin_configs
+                .iter()
+                .all(|p| p.plugin_name != "mesh_route_dispatch"),
+            "URI-only match should not emit mesh_route_dispatch"
+        );
+    }
+
+    #[test]
+    fn virtual_service_header_match_emits_plugin_with_headers() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "headers": {"x-canary": {"exact": "v2"}}
+                        }],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin should be emitted");
+        let headers = &plugin.config["rules"][0]["match"]["headers"];
+        assert_eq!(headers["x-canary"].as_str(), Some("v2"));
     }
 
     #[test]

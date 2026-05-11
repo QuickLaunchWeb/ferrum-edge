@@ -533,6 +533,14 @@ pub struct EnvConfig {
     /// leaking to non-mesh upstream services.
     pub mesh_egress_strip_baggage_keys: Vec<String>,
 
+    /// Opt-in: emit `mesh_route_dispatch` plugin instances for Istio
+    /// VirtualService routes that carry method/header/queryParam predicates.
+    /// Default false (existing predicate-drop behavior). Operators turn this
+    /// on to surface the predicates as a per-proxy plugin config — the
+    /// override channel runs through `RequestContext.route_override_*` and
+    /// is applied to dispatch via `RequestContext::apply_route_overrides`.
+    pub mesh_vs_header_routing_experimental: bool,
+
     // Kubernetes CRD controller (Layer 8)
     /// Enable the Kubernetes CRD controller in CP mode. When true, the CP
     /// watches Istio and Gateway API CRDs and reconciles them into Ferrum
@@ -1260,6 +1268,7 @@ impl Default for EnvConfig {
             mesh_config_protocol: "native".to_string(),
             mesh_trust_domain_aliases: Vec::new(),
             mesh_egress_strip_baggage_keys: Vec::new(),
+            mesh_vs_header_routing_experimental: false,
             k8s_controller_enabled: false,
             k8s_watch_namespaces: Vec::new(),
             k8s_kubeconfig_path: None,
@@ -1546,6 +1555,7 @@ impl EnvConfig {
             mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
+            mesh_vs_header_routing_experimental: bool = "FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL" => false;
             k8s_controller_enabled: bool = "FERRUM_K8S_CONTROLLER_ENABLED" => false;
             k8s_watch_namespaces: Vec<String> = "FERRUM_K8S_WATCH_NAMESPACES" => Vec::new();
             k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
@@ -1904,6 +1914,7 @@ impl EnvConfig {
             mesh_config_protocol,
             mesh_trust_domain_aliases,
             mesh_egress_strip_baggage_keys,
+            mesh_vs_header_routing_experimental,
             k8s_controller_enabled,
             k8s_watch_namespaces,
             k8s_kubeconfig_path,

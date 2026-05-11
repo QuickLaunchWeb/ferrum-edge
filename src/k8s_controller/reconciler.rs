@@ -29,6 +29,10 @@ pub struct ReconcilerConfig {
     pub watch_namespaces: Vec<String>,
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
+    /// When true, the Istio VirtualService translator emits a
+    /// `mesh_route_dispatch` plugin instance for routes with method/header/
+    /// query-param predicates. Default false (existing behavior).
+    pub vs_header_routing_experimental: bool,
 }
 
 pub struct ReconcileBroadcasters {
@@ -92,6 +96,7 @@ pub fn spawn_reconcile_loop(
                 cluster_domain: &reconciler_config.cluster_domain,
                 watch_namespaces: &reconciler_config.watch_namespaces,
                 trust_domain: &trust_domain,
+                vs_header_routing_experimental: reconciler_config.vs_header_routing_experimental,
                 metrics: &metrics,
             },
         )
@@ -121,6 +126,7 @@ pub fn spawn_reconcile_loop(
                             cluster_domain: &reconciler_config.cluster_domain,
                             watch_namespaces: &reconciler_config.watch_namespaces,
                             trust_domain: &trust_domain,
+                            vs_header_routing_experimental: reconciler_config.vs_header_routing_experimental,
                             metrics: &metrics,
                         },
                     ).await;
@@ -144,6 +150,7 @@ pub fn spawn_reconcile_loop(
                             cluster_domain: &reconciler_config.cluster_domain,
                             watch_namespaces: &reconciler_config.watch_namespaces,
                             trust_domain: &trust_domain,
+                            vs_header_routing_experimental: reconciler_config.vs_header_routing_experimental,
                             metrics: &metrics,
                         },
                     ).await;
@@ -304,6 +311,7 @@ struct ReconcileContext<'a> {
     cluster_domain: &'a str,
     watch_namespaces: &'a [String],
     trust_domain: &'a TrustDomain,
+    vs_header_routing_experimental: bool,
     metrics: &'a ControllerMetrics,
 }
 
@@ -326,7 +334,8 @@ async fn do_reconcile(
 
     let options = K8sTranslationOptions::new(ctx.namespace.to_string(), ctx.trust_domain.clone())
         .with_cluster_domain(ctx.cluster_domain.to_string())
-        .with_source_namespaces(ctx.watch_namespaces.to_vec());
+        .with_source_namespaces(ctx.watch_namespaces.to_vec())
+        .with_vs_header_routing_experimental(ctx.vs_header_routing_experimental);
     let Some(translation) = translate_with_skip_retries(&objects, options, ctx.metrics) else {
         return;
     };

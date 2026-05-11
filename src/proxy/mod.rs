@@ -7192,9 +7192,19 @@ async fn handle_proxy_request_inner(
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
+    // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
+    // Istio VirtualService header/method match). When no overrides are set,
+    // this is an `Arc::clone` — no per-request allocation. When overrides
+    // are set, the override values are baked into a fresh `Arc<Proxy>` so
+    // downstream pool keys, capability-registry lookups, URL construction,
+    // and circuit-breaker target keys all derive from the effective
+    // destination (pool-poisoning invariant).
+    let proxy = ctx.apply_route_overrides(proxy);
+
     // Resolve upstream target and hash key from the request epoch.
     let selection = backend_dispatch::select_upstream_target(
         &proxy,
+        ctx.route_override_upstream_id.as_deref(),
         &state,
         &epoch,
         &ctx.client_ip,
@@ -8561,6 +8571,7 @@ async fn handle_proxy_request_inner(
     backend_dispatch::record_backend_outcome(
         &state,
         &proxy,
+        ctx.route_override_upstream_id.as_deref(),
         &epoch.load_balancer,
         upstream_balancer.as_ref(),
         upstream_target.as_deref(),

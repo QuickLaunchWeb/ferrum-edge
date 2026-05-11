@@ -179,6 +179,7 @@ With the xDS ADS protocol, invalid resource updates are NACKed and the last acce
 | `FERRUM_MESH_CA_BACKEND` | No | `none` | CA backend for mesh SVID issuance: `none` (no automatic identity), `internal` (self-signed dev CA), `spire_agent` (SPIRE Workload API) |
 | `FERRUM_MESH_SPIRE_AGENT_SOCKET` | No | `/run/spire/sockets/agent.sock` | SPIRE Agent Workload API Unix socket path. Only used when `FERRUM_MESH_CA_BACKEND=spire_agent` |
 | `FERRUM_MESH_CERT_TTL_SECONDS` | No | `3600` | Requested certificate TTL for issued SVIDs |
+| `FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL` | No | `false` | Opt-in: emit `mesh_route_dispatch` plugin instances for Istio VirtualService routes with method/header/queryParam predicates. The K8s translator captures the predicates as plugin config; the data plane plumbs route overrides through `RequestContext.route_override_*` so downstream pool keys, capability registry, and circuit-breaker target keys derive from the effective destination. Default false (predicates dropped — existing behavior). Multi-destination canary routing is a tracked follow-up |
 
 Mesh DNS caches serialized response templates per mesh slice for mesh-owned names, bounded by `FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES` (default 4,096). The cache is rebuilt with the slice, excludes the client transaction ID, and patches the caller's ID into each returned response, so repeated A/AAAA and mesh-owned empty responses avoid repeated wire-format serialization without leaking IDs across clients.
 

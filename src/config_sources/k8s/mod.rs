@@ -51,6 +51,12 @@ pub struct K8sTranslationOptions {
     pub prefer_istio_on_overlap: bool,
     pub istio_root_namespace: String,
     pub cluster_domain: String,
+    /// When `true`, the Istio VirtualService translator emits a
+    /// `mesh_route_dispatch` plugin instance for routes with method/header/
+    /// query-param predicates. When `false` (default), those predicates are
+    /// silently dropped — preserving existing behavior. Operator opts in via
+    /// `FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL`.
+    pub vs_header_routing_experimental: bool,
     source_namespaces: Option<HashSet<String>>,
 }
 
@@ -63,8 +69,14 @@ impl K8sTranslationOptions {
             prefer_istio_on_overlap: true,
             istio_root_namespace: "istio-system".to_string(),
             cluster_domain: "cluster.local".to_string(),
+            vs_header_routing_experimental: false,
             source_namespaces: Some(source_namespaces),
         }
+    }
+
+    pub fn with_vs_header_routing_experimental(mut self, enabled: bool) -> Self {
+        self.vs_header_routing_experimental = enabled;
+        self
     }
 
     pub fn with_istio_root_namespace(mut self, namespace: String) -> Self {
@@ -617,6 +629,113 @@ pub(crate) fn fault_injection_plugin_for_proxy(
         plugin_name: "fault_injection".to_string(),
         namespace: namespace.to_string(),
         config: Value::Object(config),
+        scope: PluginScope::Proxy,
+        proxy_id: Some(proxy_id.to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+/// Translate a VirtualService `http[]` entry's `match[]` blocks into a
+/// `mesh_route_dispatch` plugin instance for the route's proxy.
+///
+/// Each `match[]` entry becomes one rule. URI predicates are already
+/// captured at the proxy level via `listen_path`, so this helper extracts
+/// only the non-URI predicates (`method`, `headers`, `queryParams`). If no
+/// match entry has non-URI predicates, returns `None` — no plugin emitted.
+///
+/// The rule's destination overrides to the route's own destination
+/// (`backend_host`/`backend_port` or `upstream_id`). The destination is
+/// effectively the proxy's default backend, so the override is a no-op for
+/// the single-route case. The plugin is still emitted so:
+///   1. Predicate config is captured and visible via the admin API.
+///   2. Future enhancements (multi-destination canary routing collapsing
+///      multiple `http[]` entries into one proxy + multi-rule plugin) reuse
+///      the same plugin contract.
+pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
+    proxy_id: &str,
+    namespace: &str,
+    http: &Value,
+    backend_host: &str,
+    backend_port: u16,
+    upstream_id: Option<&str>,
+) -> Option<PluginConfig> {
+    let matches = http.get("match").and_then(Value::as_array)?;
+    if matches.is_empty() {
+        return None;
+    }
+
+    let mut rules = Vec::new();
+    for entry in matches {
+        let mut match_criteria = serde_json::Map::new();
+
+        if let Some(method_obj) = entry.get("method").and_then(Value::as_object)
+            && let Some(method) = method_obj.get("exact").and_then(Value::as_str)
+        {
+            match_criteria.insert(
+                "methods".to_string(),
+                serde_json::json!([method.to_ascii_uppercase()]),
+            );
+        }
+
+        if let Some(headers_obj) = entry.get("headers").and_then(Value::as_object) {
+            let mut headers = serde_json::Map::new();
+            for (name, value) in headers_obj {
+                if let Some(exact) = value.get("exact").and_then(Value::as_str) {
+                    headers.insert(name.to_ascii_lowercase(), Value::String(exact.to_string()));
+                }
+            }
+            if !headers.is_empty() {
+                match_criteria.insert("headers".to_string(), Value::Object(headers));
+            }
+        }
+
+        if let Some(qp_obj) = entry.get("queryParams").and_then(Value::as_object) {
+            let mut params = serde_json::Map::new();
+            for (name, value) in qp_obj {
+                if let Some(exact) = value.get("exact").and_then(Value::as_str) {
+                    params.insert(name.to_string(), Value::String(exact.to_string()));
+                }
+            }
+            if !params.is_empty() {
+                match_criteria.insert("query_params".to_string(), Value::Object(params));
+            }
+        }
+
+        if match_criteria.is_empty() {
+            continue;
+        }
+
+        let mut destination = serde_json::Map::new();
+        if let Some(uid) = upstream_id {
+            destination.insert("upstream_id".to_string(), Value::String(uid.to_string()));
+        } else {
+            destination.insert(
+                "backend_host".to_string(),
+                Value::String(backend_host.to_string()),
+            );
+            destination.insert("backend_port".to_string(), serde_json::json!(backend_port));
+        }
+
+        let mut rule = serde_json::Map::new();
+        rule.insert("match".to_string(), Value::Object(match_criteria));
+        rule.insert("destination".to_string(), Value::Object(destination));
+        rules.push(Value::Object(rule));
+    }
+
+    if rules.is_empty() {
+        return None;
+    }
+
+    let now = Utc::now();
+    Some(PluginConfig {
+        id: format!("istio-vs-mrd-{proxy_id}"),
+        plugin_name: "mesh_route_dispatch".to_string(),
+        namespace: namespace.to_string(),
+        config: serde_json::json!({"rules": rules}),
         scope: PluginScope::Proxy,
         proxy_id: Some(proxy_id.to_string()),
         enabled: true,

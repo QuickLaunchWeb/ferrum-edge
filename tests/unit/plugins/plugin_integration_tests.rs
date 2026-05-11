@@ -242,6 +242,7 @@ async fn test_all_plugins_available() {
         "spec_expose",
         "spiffe_identity",
         "mesh_authz",
+        "mesh_route_dispatch",
         "workload_metrics",
         "access_log",
         "ai_federation",
@@ -338,6 +339,14 @@ async fn test_plugin_creation_all_plugins() {
             }
             "transaction_log_schema" => {
                 json!({"schemas": {"default": {"summary_type": "both"}}})
+            }
+            "mesh_route_dispatch" => {
+                json!({
+                    "rules": [{
+                        "match": {"methods": ["GET"]},
+                        "destination": {"upstream_id": "canary"}
+                    }]
+                })
             }
             _ => json!({}),
         };

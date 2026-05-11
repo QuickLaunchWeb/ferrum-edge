@@ -47,6 +47,7 @@ pub mod ldap_auth;
 pub mod load_testing;
 pub mod loki_logging;
 pub mod mesh;
+pub mod mesh_route_dispatch;
 pub mod mtls_auth;
 pub mod otel_tracing;
 pub mod prometheus_metrics;
@@ -335,6 +336,22 @@ pub struct RequestContext {
     /// Set on HTTP/3 via quinn's `into_0rtt()` detection, and on HTTPS via the
     /// `Early-Data: 1` header (RFC 8470) from upstream proxies/CDNs.
     pub is_early_data: bool,
+    /// Plugin-set override for the proxy's `upstream_id`. When `Some`, the
+    /// dispatch path uses this instead of `proxy.upstream_id`. Used by
+    /// `mesh_route_dispatch` to implement Istio `VirtualService` header/method
+    /// route matching without per-match `Proxy` materialization.
+    ///
+    /// **Pool-key invariant**: every connection-pool key that mentions
+    /// upstream identity MUST derive from this override when set. See
+    /// `RequestContext::effective_upstream_id`.
+    pub route_override_upstream_id: Option<String>,
+    /// Plugin-set override for the proxy's `backend_host`. Same contract as
+    /// `route_override_upstream_id`; the dispatch path falls back to
+    /// `proxy.backend_host` when this is `None`.
+    pub route_override_backend_host: Option<String>,
+    /// Plugin-set override for the proxy's `backend_port`. Same contract as
+    /// `route_override_upstream_id`.
+    pub route_override_backend_port: Option<u16>,
 }
 
 impl RequestContext {
@@ -363,7 +380,69 @@ impl RequestContext {
             request_body_bytes: None,
             request_bytes_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             is_early_data: false,
+            route_override_upstream_id: None,
+            route_override_backend_host: None,
+            route_override_backend_port: None,
         }
+    }
+
+    /// Effective upstream id for routing: plugin override > proxy.upstream_id.
+    /// Pool keys mentioning upstream identity must derive from this.
+    #[inline]
+    pub fn effective_upstream_id<'a>(&'a self, proxy: &'a Proxy) -> Option<&'a str> {
+        self.route_override_upstream_id
+            .as_deref()
+            .or(proxy.upstream_id.as_deref())
+    }
+
+    /// Effective backend host for routing: plugin override > proxy.backend_host.
+    #[inline]
+    pub fn effective_backend_host<'a>(&'a self, proxy: &'a Proxy) -> &'a str {
+        self.route_override_backend_host
+            .as_deref()
+            .unwrap_or(proxy.backend_host.as_str())
+    }
+
+    /// Effective backend port for routing: plugin override > proxy.backend_port.
+    #[inline]
+    pub fn effective_backend_port(&self, proxy: &Proxy) -> u16 {
+        self.route_override_backend_port
+            .unwrap_or(proxy.backend_port)
+    }
+
+    /// True when any of the route-override fields are set by a plugin.
+    /// Used at dispatch entry to decide whether to clone the matched
+    /// `Proxy` and bake in the overrides.
+    #[inline]
+    pub fn has_route_overrides(&self) -> bool {
+        self.route_override_upstream_id.is_some()
+            || self.route_override_backend_host.is_some()
+            || self.route_override_backend_port.is_some()
+    }
+
+    /// Build a `Proxy` Arc with any plugin-set route overrides applied. If no
+    /// overrides are set, returns a clone of the original `Arc` (no struct
+    /// alloc). When overrides are set, allocates one `Proxy` struct + `Arc`.
+    ///
+    /// Downstream dispatch reads `proxy.upstream_id` / `proxy.backend_host` /
+    /// `proxy.backend_port` directly; using the returned `Arc<Proxy>` makes
+    /// the override transparent to dispatch sites that already accept
+    /// `&Proxy` (pool keys, capability registry, URL construction, etc.).
+    pub fn apply_route_overrides(&self, proxy: Arc<Proxy>) -> Arc<Proxy> {
+        if !self.has_route_overrides() {
+            return proxy;
+        }
+        let mut overridden = (*proxy).clone();
+        if let Some(id) = &self.route_override_upstream_id {
+            overridden.upstream_id = Some(id.clone());
+        }
+        if let Some(host) = &self.route_override_backend_host {
+            overridden.backend_host = host.clone();
+        }
+        if let Some(port) = self.route_override_backend_port {
+            overridden.backend_port = port;
+        }
+        Arc::new(overridden)
     }
 
     // -- Lazy header materialization -----------------------------------------
@@ -1028,6 +1107,11 @@ pub mod priority {
     pub const BODY_VALIDATOR: u16 = 2950;
     pub const AI_REQUEST_GUARD: u16 = 2975;
     pub const AI_FEDERATION: u16 = 2985;
+    /// `mesh_route_dispatch`: rewrites `route_override_*` on `RequestContext`
+    /// based on Istio VirtualService method/header/query-param predicates.
+    /// Runs at the top of the `before_proxy` band so subsequent plugins see
+    /// the resolved routing target via `RequestContext::apply_route_overrides`.
+    pub const MESH_ROUTE_DISPATCH: u16 = 2995;
     pub const REQUEST_TRANSFORMER: u16 = 3000;
     pub const SERVERLESS_FUNCTION: u16 = 3025;
     pub const RESPONSE_MOCK: u16 = 3030;
@@ -1559,6 +1643,9 @@ pub fn create_plugin_with_http_client(
         "request_transformer" => Ok(Some(Arc::new(
             request_transformer::RequestTransformer::new(config)?,
         ))),
+        "mesh_route_dispatch" => Ok(Some(Arc::new(mesh_route_dispatch::MeshRouteDispatch::new(
+            config,
+        )?))),
         "response_transformer" => Ok(Some(Arc::new(
             response_transformer::ResponseTransformer::new(config)?,
         ))),
@@ -1737,6 +1824,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "correlation_id",
         "request_transformer",
         "response_transformer",
+        "mesh_route_dispatch",
         "graphql",
         "grpc_method_router",
         "grpc_deadline",

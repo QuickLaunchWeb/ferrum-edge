@@ -238,8 +238,14 @@ pub(super) async fn handle_hbone_request(
     method: &str,
     plugin_execution_ns: u64,
 ) -> Response<ProxyBody> {
-    let selection =
-        backend_dispatch::select_upstream_target(proxy, state, epoch, &ctx.client_ip, &ctx.headers);
+    let selection = backend_dispatch::select_upstream_target(
+        proxy,
+        ctx.route_override_upstream_id.as_deref(),
+        state,
+        epoch,
+        &ctx.client_ip,
+        &ctx.headers,
+    );
     let upstream_target = selection.target;
     let upstream_balancer = selection.balancer;
 
