@@ -1220,6 +1220,7 @@ pub struct ProxyState {
     /// Optional gateway SPIFFE identity used by gateway-to-mesh outbound TLS.
     /// The slot shape matches mesh SVID rotation so later trust-bundle updates
     /// can hot-swap without blocking proxy readers.
+    #[allow(dead_code)] // Consumed by gateway-to-mesh HBONE dispatch in the next bridge phase.
     pub gateway_svid_bundle: SharedSvidBundle,
     /// Startup SVID bundle loaded from files. CP-delivered trust bundles are an
     /// override; when a CP snapshot removes them, this restores file trust.
@@ -6636,8 +6637,10 @@ async fn handle_proxy_request_inner(
     // Some auth plugins (for example `hmac_auth`) verify request body integrity
     // at authenticate time. Buffer the body before the auth phase runs so those
     // plugins can read `ctx.request_body_bytes`.
-    let requires_body_before_authenticate = capabilities
-        .has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
+    // HBONE CONNECT must keep hyper's upgrade handle in the streaming request
+    // body. Pre-auth body buffering would consume it and make the relay fail.
+    let requires_body_before_authenticate = !is_hbone_connect
+        && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
         && plugins.iter().any(|plugin| {
             plugin.requires_request_body_before_authenticate()
                 && plugin.should_buffer_request_body(&ctx)

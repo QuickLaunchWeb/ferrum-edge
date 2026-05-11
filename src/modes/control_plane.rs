@@ -29,6 +29,9 @@ use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot as apply_incremental_to_config;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::cp_server::CpGrpcServer;
+use crate::grpc::mesh_registry::{
+    MESH_NODE_REGISTRY_REAPER_INTERVAL, mesh_node_registry_stale_ttl,
+};
 use crate::grpc::mesh_server::MeshGrpcServer;
 use crate::modes::mesh::config::TrustBundleSet as MeshTrustBundleSet;
 use crate::startup::wait_for_start_signals;
@@ -906,6 +909,37 @@ pub async fn run(
         }
     });
 
+    let mesh_registry_reaper_handle = {
+        let registry = mesh_registry.clone();
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(MESH_NODE_REGISTRY_REAPER_INTERVAL);
+            interval.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let removed = registry.remove_stale_heartbeats(
+                            chrono::Utc::now(),
+                            mesh_node_registry_stale_ttl(),
+                        );
+                        if removed > 0 {
+                            warn!(
+                                removed,
+                                "Removed stale mesh nodes after heartbeat timeout"
+                            );
+                        }
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+    };
+
     // Wait for ALL listener handles to exit, or the shutdown signal if no
     // listeners were spawned (e.g., admin_http=0, no admin TLS, gRPC port=0).
     //
@@ -964,7 +998,11 @@ pub async fn run(
     // hanging if a task is stuck (e.g., blocked on a DB query). Same 5 s
     // cap as the pre-refactor inline timeout — a stuck DB poll is never
     // allowed to wedge graceful shutdown.
-    crate::modes::file::join_background_handles(vec![db_poll_handle], Duration::from_secs(5)).await;
+    crate::modes::file::join_background_handles(
+        vec![db_poll_handle, mesh_registry_reaper_handle],
+        Duration::from_secs(5),
+    )
+    .await;
 
     Ok(())
 }

@@ -35,6 +35,27 @@ fn test_ca() -> TestCa {
     }
 }
 
+fn issue_intermediate_ca(
+    ca: &TestCa,
+    not_before: time::OffsetDateTime,
+    not_after: time::OffsetDateTime,
+) -> TestCa {
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("intermediate key");
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("intermediate params");
+    params.distinguished_name = DistinguishedName::new();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params.not_before = not_before;
+    params.not_after = not_after;
+    let cert = params
+        .signed_by(&key, &ca.issuer)
+        .expect("intermediate cert");
+    TestCa {
+        cert_pem: cert.pem(),
+        issuer: Issuer::new(params, key),
+    }
+}
+
 fn issue_svid(
     ca: &TestCa,
     spiffe_id: Option<&str>,
@@ -289,5 +310,36 @@ fn rejects_expired_leaf_certificate() {
     .expect_err("expired cert rejected")
     .to_string();
 
+    assert!(err.contains("has expired"));
+}
+
+#[test]
+fn rejects_expired_intermediate_certificate() {
+    let root = test_ca();
+    let now = time::OffsetDateTime::now_utc();
+    let intermediate = issue_intermediate_ca(
+        &root,
+        now - time::Duration::days(3),
+        now - time::Duration::days(1),
+    );
+    let (cert_pem, key_pem) = issue_svid(
+        &intermediate,
+        Some("spiffe://corp.example/ns/gateway/sa/edge"),
+        now - time::Duration::minutes(1),
+        now + time::Duration::hours(1),
+    );
+    let cert_chain_pem = format!("{cert_pem}{}", intermediate.cert_pem);
+    let files = write_svid_files(&cert_chain_pem, &key_pem, &root.cert_pem);
+
+    let err = load_svid_bundle_from_files(
+        &files.cert_path,
+        &files.key_path,
+        &files.trust_bundle_path,
+        None,
+    )
+    .expect_err("expired intermediate cert rejected")
+    .to_string();
+
+    assert!(err.contains("gateway SVID intermediate certificate #1"));
     assert!(err.contains("has expired"));
 }

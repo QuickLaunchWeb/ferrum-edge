@@ -1,11 +1,18 @@
 use bytes::Bytes;
 use chrono::Utc;
 use hyper::{Method, Request, StatusCode};
+use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
+use crate::common::{empty_digest_header, generate_hmac_signature};
+
+use ferrum_edge::config::types::{
+    AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, PluginConfig, PluginScope,
+    Proxy,
+};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener};
@@ -69,11 +76,19 @@ fn create_mesh_proxy(backend_port: u16) -> Proxy {
 }
 
 fn create_mesh_proxy_state(proxy: Proxy) -> ProxyState {
+    create_mesh_proxy_state_with_config(proxy, Vec::new(), Vec::new())
+}
+
+fn create_mesh_proxy_state_with_config(
+    proxy: Proxy,
+    consumers: Vec<Consumer>,
+    plugin_configs: Vec<PluginConfig>,
+) -> ProxyState {
     let config = GatewayConfig {
         version: "1".to_string(),
         proxies: vec![proxy],
-        consumers: vec![],
-        plugin_configs: vec![],
+        consumers,
+        plugin_configs,
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
@@ -100,6 +115,42 @@ fn create_mesh_proxy_state(proxy: Proxy) -> ProxyState {
     )
     .expect("proxy state")
     .0
+}
+
+fn create_hmac_consumer(secret: &str) -> Consumer {
+    let mut hmac_creds = Map::new();
+    hmac_creds.insert("secret".to_string(), Value::String(secret.to_string()));
+    let credentials = HashMap::from([(
+        "hmac_auth".to_string(),
+        Value::Array(vec![Value::Object(hmac_creds)]),
+    )]);
+
+    Consumer {
+        id: "hmac-consumer".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: "hmacuser".to_string(),
+        custom_id: None,
+        credentials,
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn hmac_auth_plugin_config() -> PluginConfig {
+    PluginConfig {
+        id: "hmac-auth".to_string(),
+        plugin_name: "hmac_auth".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        config: json!({}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
 }
 
 async fn start_gateway(state: ProxyState) -> (std::net::SocketAddr, watch::Sender<bool>) {
@@ -167,6 +218,68 @@ async fn hbone_connect_relays_data_frames_to_tcp_backend() {
     let req = Request::builder()
         .method(Method::CONNECT)
         .uri("orders.default.svc.cluster.local:8080")
+        .body(())
+        .expect("connect request");
+    let (response_fut, mut request_body) = sender.send_request(req, false).expect("send CONNECT");
+    request_body
+        .send_data(Bytes::from_static(b"mesh-bytes"), true)
+        .expect("send CONNECT data");
+    let resp = response_fut.await.expect("CONNECT response");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut response_body = resp.into_body();
+    let body = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut body = Vec::new();
+        while let Some(chunk) = response_body.data().await {
+            let chunk = chunk.expect("CONNECT response chunk");
+            let _ = response_body.flow_control().release_capacity(chunk.len());
+            body.extend_from_slice(&chunk);
+        }
+        body
+    })
+    .await
+    .expect("collect CONNECT response");
+    assert_eq!(&body[..], b"echo:mesh-bytes");
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    backend_handle.await.expect("backend task");
+    conn_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hbone_connect_with_body_auth_plugin_keeps_upgrade_streaming() {
+    const HMAC_SECRET: &str = "mesh-hbone-secret";
+
+    let (backend_addr, backend_handle) = start_echo_backend().await;
+    let state = create_mesh_proxy_state_with_config(
+        create_mesh_proxy(backend_addr.port()),
+        vec![create_hmac_consumer(HMAC_SECRET)],
+        vec![hmac_auth_plugin_config()],
+    );
+    let (gateway_addr, shutdown_tx) = start_gateway(state).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect gateway");
+    let _ = stream.set_nodelay(true);
+    let (mut sender, conn) = h2::client::handshake(stream).await.expect("h2 handshake");
+    let conn_task = tokio::spawn(conn);
+
+    let method = "CONNECT";
+    let path = "/";
+    let date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let signature = generate_hmac_signature(method, path, &date, HMAC_SECRET);
+    let req = Request::builder()
+        .method(Method::CONNECT)
+        .uri("orders.default.svc.cluster.local:8080")
+        .header(
+            "authorization",
+            format!(
+                r#"hmac username="hmacuser", algorithm="hmac-sha256", signature="{signature}""#
+            ),
+        )
+        .header("date", date)
+        .header("digest", empty_digest_header())
         .body(())
         .expect("connect request");
     let (response_fut, mut request_body) = sender.send_request(req, false).expect("send CONNECT");
