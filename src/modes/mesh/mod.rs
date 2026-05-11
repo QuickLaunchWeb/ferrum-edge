@@ -4042,6 +4042,9 @@ mod tests {
 
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
+        // Proxy stays pinned to the ServiceEntry host so SNI/Host headers are
+        // not crossed by load balancing across endpoint IPs.
+        assert_eq!(proxies[0].hosts, vec!["api.vendor.com"]);
         assert_eq!(upstreams[0].targets.len(), 2);
         assert_eq!(upstreams[0].targets[0].host, "203.0.113.10");
         assert_eq!(upstreams[0].targets[0].port, 8443);
@@ -4125,6 +4128,13 @@ mod tests {
             .filter(|p| p.id.starts_with("mesh-egress-"))
             .collect();
         assert_eq!(egress_proxies.len(), 2);
+
+        let egress_upstreams: Vec<_> = prepared
+            .upstreams
+            .iter()
+            .filter(|u| u.id.starts_with("mesh-egress-up-"))
+            .collect();
+        assert_eq!(egress_upstreams.len(), 2);
 
         // Verify the external ones are present
         assert!(
