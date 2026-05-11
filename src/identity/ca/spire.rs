@@ -33,6 +33,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tokio::sync::Notify;
+use tokio::task::AbortHandle;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 
@@ -93,6 +94,8 @@ pub struct SpireAgentCa {
     /// Fires once the first SVID has been observed.
     first_ready: Arc<Notify>,
     first_received: Arc<std::sync::atomic::AtomicBool>,
+    /// Cancels the detached Workload API stream task when this CA is dropped.
+    stream_task_abort: AbortHandle,
 }
 
 impl SpireAgentCa {
@@ -103,20 +106,21 @@ impl SpireAgentCa {
         let first_ready = Arc::new(Notify::new());
         let first_received = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let ca = Self {
-            config: config.clone(),
-            current: Arc::clone(&current),
-            first_ready: Arc::clone(&first_ready),
-            first_received: Arc::clone(&first_received),
-        };
-
         // Spawn the background stream loop.
-        tokio::spawn(stream_loop(
+        let stream_task = tokio::spawn(stream_loop(
             config.socket_path.clone(),
             Arc::clone(&current),
             Arc::clone(&first_ready),
             Arc::clone(&first_received),
         ));
+        let ca = Self {
+            config: config.clone(),
+            current: Arc::clone(&current),
+            first_ready: Arc::clone(&first_ready),
+            first_received: Arc::clone(&first_received),
+            stream_task_abort: stream_task.abort_handle(),
+        };
+        drop(stream_task);
 
         // Wait for the first SVID with a timeout so startup does not hang
         // indefinitely when the agent is unreachable.
@@ -158,7 +162,7 @@ impl SpireAgentCa {
         guard.as_ref().clone()
     }
 
-    /// Block until the first SVID arrives (or the timeout expires).
+    /// Block until the first SVID arrives.
     ///
     /// Race-free: registers a waiter before checking the flag — same
     /// pattern as [`crate::identity::workload_api::fetch_loop::SvidFetchHandle`].
@@ -174,6 +178,12 @@ impl SpireAgentCa {
             return;
         }
         notified.await;
+    }
+}
+
+impl Drop for SpireAgentCa {
+    fn drop(&mut self) {
+        self.stream_task_abort.abort();
     }
 }
 
@@ -276,7 +286,13 @@ impl CertificateAuthority for SpireAgentCa {
 
         // Validate that the requested SPIFFE ID matches the agent-issued one.
         let requested_id = match &req {
-            IssuanceRequest::Csr { spiffe_id, .. } => spiffe_id,
+            IssuanceRequest::Csr { .. } => {
+                return Err(CaError::BadCsr(
+                    "SPIRE agent CA cannot sign caller-supplied CSRs; it can only return \
+                     the current agent-issued SVID for generate requests"
+                        .to_string(),
+                ));
+            }
             IssuanceRequest::Generate { spiffe_id, .. } => spiffe_id,
         };
 
@@ -340,5 +356,112 @@ impl CertificateAuthority for SpireAgentCa {
                 public_key_pem: ja.public_key_pem.clone(),
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use crate::identity::ca::CertificateAuthority;
+    use crate::identity::spiffe::{SpiffeId, spiffe_id_to_san};
+    use crate::identity::{TrustBundle, TrustBundleSet};
+
+    use super::*;
+
+    fn test_bundle(spiffe_id: &str) -> SvidBundle {
+        let spiffe_id = SpiffeId::new(spiffe_id).expect("test SPIFFE ID is valid");
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("test key generated");
+        let mut params = rcgen::CertificateParams::default();
+        params
+            .subject_alt_names
+            .push(spiffe_id_to_san(&spiffe_id).expect("SPIFFE SAN encodes"));
+        let cert = params.self_signed(&key_pair).expect("test cert signed");
+        let cert_der = cert.der().to_vec();
+        let trust_domain = spiffe_id.trust_domain().clone();
+
+        SvidBundle {
+            spiffe_id,
+            cert_chain_der: vec![cert_der.clone()],
+            private_key_pkcs8_der: key_pair.serialize_der(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain,
+                x509_authorities: vec![cert_der],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        }
+    }
+
+    fn test_ca_with_bundle(bundle: SvidBundle, stream_task_abort: AbortHandle) -> SpireAgentCa {
+        SpireAgentCa {
+            config: SpireAgentCaConfig::default(),
+            current: Arc::new(ArcSwap::new(Arc::new(Some(AgentSnapshot { bundle })))),
+            first_ready: Arc::new(Notify::new()),
+            first_received: Arc::new(AtomicBool::new(true)),
+            stream_task_abort,
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_csr_requests_instead_of_returning_agent_private_key() {
+        let id = SpiffeId::new("spiffe://example.test/ns/default/sa/ferrum").unwrap();
+        let stream_task = tokio::spawn(future::pending::<()>());
+        let ca = test_ca_with_bundle(test_bundle(id.as_str()), stream_task.abort_handle());
+        let csr_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("CSR key generated");
+        let csr = rcgen::CertificateParams::default()
+            .serialize_request(&csr_key)
+            .expect("CSR generated");
+
+        let err = ca
+            .issue_svid(IssuanceRequest::Csr {
+                csr_der: csr.der().as_ref().to_vec(),
+                spiffe_id: id,
+                ttl_secs: 60,
+            })
+            .await
+            .expect_err("SPIRE agent CA cannot sign caller CSRs");
+
+        assert!(matches!(err, CaError::BadCsr(_)));
+        drop(ca);
+        let _ = stream_task.await;
+    }
+
+    #[tokio::test]
+    async fn drop_aborts_background_stream_task() {
+        let stream_task = tokio::spawn(future::pending::<()>());
+        let ca = test_ca_with_bundle(
+            test_bundle("spiffe://example.test/ns/default/sa/ferrum"),
+            stream_task.abort_handle(),
+        );
+
+        drop(ca);
+
+        let err = tokio::time::timeout(Duration::from_secs(1), stream_task)
+            .await
+            .expect("background task should be aborted promptly")
+            .expect_err("aborted task returns JoinError");
+        assert!(err.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn wait_for_first_svid_returns_when_snapshot_already_ready() {
+        let stream_task = tokio::spawn(future::pending::<()>());
+        let ca = test_ca_with_bundle(
+            test_bundle("spiffe://example.test/ns/default/sa/ferrum"),
+            stream_task.abort_handle(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), ca.wait_for_first_svid())
+            .await
+            .expect("ready snapshot should not block");
+        assert!(ca.first_received.load(Ordering::Acquire));
+
+        drop(ca);
+        let _ = stream_task.await;
     }
 }
