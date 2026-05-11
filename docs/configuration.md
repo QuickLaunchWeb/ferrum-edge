@@ -281,6 +281,10 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 | `FERRUM_TLS_CA_BUNDLE_PATH` | No | — | Path to PEM CA bundle for all outbound TLS verification |
 | `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for backend mTLS |
 | `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for backend mTLS |
+| `FERRUM_GATEWAY_SVID_CERT_PATH` | No | — | Leaf-first PEM X.509-SVID certificate chain used as the gateway's SPIFFE identity for gateway-to-mesh TLS |
+| `FERRUM_GATEWAY_SVID_KEY_PATH` | No | — | PKCS#8 private key for `FERRUM_GATEWAY_SVID_CERT_PATH` |
+| `FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH` | No | — | PEM trust bundle used to verify mesh SPIFFE peers for gateway-to-mesh TLS |
+| `FERRUM_GATEWAY_SPIFFE_ID` | No | — | Explicit SPIFFE URI fallback when the gateway SVID certificate has no SPIFFE URI SAN |
 | `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | Path to client CA bundle for mTLS verification |
 | `FERRUM_TLS_NO_VERIFY` | No | `false` | Disable outbound TLS verification for all connections (testing only) |
 | `FERRUM_TLS_CRL_FILE_PATH` | No | — | PEM CRL bundle for revocation checks across TLS/DTLS surfaces |
@@ -294,6 +298,8 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 | `FERRUM_TLS_EARLY_DATA_METHODS` | No | — | Comma-separated methods allowed as TLS 1.3 0-RTT early data |
 
 These TLS policy settings apply uniformly to both inbound (frontend) and outbound (backend) connections across all TLS-capable protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP-TLS). DTLS uses a separate library and is not affected. See [frontend_tls.md](frontend_tls.md) and [backend_mtls.md](backend_mtls.md) for detailed TLS configuration guides.
+
+Gateway SVID files are static startup inputs. Set all three SVID path variables together; the gateway rejects partial configuration and validates the leaf certificate, intermediate certificate freshness, PKCS#8 key match, and trust bundle before serving. The SPIFFE ID is read from the leaf URI SAN when present; `FERRUM_GATEWAY_SPIFFE_ID` is only a fallback for file bundles without a SPIFFE URI SAN. Private keys must be PKCS#8 PEM (`BEGIN PRIVATE KEY`); legacy `BEGIN RSA PRIVATE KEY` or `BEGIN EC PRIVATE KEY` files are rejected.
 
 Admin listener TLS and mTLS variables are listed in [Admin API](#admin-api).
 

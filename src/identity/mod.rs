@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 pub mod attestation;
 pub mod ca;
+pub mod file_loader;
 pub mod rotation;
 pub mod spiffe;
 pub mod workload_api;
