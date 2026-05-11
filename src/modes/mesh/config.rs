@@ -211,6 +211,22 @@ pub struct RequestMatch {
     /// Glob port patterns, used for Istio string-match ports such as "*".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub port_patterns: Vec<String>,
+    /// Istio `notMethods` — conjunctive negative-match: when any value
+    /// matches the request method, the rule fails. Empty means "no
+    /// negative filter".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_methods: Vec<String>,
+    /// Istio `notPaths` — conjunctive negative-match for the request path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_paths: Vec<String>,
+    /// Istio `notHosts` — conjunctive negative-match for the request host.
+    /// Normalised at config-load time identical to `hosts` so the hot path
+    /// stays allocation-free.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_hosts: Vec<String>,
+    /// Istio `notPorts` — conjunctive negative-match for the request port.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -997,10 +1013,15 @@ fn validate_mesh_config_internal(
                 let any_host = !request.hosts.is_empty();
                 let any_header = !request.headers.is_empty();
                 let any_port = !request.ports.is_empty() || !request.port_patterns.is_empty();
-                if !(any_method || any_path || any_host || any_header || any_port) {
+                let any_not = !request.not_methods.is_empty()
+                    || !request.not_paths.is_empty()
+                    || !request.not_hosts.is_empty()
+                    || !request.not_ports.is_empty();
+                if !(any_method || any_path || any_host || any_header || any_port || any_not) {
                     errors.push(format!(
                         "MeshPolicy '{}'.rules[{}].to[{}]: at least one of \
-                         methods/paths/hosts/headers/ports must be non-empty",
+                         methods/paths/hosts/headers/ports or their negated \
+                         counterparts must be non-empty",
                         policy.name, i, j
                     ));
                 }
@@ -1008,6 +1029,17 @@ fn validate_mesh_config_internal(
                     if !is_valid_request_match_host_pattern(host) {
                         errors.push(format!(
                             "MeshPolicy '{}'.rules[{}].to[{}].hosts[{}] \
+                             '{}' is not a valid host pattern \
+                             (expected hostname, [ipv6], or host:port/host:* \
+                             with u16 numeric or '*' port)",
+                            policy.name, i, j, k, host
+                        ));
+                    }
+                }
+                for (k, host) in request.not_hosts.iter().enumerate() {
+                    if !is_valid_request_match_host_pattern(host) {
+                        errors.push(format!(
+                            "MeshPolicy '{}'.rules[{}].to[{}].not_hosts[{}] \
                              '{}' is not a valid host pattern \
                              (expected hostname, [ipv6], or host:port/host:* \
                              with u16 numeric or '*' port)",
@@ -1319,6 +1351,9 @@ fn normalize_mesh_policy_fields(policies: &mut [MeshPolicy]) {
         for rule in &mut policy.rules {
             for request in &mut rule.to {
                 for host in &mut request.hosts {
+                    *host = normalize_request_match_host_pattern(host);
+                }
+                for host in &mut request.not_hosts {
                     *host = normalize_request_match_host_pattern(host);
                 }
                 for pattern in &mut request.port_patterns {
