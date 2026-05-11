@@ -920,46 +920,37 @@ fn apply_destination_rules(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
             continue;
         };
 
+        let connect_timeout_ms = dr
+            .traffic_policy
+            .as_ref()
+            .and_then(|tp| tp.connect_timeout_ms);
+
         for idx in matching_upstream_indices {
-            let upstream_id = config.upstreams[idx].id.clone();
+            let upstream = &mut config.upstreams[idx];
 
-            let connect_timeout_ms = {
-                let upstream = &mut config.upstreams[idx];
+            if let Some(ref policy) = dr.traffic_policy {
+                apply_traffic_policy_to_upstream(upstream, policy);
+            }
 
-                // Apply top-level traffic policy to the upstream.
-                let connect_timeout_ms = if let Some(ref policy) = dr.traffic_policy {
-                    apply_traffic_policy_to_upstream(upstream, policy);
-                    policy.connect_timeout_ms
-                } else {
-                    None
-                };
+            if !dr.subsets.is_empty() {
+                let subset_defs: Vec<SubsetDefinition> = dr
+                    .subsets
+                    .iter()
+                    .map(|subset| SubsetDefinition {
+                        name: subset.name.clone(),
+                        labels: subset.labels.clone(),
+                        traffic_policy: subset.traffic_policy.as_ref().map(|sp| {
+                            SubsetTrafficPolicy {
+                                load_balancer_algorithm: mesh_lb_to_ferrum(&sp.load_balancer),
+                            }
+                        }),
+                    })
+                    .collect();
+                upstream.subsets = Some(subset_defs);
+            }
 
-                // Build subset definitions from DR subsets.
-                if !dr.subsets.is_empty() {
-                    let mut subset_defs: Vec<SubsetDefinition> =
-                        Vec::with_capacity(dr.subsets.len());
-                    for subset in &dr.subsets {
-                        let subset_traffic_policy =
-                            subset
-                                .traffic_policy
-                                .as_ref()
-                                .map(|sp| SubsetTrafficPolicy {
-                                    load_balancer_algorithm: mesh_lb_to_ferrum(&sp.load_balancer),
-                                });
-                        subset_defs.push(SubsetDefinition {
-                            name: subset.name.clone(),
-                            labels: subset.labels.clone(),
-                            traffic_policy: subset_traffic_policy,
-                        });
-                    }
-                    upstream.subsets = Some(subset_defs);
-                }
-
-                connect_timeout_ms
-            };
-
-            // Apply connect timeout to proxies referencing this upstream.
             if let Some(timeout_ms) = connect_timeout_ms {
+                let upstream_id = &config.upstreams[idx].id;
                 for proxy in &mut config.proxies {
                     if proxy.upstream_id.as_deref() == Some(upstream_id.as_str()) {
                         proxy.backend_connect_timeout_ms = timeout_ms;
@@ -1007,12 +998,10 @@ fn destination_rule_host_matches(rule_host: &str, namespace: &str, candidate: &s
 
 /// Apply a `MeshTrafficPolicy` onto a Ferrum `Upstream`.
 fn apply_traffic_policy_to_upstream(upstream: &mut Upstream, policy: &MeshTrafficPolicy) {
-    // Load balancer algorithm.
     if let Some(lb) = &policy.load_balancer {
-        if let Some(algorithm) = mesh_lb_to_ferrum(&Some(lb.clone())) {
+        if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
             upstream.algorithm = algorithm;
         }
-        // Set hash_on for consistent hashing.
         if let MeshLoadBalancer::ConsistentHash(ch) = lb {
             if let Some(header) = &ch.http_header_name {
                 upstream.hash_on = Some(format!("header:{header}"));
@@ -1054,6 +1043,7 @@ fn mesh_lb_to_ferrum(lb: &Option<MeshLoadBalancer>) -> Option<LoadBalancerAlgori
             MeshSimpleLb::RoundRobin => Some(LoadBalancerAlgorithm::RoundRobin),
             MeshSimpleLb::LeastRequest => Some(LoadBalancerAlgorithm::LeastConnections),
             MeshSimpleLb::Random => Some(LoadBalancerAlgorithm::Random),
+            // Istio PASSTHROUGH means direct-to-original-IP; Ferrum always routes via upstreams so RoundRobin is the closest approximation.
             MeshSimpleLb::Passthrough => Some(LoadBalancerAlgorithm::RoundRobin),
         },
         Some(MeshLoadBalancer::ConsistentHash(_)) => Some(LoadBalancerAlgorithm::ConsistentHashing),
