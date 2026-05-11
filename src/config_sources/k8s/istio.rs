@@ -567,23 +567,27 @@ fn translate_outlier_detection(
         .and_then(Value::as_u64)
         .and_then(|v| u32::try_from(v).ok());
 
-    let interval_seconds = string_field(value, "interval").and_then(parse_istio_duration_secs);
+    let interval_seconds = string_field(value, "interval")
+        .and_then(parse_istio_duration_secs)
+        .filter(|seconds| *seconds > 0);
 
     let base_ejection_seconds =
         string_field(value, "baseEjectionTime").and_then(parse_istio_duration_secs);
 
-    let max_ejection_raw = value.get("maxEjectionPercent").and_then(Value::as_u64);
-    let max_ejection_percent = max_ejection_raw
+    let max_ejection_percent = value
+        .get("maxEjectionPercent")
+        .and_then(Value::as_u64)
         .map(|v| {
-            u8::try_from(v).map_err(|_| {
-                invalid_resource(
+            if v <= 100 {
+                Ok(v as u8)
+            } else {
+                Err(invalid_resource(
                     object,
                     format!("outlierDetection.maxEjectionPercent must be 0-100 (got {v})"),
-                )
-            })
+                ))
+            }
         })
-        .transpose()?
-        .filter(|v| *v <= 100);
+        .transpose()?;
 
     Ok(MeshOutlierDetection {
         consecutive_errors,
@@ -1069,7 +1073,7 @@ fn duration_component_ms(raw: &str, multiplier: f64) -> Option<u64> {
 
 /// Parse Istio/Go-style duration strings into whole seconds.
 fn parse_istio_duration_secs(raw: &str) -> Option<u64> {
-    parse_istio_duration_ms(raw).map(|ms| ms / 1000)
+    parse_istio_duration_ms(raw).map(|ms| if ms == 0 { 0 } else { ms.div_ceil(1000) })
 }
 
 fn path_match(uri: &Value) -> Option<String> {
@@ -3044,6 +3048,30 @@ mod tests {
     }
 
     #[test]
+    fn destination_rule_rejects_outlier_ejection_percent_above_100() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "outlierDetection": {
+                            "maxEjectionPercent": 101
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid max ejection percent must fail");
+
+        assert!(
+            err.to_string()
+                .contains("outlierDetection.maxEjectionPercent must be 0-100")
+        );
+    }
+
+    #[test]
     fn destination_rule_rejects_subset_without_name() {
         let err = translate_k8s_objects(
             &[object(
@@ -3483,6 +3511,8 @@ mod tests {
     #[test]
     fn parse_istio_duration_positive_sub_millisecond_clamps_to_one() {
         assert_eq!(parse_istio_duration_ms("0.0001s"), Some(1));
+        assert_eq!(parse_istio_duration_ms("0.1ms"), Some(1));
+        assert_eq!(parse_istio_duration_ms("0.0005s"), Some(1));
         assert_eq!(parse_istio_duration_ms("0s"), Some(0));
     }
 
@@ -3663,6 +3693,77 @@ mod tests {
         assert_eq!(
             evaluate_mesh_authorization(&slice, &authed),
             MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn parse_istio_duration_rejects_negative_non_finite_and_overflow() {
+        assert_eq!(parse_istio_duration_ms("-1s"), None);
+        assert_eq!(parse_istio_duration_ms("NaNs"), None);
+        assert_eq!(parse_istio_duration_ms("infms"), None);
+        assert_eq!(
+            parse_istio_duration_ms("999999999999999999999999999999m"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_istio_duration_secs_rounds_positive_subseconds_up() {
+        assert_eq!(parse_istio_duration_secs("0.5s"), Some(1));
+        assert_eq!(parse_istio_duration_secs("1.1s"), Some(2));
+        assert_eq!(parse_istio_duration_secs("0s"), Some(0));
+    }
+
+    #[test]
+    fn destination_rule_outlier_interval_ignores_zero_and_rounds_subsecond() {
+        let zero_interval = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "outlierDetection": {
+                            "interval": "0s"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let mesh = zero_interval.config.mesh.expect("mesh config");
+        assert_eq!(
+            mesh.destination_rules[0]
+                .traffic_policy
+                .as_ref()
+                .and_then(|policy| policy.outlier_detection.as_ref())
+                .and_then(|outlier| outlier.interval_seconds),
+            None
+        );
+
+        let subsecond_interval = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "outlierDetection": {
+                            "interval": "0.5s"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let mesh = subsecond_interval.config.mesh.expect("mesh config");
+        assert_eq!(
+            mesh.destination_rules[0]
+                .traffic_policy
+                .as_ref()
+                .and_then(|policy| policy.outlier_detection.as_ref())
+                .and_then(|outlier| outlier.interval_seconds),
+            Some(1)
         );
     }
 }

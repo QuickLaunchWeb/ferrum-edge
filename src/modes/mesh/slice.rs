@@ -433,6 +433,7 @@ mod tests {
             mesh_policies: vec![make_policy("p1", "ns", PolicyScope::MeshWide)],
             peer_authentications: vec![make_peer_auth("pa1", "ns", None)],
             service_entries: vec![make_service_entry("se1", "ns", vec!["*".into()])],
+            destination_rules: Vec::new(),
             request_authentications: vec![make_request_auth("ra1", "ns", PolicyScope::MeshWide)],
             telemetry_resources: vec![make_telemetry("t1", "ns", PolicyScope::MeshWide)],
             trust_bundles: Some(make_trust_bundle_set()),
