@@ -103,7 +103,10 @@ pub async fn run(
     );
 
     if !probe.supports_ebpf() {
-        return handle_fallback(&config, &probe);
+        handle_fallback(&config, &probe)?;
+        wait_for_shutdown(&shutdown_tx).await;
+        info!("Node agent fallback mode shutting down");
+        return Ok(());
     }
 
     let mut backend = MockEbpfBackend::default();
@@ -116,13 +119,19 @@ pub async fn run(
         config.node_name
     );
 
-    let mut shutdown_rx = shutdown_tx.subscribe();
-    shutdown_rx.changed().await.ok();
+    wait_for_shutdown(&shutdown_tx).await;
 
     info!("Node agent shutting down, detaching BPF programs");
     cleanup_all_pods(&mut backend, &pod_states);
 
     Ok(())
+}
+
+async fn wait_for_shutdown(shutdown_tx: &tokio::sync::watch::Sender<bool>) {
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    if !*shutdown_rx.borrow() {
+        shutdown_rx.changed().await.ok();
+    }
 }
 
 fn handle_fallback(
@@ -316,5 +325,26 @@ mod tests {
         };
 
         assert!(handle_fallback(&config, &probe).is_err());
+    }
+
+    #[tokio::test]
+    async fn wait_for_shutdown_blocks_until_signal() {
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let task_tx = shutdown_tx.clone();
+        let task = tokio::spawn(async move {
+            wait_for_shutdown(&task_tx).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !task.is_finished(),
+            "node agent should stay alive until shutdown is signaled"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("shutdown wait should finish after signal")
+            .unwrap();
     }
 }
