@@ -144,6 +144,7 @@ fn peer_authentication_default_mtls_mode_is_permissive() {
     let pa = PeerAuthentication {
         name: "allow-mixed".into(),
         namespace: "default".into(),
+        scope: None,
         selector: None,
         mtls_mode: MtlsMode::default(),
         port_overrides: HashMap::new(),
