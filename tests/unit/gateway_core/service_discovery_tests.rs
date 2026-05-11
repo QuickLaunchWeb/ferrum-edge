@@ -1,7 +1,15 @@
 //! Unit tests for the service discovery module.
 
 use ferrum_edge::config::types::*;
+use ferrum_edge::consumer_index::ConsumerIndex;
+use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::load_balancer::LoadBalancerCache;
+use ferrum_edge::modes::mesh::config::{
+    AppProtocol, MeshConfig, MeshService, ServicePort, Workload, WorkloadPort, WorkloadRef,
+    WorkloadSelector,
+};
+use ferrum_edge::plugin_cache::PluginCache;
+use ferrum_edge::request_epoch::RequestEpochStore;
 use ferrum_edge::service_discovery::consul::ConsulDiscoverer;
 use ferrum_edge::service_discovery::kubernetes::KubernetesDiscoverer;
 use ferrum_edge::service_discovery::{ServiceDiscoverer, ServiceDiscoveryManager};
@@ -51,6 +59,56 @@ fn make_target(host: &str, port: u16) -> UpstreamTarget {
         tags: HashMap::new(),
         path: None,
     }
+}
+
+fn mesh_spiffe(raw: &str) -> SpiffeId {
+    SpiffeId::new(raw.to_string()).expect("test SPIFFE ID")
+}
+
+fn mesh_workload(id: &str, service_name: &str, address: &str, port: u16) -> Workload {
+    Workload {
+        spiffe_id: mesh_spiffe(id),
+        selector: WorkloadSelector::default(),
+        service_name: service_name.to_string(),
+        addresses: vec![address.to_string()],
+        ports: vec![WorkloadPort {
+            port,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }],
+        trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+        namespace: default_namespace(),
+        network: None,
+        cluster: None,
+    }
+}
+
+fn mesh_service(name: &str, spiffe_id: &str, port: u16) -> MeshService {
+    MeshService {
+        name: name.to_string(),
+        namespace: default_namespace(),
+        ports: vec![ServicePort {
+            port,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }],
+        workloads: vec![WorkloadRef {
+            spiffe_id: mesh_spiffe(spiffe_id),
+        }],
+        protocol_overrides: HashMap::new(),
+    }
+}
+
+fn request_epoch_store(config: GatewayConfig) -> Arc<RequestEpochStore> {
+    let plugin_cache = PluginCache::new(&config).expect("plugin cache");
+    let consumer_index = ConsumerIndex::new(&config.consumers);
+    let load_balancer_cache = LoadBalancerCache::new(&config);
+    Arc::new(RequestEpochStore::from_runtime_parts(
+        config,
+        &plugin_cache,
+        &consumer_index,
+        &load_balancer_cache,
+    ))
 }
 
 // ── ServiceDiscoveryConfig serialization ──────────────────────────────
@@ -127,6 +185,29 @@ fn test_sd_config_deserialize_consul() {
 }
 
 #[test]
+fn test_sd_config_deserialize_mesh() {
+    let json = r#"{
+        "provider": "mesh",
+        "mesh": {
+            "service_name": "payments",
+            "namespace": "backend",
+            "port": 8080,
+            "poll_interval_seconds": 5
+        },
+        "default_weight": 9
+    }"#;
+
+    let config: ServiceDiscoveryConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(config.provider, SdProvider::Mesh);
+    assert_eq!(config.default_weight, 9);
+    let mesh = config.mesh.unwrap();
+    assert_eq!(mesh.service_name, "payments");
+    assert_eq!(mesh.namespace.as_deref(), Some("backend"));
+    assert_eq!(mesh.port, Some(8080));
+    assert_eq!(mesh.poll_interval_seconds, 5);
+}
+
+#[test]
 fn test_sd_config_defaults() {
     let json = r#"{
         "provider": "consul",
@@ -156,6 +237,7 @@ fn test_sd_config_roundtrip_json() {
         }),
         kubernetes: None,
         consul: None,
+        mesh: None,
         default_weight: 3,
     };
 
@@ -366,6 +448,7 @@ fn test_sd_provider_as_str() {
     assert_eq!(SdProvider::DnsSd.as_str(), "dns_sd");
     assert_eq!(SdProvider::Kubernetes.as_str(), "kubernetes");
     assert_eq!(SdProvider::Consul.as_str(), "consul");
+    assert_eq!(SdProvider::Mesh.as_str(), "mesh");
 }
 
 // ── ServiceDiscoveryManager lifecycle ─────────────────────────────────
@@ -695,6 +778,14 @@ fn test_sd_config_provider_mismatch_consul_missing_config() {
 }
 
 #[test]
+fn test_sd_config_provider_mismatch_mesh_missing_config() {
+    let json = r#"{"provider": "mesh"}"#;
+    let config: ServiceDiscoveryConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(config.provider, SdProvider::Mesh);
+    assert!(config.mesh.is_none());
+}
+
+#[test]
 fn test_sd_config_invalid_provider_rejected() {
     let json = r#"{"provider": "etcd"}"#;
     let result: Result<ServiceDiscoveryConfig, _> = serde_json::from_str(json);
@@ -742,6 +833,20 @@ fn test_sd_config_dns_sd_defaults() {
     let config: ServiceDiscoveryConfig = serde_json::from_str(json).unwrap();
     let dns = config.dns_sd.unwrap();
     assert_eq!(dns.poll_interval_seconds, 30);
+}
+
+#[test]
+fn test_sd_config_mesh_defaults() {
+    let json = r#"{
+        "provider": "mesh",
+        "mesh": {"service_name": "payments"}
+    }"#;
+    let config: ServiceDiscoveryConfig = serde_json::from_str(json).unwrap();
+    let mesh = config.mesh.unwrap();
+    assert_eq!(mesh.service_name, "payments");
+    assert!(mesh.namespace.is_none());
+    assert!(mesh.port.is_none());
+    assert_eq!(mesh.poll_interval_seconds, 30);
 }
 
 // ── targets_equal edge cases ──────────────────────────────────────────
@@ -1429,6 +1534,7 @@ async fn test_manager_start_with_mismatched_provider_skips() {
             dns_sd: None,
             kubernetes: None,
             consul: None, // mismatch: provider says consul but no config
+            mesh: None,
             default_weight: 1,
         }),
     )]);
@@ -1463,6 +1569,7 @@ async fn test_manager_start_with_dns_sd_mismatch_skips() {
             dns_sd: None, // mismatch
             kubernetes: None,
             consul: None,
+            mesh: None,
             default_weight: 1,
         }),
     )]);
@@ -1491,6 +1598,7 @@ async fn test_manager_start_with_kubernetes_mismatch_skips() {
             dns_sd: None,
             kubernetes: None, // mismatch
             consul: None,
+            mesh: None,
             default_weight: 1,
         }),
     )]);
@@ -1507,4 +1615,103 @@ async fn test_manager_start_with_kubernetes_mismatch_skips() {
 
     manager.start(&config, None);
     manager.stop();
+}
+
+#[tokio::test]
+async fn test_manager_start_with_mesh_missing_epoch_skips() {
+    let config = make_config_with_upstreams(vec![make_upstream(
+        "up-mesh",
+        vec![make_target("fallback", 8080)],
+        Some(ServiceDiscoveryConfig {
+            provider: SdProvider::Mesh,
+            dns_sd: None,
+            kubernetes: None,
+            consul: None,
+            mesh: Some(MeshSdConfig {
+                service_name: "api".to_string(),
+                namespace: None,
+                port: None,
+                poll_interval_seconds: 30,
+            }),
+            default_weight: 1,
+        }),
+    )]);
+
+    let cache = Arc::new(LoadBalancerCache::new(&config));
+    let dns_cache = ferrum_edge::dns::DnsCache::new(Default::default());
+    let manager = ServiceDiscoveryManager::new(
+        cache.clone(),
+        dns_cache,
+        Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        ferrum_edge::plugins::PluginHttpClient::default(),
+        None,
+    );
+
+    manager.start(&config, None);
+    manager.stop();
+
+    let u = cache.get_upstream("up-mesh").unwrap();
+    assert_eq!(u.targets.len(), 1);
+    assert_eq!(u.targets[0].host, "fallback");
+}
+
+#[tokio::test]
+async fn test_manager_mesh_discovery_populates_load_balancer() {
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let mut config = make_config_with_upstreams(vec![make_upstream(
+        "up-mesh",
+        Vec::new(),
+        Some(ServiceDiscoveryConfig {
+            provider: SdProvider::Mesh,
+            dns_sd: None,
+            kubernetes: None,
+            consul: None,
+            mesh: Some(MeshSdConfig {
+                service_name: "api".to_string(),
+                namespace: None,
+                port: Some(8080),
+                poll_interval_seconds: 30,
+            }),
+            default_weight: 4,
+        }),
+    )]);
+    config.mesh = Some(Box::new(MeshConfig {
+        services: vec![mesh_service("api", api_id, 8080)],
+        workloads: vec![mesh_workload(api_id, "api", "10.0.0.9", 8080)],
+        ..MeshConfig::default()
+    }));
+
+    let cache = Arc::new(LoadBalancerCache::new(&config));
+    let dns_cache = ferrum_edge::dns::DnsCache::new(Default::default());
+    let manager = ServiceDiscoveryManager::new(
+        cache.clone(),
+        dns_cache,
+        Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        ferrum_edge::plugins::PluginHttpClient::default(),
+        Some(request_epoch_store(config.clone())),
+    );
+
+    manager.start(&config, None);
+
+    let mut discovered = Vec::new();
+    for _ in 0..50 {
+        discovered = cache
+            .get_upstream("up-mesh")
+            .map(|upstream| upstream.targets.clone())
+            .unwrap_or_default();
+        if !discovered.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    manager.stop();
+
+    assert_eq!(discovered.len(), 1);
+    assert_eq!(discovered[0].host, "10.0.0.9");
+    assert_eq!(discovered[0].port, 8080);
+    assert_eq!(discovered[0].weight, 4);
+    assert_eq!(
+        discovered[0].tags.get("mesh.spiffe_id").map(String::as_str),
+        Some(api_id)
+    );
 }
