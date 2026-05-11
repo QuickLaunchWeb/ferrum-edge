@@ -138,7 +138,7 @@ async fn run_with_backend(
         config.node_name
     );
 
-    wait_for_shutdown(&shutdown_tx).await;
+    wait_for_shutdown(shutdown_tx).await;
 
     info!("Node agent shutting down, detaching BPF programs");
     cleanup_all_pods(backend.as_mut(), &pod_states);
