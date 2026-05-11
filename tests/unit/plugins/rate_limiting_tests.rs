@@ -1,5 +1,6 @@
 //! Tests for rate_limiting plugin
 
+use ferrum_edge::identity::SpiffeId;
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, priority, rate_limiting::RateLimiting,
 };
@@ -250,6 +251,68 @@ async fn test_rate_limiting_consumer_fallback_to_ip() {
     ctx2.identified_consumer = None;
     let result = plugin.authorize(&mut ctx2).await;
     assert_reject(result, Some(429));
+}
+
+#[tokio::test]
+async fn test_rate_limiting_spiffe_mode_on_request_received_is_noop() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 1,
+        "limit_by": "spiffe_identity"
+    });
+    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.peer_spiffe_id = Some(SpiffeId::new("spiffe://example.test/ns/app/sa/api").unwrap());
+
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert_continue(result);
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert_continue(result);
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+}
+
+#[tokio::test]
+async fn test_rate_limiting_spiffe_identity_limits_by_spiffe_id() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 1,
+        "limit_by": "spiffe"
+    });
+    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+
+    let mut ctx1 = create_test_context();
+    ctx1.client_ip = "10.0.0.1".to_string();
+    ctx1.peer_spiffe_id = Some(SpiffeId::new("spiffe://example.test/ns/app/sa/api").unwrap());
+    assert_continue(plugin.authorize(&mut ctx1).await);
+
+    let mut ctx2 = create_test_context();
+    ctx2.client_ip = "10.0.0.2".to_string();
+    ctx2.peer_spiffe_id = Some(SpiffeId::new("spiffe://example.test/ns/app/sa/api").unwrap());
+    assert_reject(plugin.authorize(&mut ctx2).await, Some(429));
+
+    let mut ctx3 = create_test_context();
+    ctx3.client_ip = "10.0.0.3".to_string();
+    ctx3.peer_spiffe_id = Some(SpiffeId::new("spiffe://example.test/ns/app/sa/web").unwrap());
+    assert_continue(plugin.authorize(&mut ctx3).await);
+}
+
+#[tokio::test]
+async fn test_rate_limiting_spiffe_identity_fallback_to_ip() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 1,
+        "limit_by": "spiffe_identity"
+    });
+    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+
+    let mut ctx1 = create_test_context();
+    ctx1.peer_spiffe_id = None;
+    assert_continue(plugin.authorize(&mut ctx1).await);
+
+    let mut ctx2 = create_test_context();
+    ctx2.peer_spiffe_id = None;
+    assert_reject(plugin.authorize(&mut ctx2).await, Some(429));
 }
 
 #[tokio::test]
@@ -785,6 +848,37 @@ async fn test_expose_headers_consumer_identity() {
     assert_eq!(
         response_headers.get("x-ratelimit-identity").unwrap(),
         "consumer:testuser"
+    );
+}
+
+#[tokio::test]
+async fn test_expose_headers_spiffe_identity() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "spiffe_identity",
+        "expose_headers": true
+    });
+    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.peer_spiffe_id = Some(SpiffeId::new("spiffe://example.test/ns/app/sa/api").unwrap());
+
+    let result = plugin.authorize(&mut ctx).await;
+    assert_continue(result);
+
+    assert_eq!(
+        ctx.metadata.get("ratelimit_identity").unwrap(),
+        "spiffe:spiffe://example.test/ns/app/sa/api"
+    );
+
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_eq!(
+        response_headers.get("x-ratelimit-identity").unwrap(),
+        "spiffe:spiffe://example.test/ns/app/sa/api"
     );
 }
 
