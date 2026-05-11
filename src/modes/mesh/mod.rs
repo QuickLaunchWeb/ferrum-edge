@@ -701,7 +701,14 @@ fn build_east_west_service_proxies_and_upstreams(
 
     for service in &mesh_slice.services {
         // Build upstream targets from workloads that belong to this service.
-        let targets = build_east_west_service_targets(service, &mesh_slice.workloads);
+        let targets = build_east_west_service_targets(
+            service,
+            &mesh_slice.workloads,
+            mesh_slice
+                .multi_cluster
+                .as_ref()
+                .and_then(|multi_cluster| multi_cluster.local_cluster.as_deref()),
+        );
         if targets.is_empty() {
             debug!(
                 service = %service.name,
@@ -764,6 +771,7 @@ fn build_east_west_service_proxies_and_upstreams(
 fn build_east_west_service_targets(
     service: &crate::modes::mesh::config::MeshService,
     workloads: &[crate::modes::mesh::config::Workload],
+    local_cluster: Option<&str>,
 ) -> Vec<UpstreamTarget> {
     let mut targets = Vec::new();
 
@@ -774,6 +782,14 @@ fn build_east_west_service_targets(
         else {
             continue;
         };
+        if local_cluster.is_some_and(|local_cluster| {
+            workload
+                .cluster
+                .as_deref()
+                .is_some_and(|cluster| cluster != local_cluster)
+        }) {
+            continue;
+        }
 
         // Use the first service port as the target port. If the service has no
         // ports, fall back to the workload's first port.
@@ -3252,6 +3268,88 @@ mod tests {
                 assert_eq!(ratings_upstream.targets[0].host, "10.0.0.6");
                 assert_eq!(ratings_upstream.targets[1].host, "10.0.0.7");
                 assert_eq!(ratings_upstream.targets[0].port, 3000);
+            },
+        );
+    }
+
+    #[test]
+    fn east_west_gateway_service_targets_ignore_remote_cluster_workloads() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_NAMESPACE", "default"),
+                ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                let mut local = workload("reviews-local", "reviews");
+                local.addresses = vec!["10.0.0.5".to_string()];
+                local.cluster = Some("cluster-a".to_string());
+                let mut remote = workload("reviews-remote", "reviews");
+                remote.addresses = vec!["172.16.0.5".to_string()];
+                remote.cluster = Some("cluster-b".to_string());
+                let mut clusterless = workload("reviews-clusterless", "reviews");
+                clusterless.addresses = vec!["10.0.0.6".to_string()];
+
+                let config = GatewayConfig {
+                    mesh: Some(Box::new(MeshConfig {
+                        services: vec![MeshService {
+                            name: "reviews".to_string(),
+                            namespace: "default".to_string(),
+                            ports: vec![ServicePort {
+                                port: 9080,
+                                protocol: AppProtocol::Http,
+                                name: None,
+                            }],
+                            workloads: vec![
+                                crate::modes::mesh::config::WorkloadRef {
+                                    spiffe_id: local.spiffe_id.clone(),
+                                },
+                                crate::modes::mesh::config::WorkloadRef {
+                                    spiffe_id: remote.spiffe_id.clone(),
+                                },
+                                crate::modes::mesh::config::WorkloadRef {
+                                    spiffe_id: clusterless.spiffe_id.clone(),
+                                },
+                            ],
+                            protocol_overrides: HashMap::new(),
+                        }],
+                        workloads: vec![local, remote, clusterless],
+                        multi_cluster: Some(MultiClusterConfig {
+                            local_cluster: Some("cluster-a".to_string()),
+                            ..MultiClusterConfig::default()
+                        }),
+                        ..MeshConfig::default()
+                    })),
+                    ..GatewayConfig::default()
+                };
+
+                let prepared =
+                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                let upstream = prepared
+                    .upstreams
+                    .iter()
+                    .find(|u| u.id == "__mesh-ew-upstream-default-reviews")
+                    .expect("reviews upstream");
+                let hosts: Vec<&str> = upstream
+                    .targets
+                    .iter()
+                    .map(|target| target.host.as_str())
+                    .collect();
+
+                assert_eq!(hosts, vec!["10.0.0.5", "10.0.0.6"]);
+                assert!(
+                    !hosts.contains(&"172.16.0.5"),
+                    "remote-cluster workloads should not become local east-west targets"
+                );
             },
         );
     }
