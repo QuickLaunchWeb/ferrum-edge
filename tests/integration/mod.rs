@@ -17,6 +17,7 @@ mod graceful_shutdown_tests;
 mod grpc_proxy_tests;
 mod http2_pool_tests;
 mod http3_integration_tests;
+mod mesh_authz_negative_match_tests;
 mod mesh_hbone_tests;
 mod mesh_proxy_config_tests;
 mod scripted_backend_smoke_tests;

@@ -233,7 +233,16 @@ fn principal_matches(source: &Value) -> Vec<PrincipalMatch> {
 
 fn request_match(object: &K8sObject, operation: &Value) -> Result<RequestMatch, K8sTranslateError> {
     validate_supported_operation_fields(object, operation)?;
-    let (ports, port_patterns) = operation_ports(object, operation)?;
+    let (ports, port_patterns) = operation_ports(object, operation, "ports")?;
+    let (not_ports, not_port_patterns) = operation_ports(object, operation, "notPorts")?;
+    if !not_port_patterns.is_empty() {
+        return Err(invalid_resource(
+            object,
+            "rules[].to[].operation.notPorts wildcard patterns are unsupported \
+             (use literal numeric ports)"
+                .to_string(),
+        ));
+    }
 
     Ok(RequestMatch {
         methods: string_array(operation, "methods"),
@@ -242,6 +251,10 @@ fn request_match(object: &K8sObject, operation: &Value) -> Result<RequestMatch, 
         headers: HashMap::new(),
         ports,
         port_patterns,
+        not_methods: string_array(operation, "notMethods"),
+        not_paths: string_array(operation, "notPaths"),
+        not_hosts: string_array(operation, "notHosts"),
+        not_ports,
     })
 }
 
@@ -255,7 +268,8 @@ fn validate_supported_operation_fields(
         .flat_map(|fields| fields.keys())
     {
         match key.as_str() {
-            "methods" | "paths" | "hosts" | "ports" => {}
+            "methods" | "paths" | "hosts" | "ports" | "notMethods" | "notPaths" | "notHosts"
+            | "notPorts" => {}
             _ => {
                 return Err(invalid_resource(
                     object,
@@ -270,10 +284,11 @@ fn validate_supported_operation_fields(
 fn operation_ports(
     object: &K8sObject,
     operation: &Value,
+    field: &str,
 ) -> Result<(Vec<u16>, Vec<String>), K8sTranslateError> {
     let mut ports = Vec::new();
     let mut port_patterns = Vec::new();
-    for port in string_array(operation, "ports") {
+    for port in string_array(operation, field) {
         if is_istio_port_pattern(&port) {
             port_patterns.push(port);
             continue;
@@ -281,7 +296,7 @@ fn operation_ports(
         ports.push(port_from_string(
             object,
             &port,
-            "rules[].to[].operation.ports",
+            &format!("rules[].to[].operation.{field}"),
         )?);
     }
     Ok((ports, port_patterns))
@@ -307,6 +322,10 @@ fn request_match_is_unconstrained(request: &RequestMatch) -> bool {
         && request.headers.is_empty()
         && request.ports.is_empty()
         && request.port_patterns.is_empty()
+        && request.not_methods.is_empty()
+        && request.not_paths.is_empty()
+        && request.not_hosts.is_empty()
+        && request.not_ports.is_empty()
 }
 
 fn condition_match(value: &Value) -> Option<ConditionMatch> {
@@ -1878,16 +1897,166 @@ mod tests {
                 serde_json::json!({
                     "action": "DENY",
                     "rules": [{
-                        "to": [{"operation": {"notPorts": ["8080"]}}]
+                        "to": [{"operation": {"someUnsupportedField": ["foo"]}}]
                     }]
                 }),
             )],
             options(),
         )
-        .expect_err("unsupported negative operation fields must fail closed");
+        .expect_err("unsupported operation fields must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("rules[].to[].operation.someUnsupportedField")
+        );
+        assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn translates_authorization_policy_negative_match_fields() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "selector": {"matchLabels": {"app": "api"}},
+            "rules": [{
+                "to": [{"operation": {
+                    "methods": ["GET"],
+                    "notMethods": ["POST", "DELETE"],
+                    "notPaths": ["/admin/*"],
+                    "notHosts": ["evil.example.com"],
+                    "notPorts": ["8080"]
+                }}]
+            }]
+        }));
+
+        assert_eq!(policy.rules.len(), 1);
+        let operation = &policy.rules[0].to[0];
+        assert_eq!(operation.methods, vec!["GET".to_string()]);
+        assert_eq!(
+            operation.not_methods,
+            vec!["POST".to_string(), "DELETE".to_string()]
+        );
+        assert_eq!(operation.not_paths, vec!["/admin/*".to_string()]);
+        // Host is normalised to ASCII-lowercase at config-load time.
+        assert_eq!(operation.not_hosts, vec!["evil.example.com".to_string()]);
+        assert_eq!(operation.not_ports, vec![8080]);
+    }
+
+    #[test]
+    fn negative_match_operation_alone_is_constrained() {
+        // An operation that has ONLY negative-match fields is still a
+        // constraint — the translator must not collapse it to "any".
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "selector": {"matchLabels": {"app": "api"}},
+            "rules": [{
+                "to": [{"operation": {"notMethods": ["POST"]}}]
+            }]
+        }));
+
+        assert_eq!(policy.rules.len(), 1);
+        assert_eq!(policy.rules[0].to.len(), 1);
+        assert_eq!(policy.rules[0].to[0].not_methods, vec!["POST".to_string()]);
+        assert!(policy.rules[0].to[0].methods.is_empty());
+    }
+
+    #[test]
+    fn rejects_authorization_policy_not_ports_wildcard_pattern() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [{"operation": {"notPorts": ["8*"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("wildcard notPorts patterns must fail closed");
+
+        assert!(err.to_string().contains("notPorts"));
+        assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn rejects_authorization_policy_not_ports_outside_kubernetes_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [{"operation": {"notPorts": ["70000"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid notPorts must fail closed");
 
         assert!(err.to_string().contains("rules[].to[].operation.notPorts"));
-        assert!(err.to_string().contains("unsupported"));
+        assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn authorization_policy_negative_match_round_trip_decision() {
+        // ALLOW with methods=[GET] AND notPaths=[/admin/*]:
+        // - GET /api allowed (positive method match, negative path mismatch)
+        // - GET /admin/users denied (positive method match BUT negative path matches → rule fails → implicit deny)
+        // - POST /api denied (positive method does not match → implicit deny)
+        let result = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "selector": {"matchLabels": {"app": "api"}},
+                    "rules": [{
+                        "to": [{"operation": {
+                            "methods": ["GET"],
+                            "notPaths": ["/admin/*"]
+                        }}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let slice = MeshSlice {
+            mesh_policies: mesh.mesh_policies,
+            ..MeshSlice::default()
+        };
+
+        let get_api = MeshAuthzRequest {
+            method: Some("GET".to_string()),
+            path: Some("/api/items".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+        let get_admin = MeshAuthzRequest {
+            method: Some("GET".to_string()),
+            path: Some("/admin/users".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+        let post_api = MeshAuthzRequest {
+            method: Some("POST".to_string()),
+            path: Some("/api/items".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &get_api),
+            MeshAuthzDecision::Allow
+        );
+        assert!(matches!(
+            evaluate_mesh_authorization(&slice, &get_admin),
+            MeshAuthzDecision::Deny { .. }
+        ));
+        assert!(matches!(
+            evaluate_mesh_authorization(&slice, &post_api),
+            MeshAuthzDecision::Deny { .. }
+        ));
     }
 
     #[test]

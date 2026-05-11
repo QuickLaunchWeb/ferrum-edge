@@ -159,6 +159,25 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
     {
         return false;
     }
+    // HTTP-only negative predicates (`not_methods`, `not_paths`, `not_hosts`)
+    // fail the match when the corresponding HTTP attribute is absent. This
+    // mirrors how the positive `methods`/`paths`/`hosts` checks above behave
+    // for the same case (e.g. raw-TCP `on_stream_connect`, which only carries
+    // a port) — without this, an ALLOW rule that mentions an HTTP-only field
+    // would over-permissively match non-HTTP traffic that should fall through
+    // to implicit deny.
+    if !match_.not_methods.is_empty() {
+        let Some(method) = request.method.as_ref() else {
+            return false;
+        };
+        if match_
+            .not_methods
+            .iter()
+            .any(|denied| denied.eq_ignore_ascii_case(method))
+        {
+            return false;
+        }
+    }
     if !match_.paths.is_empty()
         && !request.path.as_ref().is_some_and(|path| {
             match_
@@ -168,6 +187,18 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
         })
     {
         return false;
+    }
+    if !match_.not_paths.is_empty() {
+        let Some(path) = request.path.as_ref() else {
+            return false;
+        };
+        if match_
+            .not_paths
+            .iter()
+            .any(|pattern| wildcard_match(pattern, path))
+        {
+            return false;
+        }
     }
     let normalized_host = request.host.as_deref().and_then(normalize_match_host);
     if !match_.hosts.is_empty()
@@ -180,6 +211,18 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
     {
         return false;
     }
+    if !match_.not_hosts.is_empty() {
+        let Some(host) = normalized_host.as_ref() else {
+            return false;
+        };
+        if match_
+            .not_hosts
+            .iter()
+            .any(|pattern| normalized_host_matches(pattern, host))
+        {
+            return false;
+        }
+    }
     if (!match_.ports.is_empty() || !match_.port_patterns.is_empty())
         && !request.port.is_some_and(|port| {
             match_.ports.contains(&port)
@@ -188,6 +231,13 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
                     .iter()
                     .any(|pattern| port_pattern_matches(pattern, port))
         })
+    {
+        return false;
+    }
+    if !match_.not_ports.is_empty()
+        && request
+            .port
+            .is_some_and(|port| match_.not_ports.contains(&port))
     {
         return false;
     }
@@ -530,6 +580,7 @@ mod tests {
                             .collect(),
                         ports: vec![8080],
                         port_patterns: Vec::new(),
+                        ..RequestMatch::default()
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
@@ -2410,5 +2461,333 @@ mod tests {
         assert_eq!(extract_namespace("spiffe://cluster.local/sa/client"), None);
         // "/ns/" at the very end with no following segment.
         assert_eq!(extract_namespace("spiffe://cluster.local/ns/"), Some(""));
+    }
+
+    // ── Istio-style negative-match (notMethods/notPaths/notHosts/notPorts) ─
+
+    fn allow_policy_with_request_match(name: &str, request: RequestMatch) -> MeshPolicy {
+        MeshPolicy {
+            name: name.to_string(),
+            namespace: "default".to_string(),
+            scope: PolicyScope::MeshWide,
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: vec![request],
+                when: Vec::new(),
+                request_principals: Vec::new(),
+                never_matches: false,
+                action: PolicyAction::Allow,
+            }],
+        }
+    }
+
+    #[test]
+    fn request_match_not_methods_only_allows_other_methods() {
+        let slice = MeshSlice {
+            mesh_policies: vec![allow_policy_with_request_match(
+                "deny-post",
+                RequestMatch {
+                    not_methods: vec!["POST".to_string()],
+                    ..RequestMatch::default()
+                },
+            )],
+            ..MeshSlice::default()
+        };
+
+        let get_request = MeshAuthzRequest {
+            method: Some("GET".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+        let post_request = MeshAuthzRequest {
+            method: Some("POST".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &get_request),
+            MeshAuthzDecision::Allow,
+            "GET should match the rule (notMethods=[POST] does not exclude GET)"
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &post_request),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            },
+            "POST should fall through to implicit-deny (rule rejects POST)"
+        );
+    }
+
+    #[test]
+    fn request_match_not_methods_is_case_insensitive() {
+        let slice = MeshSlice {
+            mesh_policies: vec![allow_policy_with_request_match(
+                "deny-post",
+                RequestMatch {
+                    not_methods: vec!["post".to_string()],
+                    ..RequestMatch::default()
+                },
+            )],
+            ..MeshSlice::default()
+        };
+
+        let post_request = MeshAuthzRequest {
+            method: Some("POST".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &post_request),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn request_match_methods_and_not_paths_combine_as_conjunction() {
+        // ALLOW with methods=[GET] AND notPaths=[/admin/*]:
+        // GET /api passes (positive method match + negative path mismatch).
+        // GET /admin/users fails (positive method match BUT negative path matches → reject).
+        let slice = MeshSlice {
+            mesh_policies: vec![allow_policy_with_request_match(
+                "allow-get-except-admin",
+                RequestMatch {
+                    methods: vec!["GET".to_string()],
+                    not_paths: vec!["/admin/*".to_string()],
+                    ..RequestMatch::default()
+                },
+            )],
+            ..MeshSlice::default()
+        };
+
+        let get_api = MeshAuthzRequest {
+            method: Some("GET".to_string()),
+            path: Some("/api/items".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+        let get_admin = MeshAuthzRequest {
+            method: Some("GET".to_string()),
+            path: Some("/admin/users".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &get_api),
+            MeshAuthzDecision::Allow,
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &get_admin),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn request_match_hosts_and_not_hosts_combine_as_conjunction() {
+        // ALLOW with hosts=[*.example.com] AND notHosts=[evil.example.com]:
+        // good.example.com passes (positive match + negative miss).
+        // evil.example.com fails (positive match + negative match → reject).
+        let slice = MeshSlice {
+            mesh_policies: vec![allow_policy_with_request_match(
+                "allow-domain-except-evil",
+                RequestMatch {
+                    hosts: vec!["*.example.com".to_string()],
+                    not_hosts: vec!["evil.example.com".to_string()],
+                    ..RequestMatch::default()
+                },
+            )],
+            ..MeshSlice::default()
+        };
+
+        let good = MeshAuthzRequest {
+            host: Some("good.example.com".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+        let evil = MeshAuthzRequest {
+            host: Some("evil.example.com".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &good),
+            MeshAuthzDecision::Allow
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &evil),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn request_match_not_hosts_normalized_at_config_load() {
+        // The not_hosts entry written in mixed case + trailing dot must be
+        // normalised to ASCII-lowercase (sans trailing dot) so the hot path
+        // matches against the already-normalised request authority without
+        // re-allocating.
+        let mut config = crate::modes::mesh::config::MeshConfig {
+            mesh_policies: vec![allow_policy_with_request_match(
+                "deny-evil",
+                RequestMatch {
+                    hosts: vec!["*.example.com".to_string()],
+                    not_hosts: vec!["Evil.Example.COM.".to_string()],
+                    ..RequestMatch::default()
+                },
+            )],
+            ..crate::modes::mesh::config::MeshConfig::default()
+        };
+        config.normalize();
+
+        let slice = MeshSlice {
+            mesh_policies: config.mesh_policies,
+            ..MeshSlice::default()
+        };
+
+        let evil = MeshAuthzRequest {
+            host: Some("evil.example.com".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &evil),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn request_match_not_ports_blocks_specific_ports() {
+        let slice = MeshSlice {
+            mesh_policies: vec![allow_policy_with_request_match(
+                "deny-8080",
+                RequestMatch {
+                    not_ports: vec![8080],
+                    ..RequestMatch::default()
+                },
+            )],
+            ..MeshSlice::default()
+        };
+
+        let port_9090 = MeshAuthzRequest {
+            port: Some(9090),
+            ..MeshAuthzRequest::default()
+        };
+        let port_8080 = MeshAuthzRequest {
+            port: Some(8080),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &port_9090),
+            MeshAuthzDecision::Allow,
+            "Port 9090 not in not_ports list → rule matches → allow"
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &port_8080),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            },
+            "Port 8080 in not_ports list → rule rejects → implicit deny"
+        );
+    }
+
+    #[test]
+    fn request_match_http_only_not_predicates_fail_match_on_stream_request() {
+        // Stream-level authz (`MeshAuthz::on_stream_connect`) builds a
+        // `MeshAuthzRequest` with only `port` populated — `method`, `path`,
+        // and `host` are `None`. An ALLOW rule that mentions an HTTP-only
+        // negative predicate (`notMethods`/`notPaths`/`notHosts`) must NOT
+        // match such a request — symmetric with how the positive
+        // `methods`/`paths`/`hosts` predicates fail when the corresponding
+        // attribute is absent. Otherwise translated Istio policies would
+        // accidentally allow raw TCP connections that should fall through
+        // to implicit deny.
+        let cases: [(&str, RequestMatch); 3] = [
+            (
+                "not_methods",
+                RequestMatch {
+                    not_methods: vec!["POST".to_string()],
+                    ..RequestMatch::default()
+                },
+            ),
+            (
+                "not_paths",
+                RequestMatch {
+                    not_paths: vec!["/admin/*".to_string()],
+                    ..RequestMatch::default()
+                },
+            ),
+            (
+                "not_hosts",
+                RequestMatch {
+                    not_hosts: vec!["evil.example.com".to_string()],
+                    ..RequestMatch::default()
+                },
+            ),
+        ];
+
+        for (label, request_match) in cases {
+            let slice = MeshSlice {
+                mesh_policies: vec![allow_policy_with_request_match(
+                    "allow-with-http-only-negative",
+                    request_match,
+                )],
+                ..MeshSlice::default()
+            };
+
+            let stream_request = MeshAuthzRequest {
+                port: Some(8080),
+                ..MeshAuthzRequest::default()
+            };
+
+            assert_eq!(
+                evaluate_mesh_authorization(&slice, &stream_request),
+                MeshAuthzDecision::Deny {
+                    policy: "implicit-deny".to_string()
+                },
+                "{label}: HTTP-only negative predicate must fail the match on a \
+                 stream-level request (no method/path/host) → implicit deny"
+            );
+        }
+    }
+
+    #[test]
+    fn request_match_multiple_not_methods_any_match_rejects() {
+        let slice = MeshSlice {
+            mesh_policies: vec![allow_policy_with_request_match(
+                "deny-mutations",
+                RequestMatch {
+                    not_methods: vec!["POST".to_string(), "PUT".to_string(), "DELETE".to_string()],
+                    ..RequestMatch::default()
+                },
+            )],
+            ..MeshSlice::default()
+        };
+
+        for method in ["POST", "PUT", "DELETE"] {
+            let request = MeshAuthzRequest {
+                method: Some(method.to_string()),
+                ..MeshAuthzRequest::default()
+            };
+            assert_eq!(
+                evaluate_mesh_authorization(&slice, &request),
+                MeshAuthzDecision::Deny {
+                    policy: "implicit-deny".to_string()
+                },
+                "method {method} should be rejected by not_methods list"
+            );
+        }
+
+        let get_request = MeshAuthzRequest {
+            method: Some("GET".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &get_request),
+            MeshAuthzDecision::Allow
+        );
     }
 }
