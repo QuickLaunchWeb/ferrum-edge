@@ -490,27 +490,7 @@ pub(crate) fn fault_injection_plugin_for_proxy(
     let obj = fault.as_object()?;
     let mut config = serde_json::Map::new();
 
-    if let Some(delay) = obj.get("fixedDelay").and_then(Value::as_str)
-        && let Some(ms) = parse_istio_duration_ms(delay)
-    {
-        let percentage = obj
-            .get("percentage")
-            .and_then(|p| p.get("value"))
-            .and_then(Value::as_f64)
-            .or_else(|| obj.get("percent").and_then(Value::as_f64))
-            .unwrap_or(100.0);
-        config.insert(
-            "delay".to_string(),
-            serde_json::json!({
-                "duration_ms": ms,
-                "percentage": percentage,
-            }),
-        );
-    }
-
-    // Also check nested delay object (Istio HTTPFaultInjection.Delay)
-    if !config.contains_key("delay")
-        && let Some(delay_obj) = obj.get("delay").and_then(Value::as_object)
+    if let Some(delay_obj) = obj.get("delay").and_then(Value::as_object)
         && let Some(delay_str) = delay_obj.get("fixedDelay").and_then(Value::as_str)
         && let Some(ms) = parse_istio_duration_ms(delay_str)
     {
@@ -529,15 +509,7 @@ pub(crate) fn fault_injection_plugin_for_proxy(
         );
     }
 
-    // Check for abort at top level or nested
-    let abort_source = obj.get("abort").and_then(Value::as_object).or_else(|| {
-        // Top-level httpStatus + percentage (flat Istio abort)
-        if obj.contains_key("httpStatus") {
-            Some(obj)
-        } else {
-            None
-        }
-    });
+    let abort_source = obj.get("abort").and_then(Value::as_object);
 
     if let Some(abort_obj) = abort_source
         && let Some(status) = abort_obj.get("httpStatus").and_then(Value::as_u64)
@@ -582,17 +554,25 @@ pub(crate) fn fault_injection_plugin_for_proxy(
 pub(crate) fn parse_istio_duration_ms(duration: &str) -> Option<u64> {
     let trimmed = duration.trim();
     if let Some(ms_str) = trimmed.strip_suffix("ms") {
-        return ms_str.trim().parse::<u64>().ok().filter(|&v| v > 0);
+        return duration_component_ms(ms_str, 1.0);
     }
     if let Some(s_str) = trimmed.strip_suffix('s') {
-        let seconds: f64 = s_str.trim().parse().ok()?;
-        let ms = (seconds * 1000.0) as u64;
-        return if ms > 0 { Some(ms) } else { None };
+        return duration_component_ms(s_str, 1000.0);
     }
-    // Plain numeric string treated as seconds
-    let seconds: f64 = trimmed.parse().ok()?;
-    let ms = (seconds * 1000.0) as u64;
-    if ms > 0 { Some(ms) } else { None }
+    None
+}
+
+fn duration_component_ms(raw: &str, multiplier: f64) -> Option<u64> {
+    let value: f64 = raw.trim().parse().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let ms = value * multiplier;
+    if !ms.is_finite() || ms > u64::MAX as f64 {
+        return None;
+    }
+    let result = ms as u64;
+    if result > 0 { Some(result) } else { None }
 }
 
 /// Extract retry config from an Istio VirtualService `retries` object.
@@ -603,12 +583,7 @@ pub(crate) fn extract_retry_config(retries: &Value) -> Option<RetryConfig> {
         return None;
     }
 
-    let per_try_timeout_ms = obj
-        .get("perTryTimeout")
-        .and_then(Value::as_str)
-        .and_then(parse_istio_duration_ms);
-
-    let retryable_status_codes = obj
+    let mut retryable_status_codes = obj
         .get("retryOn")
         .and_then(Value::as_str)
         .map(|retry_on| {
@@ -616,7 +591,6 @@ pub(crate) fn extract_retry_config(retries: &Value) -> Option<RetryConfig> {
                 .split(',')
                 .filter_map(|token| {
                     let token = token.trim();
-                    // Istio retryOn uses Envoy retry-on tokens. Some map to status codes.
                     match token {
                         "5xx" => Some(vec![500, 502, 503, 504]),
                         "gateway-error" => Some(vec![502, 503, 504]),
@@ -630,6 +604,9 @@ pub(crate) fn extract_retry_config(retries: &Value) -> Option<RetryConfig> {
         })
         .unwrap_or_default();
 
+    retryable_status_codes.sort_unstable();
+    retryable_status_codes.dedup();
+
     let retry_on_connect = obj
         .get("retryOn")
         .and_then(Value::as_str)
@@ -640,19 +617,13 @@ pub(crate) fn extract_retry_config(retries: &Value) -> Option<RetryConfig> {
             })
         });
 
-    let mut config = RetryConfig {
+    // Istio retries all HTTP methods by default (unlike Ferrum's default which
+    // excludes POST/PATCH), so unconditionally include every standard method.
+    Some(RetryConfig {
         max_retries: attempts as u32,
         retryable_status_codes,
         retry_on_connect_failure: retry_on_connect,
-        ..RetryConfig::default()
-    };
-
-    // Override per-try timeout if specified — this maps to
-    // backend_read_timeout_ms at the proxy level, but we pass it through
-    // RetryConfig's default retryable_methods since Istio doesn't limit by method.
-    if per_try_timeout_ms.is_some() {
-        // Make all methods retryable, matching Istio's default behavior
-        config.retryable_methods = vec![
+        retryable_methods: vec![
             "GET".to_string(),
             "HEAD".to_string(),
             "OPTIONS".to_string(),
@@ -660,10 +631,9 @@ pub(crate) fn extract_retry_config(retries: &Value) -> Option<RetryConfig> {
             "DELETE".to_string(),
             "POST".to_string(),
             "PATCH".to_string(),
-        ];
-    }
-
-    Some(config)
+        ],
+        ..RetryConfig::default()
+    })
 }
 
 pub(crate) struct RouteBackend {

@@ -2642,6 +2642,9 @@ mod tests {
         assert!(retry.retryable_status_codes.contains(&503));
         assert!(retry.retryable_status_codes.contains(&504));
         assert!(retry.retry_on_connect_failure);
+        // Istio retries all methods by default, including POST
+        assert!(retry.retryable_methods.contains(&"POST".to_string()));
+        assert!(retry.retryable_methods.contains(&"PATCH".to_string()));
     }
 
     #[test]
@@ -2781,6 +2784,10 @@ mod tests {
         assert_eq!(parse_istio_duration_ms("500ms"), Some(500));
         assert_eq!(parse_istio_duration_ms("0s"), None);
         assert_eq!(parse_istio_duration_ms("0ms"), None);
+        assert_eq!(parse_istio_duration_ms("-1s"), None);
+        assert_eq!(parse_istio_duration_ms("-500ms"), None);
+        assert_eq!(parse_istio_duration_ms("NaN s"), None);
+        assert_eq!(parse_istio_duration_ms("10"), None);
     }
 
     #[test]
