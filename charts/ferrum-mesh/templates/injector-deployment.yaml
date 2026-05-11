@@ -20,11 +20,19 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: ferrum-mesh
+{{ with .Values.injector.podSecurityContext }}
+      securityContext:
+{{ toYaml . | nindent 8 }}
+{{ end }}
       containers:
         - name: ferrum-edge
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["run"]
+{{ with .Values.injector.securityContext }}
+          securityContext:
+{{ toYaml . | nindent 12 }}
+{{ end }}
           ports:
             - name: webhook
               containerPort: {{ .Values.injector.listenPort }}
@@ -33,6 +41,8 @@ spec:
               value: "0.0.0.0:{{ .Values.injector.listenPort }}"
             - name: FERRUM_INJECTOR_SIDECAR_IMAGE
               value: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+            - name: FERRUM_INJECTOR_REQUIRE_ANNOTATION
+              value: {{ .Values.injector.requireAnnotation | quote }}
             - name: FERRUM_INJECTOR_TLS_CERT_PATH
               value: {{ .Values.injector.tls.certPath | quote }}
             - name: FERRUM_INJECTOR_TLS_KEY_PATH
@@ -45,6 +55,10 @@ spec:
             - name: injector-tls
               mountPath: /etc/ferrum/injector/tls
               readOnly: true
+{{ with .Values.injector.resources }}
+          resources:
+{{ toYaml . | nindent 12 }}
+{{ end }}
       volumes:
         - name: injector-tls
           secret:
@@ -77,6 +91,10 @@ webhooks:
       - v1
     sideEffects: None
     failurePolicy: {{ .Values.injector.failurePolicy }}
+{{ with .Values.injector.namespaceSelector }}
+    namespaceSelector:
+{{ toYaml . | nindent 6 }}
+{{ end }}
     clientConfig:
       service:
         name: ferrum-mesh-injector

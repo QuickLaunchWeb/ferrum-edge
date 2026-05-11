@@ -144,7 +144,7 @@ See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_
 
 Mesh mode consumes Layer 2 mesh slices from the control protocols and prepares the shared sidecar/ambient data-plane listeners. Non-mesh modes do not instantiate this runtime.
 
-With the native `MeshSubscribe` protocol, mesh mode waits for the first delivered mesh slice before serving, builds the proxy/plugin runtime from that slice, and hot-applies later valid slices atomically. Invalid slice updates are logged and ignored so the last accepted runtime config keeps serving.
+With the native `MeshSubscribe` protocol, mesh mode waits for the first delivered mesh slice before serving, builds the proxy/plugin runtime from that slice, and hot-applies later valid slices atomically. Invalid slice updates are logged and ignored so the last accepted runtime config keeps serving. The xDS ADS consumer coalesces bursts with a short debounce and a bounded max-delay cap, so continuous control-plane churn cannot indefinitely postpone applying the latest valid snapshot.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -174,11 +174,13 @@ With the native `MeshSubscribe` protocol, mesh mode waits for the first delivere
 
 Mesh DNS caches serialized response templates per mesh slice for mesh-owned names, bounded by `FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES` (default 4,096). The cache is rebuilt with the slice, excludes the client transaction ID, and patches the caller's ID into each returned response, so repeated A/AAAA and mesh-owned empty responses avoid repeated wire-format serialization without leaking IDs across clients.
 
-Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Prometheus plugin when mesh metadata is present. The added series are `ferrum_mesh_requests_total` and `ferrum_mesh_request_duration_ms`, labelled with source/destination workload, namespace, principal, app, service, request protocol, response code, response flags, and connection security policy.
+Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Prometheus plugin when mesh metadata is present. The added series are `ferrum_mesh_requests_total` and `ferrum_mesh_request_duration_ms`, labelled with source/destination workload, namespace, principal, app, service, request protocol, response code, response flags, and connection security policy. HBONE tunnel copy failures after a CONNECT response has already been sent increment `ferrum_mesh_hbone_relay_failures_total` with `proxy_id`, `direction`, and `error_class` labels.
 
-HBONE identity metadata is read from all `baggage` headers on authenticated HBONE requests where the peer already presented a SPIFFE identity. Baggage values may be percent-encoded, and Ferrum decodes them before extracting `source.principal` or `destination.principal`. Plain HTTP requests, or requests without an authenticated peer, cannot supply `source.principal` through baggage for `mesh_authz` or `workload_metrics`.
+HBONE identity metadata is read from all `baggage` headers on authenticated HBONE requests where the peer already presented a SPIFFE identity. Baggage values may be percent-encoded, and Ferrum decodes them before extracting `source.principal` or `destination.principal`. Baggage parsing and egress stripping are quoted-value aware, so user-defined members with quoted commas are preserved. Plain HTTP requests, or requests without an authenticated peer, cannot supply `source.principal` through baggage for `mesh_authz` or `workload_metrics`; when unauthenticated HBONE baggage is present, Ferrum stamps `mesh_authz.ignored_baggage.unauthenticated = "true"` and `mesh.ignored_baggage = "unauthenticated_hbone"` for log triage.
 
-Baggage SPIFFE identities are additionally gated by trust-domain matching: a baggage `source.principal` is honored only when its SPIFFE trust domain matches the peer cert's trust domain, or appears in `FERRUM_MESH_TRUST_DOMAIN_ALIASES`. Mismatches stamp `mesh_authz.ignored_baggage = "trust_domain_mismatch"` (and `mesh.ignored_baggage` from `workload_metrics`); the gateway falls back to the peer cert's identity. When the resulting authorization is rejected, the deny policy is annotated as `trust_domain_mismatch` for audit log triage.
+Baggage SPIFFE identities are additionally gated by trust-domain matching: a baggage `source.principal` is honored only when its SPIFFE trust domain matches the peer cert's trust domain, or appears in `FERRUM_MESH_TRUST_DOMAIN_ALIASES`. Mismatches stamp `mesh_authz.ignored_baggage.trust_domain_mismatch = "true"` and keep `mesh_authz.ignored_baggage` as a comma-separated compatibility summary (and `mesh.ignored_baggage` from `workload_metrics`); the gateway falls back to the peer cert's identity. When the resulting authorization is rejected, the deny policy is annotated as `trust_domain_mismatch` for audit log triage.
+
+HBONE CONNECT streams are always kept in streaming mode through authentication so the HTTP/2 upgrade handle remains available to the tunnel relay. Request-body plugins that run after authentication are skipped by the HBONE relay path. Security note: auth plugins that normally require pre-auth body buffering, such as digest-backed `hmac_auth`, authenticate against the CONNECT headers and an empty request body digest instead of consuming DATA frames before the tunnel is established. Do not rely on HMAC body-integrity checks to cover HBONE tunnel payload bytes; enforce tunnel payload policy with mesh identity, authorization, and workload controls instead.
 
 Operators may strip mesh-internal baggage members at egress via `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`. Members whose key starts with any configured prefix are removed from the `baggage` header before backend dispatch; the rest of the baggage (e.g., user-defined tracing keys) propagates verbatim. The default empty list is a no-op — operators opt in.
 
@@ -208,10 +210,20 @@ The Istio `AuthorizationPolicy` translator only consumes the four positive-match
 | `FERRUM_INJECTOR_TRUST_DOMAIN` | No | `cluster.local` | Trust domain used to derive injected sidecar `FERRUM_MESH_WORKLOAD_SPIFFE_ID` from pod namespace and service account |
 | `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` | No | — | Kubernetes Secret name used as the injected sidecar `FERRUM_CP_DP_GRPC_JWT_SECRET` source |
 | `FERRUM_INJECTOR_JWT_SECRET_REF_KEY` | No | — | Key inside `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` used as the injected sidecar `FERRUM_CP_DP_GRPC_JWT_SECRET` source |
+| `FERRUM_INJECTOR_SIDECAR_CPU_REQUEST` | No | `25m` | CPU request injected for the Ferrum sidecar container |
+| `FERRUM_INJECTOR_SIDECAR_MEMORY_REQUEST` | No | `64Mi` | Memory request injected for the Ferrum sidecar container |
+| `FERRUM_INJECTOR_SIDECAR_CPU_LIMIT` | No | `250m` | CPU limit injected for the Ferrum sidecar container |
+| `FERRUM_INJECTOR_SIDECAR_MEMORY_LIMIT` | No | `256Mi` | Memory limit injected for the Ferrum sidecar container |
+| `FERRUM_INJECTOR_INIT_CPU_REQUEST` | No | `10m` | CPU request injected for the iptables init container |
+| `FERRUM_INJECTOR_INIT_MEMORY_REQUEST` | No | `32Mi` | Memory request injected for the iptables init container |
+| `FERRUM_INJECTOR_INIT_CPU_LIMIT` | No | `100m` | CPU limit injected for the iptables init container |
+| `FERRUM_INJECTOR_INIT_MEMORY_LIMIT` | No | `128Mi` | Memory limit injected for the iptables init container |
 | `FERRUM_INJECTOR_TLS_CERT_PATH` | Kubernetes webhook deployments | — | TLS certificate presented by the injector webhook server |
 | `FERRUM_INJECTOR_TLS_KEY_PATH` | Kubernetes webhook deployments | — | TLS private key for `FERRUM_INJECTOR_TLS_CERT_PATH` |
 
 The injector copies non-secret mesh sidecar control-plane env vars from its own environment into injected containers when set: `FERRUM_DP_CP_GRPC_URLS`, `FERRUM_CP_DP_GRPC_JWT_ISSUER`, DP gRPC TLS vars, and `FERRUM_MESH_CONFIG_PROTOCOL`. It does not copy plaintext `FERRUM_CP_DP_GRPC_JWT_SECRET`; set `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` and `FERRUM_INJECTOR_JWT_SECRET_REF_KEY` to inject that variable via `valueFrom.secretKeyRef`.
+
+Injected sidecars run as the configured mesh proxy UID with `runAsNonRoot=true`, `allowPrivilegeEscalation=false`, `readOnlyRootFilesystem=true`, `seccompProfile=RuntimeDefault`, and all Linux capabilities dropped. `FERRUM_MESH_PROXY_UID=0` is rejected at injector startup because Kubernetes would reject a sidecar that combines UID 0 with `runAsNonRoot=true`. The iptables init container explicitly sets `runAsUser=0`, `runAsNonRoot=false`, and `seccompProfile=RuntimeDefault`; it runs as root only long enough to program capture rules, drops all capabilities before adding back `NET_ADMIN` and `NET_RAW`, disables privilege escalation, and receives bounded CPU/memory requests and limits. Injector startup validates those resource quantity env vars so malformed values fail before admission requests are served. Its root filesystem remains writable because iptables needs the xtables lock path while programming capture rules.
 
 ### Migration
 
@@ -272,6 +284,10 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 | `FERRUM_TLS_CA_BUNDLE_PATH` | No | — | Path to PEM CA bundle for all outbound TLS verification |
 | `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for backend mTLS |
 | `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for backend mTLS |
+| `FERRUM_GATEWAY_SVID_CERT_PATH` | No | — | Leaf-first PEM X.509-SVID certificate chain used as the gateway's SPIFFE identity for gateway-to-mesh TLS |
+| `FERRUM_GATEWAY_SVID_KEY_PATH` | No | — | PKCS#8 private key for `FERRUM_GATEWAY_SVID_CERT_PATH` |
+| `FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH` | No | — | PEM trust bundle used to verify mesh SPIFFE peers for gateway-to-mesh TLS |
+| `FERRUM_GATEWAY_SPIFFE_ID` | No | — | Explicit SPIFFE URI fallback when the gateway SVID certificate has no SPIFFE URI SAN |
 | `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | Path to client CA bundle for mTLS verification |
 | `FERRUM_TLS_NO_VERIFY` | No | `false` | Disable outbound TLS verification for all connections (testing only) |
 | `FERRUM_TLS_CRL_FILE_PATH` | No | — | PEM CRL bundle for revocation checks across TLS/DTLS surfaces |
@@ -285,6 +301,8 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 | `FERRUM_TLS_EARLY_DATA_METHODS` | No | — | Comma-separated methods allowed as TLS 1.3 0-RTT early data |
 
 These TLS policy settings apply uniformly to both inbound (frontend) and outbound (backend) connections across all TLS-capable protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP-TLS). DTLS uses a separate library and is not affected. See [frontend_tls.md](frontend_tls.md) and [backend_mtls.md](backend_mtls.md) for detailed TLS configuration guides.
+
+Gateway SVID files are static startup inputs. Set all three SVID path variables together; the gateway rejects partial configuration and validates the leaf certificate, intermediate certificate freshness, PKCS#8 key match, and trust bundle before serving. The SPIFFE ID is read from the leaf URI SAN when present; `FERRUM_GATEWAY_SPIFFE_ID` is only a fallback for file bundles without a SPIFFE URI SAN. Private keys must be PKCS#8 PEM (`BEGIN PRIVATE KEY`); legacy `BEGIN RSA PRIVATE KEY` or `BEGIN EC PRIVATE KEY` files are rejected.
 
 Admin listener TLS and mTLS variables are listed in [Admin API](#admin-api).
 
