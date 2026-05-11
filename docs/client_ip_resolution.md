@@ -187,7 +187,7 @@ The resolved client IP (`ctx.client_ip`) is used throughout the gateway:
 |---|---|
 | **IP Whitelisting / Blacklisting** | `ip_restriction` plugin checks `client_ip` against allow/deny lists |
 | **IP Restriction** | `ip_restriction` plugin enforces allow-first or deny-first IP policies |
-| **Rate Limiting** | When `limit_by="ip"` (default), rate limit key is `ip:{client_ip}` |
+| **Rate Limiting** | When `limit_by="ip"` (default), rate limit key is `ip:{client_ip}`. `consumer` and `spiffe_identity` modes fall back to this IP key when their identity is absent |
 | **Load Balancer Hashing** | `client_ip` used as hash key for consistent upstream selection |
 | **Transaction Logging** | `client_ip` included in all log entries and transaction summaries |
 | **X-Forwarded-For (outbound)** | Real client IP appended to XFF when proxying to backends |

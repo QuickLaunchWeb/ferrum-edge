@@ -672,6 +672,14 @@ pub struct EnvConfig {
     pub backend_tls_client_cert_path: Option<String>,
     /// Path to a PEM file containing the client key for backend TLS verification
     pub backend_tls_client_key_path: Option<String>,
+    /// Leaf-first PEM X.509-SVID certificate chain for gateway-to-mesh identity.
+    pub gateway_svid_cert_path: Option<String>,
+    /// PKCS#8 private key for `gateway_svid_cert_path`.
+    pub gateway_svid_key_path: Option<String>,
+    /// PEM trust bundle for gateway-to-mesh SPIFFE peer verification.
+    pub gateway_svid_trust_bundle_path: Option<String>,
+    /// Explicit SPIFFE ID fallback when the SVID certificate lacks a URI SAN.
+    pub gateway_spiffe_id: Option<String>,
     /// Path to a PEM file containing trusted CA certificates for client certificate verification
     pub frontend_tls_client_ca_bundle_path: Option<String>,
 
@@ -1281,6 +1289,10 @@ impl Default for EnvConfig {
             tls_ca_bundle_path: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
+            gateway_svid_cert_path: None,
+            gateway_svid_key_path: None,
+            gateway_svid_trust_bundle_path: None,
+            gateway_spiffe_id: None,
             frontend_tls_client_ca_bundle_path: None,
             admin_tls_client_ca_bundle_path: None,
             tls_no_verify: false,
@@ -1573,6 +1585,10 @@ impl EnvConfig {
             tls_ca_bundle_path: Option<String> = "FERRUM_TLS_CA_BUNDLE_PATH";
             backend_tls_client_cert_path: Option<String> = "FERRUM_BACKEND_TLS_CLIENT_CERT_PATH";
             backend_tls_client_key_path: Option<String> = "FERRUM_BACKEND_TLS_CLIENT_KEY_PATH";
+            gateway_svid_cert_path: Option<String> = "FERRUM_GATEWAY_SVID_CERT_PATH";
+            gateway_svid_key_path: Option<String> = "FERRUM_GATEWAY_SVID_KEY_PATH";
+            gateway_svid_trust_bundle_path: Option<String> = "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH";
+            gateway_spiffe_id: Option<String> = "FERRUM_GATEWAY_SPIFFE_ID";
             frontend_tls_client_ca_bundle_path: Option<String> = "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH";
             admin_tls_client_ca_bundle_path: Option<String> = "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH";
             tls_no_verify: bool = "FERRUM_TLS_NO_VERIFY" => false;
@@ -1909,6 +1925,10 @@ impl EnvConfig {
             tls_ca_bundle_path,
             backend_tls_client_cert_path,
             backend_tls_client_key_path,
+            gateway_svid_cert_path,
+            gateway_svid_key_path,
+            gateway_svid_trust_bundle_path,
+            gateway_spiffe_id,
             frontend_tls_client_ca_bundle_path,
             admin_tls_client_ca_bundle_path,
             tls_no_verify,
