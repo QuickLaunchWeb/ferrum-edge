@@ -4182,4 +4182,194 @@ mod tests {
             result.warnings
         );
     }
+
+    #[test]
+    fn vs_destination_port_name_isolates_services_by_namespace() {
+        // Two services named `reviews` in different namespaces with the same
+        // port name but different port numbers; lookup must resolve against
+        // the namespace embedded in the destination host, not the first match.
+        let svc_default = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let svc_prod = service_with_named_ports("reviews", "prod", &[("http", 9090)]);
+        let vs_default = virtual_service_with_destination(
+            "reviews-default",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "port": {"name": "http"}
+            }),
+        );
+        let mut vs_prod = virtual_service_with_destination(
+            "reviews-prod",
+            serde_json::json!({
+                "host": "reviews.prod.svc.cluster.local",
+                "port": {"name": "http"}
+            }),
+        );
+        // Cross-namespace destination is allowed: VS in `default` pointing at
+        // a Service in `prod` — must resolve to the prod port number.
+        vs_prod.metadata.namespace = "default".to_string();
+        let result = translate_k8s_objects(
+            &[svc_default, svc_prod, vs_default, vs_prod],
+            options().with_source_namespaces(vec!["default".to_string(), "prod".to_string()]),
+        )
+        .expect("translation succeeds");
+        let default_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.id.contains("reviews-default"))
+            .expect("default-namespace proxy materialized");
+        let prod_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.id.contains("reviews-prod"))
+            .expect("prod-namespace proxy materialized");
+        assert_eq!(default_proxy.backend_port, 8080);
+        assert_eq!(prod_proxy.backend_port, 9090);
+    }
+
+    #[test]
+    fn vs_destination_short_host_isolates_services_by_vs_namespace() {
+        // Short host (`reviews`) must inherit the VS's own namespace, NOT the
+        // first matching service in any namespace. Two services with the same
+        // name in different namespaces; the short-host VS in `prod` must pick
+        // the `prod` service.
+        let svc_default = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let svc_prod = service_with_named_ports("reviews", "prod", &[("http", 9090)]);
+        let mut vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews",
+                "port": {"name": "http"}
+            }),
+        );
+        vs.metadata.namespace = "prod".to_string();
+        let result = translate_k8s_objects(
+            &[svc_default, svc_prod, vs],
+            options().with_source_namespaces(vec!["default".to_string(), "prod".to_string()]),
+        )
+        .expect("translation succeeds");
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].backend_port, 9090);
+    }
+
+    #[test]
+    fn service_with_unnamed_ports_does_not_panic_and_lookup_misses() {
+        // K8s allows Service ports without a `name` field. Those entries are
+        // silently skipped by the indexer (no panic, no error). A VS that
+        // references such a Service by port name must still fail closed
+        // because the name was never indexed.
+        let svc = K8sObject {
+            api_version: "v1".to_string(),
+            kind: "Service".to_string(),
+            metadata: K8sMetadata {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                labels: HashMap::new(),
+            },
+            spec: serde_json::json!({
+                "ports": [
+                    {"port": 8080},                           // no name
+                    {"name": "grpc", "port": 9090}            // named entry survives
+                ]
+            }),
+        };
+        let vs_missing = virtual_service_with_destination(
+            "vs-missing",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "port": {"name": "http"}
+            }),
+        );
+        let err = translate_k8s_objects(&[svc.clone(), vs_missing], options())
+            .expect_err("unnamed Service ports must not satisfy a name lookup");
+        assert!(
+            err.to_string().contains("http"),
+            "error must name the missing port: {err}"
+        );
+
+        // The named entry is still indexed and resolvable.
+        let vs_grpc = virtual_service_with_destination(
+            "vs-grpc",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "port": {"name": "grpc"}
+            }),
+        );
+        let result =
+            translate_k8s_objects(&[svc, vs_grpc], options()).expect("named entry still resolves");
+        assert_eq!(result.config.proxies[0].backend_port, 9090);
+    }
+
+    #[test]
+    fn service_with_no_ports_field_does_not_panic() {
+        // Service objects with no `spec.ports` array at all must not panic
+        // the pre-pass — we just index an empty entry.
+        let svc = K8sObject {
+            api_version: "v1".to_string(),
+            kind: "Service".to_string(),
+            metadata: K8sMetadata {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                labels: HashMap::new(),
+            },
+            spec: serde_json::json!({}),
+        };
+        let result =
+            translate_k8s_objects(&[svc], options()).expect("Service with no ports must not panic");
+        assert!(result.config.proxies.is_empty());
+    }
+
+    #[test]
+    fn vs_destination_port_name_resolves_with_trailing_dot_fqdn() {
+        // Trailing dot is a valid DNS-FQDN form (root anchor); the host parser
+        // must treat `reviews.default.svc.cluster.local.` the same as the
+        // non-anchored FQDN. Otherwise hand-written Istio configs that copy
+        // from `dig` output fail closed for no good reason.
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local.",
+                "port": {"name": "http"}
+            }),
+        );
+        let result = translate_k8s_objects(&[svc, vs], options()).expect("translation succeeds");
+        assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn vs_destination_port_name_resolves_with_svc_only_suffix() {
+        // `<svc>.<ns>.svc` (no cluster domain) is another canonical short
+        // form Istio docs reference — the parser must take only the first
+        // two labels and discard the `.svc` suffix.
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews.default.svc",
+                "port": {"name": "http"}
+            }),
+        );
+        let result = translate_k8s_objects(&[svc, vs], options()).expect("translation succeeds");
+        assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn service_objects_are_processed_regardless_of_input_order() {
+        // The pre-pass design must tolerate arbitrary input order — a
+        // VirtualService that appears BEFORE its Service in the input slice
+        // must still resolve the port name. Two-pass translation guarantees
+        // this, but a regression to single-pass would silently fail closed.
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "port": {"name": "http"}
+            }),
+        );
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let result = translate_k8s_objects(&[vs, svc], options()).expect("translation succeeds");
+        assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
 }
