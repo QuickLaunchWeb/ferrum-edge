@@ -695,3 +695,380 @@ async fn test_all_mode_redacts_sibling_fields_when_choices_present() {
         v["extra"]
     );
 }
+
+// ─── SSE / streaming response support ────────────────────────────────
+
+fn sse_headers() -> HashMap<String, String> {
+    let mut h = HashMap::new();
+    h.insert("content-type".to_string(), "text/event-stream".to_string());
+    h
+}
+
+fn openai_sse_body(chunks: &[&str]) -> Vec<u8> {
+    let mut body = String::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let frame = json!({
+            "id": format!("chatcmpl-{}", i),
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": serde_json::Value::Null}]
+        });
+        body.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::to_string(&frame).unwrap()
+        ));
+    }
+    body.push_str("data: [DONE]\n\n");
+    body.into_bytes()
+}
+
+#[tokio::test]
+async fn test_sse_pii_detection_reject() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    let body = openai_sse_body(&["Your SSN is ", "123-45-6789", " ok?"]);
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+        .await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("pii:ssn"));
+        }
+        _ => panic!("Expected Reject for SSE with SSN, got {:?}", result),
+    }
+}
+
+#[tokio::test]
+async fn test_sse_pii_detection_warn() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "warn"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    let body = openai_sse_body(&["Contact ", "admin@secret.com", " now"]);
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        ctx.metadata.contains_key("ai_response_guard_detected"),
+        "warn mode should set detected metadata"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_pii_redaction() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "redact"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    let body = openai_sse_body(&["Email: user@example.com please"]);
+
+    // on_response_body marks for redaction
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
+
+    // transform_response_body actually redacts
+    let transformed = plugin
+        .transform_response_body(&body, Some("text/event-stream"), &sse_headers())
+        .await;
+    let transformed = transformed.expect("expected redacted SSE body");
+    let transformed_str = String::from_utf8(transformed).unwrap();
+    assert!(
+        !transformed_str.contains("user@example.com"),
+        "email should be removed"
+    );
+    assert!(
+        transformed_str.contains("[REDACTED:pii:email]"),
+        "should contain redaction placeholder"
+    );
+    assert!(
+        transformed_str.contains("data: "),
+        "SSE framing must be preserved"
+    );
+    assert!(
+        transformed_str.contains("[DONE]"),
+        "[DONE] sentinel must be preserved"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_clean_response_passes() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn", "credit_card"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    let body = openai_sse_body(&["The weather ", "is nice today"]);
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn test_sse_max_completion_length_across_deltas() {
+    let plugin = make_plugin(json!({
+        "max_completion_length": 10,
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    // Each chunk is short, but concatenated they exceed 10 chars
+    let body = openai_sse_body(&["Hello ", "wonderful ", "world!"]);
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "accumulated text exceeds max_completion_length"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_anthropic_streaming_format() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    let mut body = String::new();
+    // Anthropic content_block_delta frames
+    for text in &["Your SSN is ", "123-45-6789"] {
+        let frame = json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text}
+        });
+        body.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::to_string(&frame).unwrap()
+        ));
+    }
+    body.push_str("data: {\"type\":\"message_stop\"}\n\n");
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "Anthropic SSE with SSN should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_anthropic_redaction() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "redact"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    let frame = json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": "email me at bob@corp.io"}
+    });
+    let body_str = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(&frame).unwrap()
+    );
+    let body = body_str.as_bytes();
+
+    let _ = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), body)
+        .await;
+    let transformed = plugin
+        .transform_response_body(body, Some("text/event-stream"), &sse_headers())
+        .await
+        .expect("expected redacted body");
+    let out = String::from_utf8(transformed).unwrap();
+    assert!(!out.contains("bob@corp.io"));
+    assert!(out.contains("[REDACTED:pii:email]"));
+}
+
+#[tokio::test]
+async fn test_sse_gemini_streaming_format() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["credit_card"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    let mut body = String::new();
+    for text in &["Card number: ", "4111-1111-1111-1111"] {
+        let frame = json!({
+            "candidates": [{"content": {"parts": [{"text": text}]}}]
+        });
+        body.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::to_string(&frame).unwrap()
+        ));
+    }
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "Gemini SSE with credit card should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_scan_all_mode() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ip_address"],
+        "scan_fields": "all",
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    // IP address appears in a non-content field within the SSE body
+    let frame = json!({"metadata": {"source_ip": "192.168.1.1"}, "choices": [{"delta": {"content": "hi"}}]});
+    let body = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(&frame).unwrap()
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "scan_all mode should detect PII anywhere in SSE body"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_scan_all_redaction() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ip_address"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    let frame =
+        json!({"extra": "see 10.0.0.1", "choices": [{"delta": {"content": "IP: 8.8.8.8"}}]});
+    let body = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(&frame).unwrap()
+    );
+
+    let _ = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+        .await;
+    let transformed = plugin
+        .transform_response_body(body.as_bytes(), Some("text/event-stream"), &sse_headers())
+        .await
+        .expect("expected redacted body");
+    let out = String::from_utf8(transformed).unwrap();
+    assert!(!out.contains("10.0.0.1"));
+    assert!(!out.contains("8.8.8.8"));
+    assert!(out.contains("[REDACTED:pii:ip_address]"));
+}
+
+#[tokio::test]
+async fn test_sse_blocked_phrase_detection() {
+    let plugin = make_plugin(json!({
+        "blocked_phrases": ["harmful content"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    let body = openai_sse_body(&["This has ", "harmful content", " in it"]);
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+}
+
+#[tokio::test]
+async fn test_sse_error_status_skipped() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    let body = openai_sse_body(&["SSN: 123-45-6789"]);
+
+    let result = plugin
+        .on_response_body(&mut ctx, 500, &sse_headers(), &body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn test_sse_empty_frames_pass() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    let body = b"data: [DONE]\n\n";
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn test_sse_redaction_preserves_non_content_frames() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "redact"
+    }));
+
+    // Frame 1 has no content, frame 2 has PII
+    let frame1 = json!({"choices": [{"index": 0, "delta": {"role": "assistant"}}]});
+    let frame2 = json!({"choices": [{"index": 0, "delta": {"content": "hi user@test.io"}}]});
+    let body = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(&frame1).unwrap(),
+        serde_json::to_string(&frame2).unwrap()
+    );
+
+    let transformed = plugin
+        .transform_response_body(body.as_bytes(), Some("text/event-stream"), &HashMap::new())
+        .await
+        .expect("expected redacted body");
+    let out = String::from_utf8(transformed).unwrap();
+
+    // First frame (role-only) should still be present
+    assert!(out.contains("\"role\":\"assistant\""));
+    // Second frame should be redacted
+    assert!(!out.contains("user@test.io"));
+    assert!(out.contains("[REDACTED:pii:email]"));
+}
+
+#[tokio::test]
+async fn test_sse_no_redaction_returns_none() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "redact"
+    }));
+    let body = openai_sse_body(&["The weather is nice"]);
+
+    let transformed = plugin
+        .transform_response_body(&body, Some("text/event-stream"), &HashMap::new())
+        .await;
+    assert!(
+        transformed.is_none(),
+        "no modification expected when no PII present"
+    );
+}

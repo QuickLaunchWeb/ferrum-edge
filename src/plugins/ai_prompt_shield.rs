@@ -431,18 +431,30 @@ impl Plugin for AiPromptShield {
             return PluginResult::Continue;
         }
 
+        // Parse JSON once for streaming detection and content-mode PII scanning.
+        let json_parsed = serde_json::from_str::<Value>(body).ok();
+
+        // Check streaming intent — defer the metadata insert until after `body`
+        // (which borrows from `ctx.metadata`) is no longer needed.
+        let is_streaming_request = json_parsed
+            .as_ref()
+            .is_some_and(|json| json.get("stream").and_then(|s| s.as_bool()) == Some(true));
+
         // Detect PII
         let detected = if self.scan_mode == ScanMode::All {
             self.detect_pii_in_str(body)
+        } else if let Some(ref json) = json_parsed {
+            let texts = self.extract_scan_text(json);
+            self.detect_pii(&texts)
         } else {
-            match serde_json::from_str::<Value>(body) {
-                Ok(json) => {
-                    let texts = self.extract_scan_text(&json);
-                    self.detect_pii(&texts)
-                }
-                Err(_) => return PluginResult::Continue,
-            }
+            return PluginResult::Continue;
         };
+
+        // `body` borrow released — safe to mutate ctx.metadata now.
+        if is_streaming_request {
+            ctx.metadata
+                .insert("ai_request_streaming".to_string(), "true".to_string());
+        }
 
         if detected.is_empty() {
             return PluginResult::Continue;
