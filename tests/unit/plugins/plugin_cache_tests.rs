@@ -2096,3 +2096,674 @@ fn test_disabled_proxy_group_plugin_excluded() {
     let plugins = cache.get_plugins("p1");
     assert_eq!(plugins.len(), 0);
 }
+
+// ---- Construction tests ----
+
+#[test]
+fn test_empty_config_produces_empty_cache() {
+    let config = make_config(vec![], vec![]);
+    let cache = PluginCache::new(&config).unwrap();
+
+    assert_eq!(cache.proxy_count(), 0);
+    // Unknown proxy falls back to globals, which are also empty
+    let plugins = cache.get_plugins("nonexistent");
+    assert_eq!(plugins.len(), 0);
+    assert!(!cache.requires_response_body_buffering("nonexistent"));
+    assert!(!cache.requires_request_body_buffering("nonexistent"));
+    assert!(!cache.requires_ws_frame_hooks("nonexistent"));
+}
+
+#[test]
+fn test_single_proxy_single_plugin_cached() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "cors",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    assert_eq!(cache.proxy_count(), 1);
+    let plugins = cache.get_plugins("p1");
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].name(), "cors");
+}
+
+#[test]
+fn test_multiple_proxies_with_different_plugins() {
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["ps1"]),
+            make_proxy("p2", "/web", vec!["ps2"]),
+        ],
+        vec![
+            make_plugin_config("ps1", "cors", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config("ps2", "rate_limiting", PluginScope::Proxy, Some("p2"), true),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    assert_eq!(cache.proxy_count(), 2);
+
+    let p1_plugins = cache.get_plugins("p1");
+    assert_eq!(p1_plugins.len(), 1);
+    assert_eq!(p1_plugins[0].name(), "cors");
+
+    let p2_plugins = cache.get_plugins("p2");
+    assert_eq!(p2_plugins.len(), 1);
+    assert_eq!(p2_plugins[0].name(), "rate_limiting");
+}
+
+// ---- Protocol filtering: TCP-only / UDP-only exclusion ----
+
+#[test]
+fn test_tcp_only_plugin_excluded_from_http() {
+    // tcp_connection_throttle supports TCP_ONLY_PROTOCOLS
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "tcp_connection_throttle",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    // tcp_connection_throttle should be in the unfiltered list
+    let all = cache.get_plugins("p1");
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].name(), "tcp_connection_throttle");
+
+    // HTTP should NOT include tcp_connection_throttle
+    let http_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    assert_eq!(
+        http_plugins.len(),
+        0,
+        "tcp_connection_throttle must be excluded from HTTP"
+    );
+
+    // gRPC should NOT include tcp_connection_throttle
+    let grpc_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Grpc);
+    assert_eq!(
+        grpc_plugins.len(),
+        0,
+        "tcp_connection_throttle must be excluded from gRPC"
+    );
+
+    // WebSocket should NOT include tcp_connection_throttle
+    let ws_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+    assert_eq!(
+        ws_plugins.len(),
+        0,
+        "tcp_connection_throttle must be excluded from WebSocket"
+    );
+
+    // UDP should NOT include tcp_connection_throttle
+    let udp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Udp);
+    assert_eq!(
+        udp_plugins.len(),
+        0,
+        "tcp_connection_throttle must be excluded from UDP"
+    );
+
+    // TCP SHOULD include tcp_connection_throttle
+    let tcp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    assert_eq!(tcp_plugins.len(), 1);
+    assert_eq!(tcp_plugins[0].name(), "tcp_connection_throttle");
+}
+
+#[test]
+fn test_udp_only_plugin_included_for_udp_excluded_from_others() {
+    // udp_rate_limiting supports UDP_ONLY_PROTOCOLS
+    let config = make_config(
+        vec![make_proxy("p1", "/udp-svc", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "udp_rate_limiting",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    // UDP should include udp_rate_limiting
+    let udp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Udp);
+    assert_eq!(udp_plugins.len(), 1);
+    assert_eq!(udp_plugins[0].name(), "udp_rate_limiting");
+
+    // HTTP should NOT include udp_rate_limiting
+    let http_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    assert_eq!(
+        http_plugins.len(),
+        0,
+        "udp_rate_limiting must be excluded from HTTP"
+    );
+
+    // TCP should NOT include udp_rate_limiting
+    let tcp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    assert_eq!(
+        tcp_plugins.len(),
+        0,
+        "udp_rate_limiting must be excluded from TCP"
+    );
+
+    // gRPC should NOT include udp_rate_limiting
+    let grpc_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Grpc);
+    assert_eq!(
+        grpc_plugins.len(),
+        0,
+        "udp_rate_limiting must be excluded from gRPC"
+    );
+}
+
+#[test]
+fn test_all_protocols_plugin_included_for_all_protocol_types() {
+    // stdout_logging supports ALL_PROTOCOLS
+    let config = make_config(
+        vec![make_proxy("p1", "/svc", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "stdout_logging",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    for protocol in &[
+        ProxyProtocol::Http,
+        ProxyProtocol::Grpc,
+        ProxyProtocol::WebSocket,
+        ProxyProtocol::Tcp,
+        ProxyProtocol::Udp,
+    ] {
+        let plugins = cache.get_plugins_for_protocol("p1", *protocol);
+        assert_eq!(
+            plugins.len(),
+            1,
+            "stdout_logging (ALL_PROTOCOLS) must be included for {:?}",
+            protocol
+        );
+        assert_eq!(plugins[0].name(), "stdout_logging");
+    }
+}
+
+#[test]
+fn test_mixed_protocol_plugins_filtered_correctly_per_protocol() {
+    // tcp_connection_throttle = TCP_ONLY, udp_rate_limiting = UDP_ONLY,
+    // cors = HTTP_ONLY, stdout_logging = ALL_PROTOCOLS
+    let config = make_config(
+        vec![make_proxy("p1", "/svc", vec!["ps1", "ps2", "ps3", "ps4"])],
+        vec![
+            make_plugin_config(
+                "ps1",
+                "tcp_connection_throttle",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "ps2",
+                "udp_rate_limiting",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config("ps3", "cors", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "ps4",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    // HTTP: only cors + stdout_logging
+    let http = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let http_names: Vec<&str> = http.iter().map(|p| p.name()).collect();
+    assert!(http_names.contains(&"cors"));
+    assert!(http_names.contains(&"stdout_logging"));
+    assert!(!http_names.contains(&"tcp_connection_throttle"));
+    assert!(!http_names.contains(&"udp_rate_limiting"));
+    assert_eq!(http_names.len(), 2);
+
+    // TCP: only tcp_connection_throttle + stdout_logging
+    let tcp = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let tcp_names: Vec<&str> = tcp.iter().map(|p| p.name()).collect();
+    assert!(tcp_names.contains(&"tcp_connection_throttle"));
+    assert!(tcp_names.contains(&"stdout_logging"));
+    assert!(!tcp_names.contains(&"cors"));
+    assert!(!tcp_names.contains(&"udp_rate_limiting"));
+    assert_eq!(tcp_names.len(), 2);
+
+    // UDP: only udp_rate_limiting + stdout_logging
+    let udp = cache.get_plugins_for_protocol("p1", ProxyProtocol::Udp);
+    let udp_names: Vec<&str> = udp.iter().map(|p| p.name()).collect();
+    assert!(udp_names.contains(&"udp_rate_limiting"));
+    assert!(udp_names.contains(&"stdout_logging"));
+    assert!(!udp_names.contains(&"cors"));
+    assert!(!udp_names.contains(&"tcp_connection_throttle"));
+    assert_eq!(udp_names.len(), 2);
+}
+
+// ---- Body buffering flag tests ----
+
+#[test]
+fn test_no_body_buffering_plugins_returns_false() {
+    // stdout_logging does not require any body buffering
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "stdout_logging",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    assert!(
+        !cache.requires_request_body_buffering("p1"),
+        "stdout_logging should not require request body buffering"
+    );
+    assert!(
+        !cache.requires_response_body_buffering("p1"),
+        "stdout_logging should not require response body buffering"
+    );
+}
+
+#[test]
+fn test_body_validator_requires_request_body_buffering() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config_with_json(
+            "ps1",
+            "body_validator",
+            json!({"validate_xml": true}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    assert!(
+        cache.requires_request_body_buffering("p1"),
+        "body_validator with request validation should require request body buffering"
+    );
+}
+
+#[test]
+fn test_response_caching_requires_response_body_buffering() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config_with_json(
+            "ps1",
+            "response_caching",
+            json!({"ttl_seconds": 60}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    assert!(
+        cache.requires_response_body_buffering("p1"),
+        "response_caching should require response body buffering"
+    );
+}
+
+#[test]
+fn test_buffering_flags_use_global_fallback_for_unknown_proxy() {
+    // Global response_caching should make the fallback return true
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "g1",
+            "response_caching",
+            json!({"ttl_seconds": 60}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    // Unknown proxy uses global fallback
+    assert!(
+        cache.requires_response_body_buffering("unknown"),
+        "unknown proxy should use global fallback for response buffering"
+    );
+}
+
+// ---- Metadata flag tests ----
+
+#[test]
+fn test_modifies_request_headers_flag_computed() {
+    // request_transformer with header rules modifies request headers
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "request_transformer",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    assert!(
+        caps.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS),
+        "request_transformer should set MODIFIES_REQUEST_HEADERS"
+    );
+}
+
+#[test]
+fn test_modifies_request_headers_flag_false_when_no_plugin_modifies() {
+    // stdout_logging does not modify request headers
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "stdout_logging",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    assert!(
+        !caps.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS),
+        "stdout_logging should not set MODIFIES_REQUEST_HEADERS"
+    );
+}
+
+#[test]
+fn test_requires_udp_datagram_hooks_flag_with_udp_rate_limiting() {
+    // udp_rate_limiting returns true for requires_udp_datagram_hooks()
+    let config = make_config(
+        vec![make_proxy("p1", "/udp-svc", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "udp_rate_limiting",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    // The unfiltered plugin list should contain udp_rate_limiting
+    let all = cache.get_plugins("p1");
+    assert_eq!(all.len(), 1);
+    assert!(
+        all[0].requires_udp_datagram_hooks(),
+        "udp_rate_limiting must opt into UDP datagram hooks"
+    );
+}
+
+#[test]
+fn test_requires_udp_datagram_hooks_false_for_non_udp_plugin() {
+    // stdout_logging does not opt into UDP datagram hooks
+    let config = make_config(
+        vec![make_proxy("p1", "/svc", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "stdout_logging",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let all = cache.get_plugins("p1");
+    assert_eq!(all.len(), 1);
+    assert!(
+        !all[0].requires_udp_datagram_hooks(),
+        "stdout_logging must not opt into UDP datagram hooks"
+    );
+}
+
+// ---- Auth plugin phase data precomputation ----
+
+#[test]
+fn test_auth_plugins_precomputed_for_protocol() {
+    // key_auth is an auth plugin (HTTP_FAMILY), should be in auth_plugins for HTTP
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1", "ps2"])],
+        vec![
+            make_plugin_config("ps1", "key_auth", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "ps2",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let auth = cache.get_auth_plugins("p1", ProxyProtocol::Http);
+    assert_eq!(auth.len(), 1);
+    assert_eq!(auth[0].name(), "key_auth");
+
+    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    assert!(
+        caps.has(PluginCapabilities::HAS_AUTH_PLUGINS),
+        "key_auth should set HAS_AUTH_PLUGINS"
+    );
+
+    // TCP should not have key_auth (HTTP_FAMILY only)
+    let tcp_auth = cache.get_auth_plugins("p1", ProxyProtocol::Tcp);
+    assert_eq!(
+        tcp_auth.len(),
+        0,
+        "key_auth must not appear in TCP auth plugins"
+    );
+}
+
+// ---- Scope resolution edge cases ----
+
+#[test]
+fn test_proxy_group_only_applies_to_associated_proxies() {
+    // p1 is associated, p2 is not, p3 is associated
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["group1"]),
+            make_proxy("p2", "/web", vec![]),
+            make_proxy("p3", "/admin", vec!["group1"]),
+        ],
+        vec![make_plugin_config(
+            "group1",
+            "rate_limiting",
+            PluginScope::ProxyGroup,
+            None,
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    // p1 and p3 should have the group plugin
+    let p1 = cache.get_plugins("p1");
+    assert_eq!(p1.len(), 1);
+    assert_eq!(p1[0].name(), "rate_limiting");
+
+    let p3 = cache.get_plugins("p3");
+    assert_eq!(p3.len(), 1);
+    assert_eq!(p3[0].name(), "rate_limiting");
+
+    // p2 should have no plugins (no global, no association)
+    let p2 = cache.get_plugins("p2");
+    assert_eq!(
+        p2.len(),
+        0,
+        "proxy without group association must not receive group plugin"
+    );
+
+    // p1 and p3 should share the same Arc instance
+    let p1_ptr = Arc::as_ptr(&p1[0]) as *const () as usize;
+    let p3_ptr = Arc::as_ptr(&p3[0]) as *const () as usize;
+    assert_eq!(
+        p1_ptr, p3_ptr,
+        "proxy-group plugin must be shared across associated proxies"
+    );
+}
+
+#[test]
+fn test_proxy_scoped_overrides_global_for_specific_proxy_only() {
+    // Global cors, proxy-scoped cors on p1 only — p2 should keep global
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["ps1"]),
+            make_proxy("p2", "/web", vec![]),
+        ],
+        vec![
+            make_plugin_config("g1", "cors", PluginScope::Global, None, true),
+            make_plugin_config("ps1", "cors", PluginScope::Proxy, Some("p1"), true),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let p1 = cache.get_plugins("p1");
+    let p2 = cache.get_plugins("p2");
+
+    // Both should have exactly one cors plugin
+    assert_eq!(p1.len(), 1);
+    assert_eq!(p1[0].name(), "cors");
+    assert_eq!(p2.len(), 1);
+    assert_eq!(p2[0].name(), "cors");
+
+    // But they should be different instances (proxy-scoped vs global)
+    let p1_ptr = Arc::as_ptr(&p1[0]) as *const () as usize;
+    let p2_ptr = Arc::as_ptr(&p2[0]) as *const () as usize;
+    assert_ne!(
+        p1_ptr, p2_ptr,
+        "p1 should have proxy-scoped cors, p2 should have global cors"
+    );
+}
+
+// ---- Request view consistency ----
+
+#[test]
+fn test_request_view_contains_all_precomputed_fields() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1", "ps2", "ps3"])],
+        vec![
+            make_plugin_config("ps1", "key_auth", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "ps2",
+                "request_transformer",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "ps3",
+                "response_caching",
+                json!({"ttl_seconds": 60}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let view = cache.request_view("p1", ProxyProtocol::Http);
+
+    // Plugins should be filtered for HTTP protocol
+    let plugins = view.plugins();
+    let names: Vec<&str> = plugins.iter().map(|p| p.name()).collect();
+    assert!(names.contains(&"key_auth"));
+    assert!(names.contains(&"request_transformer"));
+    assert!(names.contains(&"response_caching"));
+
+    // Auth plugins precomputed
+    let auth = view.auth_plugins();
+    assert_eq!(auth.len(), 1);
+    assert_eq!(auth[0].name(), "key_auth");
+
+    // Capabilities
+    assert!(
+        view.capabilities()
+            .has(PluginCapabilities::MODIFIES_REQUEST_HEADERS)
+    );
+    assert!(
+        view.capabilities()
+            .has(PluginCapabilities::HAS_AUTH_PLUGINS)
+    );
+
+    // Buffering flags
+    assert!(view.requires_response_body_buffering());
+    assert!(!view.requires_ws_frame_hooks());
+}
+
+// ---- Priority with default vs override ----
+
+#[test]
+fn test_default_priority_used_when_no_override() {
+    // cors has default priority 100, key_auth has default priority 1200
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1", "ps2"])],
+        vec![
+            make_plugin_config("ps1", "key_auth", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config("ps2", "cors", PluginScope::Proxy, Some("p1"), true),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 2);
+    // cors (100) should come before key_auth (1200)
+    assert_eq!(plugins[0].name(), "cors");
+    assert_eq!(plugins[1].name(), "key_auth");
+}
+
+#[test]
+fn test_priority_override_reverses_default_order() {
+    // Give cors a higher priority number than key_auth via override
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1", "ps2"])],
+        vec![
+            make_plugin_config_with_priority(
+                "ps1",
+                "key_auth",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+                Some(50), // lower than cors's default
+            ),
+            make_plugin_config_with_priority(
+                "ps2",
+                "cors",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+                Some(5000), // higher than key_auth's override
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 2);
+    // key_auth (50) should now come before cors (5000)
+    assert_eq!(plugins[0].name(), "key_auth");
+    assert_eq!(plugins[0].priority(), 50);
+    assert_eq!(plugins[1].name(), "cors");
+    assert_eq!(plugins[1].priority(), 5000);
+}
