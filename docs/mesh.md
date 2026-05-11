@@ -849,6 +849,7 @@ The following Istio mesh surfaces are **not yet supported** and should be treate
 | IP-range capture exclusions (`excludeOutboundIPRanges`, `includeOutboundIPRanges`) | Deferred | |
 | `Service.spec.ports[].name` resolution | Deferred | Use numeric ports in backendRefs and VirtualService destinations |
 | `WorkloadEntry` beyond address/labels/network/cluster | Partial | Basic fields supported; full VM lifecycle deferred |
+| `Telemetry.tracing[].providers[]` span emission | Partial | Provider config (zipkin/datadog/lightstep/opentelemetry) is captured into the mesh slice and merged into the `workload_metrics` plugin as `tracing_provider`, but span emission to provider backends is not yet wired — sink-plugin follow-up. Only the first `providers[]` entry is surfaced; multi-provider fan-out is deferred. Provider lookup against `meshConfig.extensionProviders` / `meshConfig.defaultProviders` is deferred — provider type comes from the inline `name` (e.g. `zipkin`) and required URL/endpoint fields live on the provider entry itself. `Telemetry.tracing[].disableSpanReporting` and per-tag `CLIENT`/`SERVER` modes are deferred. |
 
 ## Environment Variables
 

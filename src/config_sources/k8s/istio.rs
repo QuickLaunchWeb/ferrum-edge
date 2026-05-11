@@ -1353,7 +1353,17 @@ fn telemetry_tracing_provider(
             TracingProvider::Zipkin { url }
         }
         "datadog" => {
-            let agent_url = telemetry_provider_string_field(object, first, "datadog", "agent_url")?;
+            // K8s/Istio CRDs use camelCase, matching the rest of the translator
+            // (`randomSamplingPercentage`, `customTags`, ...). The trailing
+            // snake_case alias preserves the original PR field name so any
+            // operator manifest written against the first draft still applies.
+            let agent_url = telemetry_provider_string_field_aliased(
+                object,
+                first,
+                "datadog",
+                "agentUrl",
+                &["agent_url"],
+            )?;
             let service = first
                 .get("service")
                 .and_then(Value::as_str)
@@ -1361,10 +1371,20 @@ fn telemetry_tracing_provider(
             TracingProvider::Datadog { agent_url, service }
         }
         "lightstep" => {
-            let collector_url =
-                telemetry_provider_string_field(object, first, "lightstep", "collector_url")?;
-            let access_token =
-                telemetry_provider_string_field(object, first, "lightstep", "access_token")?;
+            let collector_url = telemetry_provider_string_field_aliased(
+                object,
+                first,
+                "lightstep",
+                "collectorUrl",
+                &["collector_url"],
+            )?;
+            let access_token = telemetry_provider_string_field_aliased(
+                object,
+                first,
+                "lightstep",
+                "accessToken",
+                &["access_token"],
+            )?;
             TracingProvider::Lightstep {
                 collector_url,
                 access_token,
@@ -1393,11 +1413,27 @@ fn telemetry_provider_string_field(
     provider_name: &str,
     field: &str,
 ) -> Result<String, K8sTranslateError> {
-    entry
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
+    telemetry_provider_string_field_aliased(object, entry, provider_name, field, &[])
+}
+
+/// Read a required string field, trying the canonical (camelCase) name first
+/// then any provided aliases. Non-empty after trim is required.
+fn telemetry_provider_string_field_aliased(
+    object: &K8sObject,
+    entry: &Value,
+    provider_name: &str,
+    field: &str,
+    aliases: &[&str],
+) -> Result<String, K8sTranslateError> {
+    std::iter::once(field)
+        .chain(aliases.iter().copied())
+        .find_map(|name| {
+            entry
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+        })
         .ok_or_else(|| {
             invalid_resource(
                 object,
@@ -2807,7 +2843,7 @@ mod tests {
                     "tracing": [{
                         "providers": [{
                             "name": "datadog",
-                            "agent_url": "http://datadog-agent:8126",
+                            "agentUrl": "http://datadog-agent:8126",
                             "service": "reviews"
                         }]
                     }]
@@ -2833,6 +2869,71 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_tracing_datadog_snake_case_alias_still_accepted() {
+        // Backward compat: operators who wrote against the first draft used
+        // `agent_url`. The translator accepts both spellings so manifests
+        // captured before the camelCase canonicalisation keep working.
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "datadog",
+                            "agent_url": "http://datadog-agent:8126"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        match tracing.provider.as_ref().expect("provider translated") {
+            TracingProvider::Datadog { agent_url, service } => {
+                assert_eq!(agent_url, "http://datadog-agent:8126");
+                assert!(service.is_none(), "service omitted in manifest");
+            }
+            other => panic!("expected Datadog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telemetry_tracing_datadog_missing_agent_url_fails_closed() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "datadog",
+                            "service": "reviews"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("missing required field should fail closed");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("datadog"),
+            "error must mention provider: {msg}"
+        );
+        assert!(
+            msg.contains("agentUrl"),
+            "error must mention missing field: {msg}"
+        );
+    }
+
+    #[test]
     fn telemetry_tracing_lightstep_provider_translates() {
         let result = translate_k8s_objects(
             &[object(
@@ -2841,8 +2942,8 @@ mod tests {
                     "tracing": [{
                         "providers": [{
                             "name": "lightstep",
-                            "collector_url": "https://ingest.lightstep.com:443",
-                            "access_token": "secret-token"
+                            "collectorUrl": "https://ingest.lightstep.com:443",
+                            "accessToken": "secret-token"
                         }]
                     }]
                 }),
@@ -2955,6 +3056,88 @@ mod tests {
         assert!(
             msg.contains("not a supported provider"),
             "error must explain the kind is unsupported: {msg}"
+        );
+    }
+
+    #[test]
+    fn telemetry_tracing_multiple_providers_takes_first() {
+        // Istio's Telemetry CRD allows `providers[]` to list multiple entries.
+        // Multi-provider fan-out is deferred; today we surface only the first
+        // entry. This test pins that behavior so the limitation cannot drift
+        // silently as later providers (Stackdriver/SkyWalking) are added — a
+        // future change that needs to surface every entry should also update
+        // this test.
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [
+                            {
+                                "name": "zipkin",
+                                "url": "http://zipkin.istio-system:9411/api/v2/spans"
+                            },
+                            {
+                                "name": "datadog",
+                                "agentUrl": "http://datadog-agent:8126"
+                            }
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        match tracing.provider.as_ref().expect("provider translated") {
+            TracingProvider::Zipkin { url } => {
+                assert_eq!(url, "http://zipkin.istio-system:9411/api/v2/spans");
+            }
+            other => panic!("expected first-entry Zipkin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telemetry_tracing_provider_without_sampling_still_surfaces() {
+        // Provider configuration is independent from sampling. A Telemetry
+        // block with only `providers[]` (no `randomSamplingPercentage`)
+        // should still surface the provider — sampling is allowed to come
+        // from a less-specific Telemetry resource via merge_tracing_config.
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "zipkin",
+                            "url": "http://zipkin.istio-system:9411/api/v2/spans"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        assert!(
+            tracing.sampling_percentage.is_none(),
+            "sampling omitted in manifest"
+        );
+        assert!(
+            tracing.provider.is_some(),
+            "provider should surface independently of sampling"
         );
     }
 
