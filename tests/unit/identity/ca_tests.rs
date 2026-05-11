@@ -7,7 +7,7 @@
 
 use super::env_guard::EnvGuard;
 use ferrum_edge::identity::ca::{
-    CaError, CertificateAuthority, IssuanceRequest, bootstrap, internal,
+    CaBackend, CaError, CertificateAuthority, IssuanceRequest, bootstrap, internal,
 };
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 
@@ -270,4 +270,85 @@ fn internal_ca_rejects_multi_block_root_pem() {
         Ok(_) => panic!("expected CaError::Config(multi-block), got Ok"),
         Err(other) => panic!("expected CaError::Config, got {other:?}"),
     }
+}
+
+// ── CaBackend enum tests ──────────────────────────────────────────────
+
+#[test]
+fn ca_backend_parses_internal() {
+    assert_eq!(
+        CaBackend::from_str_lossy("internal").unwrap(),
+        CaBackend::Internal
+    );
+    assert_eq!(
+        CaBackend::from_str_lossy("INTERNAL").unwrap(),
+        CaBackend::Internal
+    );
+}
+
+#[test]
+fn ca_backend_parses_spire_variants() {
+    assert_eq!(
+        CaBackend::from_str_lossy("spire").unwrap(),
+        CaBackend::SpireAgent
+    );
+    assert_eq!(
+        CaBackend::from_str_lossy("spire_agent").unwrap(),
+        CaBackend::SpireAgent
+    );
+    assert_eq!(
+        CaBackend::from_str_lossy("spire-agent").unwrap(),
+        CaBackend::SpireAgent
+    );
+    assert_eq!(
+        CaBackend::from_str_lossy("SPIRE").unwrap(),
+        CaBackend::SpireAgent
+    );
+}
+
+#[test]
+fn ca_backend_parses_none() {
+    assert_eq!(CaBackend::from_str_lossy("none").unwrap(), CaBackend::None);
+    assert_eq!(CaBackend::from_str_lossy("").unwrap(), CaBackend::None);
+    assert_eq!(CaBackend::from_str_lossy("  ").unwrap(), CaBackend::None);
+}
+
+#[test]
+fn ca_backend_rejects_unknown() {
+    let result = CaBackend::from_str_lossy("vault");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("unknown"),
+        "error should describe unknown backend: {err}"
+    );
+}
+
+#[test]
+fn ca_backend_display() {
+    assert_eq!(CaBackend::Internal.to_string(), "internal");
+    assert_eq!(CaBackend::SpireAgent.to_string(), "spire");
+    assert_eq!(CaBackend::None.to_string(), "none");
+}
+
+#[test]
+fn ca_backend_default_is_none() {
+    assert_eq!(CaBackend::default(), CaBackend::None);
+}
+
+// ── SpireAgentCa config tests ─────────────────────────────────────────
+
+#[test]
+fn spire_agent_ca_config_default_socket_path() {
+    let cfg = ferrum_edge::identity::ca::spire::SpireAgentCaConfig::default();
+    assert_eq!(cfg.socket_path, "/run/spire/sockets/agent.sock");
+    assert_eq!(cfg.cert_ttl_secs, 3600);
+}
+
+#[test]
+fn spire_agent_ca_default_socket_constant() {
+    assert_eq!(
+        ferrum_edge::identity::ca::spire::DEFAULT_SPIRE_AGENT_SOCKET,
+        "/run/spire/sockets/agent.sock"
+    );
 }

@@ -31,7 +31,7 @@ pub mod workload_api;
 #[allow(unused_imports)]
 pub use attestation::{Attestor, PeerInfo, WorkloadIdentity};
 #[allow(unused_imports)]
-pub use ca::{CertificateAuthority, SharedCa};
+pub use ca::{CaBackend, CertificateAuthority, SharedCa};
 #[allow(unused_imports)]
 pub use spiffe::{SpiffeId, SpiffeIdError, TrustDomain, TrustDomainError};
 
