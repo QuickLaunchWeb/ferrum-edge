@@ -320,6 +320,7 @@ fn peer_authentication_requires_namespace() {
     let pa = PeerAuthentication {
         name: "pa".into(),
         namespace: String::new(),
+        scope: None,
         selector: None,
         mtls_mode: ferrum_edge::modes::mesh::config::MtlsMode::Strict,
         port_overrides: HashMap::new(),

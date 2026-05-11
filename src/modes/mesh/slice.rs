@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, HashMap};
 use crate::config::types::GatewayConfig;
 use crate::modes::mesh::config::{
     MeshDestinationRule, MeshPolicy, MeshRequestAuthentication, MeshService, MeshTelemetryResource,
-    MtlsMode, MultiClusterConfig, PeerAuthentication, ServiceEntry, TrustBundleSet, Workload,
-    WorkloadLabels, policy_scope_applies_to_workload, scope_applies_to_workload,
+    MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyScope, ServiceEntry, TrustBundleSet,
+    Workload, WorkloadLabels, policy_scope_applies_to_workload, scope_applies_to_workload,
     service_entry_applies_to_workload, workload_selector_matches,
 };
 
@@ -184,10 +184,7 @@ impl MeshSlice {
             .peer_authentications
             .iter()
             .filter(|peer_auth| {
-                peer_auth.namespace == namespace
-                    && peer_auth.selector.as_ref().is_none_or(|selector| {
-                        workload_selector_matches(selector, effective_namespace, &effective_labels)
-                    })
+                peer_auth_applies_to_workload(peer_auth, effective_namespace, &effective_labels)
             })
             .cloned()
             .collect();
@@ -243,11 +240,7 @@ impl MeshSlice {
 /// Scope tier used for PeerAuthentication precedence ranking.
 ///
 /// Higher discriminant wins. Istio semantics: WorkloadSelector > Namespace > MeshWide.
-/// `MeshWide` is not currently emitted by `classify_peer_auth_scope` because the
-/// slice pre-filters policies by namespace; retained for correctness and future
-/// root-namespace awareness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(dead_code)]
 enum PeerAuthScope {
     MeshWide = 0,
     Namespace = 1,
@@ -256,36 +249,34 @@ enum PeerAuthScope {
 
 /// Classify a [`PeerAuthentication`] into a scope tier for precedence ordering.
 fn classify_peer_auth_scope(pa: &PeerAuthentication) -> PeerAuthScope {
+    if let Some(scope) = &pa.scope {
+        return match scope {
+            PolicyScope::MeshWide => PeerAuthScope::MeshWide,
+            PolicyScope::Namespace { .. } => PeerAuthScope::Namespace,
+            PolicyScope::WorkloadSelector { .. } => PeerAuthScope::WorkloadSelector,
+        };
+    }
+
     match &pa.selector {
         Some(selector) if !selector.labels.is_empty() => PeerAuthScope::WorkloadSelector,
-        _ => {
-            // No selector (or empty labels) => namespace-scoped.
-            // Mesh-wide policies are namespace-scoped policies pushed from
-            // the root namespace; `from_gateway_config` already filters them
-            // into the slice. We differentiate mesh-wide by checking whether
-            // the policy has no selector at all (true mesh-wide) vs an empty-
-            // labels selector (namespace-scoped that matches any workload).
-            // Istio: mesh-wide is root-namespace + no selector; namespace is
-            // same-namespace + no selector. Since the slice already filters
-            // by namespace, both land here. A policy with `selector: None`
-            // whose namespace differs from the workload namespace would have
-            // been filtered out by `from_gateway_config`, so the only `None`
-            // selectors reaching this point are namespace-scoped or mesh-wide.
-            //
-            // For ordering correctness, namespace-scoped beats mesh-wide.
-            // The slice cannot reliably distinguish the two after filtering
-            // (the root-namespace origin is lost), but Istio guarantees at
-            // most one mesh-wide policy. When both exist, the namespace-scoped
-            // one should win. We use a heuristic: if the policy's namespace
-            // matches the slice namespace AND it has no selector, it could be
-            // either. To break the tie correctly we'd need the root namespace
-            // identity. Since the slice pre-filters, we treat all selector-
-            // less policies as Namespace scope (which is >= MeshWide), so a
-            // true mesh-wide policy from root-ns is overridden by the local
-            // namespace policy — correct behavior.
-            PeerAuthScope::Namespace
-        }
+        _ => PeerAuthScope::Namespace,
     }
+}
+
+fn peer_auth_applies_to_workload<L: WorkloadLabels + ?Sized>(
+    pa: &PeerAuthentication,
+    namespace: &str,
+    labels: &L,
+) -> bool {
+    if let Some(scope) = &pa.scope {
+        return scope_applies_to_workload(scope, namespace, labels);
+    }
+
+    pa.namespace == namespace
+        && pa
+            .selector
+            .as_ref()
+            .is_none_or(|selector| workload_selector_matches(selector, namespace, labels))
 }
 
 /// Resolve the effective mTLS mode for a given port from a set of
@@ -302,16 +293,7 @@ pub fn resolve_effective_mtls_mode<L: WorkloadLabels + ?Sized>(
     let mut best: Option<(PeerAuthScope, &PeerAuthentication)> = None;
 
     for pa in peer_auths {
-        // Only consider policies in the workload's namespace (should already
-        // be filtered by `from_gateway_config`, but defend in depth).
-        if pa.namespace != namespace {
-            continue;
-        }
-
-        // Check selector match.
-        if let Some(selector) = &pa.selector
-            && !workload_selector_matches(selector, namespace, labels)
-        {
+        if !peer_auth_applies_to_workload(pa, namespace, labels) {
             continue;
         }
 
@@ -428,6 +410,7 @@ mod tests {
         PeerAuthentication {
             name: name.into(),
             namespace: namespace.into(),
+            scope: None,
             selector,
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
@@ -1397,9 +1380,30 @@ mod tests {
         PeerAuthentication {
             name: name.to_string(),
             namespace: namespace.to_string(),
+            scope: None,
             selector,
             mtls_mode: mode,
             port_overrides,
+        }
+    }
+
+    fn pa_with_scope(
+        name: &str,
+        namespace: &str,
+        scope: PolicyScope,
+        mode: MtlsMode,
+    ) -> PeerAuthentication {
+        let selector = match &scope {
+            PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
+            PolicyScope::MeshWide | PolicyScope::Namespace { .. } => None,
+        };
+        PeerAuthentication {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            scope: Some(scope),
+            selector,
+            mtls_mode: mode,
+            port_overrides: HashMap::new(),
         }
     }
 
@@ -1456,23 +1460,20 @@ mod tests {
 
     #[test]
     fn namespace_scope_beats_mesh_wide_when_both_selector_none() {
-        // Both have selector: None. The one matching the workload namespace
-        // wins (both should, since they share the same namespace in the
-        // pre-filtered slice). First seen wins at the same scope tier.
         let policies = vec![
-            pa(
+            pa_with_scope(
                 "mesh-wide",
-                "default",
-                None,
+                "istio-system",
+                PolicyScope::MeshWide,
                 MtlsMode::Disable,
-                HashMap::new(),
             ),
-            pa(
+            pa_with_scope(
                 "ns-strict",
                 "default",
-                None,
+                PolicyScope::Namespace {
+                    namespace: "default".to_string(),
+                },
                 MtlsMode::Strict,
-                HashMap::new(),
             ),
         ];
         let mode = resolve_effective_mtls_mode(
@@ -1481,8 +1482,37 @@ mod tests {
             &HashMap::<String, String>::new(),
             8080,
         );
-        // First policy at Namespace scope wins (both are Namespace tier).
-        assert_eq!(mode, MtlsMode::Disable);
+        assert_eq!(mode, MtlsMode::Strict);
+    }
+
+    #[test]
+    fn mesh_slice_carries_mesh_wide_peer_auth_to_workload_namespace() {
+        let mut config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                peer_authentications: vec![pa_with_scope(
+                    "mesh-strict",
+                    "istio-system",
+                    PolicyScope::MeshWide,
+                    MtlsMode::Strict,
+                )],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        config.loaded_at = chrono::Utc::now();
+
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            MeshSliceRequest {
+                node_id: "node-a".to_string(),
+                namespace: "default".to_string(),
+                workload_spiffe_id: None,
+                labels: BTreeMap::new(),
+            },
+        );
+
+        assert_eq!(slice.peer_authentications.len(), 1);
+        assert_eq!(slice.resolve_effective_mtls_mode(8080), MtlsMode::Strict);
     }
 
     #[test]

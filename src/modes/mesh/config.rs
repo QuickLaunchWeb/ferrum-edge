@@ -489,6 +489,8 @@ pub struct PeerAuthentication {
     pub name: String,
     pub namespace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<PolicyScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<WorkloadSelector>,
     #[serde(default)]
     pub mtls_mode: MtlsMode,

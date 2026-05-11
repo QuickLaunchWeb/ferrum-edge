@@ -18,6 +18,7 @@ fn peer_auth(
     PeerAuthentication {
         name: name.to_string(),
         namespace: namespace.to_string(),
+        scope: None,
         selector,
         mtls_mode: mode,
         port_overrides,

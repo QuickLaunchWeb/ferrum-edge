@@ -1987,7 +1987,7 @@ async fn serve_mesh_runtime(
 
     // Resolve mTLS mode from the initial mesh slice before moving it.
     let inbound_mtls_mode =
-        resolve_inbound_mtls_mode(initial_applied_mesh_slice.as_ref(), &runtime);
+        resolve_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime);
 
     let mesh_apply_handle = start_mesh_slice_apply_task(
         mesh_state,
@@ -2200,16 +2200,24 @@ fn load_mesh_frontend_tls(
         env_config.frontend_tls_cert_path.as_ref(),
         env_config.frontend_tls_key_path.as_ref(),
     ) else {
+        if mtls_mode == config::MtlsMode::Strict {
+            return Err(anyhow::anyhow!(
+                "Mesh PeerAuthentication STRICT requires FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH"
+            ));
+        }
         return Ok(None);
     };
 
+    let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
     let client_auth = match mtls_mode {
         config::MtlsMode::Strict => tls::MeshClientAuth::Required,
-        config::MtlsMode::Permissive => tls::MeshClientAuth::Optional,
+        config::MtlsMode::Permissive if client_ca_bundle_path.is_some() => {
+            tls::MeshClientAuth::Optional
+        }
+        config::MtlsMode::Permissive => tls::MeshClientAuth::None,
         config::MtlsMode::Disable => unreachable!("handled above"),
     };
 
-    let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
     let mut tls_config = tls::load_mesh_tls_config(
         cert_path,
         key_path,
@@ -4566,6 +4574,32 @@ mod tests {
         env.tls_no_verify = true;
         let err = validate_egress_gateway_mtls_config(&runtime, &env).unwrap_err();
         assert!(err.to_string().contains("FERRUM_TLS_NO_VERIFY=true"));
+    }
+
+    #[test]
+    fn strict_peer_auth_fails_closed_without_frontend_tls_materials() {
+        let env = EnvConfig::default();
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+
+        let err = load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Strict)
+            .expect_err("strict mTLS must require cert and key material");
+
+        assert!(
+            err.to_string()
+                .contains("PeerAuthentication STRICT requires")
+        );
+    }
+
+    #[test]
+    fn permissive_peer_auth_allows_missing_frontend_tls_materials() {
+        let env = EnvConfig::default();
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+
+        let tls_config =
+            load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Permissive)
+                .expect("permissive mTLS can run without frontend TLS materials");
+
+        assert!(tls_config.is_none());
     }
 
     fn test_external_service_entry(
