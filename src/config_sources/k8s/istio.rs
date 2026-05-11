@@ -916,10 +916,34 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
 }
 
 fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, K8sTranslateError> {
-    let service_account = string_field(&object.spec, "serviceAccount").unwrap_or("default");
-    let path = format!("ns/{}/sa/{service_account}", object.metadata.namespace);
+    let service_account_raw = string_field(&object.spec, "serviceAccount");
+    let path = format!(
+        "ns/{}/sa/{}",
+        object.metadata.namespace,
+        service_account_raw.unwrap_or("default")
+    );
     let spiffe_id = SpiffeId::from_parts(&acc.options.trust_domain, &path)
         .map_err(|e| invalid_resource(object, format!("invalid workload SPIFFE ID: {e}")))?;
+
+    let weight = object
+        .spec
+        .get("weight")
+        .map(|w| {
+            let raw = w.as_u64().ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    "WorkloadEntry.weight must be a non-negative integer",
+                )
+            })?;
+            if raw > u64::from(MAX_TARGET_WEIGHT) {
+                return Err(invalid_resource(
+                    object,
+                    format!("WorkloadEntry.weight must be 0..={MAX_TARGET_WEIGHT} (got {raw})"),
+                ));
+            }
+            Ok(raw as u32)
+        })
+        .transpose()?;
 
     Ok(Workload {
         spiffe_id: spiffe_id.clone(),
@@ -945,6 +969,9 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         namespace: object.metadata.namespace.clone(),
         network: string_field(&object.spec, "network").map(ToOwned::to_owned),
         cluster: string_field(&object.spec, "cluster").map(ToOwned::to_owned),
+        weight,
+        locality: string_field(&object.spec, "locality").map(ToOwned::to_owned),
+        service_account: service_account_raw.map(ToOwned::to_owned),
     })
 }
 
@@ -2519,6 +2546,72 @@ mod tests {
             workload.spiffe_id.as_str(),
             "spiffe://cluster.local/ns/default/sa/api"
         );
+        assert_eq!(workload.service_account.as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn workload_entry_weight_and_locality_translate() {
+        let result = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5",
+                    "serviceAccount": "api",
+                    "weight": 42,
+                    "locality": "us-west-2/us-west-2a/sub-a"
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let workload = &mesh.workloads[0];
+        assert_eq!(workload.weight, Some(42));
+        assert_eq!(
+            workload.locality.as_deref(),
+            Some("us-west-2/us-west-2a/sub-a")
+        );
+    }
+
+    #[test]
+    fn workload_entry_weight_above_max_target_weight_fails_closed() {
+        let err = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5",
+                    "weight": 70_000
+                }),
+            )],
+            options(),
+        )
+        .expect_err("weight exceeds MAX_TARGET_WEIGHT must fail");
+        assert!(
+            err.to_string().contains("WorkloadEntry.weight"),
+            "error should mention WorkloadEntry.weight: {err}"
+        );
+    }
+
+    #[test]
+    fn workload_entry_omitted_optionals_are_none() {
+        let result = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5"
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let mesh = result.config.mesh.expect("mesh config");
+        let workload = &mesh.workloads[0];
+        assert!(workload.weight.is_none());
+        assert!(workload.locality.is_none());
+        assert!(workload.service_account.is_none());
+        // SPIFFE still falls back to "default" SA for SVID issuance.
+        assert!(workload.spiffe_id.as_str().ends_with("/sa/default"));
     }
 
     #[test]

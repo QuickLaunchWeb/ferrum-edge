@@ -421,6 +421,9 @@ mod tests {
             namespace: namespace.into(),
             network: None,
             cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
         }
     }
 
