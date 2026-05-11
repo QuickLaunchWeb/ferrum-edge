@@ -1,14 +1,14 @@
-//! tc/ingress — inbound packet marking for enrolled pods.
+//! tc/ingress — inbound packet classification for enrolled pods.
 //!
 //! Attached to the host-side veth interface of enrolled pods. Parses the
 //! IPv4 header and checks whether the destination IP is in `FERRUM_POD_IPS`.
-//! When matched, marks the packet with `TC_ACT_PIPE` so downstream iptables
-//! TPROXY rules can redirect it to the proxy's HBONE port (15008).
+//! When matched, returns `TC_ACT_PIPE` so later tc actions can continue
+//! processing the packet while the current phase avoids in-BPF destination
+//! rewrites.
 //!
 //! Direct destination rewrite via `bpf_skb_store_bytes` + `bpf_l4_csum_replace`
 //! requires recalculating TCP/IP checksums in BPF — deferred to a future phase
-//! once the L4 checksum helpers are wired. For now, marking + TPROXY is the
-//! safe path.
+//! once the L4 checksum helpers are wired.
 //!
 //! Only IPv4 TCP packets are considered. IPv6 and non-TCP traffic passes
 //! through unmodified.
