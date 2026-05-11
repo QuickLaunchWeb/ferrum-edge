@@ -87,3 +87,25 @@ observability:
   enabled: false
   dashboards:
     enabled: true
+
+nodeAgent:
+  enabled: false
+  image:
+    repository: ferrumedge/ferrum-edge
+    tag: latest
+  captureMode: ebpf
+  proxyUid: 1337
+  cgroupRoot: /sys/fs/cgroup
+  bpfFsPath: /sys/fs/bpf
+  fallbackMode: iptables
+  capture:
+    includeCidrs: "0.0.0.0/0"
+    excludeCidrs: ""
+    excludePorts: "15001,15006,15008,15020"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
