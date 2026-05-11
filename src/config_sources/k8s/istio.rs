@@ -80,7 +80,9 @@ pub(super) fn translate(
             Ok(true)
         }
         "ProxyConfig" => {
-            acc.mesh.proxy_configs.push(proxy_config(object)?);
+            acc.mesh
+                .proxy_configs
+                .push(proxy_config(&acc.options, object)?);
             Ok(true)
         }
         _ => Ok(false),
@@ -1328,20 +1330,35 @@ fn telemetry(
 ///
 /// - `metadata.name` -> `name`
 /// - `metadata.namespace` -> `namespace`
-/// - `spec.selector.matchLabels` -> `selector_labels` (empty = namespace default)
-/// - `spec.concurrency` -> `concurrency`
+/// - `spec.selector` + root-namespace rule -> [`PolicyScope`] (via
+///   [`istio_policy_scope`]). A ProxyConfig in the Istio root namespace
+///   with no selector applies mesh-wide; with a selector it applies to
+///   matching workloads across the mesh. In any other namespace, no
+///   selector means namespace-default and a selector narrows further.
+/// - `spec.concurrency` -> `concurrency` (rejected as invalid if outside
+///   `u32` range)
 /// - `spec.image.imageType` -> `image` (informational)
 /// - `spec.environmentVariables` -> `environment`
 /// - `spec.tracing.sampling` -> `tracing_sampling` (percentage 0-100,
 ///   merged into `workload_metrics.sampling_percentage` at slice-apply time)
-fn proxy_config(object: &K8sObject) -> Result<MeshProxyConfig, K8sTranslateError> {
-    let selector_labels = selector_from_istio(object.spec.get("selector"));
+fn proxy_config(
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+) -> Result<MeshProxyConfig, K8sTranslateError> {
+    let scope = istio_policy_scope(options, object, object.spec.get("selector"));
 
-    let concurrency = object
-        .spec
-        .get("concurrency")
-        .and_then(Value::as_u64)
-        .map(|raw| u32::try_from(raw).unwrap_or(u32::MAX));
+    let concurrency = match object.spec.get("concurrency").and_then(Value::as_u64) {
+        Some(raw) => Some(u32::try_from(raw).map_err(|_| {
+            invalid_resource(
+                object,
+                format!(
+                    "ProxyConfig spec.concurrency must fit in u32 (0..={}), got {raw}",
+                    u32::MAX
+                ),
+            )
+        })?),
+        None => None,
+    };
 
     let image = object
         .spec
@@ -1365,7 +1382,7 @@ fn proxy_config(object: &K8sObject) -> Result<MeshProxyConfig, K8sTranslateError
     Ok(MeshProxyConfig {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
-        selector_labels,
+        scope,
         concurrency,
         image,
         environment,
@@ -4532,10 +4549,13 @@ mod tests {
         let pc = &mesh.proxy_configs[0];
         assert_eq!(pc.name, "sample");
         assert_eq!(pc.namespace, "default");
-        assert_eq!(
-            pc.selector_labels.get("app").map(String::as_str),
-            Some("api")
-        );
+        match &pc.scope {
+            PolicyScope::WorkloadSelector { selector } => {
+                assert_eq!(selector.labels.get("app").map(String::as_str), Some("api"));
+                assert_eq!(selector.namespace.as_deref(), Some("default"));
+            }
+            other => panic!("expected WorkloadSelector scope, got {other:?}"),
+        }
         assert_eq!(pc.concurrency, Some(4));
         assert_eq!(pc.image.as_deref(), Some("distroless"));
         assert_eq!(
@@ -4565,10 +4585,12 @@ mod tests {
         let mesh = result.config.mesh.expect("mesh config");
         assert_eq!(mesh.proxy_configs.len(), 1);
         let pc = &mesh.proxy_configs[0];
-        assert!(
-            pc.selector_labels.is_empty(),
-            "missing selector should yield namespace-default scope (empty selector_labels)"
-        );
+        match &pc.scope {
+            PolicyScope::Namespace { namespace } => {
+                assert_eq!(namespace, "default");
+            }
+            other => panic!("expected Namespace scope, got {other:?}"),
+        }
         assert_eq!(pc.namespace, "default");
         assert_eq!(pc.concurrency, Some(2));
     }
@@ -4582,11 +4604,111 @@ mod tests {
         let mesh = result.config.mesh.expect("mesh config");
         assert_eq!(mesh.proxy_configs.len(), 1);
         let pc = &mesh.proxy_configs[0];
-        assert!(pc.selector_labels.is_empty());
+        match &pc.scope {
+            PolicyScope::Namespace { namespace } => assert_eq!(namespace, "default"),
+            other => panic!("expected Namespace scope, got {other:?}"),
+        }
         assert!(pc.concurrency.is_none());
         assert!(pc.image.is_none());
         assert!(pc.environment.is_empty());
         assert!(pc.tracing_sampling.is_none());
+    }
+
+    #[test]
+    fn translates_root_namespace_proxy_config_without_selector_is_mesh_wide() {
+        // A ProxyConfig in the Istio root namespace with no selector is the
+        // canonical Istio pattern for a mesh-wide default. The previous
+        // namespace-only filter dropped this entirely; PolicyScope::MeshWide
+        // is the fix.
+        let result = translate_k8s_objects(
+            &[K8sObject {
+                api_version: "networking.istio.io/v1beta1".to_string(),
+                kind: "ProxyConfig".to_string(),
+                metadata: K8sMetadata {
+                    name: "mesh-default".to_string(),
+                    namespace: "istio-config".to_string(),
+                    labels: HashMap::new(),
+                },
+                spec: serde_json::json!({"tracing": {"sampling": 5.0}}),
+            }],
+            options_for_namespace("default").with_istio_root_namespace("istio-config".to_string()),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.proxy_configs.len(), 1);
+        let pc = &mesh.proxy_configs[0];
+        assert!(
+            matches!(pc.scope, PolicyScope::MeshWide),
+            "expected MeshWide, got {:?}",
+            pc.scope
+        );
+        assert_eq!(pc.tracing_sampling, Some(5.0));
+    }
+
+    #[test]
+    fn translates_root_namespace_proxy_config_with_selector_is_mesh_wide_selector() {
+        // A ProxyConfig in the Istio root namespace with a selector applies
+        // to matching workloads across all namespaces. Encoded as
+        // PolicyScope::WorkloadSelector with namespace=None — same pattern
+        // as Telemetry / RequestAuthentication.
+        let result = translate_k8s_objects(
+            &[K8sObject {
+                api_version: "networking.istio.io/v1beta1".to_string(),
+                kind: "ProxyConfig".to_string(),
+                metadata: K8sMetadata {
+                    name: "mesh-api".to_string(),
+                    namespace: "istio-config".to_string(),
+                    labels: HashMap::new(),
+                },
+                spec: serde_json::json!({
+                    "selector": {"matchLabels": {"app": "api"}},
+                    "tracing": {"sampling": 50.0}
+                }),
+            }],
+            options_for_namespace("default").with_istio_root_namespace("istio-config".to_string()),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.proxy_configs.len(), 1);
+        let pc = &mesh.proxy_configs[0];
+        match &pc.scope {
+            PolicyScope::WorkloadSelector { selector } => {
+                assert_eq!(selector.labels.get("app").map(String::as_str), Some("api"));
+                assert!(
+                    selector.namespace.is_none(),
+                    "root-namespace selector must drop namespace pin"
+                );
+            }
+            other => panic!("expected WorkloadSelector with no namespace, got {other:?}"),
+        }
+        assert_eq!(pc.tracing_sampling, Some(50.0));
+    }
+
+    #[test]
+    fn proxy_config_concurrency_overflow_is_rejected() {
+        // Out-of-range concurrency must surface as an InvalidResource error
+        // instead of silently clamping to u32::MAX.
+        let err = translate_k8s_objects(
+            &[object(
+                "ProxyConfig",
+                serde_json::json!({"concurrency": 9_999_999_999_u64}),
+            )],
+            options(),
+        )
+        .expect_err("overflow must be rejected");
+
+        match err {
+            K8sTranslateError::InvalidResource { kind, message, .. } => {
+                assert_eq!(kind, "ProxyConfig");
+                assert!(
+                    message.contains("concurrency"),
+                    "error message must mention concurrency: {message}"
+                );
+            }
+            other => panic!("expected InvalidResource, got {other:?}"),
+        }
     }
 
     #[test]

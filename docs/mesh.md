@@ -171,9 +171,12 @@ Maps an Istio `ProxyConfig` (`networking.istio.io/v1beta1`) onto a config-time, 
 ```yaml
 name: "api-defaults"
 namespace: "default"
-selector_labels:        # spec.selector.matchLabels
-  app: "api"
-concurrency: 4          # spec.concurrency (informational)
+scope:                  # resolved from spec.selector + Istio root-namespace rule
+  workload_selector:
+    selector:
+      labels: { app: "api" }
+      namespace: "default"  # absent when the resource lives in the Istio root namespace
+concurrency: 4          # spec.concurrency (informational; rejected if outside u32 range)
 image: "distroless"     # spec.image.imageType (informational)
 environment:            # spec.environmentVariables (informational)
   GOMAXPROCS: "4"
@@ -186,16 +189,23 @@ tracing_sampling: 42.5  # spec.tracing.sampling — percentage 0-100
 |---|---|---|
 | `metadata.name` | `name` | |
 | `metadata.namespace` | `namespace` | |
-| `spec.selector.matchLabels` | `selector_labels` | Empty selector = namespace-default |
-| `spec.concurrency` | `concurrency` | Informational; surfaced to operator tooling |
+| `spec.selector` + root-namespace rule | `scope` ([`PolicyScope`](#policyscope)) | See "Scope resolution" below — same semantics as Telemetry / PeerAuthentication |
+| `spec.concurrency` | `concurrency` | Informational; rejected as `InvalidResource` if it does not fit in `u32` |
 | `spec.image.imageType` | `image` | Informational; surfaced to operator tooling |
 | `spec.environmentVariables` | `environment` | Informational; surfaced to operator tooling |
 | `spec.tracing.sampling` | `tracing_sampling` | Percentage 0-100; merged into the injected `workload_metrics` plugin's `sampling_percentage` |
 
-**Scope resolution**: ProxyConfigs are filtered to the subscriber's namespace at slice-construction time. Within the resolved slice, [`MeshSlice::resolved_proxy_config()`](../src/modes/mesh/slice.rs) returns the most-specific applicable entry:
+**Scope resolution**: ProxyConfig honors the same Istio root-namespace + selector rules used by `Telemetry`, `RequestAuthentication`, and `PeerAuthentication`. The K8s translator routes through the shared `istio_policy_scope` helper, so [`scope`](../src/modes/mesh/config.rs) ends up as:
 
-1. Resources with non-empty `selector_labels` (workload-scoped) outrank namespace-default resources (`selector_labels.is_empty()`).
-2. Among same-specificity matches, the ASCII-smallest `name` wins (deterministic tiebreaker mirroring the accumulator's `(namespace, name)` sort).
+- `MeshWide` — resource in the Istio root namespace (`FERRUM_K8S_ISTIO_ROOT_NAMESPACE`, default `istio-system`) with no selector. Applies to every workload in the mesh.
+- `WorkloadSelector { namespace: None, labels: ... }` — resource in the Istio root namespace with a selector. Applies to matching workloads across all namespaces.
+- `Namespace { namespace }` — resource in any other namespace with no selector. Applies to all workloads in that namespace.
+- `WorkloadSelector { namespace: Some(ns), labels: ... }` — resource in any other namespace with a selector. Applies to matching workloads in that namespace.
+
+Within the resolved slice, [`MeshSlice::resolved_proxy_config()`](../src/modes/mesh/slice.rs) returns the most-specific applicable entry:
+
+1. `WorkloadSelector` > `Namespace` > `MeshWide`.
+2. Among same-tier matches, the ASCII-smallest `name` wins (deterministic tiebreaker mirroring the accumulator's `(namespace, name)` sort).
 
 **`tracing.sampling` merge with `Telemetry`**: ProxyConfig `tracing_sampling` is applied first as a baseline, then `Telemetry.tracing.randomSamplingPercentage` overrides on the same `sampling_percentage` key when both are present. The more granular Telemetry API wins because it can be per-section scoped; ProxyConfig provides a per-workload-config-level default.
 
@@ -278,7 +288,7 @@ The slice builder:
 5. Filters `ServiceEntry` entries by `export_to` visibility.
 6. Filters `MeshRequestAuthentication` entries by scope.
 7. Filters `MeshTelemetryResource` entries by scope.
-8. Filters `MeshProxyConfig` entries by namespace and `selector_labels` (workload superset match).
+8. Filters `MeshProxyConfig` entries by [`PolicyScope`](#policyscope) — same predicate as `MeshPolicy`, so root-namespace ProxyConfigs apply mesh-wide.
 
 ## Authorization
 

@@ -13,7 +13,7 @@ use ferrum_edge::capture::CaptureMode;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshProxyConfig, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
-    PolicyScope,
+    PolicyScope, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::{
     MESH_WORKLOAD_METRICS_PLUGIN_ID, MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
@@ -64,7 +64,12 @@ fn proxy_config_tracing_sampling_flows_into_workload_metrics_plugin() {
         proxy_configs: vec![MeshProxyConfig {
             name: "api-defaults".to_string(),
             namespace: "default".to_string(),
-            selector_labels: HashMap::from([("app".to_string(), "api".to_string())]),
+            scope: PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                    namespace: Some("default".to_string()),
+                },
+            },
             concurrency: Some(4),
             image: Some("distroless".to_string()),
             environment: HashMap::from([("GOMAXPROCS".to_string(), "4".to_string())]),
@@ -105,7 +110,12 @@ fn proxy_config_does_not_set_sampling_when_unset() {
         proxy_configs: vec![MeshProxyConfig {
             name: "api-defaults".to_string(),
             namespace: "default".to_string(),
-            selector_labels: HashMap::from([("app".to_string(), "api".to_string())]),
+            scope: PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                    namespace: Some("default".to_string()),
+                },
+            },
             concurrency: Some(4),
             image: None,
             environment: HashMap::new(),
@@ -144,7 +154,12 @@ fn telemetry_tracing_sampling_overrides_proxy_config_tracing_sampling() {
         proxy_configs: vec![MeshProxyConfig {
             name: "api-defaults".to_string(),
             namespace: "default".to_string(),
-            selector_labels: HashMap::from([("app".to_string(), "api".to_string())]),
+            scope: PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                    namespace: Some("default".to_string()),
+                },
+            },
             concurrency: None,
             image: None,
             environment: HashMap::new(),
@@ -204,7 +219,12 @@ fn proxy_config_tracing_sampling_survives_telemetry_without_sampling_field() {
         proxy_configs: vec![MeshProxyConfig {
             name: "api-defaults".to_string(),
             namespace: "default".to_string(),
-            selector_labels: HashMap::from([("app".to_string(), "api".to_string())]),
+            scope: PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                    namespace: Some("default".to_string()),
+                },
+            },
             concurrency: None,
             image: None,
             environment: HashMap::new(),
@@ -265,7 +285,12 @@ fn proxy_config_zero_sampling_is_applied_not_skipped() {
         proxy_configs: vec![MeshProxyConfig {
             name: "no-tracing".to_string(),
             namespace: "default".to_string(),
-            selector_labels: HashMap::from([("app".to_string(), "api".to_string())]),
+            scope: PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                    namespace: Some("default".to_string()),
+                },
+            },
             concurrency: None,
             image: None,
             environment: HashMap::new(),
@@ -311,7 +336,12 @@ fn proxy_config_non_matching_selector_does_not_apply() {
             namespace: "default".to_string(),
             // Workload has `app=api` (see `test_runtime`), but this selector
             // requires `app=worker`.
-            selector_labels: HashMap::from([("app".to_string(), "worker".to_string())]),
+            scope: PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "worker".to_string())]),
+                    namespace: Some("default".to_string()),
+                },
+            },
             concurrency: None,
             image: None,
             environment: HashMap::new(),
@@ -339,4 +369,46 @@ fn proxy_config_non_matching_selector_does_not_apply() {
         metrics_plugin.config.get("sampling_percentage").is_none(),
         "non-matching ProxyConfig must not contribute sampling"
     );
+}
+
+#[test]
+fn mesh_wide_proxy_config_applies_to_workload_in_other_namespace() {
+    // A ProxyConfig translated as PolicyScope::MeshWide (Istio
+    // root-namespace + no selector) must apply to a workload in a
+    // different namespace, surfacing as sampling_percentage on the
+    // injected workload_metrics plugin.
+    let mesh = MeshConfig {
+        proxy_configs: vec![MeshProxyConfig {
+            name: "mesh-default".to_string(),
+            namespace: "istio-config".to_string(),
+            scope: PolicyScope::MeshWide,
+            concurrency: None,
+            image: None,
+            environment: HashMap::new(),
+            tracing_sampling: Some(7.5),
+        }],
+        ..MeshConfig::default()
+    };
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    let runtime = test_runtime();
+
+    let prepared =
+        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+
+    let metrics_plugin = prepared
+        .plugin_configs
+        .iter()
+        .find(|p| p.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+        .expect("workload_metrics plugin injected");
+
+    let sampling = metrics_plugin
+        .config
+        .get("sampling_percentage")
+        .and_then(|v| v.as_f64())
+        .expect("mesh-wide ProxyConfig must contribute sampling");
+    assert_eq!(sampling, 7.5);
 }

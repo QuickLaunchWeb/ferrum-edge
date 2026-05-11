@@ -132,27 +132,23 @@ impl MeshSlice {
     /// Returns the most-specific applicable [`MeshProxyConfig`] for this slice's
     /// workload, or `None` when no `ProxyConfig` applies.
     ///
-    /// Specificity ordering:
-    /// 1. Resources with non-empty `selector_labels` (workload-scoped) outrank
-    ///    namespace-default resources (`selector_labels.is_empty()`).
-    /// 2. Among same-specificity matches, the ASCII-smallest `name` wins —
-    ///    deterministic tiebreaker that mirrors the accumulator's
-    ///    `(namespace, name)` sort so consumers see a stable choice
-    ///    regardless of informer delivery order.
+    /// Specificity ordering mirrors Istio's `PolicyScope` tiers:
+    /// `WorkloadSelector` > `Namespace` > `MeshWide`. Among same-tier
+    /// matches the ASCII-smallest `name` wins — deterministic tiebreaker
+    /// that mirrors the accumulator's `(namespace, name)` sort so consumers
+    /// see a stable choice regardless of informer delivery order.
     ///
     /// Slice construction in [`Self::from_gateway_config`] already filters
     /// `proxy_configs` down to those visible to the current node, so this
     /// method just resolves specificity among matched entries.
     pub fn resolved_proxy_config(&self) -> Option<&MeshProxyConfig> {
         self.proxy_configs.iter().min_by(|a, b| {
-            let a_specificity: u8 = if a.selector_labels.is_empty() { 0 } else { 1 };
-            let b_specificity: u8 = if b.selector_labels.is_empty() { 0 } else { 1 };
-            // Higher specificity first (reverse cmp), then smaller name first.
+            // Higher tier first (reverse cmp), then smaller name first.
             // `min_by` picks the comparator's smallest, so:
-            //   - workload-scoped (1) < namespace-default (0) after reverse
-            //   - within same specificity, the ASCII-smallest name wins
-            b_specificity
-                .cmp(&a_specificity)
+            //   - WorkloadSelector (2) < Namespace (1) < MeshWide (0) after reverse
+            //   - within same tier, the ASCII-smallest name wins
+            proxy_config_scope_tier(b)
+                .cmp(&proxy_config_scope_tier(a))
                 .then_with(|| a.name.as_str().cmp(b.name.as_str()))
         })
     }
@@ -288,6 +284,19 @@ enum PeerAuthScope {
     MeshWide = 0,
     Namespace = 1,
     WorkloadSelector = 2,
+}
+
+/// Classify a [`MeshProxyConfig`]'s [`PolicyScope`] into a `u8` tier for
+/// precedence ordering. Higher = more specific. Mirrors `PeerAuthScope`'s
+/// `WorkloadSelector > Namespace > MeshWide` ordering so `MeshProxyConfig`
+/// resolution stays byte-identical to PeerAuthentication semantics.
+#[inline]
+fn proxy_config_scope_tier(pc: &MeshProxyConfig) -> u8 {
+    match pc.scope {
+        PolicyScope::MeshWide => 0,
+        PolicyScope::Namespace { .. } => 1,
+        PolicyScope::WorkloadSelector { .. } => 2,
+    }
 }
 
 /// Classify a [`PeerAuthentication`] into a scope tier for precedence ordering.
@@ -1459,10 +1468,60 @@ mod tests {
         selector_labels: HashMap<String, String>,
         tracing_sampling: Option<f64>,
     ) -> MeshProxyConfig {
+        let scope = if selector_labels.is_empty() {
+            PolicyScope::Namespace {
+                namespace: namespace.into(),
+            }
+        } else {
+            PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: selector_labels,
+                    namespace: Some(namespace.into()),
+                },
+            }
+        };
         MeshProxyConfig {
             name: name.into(),
             namespace: namespace.into(),
-            selector_labels,
+            scope,
+            concurrency: None,
+            image: None,
+            environment: HashMap::new(),
+            tracing_sampling,
+        }
+    }
+
+    fn make_mesh_wide_proxy_config(
+        name: &str,
+        namespace: &str,
+        tracing_sampling: Option<f64>,
+    ) -> MeshProxyConfig {
+        MeshProxyConfig {
+            name: name.into(),
+            namespace: namespace.into(),
+            scope: PolicyScope::MeshWide,
+            concurrency: None,
+            image: None,
+            environment: HashMap::new(),
+            tracing_sampling,
+        }
+    }
+
+    fn make_mesh_wide_selector_proxy_config(
+        name: &str,
+        namespace: &str,
+        labels: HashMap<String, String>,
+        tracing_sampling: Option<f64>,
+    ) -> MeshProxyConfig {
+        MeshProxyConfig {
+            name: name.into(),
+            namespace: namespace.into(),
+            scope: PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels,
+                    namespace: None,
+                },
+            },
             concurrency: None,
             image: None,
             environment: HashMap::new(),
@@ -1839,5 +1898,103 @@ mod tests {
             !a.content_eq(&b),
             "proxy_configs difference should be detected"
         );
+    }
+
+    #[test]
+    fn mesh_wide_proxy_config_applies_across_namespaces() {
+        // A MeshWide ProxyConfig (Istio root-namespace pattern with no
+        // selector) must apply to workloads in any namespace, not just
+        // the resource's own namespace.
+        let mesh = MeshConfig {
+            proxy_configs: vec![make_mesh_wide_proxy_config(
+                "mesh-default",
+                "istio-system",
+                Some(10.0),
+            )],
+            ..MeshConfig::default()
+        };
+        let cfg = config_with_mesh(mesh);
+        // Workload lives in "team-a", not the resource's "istio-system".
+        let request = slice_request_with_labels("team-a", BTreeMap::new());
+        let slice = MeshSlice::from_gateway_config(&cfg, request);
+
+        assert_eq!(slice.proxy_configs.len(), 1);
+        let resolved = slice.resolved_proxy_config().expect("resolved present");
+        assert_eq!(resolved.tracing_sampling, Some(10.0));
+    }
+
+    #[test]
+    fn mesh_wide_selector_proxy_config_applies_across_namespaces() {
+        // A root-namespace ProxyConfig with a selector applies to matching
+        // workloads in any namespace (PolicyScope::WorkloadSelector with
+        // namespace=None).
+        let mesh = MeshConfig {
+            proxy_configs: vec![make_mesh_wide_selector_proxy_config(
+                "mesh-api",
+                "istio-system",
+                HashMap::from([("app".into(), "api".into())]),
+                Some(80.0),
+            )],
+            ..MeshConfig::default()
+        };
+        let cfg = config_with_mesh(mesh);
+        // Workload in "team-a" with matching label.
+        let request =
+            slice_request_with_labels("team-a", BTreeMap::from([("app".into(), "api".into())]));
+        let slice = MeshSlice::from_gateway_config(&cfg, request);
+
+        assert_eq!(slice.proxy_configs.len(), 1);
+        let resolved = slice.resolved_proxy_config().expect("resolved present");
+        assert_eq!(resolved.tracing_sampling, Some(80.0));
+    }
+
+    #[test]
+    fn namespace_scoped_proxy_config_overrides_mesh_wide_default() {
+        // Workload-applicable Namespace-scoped ProxyConfig must outrank a
+        // MeshWide default when both apply (specificity ordering).
+        let mesh = MeshConfig {
+            proxy_configs: vec![
+                make_mesh_wide_proxy_config("zzz-mesh-default", "istio-system", Some(10.0)),
+                make_proxy_config("ns-override", "ns", HashMap::new(), Some(50.0)),
+            ],
+            ..MeshConfig::default()
+        };
+        let cfg = config_with_mesh(mesh);
+        let request = slice_request_with_labels("ns", BTreeMap::new());
+        let slice = MeshSlice::from_gateway_config(&cfg, request);
+
+        assert_eq!(slice.proxy_configs.len(), 2);
+        let resolved = slice.resolved_proxy_config().expect("resolved present");
+        assert_eq!(
+            resolved.name, "ns-override",
+            "Namespace-scoped must outrank MeshWide default"
+        );
+        assert_eq!(resolved.tracing_sampling, Some(50.0));
+    }
+
+    #[test]
+    fn workload_selector_outranks_mesh_wide_default() {
+        // WorkloadSelector beats MeshWide even when both match.
+        let mesh = MeshConfig {
+            proxy_configs: vec![
+                make_mesh_wide_proxy_config("aaa-mesh-default", "istio-system", Some(10.0)),
+                make_proxy_config(
+                    "zzz-workload",
+                    "ns",
+                    HashMap::from([("app".into(), "api".into())]),
+                    Some(90.0),
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let cfg = config_with_mesh(mesh);
+        let request =
+            slice_request_with_labels("ns", BTreeMap::from([("app".into(), "api".into())]));
+        let slice = MeshSlice::from_gateway_config(&cfg, request);
+
+        assert_eq!(slice.proxy_configs.len(), 2);
+        let resolved = slice.resolved_proxy_config().expect("resolved present");
+        assert_eq!(resolved.name, "zzz-workload");
+        assert_eq!(resolved.tracing_sampling, Some(90.0));
     }
 }

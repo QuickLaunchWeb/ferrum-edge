@@ -465,18 +465,23 @@ pub struct AccessLogFilter {
 /// tooling. Tracing `sampling` flows into the injected `workload_metrics`
 /// plugin's `sampling_percentage` field.
 ///
-/// Scope resolution: when `selector_labels` is empty the ProxyConfig is
-/// namespace-default; when populated it matches workloads whose labels are
-/// a superset (same `workload_selector_matches` predicate used by other
-/// mesh types). Most-specific match wins per workload (workload-labeled >
-/// namespace-only); same-specificity ties are broken by ASCII-ordered name.
+/// Scope resolution mirrors the canonical [`PolicyScope`] used by
+/// `PeerAuthentication`, `RequestAuthentication`, and `Telemetry`: a
+/// resource in the Istio root namespace with no selector is `MeshWide`; a
+/// resource in any other namespace with no selector is `Namespace`-scoped;
+/// any resource with a selector is `WorkloadSelector`-scoped (with the
+/// `namespace` set when not in the root namespace, mirroring the Istio
+/// "root-namespace selectors apply mesh-wide" rule used by Telemetry / RA).
+/// Most-specific match wins per workload (WorkloadSelector > Namespace >
+/// MeshWide); same-specificity ties are broken by ASCII-ordered name.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MeshProxyConfig {
     pub name: String,
     pub namespace: String,
-    /// Selector labels (`spec.selector.matchLabels`). Empty = namespace-default.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub selector_labels: HashMap<String, String>,
+    /// Resolved [`PolicyScope`] capturing Istio's root-namespace +
+    /// selector semantics. See struct docs for the full table.
+    #[serde(default)]
+    pub scope: PolicyScope,
     /// `spec.concurrency` — informational; surfaced to operator tooling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,
@@ -495,24 +500,21 @@ pub struct MeshProxyConfig {
 /// Returns `true` when a [`MeshProxyConfig`] applies to a workload whose
 /// namespace is `proxy_namespace` and whose labels are `proxy_labels`.
 ///
-/// Adapts `MeshProxyConfig`'s flat (namespace + selector_labels) shape onto
-/// the same predicate used by [`workload_selector_matches`]: the resource's
-/// namespace must match (ProxyConfig namespace is required), then every
-/// key/value in `selector_labels` must match the workload's labels (subset
-/// check — empty selector_labels means "any workload in the same namespace").
+/// Delegates to the canonical [`scope_applies_to_workload`] helper so
+/// ProxyConfig honors the same root-namespace + selector semantics as
+/// every other Istio mesh resource (PeerAuthentication, Telemetry,
+/// RequestAuthentication, AuthorizationPolicy).
 pub fn proxy_config_applies_to_workload<L: WorkloadLabels + ?Sized>(
     config: &MeshProxyConfig,
     proxy_namespace: &str,
     proxy_labels: &L,
 ) -> bool {
-    config.namespace == proxy_namespace
-        && labels_match_subset(&config.selector_labels, proxy_labels)
+    scope_applies_to_workload(&config.scope, proxy_namespace, proxy_labels)
 }
 
 /// Returns `true` when every `(key, value)` in `selector_labels` is present
 /// in `proxy_labels` with the same value. Empty `selector_labels` always
-/// matches (subset semantics). Shared by [`workload_selector_matches`] and
-/// [`proxy_config_applies_to_workload`].
+/// matches (subset semantics). Shared by [`workload_selector_matches`].
 #[inline]
 fn labels_match_subset<L: WorkloadLabels + ?Sized>(
     selector_labels: &HashMap<String, String>,
