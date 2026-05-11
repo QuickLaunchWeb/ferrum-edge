@@ -1003,7 +1003,16 @@ fn resolve_destination_port(
     let Some(name) = string_field(port_value, "name") else {
         return Ok(None);
     };
-    let (svc, ns) = service_host_components(host, &object.metadata.namespace);
+    let Some((svc, ns)) = service_host_components(host, &object.metadata.namespace) else {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService route.destination.host '{}' is not a recognized in-cluster service form; \
+                 port.name resolution only supports <svc>, <svc>.<ns>, <svc>.<ns>.svc, or <svc>.<ns>.svc.cluster.local (optional trailing dot)",
+                host
+            ),
+        ));
+    };
     match acc.lookup_service_port(&ns, &svc, name) {
         Some(port) => Ok(Some(port)),
         None => Err(invalid_resource(
@@ -1017,20 +1026,38 @@ fn resolve_destination_port(
 }
 
 /// Parse an Istio destination host into `(service_name, namespace)`.
-/// Accepts:
-///   - `<svc>` (short form; falls back to the resource's own namespace)
-///   - `<svc>.<ns>` (two-label form)
-///   - `<svc>.<ns>.svc.cluster.local` (FQDN form — only the first two
-///     labels are inspected; the cluster-local suffix is discarded)
 ///
-/// Anything that doesn't match these patterns returns the full host as the
-/// service name and the resource's namespace — `lookup_service_port` will
-/// miss, the caller emits an actionable error.
-fn service_host_components(host: &str, default_namespace: &str) -> (String, String) {
-    let mut parts = host.split('.');
-    let service = parts.next().unwrap_or(host).to_string();
-    let namespace = parts.next().unwrap_or(default_namespace).to_string();
-    (service, namespace)
+/// Accepted shapes (all may carry an optional trailing `.` root anchor):
+///   - `<svc>` — short form; inherits the caller's default namespace
+///   - `<svc>.<ns>` — two-label form
+///   - `<svc>.<ns>.svc` — three-label form (final label MUST be `svc`)
+///   - `<svc>.<ns>.svc.cluster.local` — FQDN form
+///
+/// Any other shape — including external hosts (`api.example.com`), foreign
+/// FQDNs (`foo.bar.tld.invalid`), partial suffixes (`<svc>.<ns>.cluster.local`,
+/// `<svc>.<ns>.svc.cluster`), or any label count not in `{1, 2, 3, 5}` —
+/// returns `None`. Empty labels (leading/trailing dots that aren't the root
+/// anchor, consecutive dots) are also rejected. Callers MUST treat `None`
+/// as "this host is not a Kubernetes service reference" and surface a clear
+/// error instead of attempting a service lookup.
+fn service_host_components(host: &str, default_namespace: &str) -> Option<(String, String)> {
+    // Strip a single trailing dot (DNS root anchor); reject anything still
+    // ending in `.` afterward (`foo..` etc).
+    let trimmed = host.strip_suffix('.').unwrap_or(host);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let labels: Vec<&str> = trimmed.split('.').collect();
+    if labels.iter().any(|l| l.is_empty()) {
+        return None;
+    }
+    match labels.as_slice() {
+        [svc] => Some(((*svc).to_string(), default_namespace.to_string())),
+        [svc, ns] => Some(((*svc).to_string(), (*ns).to_string())),
+        [svc, ns, "svc"] => Some(((*svc).to_string(), (*ns).to_string())),
+        [svc, ns, "svc", "cluster", "local"] => Some(((*svc).to_string(), (*ns).to_string())),
+        _ => None,
+    }
 }
 
 fn route_weight(object: &K8sObject, route: &Value) -> Result<u32, K8sTranslateError> {
@@ -4371,5 +4398,112 @@ mod tests {
         let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
         let result = translate_k8s_objects(&[vs, svc], options()).expect("translation succeeds");
         assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn vs_destination_port_name_rejects_external_host() {
+        // External hosts that happen to share a first/second label with a
+        // real in-cluster Service must NOT trigger a service lookup. Before
+        // this guard, `api.example.com` would silently parse as service=api,
+        // namespace=example and either resolve against an unrelated Service
+        // or emit a misleading "Service example/api not found" error.
+        let svc = service_with_named_ports("api", "example", &[("http", 8080)]);
+        let vs = virtual_service_with_destination(
+            "external-vs",
+            serde_json::json!({
+                "host": "api.example.com",
+                "port": {"name": "http"}
+            }),
+        );
+        let err = translate_k8s_objects(&[svc, vs], options())
+            .expect_err("external host must not be resolved against a Service");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a recognized in-cluster service form"),
+            "error must explain the host shape rejection: {msg}"
+        );
+        assert!(
+            msg.contains("api.example.com"),
+            "error must echo the offending host: {msg}"
+        );
+    }
+
+    #[test]
+    fn vs_destination_port_name_rejects_partial_cluster_suffix() {
+        // `<svc>.<ns>.cluster.local` (missing the `.svc.` infix) and
+        // `<svc>.<ns>.svc.cluster` (missing the `.local` tail) are NOT valid
+        // Kubernetes service DNS forms — accepting them silently encourages
+        // operator typos to resolve against real services.
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        for host in [
+            "reviews.default.cluster.local",
+            "reviews.default.svc.cluster",
+            "reviews.default.svc.cluster.local.extra",
+        ] {
+            let vs = virtual_service_with_destination(
+                "reviews-vs",
+                serde_json::json!({
+                    "host": host,
+                    "port": {"name": "http"}
+                }),
+            );
+            let err = translate_k8s_objects(&[svc.clone(), vs], options())
+                .err()
+                .unwrap_or_else(|| panic!("host '{host}' must be rejected"));
+            assert!(
+                err.to_string()
+                    .contains("not a recognized in-cluster service form"),
+                "host '{host}' must hit shape rejection: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn vs_destination_port_name_rejects_empty_labels() {
+        // Leading dots, consecutive dots, and lone-dot hosts produce empty
+        // labels — the parser must reject these rather than picking the empty
+        // string up as a service name.
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        for host in [".reviews", "reviews..default", "."] {
+            let vs = virtual_service_with_destination(
+                "reviews-vs",
+                serde_json::json!({
+                    "host": host,
+                    "port": {"name": "http"}
+                }),
+            );
+            let err = translate_k8s_objects(&[svc.clone(), vs], options())
+                .expect_err("empty-label host must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("not a recognized in-cluster service form"),
+                "host '{host}' must hit shape rejection: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn vs_destination_port_name_accepts_trailing_dot_on_short_forms() {
+        // Trailing dot must apply uniformly across all accepted shapes, not
+        // only the 5-label FQDN. Otherwise an operator typing `reviews.` or
+        // `reviews.default.` gets an inconsistent rejection vs. the FQDN.
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        for host in [
+            "reviews.",
+            "reviews.default.",
+            "reviews.default.svc.",
+            "reviews.default.svc.cluster.local.",
+        ] {
+            let vs = virtual_service_with_destination(
+                "reviews-vs",
+                serde_json::json!({
+                    "host": host,
+                    "port": {"name": "http"}
+                }),
+            );
+            let result = translate_k8s_objects(&[svc.clone(), vs], options())
+                .unwrap_or_else(|e| panic!("trailing-dot host '{host}' must resolve: {e}"));
+            assert_eq!(result.config.proxies[0].backend_port, 8080);
+        }
     }
 }
