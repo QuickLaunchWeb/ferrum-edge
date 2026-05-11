@@ -1985,7 +1985,10 @@ async fn serve_mesh_runtime(
         None
     };
 
-    // Resolve mTLS mode from the initial mesh slice before moving it.
+    // Resolve mTLS mode from the initial mesh slice. This is evaluated once at
+    // startup — PeerAuthentication changes pushed via CP/xDS update the slice
+    // but do NOT live-rotate the inbound TLS ServerConfig (consistent with the
+    // project's static-TLS-material model). A restart is required.
     let inbound_mtls_mode =
         resolve_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime);
 
@@ -2132,39 +2135,6 @@ async fn serve_mesh_runtime(
     Ok(())
 }
 
-/// Load the non-mesh frontend TLS config. Retained for the egress gateway
-/// validation path that does not use PeerAuthentication.
-#[allow(dead_code)]
-fn load_frontend_tls(
-    env_config: &EnvConfig,
-    tls_policy: &TlsPolicy,
-    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
-) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
-    let (Some(cert_path), Some(key_path)) = (
-        env_config.frontend_tls_cert_path.as_ref(),
-        env_config.frontend_tls_key_path.as_ref(),
-    ) else {
-        return Ok(None);
-    };
-
-    let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
-    let mut config = tls::load_tls_config_with_client_auth(
-        cert_path,
-        key_path,
-        client_ca_bundle_path,
-        env_config.tls_no_verify,
-        tls_policy,
-        env_config.tls_cert_expiry_warning_days,
-        crls,
-    )
-    .map_err(|e| anyhow::anyhow!("Invalid mesh frontend TLS configuration: {}", e))?;
-    tls::enable_early_data(&mut config, tls_policy);
-    if env_config.ktls_enabled.could_be_enabled() {
-        tls::enable_secret_extraction_for_ktls(&mut config);
-    }
-    Ok(Some(config))
-}
-
 /// Resolve the effective mTLS mode for the inbound listener from the initial
 /// mesh slice. Falls back to `Permissive` when no slice or no
 /// PeerAuthentication policies are available.
@@ -2214,7 +2184,14 @@ fn load_mesh_frontend_tls(
         config::MtlsMode::Permissive if client_ca_bundle_path.is_some() => {
             tls::MeshClientAuth::Optional
         }
-        config::MtlsMode::Permissive => tls::MeshClientAuth::None,
+        config::MtlsMode::Permissive => {
+            warn!(
+                "Mesh PeerAuthentication mTLS mode is PERMISSIVE but no \
+                 FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH is configured; \
+                 client certificates will not be requested or verified"
+            );
+            tls::MeshClientAuth::None
+        }
         config::MtlsMode::Disable => unreachable!("handled above"),
     };
 
@@ -4600,6 +4577,26 @@ mod tests {
                 .expect("permissive mTLS can run without frontend TLS materials");
 
         assert!(tls_config.is_none());
+    }
+
+    #[test]
+    fn permissive_without_ca_bundle_degrades_to_no_client_auth() {
+        let env = EnvConfig {
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            frontend_tls_client_ca_bundle_path: None,
+            ..EnvConfig::default()
+        };
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+
+        let tls_config =
+            load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Permissive)
+                .expect("permissive without CA bundle should succeed");
+
+        assert!(
+            tls_config.is_some(),
+            "TLS config should be built (no client auth, but server TLS active)"
+        );
     }
 
     fn test_external_service_entry(

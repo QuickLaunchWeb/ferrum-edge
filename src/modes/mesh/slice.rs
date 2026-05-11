@@ -239,7 +239,9 @@ impl MeshSlice {
 
 /// Scope tier used for PeerAuthentication precedence ranking.
 ///
-/// Higher discriminant wins. Istio semantics: WorkloadSelector > Namespace > MeshWide.
+/// Discriminant order is load-bearing: `Ord` derive uses it, and the
+/// resolution loop picks the highest-valued tier. Istio semantics:
+/// WorkloadSelector > Namespace > MeshWide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PeerAuthScope {
     MeshWide = 0,
