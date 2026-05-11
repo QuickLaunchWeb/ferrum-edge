@@ -714,7 +714,19 @@ mod tests {
         assert!(backend.cleaned_up);
     }
 
+    // Note: the iptables fallback executes `sh -c "iptables ..."` shell commands
+    // directly. On non-Linux (or Linux without `iptables` in PATH / without
+    // privilege) every command fails fast and the test verifies only that
+    // setup→shutdown→cleanup completes without panicking.
+    //
+    // Skipping on Linux avoids the failure mode where a developer or CI runner
+    // happens to have iptables installed AND root privileges (containers
+    // running as root, dev VMs) — in which case the test would mutate the
+    // host's real netfilter state. Cleanup runs on shutdown so normal
+    // termination self-recovers, but a panic mid-test would leave orphaned
+    // `FERRUM_MESH_*` chains in the `nat` table.
     #[tokio::test]
+    #[cfg(not(target_os = "linux"))]
     async fn handle_fallback_iptables_succeeds() {
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
