@@ -31,9 +31,8 @@ pub(super) fn translate(
             Ok(true)
         }
         "PeerAuthentication" => {
-            acc.mesh
-                .peer_authentications
-                .push(peer_authentication(object)?);
+            let peer_auth = peer_authentication(&acc.options, object)?;
+            acc.mesh.peer_authentications.push(peer_auth);
             Ok(true)
         }
         "ServiceEntry" => {
@@ -308,7 +307,10 @@ fn condition_match(value: &Value) -> Option<ConditionMatch> {
     })
 }
 
-fn peer_authentication(object: &K8sObject) -> Result<PeerAuthentication, K8sTranslateError> {
+fn peer_authentication(
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+) -> Result<PeerAuthentication, K8sTranslateError> {
     let mtls = object.spec.get("mtls").unwrap_or(&Value::Null);
     let effective_mtls_mode = mtls_mode(string_field(mtls, "mode").unwrap_or("PERMISSIVE"));
     let mut port_overrides = HashMap::new();
@@ -324,16 +326,18 @@ fn peer_authentication(object: &K8sObject) -> Result<PeerAuthentication, K8sTran
         port_overrides.insert(port, mode);
     }
 
+    let selector = object.spec.get("selector");
+    let scope = istio_policy_scope(options, object, selector);
+    let selector = match &scope {
+        PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
+        PolicyScope::MeshWide | PolicyScope::Namespace { .. } => None,
+    };
+
     Ok(PeerAuthentication {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
-        selector: object
-            .spec
-            .get("selector")
-            .map(|selector| WorkloadSelector {
-                labels: selector_from_istio(Some(selector)),
-                namespace: Some(object.metadata.namespace.clone()),
-            }),
+        scope: Some(scope),
+        selector,
         mtls_mode: effective_mtls_mode,
         port_overrides,
     })
@@ -1857,6 +1861,30 @@ mod tests {
 
         assert!(err.to_string().contains("portLevelMtls"));
         assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn root_namespace_peer_authentication_without_selector_is_mesh_wide() {
+        let mut peer_auth = object(
+            "PeerAuthentication",
+            serde_json::json!({
+                "mtls": {"mode": "STRICT"}
+            }),
+        );
+        peer_auth.metadata.namespace = "istio-config".to_string();
+
+        let result = translate_k8s_objects(
+            &[peer_auth],
+            options_for_namespace("istio-config")
+                .with_istio_root_namespace("istio-config".to_string()),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert!(matches!(
+            mesh.peer_authentications[0].scope,
+            Some(PolicyScope::MeshWide)
+        ));
     }
 
     #[test]

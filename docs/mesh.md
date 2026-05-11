@@ -353,21 +353,35 @@ port_overrides:
 
 Selector-less `PeerAuthentication` applies to all workloads in its namespace (or mesh-wide if namespace-scoped).
 
-### Runtime mTLS Mode Resolution
+### Resolution and listener wiring
 
-At mesh slice apply time, the effective mTLS mode for the inbound listener is resolved using Istio scope precedence:
+The effective mTLS mode for the inbound TLS-terminating listener is resolved at startup from the initial mesh slice via `resolve_effective_mtls_mode()`. Scope precedence (highest wins): `WorkloadSelector` > `Namespace` > `MeshWide`. Port-level overrides within the winning policy then take precedence over its top-level `mtls_mode`.
 
-1. **WorkloadSelector** (most specific) -- a `PeerAuthentication` with a selector matching the proxy's labels wins.
-2. **Namespace** -- a selector-less `PeerAuthentication` in the proxy's namespace.
-3. **MeshWide** -- a `PeerAuthentication` with no namespace restriction.
-
-Per-port overrides are applied after the base mode is resolved. The resulting `MeshClientAuth` (`Required`, `Optional`, or `Disabled`) is plumbed into the inbound TLS acceptor:
+The resulting `MeshClientAuth` is plumbed into the inbound TLS acceptor:
 
 - `strict` -> TLS `Required` (client cert mandatory; plaintext rejected).
-- `permissive` -> TLS `Optional` (accept both mTLS and plaintext).
+- `permissive` -> TLS `Optional` (TLS accepted with optional client cert; plaintext can be accepted by the mesh listener).
 - `disable` -> TLS `Disabled` (plaintext only; mTLS connections rejected).
 
-This resolution runs on the cold path (config reload), not per-request.
+The port used for `port_overrides` lookup follows the topology's TLS-terminating listener (see `MeshRuntimeConfig::listener_plan()`):
+
+| Topology | Resolution port (default) | Override key example |
+|---|---|---|
+| `Sidecar` | `inbound_listen_addr` (15006) | `port_overrides: {15006: strict}` |
+| `Ambient` | `hbone_listen_addr` (15008) | `port_overrides: {15008: strict}` |
+| `EgressGateway` | `egress_listen_addr` (15090) | `port_overrides: {15090: strict}` |
+| `EastWestGateway` | n/a (SNI passthrough, no termination) | — |
+
+The resolved mode is captured **once at startup** from the first valid slice. Subsequent `PeerAuthentication` changes pushed via the control plane update the in-memory slice and are honored by other plugin paths (e.g. `mesh_authz`, plugin chains), but the inbound TLS `ServerConfig` is **not** re-built — consistent with the project's static-TLS-material rotation model. To change the inbound mTLS mode, restart the data plane.
+
+### Disable-mode topology guard
+
+`PeerAuthentication.mode: disable` resolved against an `Ambient` or `EgressGateway` workload causes startup to fail closed:
+
+- **Ambient**: HBONE is HTTP/2 CONNECT over mTLS — running the inbound listener plaintext is not a valid HBONE listener. Use `permissive` or `strict`, or move the workload to `Sidecar` topology if plaintext-only inbound is intended.
+- **EgressGateway**: the egress listener must verify sidecar client certificates. Use `permissive` or `strict`.
+
+`Sidecar` and `EastWestGateway` accept any resolved mode (`Disable` on Sidecar produces a plaintext inbound listener; on EastWestGateway the resolved mode is unused because there is no TLS termination).
 
 ## Transparent DNS Proxy
 

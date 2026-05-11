@@ -1985,6 +1985,14 @@ async fn serve_mesh_runtime(
         None
     };
 
+    // Resolve mTLS mode from the initial mesh slice. This is evaluated once at
+    // startup — PeerAuthentication changes pushed via CP/xDS update the slice
+    // but do NOT live-rotate the inbound TLS ServerConfig (consistent with the
+    // project's static-TLS-material model). A restart is required.
+    let inbound_mtls_mode =
+        resolve_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime);
+    validate_inbound_mtls_mode_for_topology(&runtime, inbound_mtls_mode)?;
+
     let mesh_apply_handle = start_mesh_slice_apply_task(
         mesh_state,
         proxy_state.clone(),
@@ -1995,7 +2003,7 @@ async fn serve_mesh_runtime(
     );
 
     validate_egress_gateway_mtls_config(&runtime, &env_config)?;
-    let frontend_tls = load_frontend_tls(&env_config, &tls_policy, &crls)?;
+    let frontend_tls = load_mesh_frontend_tls(&env_config, &tls_policy, &crls, inbound_mtls_mode)?;
     if let Some(ref tls_config) = frontend_tls {
         proxy_state
             .stream_listener_manager
@@ -2005,17 +2013,20 @@ async fn serve_mesh_runtime(
 
     info!(
         listeners = runtime.listener_plan().len(),
+        ?inbound_mtls_mode,
         "Mesh listener plan prepared"
     );
     let mut listener_handles = Vec::new();
     let mut startup_signals = Vec::new();
     for listener in runtime.listener_plan() {
-        let tls_config = listener_tls_config(&listener, frontend_tls.clone());
+        let tls_config =
+            listener_tls_config_for_mtls_mode(&listener, frontend_tls.clone(), inbound_mtls_mode);
         if tls_config.is_none()
             && matches!(
                 listener.kind,
                 MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
             )
+            && inbound_mtls_mode != config::MtlsMode::Disable
         {
             warn!(
                 direction = ?listener.direction,
@@ -2125,34 +2136,132 @@ async fn serve_mesh_runtime(
     Ok(())
 }
 
-fn load_frontend_tls(
+/// Resolve the effective mTLS mode for the inbound TLS-terminating listener
+/// from the initial mesh slice. Falls back to `Permissive` when no slice or no
+/// PeerAuthentication policies are available.
+///
+/// Port selection follows the topology's TLS-terminating listener (see
+/// `listener_plan()`), so PeerAuthentication `port_overrides` keyed on the
+/// actual listener port are honoured for every topology, not just Sidecar.
+fn resolve_inbound_mtls_mode(
+    initial_slice: Option<&MeshSlice>,
+    runtime: &MeshRuntimeConfig,
+) -> config::MtlsMode {
+    let Some(slice) = initial_slice else {
+        return config::MtlsMode::Permissive;
+    };
+    slice.resolve_effective_mtls_mode(inbound_mtls_resolution_port(runtime))
+}
+
+/// Pick the port used to resolve PeerAuthentication `port_overrides` for the
+/// inbound TLS-terminating listener of the current topology.
+fn inbound_mtls_resolution_port(runtime: &MeshRuntimeConfig) -> u16 {
+    match runtime.topology {
+        MeshTopology::Sidecar => runtime.inbound_listen_addr.port(),
+        MeshTopology::Ambient => runtime.hbone_listen_addr.port(),
+        MeshTopology::EgressGateway => runtime.egress_listen_addr.port(),
+        // East-west gateways do SNI passthrough — no TLS termination, no port
+        // override surface. Use inbound for stability; the resolved mode is
+        // not consumed by any TLS listener in this topology.
+        MeshTopology::EastWestGateway => runtime.inbound_listen_addr.port(),
+    }
+}
+
+/// Reject `MtlsMode::Disable` on topologies whose inbound listener is
+/// fundamentally mTLS-only:
+///
+/// - **Ambient**: HBONE is HTTP/2 CONNECT over mTLS — running it plaintext
+///   is not a valid HBONE listener.
+/// - **EgressGateway**: the egress listener must verify sidecar client
+///   certificates (already enforced for env-derived TLS materials by
+///   `validate_egress_gateway_mtls_config`; this check covers the
+///   policy-derived path).
+///
+/// Sidecar and EastWestGateway accept any resolved mode (EastWestGateway
+/// has no TLS termination so it is structurally a no-op).
+fn validate_inbound_mtls_mode_for_topology(
+    runtime: &MeshRuntimeConfig,
+    mtls_mode: config::MtlsMode,
+) -> Result<(), anyhow::Error> {
+    if mtls_mode != config::MtlsMode::Disable {
+        return Ok(());
+    }
+    match runtime.topology {
+        MeshTopology::Ambient => Err(anyhow::anyhow!(
+            "Mesh PeerAuthentication resolved to DISABLE on Ambient topology, but HBONE \
+             (HTTP/2 CONNECT over mTLS) requires mTLS. Use PERMISSIVE or STRICT for this \
+             workload, or move it to Sidecar topology if plaintext-only is intended."
+        )),
+        MeshTopology::EgressGateway => Err(anyhow::anyhow!(
+            "Mesh PeerAuthentication resolved to DISABLE on EgressGateway topology, but the \
+             egress mTLS listener must verify sidecar client certificates. Use PERMISSIVE or \
+             STRICT for this workload."
+        )),
+        MeshTopology::Sidecar | MeshTopology::EastWestGateway => Ok(()),
+    }
+}
+
+/// Build the mesh frontend TLS configuration respecting the resolved mTLS mode.
+///
+/// - `Strict` / `Permissive`: Load TLS with the appropriate client-auth mode.
+/// - `Disable`: Return `None` (plaintext listener).
+fn load_mesh_frontend_tls(
     env_config: &EnvConfig,
     tls_policy: &TlsPolicy,
     crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+    mtls_mode: config::MtlsMode,
 ) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
+    if mtls_mode == config::MtlsMode::Disable {
+        info!(
+            "Mesh PeerAuthentication mTLS mode is DISABLE; inbound listener will accept plaintext only"
+        );
+        return Ok(None);
+    }
+
     let (Some(cert_path), Some(key_path)) = (
         env_config.frontend_tls_cert_path.as_ref(),
         env_config.frontend_tls_key_path.as_ref(),
     ) else {
+        if mtls_mode == config::MtlsMode::Strict {
+            return Err(anyhow::anyhow!(
+                "Mesh PeerAuthentication STRICT requires FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH"
+            ));
+        }
         return Ok(None);
     };
 
     let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
-    let mut config = tls::load_tls_config_with_client_auth(
+    let client_auth = match mtls_mode {
+        config::MtlsMode::Strict => tls::MeshClientAuth::Required,
+        config::MtlsMode::Permissive if client_ca_bundle_path.is_some() => {
+            tls::MeshClientAuth::Optional
+        }
+        config::MtlsMode::Permissive => {
+            warn!(
+                "Mesh PeerAuthentication mTLS mode is PERMISSIVE but no \
+                 FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH is configured; \
+                 client certificates will not be requested or verified"
+            );
+            tls::MeshClientAuth::None
+        }
+        config::MtlsMode::Disable => unreachable!("handled above"),
+    };
+
+    let mut tls_config = tls::load_mesh_tls_config(
         cert_path,
         key_path,
         client_ca_bundle_path,
-        env_config.tls_no_verify,
+        client_auth,
         tls_policy,
         env_config.tls_cert_expiry_warning_days,
         crls,
     )
     .map_err(|e| anyhow::anyhow!("Invalid mesh frontend TLS configuration: {}", e))?;
-    tls::enable_early_data(&mut config, tls_policy);
+    tls::enable_early_data(&mut tls_config, tls_policy);
     if env_config.ktls_enabled.could_be_enabled() {
-        tls::enable_secret_extraction_for_ktls(&mut config);
+        tls::enable_secret_extraction_for_ktls(&mut tls_config);
     }
-    Ok(Some(config))
+    Ok(Some(tls_config))
 }
 
 fn validate_egress_gateway_mtls_config(
@@ -2192,6 +2301,22 @@ fn listener_tls_config(
         MeshListenerKind::PlaintextCapture => None,
         MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination => frontend_tls,
     }
+}
+
+/// Resolve the per-listener TLS config, respecting PeerAuthentication mTLS mode.
+///
+/// - `Disable` mode: all listeners run plaintext (no TLS config).
+/// - `Strict` / `Permissive`: mTLS/HBONE listeners get the frontend TLS config;
+///   plaintext-capture listeners stay plaintext.
+fn listener_tls_config_for_mtls_mode(
+    listener: &MeshListener,
+    frontend_tls: Option<Arc<rustls::ServerConfig>>,
+    mtls_mode: config::MtlsMode,
+) -> Option<Arc<rustls::ServerConfig>> {
+    if mtls_mode == config::MtlsMode::Disable {
+        return None;
+    }
+    listener_tls_config(listener, frontend_tls)
 }
 
 fn start_mesh_slice_apply_task(
@@ -4478,6 +4603,197 @@ mod tests {
         env.tls_no_verify = true;
         let err = validate_egress_gateway_mtls_config(&runtime, &env).unwrap_err();
         assert!(err.to_string().contains("FERRUM_TLS_NO_VERIFY=true"));
+    }
+
+    #[test]
+    fn strict_peer_auth_fails_closed_without_frontend_tls_materials() {
+        let env = EnvConfig::default();
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+
+        let err = load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Strict)
+            .expect_err("strict mTLS must require cert and key material");
+
+        assert!(
+            err.to_string()
+                .contains("PeerAuthentication STRICT requires")
+        );
+    }
+
+    #[test]
+    fn permissive_peer_auth_allows_missing_frontend_tls_materials() {
+        let env = EnvConfig::default();
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+
+        let tls_config =
+            load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Permissive)
+                .expect("permissive mTLS can run without frontend TLS materials");
+
+        assert!(tls_config.is_none());
+    }
+
+    #[test]
+    fn permissive_without_ca_bundle_degrades_to_no_client_auth() {
+        let env = EnvConfig {
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            frontend_tls_client_ca_bundle_path: None,
+            ..EnvConfig::default()
+        };
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+
+        let tls_config =
+            load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Permissive)
+                .expect("permissive without CA bundle should succeed");
+
+        assert!(
+            tls_config.is_some(),
+            "TLS config should be built (no client auth, but server TLS active)"
+        );
+    }
+
+    // ── Topology-aware port resolution + Disable-mode validation ────────
+
+    fn runtime_with_topology(topology: MeshTopology) -> MeshRuntimeConfig {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.topology = topology;
+        runtime.inbound_listen_addr = "127.0.0.1:15006".parse().unwrap();
+        runtime.hbone_listen_addr = "127.0.0.1:15008".parse().unwrap();
+        runtime.egress_listen_addr = "127.0.0.1:15090".parse().unwrap();
+        runtime
+    }
+
+    fn peer_auth_with_port_override(
+        port: u16,
+        mode: config::MtlsMode,
+    ) -> config::PeerAuthentication {
+        config::PeerAuthentication {
+            name: "ns-policy".to_string(),
+            namespace: "default".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: config::MtlsMode::Permissive,
+            port_overrides: HashMap::from([(port, mode)]),
+        }
+    }
+
+    fn slice_with_peer_auths(peer_auths: Vec<config::PeerAuthentication>) -> MeshSlice {
+        MeshSlice {
+            namespace: "default".to_string(),
+            peer_authentications: peer_auths,
+            ..MeshSlice::default()
+        }
+    }
+
+    #[test]
+    fn inbound_mtls_resolution_port_picks_topology_correct_port() {
+        let sidecar = runtime_with_topology(MeshTopology::Sidecar);
+        assert_eq!(inbound_mtls_resolution_port(&sidecar), 15006);
+
+        let ambient = runtime_with_topology(MeshTopology::Ambient);
+        assert_eq!(inbound_mtls_resolution_port(&ambient), 15008);
+
+        let egress = runtime_with_topology(MeshTopology::EgressGateway);
+        assert_eq!(inbound_mtls_resolution_port(&egress), 15090);
+
+        // East-west has no TLS termination; pick a stable port for the call.
+        let east_west = runtime_with_topology(MeshTopology::EastWestGateway);
+        assert_eq!(inbound_mtls_resolution_port(&east_west), 15006);
+    }
+
+    #[test]
+    fn resolve_inbound_mtls_mode_honours_hbone_port_override_for_ambient() {
+        // Port override keyed on the HBONE port (15008). With the prior bug
+        // (always looking up 15006) this would have fallen through to the
+        // top-level Permissive mode.
+        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
+            15008,
+            config::MtlsMode::Strict,
+        )]);
+        let runtime = runtime_with_topology(MeshTopology::Ambient);
+
+        assert_eq!(
+            resolve_inbound_mtls_mode(Some(&slice), &runtime),
+            config::MtlsMode::Strict,
+        );
+    }
+
+    #[test]
+    fn resolve_inbound_mtls_mode_honours_egress_port_override_for_egress_gateway() {
+        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
+            15090,
+            config::MtlsMode::Strict,
+        )]);
+        let runtime = runtime_with_topology(MeshTopology::EgressGateway);
+
+        assert_eq!(
+            resolve_inbound_mtls_mode(Some(&slice), &runtime),
+            config::MtlsMode::Strict,
+        );
+    }
+
+    #[test]
+    fn resolve_inbound_mtls_mode_honours_inbound_port_override_for_sidecar() {
+        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
+            15006,
+            config::MtlsMode::Strict,
+        )]);
+        let runtime = runtime_with_topology(MeshTopology::Sidecar);
+
+        assert_eq!(
+            resolve_inbound_mtls_mode(Some(&slice), &runtime),
+            config::MtlsMode::Strict,
+        );
+    }
+
+    #[test]
+    fn validate_inbound_mtls_mode_rejects_disable_on_ambient() {
+        let runtime = runtime_with_topology(MeshTopology::Ambient);
+        let err = validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Disable)
+            .expect_err("Disable on Ambient must be rejected");
+
+        assert!(err.to_string().contains("Ambient"));
+        assert!(err.to_string().contains("HBONE"));
+    }
+
+    #[test]
+    fn validate_inbound_mtls_mode_rejects_disable_on_egress_gateway() {
+        let runtime = runtime_with_topology(MeshTopology::EgressGateway);
+        let err = validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Disable)
+            .expect_err("Disable on EgressGateway must be rejected");
+
+        assert!(err.to_string().contains("EgressGateway"));
+    }
+
+    #[test]
+    fn validate_inbound_mtls_mode_accepts_disable_on_sidecar() {
+        let runtime = runtime_with_topology(MeshTopology::Sidecar);
+        validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Disable)
+            .expect("Disable on Sidecar is allowed (plaintext-only inbound)");
+    }
+
+    #[test]
+    fn validate_inbound_mtls_mode_accepts_disable_on_east_west_gateway() {
+        // East-west gateways do SNI passthrough — there is no TLS-terminating
+        // listener to fail closed. The resolved mode is structurally unused.
+        let runtime = runtime_with_topology(MeshTopology::EastWestGateway);
+        validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Disable)
+            .expect("Disable on EastWestGateway is structurally a no-op");
+    }
+
+    #[test]
+    fn validate_inbound_mtls_mode_accepts_permissive_and_strict_on_all_topologies() {
+        for topology in [
+            MeshTopology::Sidecar,
+            MeshTopology::Ambient,
+            MeshTopology::EastWestGateway,
+            MeshTopology::EgressGateway,
+        ] {
+            let runtime = runtime_with_topology(topology);
+            validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Permissive)
+                .unwrap_or_else(|e| panic!("Permissive on {:?} should succeed: {}", topology, e));
+            validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Strict)
+                .unwrap_or_else(|e| panic!("Strict on {:?} should succeed: {}", topology, e));
+        }
     }
 
     fn test_external_service_entry(
