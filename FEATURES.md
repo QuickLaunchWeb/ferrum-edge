@@ -43,13 +43,14 @@ A comprehensive feature list for Ferrum Edge.
 
 ## Service Discovery
 
-Ferrum supports dynamic upstream target discovery through three providers, configured via the `service_discovery` block on an upstream.
+Ferrum supports dynamic upstream target discovery through four providers, configured via the `service_discovery` block on an upstream.
 
 ### Providers
 
 - **DNS-SD** — discovers targets via DNS SRV record lookups. Suitable for environments using mDNS or service-aware DNS infrastructure. Configurable service name and poll interval.
 - **Kubernetes** — queries the Kubernetes API for endpoint addresses backing a named Service. Supports namespace scoping and named port selection. Requires in-cluster credentials or a configured kubeconfig.
 - **Consul** — queries a Consul agent or server for healthy service instances. Supports datacenter selection and ACL token authentication.
+- **Ferrum Mesh** — resolves CP-delivered mesh services and workload SPIFFE references into gateway upstream targets tagged with mesh identity metadata.
 
 ### Behavior
 
