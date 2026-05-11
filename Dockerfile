@@ -39,6 +39,9 @@ COPY custom_plugins ./custom_plugins
 # below) — Cargo resolves patch paths during manifest load, not just at
 # compile time.
 COPY vendor ./vendor
+# The main crate depends on shared no_std eBPF ABI types via a path dependency,
+# so the Docker build context must include ebpf/ before any Cargo metadata load.
+COPY ebpf ./ebpf
 
 # Create a dummy main.rs to build dependencies only
 RUN mkdir src && \
