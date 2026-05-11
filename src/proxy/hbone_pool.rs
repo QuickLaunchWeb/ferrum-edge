@@ -163,16 +163,30 @@ impl HboneConnectionPool {
     ) -> Result<(), HbonePoolError> {
         let (source_identity, fingerprint) = current_svid_identity(&self.gateway_svid)?;
         let pool_config = self.pool_config.for_proxy(proxy);
-        let key = pool_key_owned(
+
+        let fast_sender = with_hbone_pool_key(
             target_host,
             target_port,
             hbone_port,
             proxy.dns_override.as_deref(),
             &fingerprint,
             &pool_config,
+            |key| self.try_cached_sender_read(key),
         );
-        let sender = self
-            .get_or_create_sender(
+
+        let sender = if let Some(sender) = fast_sender {
+            sender
+        } else {
+            let key = with_hbone_pool_key(
+                target_host,
+                target_port,
+                hbone_port,
+                proxy.dns_override.as_deref(),
+                &fingerprint,
+                &pool_config,
+                |key| key.to_string(),
+            );
+            self.get_or_create_sender(
                 proxy,
                 target_host,
                 target_port,
@@ -180,7 +194,8 @@ impl HboneConnectionPool {
                 &key,
                 &pool_config,
             )
-            .await?;
+            .await?
+        };
         tokio::time::timeout(
             Duration::from_millis(proxy.backend_connect_timeout_ms),
             self.open_connect_stream(sender, target_host, target_port, &source_identity),
@@ -205,16 +220,30 @@ impl HboneConnectionPool {
     ) -> Result<HboneTunnel, HbonePoolError> {
         let (source_identity, fingerprint) = current_svid_identity(&self.gateway_svid)?;
         let pool_config = self.pool_config.for_proxy(proxy);
-        let key = pool_key_owned(
+
+        let fast_sender = with_hbone_pool_key(
             target_host,
             target_port,
             hbone_port,
             proxy.dns_override.as_deref(),
             &fingerprint,
             &pool_config,
+            |key| self.try_cached_sender_read(key),
         );
-        let sender = self
-            .get_or_create_sender(
+
+        let sender = if let Some(sender) = fast_sender {
+            sender
+        } else {
+            let key = with_hbone_pool_key(
+                target_host,
+                target_port,
+                hbone_port,
+                proxy.dns_override.as_deref(),
+                &fingerprint,
+                &pool_config,
+                |key| key.to_string(),
+            );
+            self.get_or_create_sender(
                 proxy,
                 target_host,
                 target_port,
@@ -222,7 +251,8 @@ impl HboneConnectionPool {
                 &key,
                 &pool_config,
             )
-            .await?;
+            .await?
+        };
         tokio::time::timeout(
             Duration::from_millis(proxy.backend_connect_timeout_ms),
             self.open_connect_stream(sender, target_host, target_port, &source_identity),
@@ -405,6 +435,28 @@ impl HboneConnectionPool {
         }
     }
 
+    /// Shared-lock fast path: scan for a ready sender without pruning or
+    /// updating `last_used_at`. Avoids the exclusive shard write lock that
+    /// `cached_sender` holds during prune + scan + clone. Expired entries
+    /// are skipped (not removed); dead senders fall through to the write
+    /// path. The `last_used_at` staleness is bounded by
+    /// `maybe_prune_idle_entries` running on the next write-path call.
+    fn try_cached_sender_read(&self, key: &str) -> Option<SendRequest<Bytes>> {
+        let entries = self.entries.get(key)?;
+        let now = Instant::now();
+        for entry in entries.value().iter() {
+            if entry_idle_expired(entry.last_used_at, entry.idle_timeout_seconds, now) {
+                continue;
+            }
+            let sender = entry.sender.clone();
+            match sender.ready().now_or_never() {
+                Some(Ok(ready)) => return Some(ready),
+                _ => continue,
+            }
+        }
+        None
+    }
+
     fn maybe_prune_idle_entries(&self) {
         let now = unix_secs();
         let interval = if self.pool_config.idle_timeout_seconds == 0 {
@@ -543,6 +595,8 @@ impl HboneConnectionPool {
             );
         }
 
+        // Connection driver exits when all SendRequest handles are dropped.
+        // In-flight tunnels are covered by RequestGuard on the dispatch path.
         tokio::spawn(async move {
             if let Err(e) = connection.await {
                 debug!("hbone_pool: HTTP/2 connection closed: {}", e);
@@ -717,6 +771,8 @@ impl AsyncWrite for HboneTunnel {
         }
     }
 
+    // h2 send_data queues into the connection driver which flushes to
+    // TCP independently; no explicit flush API on SendStream.
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
@@ -826,14 +882,15 @@ fn matches_boolish_true(value: &str) -> bool {
         || value == "1"
 }
 
-pub fn pool_key_owned(
+fn with_hbone_pool_key<R>(
     host: &str,
     target_port: u16,
     hbone_port: u16,
     dns_override: Option<&str>,
     svid_fingerprint: &str,
     pool_config: &PoolConfig,
-) -> String {
+    f: impl FnOnce(&str) -> R,
+) -> R {
     HBONE_POOL_KEY_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
         write_hbone_pool_key(
@@ -845,8 +902,28 @@ pub fn pool_key_owned(
             svid_fingerprint,
             pool_config,
         );
-        buf.clone()
+        f(&buf)
     })
+}
+
+#[cfg(test)]
+fn pool_key_owned(
+    host: &str,
+    target_port: u16,
+    hbone_port: u16,
+    dns_override: Option<&str>,
+    svid_fingerprint: &str,
+    pool_config: &PoolConfig,
+) -> String {
+    with_hbone_pool_key(
+        host,
+        target_port,
+        hbone_port,
+        dns_override,
+        svid_fingerprint,
+        pool_config,
+        |key| key.to_string(),
+    )
 }
 
 fn write_hbone_pool_key(
@@ -1194,6 +1271,30 @@ mod tests {
             h2_failure.is_capability_failure(),
             "pre-CONNECT HTTP/2 establishment failure is a capability signal"
         );
+    }
+
+    #[test]
+    fn with_hbone_pool_key_matches_pool_key_owned() {
+        let pool_config = PoolConfig::default();
+        let owned = pool_key_owned("host", 8080, 15008, None, "fp", &pool_config);
+        let via_callback =
+            with_hbone_pool_key("host", 8080, 15008, None, "fp", &pool_config, |key| {
+                key.to_string()
+            });
+        assert_eq!(owned, via_callback);
+    }
+
+    #[test]
+    fn read_path_returns_none_on_empty_and_missing_keys() {
+        let pool = HboneConnectionPool::new(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            Arc::new(ArcSwap::new(Arc::new(None))),
+            4,
+        );
+        assert!(pool.try_cached_sender_read("missing").is_none());
+        pool.entries.insert("empty".to_string(), Vec::new());
+        assert!(pool.try_cached_sender_read("empty").is_none());
     }
 
     #[test]
