@@ -196,6 +196,28 @@ pub struct SubsetTrafficPolicy {
     pub load_balancer_algorithm: Option<LoadBalancerAlgorithm>,
 }
 
+/// Per-destination-port traffic policy overrides on an upstream.
+///
+/// Populated from an Istio DestinationRule's `trafficPolicy.portLevelSettings[]`
+/// (see [`crate::modes::mesh::config::MeshDestinationRule::port_level_settings`]).
+/// Fields are a strict subset of the upstream-level policy: only fields the
+/// existing top-level DR policy already sets on `Upstream` are surfaced here.
+/// Connect timeout is included for forward-compat with pool-level per-port
+/// lookups even though it is currently only consumed at the proxy level.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct UpstreamPortOverride {
+    /// Per-port backend connect timeout override (milliseconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    /// Override the upstream's load balancer algorithm for this port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algorithm: Option<LoadBalancerAlgorithm>,
+    /// Override the upstream's `hash_on` selector for this port. Same format
+    /// as `Upstream.hash_on`: `"ip"`, `"header:<name>"`, or `"cookie:<name>"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_on: Option<String>,
+}
+
 /// A named subset of upstream targets identified by label selectors.
 ///
 /// Targets whose `tags` are a superset of `labels` belong to this subset.
@@ -505,6 +527,12 @@ pub struct Upstream {
     /// are a superset of a subset's `labels` belong to that subset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subsets: Option<Vec<SubsetDefinition>>,
+    /// Per-destination-port traffic policy overrides populated by Istio
+    /// `DestinationRule.trafficPolicy.portLevelSettings[]`. Keyed by
+    /// destination port number; empty by default. Round-trips identically to
+    /// the prior schema when empty (via `skip_serializing_if`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub port_overrides: HashMap<u16, UpstreamPortOverride>,
     /// Path to a PEM client certificate for mTLS with backend targets.
     #[serde(default)]
     pub backend_tls_client_cert_path: Option<String>,

@@ -28,7 +28,7 @@ use crate::config::conf_file::resolve_ferrum_var;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm,
     PassiveHealthCheck, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,
-    SubsetDefinition, SubsetTrafficPolicy, Upstream, UpstreamTarget,
+    SubsetDefinition, SubsetTrafficPolicy, Upstream, UpstreamPortOverride, UpstreamTarget,
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
@@ -740,6 +740,7 @@ fn build_east_west_service_proxies_and_upstreams(
             }),
             service_discovery: None,
             subsets: None,
+            port_overrides: HashMap::new(),
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
@@ -940,6 +941,17 @@ fn apply_destination_rules(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
                 apply_traffic_policy_to_upstream(upstream, policy);
             }
 
+            // Second pass: per-port traffic policy overrides land on the
+            // upstream's `port_overrides` slot. Pool-level dispatch already
+            // keys per destination port, so per-port policy naturally scopes
+            // to that port's pool entry. The top-level policy is still applied
+            // first so per-port acts as an additive override of the same
+            // fields.
+            for (port, port_policy) in &dr.port_level_settings {
+                let override_slot = upstream.port_overrides.entry(*port).or_default();
+                apply_traffic_policy_to_port_override(override_slot, port_policy);
+            }
+
             if !dr.subsets.is_empty() {
                 if upstream.subsets.is_some() {
                     debug!(
@@ -981,6 +993,36 @@ fn apply_destination_rules(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
                         proxy.backend_connect_timeout_ms = timeout_ms;
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Project a `MeshTrafficPolicy` onto a per-port `UpstreamPortOverride` slot.
+///
+/// Only the strict subset of fields that the top-level DR policy already
+/// installs on the upstream is mirrored here (LB algorithm + hash key +
+/// connect timeout). Outlier detection is intentionally not split per-port —
+/// it produces a single `PassiveHealthCheck` on the upstream.
+fn apply_traffic_policy_to_port_override(
+    slot: &mut UpstreamPortOverride,
+    policy: &MeshTrafficPolicy,
+) {
+    if let Some(timeout_ms) = policy.connect_timeout_ms {
+        slot.connect_timeout_ms = Some(timeout_ms);
+    }
+
+    if let Some(lb) = &policy.load_balancer {
+        if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
+            slot.algorithm = Some(algorithm);
+        }
+        if let MeshLoadBalancer::ConsistentHash(ch) = lb {
+            if let Some(header) = &ch.http_header_name {
+                slot.hash_on = Some(format!("header:{header}"));
+            } else if let Some(cookie) = &ch.http_cookie_name {
+                slot.hash_on = Some(format!("cookie:{cookie}"));
+            } else if ch.use_source_ip {
+                slot.hash_on = Some("ip".to_string());
             }
         }
     }
@@ -1227,6 +1269,7 @@ fn build_egress_proxies_and_upstreams(
                     health_checks: egress_health_checks(),
                     service_discovery: None,
                     subsets: None,
+                    port_overrides: HashMap::new(),
                     backend_tls_client_cert_path: None,
                     backend_tls_client_key_path: None,
                     backend_tls_verify_server_cert: true,
@@ -3099,6 +3142,7 @@ mod tests {
             health_checks: None,
             service_discovery: None,
             subsets: None,
+            port_overrides: HashMap::new(),
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
@@ -3143,6 +3187,7 @@ mod tests {
                     load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
                     ..MeshTrafficPolicy::default()
                 }),
+                port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
             }],
             ..MeshSlice::default()
@@ -3187,6 +3232,7 @@ mod tests {
                         load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
                         ..MeshTrafficPolicy::default()
                     }),
+                    port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
                 },
                 MeshDestinationRule {
@@ -3198,6 +3244,7 @@ mod tests {
                         load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin)),
                         ..MeshTrafficPolicy::default()
                     }),
+                    port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
                 },
             ],
@@ -3208,6 +3255,131 @@ mod tests {
 
         assert_eq!(config.upstreams[0].algorithm, LoadBalancerAlgorithm::Random);
         assert_eq!(config.proxies[0].backend_connect_timeout_ms, 9999);
+    }
+
+    #[test]
+    fn destination_rule_top_level_and_per_port_override_apply_independently() {
+        let mut config = GatewayConfig {
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        let mut port_level = HashMap::new();
+        port_level.insert(
+            8080u16,
+            MeshTrafficPolicy {
+                connect_timeout_ms: Some(2222),
+                load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connect_timeout_ms: Some(1111),
+                    load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin)),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: port_level,
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &slice);
+
+        // Top-level policy still applies to the upstream itself.
+        assert_eq!(
+            config.upstreams[0].algorithm,
+            LoadBalancerAlgorithm::RoundRobin
+        );
+        assert_eq!(config.proxies[0].backend_connect_timeout_ms, 1111);
+
+        // Per-port 8080 override lands on port_overrides[8080] without
+        // disturbing the upstream-level fields.
+        let port_8080 = config.upstreams[0]
+            .port_overrides
+            .get(&8080)
+            .expect("port 8080 override");
+        assert_eq!(port_8080.connect_timeout_ms, Some(2222));
+        assert_eq!(port_8080.algorithm, Some(LoadBalancerAlgorithm::Random));
+        // Hash key not set in this policy; should remain None.
+        assert_eq!(port_8080.hash_on, None);
+    }
+
+    #[test]
+    fn destination_rule_two_per_port_overrides_land_on_distinct_slots() {
+        let mut config = GatewayConfig {
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        let mut port_level = HashMap::new();
+        port_level.insert(
+            8080u16,
+            MeshTrafficPolicy {
+                connect_timeout_ms: Some(750),
+                load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        port_level.insert(
+            9090u16,
+            MeshTrafficPolicy {
+                connect_timeout_ms: Some(3000),
+                load_balancer: Some(MeshLoadBalancer::ConsistentHash(
+                    crate::modes::mesh::config::MeshConsistentHash {
+                        http_header_name: Some("x-user".to_string()),
+                        http_cookie_name: None,
+                        use_source_ip: false,
+                    },
+                )),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: port_level,
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &slice);
+
+        let p8080 = config.upstreams[0]
+            .port_overrides
+            .get(&8080)
+            .expect("port 8080 override");
+        assert_eq!(p8080.connect_timeout_ms, Some(750));
+        assert_eq!(
+            p8080.algorithm,
+            Some(LoadBalancerAlgorithm::LeastConnections)
+        );
+
+        let p9090 = config.upstreams[0]
+            .port_overrides
+            .get(&9090)
+            .expect("port 9090 override");
+        assert_eq!(p9090.connect_timeout_ms, Some(3000));
+        assert_eq!(
+            p9090.algorithm,
+            Some(LoadBalancerAlgorithm::ConsistentHashing)
+        );
+        assert_eq!(p9090.hash_on.as_deref(), Some("header:x-user"));
     }
 
     #[test]
@@ -5157,6 +5329,7 @@ mod tests {
                         load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
                         ..MeshTrafficPolicy::default()
                     }),
+                    port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
                 }],
                 ..MeshConfig::default()

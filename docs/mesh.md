@@ -223,7 +223,7 @@ subsets:
 | `trafficPolicy.connectionPool.http.*` | Ignored | Per-protocol connection pool not surfaced |
 | `trafficPolicy.connectionPool.tcp.maxConnections` / `tcpKeepalive` | Ignored | Pool sizing handled globally via `FERRUM_POOL_*` |
 | `trafficPolicy.tls` | Ignored | mTLS posture comes from `PeerAuthentication` |
-| `trafficPolicy.portLevelSettings` | Ignored | Per-port traffic policy not modeled |
+| `trafficPolicy.portLevelSettings[].port.number` + nested `connectionPool` / `outlierDetection` / `loadBalancer` | Supported | Top-level policy applies first; per-port entries override matching fields on `Upstream.port_overrides[port]` (LB algorithm, hash key, connect timeout). Ports outside 1-65535 rejected; duplicate port entries rejected |
 | `exportTo` | Ignored | DRs are scoped to their declared namespace at slice-filter time |
 
 Translator warnings surface in the `K8sTranslation.warnings` returned from `translate_k8s_objects`, so operators see them at apply time.
@@ -841,7 +841,6 @@ The following Istio mesh surfaces are **not yet supported** and should be treate
 | `ProxyConfig` | Deferred | Configure via `FERRUM_*` environment variables |
 | `WasmPlugin` | Not planned | Use Ferrum custom plugins (`custom_plugins/`) |
 | `DestinationRule.trafficPolicy.tls` | Deferred | Use per-proxy `backend_tls_*` fields |
-| `DestinationRule` port-level traffic policy | Deferred | Top-level traffic policy applies to all ports |
 | Outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`) | Deferred | Unknown outbound destinations are not blocked today |
 | `AuthorizationPolicy` negative-match fields (`notMethods`, `notPaths`, `notHosts`, `notPorts`) | Rejected at translation | Split into separate DENY policies |
 | `VirtualService` header/method-only matches | Skipped | Ferrum route proxies do not encode header/method predicates |

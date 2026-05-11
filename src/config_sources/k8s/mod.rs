@@ -691,6 +691,7 @@ pub(crate) fn upstream_for_route(
         health_checks: None,
         service_discovery: None,
         subsets: None,
+        port_overrides: HashMap::new(),
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
