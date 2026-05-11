@@ -18,7 +18,7 @@ use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::ebpf::kernel_probe::{self, KernelProbeResult};
 use crate::ebpf::pod_watcher;
-use crate::ebpf::{EbpfBackend, FallbackMode, MockEbpfBackend, PodAttachmentState};
+use crate::ebpf::{EbpfBackend, FallbackMode, PodAttachmentState};
 
 const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const DEFAULT_BPF_FS_PATH: &str = "/sys/fs/bpf";
@@ -109,8 +109,27 @@ pub async fn run(
         return Ok(());
     }
 
-    let mut backend = MockEbpfBackend::default();
-    initialize_backend(&mut backend, &config)?;
+    run_with_backend(create_backend(), &config, &shutdown_tx).await
+}
+
+fn create_backend() -> Box<dyn EbpfBackend> {
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    {
+        Box::new(crate::ebpf::AyaEbpfBackend::new())
+    }
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+    {
+        info!("ebpf feature not enabled, using mock backend");
+        Box::new(crate::ebpf::MockEbpfBackend::default())
+    }
+}
+
+async fn run_with_backend(
+    mut backend: Box<dyn EbpfBackend>,
+    config: &NodeAgentConfig,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+) -> Result<(), anyhow::Error> {
+    initialize_backend(backend.as_mut(), config)?;
 
     let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
 
@@ -119,10 +138,10 @@ pub async fn run(
         config.node_name
     );
 
-    wait_for_shutdown(&shutdown_tx).await;
+    wait_for_shutdown(shutdown_tx).await;
 
     info!("Node agent shutting down, detaching BPF programs");
-    cleanup_all_pods(&mut backend, &pod_states);
+    cleanup_all_pods(backend.as_mut(), &pod_states);
 
     Ok(())
 }
@@ -176,7 +195,7 @@ fn handle_fallback(
 }
 
 fn initialize_backend(
-    backend: &mut impl EbpfBackend,
+    backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
 ) -> Result<(), anyhow::Error> {
     backend.load_programs().map_err(anyhow::Error::msg)?;
@@ -206,7 +225,7 @@ fn initialize_backend(
 }
 
 fn cleanup_all_pods(
-    backend: &mut impl EbpfBackend,
+    backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
 ) {
     for entry in pod_states.iter() {
@@ -226,6 +245,7 @@ fn cleanup_all_pods(
 mod tests {
     use super::*;
     use crate::capture::CaptureMode;
+    use crate::ebpf::MockEbpfBackend;
 
     #[test]
     fn initialize_backend_populates_maps() {

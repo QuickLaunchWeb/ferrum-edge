@@ -175,6 +175,9 @@ mongodb = "3"
 # SYNC: version must match tests/performance/multi_protocol/Cargo.toml (cross-version DTLS handshakes hang)
 dimpl = { version = "0.6", features = ["aws-lc-rs", "rcgen"] }
 
+# Shared types between eBPF programs and userspace (no_std, platform-independent)
+ferrum-ebpf-common = { path = "ebpf/ferrum-ebpf-common" }
+
 # Memory allocator — jemalloc reduces fragmentation and improves throughput
 # under high concurrency (50k+ connections). Not available on Windows.
 [target.'cfg(not(windows))'.dependencies]
@@ -184,6 +187,9 @@ tikv-jemallocator = "0.6"
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 io-uring = "0.7"
+# eBPF program loader (optional, behind `ebpf` feature)
+aya = { version = "0.13", optional = true }
+aya-log = { version = "0.2", optional = true }
 
 # ── Feature flags ──────────────────────────────────────────────────────────
 # Cloud secret backends are optional.  Disabling them saves ~1,900 transitive
@@ -196,6 +202,7 @@ secrets-vault = ["dep:vaultrs"]
 secrets-aws = ["dep:aws-config", "dep:aws-sdk-secretsmanager"]
 secrets-gcp = ["dep:google-cloud-secretmanager-v1"]
 secrets-azure = ["dep:azure_identity", "dep:azure_security_keyvault_secrets", "dep:azure_core"]
+ebpf = ["dep:aya", "dep:aya-log"]
 
 # ── Build profiles ─────────────────────────────────────────────────────────
 # Dev: optimise for fast compile-edit-run cycles
