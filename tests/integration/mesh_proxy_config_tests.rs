@@ -11,7 +11,10 @@ use std::net::SocketAddr;
 
 use ferrum_edge::capture::CaptureMode;
 use ferrum_edge::config::types::GatewayConfig;
-use ferrum_edge::modes::mesh::config::{MeshConfig, MeshProxyConfig};
+use ferrum_edge::modes::mesh::config::{
+    MeshConfig, MeshProxyConfig, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
+    PolicyScope,
+};
 use ferrum_edge::modes::mesh::{
     MESH_WORKLOAD_METRICS_PLUGIN_ID, MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
     prepare_gateway_config_for_mesh,
@@ -129,6 +132,171 @@ fn proxy_config_does_not_set_sampling_when_unset() {
     assert!(
         metrics_plugin.config.get("sampling_percentage").is_none(),
         "no sampling_percentage should be set when ProxyConfig.tracing_sampling is None"
+    );
+}
+
+#[test]
+fn telemetry_tracing_sampling_overrides_proxy_config_tracing_sampling() {
+    // When BOTH a ProxyConfig and a Telemetry resource set a tracing
+    // sampling value, the more granular Telemetry CRD must win on the
+    // `sampling_percentage` key. This is the PR's stated merge contract.
+    let mesh = MeshConfig {
+        proxy_configs: vec![MeshProxyConfig {
+            name: "api-defaults".to_string(),
+            namespace: "default".to_string(),
+            selector_labels: HashMap::from([("app".to_string(), "api".to_string())]),
+            concurrency: None,
+            image: None,
+            environment: HashMap::new(),
+            tracing_sampling: Some(10.0),
+        }],
+        telemetry_resources: vec![MeshTelemetryResource {
+            name: "telemetry-default".to_string(),
+            namespace: "default".to_string(),
+            scope: PolicyScope::Namespace {
+                namespace: "default".to_string(),
+            },
+            config: MeshTelemetryConfig {
+                tracing: Some(MeshTracingConfig {
+                    sampling_percentage: Some(99.0),
+                    custom_tags: HashMap::new(),
+                    custom_header_tags: HashMap::new(),
+                }),
+                metrics: None,
+                access_logging: None,
+            },
+        }],
+        ..MeshConfig::default()
+    };
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    let runtime = test_runtime();
+
+    let prepared =
+        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+
+    let metrics_plugin = prepared
+        .plugin_configs
+        .iter()
+        .find(|p| p.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+        .expect("workload_metrics plugin injected");
+
+    let sampling = metrics_plugin
+        .config
+        .get("sampling_percentage")
+        .and_then(|v| v.as_f64())
+        .expect("sampling_percentage populated");
+    assert_eq!(
+        sampling, 99.0,
+        "Telemetry.tracing.sampling_percentage must override ProxyConfig.tracing_sampling"
+    );
+}
+
+#[test]
+fn proxy_config_tracing_sampling_survives_telemetry_without_sampling_field() {
+    // When ProxyConfig sets sampling and Telemetry has tracing but does not
+    // populate the sampling field (e.g., only custom_tags), the ProxyConfig
+    // baseline must NOT be erased — Telemetry only overrides per-field.
+    let mesh = MeshConfig {
+        proxy_configs: vec![MeshProxyConfig {
+            name: "api-defaults".to_string(),
+            namespace: "default".to_string(),
+            selector_labels: HashMap::from([("app".to_string(), "api".to_string())]),
+            concurrency: None,
+            image: None,
+            environment: HashMap::new(),
+            tracing_sampling: Some(25.0),
+        }],
+        telemetry_resources: vec![MeshTelemetryResource {
+            name: "telemetry-tags-only".to_string(),
+            namespace: "default".to_string(),
+            scope: PolicyScope::Namespace {
+                namespace: "default".to_string(),
+            },
+            config: MeshTelemetryConfig {
+                tracing: Some(MeshTracingConfig {
+                    sampling_percentage: None,
+                    custom_tags: HashMap::from([("region".to_string(), "us-east".to_string())]),
+                    custom_header_tags: HashMap::new(),
+                }),
+                metrics: None,
+                access_logging: None,
+            },
+        }],
+        ..MeshConfig::default()
+    };
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    let runtime = test_runtime();
+
+    let prepared =
+        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+
+    let metrics_plugin = prepared
+        .plugin_configs
+        .iter()
+        .find(|p| p.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+        .expect("workload_metrics plugin injected");
+
+    let sampling = metrics_plugin
+        .config
+        .get("sampling_percentage")
+        .and_then(|v| v.as_f64())
+        .expect("sampling_percentage must remain from ProxyConfig baseline");
+    assert_eq!(
+        sampling, 25.0,
+        "ProxyConfig.tracing_sampling must survive Telemetry with no sampling field"
+    );
+}
+
+#[test]
+fn proxy_config_zero_sampling_is_applied_not_skipped() {
+    // ProxyConfig with tracing_sampling=0.0 means "never sample" — it must
+    // be propagated, not silently treated as unset. (A None-vs-Some(0.0)
+    // mix-up here would cause a 0% intent to fall back to the plugin's
+    // 100% default.)
+    let mesh = MeshConfig {
+        proxy_configs: vec![MeshProxyConfig {
+            name: "no-tracing".to_string(),
+            namespace: "default".to_string(),
+            selector_labels: HashMap::from([("app".to_string(), "api".to_string())]),
+            concurrency: None,
+            image: None,
+            environment: HashMap::new(),
+            tracing_sampling: Some(0.0),
+        }],
+        ..MeshConfig::default()
+    };
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    let runtime = test_runtime();
+
+    let prepared =
+        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+
+    let metrics_plugin = prepared
+        .plugin_configs
+        .iter()
+        .find(|p| p.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+        .expect("workload_metrics plugin injected");
+
+    let sampling = metrics_plugin
+        .config
+        .get("sampling_percentage")
+        .and_then(|v| v.as_f64())
+        .expect("sampling_percentage must be present for Some(0.0)");
+    assert_eq!(
+        sampling, 0.0,
+        "ProxyConfig.tracing_sampling=Some(0.0) must propagate as 0.0, not be skipped"
     );
 }
 
