@@ -81,4 +81,7 @@ message MeshConfigUpdate {
   string mesh_slice_json = 3;
   // Ferrum Edge binary version of the CP (e.g. "0.9.0")
   string ferrum_version = 4;
+  // Lightweight keepalive frame for MeshSubscribe streams. Heartbeats keep
+  // registry liveness fresh without forcing receivers to re-apply a slice.
+  bool heartbeat = 5;
 }
