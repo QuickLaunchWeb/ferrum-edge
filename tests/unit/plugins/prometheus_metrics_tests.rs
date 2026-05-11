@@ -435,6 +435,27 @@ async fn test_registry_rate_limit_counter() {
 }
 
 #[tokio::test]
+async fn test_registry_records_mesh_dns_upstream_id_exhaustion() {
+    let registry = MetricsRegistry::new();
+
+    let initial_output = registry.render_uncached();
+    assert!(initial_output.contains("ferrum_mesh_dns_upstream_id_exhaustions_total 0"));
+
+    registry.record_mesh_dns_upstream_id_exhaustion();
+    registry.record_mesh_dns_upstream_id_exhaustion();
+
+    assert_eq!(
+        registry
+            .mesh_dns_upstream_id_exhaustions
+            .load(Ordering::Relaxed),
+        2
+    );
+    let output = registry.render_uncached();
+    assert!(output.contains("# TYPE ferrum_mesh_dns_upstream_id_exhaustions_total counter"));
+    assert!(output.contains("ferrum_mesh_dns_upstream_id_exhaustions_total 2"));
+}
+
+#[tokio::test]
 async fn test_histogram_multiple_observations() {
     let registry = MetricsRegistry::new();
 
