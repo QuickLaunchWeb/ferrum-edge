@@ -4609,4 +4609,180 @@ mod tests {
         );
         assert_eq!(egress_backend_scheme(AppProtocol::Tcp), None);
     }
+
+    #[test]
+    fn egress_resolution_none_uses_hosts_as_targets() {
+        let service_entries = vec![ServiceEntry {
+            name: "passthrough-ext".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["cdn.example.com".to_string()],
+            endpoints: Vec::new(),
+            resolution: Resolution::None,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 443,
+                protocol: AppProtocol::Tls,
+                name: Some("https".to_string()),
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(upstreams[0].targets.len(), 1);
+        assert_eq!(upstreams[0].targets[0].host, "cdn.example.com");
+        assert_eq!(upstreams[0].targets[0].port, 443);
+    }
+
+    #[test]
+    fn egress_static_resolution_unnamed_port_uses_entry_port() {
+        let service_entries = vec![ServiceEntry {
+            name: "static-unnamed".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["api.vendor.com".to_string()],
+            endpoints: vec![
+                MeshEndpoint {
+                    address: "203.0.113.10".to_string(),
+                    ports: HashMap::new(),
+                    labels: HashMap::new(),
+                    network: None,
+                },
+                MeshEndpoint {
+                    address: "203.0.113.11".to_string(),
+                    ports: HashMap::new(),
+                    labels: HashMap::new(),
+                    network: None,
+                },
+            ],
+            resolution: Resolution::Static,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 8443,
+                protocol: AppProtocol::Tls,
+                name: None,
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(upstreams.len(), 1);
+        // Proxy stays pinned to the ServiceEntry host so SNI/Host headers are
+        // not crossed by load balancing across endpoint IPs.
+        assert_eq!(proxies[0].hosts, vec!["api.vendor.com"]);
+        assert_eq!(upstreams[0].targets.len(), 2);
+        assert_eq!(upstreams[0].targets[0].host, "203.0.113.10");
+        assert_eq!(upstreams[0].targets[0].port, 8443);
+        assert_eq!(upstreams[0].targets[1].host, "203.0.113.11");
+        assert_eq!(upstreams[0].targets[1].port, 8443);
+    }
+
+    #[test]
+    fn egress_skips_service_entries_with_empty_hosts() {
+        let service_entries = vec![ServiceEntry {
+            name: "no-hosts".to_string(),
+            namespace: "default".to_string(),
+            hosts: Vec::new(),
+            endpoints: Vec::new(),
+            resolution: Resolution::Dns,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 443,
+                protocol: AppProtocol::Tls,
+                name: Some("https".to_string()),
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        assert!(proxies.is_empty());
+        assert!(upstreams.is_empty());
+    }
+
+    #[test]
+    fn egress_mixed_internal_external_only_materializes_external() {
+        let runtime = MeshRuntimeConfig {
+            topology: MeshTopology::EgressGateway,
+            ..test_mesh_runtime_config()
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                service_entries: vec![
+                    // MeshExternal -- should be materialized
+                    test_external_service_entry(
+                        "ext-api",
+                        vec!["api.partner.com".to_string()],
+                        443,
+                        AppProtocol::Tls,
+                    ),
+                    // MeshInternal -- should be skipped
+                    ServiceEntry {
+                        name: "internal-svc".to_string(),
+                        namespace: "default".to_string(),
+                        hosts: vec!["internal.svc.cluster.local".to_string()],
+                        endpoints: Vec::new(),
+                        resolution: Resolution::Dns,
+                        location: ServiceEntryLocation::MeshInternal,
+                        ports: vec![ServicePort {
+                            port: 8080,
+                            protocol: AppProtocol::Http,
+                            name: None,
+                        }],
+                        export_to: Vec::new(),
+                        workload_selector: None,
+                    },
+                    // Another MeshExternal -- should be materialized
+                    test_external_service_entry(
+                        "ext-metrics",
+                        vec!["metrics.vendor.com".to_string()],
+                        443,
+                        AppProtocol::Tls,
+                    ),
+                ],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+
+        let egress_proxies: Vec<_> = prepared
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("mesh-egress-"))
+            .collect();
+        assert_eq!(egress_proxies.len(), 2);
+
+        let egress_upstreams: Vec<_> = prepared
+            .upstreams
+            .iter()
+            .filter(|u| u.id.starts_with("mesh-egress-up-"))
+            .collect();
+        assert_eq!(egress_upstreams.len(), 2);
+
+        // Verify the external ones are present
+        assert!(
+            egress_proxies
+                .iter()
+                .any(|p| p.hosts == vec!["api.partner.com"])
+        );
+        assert!(
+            egress_proxies
+                .iter()
+                .any(|p| p.hosts == vec!["metrics.vendor.com"])
+        );
+
+        // Verify the internal one is NOT present
+        assert!(
+            !egress_proxies
+                .iter()
+                .any(|p| p.hosts.contains(&"internal.svc.cluster.local".to_string()))
+        );
+    }
 }
