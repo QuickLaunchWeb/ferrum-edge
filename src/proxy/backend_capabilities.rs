@@ -70,6 +70,7 @@ impl Default for GrpcTransportCapabilities {
 pub struct BackendCapabilityRecord {
     pub plain_http: PlainHttpCapabilities,
     pub grpc_transport: GrpcTransportCapabilities,
+    pub hbone: ProtocolSupport,
     pub last_probe_at_unix_secs: u64,
     pub last_probe_error: Option<String>,
 }
@@ -79,6 +80,7 @@ impl Default for BackendCapabilityRecord {
         Self {
             plain_http: PlainHttpCapabilities::default(),
             grpc_transport: GrpcTransportCapabilities::default(),
+            hbone: ProtocolSupport::Unknown,
             last_probe_at_unix_secs: now_unix_secs(),
             last_probe_error: None,
         }
@@ -92,19 +94,32 @@ pub struct BackendCapabilityProbeTarget {
     /// target. Probe helpers that take `&Proxy` read `.backend_host` /
     /// `.backend_port` directly — no separate host/port fields needed.
     pub proxy: Proxy,
+    /// Whether this target opts into gateway-to-mesh HBONE probing.
+    pub hbone_hint: bool,
+    /// Sidecar HBONE listener port for this target. Defaults to Istio 15008.
+    pub hbone_port: u16,
 }
 
 impl BackendCapabilityProbeTarget {
     pub fn from_proxy(proxy: &Proxy, target: Option<&UpstreamTarget>) -> Self {
         let mut probe_proxy = proxy.clone();
+        let mut hbone_hint = false;
+        let mut hbone_port = crate::modes::mesh::hbone::ISTIO_HBONE_PORT;
         if let Some(target) = target {
             probe_proxy.backend_host = target.host.clone();
             probe_proxy.backend_port = target.port;
+            hbone_hint = crate::proxy::hbone_pool::target_hbone_enabled(target);
+            hbone_port = crate::proxy::hbone_pool::target_hbone_port(target);
         }
-        let key = capability_key(&probe_proxy);
+        let key = match target {
+            Some(_) => capability_key_for_proxy_target(proxy, target),
+            None => capability_key(&probe_proxy),
+        };
         Self {
             key,
             proxy: probe_proxy,
+            hbone_hint,
+            hbone_port,
         }
     }
 
@@ -174,6 +189,10 @@ impl BackendCapabilityRegistry {
             .or_insert_with(|| Arc::new(record));
     }
 
+    pub fn get_by_key(&self, key: &str) -> Option<Arc<BackendCapabilityRecord>> {
+        self.entries.get(key).map(|entry| entry.value().clone())
+    }
+
     /// Downgrade the cached H3 classification for a backend target to
     /// `Unsupported` after an observed H3 connection / protocol failure.
     /// No-op when the target has no cached record (the next periodic refresh
@@ -233,6 +252,23 @@ impl BackendCapabilityRegistry {
         }
     }
 
+    /// Downgrade the cached HBONE classification for a backend target after a
+    /// live gateway-to-mesh tunnel failure. No-op when the target has no
+    /// cached record.
+    pub fn mark_hbone_unsupported(&self, proxy: &Proxy, target: Option<&UpstreamTarget>) {
+        let key = capability_key_for_proxy_target(proxy, target);
+        if let Some(mut entry) = self.entries.get_mut(&key)
+            && !matches!(entry.hbone, ProtocolSupport::Unsupported)
+        {
+            let mut new_record = (**entry).clone();
+            new_record.hbone = ProtocolSupport::Unsupported;
+            new_record.last_probe_at_unix_secs = now_unix_secs();
+            new_record.last_probe_error =
+                Some("HBONE downgraded after tunnel failure on request path".to_string());
+            *entry = Arc::new(new_record);
+        }
+    }
+
     pub fn retain_keys(&self, active_keys: &std::collections::HashSet<String>) {
         self.entries.retain(|key, _| active_keys.contains(key));
     }
@@ -281,14 +317,21 @@ pub fn capability_key(proxy: &Proxy) -> String {
 /// Write the capability key into `buf`. Callers clear the buffer first if
 /// they're reusing one (see `BackendCapabilityRegistry::get`).
 ///
-/// Key shape: `scheme|host|port|dns_override|ca|mtls_cert|mtls_key|verify`.
+/// Key shape:
+/// `scheme|host|port|dns_override|ca|mtls_cert|mtls_key|verify|hbone_port`.
 /// `|` delimiter matches the pool-key conventions in the rest of the code.
+/// The HBONE port field is populated only when the upstream target opts into
+/// HBONE; direct backend capability observations remain shared for ordinary
+/// targets that use the same connection identity.
 fn write_capability_key(buf: &mut String, proxy: &Proxy, target: Option<&UpstreamTarget>) {
     let scheme = proxy.backend_scheme.unwrap_or(BackendScheme::Https);
     let (host, port) = match target {
         Some(t) => (t.host.as_str(), t.port),
         None => (proxy.backend_host.as_str(), proxy.backend_port),
     };
+    let hbone_port = target
+        .filter(|t| crate::proxy::hbone_pool::target_hbone_enabled(t))
+        .map(crate::proxy::hbone_pool::target_hbone_port);
     let _ = write!(
         buf,
         "{}|{}|{}|{}|",
@@ -326,6 +369,10 @@ fn write_capability_key(buf: &mut String, proxy: &Proxy, target: Option<&Upstrea
     } else {
         '0'
     });
+    buf.push('|');
+    if let Some(port) = hbone_port {
+        let _ = write!(buf, "{port}");
+    }
 }
 
 #[inline]
@@ -493,12 +540,15 @@ mod tests {
         let mut record = BackendCapabilityRecord::default();
         record.plain_http.h2_tls = ProtocolSupport::Supported;
         record.plain_http.h3 = ProtocolSupport::Supported;
-        registry.upsert(key, record);
+        registry.upsert(key.clone(), record);
 
         let fetched = registry.get(&proxy, None).expect("entry should exist");
         assert!(fetched.plain_http.h2_tls.is_supported());
         assert!(fetched.plain_http.h3.is_supported());
         assert!(!fetched.plain_http.h1.is_supported());
+
+        let by_key = registry.get_by_key(&key).expect("key lookup should work");
+        assert!(by_key.plain_http.h2_tls.is_supported());
     }
 
     #[test]
@@ -614,6 +664,85 @@ mod tests {
         let registry = BackendCapabilityRegistry::new();
         let proxy = minimal_proxy();
         registry.mark_h2_tls_unsupported(&proxy, None);
+        assert!(registry.get(&proxy, None).is_none());
+    }
+
+    #[test]
+    fn probe_target_carries_hbone_hint_from_upstream_tags() {
+        let proxy = minimal_proxy();
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("mesh.hbone".to_string(), "true".to_string());
+        tags.insert("mesh.hbone_port".to_string(), "16008".to_string());
+        let target = UpstreamTarget {
+            host: "orders.default.svc.cluster.local".to_string(),
+            port: 8080,
+            weight: 100,
+            tags,
+            path: None,
+        };
+
+        let probe_target = BackendCapabilityProbeTarget::from_proxy(&proxy, Some(&target));
+
+        assert!(probe_target.hbone_hint);
+        assert_eq!(probe_target.hbone_port, 16008);
+        assert_eq!(probe_target.host(), "orders.default.svc.cluster.local");
+        assert_eq!(probe_target.port(), 8080);
+        assert_eq!(
+            probe_target.key,
+            capability_key_for_proxy_target(&proxy, Some(&target))
+        );
+
+        let mut other_hbone_port = target.clone();
+        other_hbone_port
+            .tags
+            .insert("mesh.hbone_port".to_string(), "15008".to_string());
+        assert_ne!(
+            capability_key_for_proxy_target(&proxy, Some(&target)),
+            capability_key_for_proxy_target(&proxy, Some(&other_hbone_port)),
+            "HBONE targets sharing the same app host:port must not share capability entries when sidecar ports differ"
+        );
+
+        let mut direct_target = target.clone();
+        direct_target.tags.clear();
+        assert_ne!(
+            capability_key_for_proxy_target(&proxy, Some(&target)),
+            capability_key_for_proxy_target(&proxy, Some(&direct_target)),
+            "HBONE opt-in must be part of the capability key"
+        );
+    }
+
+    #[test]
+    fn registry_mark_hbone_unsupported_downgrades_supported_entry() {
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = minimal_proxy();
+        let key = capability_key(&proxy);
+        let record = BackendCapabilityRecord {
+            hbone: ProtocolSupport::Supported,
+            plain_http: PlainHttpCapabilities {
+                h2_tls: ProtocolSupport::Supported,
+                ..PlainHttpCapabilities::default()
+            },
+            ..BackendCapabilityRecord::default()
+        };
+        registry.upsert(key, record);
+
+        registry.mark_hbone_unsupported(&proxy, None);
+
+        let fetched = registry.get(&proxy, None).unwrap();
+        assert_eq!(fetched.hbone, ProtocolSupport::Unsupported);
+        assert_eq!(
+            fetched.plain_http.h2_tls,
+            ProtocolSupport::Supported,
+            "HBONE downgrade must not affect direct HTTPS capabilities"
+        );
+        assert!(fetched.last_probe_error.is_some());
+    }
+
+    #[test]
+    fn registry_mark_hbone_unsupported_is_noop_when_no_cached_entry() {
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = minimal_proxy();
+        registry.mark_hbone_unsupported(&proxy, None);
         assert!(registry.get(&proxy, None).is_none());
     }
 

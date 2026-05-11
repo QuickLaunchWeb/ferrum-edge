@@ -334,6 +334,12 @@ async fn test_http3_proxy_state_creation() {
         status_counts: Arc::new(dashmap::DashMap::new()),
         grpc_pool: Arc::new(ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool::default()),
         http2_pool: Arc::new(ferrum_edge::proxy::http2_pool::Http2ConnectionPool::default()),
+        hbone_pool: Arc::new(ferrum_edge::proxy::hbone_pool::HboneConnectionPool::new(
+            ferrum_edge::config::PoolConfig::default(),
+            ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+            64,
+        )),
         h3_pool: Arc::new(ferrum_edge::http3::client::Http3ConnectionPool::new(
             Arc::new(ferrum_edge::config::EnvConfig::default()),
             ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
@@ -585,6 +591,12 @@ async fn test_http3_full_integration() {
         status_counts: Arc::new(dashmap::DashMap::new()),
         grpc_pool: Arc::new(ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool::default()),
         http2_pool: Arc::new(ferrum_edge::proxy::http2_pool::Http2ConnectionPool::default()),
+        hbone_pool: Arc::new(ferrum_edge::proxy::hbone_pool::HboneConnectionPool::new(
+            ferrum_edge::config::PoolConfig::default(),
+            ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+            64,
+        )),
         h3_pool: Arc::new(ferrum_edge::http3::client::Http3ConnectionPool::new(
             Arc::new(ferrum_edge::config::EnvConfig::default()),
             ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
