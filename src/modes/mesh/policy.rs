@@ -19,6 +19,9 @@ use crate::modes::mesh::slice::MeshSlice;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MeshAuthzRequest {
     pub source_principal: Option<SpiffeId>,
+    /// JWT-derived request principal in `iss/sub` format, set by `jwks_auth`
+    /// metadata. Used for Istio AuthorizationPolicy `requestPrincipals` matching.
+    pub request_principal: Option<String>,
     pub method: Option<String>,
     pub path: Option<String>,
     pub host: Option<String>,
@@ -87,8 +90,24 @@ fn rule_matches(rule: &MeshRule, request: &MeshAuthzRequest) -> bool {
         return false;
     }
     matches_principals(&rule.from, request)
+        && matches_request_principals(&rule.request_principals, request)
         && matches_requests(&rule.to, request)
         && matches_conditions(&rule.when, request)
+}
+
+/// Istio `requestPrincipals` matching: JWT-derived `iss/sub` identity.
+///
+/// An empty list means "any" (no filter). A non-empty list requires a
+/// matching `request_principal`; `None` (no JWT) fails the match.
+fn matches_request_principals(patterns: &[String], request: &MeshAuthzRequest) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    request.request_principal.as_ref().is_some_and(|principal| {
+        patterns
+            .iter()
+            .any(|pattern| wildcard_match(pattern, principal))
+    })
 }
 
 fn matches_principals(matches: &[PrincipalMatch], request: &MeshAuthzRequest) -> bool {
@@ -432,6 +451,7 @@ mod tests {
                 from,
                 to: Vec::new(),
                 when: Vec::new(),
+                request_principals: Vec::new(),
                 never_matches: false,
                 action,
             }],
@@ -512,6 +532,7 @@ mod tests {
                         port_patterns: Vec::new(),
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -577,6 +598,7 @@ mod tests {
                 }],
                 when: Vec::new(),
                 action: PolicyAction::Allow,
+                request_principals: Vec::new(),
                 never_matches: false,
             }],
         };
@@ -607,6 +629,7 @@ mod tests {
                 }],
                 when: Vec::new(),
                 action: PolicyAction::Allow,
+                request_principals: Vec::new(),
                 never_matches: false,
             }],
         };
@@ -631,6 +654,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -662,6 +686,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -693,6 +718,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -724,6 +750,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -754,6 +781,7 @@ mod tests {
                     from: Vec::new(),
                     to: Vec::new(),
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: true,
                     action: PolicyAction::Allow,
                 }],
@@ -786,6 +814,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -818,6 +847,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -868,6 +898,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -918,6 +949,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1029,6 +1061,7 @@ mod tests {
                     from: Vec::new(),
                     to: Vec::new(),
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: true,
                     action: PolicyAction::Allow,
                 }],
@@ -1060,6 +1093,7 @@ mod tests {
                     from: Vec::new(),
                     to: Vec::new(),
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: true,
                     action: PolicyAction::Deny,
                 }],
@@ -1472,6 +1506,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1508,6 +1543,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1540,6 +1576,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1571,6 +1608,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1616,6 +1654,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1653,6 +1692,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1706,6 +1746,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1751,6 +1792,7 @@ mod tests {
                         ..RequestMatch::default()
                     }],
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1791,6 +1833,7 @@ mod tests {
                         values: vec!["us-east-1".to_string(), "eu-west-1".to_string()],
                         not_values: Vec::new(),
                     }],
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1865,6 +1908,7 @@ mod tests {
                         values: Vec::new(),
                         not_values: vec!["internal".to_string()],
                     }],
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Deny,
                 }],
@@ -1920,6 +1964,7 @@ mod tests {
                         values: vec!["prod".to_string(), "staging".to_string(), "dev".to_string()],
                         not_values: vec!["staging".to_string()],
                     }],
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1975,6 +2020,7 @@ mod tests {
                         values: vec!["required".to_string()],
                         not_values: Vec::new(),
                     }],
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -2014,6 +2060,7 @@ mod tests {
                         values: Vec::new(),
                         not_values: vec!["bad".to_string()],
                     }],
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -2057,6 +2104,7 @@ mod tests {
                             not_values: Vec::new(),
                         },
                     ],
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -2110,6 +2158,7 @@ mod tests {
                     from: Vec::new(),
                     to: Vec::new(),
                     when: Vec::new(),
+                    request_principals: Vec::new(),
                     never_matches: false,
                     action: PolicyAction::Audit,
                 }],
@@ -2140,6 +2189,7 @@ mod tests {
                         from: Vec::new(),
                         to: Vec::new(),
                         when: Vec::new(),
+                        request_principals: Vec::new(),
                         never_matches: false,
                         action: PolicyAction::Audit,
                     }],
@@ -2157,6 +2207,190 @@ mod tests {
             MeshAuthzDecision::Deny {
                 policy: "deny-all".to_string()
             }
+        );
+    }
+
+    // ── requestPrincipals matching ──────────────────────────────────────
+
+    #[test]
+    fn request_principals_exact_match_allows() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "require-jwt".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    request_principals: vec!["https://accounts.google.com/user-42".to_string()],
+                    action: PolicyAction::Allow,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+        let request = MeshAuthzRequest {
+            request_principal: Some("https://accounts.google.com/user-42".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn request_principals_wildcard_suffix_match() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "require-jwt".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    request_principals: vec!["https://accounts.google.com/*".to_string()],
+                    action: PolicyAction::Allow,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+        let request = MeshAuthzRequest {
+            request_principal: Some("https://accounts.google.com/any-subject".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn request_principals_missing_jwt_triggers_implicit_deny() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "require-jwt".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    request_principals: vec!["*".to_string()],
+                    action: PolicyAction::Allow,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+        let request = MeshAuthzRequest::default();
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn request_principals_non_matching_triggers_implicit_deny() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "require-google".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    request_principals: vec!["https://accounts.google.com/*".to_string()],
+                    action: PolicyAction::Allow,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+        let request = MeshAuthzRequest {
+            request_principal: Some("https://evil.com/attacker".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn request_principals_deny_blocks_matching_jwt() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-admin".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    request_principals: vec!["https://auth.example.com/admin-*".to_string()],
+                    action: PolicyAction::Deny,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+        let request = MeshAuthzRequest {
+            request_principal: Some("https://auth.example.com/admin-root".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request),
+            MeshAuthzDecision::Deny {
+                policy: "deny-admin".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn request_principals_deny_skips_non_matching_jwt() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-admin".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    request_principals: vec!["https://auth.example.com/admin-*".to_string()],
+                    action: PolicyAction::Deny,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+        let request = MeshAuthzRequest {
+            request_principal: Some("https://auth.example.com/user-123".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn request_principals_empty_list_allows_anonymous() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "no-jwt-required".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    request_principals: Vec::new(),
+                    action: PolicyAction::Allow,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+        let request = MeshAuthzRequest::default();
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request),
+            MeshAuthzDecision::Allow
         );
     }
 

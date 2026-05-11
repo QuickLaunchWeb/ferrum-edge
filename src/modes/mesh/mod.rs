@@ -1226,8 +1226,12 @@ fn inject_mesh_request_auth_plugin(
     // jwks_auth already passes through requests with no token
     // (ExtractedCredential::Missing -> PluginResult::Continue), which matches
     // Istio's permissive RequestAuthentication semantics. No extra flag needed.
+    //
+    // Istio JWTs may omit the `exp` claim, so we disable the default
+    // `require_exp=true` that the non-mesh jwks_auth plugin enforces.
     let jwks_config = serde_json::json!({
         "providers": providers,
+        "require_exp": false,
     });
 
     ensure_global_plugin(
@@ -2810,6 +2814,7 @@ mod tests {
                         }],
                         to: Vec::new(),
                         when: Vec::new(),
+                        request_principals: Vec::new(),
                         never_matches: false,
                         action: PolicyAction::Allow,
                     }],
@@ -2925,6 +2930,7 @@ mod tests {
                             }],
                             to: Vec::new(),
                             when: Vec::new(),
+                            request_principals: Vec::new(),
                             never_matches: false,
                             action: PolicyAction::Allow,
                         }],
@@ -3426,6 +3432,46 @@ mod tests {
         assert_eq!(
             provider.get("jwks_uri").and_then(|v| v.as_str()),
             Some("https://auth.example.com/jwks")
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_request_auth_sets_require_exp_false() {
+        let runtime = test_mesh_runtime_config();
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                request_authentications: vec![MeshRequestAuthentication {
+                    name: "exp-test".to_string(),
+                    namespace: "default".to_string(),
+                    scope: PolicyScope::MeshWide,
+                    jwt_rules: vec![MeshJwtRule {
+                        issuer: "https://auth.example.com".to_string(),
+                        audiences: Vec::new(),
+                        jwks_uri: Some("https://auth.example.com/jwks".to_string()),
+                        jwks: None,
+                        from_headers: Vec::new(),
+                        from_params: Vec::new(),
+                        forward_original_token: false,
+                    }],
+                }],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let jwks = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID)
+            .expect("jwks_auth plugin");
+
+        // Istio JWTs may omit `exp`, so mesh injection must disable
+        // the default require_exp=true behavior.
+        assert_eq!(
+            jwks.config.get("require_exp").and_then(|v| v.as_bool()),
+            Some(false),
+            "mesh request auth must set require_exp=false for Istio compatibility"
         );
     }
 
