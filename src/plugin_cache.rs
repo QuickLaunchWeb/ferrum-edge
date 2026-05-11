@@ -802,9 +802,35 @@ impl PluginCache {
         // Rebuild globals if any global plugin config changed
         let new_globals = if rebuild_globals {
             let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+
+            // Atomically refresh the named-schema registry first so
+            // subsequent global / proxy plugins can resolve `schema_ref`
+            // against the new state. See build_cache for rationale.
+            crate::plugins::utils::log_schema::registry::begin_reload();
+            for pc in &config.plugin_configs {
+                if !pc.enabled || pc.scope != PluginScope::Global {
+                    continue;
+                }
+                if pc.plugin_name != "transaction_log_schema" {
+                    continue;
+                }
+                match try_create_plugin(pc, &self.http_client) {
+                    Ok(Some(plugin)) => global_plugins.push(plugin),
+                    Ok(None) => {}
+                    Err(e) => {
+                        error!("Config reload: {}", e);
+                        security_errors.push(e);
+                    }
+                }
+            }
+            crate::plugins::utils::log_schema::registry::commit_reload();
+
             for pc in &config.plugin_configs {
                 if !pc.enabled {
                     continue;
+                }
+                if pc.plugin_name == "transaction_log_schema" {
+                    continue; // already constructed
                 }
                 if pc.scope == PluginScope::Global {
                     match try_create_plugin(pc, &self.http_client) {
@@ -1280,9 +1306,35 @@ impl PluginCache {
         let mut proxy_group_configs: HashMap<&str, &crate::config::types::PluginConfig> =
             HashMap::new();
 
+        // First pass: build the named-schema registry from
+        // `transaction_log_schema` global plugins so subsequent plugins
+        // can resolve `schema_ref:` against the new state. Wrapped in
+        // begin/commit so the registry is atomically replaced (renamed
+        // or removed schemas don't leak across reloads).
+        crate::plugins::utils::log_schema::registry::begin_reload();
+        for pc in &config.plugin_configs {
+            if !pc.enabled || pc.scope != PluginScope::Global {
+                continue;
+            }
+            if pc.plugin_name != "transaction_log_schema" {
+                continue;
+            }
+            match try_create_plugin(pc, http_client) {
+                Ok(Some(plugin)) => global_plugins.push(plugin),
+                Ok(None) => {}
+                Err(e) => security_errors.push(e),
+            }
+        }
+        crate::plugins::utils::log_schema::registry::commit_reload();
+
+        // Second pass: everything else, including other globals,
+        // proxy-scoped, and proxy_group-scoped configs.
         for pc in &config.plugin_configs {
             if !pc.enabled {
                 continue;
+            }
+            if pc.plugin_name == "transaction_log_schema" {
+                continue; // already constructed above
             }
             if pc.scope == PluginScope::Global {
                 match try_create_plugin(pc, http_client) {

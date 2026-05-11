@@ -545,6 +545,49 @@ impl MyRateLimiter {
 
 The `DashMap` state persists across requests because the `PluginCache` holds an `Arc<dyn Plugin>` for each plugin instance.
 
+## Opting Into Transaction-Log Schema Customization
+
+Logging-style custom plugins can opt into the same `schema:` /
+`schema_ref:` controls as the built-in loggers by importing the
+public helpers and wrapping every `serde_json::to_string(summary)` call
+site behind a schema branch:
+
+```rust
+use std::sync::Arc;
+use crate::plugins::utils::log_schema::{
+    SchemaView, SummarySchema, resolve_schema,
+};
+
+pub struct MyLogger {
+    schema: Option<Arc<SummarySchema>>,
+    // ... other fields
+}
+
+impl MyLogger {
+    pub fn new(config: &Value) -> Result<Self, String> {
+        let schema = resolve_schema(config, "my_logger")?;
+        Ok(Self { schema /*, ... */ })
+    }
+}
+
+#[async_trait]
+impl Plugin for MyLogger {
+    async fn log(&self, summary: &TransactionSummary) {
+        let json = match self.schema.as_ref().filter(|s| s.applies_to_http()) {
+            Some(schema) => serde_json::to_string(&SchemaView { summary, schema }),
+            None => serde_json::to_string(summary),
+        };
+        // ... ship json
+    }
+}
+```
+
+`SummaryLogEntryView` and `SummaryLogEntryBatchView` are available for
+the batched / multi-variant case (mirroring `http_logging`, `tcp_logging`
+etc.). Metadata redaction is preserved on every code path. See
+[docs/log_schema.md](docs/log_schema.md) for the operator-facing
+schema reference.
+
 ## Using the Shared HTTP Client
 
 If your plugin needs to make outbound HTTP calls (webhooks, token introspection, external APIs), use the shared `PluginHttpClient` passed to the factory:
