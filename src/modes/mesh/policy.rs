@@ -159,15 +159,24 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
     {
         return false;
     }
-    if !match_.not_methods.is_empty()
-        && request.method.as_ref().is_some_and(|method| {
-            match_
-                .not_methods
-                .iter()
-                .any(|denied| denied.eq_ignore_ascii_case(method))
-        })
-    {
-        return false;
+    // HTTP-only negative predicates (`not_methods`, `not_paths`, `not_hosts`)
+    // fail the match when the corresponding HTTP attribute is absent. This
+    // mirrors how the positive `methods`/`paths`/`hosts` checks above behave
+    // for the same case (e.g. raw-TCP `on_stream_connect`, which only carries
+    // a port) — without this, an ALLOW rule that mentions an HTTP-only field
+    // would over-permissively match non-HTTP traffic that should fall through
+    // to implicit deny.
+    if !match_.not_methods.is_empty() {
+        let Some(method) = request.method.as_ref() else {
+            return false;
+        };
+        if match_
+            .not_methods
+            .iter()
+            .any(|denied| denied.eq_ignore_ascii_case(method))
+        {
+            return false;
+        }
     }
     if !match_.paths.is_empty()
         && !request.path.as_ref().is_some_and(|path| {
@@ -179,15 +188,17 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
     {
         return false;
     }
-    if !match_.not_paths.is_empty()
-        && request.path.as_ref().is_some_and(|path| {
-            match_
-                .not_paths
-                .iter()
-                .any(|pattern| wildcard_match(pattern, path))
-        })
-    {
-        return false;
+    if !match_.not_paths.is_empty() {
+        let Some(path) = request.path.as_ref() else {
+            return false;
+        };
+        if match_
+            .not_paths
+            .iter()
+            .any(|pattern| wildcard_match(pattern, path))
+        {
+            return false;
+        }
     }
     let normalized_host = request.host.as_deref().and_then(normalize_match_host);
     if !match_.hosts.is_empty()
@@ -200,15 +211,17 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
     {
         return false;
     }
-    if !match_.not_hosts.is_empty()
-        && normalized_host.as_ref().is_some_and(|host| {
-            match_
-                .not_hosts
-                .iter()
-                .any(|pattern| normalized_host_matches(pattern, host))
-        })
-    {
-        return false;
+    if !match_.not_hosts.is_empty() {
+        let Some(host) = normalized_host.as_ref() else {
+            return false;
+        };
+        if match_
+            .not_hosts
+            .iter()
+            .any(|pattern| normalized_host_matches(pattern, host))
+        {
+            return false;
+        }
     }
     if (!match_.ports.is_empty() || !match_.port_patterns.is_empty())
         && !request.port.is_some_and(|port| {
@@ -2682,29 +2695,63 @@ mod tests {
     }
 
     #[test]
-    fn request_match_not_methods_does_not_fire_when_request_method_missing() {
-        // If the request has no method (e.g. stream-level evaluation), a
-        // notMethods filter cannot fire — match continues.
-        let slice = MeshSlice {
-            mesh_policies: vec![allow_policy_with_request_match(
-                "deny-post",
+    fn request_match_http_only_not_predicates_fail_match_on_stream_request() {
+        // Stream-level authz (`MeshAuthz::on_stream_connect`) builds a
+        // `MeshAuthzRequest` with only `port` populated — `method`, `path`,
+        // and `host` are `None`. An ALLOW rule that mentions an HTTP-only
+        // negative predicate (`notMethods`/`notPaths`/`notHosts`) must NOT
+        // match such a request — symmetric with how the positive
+        // `methods`/`paths`/`hosts` predicates fail when the corresponding
+        // attribute is absent. Otherwise translated Istio policies would
+        // accidentally allow raw TCP connections that should fall through
+        // to implicit deny.
+        let cases: [(&str, RequestMatch); 3] = [
+            (
+                "not_methods",
                 RequestMatch {
                     not_methods: vec!["POST".to_string()],
                     ..RequestMatch::default()
                 },
-            )],
-            ..MeshSlice::default()
-        };
+            ),
+            (
+                "not_paths",
+                RequestMatch {
+                    not_paths: vec!["/admin/*".to_string()],
+                    ..RequestMatch::default()
+                },
+            ),
+            (
+                "not_hosts",
+                RequestMatch {
+                    not_hosts: vec!["evil.example.com".to_string()],
+                    ..RequestMatch::default()
+                },
+            ),
+        ];
 
-        let request = MeshAuthzRequest {
-            method: None,
-            ..MeshAuthzRequest::default()
-        };
+        for (label, request_match) in cases {
+            let slice = MeshSlice {
+                mesh_policies: vec![allow_policy_with_request_match(
+                    "allow-with-http-only-negative",
+                    request_match,
+                )],
+                ..MeshSlice::default()
+            };
 
-        assert_eq!(
-            evaluate_mesh_authorization(&slice, &request),
-            MeshAuthzDecision::Allow
-        );
+            let stream_request = MeshAuthzRequest {
+                port: Some(8080),
+                ..MeshAuthzRequest::default()
+            };
+
+            assert_eq!(
+                evaluate_mesh_authorization(&slice, &stream_request),
+                MeshAuthzDecision::Deny {
+                    policy: "implicit-deny".to_string()
+                },
+                "{label}: HTTP-only negative predicate must fail the match on a \
+                 stream-level request (no method/path/host) → implicit deny"
+            );
+        }
     }
 
     #[test]
