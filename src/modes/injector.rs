@@ -829,13 +829,18 @@ fn capture_config(config: &InjectorConfig, pod: &Value) -> Result<CaptureConfig,
     //   - `includeOutboundIPRanges` REPLACES the env-derived include list when
     //     present (Istio semantics: include-overrides-include).
     //   - `excludeOutboundIPRanges` APPENDS to the env-derived exclude list.
+    //
+    // An annotation that parses to zero CIDRs (e.g. `""`, `" , , "`, `","`) is
+    // treated as absent and falls through to the env-derived include list.
+    // Without this guard the catch-all `-d <cidr> -j REDIRECT` rules would not
+    // be emitted at all and ALL outbound traffic would silently bypass the
+    // proxy.
     let include_annotation = annotations
         .and_then(|m| m.get(ISTIO_INCLUDE_OUTBOUND_IP_RANGES_ANNOTATION))
-        .and_then(Value::as_str)
-        .map(str::trim);
-    let resolved_include = match include_annotation {
-        Some(raw) if !raw.is_empty() => {
-            let cidrs = parse_cidr_list_env(Some(raw));
+        .and_then(Value::as_str);
+    let include_annotation_cidrs = include_annotation.map(|raw| parse_cidr_list_env(Some(raw)));
+    let resolved_include = match include_annotation_cidrs {
+        Some(cidrs) if !cidrs.is_empty() => {
             validate_cidr_list(&cidrs).map_err(|e| {
                 format!("invalid {ISTIO_INCLUDE_OUTBOUND_IP_RANGES_ANNOTATION}: {e}")
             })?;
@@ -1592,5 +1597,208 @@ mod tests {
         assert_eq!(capture.include_cidrs, vec!["0.0.0.0/0".to_string()]);
         assert!(capture.exclude_cidrs.is_empty());
         assert!(capture.exclude_inbound_ports.is_empty());
+    }
+
+    // Regression: an `includeOutboundIPRanges` annotation that parses to zero
+    // CIDRs (whitespace, comma-only, etc.) MUST fall through to the env-derived
+    // include list. Earlier behavior treated `" , , "` as "present but empty"
+    // and produced ZERO outbound REDIRECT rules — silently bypassing the proxy
+    // for ALL outbound traffic.
+    #[test]
+    fn capture_config_falls_back_to_env_when_include_annotation_is_whitespace_only() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/includeOutboundIPRanges": "   "
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let mut config = test_config(true, CaptureMode::Iptables);
+        config.include_outbound_cidrs = vec!["10.0.0.0/8".to_string()];
+
+        let capture = capture_config(&config, &pod).expect("capture config");
+
+        assert_eq!(
+            capture.include_cidrs,
+            vec!["10.0.0.0/8".to_string()],
+            "whitespace-only annotation must fall through to env-derived value"
+        );
+    }
+
+    #[test]
+    fn capture_config_falls_back_to_env_when_include_annotation_is_commas_only() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/includeOutboundIPRanges": " , , "
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let mut config = test_config(true, CaptureMode::Iptables);
+        config.include_outbound_cidrs = vec!["10.0.0.0/8".to_string()];
+
+        let capture = capture_config(&config, &pod).expect("capture config");
+
+        assert_eq!(
+            capture.include_cidrs,
+            vec!["10.0.0.0/8".to_string()],
+            "comma-only annotation must fall through to env-derived value"
+        );
+    }
+
+    #[test]
+    fn capture_config_falls_back_to_default_when_include_annotation_empty_and_env_unset() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/includeOutboundIPRanges": ""
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+
+        let capture = capture_config(&config, &pod).expect("capture config");
+
+        assert_eq!(
+            capture.include_cidrs,
+            vec!["0.0.0.0/0".to_string()],
+            "empty annotation + empty env must default to 0.0.0.0/0 (must NOT produce zero include rules)"
+        );
+    }
+
+    // Same fall-through rule on the exclude path: a comma-only annotation must
+    // not pollute the env-derived exclude list (no-op, not "extend with []").
+    #[test]
+    fn capture_config_exclude_annotation_whitespace_only_is_noop() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/excludeOutboundIPRanges": " , , "
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let mut config = test_config(true, CaptureMode::Iptables);
+        config.exclude_outbound_cidrs = vec!["10.0.0.0/8".to_string()];
+
+        let capture = capture_config(&config, &pod).expect("capture config");
+
+        assert_eq!(
+            capture.exclude_cidrs,
+            vec!["10.0.0.0/8".to_string()],
+            "whitespace/comma-only exclude annotation must be a no-op"
+        );
+    }
+
+    // Deduplication: a port repeated across env + Istio annotation + Ferrum
+    // annotation must collapse to a single RETURN rule.
+    #[test]
+    fn capture_config_deduplicates_inbound_ports_across_sources() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/excludeInboundPorts": "22, 8080",
+                    "ferrum.io/excludeInboundPorts": "22"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let mut config = test_config(true, CaptureMode::Iptables);
+        config.exclude_inbound_ports = vec![22];
+
+        let capture = capture_config(&config, &pod).expect("capture config");
+
+        // 22 appears in env + both annotations, 8080 only in Istio annotation
+        assert_eq!(
+            capture.exclude_inbound_ports,
+            vec![22, 8080],
+            "duplicate ports across sources must collapse"
+        );
+    }
+
+    // Deduplication on the exclude-CIDR path: a CIDR repeated across env and
+    // annotation must collapse to a single RETURN rule, with insertion order
+    // preserved so iptables ruleset emission stays stable across reloads.
+    #[test]
+    fn capture_config_deduplicates_exclude_cidrs_preserving_order() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/excludeOutboundIPRanges":
+                        "10.0.0.0/8, 192.168.0.0/16"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let mut config = test_config(true, CaptureMode::Iptables);
+        // First entry repeats in the annotation; both must remain in the
+        // env-first order (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16).
+        config.exclude_outbound_cidrs = vec!["10.0.0.0/8".to_string(), "172.16.0.0/12".to_string()];
+
+        let capture = capture_config(&config, &pod).expect("capture config");
+
+        assert_eq!(
+            capture.exclude_cidrs,
+            vec![
+                "10.0.0.0/8".to_string(),
+                "172.16.0.0/12".to_string(),
+                "192.168.0.0/16".to_string(),
+            ],
+            "duplicate CIDR must collapse and original insertion order must be preserved"
+        );
+    }
+
+    // Localhost CIDR — Istio's iptables pipeline returns early for loopback
+    // anyway, but the admission webhook still validates the CIDR shape.
+    #[test]
+    fn capture_config_accepts_localhost_cidr_in_exclude_annotation() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/excludeOutboundIPRanges": "127.0.0.0/8"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+
+        let capture = capture_config(&config, &pod).expect("capture config");
+
+        assert!(
+            capture.exclude_cidrs.iter().any(|c| c == "127.0.0.0/8"),
+            "loopback CIDR must be accepted (no special-case rejection)"
+        );
+    }
+
+    // IPv6 CIDR in the annotation passes admission today (the validator only
+    // checks shape, not address family). The init container only invokes
+    // `iptables` — not `ip6tables` — so the rule would no-op at runtime. This
+    // test documents the current behavior so a deliberate future change
+    // (reject vs. fan out to ip6tables) is a conscious choice.
+    #[test]
+    fn capture_config_accepts_ipv6_cidr_in_exclude_annotation_today() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/excludeOutboundIPRanges": "fd00::/8"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+
+        let capture = capture_config(&config, &pod).expect("IPv6 CIDR currently passes admission");
+        assert!(capture.exclude_cidrs.iter().any(|c| c == "fd00::/8"));
     }
 }
