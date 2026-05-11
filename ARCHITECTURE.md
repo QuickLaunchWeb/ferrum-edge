@@ -125,7 +125,8 @@ src/
 │   ├── mod.rs                 # Service discovery orchestrator
 │   ├── consul.rs              # Consul provider
 │   ├── dns_sd.rs              # DNS-SD provider
-│   └── kubernetes.rs          # Kubernetes provider
+│   ├── kubernetes.rs          # Kubernetes provider
+│   └── mesh.rs                # Ferrum mesh provider
 └── tls/
     └── mod.rs                 # TLS configuration with advanced hardening
 ```
@@ -447,6 +448,7 @@ Dynamic upstream target discovery from external registries:
 - **DNS-SD** (`dns_sd.rs`) — SRV record-based discovery
 - **Kubernetes** (`kubernetes.rs`) — Kubernetes API-based endpoint discovery
 - **Consul** (`consul.rs`) — Consul service catalog discovery
+- **Ferrum Mesh** (`mesh.rs`) — CP-delivered mesh service/workload discovery
 
 Discovered targets are merged with static upstream targets and fed into the load balancer.
 
