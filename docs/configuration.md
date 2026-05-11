@@ -146,6 +146,8 @@ Mesh mode consumes Layer 2 mesh slices from the control protocols and prepares t
 
 With the native `MeshSubscribe` protocol, mesh mode waits for the first delivered mesh slice before serving, builds the proxy/plugin runtime from that slice, and hot-applies later valid slices atomically. Invalid slice updates are logged and ignored so the last accepted runtime config keeps serving. The xDS ADS consumer coalesces bursts with a short debounce and a bounded max-delay cap, so continuous control-plane churn cannot indefinitely postpone applying the latest valid snapshot.
 
+With the xDS ADS protocol, invalid resource updates are NACKed and the last accepted snapshot remains active. If one known xDS resource type produces 5 consecutive NACKs without an ACK, the mesh client closes that ADS stream and relies on the existing reconnect/failover loop instead of NACKing the same bad control-plane state forever. In a single-CP deployment that keeps serving the same invalid resource, this becomes a bounded reconnect/NACK cycle governed by the normal jittered backoff until the CP config is corrected. Unknown type URLs are NACKed but not counted in the breaker because this client can never ACK them. Any already-ACKed slice waiting in the debounce window is applied before the stream is closed so reconnect version hints cannot advance past the local runtime.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_MESH_CONFIG_PROTOCOL` | No | `native` | Mesh config source. `native` uses Ferrum `MeshSubscribe`; `xds` uses the mesh ADS client against a Ferrum or compatible xDS control plane |
