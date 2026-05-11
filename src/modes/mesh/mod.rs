@@ -28,14 +28,14 @@ use crate::config::conf_file::resolve_ferrum_var;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm,
     PassiveHealthCheck, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,
-    Upstream, UpstreamTarget,
+    SubsetDefinition, SubsetTrafficPolicy, Upstream, UpstreamTarget,
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
 use crate::modes::mesh::config::{
-    AppProtocol, EastWestGateway, MeshConfig, MeshJwtRule, MeshRequestAuthentication,
-    MeshTelemetryConfig, PolicyScope, Resolution, ServiceEntry, ServiceEntryLocation,
-    service_entry_exported_to_namespace,
+    AppProtocol, EastWestGateway, MeshConfig, MeshDestinationRule, MeshJwtRule, MeshLoadBalancer,
+    MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig, MeshTrafficPolicy, PolicyScope,
+    Resolution, ServiceEntry, ServiceEntryLocation, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
@@ -466,6 +466,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     inject_mesh_global_plugins(&mut config, runtime, mesh_slice);
     materialize_east_west_gateway_proxies(&mut config, runtime, mesh_slice);
     materialize_egress_gateway_proxies(&mut config, runtime, mesh_slice);
+    apply_destination_rules(&mut config, mesh_slice);
     config.normalize_fields();
     Ok(config)
 }
@@ -486,6 +487,7 @@ fn gateway_config_from_mesh_slice(
             service_entries: slice.service_entries.clone(),
             request_authentications: slice.request_authentications.clone(),
             telemetry_resources: slice.telemetry_resources.clone(),
+            destination_rules: slice.destination_rules.clone(),
             trust_bundles: slice.trust_bundles.clone(),
             multi_cluster: slice.multi_cluster.clone(),
         })),
@@ -886,6 +888,192 @@ fn mesh_east_west_service_proxy_id(namespace: &str, name: &str) -> String {
 
 fn mesh_east_west_service_upstream_id(namespace: &str, name: &str) -> String {
     format!("__mesh-ew-upstream-{namespace}-{name}").replace(['/', '.'], "-")
+}
+
+// ── DestinationRule application ────────────────────────────────────────
+
+/// Apply DestinationRule traffic policies onto matching upstreams.
+///
+/// For each DestinationRule, we find upstreams whose targets match the DR
+/// host and apply:
+/// - `connectionPool.tcp.connectTimeout` onto proxies referencing the upstream
+/// - `outlierDetection` onto the upstream's passive health check
+/// - `loadBalancer` onto the upstream's algorithm
+/// - `subsets` as `SubsetDefinition` entries on the upstream
+///
+/// Multiple DRs targeting the same upstream are applied in a deterministic
+/// order — sorted by `(namespace, name)` — so the last-writer-wins outcome
+/// is reproducible across CP restarts and DP subscribers.
+fn apply_destination_rules(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
+    let mut sorted_destination_rules: Vec<&MeshDestinationRule> =
+        mesh_slice.destination_rules.iter().collect();
+    sorted_destination_rules.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+
+    for dr in sorted_destination_rules {
+        let matching_upstream_indices: Vec<usize> = config
+            .upstreams
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, upstream)| {
+                destination_rule_matches_upstream(dr, upstream).then_some(idx)
+            })
+            .collect();
+
+        if matching_upstream_indices.is_empty() {
+            debug!(
+                host = %dr.host,
+                rule = %dr.name,
+                "DestinationRule has no matching upstream; skipping"
+            );
+            continue;
+        };
+
+        let connect_timeout_ms = dr
+            .traffic_policy
+            .as_ref()
+            .and_then(|tp| tp.connect_timeout_ms);
+
+        for idx in matching_upstream_indices {
+            let upstream = &mut config.upstreams[idx];
+
+            if let Some(ref policy) = dr.traffic_policy {
+                apply_traffic_policy_to_upstream(upstream, policy);
+            }
+
+            if !dr.subsets.is_empty() {
+                if upstream.subsets.is_some() {
+                    debug!(
+                        rule = %dr.name,
+                        upstream = %upstream.id,
+                        "DestinationRule subsets overwriting existing upstream.subsets"
+                    );
+                }
+                let subset_defs: Vec<SubsetDefinition> = dr
+                    .subsets
+                    .iter()
+                    .map(|subset| SubsetDefinition {
+                        name: subset.name.clone(),
+                        labels: subset.labels.clone(),
+                        traffic_policy: subset.traffic_policy.as_ref().map(|sp| {
+                            SubsetTrafficPolicy {
+                                load_balancer_algorithm: mesh_lb_to_ferrum(&sp.load_balancer),
+                            }
+                        }),
+                    })
+                    .collect();
+                upstream.subsets = Some(subset_defs);
+            }
+
+            if let Some(timeout_ms) = connect_timeout_ms {
+                let upstream_id = config.upstreams[idx].id.clone();
+                for proxy in &mut config.proxies {
+                    if proxy.upstream_id.as_deref() == Some(upstream_id.as_str())
+                        && proxy.backend_connect_timeout_ms != timeout_ms
+                    {
+                        debug!(
+                            proxy = %proxy.id,
+                            upstream = %upstream_id,
+                            previous_ms = proxy.backend_connect_timeout_ms,
+                            new_ms = timeout_ms,
+                            rule = %dr.name,
+                            "DestinationRule overriding proxy backend_connect_timeout_ms"
+                        );
+                        proxy.backend_connect_timeout_ms = timeout_ms;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn destination_rule_matches_upstream(dr: &MeshDestinationRule, upstream: &Upstream) -> bool {
+    upstream
+        .targets
+        .iter()
+        .any(|target| destination_rule_host_matches(&dr.host, &dr.namespace, &target.host))
+        || upstream
+            .name
+            .as_deref()
+            .is_some_and(|name| destination_rule_host_matches(&dr.host, &dr.namespace, name))
+        || destination_rule_host_matches(&dr.host, &dr.namespace, &upstream.id)
+}
+
+fn destination_rule_host_matches(rule_host: &str, namespace: &str, candidate: &str) -> bool {
+    let rule_host = rule_host.trim_end_matches('.').to_ascii_lowercase();
+    let candidate = candidate.trim_end_matches('.').to_ascii_lowercase();
+    if candidate == rule_host {
+        return true;
+    }
+
+    if !rule_host.contains('.') {
+        let namespaced = format!("{rule_host}.{namespace}");
+        return candidate == namespaced || candidate.starts_with(&format!("{namespaced}.svc."));
+    }
+
+    let dot_count = rule_host.bytes().filter(|byte| *byte == b'.').count();
+    if dot_count == 1 {
+        return candidate.starts_with(&format!("{rule_host}.svc."));
+    }
+    if rule_host.ends_with(".svc") {
+        return candidate.starts_with(&format!("{rule_host}."));
+    }
+
+    false
+}
+
+/// Apply a `MeshTrafficPolicy` onto a Ferrum `Upstream`.
+fn apply_traffic_policy_to_upstream(upstream: &mut Upstream, policy: &MeshTrafficPolicy) {
+    if let Some(lb) = &policy.load_balancer {
+        if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
+            upstream.algorithm = algorithm;
+        }
+        if let MeshLoadBalancer::ConsistentHash(ch) = lb {
+            if let Some(header) = &ch.http_header_name {
+                upstream.hash_on = Some(format!("header:{header}"));
+            } else if let Some(cookie) = &ch.http_cookie_name {
+                upstream.hash_on = Some(format!("cookie:{cookie}"));
+            } else if ch.use_source_ip {
+                upstream.hash_on = Some("ip".to_string());
+            }
+        }
+    }
+
+    // Outlier detection -> passive health check.
+    if let Some(ref od) = policy.outlier_detection {
+        let passive = upstream
+            .health_checks
+            .get_or_insert_with(HealthCheckConfig::default)
+            .passive
+            .get_or_insert_with(PassiveHealthCheck::default);
+
+        if let Some(consecutive) = od.consecutive_errors {
+            passive.unhealthy_threshold = consecutive;
+        }
+        if let Some(interval) = od.interval_seconds {
+            passive.unhealthy_window_seconds = interval;
+        }
+        if let Some(ejection) = od.base_ejection_seconds {
+            passive.healthy_after_seconds = ejection;
+        }
+        if let Some(max_pct) = od.max_ejection_percent {
+            passive.max_ejection_percent = Some(max_pct);
+        }
+    }
+}
+
+/// Convert a mesh LB config to a Ferrum `LoadBalancerAlgorithm`.
+fn mesh_lb_to_ferrum(lb: &Option<MeshLoadBalancer>) -> Option<LoadBalancerAlgorithm> {
+    match lb {
+        Some(MeshLoadBalancer::Simple(simple)) => match simple {
+            MeshSimpleLb::RoundRobin => Some(LoadBalancerAlgorithm::RoundRobin),
+            MeshSimpleLb::LeastRequest => Some(LoadBalancerAlgorithm::LeastConnections),
+            MeshSimpleLb::Random => Some(LoadBalancerAlgorithm::Random),
+            // Istio PASSTHROUGH means direct-to-original-IP; Ferrum always routes via upstreams so RoundRobin is the closest approximation.
+            MeshSimpleLb::Passthrough => Some(LoadBalancerAlgorithm::RoundRobin),
+        },
+        Some(MeshLoadBalancer::ConsistentHash(_)) => Some(LoadBalancerAlgorithm::ConsistentHashing),
+        None => None,
+    }
 }
 
 // ── Egress gateway proxy materialization ─────────────────────────────────
@@ -1797,6 +1985,14 @@ async fn serve_mesh_runtime(
         None
     };
 
+    // Resolve mTLS mode from the initial mesh slice. This is evaluated once at
+    // startup — PeerAuthentication changes pushed via CP/xDS update the slice
+    // but do NOT live-rotate the inbound TLS ServerConfig (consistent with the
+    // project's static-TLS-material model). A restart is required.
+    let inbound_mtls_mode =
+        resolve_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime);
+    validate_inbound_mtls_mode_for_topology(&runtime, inbound_mtls_mode)?;
+
     let mesh_apply_handle = start_mesh_slice_apply_task(
         mesh_state,
         proxy_state.clone(),
@@ -1807,7 +2003,7 @@ async fn serve_mesh_runtime(
     );
 
     validate_egress_gateway_mtls_config(&runtime, &env_config)?;
-    let frontend_tls = load_frontend_tls(&env_config, &tls_policy, &crls)?;
+    let frontend_tls = load_mesh_frontend_tls(&env_config, &tls_policy, &crls, inbound_mtls_mode)?;
     if let Some(ref tls_config) = frontend_tls {
         proxy_state
             .stream_listener_manager
@@ -1817,17 +2013,20 @@ async fn serve_mesh_runtime(
 
     info!(
         listeners = runtime.listener_plan().len(),
+        ?inbound_mtls_mode,
         "Mesh listener plan prepared"
     );
     let mut listener_handles = Vec::new();
     let mut startup_signals = Vec::new();
     for listener in runtime.listener_plan() {
-        let tls_config = listener_tls_config(&listener, frontend_tls.clone());
+        let tls_config =
+            listener_tls_config_for_mtls_mode(&listener, frontend_tls.clone(), inbound_mtls_mode);
         if tls_config.is_none()
             && matches!(
                 listener.kind,
                 MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
             )
+            && inbound_mtls_mode != config::MtlsMode::Disable
         {
             warn!(
                 direction = ?listener.direction,
@@ -1937,34 +2136,132 @@ async fn serve_mesh_runtime(
     Ok(())
 }
 
-fn load_frontend_tls(
+/// Resolve the effective mTLS mode for the inbound TLS-terminating listener
+/// from the initial mesh slice. Falls back to `Permissive` when no slice or no
+/// PeerAuthentication policies are available.
+///
+/// Port selection follows the topology's TLS-terminating listener (see
+/// `listener_plan()`), so PeerAuthentication `port_overrides` keyed on the
+/// actual listener port are honoured for every topology, not just Sidecar.
+fn resolve_inbound_mtls_mode(
+    initial_slice: Option<&MeshSlice>,
+    runtime: &MeshRuntimeConfig,
+) -> config::MtlsMode {
+    let Some(slice) = initial_slice else {
+        return config::MtlsMode::Permissive;
+    };
+    slice.resolve_effective_mtls_mode(inbound_mtls_resolution_port(runtime))
+}
+
+/// Pick the port used to resolve PeerAuthentication `port_overrides` for the
+/// inbound TLS-terminating listener of the current topology.
+fn inbound_mtls_resolution_port(runtime: &MeshRuntimeConfig) -> u16 {
+    match runtime.topology {
+        MeshTopology::Sidecar => runtime.inbound_listen_addr.port(),
+        MeshTopology::Ambient => runtime.hbone_listen_addr.port(),
+        MeshTopology::EgressGateway => runtime.egress_listen_addr.port(),
+        // East-west gateways do SNI passthrough — no TLS termination, no port
+        // override surface. Use inbound for stability; the resolved mode is
+        // not consumed by any TLS listener in this topology.
+        MeshTopology::EastWestGateway => runtime.inbound_listen_addr.port(),
+    }
+}
+
+/// Reject `MtlsMode::Disable` on topologies whose inbound listener is
+/// fundamentally mTLS-only:
+///
+/// - **Ambient**: HBONE is HTTP/2 CONNECT over mTLS — running it plaintext
+///   is not a valid HBONE listener.
+/// - **EgressGateway**: the egress listener must verify sidecar client
+///   certificates (already enforced for env-derived TLS materials by
+///   `validate_egress_gateway_mtls_config`; this check covers the
+///   policy-derived path).
+///
+/// Sidecar and EastWestGateway accept any resolved mode (EastWestGateway
+/// has no TLS termination so it is structurally a no-op).
+fn validate_inbound_mtls_mode_for_topology(
+    runtime: &MeshRuntimeConfig,
+    mtls_mode: config::MtlsMode,
+) -> Result<(), anyhow::Error> {
+    if mtls_mode != config::MtlsMode::Disable {
+        return Ok(());
+    }
+    match runtime.topology {
+        MeshTopology::Ambient => Err(anyhow::anyhow!(
+            "Mesh PeerAuthentication resolved to DISABLE on Ambient topology, but HBONE \
+             (HTTP/2 CONNECT over mTLS) requires mTLS. Use PERMISSIVE or STRICT for this \
+             workload, or move it to Sidecar topology if plaintext-only is intended."
+        )),
+        MeshTopology::EgressGateway => Err(anyhow::anyhow!(
+            "Mesh PeerAuthentication resolved to DISABLE on EgressGateway topology, but the \
+             egress mTLS listener must verify sidecar client certificates. Use PERMISSIVE or \
+             STRICT for this workload."
+        )),
+        MeshTopology::Sidecar | MeshTopology::EastWestGateway => Ok(()),
+    }
+}
+
+/// Build the mesh frontend TLS configuration respecting the resolved mTLS mode.
+///
+/// - `Strict` / `Permissive`: Load TLS with the appropriate client-auth mode.
+/// - `Disable`: Return `None` (plaintext listener).
+fn load_mesh_frontend_tls(
     env_config: &EnvConfig,
     tls_policy: &TlsPolicy,
     crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+    mtls_mode: config::MtlsMode,
 ) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
+    if mtls_mode == config::MtlsMode::Disable {
+        info!(
+            "Mesh PeerAuthentication mTLS mode is DISABLE; inbound listener will accept plaintext only"
+        );
+        return Ok(None);
+    }
+
     let (Some(cert_path), Some(key_path)) = (
         env_config.frontend_tls_cert_path.as_ref(),
         env_config.frontend_tls_key_path.as_ref(),
     ) else {
+        if mtls_mode == config::MtlsMode::Strict {
+            return Err(anyhow::anyhow!(
+                "Mesh PeerAuthentication STRICT requires FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH"
+            ));
+        }
         return Ok(None);
     };
 
     let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
-    let mut config = tls::load_tls_config_with_client_auth(
+    let client_auth = match mtls_mode {
+        config::MtlsMode::Strict => tls::MeshClientAuth::Required,
+        config::MtlsMode::Permissive if client_ca_bundle_path.is_some() => {
+            tls::MeshClientAuth::Optional
+        }
+        config::MtlsMode::Permissive => {
+            warn!(
+                "Mesh PeerAuthentication mTLS mode is PERMISSIVE but no \
+                 FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH is configured; \
+                 client certificates will not be requested or verified"
+            );
+            tls::MeshClientAuth::None
+        }
+        config::MtlsMode::Disable => unreachable!("handled above"),
+    };
+
+    let mut tls_config = tls::load_mesh_tls_config(
         cert_path,
         key_path,
         client_ca_bundle_path,
-        env_config.tls_no_verify,
+        client_auth,
         tls_policy,
         env_config.tls_cert_expiry_warning_days,
         crls,
     )
     .map_err(|e| anyhow::anyhow!("Invalid mesh frontend TLS configuration: {}", e))?;
-    tls::enable_early_data(&mut config, tls_policy);
+    tls::enable_early_data(&mut tls_config, tls_policy);
     if env_config.ktls_enabled.could_be_enabled() {
-        tls::enable_secret_extraction_for_ktls(&mut config);
+        tls::enable_secret_extraction_for_ktls(&mut tls_config);
     }
-    Ok(Some(config))
+    Ok(Some(tls_config))
 }
 
 fn validate_egress_gateway_mtls_config(
@@ -2004,6 +2301,22 @@ fn listener_tls_config(
         MeshListenerKind::PlaintextCapture => None,
         MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination => frontend_tls,
     }
+}
+
+/// Resolve the per-listener TLS config, respecting PeerAuthentication mTLS mode.
+///
+/// - `Disable` mode: all listeners run plaintext (no TLS config).
+/// - `Strict` / `Permissive`: mTLS/HBONE listeners get the frontend TLS config;
+///   plaintext-capture listeners stay plaintext.
+fn listener_tls_config_for_mtls_mode(
+    listener: &MeshListener,
+    frontend_tls: Option<Arc<rustls::ServerConfig>>,
+    mtls_mode: config::MtlsMode,
+) -> Option<Arc<rustls::ServerConfig>> {
+    if mtls_mode == config::MtlsMode::Disable {
+        return None;
+    }
+    listener_tls_config(listener, frontend_tls)
 }
 
 fn start_mesh_slice_apply_task(
@@ -2767,6 +3080,136 @@ mod tests {
         .0
     }
 
+    fn destination_rule_test_upstream(id: &str, host: &str) -> Upstream {
+        let now = chrono::Utc::now();
+        Upstream {
+            id: id.to_string(),
+            namespace: "default".to_string(),
+            name: Some(id.to_string()),
+            targets: vec![UpstreamTarget {
+                host: host.to_string(),
+                port: 8080,
+                weight: 1,
+                tags: HashMap::new(),
+                path: None,
+            }],
+            algorithm: LoadBalancerAlgorithm::RoundRobin,
+            hash_on: None,
+            hash_on_cookie_config: None,
+            health_checks: None,
+            service_discovery: None,
+            subsets: None,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn destination_rule_test_proxy(id: &str, upstream_id: &str) -> Proxy {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "hosts": [format!("{id}.example.com")],
+            "backend_host": "",
+            "backend_port": 0,
+            "upstream_id": upstream_id
+        }))
+        .expect("test proxy")
+    }
+
+    #[test]
+    fn destination_rule_applies_short_host_to_all_matching_upstreams() {
+        let mut config = GatewayConfig {
+            proxies: vec![
+                destination_rule_test_proxy("p1", "u1"),
+                destination_rule_test_proxy("p2", "u2"),
+            ],
+            upstreams: vec![
+                destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local"),
+                destination_rule_test_upstream("u2", "reviews.default.svc.cluster.local"),
+            ],
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connect_timeout_ms: Some(1234),
+                    load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                    ..MeshTrafficPolicy::default()
+                }),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &slice);
+
+        assert!(
+            config
+                .upstreams
+                .iter()
+                .all(|upstream| upstream.algorithm == LoadBalancerAlgorithm::Random)
+        );
+        assert!(
+            config
+                .proxies
+                .iter()
+                .all(|proxy| proxy.backend_connect_timeout_ms == 1234)
+        );
+    }
+
+    #[test]
+    fn destination_rule_apply_order_is_deterministic_by_namespace_then_name() {
+        let mut config = GatewayConfig {
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        // Insert in reverse alphabetical order; sort by (namespace, name) means
+        // "default/a-first" applies first and "default/z-last" wins.
+        let slice = MeshSlice {
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "z-last".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connect_timeout_ms: Some(9999),
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "a-first".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connect_timeout_ms: Some(1111),
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &slice);
+
+        assert_eq!(config.upstreams[0].algorithm, LoadBalancerAlgorithm::Random);
+        assert_eq!(config.proxies[0].backend_connect_timeout_ms, 9999);
+    }
+
     #[test]
     fn telemetry_tracing_merge_preserves_inherited_sampling_for_tag_only_override() {
         let mesh_slice = MeshSlice {
@@ -2817,6 +3260,7 @@ mod tests {
                     },
                 },
             ],
+            destination_rules: Vec::new(),
             trust_bundles: None,
             multi_cluster: None,
         };
@@ -4161,6 +4605,197 @@ mod tests {
         assert!(err.to_string().contains("FERRUM_TLS_NO_VERIFY=true"));
     }
 
+    #[test]
+    fn strict_peer_auth_fails_closed_without_frontend_tls_materials() {
+        let env = EnvConfig::default();
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+
+        let err = load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Strict)
+            .expect_err("strict mTLS must require cert and key material");
+
+        assert!(
+            err.to_string()
+                .contains("PeerAuthentication STRICT requires")
+        );
+    }
+
+    #[test]
+    fn permissive_peer_auth_allows_missing_frontend_tls_materials() {
+        let env = EnvConfig::default();
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+
+        let tls_config =
+            load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Permissive)
+                .expect("permissive mTLS can run without frontend TLS materials");
+
+        assert!(tls_config.is_none());
+    }
+
+    #[test]
+    fn permissive_without_ca_bundle_degrades_to_no_client_auth() {
+        let env = EnvConfig {
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            frontend_tls_client_ca_bundle_path: None,
+            ..EnvConfig::default()
+        };
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+
+        let tls_config =
+            load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Permissive)
+                .expect("permissive without CA bundle should succeed");
+
+        assert!(
+            tls_config.is_some(),
+            "TLS config should be built (no client auth, but server TLS active)"
+        );
+    }
+
+    // ── Topology-aware port resolution + Disable-mode validation ────────
+
+    fn runtime_with_topology(topology: MeshTopology) -> MeshRuntimeConfig {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.topology = topology;
+        runtime.inbound_listen_addr = "127.0.0.1:15006".parse().unwrap();
+        runtime.hbone_listen_addr = "127.0.0.1:15008".parse().unwrap();
+        runtime.egress_listen_addr = "127.0.0.1:15090".parse().unwrap();
+        runtime
+    }
+
+    fn peer_auth_with_port_override(
+        port: u16,
+        mode: config::MtlsMode,
+    ) -> config::PeerAuthentication {
+        config::PeerAuthentication {
+            name: "ns-policy".to_string(),
+            namespace: "default".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: config::MtlsMode::Permissive,
+            port_overrides: HashMap::from([(port, mode)]),
+        }
+    }
+
+    fn slice_with_peer_auths(peer_auths: Vec<config::PeerAuthentication>) -> MeshSlice {
+        MeshSlice {
+            namespace: "default".to_string(),
+            peer_authentications: peer_auths,
+            ..MeshSlice::default()
+        }
+    }
+
+    #[test]
+    fn inbound_mtls_resolution_port_picks_topology_correct_port() {
+        let sidecar = runtime_with_topology(MeshTopology::Sidecar);
+        assert_eq!(inbound_mtls_resolution_port(&sidecar), 15006);
+
+        let ambient = runtime_with_topology(MeshTopology::Ambient);
+        assert_eq!(inbound_mtls_resolution_port(&ambient), 15008);
+
+        let egress = runtime_with_topology(MeshTopology::EgressGateway);
+        assert_eq!(inbound_mtls_resolution_port(&egress), 15090);
+
+        // East-west has no TLS termination; pick a stable port for the call.
+        let east_west = runtime_with_topology(MeshTopology::EastWestGateway);
+        assert_eq!(inbound_mtls_resolution_port(&east_west), 15006);
+    }
+
+    #[test]
+    fn resolve_inbound_mtls_mode_honours_hbone_port_override_for_ambient() {
+        // Port override keyed on the HBONE port (15008). With the prior bug
+        // (always looking up 15006) this would have fallen through to the
+        // top-level Permissive mode.
+        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
+            15008,
+            config::MtlsMode::Strict,
+        )]);
+        let runtime = runtime_with_topology(MeshTopology::Ambient);
+
+        assert_eq!(
+            resolve_inbound_mtls_mode(Some(&slice), &runtime),
+            config::MtlsMode::Strict,
+        );
+    }
+
+    #[test]
+    fn resolve_inbound_mtls_mode_honours_egress_port_override_for_egress_gateway() {
+        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
+            15090,
+            config::MtlsMode::Strict,
+        )]);
+        let runtime = runtime_with_topology(MeshTopology::EgressGateway);
+
+        assert_eq!(
+            resolve_inbound_mtls_mode(Some(&slice), &runtime),
+            config::MtlsMode::Strict,
+        );
+    }
+
+    #[test]
+    fn resolve_inbound_mtls_mode_honours_inbound_port_override_for_sidecar() {
+        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
+            15006,
+            config::MtlsMode::Strict,
+        )]);
+        let runtime = runtime_with_topology(MeshTopology::Sidecar);
+
+        assert_eq!(
+            resolve_inbound_mtls_mode(Some(&slice), &runtime),
+            config::MtlsMode::Strict,
+        );
+    }
+
+    #[test]
+    fn validate_inbound_mtls_mode_rejects_disable_on_ambient() {
+        let runtime = runtime_with_topology(MeshTopology::Ambient);
+        let err = validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Disable)
+            .expect_err("Disable on Ambient must be rejected");
+
+        assert!(err.to_string().contains("Ambient"));
+        assert!(err.to_string().contains("HBONE"));
+    }
+
+    #[test]
+    fn validate_inbound_mtls_mode_rejects_disable_on_egress_gateway() {
+        let runtime = runtime_with_topology(MeshTopology::EgressGateway);
+        let err = validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Disable)
+            .expect_err("Disable on EgressGateway must be rejected");
+
+        assert!(err.to_string().contains("EgressGateway"));
+    }
+
+    #[test]
+    fn validate_inbound_mtls_mode_accepts_disable_on_sidecar() {
+        let runtime = runtime_with_topology(MeshTopology::Sidecar);
+        validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Disable)
+            .expect("Disable on Sidecar is allowed (plaintext-only inbound)");
+    }
+
+    #[test]
+    fn validate_inbound_mtls_mode_accepts_disable_on_east_west_gateway() {
+        // East-west gateways do SNI passthrough — there is no TLS-terminating
+        // listener to fail closed. The resolved mode is structurally unused.
+        let runtime = runtime_with_topology(MeshTopology::EastWestGateway);
+        validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Disable)
+            .expect("Disable on EastWestGateway is structurally a no-op");
+    }
+
+    #[test]
+    fn validate_inbound_mtls_mode_accepts_permissive_and_strict_on_all_topologies() {
+        for topology in [
+            MeshTopology::Sidecar,
+            MeshTopology::Ambient,
+            MeshTopology::EastWestGateway,
+            MeshTopology::EgressGateway,
+        ] {
+            let runtime = runtime_with_topology(topology);
+            validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Permissive)
+                .unwrap_or_else(|e| panic!("Permissive on {:?} should succeed: {}", topology, e));
+            validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Strict)
+                .unwrap_or_else(|e| panic!("Strict on {:?} should succeed: {}", topology, e));
+        }
+    }
+
     fn test_external_service_entry(
         name: &str,
         hosts: Vec<String>,
@@ -4513,6 +5148,17 @@ mod tests {
                     443,
                     AppProtocol::Tls,
                 )],
+                destination_rules: vec![MeshDestinationRule {
+                    name: "partner-policy".to_string(),
+                    namespace: "default".to_string(),
+                    host: "api.partner.com".to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connect_timeout_ms: Some(1234),
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    subsets: Vec::new(),
+                }],
                 ..MeshConfig::default()
             })),
             ..GatewayConfig::default()
@@ -4529,6 +5175,7 @@ mod tests {
         assert_eq!(egress_proxy.hosts, vec!["api.partner.com"]);
         assert!(!egress_proxy.frontend_tls);
         assert_eq!(egress_proxy.backend_scheme, Some(BackendScheme::Https));
+        assert_eq!(egress_proxy.backend_connect_timeout_ms, 1234);
 
         // Should have the egress upstream
         let egress_upstream = prepared
@@ -4540,6 +5187,7 @@ mod tests {
             .expect("egress upstream should be materialized");
         assert_eq!(egress_upstream.targets.len(), 1);
         assert_eq!(egress_upstream.targets[0].host, "api.partner.com");
+        assert_eq!(egress_upstream.algorithm, LoadBalancerAlgorithm::Random);
 
         // Mesh plugins should be injected
         assert!(

@@ -21,6 +21,8 @@ use crate::config::types::{
 use crate::identity::spiffe::TrustDomain;
 use crate::modes::mesh::config::MeshConfig;
 
+const MAX_FAULT_DELAY_MS: u64 = 3_600_000;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct K8sMetadata {
     #[serde(default)]
@@ -490,6 +492,7 @@ pub(crate) fn fault_injection_plugin_for_proxy(
     if let Some(delay_obj) = obj.get("delay").and_then(Value::as_object)
         && let Some(delay_str) = delay_obj.get("fixedDelay").and_then(Value::as_str)
         && let Some(ms) = parse_istio_duration_ms(delay_str)
+        && (1..=MAX_FAULT_DELAY_MS).contains(&ms)
         && let Some(percentage) = istio_fault_percentage(delay_obj)
     {
         config.insert(
@@ -549,9 +552,8 @@ pub(crate) fn fault_injection_plugin_for_proxy(
 /// Parse an Istio duration string to milliseconds. Supports the same suffix
 /// set as Go's `time.ParseDuration` (`ns`, `us`, `ms`, `s`, `m`, `h`); Istio's
 /// CRDs expose this format via `google.protobuf.Duration`'s string form
-/// (e.g., `"5s"`, `"500ms"`, `"30m"`, `"1.5h"`). Sub-millisecond inputs that
-/// round down to zero return `None` because the target plugins require
-/// `duration_ms > 0`.
+/// (e.g., `"5s"`, `"500ms"`, `"30m"`, `"1.5h"`). Positive sub-millisecond
+/// inputs round up to 1 ms so duration-based policy fields do not disappear.
 pub(crate) fn parse_istio_duration_ms(duration: &str) -> Option<u64> {
     let trimmed = duration.trim();
     // 2-char suffixes first so they aren't shadowed by the trailing `s` or `m`.
@@ -585,8 +587,11 @@ fn duration_component_ms(raw: &str, multiplier: f64) -> Option<u64> {
     if !ms.is_finite() || ms > u64::MAX as f64 {
         return None;
     }
-    let result = ms as u64;
-    if result > 0 { Some(result) } else { None }
+    if ms > 0.0 && ms < 1.0 {
+        Some(1)
+    } else {
+        Some(ms as u64)
+    }
 }
 
 /// Extract an Istio fault percentage in the range (0.0, 100.0]. Accepts both

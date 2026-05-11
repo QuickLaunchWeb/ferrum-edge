@@ -3,9 +3,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::config::types::GatewayConfig;
 use crate::modes::mesh::config::{
-    MeshPolicy, MeshRequestAuthentication, MeshService, MeshTelemetryResource, MultiClusterConfig,
-    PeerAuthentication, ServiceEntry, TrustBundleSet, Workload, policy_scope_applies_to_workload,
-    scope_applies_to_workload, service_entry_applies_to_workload, workload_selector_matches,
+    MeshDestinationRule, MeshPolicy, MeshRequestAuthentication, MeshService, MeshTelemetryResource,
+    MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyScope, ServiceEntry, TrustBundleSet,
+    Workload, WorkloadLabels, policy_scope_applies_to_workload, scope_applies_to_workload,
+    service_entry_applies_to_workload, workload_selector_matches,
 };
 
 /// Node/workload selector used by both ADS and native `MeshSubscribe`.
@@ -72,6 +73,8 @@ pub struct MeshSlice {
     pub request_authentications: Vec<MeshRequestAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub telemetry_resources: Vec<MeshTelemetryResource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destination_rules: Vec<MeshDestinationRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,8 +98,31 @@ impl MeshSlice {
             && self.service_entries == other.service_entries
             && self.request_authentications == other.request_authentications
             && self.telemetry_resources == other.telemetry_resources
+            && self.destination_rules == other.destination_rules
             && self.trust_bundles == other.trust_bundles
             && self.multi_cluster == other.multi_cluster
+    }
+
+    /// Resolve the effective mTLS mode for a given port on this workload.
+    ///
+    /// PeerAuthentication scope precedence (highest wins):
+    ///   1. WorkloadSelector-scoped (has `selector` with labels matching this workload)
+    ///   2. Namespace-scoped (no selector, same namespace)
+    ///   3. Mesh-wide (root namespace, no selector — carried via `peer_authentications`
+    ///      which is already pre-filtered by `from_gateway_config`)
+    ///
+    /// Within the winning policy, a port-level override for `port` takes
+    /// precedence over the policy's top-level `mtls_mode`.
+    ///
+    /// When no PeerAuthentication applies, returns `MtlsMode::Permissive`
+    /// (Istio default).
+    pub fn resolve_effective_mtls_mode(&self, port: u16) -> MtlsMode {
+        resolve_effective_mtls_mode(
+            &self.peer_authentications,
+            &self.namespace,
+            &self.labels,
+            port,
+        )
     }
 
     pub fn from_gateway_config(config: &GatewayConfig, request: MeshSliceRequest) -> Self {
@@ -158,10 +184,7 @@ impl MeshSlice {
             .peer_authentications
             .iter()
             .filter(|peer_auth| {
-                peer_auth.namespace == namespace
-                    && peer_auth.selector.as_ref().is_none_or(|selector| {
-                        workload_selector_matches(selector, effective_namespace, &effective_labels)
-                    })
+                peer_auth_applies_to_workload(peer_auth, effective_namespace, &effective_labels)
             })
             .cloned()
             .collect();
@@ -187,6 +210,12 @@ impl MeshSlice {
             .filter(|t| scope_applies_to_workload(&t.scope, effective_namespace, &effective_labels))
             .cloned()
             .collect();
+        let destination_rules: Vec<MeshDestinationRule> = mesh
+            .destination_rules
+            .iter()
+            .filter(|dr| dr.namespace == namespace)
+            .cloned()
+            .collect();
 
         Self {
             node_id: request.node_id,
@@ -201,9 +230,93 @@ impl MeshSlice {
             service_entries,
             request_authentications,
             telemetry_resources,
+            destination_rules,
             trust_bundles: mesh.trust_bundles.clone(),
             multi_cluster: mesh.multi_cluster.clone(),
         }
+    }
+}
+
+/// Scope tier used for PeerAuthentication precedence ranking.
+///
+/// Discriminant order is load-bearing: `Ord` derive uses it, and the
+/// resolution loop picks the highest-valued tier. Istio semantics:
+/// WorkloadSelector > Namespace > MeshWide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PeerAuthScope {
+    MeshWide = 0,
+    Namespace = 1,
+    WorkloadSelector = 2,
+}
+
+/// Classify a [`PeerAuthentication`] into a scope tier for precedence ordering.
+fn classify_peer_auth_scope(pa: &PeerAuthentication) -> PeerAuthScope {
+    if let Some(scope) = &pa.scope {
+        return match scope {
+            PolicyScope::MeshWide => PeerAuthScope::MeshWide,
+            PolicyScope::Namespace { .. } => PeerAuthScope::Namespace,
+            PolicyScope::WorkloadSelector { .. } => PeerAuthScope::WorkloadSelector,
+        };
+    }
+
+    match &pa.selector {
+        Some(selector) if !selector.labels.is_empty() => PeerAuthScope::WorkloadSelector,
+        _ => PeerAuthScope::Namespace,
+    }
+}
+
+fn peer_auth_applies_to_workload<L: WorkloadLabels + ?Sized>(
+    pa: &PeerAuthentication,
+    namespace: &str,
+    labels: &L,
+) -> bool {
+    if let Some(scope) = &pa.scope {
+        return scope_applies_to_workload(scope, namespace, labels);
+    }
+
+    pa.namespace == namespace
+        && pa
+            .selector
+            .as_ref()
+            .is_none_or(|selector| workload_selector_matches(selector, namespace, labels))
+}
+
+/// Resolve the effective mTLS mode for a given port from a set of
+/// PeerAuthentication policies.
+///
+/// This is the canonical resolution function. The `MeshSlice` convenience
+/// method delegates here.
+pub fn resolve_effective_mtls_mode<L: WorkloadLabels + ?Sized>(
+    peer_auths: &[PeerAuthentication],
+    namespace: &str,
+    labels: &L,
+    port: u16,
+) -> MtlsMode {
+    let mut best: Option<(PeerAuthScope, &PeerAuthentication)> = None;
+
+    for pa in peer_auths {
+        if !peer_auth_applies_to_workload(pa, namespace, labels) {
+            continue;
+        }
+
+        let scope = classify_peer_auth_scope(pa);
+        let dominated = best
+            .as_ref()
+            .is_none_or(|(current_scope, _)| scope > *current_scope);
+        if dominated {
+            best = Some((scope, pa));
+        }
+    }
+
+    match best {
+        Some((_, pa)) => {
+            // Port-level override within the winning policy.
+            pa.port_overrides
+                .get(&port)
+                .copied()
+                .unwrap_or(pa.mtls_mode)
+        }
+        None => MtlsMode::Permissive,
     }
 }
 
@@ -299,6 +412,7 @@ mod tests {
         PeerAuthentication {
             name: name.into(),
             namespace: namespace.into(),
+            scope: None,
             selector,
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
@@ -422,6 +536,7 @@ mod tests {
             mesh_policies: vec![make_policy("p1", "ns", PolicyScope::MeshWide)],
             peer_authentications: vec![make_peer_auth("pa1", "ns", None)],
             service_entries: vec![make_service_entry("se1", "ns", vec!["*".into()])],
+            destination_rules: Vec::new(),
             request_authentications: vec![make_request_auth("ra1", "ns", PolicyScope::MeshWide)],
             telemetry_resources: vec![make_telemetry("t1", "ns", PolicyScope::MeshWide)],
             trust_bundles: Some(make_trust_bundle_set()),
@@ -1222,5 +1337,314 @@ mod tests {
     fn labels_to_btree_empty_map() {
         let bt = labels_to_btree(&HashMap::new());
         assert!(bt.is_empty());
+    }
+
+    // ── DestinationRule slice filtering ──────────────────────────────────
+
+    #[test]
+    fn from_gateway_config_filters_destination_rules_by_namespace() {
+        use crate::modes::mesh::config::MeshDestinationRule;
+
+        let mesh = MeshConfig {
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "in-ns".into(),
+                    namespace: "ns".into(),
+                    host: "reviews.ns.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "other-ns".into(),
+                    namespace: "other".into(),
+                    host: "reviews.other.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let cfg = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&cfg, slice_request("ns"));
+
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].namespace, "ns");
+        assert_eq!(slice.destination_rules[0].name, "in-ns");
+    }
+
+    fn pa(
+        name: &str,
+        namespace: &str,
+        selector: Option<WorkloadSelector>,
+        mode: MtlsMode,
+        port_overrides: HashMap<u16, MtlsMode>,
+    ) -> PeerAuthentication {
+        PeerAuthentication {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            scope: None,
+            selector,
+            mtls_mode: mode,
+            port_overrides,
+        }
+    }
+
+    fn pa_with_scope(
+        name: &str,
+        namespace: &str,
+        scope: PolicyScope,
+        mode: MtlsMode,
+    ) -> PeerAuthentication {
+        let selector = match &scope {
+            PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
+            PolicyScope::MeshWide | PolicyScope::Namespace { .. } => None,
+        };
+        PeerAuthentication {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            scope: Some(scope),
+            selector,
+            mtls_mode: mode,
+            port_overrides: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn no_peer_auth_defaults_to_permissive() {
+        let mode =
+            resolve_effective_mtls_mode(&[], "default", &HashMap::<String, String>::new(), 8080);
+        assert_eq!(mode, MtlsMode::Permissive);
+    }
+
+    #[test]
+    fn single_namespace_scoped_policy() {
+        let policies = vec![pa(
+            "ns-strict",
+            "default",
+            None,
+            MtlsMode::Strict,
+            HashMap::new(),
+        )];
+        let mode = resolve_effective_mtls_mode(
+            &policies,
+            "default",
+            &HashMap::<String, String>::new(),
+            8080,
+        );
+        assert_eq!(mode, MtlsMode::Strict);
+    }
+
+    #[test]
+    fn workload_selector_beats_namespace_scope() {
+        let policies = vec![
+            pa(
+                "ns-strict",
+                "default",
+                None,
+                MtlsMode::Strict,
+                HashMap::new(),
+            ),
+            pa(
+                "wl-permissive",
+                "default",
+                Some(WorkloadSelector {
+                    labels: HashMap::from([("app".into(), "web".into())]),
+                    namespace: None,
+                }),
+                MtlsMode::Permissive,
+                HashMap::new(),
+            ),
+        ];
+        let labels = HashMap::from([("app".to_string(), "web".to_string())]);
+        let mode = resolve_effective_mtls_mode(&policies, "default", &labels, 8080);
+        assert_eq!(mode, MtlsMode::Permissive);
+    }
+
+    #[test]
+    fn namespace_scope_beats_mesh_wide_when_both_selector_none() {
+        let policies = vec![
+            pa_with_scope(
+                "mesh-wide",
+                "istio-system",
+                PolicyScope::MeshWide,
+                MtlsMode::Disable,
+            ),
+            pa_with_scope(
+                "ns-strict",
+                "default",
+                PolicyScope::Namespace {
+                    namespace: "default".to_string(),
+                },
+                MtlsMode::Strict,
+            ),
+        ];
+        let mode = resolve_effective_mtls_mode(
+            &policies,
+            "default",
+            &HashMap::<String, String>::new(),
+            8080,
+        );
+        assert_eq!(mode, MtlsMode::Strict);
+    }
+
+    #[test]
+    fn mesh_slice_carries_mesh_wide_peer_auth_to_workload_namespace() {
+        let mut config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                peer_authentications: vec![pa_with_scope(
+                    "mesh-strict",
+                    "istio-system",
+                    PolicyScope::MeshWide,
+                    MtlsMode::Strict,
+                )],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        config.loaded_at = chrono::Utc::now();
+
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            MeshSliceRequest {
+                node_id: "node-a".to_string(),
+                namespace: "default".to_string(),
+                workload_spiffe_id: None,
+                labels: BTreeMap::new(),
+            },
+        );
+
+        assert_eq!(slice.peer_authentications.len(), 1);
+        assert_eq!(slice.resolve_effective_mtls_mode(8080), MtlsMode::Strict);
+    }
+
+    #[test]
+    fn port_override_within_winning_policy() {
+        let policies = vec![pa(
+            "ns-strict",
+            "default",
+            None,
+            MtlsMode::Strict,
+            HashMap::from([(8080, MtlsMode::Disable)]),
+        )];
+        // Port 8080 has an override to Disable.
+        let mode = resolve_effective_mtls_mode(
+            &policies,
+            "default",
+            &HashMap::<String, String>::new(),
+            8080,
+        );
+        assert_eq!(mode, MtlsMode::Disable);
+
+        // Port 443 uses the top-level mode.
+        let mode = resolve_effective_mtls_mode(
+            &policies,
+            "default",
+            &HashMap::<String, String>::new(),
+            443,
+        );
+        assert_eq!(mode, MtlsMode::Strict);
+    }
+
+    #[test]
+    fn port_override_only_applies_to_winning_policy() {
+        // Namespace policy has port override, but workload-selector policy
+        // wins and has no override for the port.
+        let policies = vec![
+            pa(
+                "ns-policy",
+                "default",
+                None,
+                MtlsMode::Strict,
+                HashMap::from([(8080, MtlsMode::Disable)]),
+            ),
+            pa(
+                "wl-policy",
+                "default",
+                Some(WorkloadSelector {
+                    labels: HashMap::from([("app".into(), "api".into())]),
+                    namespace: None,
+                }),
+                MtlsMode::Permissive,
+                HashMap::new(),
+            ),
+        ];
+        let labels = HashMap::from([("app".to_string(), "api".to_string())]);
+        // Workload selector wins; port 8080 has no override in winning policy.
+        let mode = resolve_effective_mtls_mode(&policies, "default", &labels, 8080);
+        assert_eq!(mode, MtlsMode::Permissive);
+    }
+
+    #[test]
+    fn wrong_namespace_is_ignored() {
+        let policies = vec![pa(
+            "other-ns",
+            "production",
+            None,
+            MtlsMode::Strict,
+            HashMap::new(),
+        )];
+        let mode = resolve_effective_mtls_mode(
+            &policies,
+            "default",
+            &HashMap::<String, String>::new(),
+            8080,
+        );
+        assert_eq!(mode, MtlsMode::Permissive);
+    }
+
+    #[test]
+    fn selector_labels_must_match() {
+        let policies = vec![pa(
+            "wl-strict",
+            "default",
+            Some(WorkloadSelector {
+                labels: HashMap::from([("app".into(), "web".into())]),
+                namespace: None,
+            }),
+            MtlsMode::Strict,
+            HashMap::new(),
+        )];
+        // Labels don't match.
+        let labels = HashMap::from([("app".to_string(), "api".to_string())]);
+        let mode = resolve_effective_mtls_mode(&policies, "default", &labels, 8080);
+        assert_eq!(mode, MtlsMode::Permissive);
+    }
+
+    #[test]
+    fn mesh_slice_resolve_delegates_correctly() {
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "web".to_string())]),
+            peer_authentications: vec![
+                pa(
+                    "ns-disable",
+                    "default",
+                    None,
+                    MtlsMode::Disable,
+                    HashMap::new(),
+                ),
+                pa(
+                    "wl-strict",
+                    "default",
+                    Some(WorkloadSelector {
+                        labels: HashMap::from([("app".into(), "web".into())]),
+                        namespace: None,
+                    }),
+                    MtlsMode::Strict,
+                    HashMap::from([(443, MtlsMode::Permissive)]),
+                ),
+            ],
+            ..MeshSlice::default()
+        };
+        // Workload selector wins (Strict), port 8080 has no override.
+        assert_eq!(slice.resolve_effective_mtls_mode(8080), MtlsMode::Strict);
+        // Port 443 has an override to Permissive in the winning policy.
+        assert_eq!(slice.resolve_effective_mtls_mode(443), MtlsMode::Permissive);
+    }
+
+    #[test]
+    fn classify_peer_auth_scope_ordering() {
+        assert!(PeerAuthScope::WorkloadSelector > PeerAuthScope::Namespace);
+        assert!(PeerAuthScope::Namespace > PeerAuthScope::MeshWide);
     }
 }
