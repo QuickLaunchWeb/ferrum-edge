@@ -431,18 +431,37 @@ impl Plugin for AiPromptShield {
             return PluginResult::Continue;
         }
 
-        // Detect PII
-        let detected = if self.scan_mode == ScanMode::All {
-            self.detect_pii_in_str(body)
+        // Detect PII and (in non-scan-all mode) capture streaming intent from
+        // the same parsed JSON. Scan-all mode operates on the raw body string,
+        // so a full JSON parse just to read `stream` would be pure overhead —
+        // gate it behind a cheap byte-level substring check first.
+        //
+        // The streaming flag is captured before mutating `ctx.metadata`
+        // because `body` borrows from `ctx.metadata.get("request_body")`.
+        let (detected, is_streaming_request) = if self.scan_mode == ScanMode::All {
+            let detected = self.detect_pii_in_str(body);
+            let is_streaming = body.contains("\"stream\"")
+                && serde_json::from_str::<Value>(body)
+                    .ok()
+                    .and_then(|json| json.get("stream").and_then(|s| s.as_bool()))
+                    == Some(true);
+            (detected, is_streaming)
         } else {
             match serde_json::from_str::<Value>(body) {
                 Ok(json) => {
+                    let is_streaming = json.get("stream").and_then(|s| s.as_bool()) == Some(true);
                     let texts = self.extract_scan_text(&json);
-                    self.detect_pii(&texts)
+                    (self.detect_pii(&texts), is_streaming)
                 }
                 Err(_) => return PluginResult::Continue,
             }
         };
+
+        // `body` borrow released — safe to mutate ctx.metadata now.
+        if is_streaming_request {
+            ctx.metadata
+                .insert("ai_request_streaming".to_string(), "true".to_string());
+        }
 
         if detected.is_empty() {
             return PluginResult::Continue;

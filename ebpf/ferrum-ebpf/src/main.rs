@@ -8,7 +8,7 @@
 //! | `ferrum_connect6`   | cgroup/connect6   | Rewrite outbound IPv6 to loopback    |
 //! | `ferrum_getpeername4` | cgroup/getpeername4 | Return original IPv4 destination   |
 //! | `ferrum_getpeername6` | cgroup/getpeername6 | Return original IPv6 destination   |
-//! | `ferrum_tc_inbound` | tc/ingress        | Redirect inbound to HBONE port       |
+//! | `ferrum_tc_inbound` | tc/ingress        | Classify enrolled pod inbound traffic |
 //!
 //! Build: `cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release`
 
