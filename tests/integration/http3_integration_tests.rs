@@ -398,6 +398,8 @@ async fn test_http3_proxy_state_creation() {
         early_data_methods: Arc::new(std::collections::HashSet::new()),
         mesh_egress_strip_baggage_keys: Arc::new(Vec::new()),
         gateway_svid_bundle: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        gateway_file_svid_bundle: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        gateway_trust_bundles: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
     };
 
     // Verify proxy state is created successfully
@@ -647,6 +649,8 @@ async fn test_http3_full_integration() {
         early_data_methods: Arc::new(std::collections::HashSet::new()),
         mesh_egress_strip_baggage_keys: Arc::new(Vec::new()),
         gateway_svid_bundle: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        gateway_file_svid_bundle: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        gateway_trust_bundles: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
     };
 
     // Verify proxy state is created successfully
