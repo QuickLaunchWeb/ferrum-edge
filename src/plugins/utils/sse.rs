@@ -51,7 +51,8 @@ pub fn headers_accept_sse(headers: &HashMap<String, String>) -> bool {
 ///
 /// Iterates lines, strips the `data: ` (or `data:`) prefix, skips empty data,
 /// the `[DONE]` sentinel, and frames that are not valid JSON. Returns the
-/// parsed frames in order.
+/// parsed frames in order. Returns an empty `Vec` if the body is not valid
+/// UTF-8 — callers receive no JSON frames but no error either.
 pub fn parse_sse_data_frames(body: &[u8]) -> Vec<Value> {
     let body_str = match std::str::from_utf8(body) {
         Ok(s) => s,

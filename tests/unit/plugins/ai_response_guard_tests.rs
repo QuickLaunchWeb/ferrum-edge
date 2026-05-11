@@ -1072,3 +1072,204 @@ async fn test_sse_no_redaction_returns_none() {
         "no modification expected when no PII present"
     );
 }
+
+#[tokio::test]
+async fn test_sse_scan_all_no_match_returns_none() {
+    // Fast-skip: scan-all mode with no pattern anywhere in the body must
+    // return None without paying per-frame parse/serialize cost.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn", "credit_card"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let body = openai_sse_body(&["nothing sensitive here"]);
+
+    let transformed = plugin
+        .transform_response_body(&body, Some("text/event-stream"), &HashMap::new())
+        .await;
+    assert!(transformed.is_none());
+}
+
+#[tokio::test]
+async fn test_sse_redaction_preserves_crlf_line_endings() {
+    // Real-world SSE servers often emit CRLF terminators. The redactor must
+    // preserve them on rewritten `data:` lines instead of mixing CR/LF.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "redact"
+    }));
+    let frame = json!({"choices": [{"index": 0, "delta": {"content": "ping admin@example.com"}}]});
+    let body = format!(
+        "data: {}\r\n\r\ndata: [DONE]\r\n\r\n",
+        serde_json::to_string(&frame).unwrap()
+    );
+
+    let transformed = plugin
+        .transform_response_body(body.as_bytes(), Some("text/event-stream"), &HashMap::new())
+        .await
+        .expect("expected redacted body");
+    let out = String::from_utf8(transformed).unwrap();
+
+    // Every `data:` line we emitted must end with CRLF, not bare LF.
+    for line in out.split('\n') {
+        if line.starts_with("data:") {
+            assert!(
+                line.ends_with('\r'),
+                "data line lost CR terminator: {:?}",
+                line
+            );
+        }
+    }
+    // Content was actually redacted.
+    assert!(!out.contains("admin@example.com"));
+    assert!(out.contains("[REDACTED:pii:email]"));
+    // [DONE] sentinel passed through unchanged (still CRLF).
+    assert!(out.contains("data: [DONE]\r"));
+}
+
+#[tokio::test]
+async fn test_sse_preserves_non_data_event_lines() {
+    // SSE comments (`:`), `event:`, `id:`, and `retry:` lines must round-trip
+    // unchanged. Only `data:` frames carry JSON we touch.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "redact"
+    }));
+    let frame = json!({"choices": [{"index": 0, "delta": {"content": "hi user@test.io"}}]});
+    let body = format!(
+        ": keep-alive comment\nevent: message\nid: 42\nretry: 5000\ndata: {}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(&frame).unwrap()
+    );
+
+    let transformed = plugin
+        .transform_response_body(body.as_bytes(), Some("text/event-stream"), &HashMap::new())
+        .await
+        .expect("expected redacted body");
+    let out = String::from_utf8(transformed).unwrap();
+
+    assert!(out.contains(": keep-alive comment"));
+    assert!(out.contains("event: message"));
+    assert!(out.contains("id: 42"));
+    assert!(out.contains("retry: 5000"));
+    assert!(out.contains("[REDACTED:pii:email]"));
+    assert!(!out.contains("user@test.io"));
+}
+
+#[tokio::test]
+async fn test_sse_oversize_body_skipped_in_transform() {
+    // The `max_scan_bytes` guard must block redaction of oversize SSE bodies
+    // even when content-type is text/event-stream.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "redact",
+        "max_scan_bytes": 64
+    }));
+    let frame = json!({"choices": [{"index": 0, "delta": {"content": "user@example.com"}}]});
+    let mut body = String::new();
+    // Inflate well past 64 bytes.
+    for _ in 0..16 {
+        body.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::to_string(&frame).unwrap()
+        ));
+    }
+    assert!(body.len() > 64);
+
+    let transformed = plugin
+        .transform_response_body(body.as_bytes(), Some("text/event-stream"), &HashMap::new())
+        .await;
+    assert!(
+        transformed.is_none(),
+        "oversize body must skip redaction (returned Some)"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_oversize_body_skipped_in_detection() {
+    // Mirror the transform guard: `on_response_body` must also bail out on
+    // oversize SSE bodies rather than buffering and scanning them.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "reject",
+        "max_scan_bytes": 64
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    let filler = "filler ".repeat(20);
+    let body = openai_sse_body(&["SSN: 123-45-6789 ", filler.as_str()]);
+    assert!(body.len() > 64);
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+        .await;
+    // Skipped, not rejected — the size guard wins over detection.
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn test_sse_cross_frame_pii_redact_returns_none() {
+    // PII split across frames: detection still flags it (on accumulated
+    // content), but per-frame redaction can't reach it. The redactor must
+    // return None (no body change) and log a warning. We can't assert the
+    // log here without a tracing subscriber harness, but we can pin the
+    // observable behavior: no transform, detection metadata still set.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "redact"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    // The SSN "123-45-6789" is split across two delta chunks.
+    let body = openai_sse_body(&["my ssn is 123-", "45-6789 ok"]);
+
+    let detect = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+        .await;
+    assert!(matches!(detect, PluginResult::Continue));
+    assert!(
+        ctx.metadata.contains_key("ai_response_guard_redacted"),
+        "accumulated-text detection should still fire"
+    );
+
+    let transformed = plugin
+        .transform_response_body(&body, Some("text/event-stream"), &sse_headers())
+        .await;
+    assert!(
+        transformed.is_none(),
+        "cross-frame PII cannot be redacted per-frame; expected zero-copy None"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_accumulated_text_order_is_deterministic() {
+    // Multiple choice indices arriving out of order must accumulate in a
+    // stable, index-sorted order so detection results don't flap between
+    // runs. We assert that a `max_completion_length` check on a high-index
+    // choice fires the same way regardless of frame arrival order.
+    let plugin = make_plugin(json!({
+        "max_completion_length": 5,
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    // Emit choice index=2 first, then index=0, then index=1. Each choice's
+    // content alone is short, but index=2's exceeds the limit.
+    let frames = [
+        json!({"choices": [{"index": 2, "delta": {"content": "longer content"}}]}),
+        json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]}),
+        json!({"choices": [{"index": 1, "delta": {"content": "ok"}}]}),
+    ];
+    let mut body = String::new();
+    for frame in &frames {
+        body.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::to_string(frame).unwrap()
+        ));
+    }
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "max_completion_length must be enforced regardless of frame order"
+    );
+}

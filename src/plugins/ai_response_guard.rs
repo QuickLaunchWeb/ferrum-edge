@@ -588,9 +588,11 @@ impl AiResponseGuard {
     /// - Anthropic: `content_block_delta` events with `delta.text` keyed by block `index`
     /// - Gemini: `candidates[].content.parts[].text` keyed by candidate position
     ///
-    /// Returns one accumulated `String` per choice/block index.
+    /// Returns one accumulated `String` per choice/block index, ordered by
+    /// index (BTreeMap keeps output deterministic across runs).
     fn extract_sse_completion_texts(&self, frames: &[Value]) -> Vec<String> {
-        let mut texts: HashMap<usize, String> = HashMap::new();
+        let mut texts: std::collections::BTreeMap<usize, String> =
+            std::collections::BTreeMap::new();
 
         for frame in frames {
             // OpenAI: choices[].delta.content
@@ -695,16 +697,37 @@ impl AiResponseGuard {
     /// Redact an SSE response body, modifying individual `data:` frames while
     /// preserving the overall SSE framing. Returns `None` when no frame was
     /// modified (zero-copy happy path).
+    ///
+    /// Rewritten `data:` lines preserve their original CR/LF terminator so
+    /// CRLF-encoded streams round-trip without mixing line endings. Frame JSON
+    /// is reserialized compactly by `serde_json::to_string`, which may alter
+    /// whitespace within a frame — clients consuming SSE byte-for-byte should
+    /// not depend on inner-frame formatting.
     fn redact_sse_body(&self, body: &[u8]) -> Option<Vec<u8>> {
         let body_str = std::str::from_utf8(body).ok()?;
+
+        // Fast-skip: a single DFA pass over the whole body tells us whether
+        // any pattern can match. Mirrors the JSON path so the common
+        // "redact mode but no PII in the stream" case stays zero-copy.
+        if !self.detection_set.is_match(body_str) {
+            return None;
+        }
+
         let lines: Vec<&str> = body_str.split('\n').collect();
         let mut output_lines: Vec<String> = Vec::with_capacity(lines.len());
         let mut modified = false;
 
         for line in &lines {
-            if let Some(data) = line
+            // Preserve the trailing CR (if any) so CRLF-encoded SSE streams
+            // round-trip losslessly when we rewrite a data line.
+            let (content, cr) = match line.strip_suffix('\r') {
+                Some(rest) => (rest, "\r"),
+                None => (*line, ""),
+            };
+
+            if let Some(data) = content
                 .strip_prefix("data: ")
-                .or_else(|| line.strip_prefix("data:"))
+                .or_else(|| content.strip_prefix("data:"))
             {
                 let trimmed = data.trim();
                 if !trimmed.is_empty()
@@ -720,7 +743,7 @@ impl AiResponseGuard {
                         if new_data != trimmed {
                             modified = true;
                         }
-                        output_lines.push(format!("data: {}", new_data));
+                        output_lines.push(format!("data: {}{}", new_data, cr));
                         continue;
                     }
                 }
@@ -729,10 +752,32 @@ impl AiResponseGuard {
         }
 
         if modified {
-            Some(output_lines.join("\n").into_bytes())
-        } else {
-            None
+            return Some(output_lines.join("\n").into_bytes());
         }
+
+        // Detection said something matched but per-frame redaction touched
+        // nothing. In structured-scan mode that almost always means a PII
+        // pattern straddles two SSE frames (e.g. half an SSN per chunk):
+        // accumulated detection in `on_response_body` will flag it, but
+        // single-frame redaction can't reach it. Surface this explicitly so
+        // operators know to switch to action="reject" when they need a hard
+        // guarantee. Scan-all mode walks the full JSON tree per frame, so a
+        // no-op there usually means the regex hit a STRUCTURAL_KEYS field
+        // (id/timestamp/etc.) — we don't warn for that.
+        if self.scan_mode != ScanMode::All {
+            let frames = parse_sse_data_frames(body);
+            let accumulated = self.extract_sse_completion_texts(&frames);
+            let refs: Vec<&str> = accumulated.iter().map(|s| s.as_str()).collect();
+            if !self.detect_matches(&refs).is_empty() {
+                warn!(
+                    "ai_response_guard: SSE response matched detection on accumulated content \
+                     but no individual frame could be redacted (pattern likely spans frames). \
+                     Use action=\"reject\" for guaranteed prevention."
+                );
+            }
+        }
+
+        None
     }
 }
 
