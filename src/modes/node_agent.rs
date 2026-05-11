@@ -171,8 +171,10 @@ async fn run_with_backend(
         config.node_name
     );
 
-    if !*shutdown_rx.borrow() {
-        loop {
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
@@ -232,7 +234,6 @@ async fn run_with_backend(
                 }
             }
         }
-    }
     }
 
     info!(
@@ -360,12 +361,13 @@ pub fn handle_pod_added(
         return;
     }
 
-    if pod_states.contains_key(pod_uid) {
-        debug!(pod_uid, pod_name, "Pod already enrolled, skipping");
+    let pod_ip = event.pod_ip_str.and_then(pod_watcher::parse_pod_ip);
+    if let Some(mut state) = pod_states.get_mut(pod_uid) {
+        reconcile_existing_pod_ip(backend, config, metrics, pod_uid, pod_ip, &mut state);
+        debug!(pod_uid, pod_name, "Pod already enrolled, reconciled state");
         return;
     }
 
-    let pod_ip = event.pod_ip_str.and_then(pod_watcher::parse_pod_ip);
     let cgroup_path = cgroup::resolve_pod_cgroup_path(&config.cgroup_root, pod_uid)
         .map(|p| p.to_string_lossy().to_string());
     let veth_iface = veth::discover_veth_for_pod(event.pod_pid);
@@ -441,6 +443,39 @@ pub fn handle_pod_added(
     if state.attached {
         pod_states.insert(pod_uid.to_string(), state);
     }
+}
+
+fn reconcile_existing_pod_ip(
+    backend: &mut dyn EbpfBackend,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    pod_uid: &str,
+    pod_ip: Option<std::net::Ipv4Addr>,
+    state: &mut PodAttachmentState,
+) {
+    let Some(new_ip) = pod_ip else {
+        return;
+    };
+    if state.pod_ip == Some(new_ip) {
+        return;
+    }
+
+    let info = PodInfo {
+        proxy_port: config.capture_config.outbound_port,
+        cgroup_id: 0,
+    };
+    if let Err(e) = backend.update_pod_ip(new_ip, &info) {
+        warn!(pod_uid, %new_ip, error = %e, "Failed to update pod IP map for existing pod");
+        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if let Some(old_ip) = state.pod_ip
+        && let Err(e) = backend.remove_pod_ip(old_ip)
+    {
+        warn!(pod_uid, %old_ip, error = %e, "Failed to remove stale pod IP from map");
+        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+    }
+    state.pod_ip = Some(new_ip);
 }
 
 #[allow(dead_code)]
@@ -904,6 +939,52 @@ mod tests {
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
 
         assert_eq!(pod_states.get("pod-uid-1").unwrap().pod_name, "existing");
+    }
+
+    #[test]
+    fn handle_pod_added_updates_existing_pod_ip() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "existing".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: None,
+                cgroup_path: None,
+                veth_iface: None,
+                attached: true,
+            },
+        );
+
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "existing",
+            namespace: "default",
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.8"),
+            pod_pid: None,
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 8);
+        assert_eq!(pod_states.get("pod-uid-1").unwrap().pod_ip, Some(ip));
+        assert!(backend.pod_ips.contains_key(&ip));
+        assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 0);
     }
 
     #[test]
