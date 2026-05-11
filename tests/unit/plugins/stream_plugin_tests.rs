@@ -408,6 +408,51 @@ async fn test_rate_limiting_stream_connect_consumer_mode_uses_consumer_identity(
 }
 
 #[tokio::test]
+async fn test_rate_limiting_stream_connect_spiffe_mode_uses_peer_metadata() {
+    let plugin = make_plugin(
+        "rate_limiting",
+        json!({"requests_per_second": 1, "limit_by": "spiffe_identity"}),
+    )
+    .unwrap();
+
+    let mut ctx1 = make_stream_ctx();
+    ctx1.client_ip = "10.0.0.1".to_string();
+    ctx1.insert_metadata(
+        "peer_spiffe_id".to_string(),
+        "spiffe://example.test/ns/app/sa/api".to_string(),
+    );
+    assert!(matches!(
+        plugin.on_stream_connect(&mut ctx1).await,
+        PluginResult::Continue
+    ));
+
+    let mut ctx2 = make_stream_ctx();
+    ctx2.client_ip = "10.0.0.2".to_string();
+    ctx2.insert_metadata(
+        "peer_spiffe_id".to_string(),
+        "spiffe://example.test/ns/app/sa/api".to_string(),
+    );
+    assert!(matches!(
+        plugin.on_stream_connect(&mut ctx2).await,
+        PluginResult::Reject {
+            status_code: 429,
+            ..
+        }
+    ));
+
+    let mut ctx3 = make_stream_ctx();
+    ctx3.client_ip = "10.0.0.3".to_string();
+    ctx3.insert_metadata(
+        "peer_spiffe_id".to_string(),
+        "spiffe://example.test/ns/app/sa/web".to_string(),
+    );
+    assert!(matches!(
+        plugin.on_stream_connect(&mut ctx3).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
 async fn test_correlation_id_stream_connect_assigns_id() {
     let plugin = make_plugin("correlation_id", json!({})).unwrap();
     let mut ctx = make_stream_ctx();

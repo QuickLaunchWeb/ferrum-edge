@@ -6503,8 +6503,10 @@ async fn handle_proxy_request_inner(
     // Some auth plugins (for example `hmac_auth`) verify request body integrity
     // at authenticate time. Buffer the body before the auth phase runs so those
     // plugins can read `ctx.request_body_bytes`.
-    let requires_body_before_authenticate = capabilities
-        .has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
+    // HBONE CONNECT must keep hyper's upgrade handle in the streaming request
+    // body. Pre-auth body buffering would consume it and make the relay fail.
+    let requires_body_before_authenticate = !is_hbone_connect
+        && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
         && plugins.iter().any(|plugin| {
             plugin.requires_request_body_before_authenticate()
                 && plugin.should_buffer_request_body(&ctx)
