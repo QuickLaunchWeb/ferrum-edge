@@ -68,17 +68,21 @@ impl TransactionLogSchema {
             let plugin_label = format!("transaction_log_schema[{name}]");
             let compiled = SummarySchema::compile(schema_value, &plugin_label)?;
 
-            // Register into the live staging area (no-op during validation;
-            // populates during a loader reload bracket).
-            registry::register_named(name, compiled.clone())?;
-
-            if schemas.insert(name.clone(), compiled).is_some() {
-                // serde_json::Map deduplicates keys before this point — this
-                // branch is unreachable but kept defensively.
+            // Stage the local map FIRST so a defensive duplicate check can
+            // short-circuit before the process-global registry is mutated.
+            // `serde_json::Map` deduplicates keys before this point so the
+            // branch is unreachable in practice, but ordering it this way
+            // keeps the registry consistent with the plugin instance even
+            // if the precondition ever changes.
+            if schemas.insert(name.clone(), compiled.clone()).is_some() {
                 return Err(format!(
                     "transaction_log_schema: duplicate schema name '{name}' within the same plugin config"
                 ));
             }
+
+            // Register into the live staging area (no-op during validation;
+            // populates during a loader reload bracket).
+            registry::register_named(name, compiled)?;
         }
 
         Ok(Self { schemas })

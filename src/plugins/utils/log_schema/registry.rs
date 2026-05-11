@@ -110,9 +110,27 @@ fn enter_bracket() {
 
 /// Decrement the bracket depth on the current thread, releasing the
 /// process-wide serializer if this is the outermost exit.
+///
+/// In debug builds, panics when called without a matching prior
+/// `enter_bracket` on the same thread. That state means either:
+///   1. `commit_reload` / `abort_reload` ran on a different thread than
+///      its `begin_reload` — the originating thread's mutex guard would
+///      leak forever, deadlocking every subsequent reload.
+///   2. `commit_reload` / `abort_reload` ran without a prior
+///      `begin_reload` — the staging area was never opened.
+///
+/// Both are programming errors; release builds tolerate them (the live
+/// map remains consistent — only future reloads on the originating
+/// thread would block, which surfaces as a visible deadlock rather
+/// than silent corruption).
 fn leave_bracket() {
     KEEPER.with(|k| {
         let mut k = k.borrow_mut();
+        debug_assert!(
+            k.depth > 0,
+            "log_schema::registry: leave_bracket called without a matching enter_bracket on this thread \
+             (likely begin_reload and commit_reload/abort_reload ran on different threads)"
+        );
         if k.depth > 0 {
             k.depth -= 1;
             if k.depth == 0 {

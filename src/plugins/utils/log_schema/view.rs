@@ -311,6 +311,12 @@ impl SchemaSerializable for TransactionSummary {
                     Ok(())
                 }
             }
+            // `TransactionSummary.metadata` has `serialize_with` but no
+            // `skip_serializing_if` — emitted unconditionally to match
+            // native serde output. Stream's `metadata` (below) carries
+            // `skip_serializing_if = "HashMap::is_empty"` and so guards
+            // empty maps explicitly. Keep both branches aligned with
+            // their native struct attributes.
             "metadata" => map.serialize_entry(out_key, &MetadataNested(&self.metadata)),
             // Unknown / stream-only sources are silently skipped — compile()
             // already validated names against the registry for the schema's
@@ -447,7 +453,12 @@ impl SchemaSerializable for StreamTransactionSummary {
                 None => Ok(()),
             },
             "metadata" => {
-                // Preserve the native "skip if empty" semantic.
+                // `StreamTransactionSummary.metadata` carries
+                // `skip_serializing_if = "HashMap::is_empty"` in its
+                // serde attribute; preserve that here so schema output
+                // matches native output for empty-metadata stream
+                // summaries. HTTP's branch (above) emits unconditionally
+                // because its native attribute has no skip guard.
                 if !self.metadata.is_empty() {
                     map.serialize_entry(out_key, &MetadataNested(&self.metadata))?;
                 }
