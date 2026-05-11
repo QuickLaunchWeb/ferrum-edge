@@ -21,7 +21,9 @@ pub const DEFAULT_EXCLUDED_NAMESPACES: &[&str] = &["kube-system", "kube-public",
 ///
 /// A pod is enrolled when:
 /// - Has `ferrum.io/mesh: enabled` label OR `ferrum.io/inject: true` annotation
-/// - Does NOT have `ferrum.io/injected: true` annotation (sidecar capture)
+/// - Does NOT have `ferrum.io/injected: "true"` annotation (sidecar capture).
+///   The value is checked explicitly so `ferrum.io/injected: "false"` does not
+///   skip an otherwise eligible pod.
 /// - Not in excluded namespaces
 pub fn evaluate_enrollment(
     labels: &std::collections::HashMap<String, String>,
@@ -43,7 +45,15 @@ pub fn evaluate_enrollment(
         return EnrollmentDecision::Skip;
     }
 
-    if annotations.get("ferrum.io/injected").is_some() {
+    // The injector stamps `ferrum.io/injected: true` on pods that already
+    // carry a sidecar; the node agent must not also enroll those for ambient
+    // capture. Match on value (`== "true"`) rather than presence so an
+    // operator-set `ferrum.io/injected: false` (e.g. on a non-injected pod
+    // that should still be ambient-enrolled) does not silently exclude it.
+    if annotations
+        .get("ferrum.io/injected")
+        .is_some_and(|v| v == "true")
+    {
         return EnrollmentDecision::Skip;
     }
 
@@ -120,6 +130,19 @@ mod tests {
         assert_eq!(
             evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
             EnrollmentDecision::Skip
+        );
+    }
+
+    #[test]
+    fn enroll_when_injected_annotation_is_false() {
+        // `ferrum.io/injected: false` is a legitimate value an operator might
+        // set; it must not silently exclude a pod that is otherwise eligible
+        // for ambient capture.
+        let labels = make_labels(&[("ferrum.io/mesh", "enabled")]);
+        let annotations = make_labels(&[("ferrum.io/injected", "false")]);
+        assert_eq!(
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+            EnrollmentDecision::Enroll
         );
     }
 

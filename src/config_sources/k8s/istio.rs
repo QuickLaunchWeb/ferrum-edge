@@ -16,11 +16,11 @@ use crate::modes::mesh::config::{
 
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions, RouteBackend,
-    RouteProxySpec, SourceKind, exact_path_listen_path, invalid_resource, optional_port_field,
-    port_from_u64, proxy_for_route, resource_id, selector_from_istio, string_array, string_field,
-    string_map, upstream_for_route,
+    RouteProxySpec, SourceKind, exact_path_listen_path, fault_injection_plugin_for_proxy,
+    invalid_resource, optional_port_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
+    resource_id, selector_from_istio, string_array, string_field, string_map, upstream_for_route,
 };
-use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT, RetryConfig};
+use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT, PluginConfig, RetryConfig};
 
 pub(super) fn translate(
     acc: &mut K8sAccumulator,
@@ -45,12 +45,15 @@ pub(super) fn translate(
             Ok(true)
         }
         "VirtualService" => {
-            let (proxies, upstreams) = virtual_service_routes(object, acc)?;
+            let (proxies, upstreams, plugins) = virtual_service_routes(object, acc)?;
             for upstream in upstreams {
                 acc.upsert_upstream(upstream);
             }
             for proxy in proxies {
                 acc.upsert_proxy(proxy, SourceKind::Istio);
+            }
+            for plugin in plugins {
+                acc.config.plugin_configs.push(plugin);
             }
             Ok(true)
         }
@@ -224,7 +227,16 @@ fn principal_matches(source: &Value) -> Vec<PrincipalMatch> {
 
 fn request_match(object: &K8sObject, operation: &Value) -> Result<RequestMatch, K8sTranslateError> {
     validate_supported_operation_fields(object, operation)?;
-    let (ports, port_patterns) = operation_ports(object, operation)?;
+    let (ports, port_patterns) = operation_ports(object, operation, "ports")?;
+    let (not_ports, not_port_patterns) = operation_ports(object, operation, "notPorts")?;
+    if !not_port_patterns.is_empty() {
+        return Err(invalid_resource(
+            object,
+            "rules[].to[].operation.notPorts wildcard patterns are unsupported \
+             (use literal numeric ports)"
+                .to_string(),
+        ));
+    }
 
     Ok(RequestMatch {
         methods: string_array(operation, "methods"),
@@ -233,6 +245,10 @@ fn request_match(object: &K8sObject, operation: &Value) -> Result<RequestMatch, 
         headers: HashMap::new(),
         ports,
         port_patterns,
+        not_methods: string_array(operation, "notMethods"),
+        not_paths: string_array(operation, "notPaths"),
+        not_hosts: string_array(operation, "notHosts"),
+        not_ports,
     })
 }
 
@@ -246,7 +262,8 @@ fn validate_supported_operation_fields(
         .flat_map(|fields| fields.keys())
     {
         match key.as_str() {
-            "methods" | "paths" | "hosts" | "ports" => {}
+            "methods" | "paths" | "hosts" | "ports" | "notMethods" | "notPaths" | "notHosts"
+            | "notPorts" => {}
             _ => {
                 return Err(invalid_resource(
                     object,
@@ -261,10 +278,11 @@ fn validate_supported_operation_fields(
 fn operation_ports(
     object: &K8sObject,
     operation: &Value,
+    field: &str,
 ) -> Result<(Vec<u16>, Vec<String>), K8sTranslateError> {
     let mut ports = Vec::new();
     let mut port_patterns = Vec::new();
-    for port in string_array(operation, "ports") {
+    for port in string_array(operation, field) {
         if is_istio_port_pattern(&port) {
             port_patterns.push(port);
             continue;
@@ -272,7 +290,7 @@ fn operation_ports(
         ports.push(port_from_string(
             object,
             &port,
-            "rules[].to[].operation.ports",
+            &format!("rules[].to[].operation.{field}"),
         )?);
     }
     Ok((ports, port_patterns))
@@ -298,6 +316,10 @@ fn request_match_is_unconstrained(request: &RequestMatch) -> bool {
         && request.headers.is_empty()
         && request.ports.is_empty()
         && request.port_patterns.is_empty()
+        && request.not_methods.is_empty()
+        && request.not_paths.is_empty()
+        && request.not_hosts.is_empty()
+        && request.not_ports.is_empty()
 }
 
 fn condition_match(value: &Value) -> Option<ConditionMatch> {
@@ -920,19 +942,20 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
     })
 }
 
+type VsRouteResult = (
+    Vec<crate::config::types::Proxy>,
+    Vec<crate::config::types::Upstream>,
+    Vec<PluginConfig>,
+);
+
 fn virtual_service_routes(
     object: &K8sObject,
     acc: &mut K8sAccumulator,
-) -> Result<
-    (
-        Vec<crate::config::types::Proxy>,
-        Vec<crate::config::types::Upstream>,
-    ),
-    K8sTranslateError,
-> {
+) -> Result<VsRouteResult, K8sTranslateError> {
     let hosts = string_array(&object.spec, "hosts");
     let mut proxies = Vec::new();
     let mut upstreams = Vec::new();
+    let mut plugins = Vec::new();
 
     for (index, http) in object
         .spec
@@ -982,13 +1005,26 @@ fn virtual_service_routes(
             } else {
                 format!("{index}-{match_index}")
             };
-            proxies.push(proxy_for_route(RouteProxySpec {
-                id: resource_id(
-                    "istio-vs",
+            let proxy_id = resource_id(
+                "istio-vs",
+                &object.metadata.namespace,
+                &object.metadata.name,
+                &suffix,
+            );
+
+            // Extract fault injection config and create a proxy-scoped plugin
+            if let Some(fault_value) = http.get("fault")
+                && let Some(plugin) = fault_injection_plugin_for_proxy(
+                    &proxy_id,
                     &object.metadata.namespace,
-                    &object.metadata.name,
-                    &suffix,
-                ),
+                    fault_value,
+                )
+            {
+                plugins.push(plugin);
+            }
+
+            proxies.push(proxy_for_route(RouteProxySpec {
+                id: proxy_id,
                 namespace: object.metadata.namespace.clone(),
                 hosts: hosts.clone(),
                 listen_path,
@@ -1004,7 +1040,7 @@ fn virtual_service_routes(
         }
     }
 
-    Ok((proxies, upstreams))
+    Ok((proxies, upstreams, plugins))
 }
 
 fn match_paths(http: &Value) -> Vec<Option<String>> {
@@ -1178,57 +1214,11 @@ fn retriable_status_codes(retries: &Value) -> impl Iterator<Item = u16> + '_ {
         .map(|code| code as u16)
 }
 
-/// Extract Istio VirtualService `http[].timeout` into milliseconds.
-///
-/// Istio timeout is a Go-duration string (e.g. `"5s"`, `"1.5s"`, `"500ms"`,
-/// `"1m"`). Returns `None` when no `timeout` field is present or when the
-/// value is not a recognized duration format.
 fn route_timeout_ms(http: &Value) -> Option<u64> {
     let raw = string_field(http, "timeout")?;
     parse_istio_duration_ms(raw)
 }
 
-/// Parse a simplified Go-duration string into milliseconds.
-///
-/// Supports:
-///   - `"<number>s"` and `"<float>s"` (seconds)
-///   - `"<number>ms"` (milliseconds)
-///   - `"<number>m"` (minutes)
-///   - `"<number>h"` (hours)
-fn parse_istio_duration_ms(raw: &str) -> Option<u64> {
-    let raw = raw.trim();
-    if let Some(ms) = raw.strip_suffix("ms") {
-        return duration_component_ms(ms, 1.0);
-    }
-    if let Some(seconds) = raw.strip_suffix('s') {
-        return duration_component_ms(seconds, 1000.0);
-    }
-    if let Some(minutes) = raw.strip_suffix('m') {
-        return duration_component_ms(minutes, 60_000.0);
-    }
-    if let Some(hours) = raw.strip_suffix('h') {
-        return duration_component_ms(hours, 3_600_000.0);
-    }
-    None
-}
-
-fn duration_component_ms(raw: &str, multiplier: f64) -> Option<u64> {
-    let value = raw.trim().parse::<f64>().ok()?;
-    if !value.is_finite() || value < 0.0 {
-        return None;
-    }
-    let millis = value * multiplier;
-    if !millis.is_finite() || millis > u64::MAX as f64 {
-        return None;
-    }
-    if millis > 0.0 && millis < 1.0 {
-        Some(1)
-    } else {
-        Some(millis as u64)
-    }
-}
-
-/// Parse Istio/Go-style duration strings into whole seconds.
 fn parse_istio_duration_secs(raw: &str) -> Option<u64> {
     parse_istio_duration_ms(raw).map(|ms| if ms == 0 { 0 } else { ms.div_ceil(1000) })
 }
@@ -1931,16 +1921,166 @@ mod tests {
                 serde_json::json!({
                     "action": "DENY",
                     "rules": [{
-                        "to": [{"operation": {"notPorts": ["8080"]}}]
+                        "to": [{"operation": {"someUnsupportedField": ["foo"]}}]
                     }]
                 }),
             )],
             options(),
         )
-        .expect_err("unsupported negative operation fields must fail closed");
+        .expect_err("unsupported operation fields must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("rules[].to[].operation.someUnsupportedField")
+        );
+        assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn translates_authorization_policy_negative_match_fields() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "selector": {"matchLabels": {"app": "api"}},
+            "rules": [{
+                "to": [{"operation": {
+                    "methods": ["GET"],
+                    "notMethods": ["POST", "DELETE"],
+                    "notPaths": ["/admin/*"],
+                    "notHosts": ["evil.example.com"],
+                    "notPorts": ["8080"]
+                }}]
+            }]
+        }));
+
+        assert_eq!(policy.rules.len(), 1);
+        let operation = &policy.rules[0].to[0];
+        assert_eq!(operation.methods, vec!["GET".to_string()]);
+        assert_eq!(
+            operation.not_methods,
+            vec!["POST".to_string(), "DELETE".to_string()]
+        );
+        assert_eq!(operation.not_paths, vec!["/admin/*".to_string()]);
+        // Host is normalised to ASCII-lowercase at config-load time.
+        assert_eq!(operation.not_hosts, vec!["evil.example.com".to_string()]);
+        assert_eq!(operation.not_ports, vec![8080]);
+    }
+
+    #[test]
+    fn negative_match_operation_alone_is_constrained() {
+        // An operation that has ONLY negative-match fields is still a
+        // constraint — the translator must not collapse it to "any".
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "selector": {"matchLabels": {"app": "api"}},
+            "rules": [{
+                "to": [{"operation": {"notMethods": ["POST"]}}]
+            }]
+        }));
+
+        assert_eq!(policy.rules.len(), 1);
+        assert_eq!(policy.rules[0].to.len(), 1);
+        assert_eq!(policy.rules[0].to[0].not_methods, vec!["POST".to_string()]);
+        assert!(policy.rules[0].to[0].methods.is_empty());
+    }
+
+    #[test]
+    fn rejects_authorization_policy_not_ports_wildcard_pattern() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [{"operation": {"notPorts": ["8*"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("wildcard notPorts patterns must fail closed");
+
+        assert!(err.to_string().contains("notPorts"));
+        assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn rejects_authorization_policy_not_ports_outside_kubernetes_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [{"operation": {"notPorts": ["70000"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid notPorts must fail closed");
 
         assert!(err.to_string().contains("rules[].to[].operation.notPorts"));
-        assert!(err.to_string().contains("unsupported"));
+        assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn authorization_policy_negative_match_round_trip_decision() {
+        // ALLOW with methods=[GET] AND notPaths=[/admin/*]:
+        // - GET /api allowed (positive method match, negative path mismatch)
+        // - GET /admin/users denied (positive method match BUT negative path matches → rule fails → implicit deny)
+        // - POST /api denied (positive method does not match → implicit deny)
+        let result = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "selector": {"matchLabels": {"app": "api"}},
+                    "rules": [{
+                        "to": [{"operation": {
+                            "methods": ["GET"],
+                            "notPaths": ["/admin/*"]
+                        }}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let slice = MeshSlice {
+            mesh_policies: mesh.mesh_policies,
+            ..MeshSlice::default()
+        };
+
+        let get_api = MeshAuthzRequest {
+            method: Some("GET".to_string()),
+            path: Some("/api/items".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+        let get_admin = MeshAuthzRequest {
+            method: Some("GET".to_string()),
+            path: Some("/admin/users".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+        let post_api = MeshAuthzRequest {
+            method: Some("POST".to_string()),
+            path: Some("/api/items".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &get_api),
+            MeshAuthzDecision::Allow
+        );
+        assert!(matches!(
+            evaluate_mesh_authorization(&slice, &get_admin),
+            MeshAuthzDecision::Deny { .. }
+        ));
+        assert!(matches!(
+            evaluate_mesh_authorization(&slice, &post_api),
+            MeshAuthzDecision::Deny { .. }
+        ));
     }
 
     #[test]
@@ -3493,7 +3633,108 @@ mod tests {
         );
     }
 
-    // -- VirtualService retry / timeout --------------------------------
+    // -- VirtualService fault injection / retry / timeout ----------------
+
+    #[test]
+    fn virtual_service_extracts_fault_injection_abort() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 503,
+                                "percentage": {"value": 50.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.plugin_configs.len(), 1);
+        let plugin = &result.config.plugin_configs[0];
+        assert_eq!(plugin.plugin_name, "fault_injection");
+        assert_eq!(
+            plugin.proxy_id.as_deref(),
+            Some(result.config.proxies[0].id.as_str())
+        );
+        let abort = plugin.config.get("abort").expect("abort config");
+        assert_eq!(abort["status_code"], 503);
+        assert_eq!(abort["percentage"], 50.0);
+    }
+
+    #[test]
+    fn virtual_service_extracts_fault_injection_delay() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "delay": {
+                                "fixedDelay": "5s",
+                                "percentage": {"value": 25.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.plugin_configs.len(), 1);
+        let plugin = &result.config.plugin_configs[0];
+        assert_eq!(plugin.plugin_name, "fault_injection");
+        let delay = plugin.config.get("delay").expect("delay config");
+        assert_eq!(delay["duration_ms"], 5000);
+        assert_eq!(delay["percentage"], 25.0);
+    }
+
+    #[test]
+    fn virtual_service_extracts_fault_injection_abort_and_delay() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 500,
+                                "percentage": {"value": 10.0}
+                            },
+                            "delay": {
+                                "fixedDelay": "2s",
+                                "percentage": {"value": 30.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = &result.config.plugin_configs[0];
+        assert!(plugin.config.get("abort").is_some());
+        assert!(plugin.config.get("delay").is_some());
+        assert_eq!(plugin.config["abort"]["status_code"], 500);
+        assert_eq!(plugin.config["delay"]["duration_ms"], 2000);
+    }
 
     #[test]
     fn virtual_service_maps_retries_to_proxy_retry_config() {
@@ -3641,6 +3882,86 @@ mod tests {
     }
 
     #[test]
+    fn virtual_service_retries_without_retry_on_defaults_to_connect_retry() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 3
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let retry = result.config.proxies[0].retry.as_ref().expect("retry");
+        assert_eq!(retry.max_retries, 3);
+        assert!(retry.retry_on_connect_failure);
+        assert!(retry.retryable_status_codes.is_empty());
+    }
+
+    #[test]
+    fn virtual_service_retries_refused_stream_sets_connect_retry() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 2,
+                            "retryOn": "refused-stream"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let retry = result.config.proxies[0].retry.as_ref().expect("retry");
+        assert!(retry.retry_on_connect_failure);
+        assert!(retry.retryable_status_codes.is_empty());
+    }
+
+    #[test]
+    fn virtual_service_retries_numeric_code_out_of_range_filtered() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 1,
+                            "retryOn": "503,9999,42,418"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let retry = result.config.proxies[0].retry.as_ref().expect("retry");
+        assert!(retry.retryable_status_codes.contains(&503));
+        assert!(retry.retryable_status_codes.contains(&418));
+        assert!(!retry.retryable_status_codes.contains(&9999));
+        assert!(!retry.retryable_status_codes.contains(&42));
+    }
+
+    #[test]
     fn virtual_service_maps_timeout_to_backend_read_timeout() {
         let result = translate_k8s_objects(
             &[object(
@@ -3704,6 +4025,27 @@ mod tests {
     }
 
     #[test]
+    fn virtual_service_timeout_extended_units() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "timeout": "2m"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies[0].backend_read_timeout_ms, 120_000);
+    }
+
+    #[test]
     fn virtual_service_timeout_and_retry_combined() {
         let result = translate_k8s_objects(
             &[object(
@@ -3760,7 +4102,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_service_no_retry_without_retries_block() {
+    fn virtual_service_no_fault_or_retry_or_timeout() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -3776,6 +4118,7 @@ mod tests {
         )
         .expect("translation succeeds");
 
+        assert!(result.config.plugin_configs.is_empty());
         assert!(result.config.proxies[0].retry.is_none());
         assert_eq!(result.config.proxies[0].backend_read_timeout_ms, 30_000);
     }
@@ -3811,45 +4154,316 @@ mod tests {
     }
 
     #[test]
-    fn parse_istio_duration_seconds() {
+    fn virtual_service_fault_delay_ms_format() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "delay": {
+                                "fixedDelay": "250ms",
+                                "percent": 100.0
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = &result.config.plugin_configs[0];
+        let delay = plugin.config.get("delay").expect("delay config");
+        assert_eq!(delay["duration_ms"], 250);
+        assert_eq!(delay["percentage"], 100.0);
+    }
+
+    #[test]
+    fn virtual_service_fault_abort_defaults_percentage_100() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 503
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = &result.config.plugin_configs[0];
+        let abort = plugin.config.get("abort").expect("abort config");
+        assert_eq!(abort["percentage"], 100.0);
+    }
+
+    #[test]
+    fn virtual_service_fault_abort_zero_percentage_skips_subfield() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 503,
+                                "percentage": {"value": 0.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.plugin_configs.is_empty());
+    }
+
+    #[test]
+    fn virtual_service_fault_zero_abort_keeps_valid_delay() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 503,
+                                "percentage": {"value": 0.0}
+                            },
+                            "delay": {
+                                "fixedDelay": "100ms",
+                                "percentage": {"value": 25.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.plugin_configs.len(), 1);
+        let plugin = &result.config.plugin_configs[0];
+        assert!(plugin.config.get("abort").is_none());
+        let delay = plugin.config.get("delay").expect("delay config");
+        assert_eq!(delay["duration_ms"], 100);
+        assert_eq!(delay["percentage"], 25.0);
+    }
+
+    #[test]
+    fn virtual_service_fault_ignores_invalid_generated_plugin_config() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/zero-delay"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "delay": {
+                                "fixedDelay": "0s",
+                                "percentage": {"value": 100.0}
+                            }
+                        }
+                    }, {
+                        "match": [{"uri": {"prefix": "/too-long-delay"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "delay": {
+                                "fixedDelay": "2h",
+                                "percentage": {"value": 100.0}
+                            }
+                        }
+                    }, {
+                        "match": [{"uri": {"prefix": "/zero-percent"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 503,
+                                "percentage": {"value": 0.0}
+                            }
+                        }
+                    }, {
+                        "match": [{"uri": {"prefix": "/bad-percent"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 503,
+                                "percent": 101.0
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 4);
+        assert!(result.config.plugin_configs.is_empty());
+    }
+
+    #[test]
+    fn virtual_service_fault_abort_grpc_status_string() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["grpc.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/"}}],
+                        "route": [{"destination": {"host": "svc.default.svc.cluster.local", "port": {"number": 50051}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 200,
+                                "grpcStatus": "UNAVAILABLE",
+                                "percentage": {"value": 30.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = &result.config.plugin_configs[0];
+        let abort = plugin.config.get("abort").expect("abort config");
+        assert_eq!(abort["grpc_status"], 14);
+        assert_eq!(abort["status_code"], 200);
+    }
+
+    #[test]
+    fn virtual_service_fault_abort_grpc_status_numeric() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["grpc.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/"}}],
+                        "route": [{"destination": {"host": "svc.default.svc.cluster.local", "port": {"number": 50051}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 200,
+                                "grpcStatus": 13,
+                                "percentage": {"value": 10.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = &result.config.plugin_configs[0];
+        let abort = plugin.config.get("abort").expect("abort config");
+        assert_eq!(abort["grpc_status"], 13);
+    }
+
+    #[test]
+    fn virtual_service_fault_abort_invalid_grpc_status_dropped() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["grpc.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/"}}],
+                        "route": [{"destination": {"host": "svc.default.svc.cluster.local", "port": {"number": 50051}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 503,
+                                "grpcStatus": "NOT_A_REAL_CODE",
+                                "percentage": {"value": 10.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = &result.config.plugin_configs[0];
+        let abort = plugin.config.get("abort").expect("abort config");
+        assert!(abort.get("grpc_status").is_none());
+        assert_eq!(abort["status_code"], 503);
+    }
+
+    #[test]
+    fn virtual_service_fault_plugin_scoped_to_proxy() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "abort": {
+                                "httpStatus": 503,
+                                "percentage": {"value": 10.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = &result.config.plugin_configs[0];
+        assert!(matches!(
+            plugin.scope,
+            crate::config::types::PluginScope::Proxy
+        ));
+        assert_eq!(
+            plugin.proxy_id.as_deref(),
+            Some(result.config.proxies[0].id.as_str())
+        );
+    }
+
+    #[test]
+    fn parse_istio_duration_ms_formats() {
         assert_eq!(parse_istio_duration_ms("5s"), Some(5000));
         assert_eq!(parse_istio_duration_ms("1.5s"), Some(1500));
-        assert_eq!(parse_istio_duration_ms("0.1s"), Some(100));
-    }
-
-    #[test]
-    fn parse_istio_duration_milliseconds() {
         assert_eq!(parse_istio_duration_ms("500ms"), Some(500));
-        assert_eq!(parse_istio_duration_ms("100ms"), Some(100));
-    }
-
-    #[test]
-    fn parse_istio_duration_minutes() {
-        assert_eq!(parse_istio_duration_ms("1m"), Some(60_000));
-        assert_eq!(parse_istio_duration_ms("2m"), Some(120_000));
-    }
-
-    #[test]
-    fn parse_istio_duration_hours() {
-        assert_eq!(parse_istio_duration_ms("1h"), Some(3_600_000));
-    }
-
-    #[test]
-    fn parse_istio_duration_invalid_returns_none() {
-        assert_eq!(parse_istio_duration_ms(""), None);
-        assert_eq!(parse_istio_duration_ms("5"), None);
-        assert_eq!(parse_istio_duration_ms("abc"), None);
-        assert_eq!(parse_istio_duration_ms("-1s"), None);
-        assert_eq!(parse_istio_duration_ms("NaNs"), None);
-        assert_eq!(parse_istio_duration_ms("infs"), None);
-    }
-
-    #[test]
-    fn parse_istio_duration_positive_sub_millisecond_clamps_to_one() {
-        assert_eq!(parse_istio_duration_ms("0.0001s"), Some(1));
-        assert_eq!(parse_istio_duration_ms("0.1ms"), Some(1));
-        assert_eq!(parse_istio_duration_ms("0.0005s"), Some(1));
         assert_eq!(parse_istio_duration_ms("0s"), Some(0));
+        assert_eq!(parse_istio_duration_ms("0ms"), Some(0));
+        assert_eq!(parse_istio_duration_ms("-1s"), None);
+        assert_eq!(parse_istio_duration_ms("-500ms"), None);
+        assert_eq!(parse_istio_duration_ms("NaN s"), None);
+        assert_eq!(parse_istio_duration_ms("10"), None);
+        assert_eq!(parse_istio_duration_ms("30m"), Some(1_800_000));
+        assert_eq!(parse_istio_duration_ms("2h"), Some(7_200_000));
+        assert_eq!(parse_istio_duration_ms("1.5h"), Some(5_400_000));
+        assert_eq!(parse_istio_duration_ms("5000us"), Some(5));
+        assert_eq!(parse_istio_duration_ms("100us"), Some(1));
+        assert_eq!(parse_istio_duration_ms("999ns"), Some(1));
     }
 
     #[test]
@@ -4012,7 +4626,6 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        // Anonymous request (no JWT) should be denied
         let anon = MeshAuthzRequest::default();
         assert_eq!(
             evaluate_mesh_authorization(&slice, &anon),
@@ -4021,7 +4634,6 @@ mod tests {
             }
         );
 
-        // Authenticated request should be allowed
         let authed = MeshAuthzRequest {
             request_principal: Some("https://auth.example.com/user".to_string()),
             ..MeshAuthzRequest::default()
