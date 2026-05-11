@@ -137,25 +137,23 @@ fn parse_cidr_to_lpm_key(cidr: &str) -> Result<aya::maps::lpm_trie::Key<CidrKey4
     Ok(aya::maps::lpm_trie::Key::new(data.prefix_len, data.addr))
 }
 
-use ferrum_ebpf_common::CidrKey4;
-
-pub fn parse_cidr_to_lpm_key_data(cidr: &str) -> Result<CidrKey4, String> {
-    let (addr_str, prefix_str) = cidr
-        .split_once('/')
-        .ok_or_else(|| format!("CIDR '{cidr}' missing prefix length"))?;
-    let addr: std::net::Ipv4Addr = addr_str
-        .parse()
-        .map_err(|e| format!("CIDR '{cidr}' invalid address: {e}"))?;
-    let prefix_len: u32 = prefix_str
-        .parse()
-        .map_err(|e| format!("CIDR '{cidr}' invalid prefix length: {e}"))?;
-
-    Ok(CidrKey4::new(u32::from(addr).to_be(), prefix_len))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use ferrum_ebpf_common::CidrKey4;
+
+    fn parse_cidr_to_lpm_key_data(cidr: &str) -> Result<CidrKey4, String> {
+        let (addr_str, prefix_str) = cidr
+            .split_once('/')
+            .ok_or_else(|| format!("CIDR '{cidr}' missing prefix length"))?;
+        let addr: std::net::Ipv4Addr = addr_str
+            .parse()
+            .map_err(|e| format!("CIDR '{cidr}' invalid address: {e}"))?;
+        let prefix_len: u32 = prefix_str
+            .parse()
+            .map_err(|e| format!("CIDR '{cidr}' invalid prefix length: {e}"))?;
+
+        Ok(CidrKey4::new(u32::from(addr).to_be(), prefix_len))
+    }
 
     #[test]
     fn parse_cidr_to_lpm_key_valid() {

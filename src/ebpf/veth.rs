@@ -52,6 +52,7 @@ fn read_pod_peer_ifindex(pid: u32) -> Option<u32> {
 /// Resolve a network interface name by its ifindex from sysfs.
 #[cfg(target_os = "linux")]
 fn resolve_iface_by_index(ifindex: u32) -> Option<String> {
+    use std::path::Path;
     let sysfs_net = Path::new("/sys/class/net");
     let entries = std::fs::read_dir(sysfs_net).ok()?;
     for entry in entries.flatten() {

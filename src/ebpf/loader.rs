@@ -42,7 +42,7 @@ const CGROUP_PROGRAMS: &[&str] = &[
 #[cfg(feature = "ebpf")]
 const TC_PROGRAM: &str = "ferrum_tc_inbound";
 
-/// Tracks per-pod attachment state for cleanup.
+/// Tracks per-pod attachment state for cleanup, keyed by pod_uid.
 #[cfg(feature = "ebpf")]
 struct PodLinks {
     cgroup_link_ids: Vec<aya::programs::CgroupSockAddrLinkId>,
@@ -54,6 +54,7 @@ struct PodLinks {
 pub struct AyaEbpfBackend {
     bpf: Option<Ebpf>,
     maps: Option<BpfMaps>,
+    /// Keyed by pod_uid so `detach_pod(pod_uid)` finds the right links.
     pod_links: HashMap<String, PodLinks>,
 }
 
@@ -117,7 +118,12 @@ impl EbpfBackend for AyaEbpfBackend {
         Ok(())
     }
 
-    fn attach_cgroup(&mut self, cgroup_path: &str, program: &str) -> Result<(), String> {
+    fn attach_cgroup(
+        &mut self,
+        pod_uid: &str,
+        cgroup_path: &str,
+        program: &str,
+    ) -> Result<(), String> {
         let cgroup_fd = File::open(cgroup_path)
             .map_err(|e| format!("Failed to open cgroup '{cgroup_path}': {e}"))?;
 
@@ -134,18 +140,18 @@ impl EbpfBackend for AyaEbpfBackend {
 
         let links = self
             .pod_links
-            .entry(cgroup_path.to_string())
+            .entry(pod_uid.to_string())
             .or_insert_with(|| PodLinks {
                 cgroup_link_ids: Vec::new(),
                 tc_link_ids: Vec::new(),
             });
         links.cgroup_link_ids.push(link_id);
 
-        debug!(program, cgroup_path, "BPF cgroup program attached");
+        debug!(program, cgroup_path, pod_uid, "BPF cgroup program attached");
         Ok(())
     }
 
-    fn attach_tc(&mut self, iface: &str, program: &str) -> Result<(), String> {
+    fn attach_tc(&mut self, pod_uid: &str, iface: &str, program: &str) -> Result<(), String> {
         let bpf = self.bpf_mut()?;
         let prog: &mut SchedClassifier = bpf
             .program_mut(program)
@@ -159,14 +165,14 @@ impl EbpfBackend for AyaEbpfBackend {
 
         let links = self
             .pod_links
-            .entry(iface.to_string())
+            .entry(pod_uid.to_string())
             .or_insert_with(|| PodLinks {
                 cgroup_link_ids: Vec::new(),
                 tc_link_ids: Vec::new(),
             });
         links.tc_link_ids.push(link_id);
 
-        debug!(program, iface, "BPF tc program attached");
+        debug!(program, iface, pod_uid, "BPF tc program attached");
         Ok(())
     }
 

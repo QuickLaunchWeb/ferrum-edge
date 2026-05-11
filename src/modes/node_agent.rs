@@ -235,7 +235,7 @@ pub fn handle_pod_added(
         ];
         let mut attach_ok = true;
         for prog in &programs {
-            if let Err(e) = backend.attach_cgroup(cgroup, prog) {
+            if let Err(e) = backend.attach_cgroup(pod_uid, cgroup, prog) {
                 warn!(pod_uid, program = prog, error = %e, "Failed to attach cgroup program");
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                 attach_ok = false;
@@ -244,7 +244,7 @@ pub fn handle_pod_added(
         }
         if attach_ok {
             if let Some(ref iface) = veth_iface
-                && let Err(e) = backend.attach_tc(iface, "ferrum_tc_inbound")
+                && let Err(e) = backend.attach_tc(pod_uid, iface, "ferrum_tc_inbound")
             {
                 warn!(pod_uid, iface, error = %e, "Failed to attach tc program");
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
@@ -272,6 +272,7 @@ pub fn handle_pod_added(
             pod_name, "Could not resolve cgroup path, skipping attachment"
         );
         metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+        return;
     }
 
     pod_states.insert(pod_uid.to_string(), state);
@@ -327,7 +328,7 @@ async fn handle_fallback(
             shutdown_rx.changed().await.ok();
 
             info!("Shutdown signal received, cleaning up iptables rules");
-            let cleanup = IptablesPlan::cleanup_commands(&config.capture_config);
+            let cleanup = IptablesPlan::cleanup_commands();
             execute_iptables_commands(&cleanup, "cleanup").await;
 
             Ok(())
@@ -551,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_pod_added_enrolls_matching_pod() {
+    fn handle_pod_added_skips_when_cgroup_not_found() {
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
@@ -577,7 +578,48 @@ mod tests {
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
 
-        assert!(pod_states.contains_key("pod-uid-1"));
+        assert!(!pod_states.contains_key("pod-uid-1"));
+        assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_pod_added_enrolls_with_real_cgroup() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+
+        let temp_dir = std::env::temp_dir().join("ferrum_test_cgroup_enroll");
+        let pod_cgroup = temp_dir.join("kubepods/podtest-uid-1");
+        std::fs::create_dir_all(&pod_cgroup).unwrap();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: temp_dir.to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid: "test-uid-1",
+            pod_name: "test-pod",
+            namespace: "default",
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert!(pod_states.contains_key("test-uid-1"));
+        let state = pod_states.get("test-uid-1").unwrap();
+        assert!(state.attached);
+        assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 1);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
     }
 
     #[test]

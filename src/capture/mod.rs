@@ -6,6 +6,8 @@
 
 use std::net::IpAddr;
 
+use crate::config::conf_file::resolve_ferrum_var;
+
 pub const DEFAULT_PROXY_UID: u32 = 1337;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,25 +56,27 @@ impl CaptureConfig {
 
     pub fn from_env() -> Result<Self, String> {
         let mode = CaptureMode::parse(
-            &std::env::var("FERRUM_MESH_CAPTURE_MODE").unwrap_or_else(|_| "explicit".to_string()),
+            &resolve_ferrum_var("FERRUM_MESH_CAPTURE_MODE")
+                .unwrap_or_else(|| "explicit".to_string()),
         )?;
-        let proxy_uid = std::env::var("FERRUM_MESH_PROXY_UID")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .or(Some(DEFAULT_PROXY_UID));
+        let proxy_uid = match resolve_ferrum_var("FERRUM_MESH_PROXY_UID") {
+            Some(raw) => Some(parse_proxy_uid(&raw)?),
+            None => Some(DEFAULT_PROXY_UID),
+        };
         let include_cidrs = parse_cidr_env(
-            &std::env::var("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS")
-                .unwrap_or_else(|_| "0.0.0.0/0".to_string()),
+            &resolve_ferrum_var("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS")
+                .unwrap_or_else(|| "0.0.0.0/0".to_string()),
         );
         validate_cidr_list(&include_cidrs)?;
-        let exclude_cidrs =
-            parse_cidr_env(&std::env::var("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS").unwrap_or_default());
+        let exclude_cidrs = parse_cidr_env(
+            &resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS").unwrap_or_default(),
+        );
         if !exclude_cidrs.is_empty() {
             validate_cidr_list(&exclude_cidrs)?;
         }
         let exclude_ports = parse_port_list(
-            &std::env::var("FERRUM_MESH_CAPTURE_EXCLUDE_PORTS")
-                .unwrap_or_else(|_| "15001,15006,15008,15020".to_string()),
+            &resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_PORTS")
+                .unwrap_or_else(|| "15001,15006,15008,15020".to_string()),
         )?;
         Ok(Self {
             mode,
@@ -92,6 +96,16 @@ fn parse_cidr_env(raw: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
+}
+
+fn parse_proxy_uid(raw: &str) -> Result<u32, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_PROXY_UID);
+    }
+    trimmed
+        .parse::<u32>()
+        .map_err(|_| format!("Invalid FERRUM_MESH_PROXY_UID '{raw}'. Expected unsigned integer"))
 }
 
 fn parse_port_list(raw: &str) -> Result<Vec<u16>, String> {
@@ -177,11 +191,7 @@ impl IptablesPlan {
     /// Each command uses `2>/dev/null || true` so partial cleanup (e.g.
     /// chains already removed by a previous run) does not fail the overall
     /// teardown.
-    pub fn cleanup_commands(config: &CaptureConfig) -> Vec<String> {
-        // Silence the config parameter — the cleanup sequence is the same
-        // regardless of config contents (flush covers all per-config rules).
-        let _ = config;
-
+    pub fn cleanup_commands() -> Vec<String> {
         vec![
             // Step 1: remove jump rules from built-in chains
             idempotent_delete("nat", "OUTPUT", "-p tcp -j FERRUM_MESH_OUTBOUND"),
@@ -340,13 +350,7 @@ mod tests {
 
     #[test]
     fn cleanup_commands_reverses_setup() {
-        let mut config = CaptureConfig::explicit(15006, 15001);
-        config.mode = CaptureMode::Iptables;
-        config.proxy_uid = Some(DEFAULT_PROXY_UID);
-        config.exclude_cidrs.push("10.0.0.0/8".to_string());
-        config.exclude_ports.push(15020);
-
-        let cleanup = IptablesPlan::cleanup_commands(&config);
+        let cleanup = IptablesPlan::cleanup_commands();
 
         // Must remove jumps from built-in chains first
         assert!(cleanup.iter().any(|cmd| cmd.contains("-D OUTPUT")));
@@ -423,8 +427,7 @@ mod tests {
 
     #[test]
     fn cleanup_commands_all_tolerate_missing_chains() {
-        let config = CaptureConfig::explicit(15006, 15001);
-        let cleanup = IptablesPlan::cleanup_commands(&config);
+        let cleanup = IptablesPlan::cleanup_commands();
 
         // Every cleanup command must have "|| true" so partial cleanup doesn't
         // fail the overall teardown
@@ -443,7 +446,7 @@ mod tests {
         config.proxy_uid = Some(DEFAULT_PROXY_UID);
 
         let setup = IptablesPlan::for_config(&config);
-        let cleanup = IptablesPlan::cleanup_commands(&config);
+        let cleanup = IptablesPlan::cleanup_commands();
 
         // Every custom chain created in setup must be deleted in cleanup
         let setup_chains: Vec<&str> = setup

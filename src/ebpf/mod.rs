@@ -65,8 +65,13 @@ impl FallbackMode {
 /// `MockEbpfBackend` provides an in-memory substitute for Phase 1 and tests.
 pub trait EbpfBackend: Send + Sync {
     fn load_programs(&mut self) -> Result<(), String>;
-    fn attach_cgroup(&mut self, cgroup_path: &str, program: &str) -> Result<(), String>;
-    fn attach_tc(&mut self, iface: &str, program: &str) -> Result<(), String>;
+    fn attach_cgroup(
+        &mut self,
+        pod_uid: &str,
+        cgroup_path: &str,
+        program: &str,
+    ) -> Result<(), String>;
+    fn attach_tc(&mut self, pod_uid: &str, iface: &str, program: &str) -> Result<(), String>;
     fn detach_pod(&mut self, pod_uid: &str) -> Result<(), String>;
     fn update_pod_ip(&mut self, ip: Ipv4Addr, info: &PodInfo) -> Result<(), String>;
     fn remove_pod_ip(&mut self, ip: Ipv4Addr) -> Result<(), String>;
@@ -98,13 +103,18 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
-    fn attach_cgroup(&mut self, cgroup_path: &str, program: &str) -> Result<(), String> {
+    fn attach_cgroup(
+        &mut self,
+        _pod_uid: &str,
+        cgroup_path: &str,
+        program: &str,
+    ) -> Result<(), String> {
         self.cgroup_attachments
             .push((cgroup_path.to_string(), program.to_string()));
         Ok(())
     }
 
-    fn attach_tc(&mut self, iface: &str, program: &str) -> Result<(), String> {
+    fn attach_tc(&mut self, _pod_uid: &str, iface: &str, program: &str) -> Result<(), String> {
         self.tc_attachments
             .push((iface.to_string(), program.to_string()));
         Ok(())
@@ -183,9 +193,15 @@ mod tests {
         assert!(backend.programs_loaded);
 
         backend
-            .attach_cgroup("/sys/fs/cgroup/kubepods/pod-abc", "ferrum_connect4")
+            .attach_cgroup(
+                "pod-abc",
+                "/sys/fs/cgroup/kubepods/pod-abc",
+                "ferrum_connect4",
+            )
             .unwrap();
-        backend.attach_tc("eth0", "ferrum_tc_inbound").unwrap();
+        backend
+            .attach_tc("pod-abc", "eth0", "ferrum_tc_inbound")
+            .unwrap();
 
         assert_eq!(backend.cgroup_attachments.len(), 1);
         assert_eq!(backend.tc_attachments.len(), 1);
@@ -211,7 +227,11 @@ mod tests {
     fn mock_backend_cleanup() {
         let mut backend = MockEbpfBackend::default();
         backend
-            .attach_cgroup("/sys/fs/cgroup/kubepods/pod-abc", "ferrum_connect4")
+            .attach_cgroup(
+                "pod-abc",
+                "/sys/fs/cgroup/kubepods/pod-abc",
+                "ferrum_connect4",
+            )
             .unwrap();
         backend
             .update_pod_ip(
