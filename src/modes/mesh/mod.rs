@@ -3439,6 +3439,10 @@ mod tests {
         upstream.backend_tls_client_cert_path = Some("/pre/client.pem".to_string());
         upstream.backend_tls_client_key_path = Some("/pre/client.key".to_string());
         upstream.backend_tls_server_ca_cert_path = Some("/pre/ca.pem".to_string());
+        // Pre-set verify=true and confirm DISABLE without insecure_skip_verify
+        // leaves it at its current value (the comment on
+        // `apply_traffic_policy_tls_to_upstream` documents this invariant).
+        upstream.backend_tls_verify_server_cert = true;
 
         let policy = MeshTrafficPolicy {
             tls: Some(MeshTrafficPolicyTls {
@@ -3452,6 +3456,33 @@ mod tests {
         assert!(upstream.backend_tls_client_cert_path.is_none());
         assert!(upstream.backend_tls_client_key_path.is_none());
         assert!(upstream.backend_tls_server_ca_cert_path.is_none());
+        assert!(
+            upstream.backend_tls_verify_server_cert,
+            "DISABLE without insecure_skip_verify must preserve the existing \
+             backend_tls_verify_server_cert value (was true before apply)"
+        );
+    }
+
+    #[test]
+    fn dr_tls_disable_with_insecure_skip_verify_flips_verify_false() {
+        // Even on DISABLE the explicit `insecureSkipVerify=true` must force
+        // backend_tls_verify_server_cert=false — `insecure_skip_verify` has
+        // operator-intent precedence over the mode-derived defaults.
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        upstream.backend_tls_verify_server_cert = true;
+
+        let policy = MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::Disable,
+                insecure_skip_verify: true,
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        };
+        apply_traffic_policy_to_upstream(&mut upstream, &policy);
+
+        assert!(!upstream.backend_tls_verify_server_cert);
     }
 
     #[test]

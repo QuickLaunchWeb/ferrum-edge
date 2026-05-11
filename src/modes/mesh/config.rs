@@ -761,7 +761,13 @@ pub struct MeshTrafficPolicy {
 /// cert/key, SAN verification list, and an `insecureSkipVerify` escape
 /// hatch. The cold-path apply at `apply_traffic_policy_to_upstream`
 /// projects these onto the `Upstream` `backend_tls_*` fields when set.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default::default()` returns a `Simple`-mode block (matches Istio's
+/// `ClientTLSSettings.mode` default and avoids the `MtlsMode::Permissive`
+/// server-side default that the derived `Default` would otherwise produce —
+/// a `MeshTrafficPolicyTls` with a server-side mode is treated as a
+/// programming error by the cold-path apply).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshTrafficPolicyTls {
     /// DR client-side TLS mode: `Disable` / `Simple` / `Mutual` / `IstioMutual`.
     pub mode: MtlsMode,
@@ -802,6 +808,26 @@ pub struct MeshTrafficPolicyTls {
 
 fn default_insecure_skip_verify() -> bool {
     false
+}
+
+impl Default for MeshTrafficPolicyTls {
+    fn default() -> Self {
+        // Use a client-side default (`Simple`) instead of the derived
+        // `MtlsMode::default() == Permissive` so that `..Default::default()`
+        // in callers / tests always produces a value that the cold-path
+        // apply treats as a valid DR.tls mode. `Simple` also matches Istio's
+        // own `ClientTLSSettings.mode` default when the block is present but
+        // `mode` is omitted.
+        Self {
+            mode: MtlsMode::Simple,
+            sni: None,
+            ca_certificates: None,
+            client_certificate: None,
+            private_key: None,
+            subject_alt_names: Vec::new(),
+            insecure_skip_verify: default_insecure_skip_verify(),
+        }
+    }
 }
 
 /// Outlier detection settings from Istio DestinationRule.

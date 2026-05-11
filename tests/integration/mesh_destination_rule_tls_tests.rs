@@ -13,7 +13,7 @@ use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
-use ferrum_edge::modes::mesh::config::{MeshTrafficPolicyTls, MtlsMode};
+use ferrum_edge::modes::mesh::config::{MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode};
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 
 fn slice_request_for_default_ns() -> MeshSliceRequest {
@@ -255,6 +255,79 @@ fn dr_tls_subset_traffic_policy_carries_tls_block() {
         "subset-level tls must produce a translator warning: {:?}",
         result.warnings
     );
+}
+
+#[test]
+fn mesh_traffic_policy_with_tls_none_omits_tls_key_from_json() {
+    // Wire-compatibility invariant: a `MeshTrafficPolicy { tls: None, .. }`
+    // serializes WITHOUT a `tls` key so old DPs reading new-format slices
+    // see this as a no-op and round-trip stays loss-less. Same is true for
+    // every other `Option<...>` field on the struct.
+    let policy = MeshTrafficPolicy {
+        connect_timeout_ms: Some(1000),
+        outlier_detection: None,
+        load_balancer: None,
+        tls: None,
+    };
+
+    let json = serde_json::to_value(&policy).expect("serialize");
+    let object = json.as_object().expect("object");
+    assert!(
+        !object.contains_key("tls"),
+        "tls=None must NOT appear in serialized JSON (wire compatibility): {json}"
+    );
+    // Sanity: the explicitly-set field is present.
+    assert_eq!(
+        object.get("connect_timeout_ms"),
+        Some(&serde_json::json!(1000))
+    );
+}
+
+#[test]
+fn mesh_traffic_policy_tls_optional_sub_fields_skip_when_none() {
+    // Sub-field wire-compatibility: every `Option<String>` / `Vec<String>`
+    // field skips when empty. Only the mandatory `mode` (and any
+    // explicitly-set extras) appears in the JSON.
+    let tls = MeshTrafficPolicyTls {
+        mode: MtlsMode::Simple,
+        ..MeshTrafficPolicyTls::default()
+    };
+
+    let json = serde_json::to_value(&tls).expect("serialize");
+    let object = json.as_object().expect("object");
+    assert!(object.contains_key("mode"));
+    assert!(!object.contains_key("sni"));
+    assert!(!object.contains_key("ca_certificates"));
+    assert!(!object.contains_key("client_certificate"));
+    assert!(!object.contains_key("private_key"));
+    assert!(!object.contains_key("subject_alt_names"));
+    // `insecure_skip_verify` is a primitive bool; it does serialize when
+    // false today (no `skip_serializing_if`). Verify the value, not the
+    // presence, so the contract here is explicit.
+    assert_eq!(
+        object.get("insecure_skip_verify"),
+        Some(&serde_json::json!(false))
+    );
+}
+
+#[test]
+fn mesh_traffic_policy_tls_round_trips_through_serde() {
+    // Round-trip a populated TLS block to verify the JSON wire format is
+    // deserializable back to an equivalent struct (catches any rename /
+    // skip-serializing-if drift between fields).
+    let original = MeshTrafficPolicyTls {
+        mode: MtlsMode::Mutual,
+        sni: Some("reviews.example.com".to_string()),
+        ca_certificates: Some("/etc/certs/ca.pem".to_string()),
+        client_certificate: Some("/etc/certs/client.pem".to_string()),
+        private_key: Some("/etc/certs/client.key".to_string()),
+        subject_alt_names: vec!["spiffe://example/sa/reviews".to_string()],
+        insecure_skip_verify: true,
+    };
+
+    let json = serde_json::to_string(&original).expect("serialize");
+    let parsed: MeshTrafficPolicyTls = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(parsed, original);
 }
 
 #[test]
