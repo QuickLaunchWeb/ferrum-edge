@@ -1,0 +1,462 @@
+//! Ferrum mesh service discovery.
+//!
+//! Resolves CP-delivered [`MeshService`](crate::modes::mesh::config::MeshService)
+//! resources into gateway upstream targets. This lets a north-south gateway use
+//! the same service names the east-west mesh already understands while keeping
+//! the request hot path on the existing load-balancer snapshot.
+
+use crate::config::types::UpstreamTarget;
+use crate::modes::mesh::config::{AppProtocol, MeshService, Workload};
+use crate::request_epoch::RequestEpochStore;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tracing::debug;
+
+/// Service discovery provider backed by the current `GatewayConfig.mesh`
+/// snapshot delivered to gateway data planes by the control plane.
+pub struct MeshServiceDiscoverer {
+    request_epoch: Arc<RequestEpochStore>,
+    service_name: String,
+    namespace: String,
+    port: Option<u16>,
+    default_weight: u32,
+}
+
+impl MeshServiceDiscoverer {
+    pub fn new(
+        request_epoch: Arc<RequestEpochStore>,
+        service_name: String,
+        namespace: String,
+        port: Option<u16>,
+        default_weight: u32,
+    ) -> Self {
+        Self {
+            request_epoch,
+            service_name,
+            namespace,
+            port,
+            default_weight,
+        }
+    }
+
+    fn selected_service_port(&self, service: &MeshService) -> Option<SelectedPort> {
+        if let Some(requested) = self.port {
+            return if service.ports.is_empty() {
+                Some(SelectedPort {
+                    port: requested,
+                    name: None,
+                    protocol: AppProtocol::Unknown,
+                })
+            } else {
+                service
+                    .ports
+                    .iter()
+                    .find(|port| port.port == requested)
+                    .map(|port| SelectedPort {
+                        port: port.port,
+                        name: port.name.clone(),
+                        protocol: port.protocol,
+                    })
+            };
+        }
+
+        service.ports.first().map(|port| SelectedPort {
+            port: port.port,
+            name: port.name.clone(),
+            protocol: port.protocol,
+        })
+    }
+
+    fn workload_matches_service(service: &MeshService, workload: &Workload) -> bool {
+        if workload.namespace != service.namespace {
+            return false;
+        }
+
+        if service.workloads.is_empty() {
+            return workload.service_name == service.name;
+        }
+
+        service
+            .workloads
+            .iter()
+            .any(|reference| reference.spiffe_id == workload.spiffe_id)
+    }
+
+    fn target_port_for_workload(
+        selected_service_port: Option<&SelectedPort>,
+        workload: &Workload,
+    ) -> Option<SelectedPort> {
+        if let Some(selected) = selected_service_port {
+            if workload.ports.is_empty() {
+                return Some(selected.clone());
+            }
+
+            if let Some(workload_port) = workload
+                .ports
+                .iter()
+                .find(|port| port.port == selected.port)
+            {
+                if selected.protocol == AppProtocol::Unknown && selected.name.is_none() {
+                    return Some(SelectedPort {
+                        port: workload_port.port,
+                        name: workload_port.name.clone(),
+                        protocol: workload_port.protocol,
+                    });
+                }
+                return Some(selected.clone());
+            }
+            return None;
+        }
+
+        workload.ports.first().map(|port| SelectedPort {
+            port: port.port,
+            name: port.name.clone(),
+            protocol: port.protocol,
+        })
+    }
+
+    fn tags_for_target(
+        service: &MeshService,
+        workload: &Workload,
+        selected_port: &SelectedPort,
+    ) -> HashMap<String, String> {
+        let mut tags = HashMap::new();
+        tags.insert("mesh.hbone".to_string(), "true".to_string());
+        tags.insert("mesh.namespace".to_string(), workload.namespace.clone());
+        tags.insert("mesh.service".to_string(), service.name.clone());
+        tags.insert(
+            "mesh.spiffe_id".to_string(),
+            workload.spiffe_id.as_str().to_string(),
+        );
+        tags.insert(
+            "mesh.trust_domain".to_string(),
+            workload.trust_domain.as_str().to_string(),
+        );
+        tags.insert(
+            "mesh.protocol".to_string(),
+            protocol_tag(selected_port.protocol).to_string(),
+        );
+        if let Some(port_name) = &selected_port.name {
+            tags.insert("mesh.port_name".to_string(), port_name.clone());
+        }
+        if let Some(network) = &workload.network {
+            tags.insert("mesh.network".to_string(), network.clone());
+        }
+        if let Some(cluster) = &workload.cluster {
+            tags.insert("mesh.cluster".to_string(), cluster.clone());
+        }
+        tags
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ServiceDiscoverer for MeshServiceDiscoverer {
+    async fn discover(&self) -> Result<Vec<UpstreamTarget>, anyhow::Error> {
+        let epoch = self.request_epoch.load();
+        let Some(mesh) = epoch.config.mesh.as_deref() else {
+            return Ok(Vec::new());
+        };
+
+        let Some(service) = mesh.services.iter().find(|service| {
+            service.name == self.service_name && service.namespace == self.namespace
+        }) else {
+            return Ok(Vec::new());
+        };
+
+        let selected_service_port = self.selected_service_port(service);
+        if self.port.is_some() && selected_service_port.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let mut targets = Vec::new();
+        let mut seen = HashSet::new();
+        for workload in mesh
+            .workloads
+            .iter()
+            .filter(|workload| Self::workload_matches_service(service, workload))
+        {
+            let Some(selected_port) =
+                Self::target_port_for_workload(selected_service_port.as_ref(), workload)
+            else {
+                continue;
+            };
+
+            for address in &workload.addresses {
+                if address.is_empty() {
+                    continue;
+                }
+                let key = (
+                    address.as_str(),
+                    selected_port.port,
+                    workload.spiffe_id.as_str(),
+                );
+                if !seen.insert(key) {
+                    continue;
+                }
+
+                targets.push(UpstreamTarget {
+                    host: address.clone(),
+                    port: selected_port.port,
+                    weight: self.default_weight,
+                    tags: Self::tags_for_target(service, workload, &selected_port),
+                    path: None,
+                });
+            }
+        }
+
+        debug!(
+            "Mesh discovery: found {} targets for {}/{}",
+            targets.len(),
+            self.namespace,
+            self.service_name,
+        );
+        Ok(targets)
+    }
+
+    fn provider_name(&self) -> &str {
+        "mesh"
+    }
+}
+
+#[derive(Clone)]
+struct SelectedPort {
+    port: u16,
+    name: Option<String>,
+    protocol: AppProtocol,
+}
+
+fn protocol_tag(protocol: AppProtocol) -> &'static str {
+    match protocol {
+        AppProtocol::Http => "http",
+        AppProtocol::Http2 => "http2",
+        AppProtocol::Grpc => "grpc",
+        AppProtocol::Tcp => "tcp",
+        AppProtocol::Tls => "tls",
+        AppProtocol::Mongo => "mongo",
+        AppProtocol::Redis => "redis",
+        AppProtocol::Mysql => "mysql",
+        AppProtocol::Postgres => "postgres",
+        AppProtocol::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::types::{GatewayConfig, default_namespace};
+    use crate::consumer_index::ConsumerIndex;
+    use crate::identity::spiffe::{SpiffeId, TrustDomain};
+    use crate::load_balancer::LoadBalancerCache;
+    use crate::modes::mesh::config::{
+        MeshConfig, ServicePort, WorkloadPort, WorkloadRef, WorkloadSelector,
+    };
+    use crate::plugin_cache::PluginCache;
+    use crate::request_epoch::RequestEpochStore;
+    use crate::service_discovery::ServiceDiscoverer;
+
+    fn spiffe(raw: &str) -> SpiffeId {
+        SpiffeId::new(raw.to_string()).expect("test SPIFFE ID")
+    }
+
+    fn workload(id: &str, service_name: &str, addresses: Vec<&str>, ports: Vec<u16>) -> Workload {
+        Workload {
+            spiffe_id: spiffe(id),
+            selector: WorkloadSelector::default(),
+            service_name: service_name.to_string(),
+            addresses: addresses.into_iter().map(str::to_string).collect(),
+            ports: ports
+                .into_iter()
+                .map(|port| WorkloadPort {
+                    port,
+                    protocol: AppProtocol::Http,
+                    name: Some("http".to_string()),
+                })
+                .collect(),
+            trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+            namespace: default_namespace(),
+            network: None,
+            cluster: None,
+        }
+    }
+
+    fn service(name: &str, refs: Vec<&str>, ports: Vec<u16>) -> MeshService {
+        MeshService {
+            name: name.to_string(),
+            namespace: default_namespace(),
+            ports: ports
+                .into_iter()
+                .map(|port| ServicePort {
+                    port,
+                    protocol: AppProtocol::Http,
+                    name: Some("http".to_string()),
+                })
+                .collect(),
+            workloads: refs
+                .into_iter()
+                .map(|id| WorkloadRef {
+                    spiffe_id: spiffe(id),
+                })
+                .collect(),
+            protocol_overrides: HashMap::new(),
+        }
+    }
+
+    fn epoch_store(mesh: Option<MeshConfig>) -> Arc<RequestEpochStore> {
+        let config = GatewayConfig {
+            version: "1".to_string(),
+            mesh: mesh.map(Box::new),
+            ..GatewayConfig::default()
+        };
+        let plugin_cache = PluginCache::new(&config).expect("plugin cache");
+        let consumer_index = ConsumerIndex::new(&config.consumers);
+        let load_balancer_cache = LoadBalancerCache::new(&config);
+        Arc::new(RequestEpochStore::from_runtime_parts(
+            config,
+            &plugin_cache,
+            &consumer_index,
+            &load_balancer_cache,
+        ))
+    }
+
+    #[tokio::test]
+    async fn discovers_mesh_service_workload_targets() {
+        let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+        let mesh = MeshConfig {
+            services: vec![service("api", vec![api_id], vec![8080])],
+            workloads: vec![
+                workload(api_id, "api", vec!["10.0.0.1", "10.0.0.2"], vec![8080]),
+                workload(
+                    "spiffe://cluster.local/ns/ferrum/sa/other",
+                    "other",
+                    vec!["10.0.0.3"],
+                    vec![8080],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            None,
+            7,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].host, "10.0.0.1");
+        assert_eq!(targets[0].port, 8080);
+        assert_eq!(targets[0].weight, 7);
+        assert_eq!(
+            targets[0].tags.get("mesh.spiffe_id").map(String::as_str),
+            Some(api_id)
+        );
+        assert_eq!(
+            targets[0].tags.get("mesh.hbone").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            targets[0].tags.get("mesh.namespace").map(String::as_str),
+            Some("ferrum")
+        );
+    }
+
+    #[tokio::test]
+    async fn service_without_workload_refs_matches_service_name() {
+        let mesh = MeshConfig {
+            services: vec![service("api", Vec::new(), vec![8080])],
+            workloads: vec![workload(
+                "spiffe://cluster.local/ns/ferrum/sa/api",
+                "api",
+                vec!["10.0.0.1"],
+                vec![8080],
+            )],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            None,
+            1,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].host, "10.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn requested_port_filters_service_and_workload_ports() {
+        let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+        let mut svc = service("api", vec![api_id], vec![8080, 9090]);
+        svc.ports[1].name = Some("metrics".to_string());
+        let mesh = MeshConfig {
+            services: vec![svc],
+            workloads: vec![workload(api_id, "api", vec!["10.0.0.1"], vec![8080, 9090])],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            Some(9090),
+            1,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].port, 9090);
+        assert_eq!(
+            targets[0].tags.get("mesh.port_name").map(String::as_str),
+            Some("metrics")
+        );
+    }
+
+    #[tokio::test]
+    async fn requested_port_uses_workload_port_metadata_when_service_ports_are_absent() {
+        let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+        let mesh = MeshConfig {
+            services: vec![service("api", vec![api_id], Vec::new())],
+            workloads: vec![workload(api_id, "api", vec!["10.0.0.1"], vec![8080])],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            Some(8080),
+            1,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].tags.get("mesh.protocol").map(String::as_str),
+            Some("http")
+        );
+        assert_eq!(
+            targets[0].tags.get("mesh.port_name").map(String::as_str),
+            Some("http")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_mesh_config_returns_empty_targets() {
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(None),
+            "api".to_string(),
+            default_namespace(),
+            None,
+            1,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+
+        assert!(targets.is_empty());
+    }
+}

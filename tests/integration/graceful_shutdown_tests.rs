@@ -122,6 +122,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        trust_bundles: None,
         mesh: None,
     };
     ProxyState::new(config, dns_cache, create_test_env_config(), None, None)
@@ -516,6 +517,7 @@ fn create_test_proxy_state_with_env(
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        trust_bundles: None,
         mesh: None,
     };
     ProxyState::new(config, dns_cache, env_config, None, None)

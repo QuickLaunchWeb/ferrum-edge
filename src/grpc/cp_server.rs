@@ -357,10 +357,20 @@ impl CpGrpcServer {
 
     /// Broadcast a full config snapshot to all connected DPs.
     pub fn broadcast_update(tx: &broadcast::Sender<ConfigUpdate>, config: &GatewayConfig) {
-        let config_json = match serde_json::to_string(config) {
+        let config_json = match Self::config_json_for_dp(config) {
             Ok(json) => json,
             Err(e) => {
                 error!("Failed to serialize config for broadcast: {}", e);
+                return;
+            }
+        };
+        let trust_bundles_json = match Self::trust_bundles_json(config.trust_bundles.as_deref()) {
+            Ok(json) => json,
+            Err(e) => {
+                error!(
+                    "Failed to serialize gateway trust bundles for broadcast; skipping update: {}",
+                    e
+                );
                 return;
             }
         };
@@ -370,6 +380,7 @@ impl CpGrpcServer {
             version: config.loaded_at.to_rfc3339(),
             timestamp: chrono::Utc::now().timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
+            trust_bundles_json,
         };
         let _ = tx.send(update);
     }
@@ -380,8 +391,9 @@ impl CpGrpcServer {
         result: &crate::config::db_loader::IncrementalResult,
         version: &str,
         registry: &DpNodeRegistry,
+        trust_bundles: Option<&crate::modes::mesh::config::TrustBundleSet>,
     ) {
-        Self::broadcast_delta(tx, result, version);
+        Self::broadcast_delta_with_trust_bundles(tx, result, version, trust_bundles);
         registry.touch_all();
     }
 
@@ -389,10 +401,40 @@ impl CpGrpcServer {
     ///
     /// Sends only the resources that changed (added/modified/removed) instead
     /// of the full config. DPs apply the delta via `ProxyState::apply_incremental`.
+    #[allow(dead_code)] // Used by integration tests and external callers without trust-bundle side-channel needs.
     pub fn broadcast_delta(
         tx: &broadcast::Sender<ConfigUpdate>,
         result: &crate::config::db_loader::IncrementalResult,
         version: &str,
+    ) {
+        Self::broadcast_delta_with_trust_bundles_json(tx, result, version, String::new());
+    }
+
+    /// Broadcast an incremental delta with optional gateway trust bundles.
+    pub fn broadcast_delta_with_trust_bundles(
+        tx: &broadcast::Sender<ConfigUpdate>,
+        result: &crate::config::db_loader::IncrementalResult,
+        version: &str,
+        trust_bundles: Option<&crate::modes::mesh::config::TrustBundleSet>,
+    ) {
+        let trust_bundles_json = match Self::trust_bundles_json(trust_bundles) {
+            Ok(json) => json,
+            Err(e) => {
+                error!(
+                    "Failed to serialize gateway trust bundles for delta broadcast; skipping update: {}",
+                    e
+                );
+                return;
+            }
+        };
+        Self::broadcast_delta_with_trust_bundles_json(tx, result, version, trust_bundles_json);
+    }
+
+    fn broadcast_delta_with_trust_bundles_json(
+        tx: &broadcast::Sender<ConfigUpdate>,
+        result: &crate::config::db_loader::IncrementalResult,
+        version: &str,
+        trust_bundles_json: String,
     ) {
         let config_json = match serde_json::to_string(result) {
             Ok(json) => json,
@@ -407,8 +449,46 @@ impl CpGrpcServer {
             version: version.to_string(),
             timestamp: chrono::Utc::now().timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
+            trust_bundles_json,
         };
         let _ = tx.send(update);
+    }
+
+    fn trust_bundles_json(
+        trust_bundles: Option<&crate::modes::mesh::config::TrustBundleSet>,
+    ) -> Result<String, serde_json::Error> {
+        match trust_bundles {
+            Some(trust_bundles) => {
+                let validation_errors = crate::modes::mesh::config::validate_mesh_config(
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    Some(trust_bundles),
+                );
+                if !validation_errors.is_empty() {
+                    error!(
+                        "Clearing invalid gateway trust bundles from CP broadcast: {}",
+                        validation_errors.join("; ")
+                    );
+                    return Ok("null".to_string());
+                }
+
+                serde_json::to_string(trust_bundles)
+            }
+            None => Ok("null".to_string()),
+        }
+    }
+
+    fn config_json_for_dp(config: &GatewayConfig) -> Result<String, serde_json::Error> {
+        let mut snapshot = config.clone();
+        // Trust bundles travel exclusively through `ConfigUpdate.trust_bundles_json`.
+        // Keeping them out of the regular GatewayConfig JSON preserves compatibility
+        // with older DPs whose `GatewayConfig` deserializer denies unknown fields.
+        snapshot.trust_bundles = None;
+        serde_json::to_string(&snapshot)
     }
 }
 
@@ -457,16 +537,25 @@ impl ConfigSync for CpGrpcServer {
 
         // Send initial full config
         let config = self.config.load_full();
-        let config_json = serde_json::to_string(config.as_ref()).map_err(|e| {
+        let config_json = Self::config_json_for_dp(config.as_ref()).map_err(|e| {
             error!("Failed to serialize config in subscribe: {}", e);
             Status::internal("Failed to serialize configuration")
         })?;
+        let trust_bundles_json = Self::trust_bundles_json(config.trust_bundles.as_deref())
+            .map_err(|e| {
+                error!(
+                    "Failed to serialize gateway trust bundles in subscribe: {}",
+                    e
+                );
+                Status::internal("Failed to serialize gateway trust bundles")
+            })?;
         let initial = ConfigUpdate {
             update_type: 0, // FULL_SNAPSHOT
             config_json,
             version: config.loaded_at.to_rfc3339(),
             timestamp: chrono::Utc::now().timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
+            trust_bundles_json,
         };
 
         let config_for_recovery = self.config.clone();
@@ -479,14 +568,29 @@ impl ConfigSync for CpGrpcServer {
                 );
                 // Send a full config snapshot so the DP recovers from missed deltas.
                 let current = config_for_recovery.load_full();
-                match serde_json::to_string(current.as_ref()) {
-                    Ok(config_json) => Some(Ok(ConfigUpdate {
-                        update_type: 0, // FULL_SNAPSHOT
-                        config_json,
-                        version: current.loaded_at.to_rfc3339(),
-                        timestamp: chrono::Utc::now().timestamp(),
-                        ferrum_version: FERRUM_VERSION.to_string(),
-                    })),
+                match Self::config_json_for_dp(current.as_ref()) {
+                    Ok(config_json) => {
+                        let trust_bundles_json = match Self::trust_bundles_json(
+                            current.trust_bundles.as_deref(),
+                        ) {
+                            Ok(json) => json,
+                            Err(e) => {
+                                error!(
+                                    "Failed to serialize gateway trust bundles for recovery snapshot: {}",
+                                    e
+                                );
+                                return None;
+                            }
+                        };
+                        Some(Ok(ConfigUpdate {
+                            update_type: 0, // FULL_SNAPSHOT
+                            config_json,
+                            version: current.loaded_at.to_rfc3339(),
+                            timestamp: chrono::Utc::now().timestamp(),
+                            ferrum_version: FERRUM_VERSION.to_string(),
+                            trust_bundles_json,
+                        }))
+                    }
                     Err(e) => {
                         error!("Failed to serialize recovery snapshot: {}", e);
                         None
@@ -528,15 +632,24 @@ impl ConfigSync for CpGrpcServer {
         );
 
         let config = self.config.load_full();
-        let config_json = serde_json::to_string(config.as_ref()).map_err(|e| {
+        let config_json = Self::config_json_for_dp(config.as_ref()).map_err(|e| {
             error!("Failed to serialize config in get_full_config: {}", e);
             Status::internal("Failed to serialize configuration")
         })?;
+        let trust_bundles_json = Self::trust_bundles_json(config.trust_bundles.as_deref())
+            .map_err(|e| {
+                error!(
+                    "Failed to serialize gateway trust bundles in get_full_config: {}",
+                    e
+                );
+                Status::internal("Failed to serialize gateway trust bundles")
+            })?;
 
         Ok(Response::new(FullConfigResponse {
             config_json,
             version: config.loaded_at.to_rfc3339(),
             ferrum_version: FERRUM_VERSION.to_string(),
+            trust_bundles_json,
         }))
     }
 }
@@ -546,6 +659,32 @@ impl ConfigSync for CpGrpcServer {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+
+    fn test_trust_bundles() -> crate::modes::mesh::config::TrustBundleSet {
+        crate::modes::mesh::config::TrustBundleSet {
+            local: crate::modes::mesh::config::TrustBundle {
+                trust_domain: crate::identity::TrustDomain::new("cluster.local")
+                    .expect("test trust domain should be valid"),
+                x509_authorities: vec!["AQIDBA==".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: Vec::new(),
+        }
+    }
+
+    fn invalid_test_trust_bundles() -> crate::modes::mesh::config::TrustBundleSet {
+        crate::modes::mesh::config::TrustBundleSet {
+            local: crate::modes::mesh::config::TrustBundle {
+                trust_domain: crate::identity::TrustDomain::new("cluster.local")
+                    .expect("test trust domain should be valid"),
+                x509_authorities: Vec::new(),
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: Vec::new(),
+        }
+    }
 
     fn registry_info(node_id: &str, version: &str, connected_at: DateTime<Utc>) -> DpNodeInfo {
         DpNodeInfo {
@@ -570,6 +709,66 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].version, "new-version");
         assert_eq!(snapshot[0].connected_at, second_connected_at);
+    }
+
+    #[test]
+    fn config_json_for_dp_strips_gateway_trust_bundles() {
+        let mut config = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            loaded_at: Utc::now(),
+            trust_bundles: Some(Box::new(test_trust_bundles())),
+            ..Default::default()
+        };
+        config.known_namespaces.push("ferrum".to_string());
+
+        let json = CpGrpcServer::config_json_for_dp(&config).expect("DP config should serialize");
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("DP config JSON should parse");
+        assert!(value.get("trust_bundles").is_none());
+
+        let parsed: GatewayConfig =
+            serde_json::from_str(&json).expect("stripped DP config should deserialize");
+        assert!(parsed.trust_bundles.is_none());
+        assert_eq!(parsed.known_namespaces, vec!["ferrum"]);
+    }
+
+    #[test]
+    fn broadcast_update_sends_trust_bundles_only_in_side_channel() {
+        let config = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            loaded_at: Utc::now(),
+            trust_bundles: Some(Box::new(test_trust_bundles())),
+            ..Default::default()
+        };
+        let (tx, mut rx) = broadcast::channel(1);
+
+        CpGrpcServer::broadcast_update(&tx, &config);
+        let update = rx.try_recv().expect("broadcast should deliver update");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&update.config_json).expect("config JSON should parse");
+        assert!(value.get("trust_bundles").is_none());
+        assert_ne!(update.trust_bundles_json, "null");
+        assert!(update.trust_bundles_json.contains("cluster.local"));
+    }
+
+    #[test]
+    fn broadcast_update_clears_invalid_trust_bundle_side_channel() {
+        let config = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            loaded_at: Utc::now(),
+            trust_bundles: Some(Box::new(invalid_test_trust_bundles())),
+            ..Default::default()
+        };
+        let (tx, mut rx) = broadcast::channel(1);
+
+        CpGrpcServer::broadcast_update(&tx, &config);
+        let update = rx.try_recv().expect("broadcast should deliver update");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&update.config_json).expect("config JSON should parse");
+        assert!(value.get("trust_bundles").is_none());
+        assert_eq!(update.trust_bundles_json, "null");
     }
 
     #[test]
