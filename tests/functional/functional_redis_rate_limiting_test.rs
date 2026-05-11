@@ -293,6 +293,13 @@ async fn start_ai_backend(
     total_tokens: u64,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    start_ai_backend_on(listener, total_tokens).await
+}
+
+async fn start_ai_backend_on(
+    listener: tokio::net::TcpListener,
+    total_tokens: u64,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
     let handle = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -727,8 +734,7 @@ async fn test_ai_rate_limiter_redis_shared_across_instances() {
 
     let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
-    let _backend = start_ai_backend(backend_port, 500).await.unwrap();
+    let _backend = start_ai_backend_on(backend_listener, 500).await.unwrap();
 
     let unique_prefix = format!("ferrum:test:ai:shared:{}", Uuid::new_v4().simple());
     let config = |prefix: &str| {

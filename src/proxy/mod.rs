@@ -79,6 +79,7 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
+use crate::identity::{SharedSvidBundle, TrustBundleSet as RuntimeTrustBundleSet};
 use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
@@ -1176,6 +1177,17 @@ pub struct ProxyState {
     /// mesh-internal identity claims (e.g. `source.principal`) from leaking
     /// to non-mesh upstream services.
     pub mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
+    /// Optional gateway SPIFFE identity used by gateway-to-mesh outbound TLS.
+    /// The slot shape matches mesh SVID rotation so later trust-bundle updates
+    /// can hot-swap without blocking proxy readers.
+    #[allow(dead_code)] // Consumed by gateway-to-mesh HBONE dispatch in the next bridge phase.
+    pub gateway_svid_bundle: SharedSvidBundle,
+    /// Startup SVID bundle loaded from files. CP-delivered trust bundles are an
+    /// override; when a CP snapshot removes them, this restores file trust.
+    pub gateway_file_svid_bundle: SharedSvidBundle,
+    /// Latest CP-delivered gateway trust bundles, stored even when this DP has
+    /// no local SVID so later bridge phases can verify mesh peers from CP state.
+    pub gateway_trust_bundles: SharedGatewayTrustBundles,
 }
 
 #[inline]
@@ -1202,7 +1214,88 @@ fn via_header_for_backend_response_body<'a>(
     }
 }
 
+fn empty_svid_bundle_slot() -> SharedSvidBundle {
+    Arc::new(ArcSwap::new(Arc::new(None)))
+}
+
+fn clone_svid_bundle_slot(slot: &SharedSvidBundle) -> SharedSvidBundle {
+    Arc::new(ArcSwap::new(slot.load_full()))
+}
+
+pub type SharedGatewayTrustBundles = Arc<ArcSwap<Option<RuntimeTrustBundleSet>>>;
+
+fn empty_gateway_trust_bundle_slot() -> SharedGatewayTrustBundles {
+    Arc::new(ArcSwap::new(Arc::new(None)))
+}
+
+fn load_gateway_svid_bundle(env_config: &EnvConfig) -> Result<SharedSvidBundle, anyhow::Error> {
+    let configured = (
+        env_config.gateway_svid_cert_path.as_deref(),
+        env_config.gateway_svid_key_path.as_deref(),
+        env_config.gateway_svid_trust_bundle_path.as_deref(),
+    );
+    let (cert_path, key_path, trust_bundle_path) = match configured {
+        (None, None, None) => return Ok(empty_svid_bundle_slot()),
+        (Some(cert_path), Some(key_path), Some(trust_bundle_path)) => {
+            (cert_path, key_path, trust_bundle_path)
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "gateway SVID configuration requires FERRUM_GATEWAY_SVID_CERT_PATH, \
+             FERRUM_GATEWAY_SVID_KEY_PATH, and FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH together"
+            ));
+        }
+    };
+
+    let cert_path = std::path::Path::new(cert_path);
+    let key_path = std::path::Path::new(key_path);
+    let trust_bundle_path = std::path::Path::new(trust_bundle_path);
+    let bundle = crate::identity::file_loader::load_svid_bundle_from_files(
+        cert_path,
+        key_path,
+        trust_bundle_path,
+        env_config.gateway_spiffe_id.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to load gateway SVID bundle: {e}"))?;
+
+    info!(
+        spiffe_id = %bundle.spiffe_id,
+        trust_domain = %bundle.trust_domain(),
+        trust_anchors = bundle.trust_bundles.local.x509_authorities.len(),
+        "Loaded gateway SPIFFE SVID bundle"
+    );
+    Ok(Arc::new(ArcSwap::new(Arc::new(Some(bundle)))))
+}
+
 impl ProxyState {
+    /// Install CP-delivered trust bundles for gateway-to-mesh TLS.
+    ///
+    /// If the gateway already has a file-loaded SVID, rebuild the SVID bundle
+    /// with the new trust material so TLS builders see the update through the
+    /// same lock-free slot. If there is no SVID, keep the bundles separately
+    /// for future gateway-mesh features.
+    pub fn update_gateway_trust_bundles(&self, trust_bundles: RuntimeTrustBundleSet) {
+        self.gateway_trust_bundles
+            .store(Arc::new(Some(trust_bundles.clone())));
+
+        // SAFETY: the load-modify-store below is valid because CP-delivered
+        // gateway trust changes are applied only by the single DP gRPC apply
+        // loop. If another writer is added, convert this to a compare/swap or
+        // a dedicated synchronized update to avoid losing concurrent SVID edits.
+        let current = self.gateway_svid_bundle.load_full();
+        if let Some(mut bundle) = current.as_ref().clone() {
+            bundle.trust_bundles = trust_bundles;
+            self.gateway_svid_bundle.store(Arc::new(Some(bundle)));
+        }
+    }
+
+    /// Clear CP-delivered trust bundles and restore the startup file SVID.
+    pub fn clear_gateway_trust_bundles(&self) {
+        self.gateway_trust_bundles.store(Arc::new(None));
+        self.gateway_svid_bundle
+            .store(self.gateway_file_svid_bundle.load_full());
+    }
+
     /// Construct the gateway state and start the health checker.
     ///
     /// `health_check_shutdown_rx` is forwarded to
@@ -1292,6 +1385,9 @@ impl ProxyState {
             crls.clone(),
         ));
         let env_config_arc = Arc::new(env_config.clone());
+        let gateway_svid_bundle = load_gateway_svid_bundle(&env_config_arc)?;
+        let gateway_file_svid_bundle = clone_svid_bundle_slot(&gateway_svid_bundle);
+        let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
         let h3_pool = Arc::new(Http3ConnectionPool::new(
             env_config_arc.clone(),
             dns_cache.clone(),
@@ -1606,6 +1702,9 @@ impl ProxyState {
             overload,
             adaptive_buffer,
             mesh_egress_strip_baggage_keys,
+            gateway_svid_bundle,
+            gateway_file_svid_bundle,
+            gateway_trust_bundles,
         };
         Ok((state, health_check_handles))
     }
@@ -13142,8 +13241,72 @@ mod tests {
             upstreams: vec![],
             loaded_at: chrono::Utc::now(),
             known_namespaces: Vec::new(),
+            trust_bundles: None,
             mesh: None,
         }
+    }
+
+    fn test_runtime_trust_bundles(
+        trust_domain: &str,
+        x509_authorities: Vec<Vec<u8>>,
+    ) -> RuntimeTrustBundleSet {
+        let trust_domain = crate::identity::TrustDomain::new(trust_domain)
+            .expect("test trust domain should be valid");
+        RuntimeTrustBundleSet {
+            local: crate::identity::TrustBundle {
+                trust_domain,
+                x509_authorities,
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: HashMap::new(),
+        }
+    }
+
+    fn test_svid_bundle(trust_bundles: RuntimeTrustBundleSet) -> crate::identity::SvidBundle {
+        let spiffe_id = crate::identity::SpiffeId::new("spiffe://file.local/ns/default/sa/gateway")
+            .expect("test SPIFFE ID should be valid");
+        crate::identity::SvidBundle {
+            spiffe_id,
+            cert_chain_der: vec![vec![42]],
+            private_key_pkcs8_der: Vec::new(),
+            trust_bundles,
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_gateway_trust_bundles_restores_startup_svid_trust() {
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let file_trust = test_runtime_trust_bundles("file.local", vec![vec![1, 2, 3]]);
+        let cp_trust = test_runtime_trust_bundles("cp.local", vec![vec![4, 5, 6]]);
+        let file_svid = test_svid_bundle(file_trust);
+
+        state
+            .gateway_file_svid_bundle
+            .store(Arc::new(Some(file_svid.clone())));
+        state.gateway_svid_bundle.store(Arc::new(Some(file_svid)));
+
+        state.update_gateway_trust_bundles(cp_trust);
+        {
+            let loaded = state.gateway_svid_bundle.load_full();
+            let svid = loaded.as_ref().as_ref().expect("SVID should be present");
+            assert_eq!(svid.trust_bundles.local.trust_domain.as_str(), "cp.local");
+            assert_eq!(
+                svid.trust_bundles.local.x509_authorities,
+                vec![vec![4, 5, 6]]
+            );
+        }
+
+        state.clear_gateway_trust_bundles();
+
+        assert!(state.gateway_trust_bundles.load().is_none());
+        let loaded = state.gateway_svid_bundle.load_full();
+        let svid = loaded.as_ref().as_ref().expect("SVID should be restored");
+        assert_eq!(svid.trust_bundles.local.trust_domain.as_str(), "file.local");
+        assert_eq!(
+            svid.trust_bundles.local.x509_authorities,
+            vec![vec![1, 2, 3]]
+        );
     }
 
     #[tokio::test]

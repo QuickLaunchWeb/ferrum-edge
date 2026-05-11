@@ -437,6 +437,8 @@ pub(super) async fn handle_hbone_request(
                         .saturating_add(result.bytes_backend_to_client),
                 );
                 if let Some((direction, class, side, message)) = result.first_failure {
+                    crate::plugins::prometheus_metrics::global_registry()
+                        .record_hbone_relay_failure(&relay_proxy_id, direction, class);
                     warn!(
                         proxy_id = %relay_proxy_id,
                         direction = ?direction,
