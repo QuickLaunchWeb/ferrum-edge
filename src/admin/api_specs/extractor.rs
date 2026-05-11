@@ -2627,4 +2627,640 @@ x-ferrum-proxy:
             "alias bomb must be rejected before YAML parsing, got {err:?}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Spec without x-ferrum-consumers passes (positive control)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_spec_without_consumers_extension_passes() {
+        let spec = minimal_json_spec(minimal_proxy());
+        let result = extract(spec.as_bytes(), Some(SpecFormat::Json), "test");
+        assert!(
+            result.is_ok(),
+            "spec without x-ferrum-consumers must pass; got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Plugin with matching proxy_id accepted
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_plugin_with_matching_proxy_id_accepted() {
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "1"}},
+                "x-ferrum-proxy": {},
+                "x-ferrum-plugins": [{{
+                    "id": "matching-plugin",
+                    "plugin_name": "cors",
+                    "scope": "proxy",
+                    "proxy_id": "my-proxy",
+                    "config": {{}}
+                }}]
+            }}"#,
+            minimal_proxy()
+        );
+        let (bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "test")
+            .expect("plugin with matching proxy_id must be accepted");
+        assert_eq!(bundle.plugins.len(), 1);
+        assert_eq!(bundle.plugins[0].proxy_id.as_deref(), Some("my-proxy"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Credential key detection — all FORBIDDEN_CONFIG_KEYS
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reject_plugin_config_with_keyauth_key() {
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "1"}},
+                "x-ferrum-proxy": {},
+                "x-ferrum-plugins": [{{
+                    "id": "keyauth-plugin",
+                    "plugin_name": "custom",
+                    "scope": "proxy",
+                    "config": {{
+                        "keyauth": {{"key": "abc123"}}
+                    }}
+                }}]
+            }}"#,
+            minimal_proxy()
+        );
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ExtractError::PluginContainsCredentials { plugin_id, key }
+                if plugin_id == "keyauth-plugin" && key == "keyauth"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reject_plugin_config_with_basicauth_key() {
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "1"}},
+                "x-ferrum-proxy": {},
+                "x-ferrum-plugins": [{{
+                    "id": "basicauth-plugin",
+                    "plugin_name": "custom",
+                    "scope": "proxy",
+                    "config": {{
+                        "basicauth": {{"username": "admin", "password": "pass"}}
+                    }}
+                }}]
+            }}"#,
+            minimal_proxy()
+        );
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ExtractError::PluginContainsCredentials { plugin_id, key }
+                if plugin_id == "basicauth-plugin" && key == "basicauth"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reject_plugin_config_with_hmac_key() {
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "1"}},
+                "x-ferrum-proxy": {},
+                "x-ferrum-plugins": [{{
+                    "id": "hmac-plugin",
+                    "plugin_name": "custom",
+                    "scope": "proxy",
+                    "config": {{
+                        "hmac": {{"secret": "s3cret"}}
+                    }}
+                }}]
+            }}"#,
+            minimal_proxy()
+        );
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ExtractError::PluginContainsCredentials { plugin_id, key }
+                if plugin_id == "hmac-plugin" && key == "hmac"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reject_plugin_config_with_mtls_key() {
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "1"}},
+                "x-ferrum-proxy": {},
+                "x-ferrum-plugins": [{{
+                    "id": "mtls-plugin",
+                    "plugin_name": "custom",
+                    "scope": "proxy",
+                    "config": {{
+                        "mtls": {{"cert_path": "/path/to/cert"}}
+                    }}
+                }}]
+            }}"#,
+            minimal_proxy()
+        );
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ExtractError::PluginContainsCredentials { plugin_id, key }
+                if plugin_id == "mtls-plugin" && key == "mtls"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reject_plugin_config_with_consumer_key() {
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "1"}},
+                "x-ferrum-proxy": {},
+                "x-ferrum-plugins": [{{
+                    "id": "consumer-plugin",
+                    "plugin_name": "custom",
+                    "scope": "proxy",
+                    "config": {{
+                        "consumer": {{"id": "alice"}}
+                    }}
+                }}]
+            }}"#,
+            minimal_proxy()
+        );
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ExtractError::PluginContainsCredentials { plugin_id, key }
+                if plugin_id == "consumer-plugin" && key == "consumer"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reject_plugin_config_with_consumer_groups_key() {
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "1"}},
+                "x-ferrum-proxy": {},
+                "x-ferrum-plugins": [{{
+                    "id": "groups-plugin",
+                    "plugin_name": "custom",
+                    "scope": "proxy",
+                    "config": {{
+                        "consumer_groups": ["admins"]
+                    }}
+                }}]
+            }}"#,
+            minimal_proxy()
+        );
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ExtractError::PluginContainsCredentials { plugin_id, key }
+                if plugin_id == "groups-plugin" && key == "consumer_groups"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reject_plugin_config_with_consumers_key() {
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "1"}},
+                "x-ferrum-proxy": {},
+                "x-ferrum-plugins": [{{
+                    "id": "consumers-plugin",
+                    "plugin_name": "custom",
+                    "scope": "proxy",
+                    "config": {{
+                        "consumers": ["alice", "bob"]
+                    }}
+                }}]
+            }}"#,
+            minimal_proxy()
+        );
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ExtractError::PluginContainsCredentials { plugin_id, key }
+                if plugin_id == "consumers-plugin" && key == "consumers"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_credential_key_detection_is_case_insensitive() {
+        // Upper-case "JWT" in config key must still be caught.
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "1"}},
+                "x-ferrum-proxy": {},
+                "x-ferrum-plugins": [{{
+                    "id": "case-plugin",
+                    "plugin_name": "custom",
+                    "scope": "proxy",
+                    "config": {{
+                        "JWT": {{"secret": "abc"}}
+                    }}
+                }}]
+            }}"#,
+            minimal_proxy()
+        );
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ExtractError::PluginContainsCredentials { plugin_id, key }
+                if plugin_id == "case-plugin" && key == "jwt"
+            ),
+            "case-insensitive credential key detection must catch 'JWT'; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_credential_key_in_array_element_detected() {
+        // Forbidden key nested inside an array element must be caught.
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "1"}},
+                "x-ferrum-proxy": {},
+                "x-ferrum-plugins": [{{
+                    "id": "arr-plugin",
+                    "plugin_name": "custom",
+                    "scope": "proxy",
+                    "config": {{
+                        "rules": [
+                            {{"keyauth": {{"key": "secret"}}}}
+                        ]
+                    }}
+                }}]
+            }}"#,
+            minimal_proxy()
+        );
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ExtractError::PluginContainsCredentials { plugin_id, key }
+                if plugin_id == "arr-plugin" && key == "keyauth"
+            ),
+            "forbidden key inside array element must be detected; got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // find_forbidden_key — clean configs pass
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_find_forbidden_key_returns_none_for_clean_config() {
+        let config = serde_json::json!({
+            "window_size": 60,
+            "window_count": 100,
+            "nested": {
+                "deep": {
+                    "setting": true
+                }
+            }
+        });
+        assert!(
+            find_forbidden_key(&config).is_none(),
+            "clean config must not trigger forbidden key detection"
+        );
+    }
+
+    #[test]
+    fn test_find_forbidden_key_returns_none_for_primitive_values() {
+        assert!(find_forbidden_key(&serde_json::json!(42)).is_none());
+        assert!(find_forbidden_key(&serde_json::json!("hello")).is_none());
+        assert!(find_forbidden_key(&serde_json::json!(true)).is_none());
+        assert!(find_forbidden_key(&serde_json::json!(null)).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tag validation — empty tag name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_empty_tag_name_accepted() {
+        // Empty strings don't contain forbidden characters, so they pass
+        // the tag validation. The tag array is de-duplicated and sorted, so
+        // a single empty tag survives as [""].
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "1"}},
+                "tags": [{{"name": ""}}],
+                "x-ferrum-proxy": {}
+            }}"#,
+            minimal_proxy()
+        );
+        let result = extract(spec.as_bytes(), Some(SpecFormat::Json), "test");
+        assert!(
+            result.is_ok(),
+            "empty tag name must be accepted; got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // hash_resource_bundle — determinism and metadata-independence
+    // -----------------------------------------------------------------------
+
+    fn build_test_bundle(proxy_id: &str, api_spec_id: Option<&str>) -> ExtractedBundle {
+        let spec = format!(
+            r#"{{
+                "openapi": "3.1.0",
+                "info": {{"title": "Hash Test", "version": "1"}},
+                "x-ferrum-proxy": {{
+                    "id": "{proxy_id}",
+                    "backend_host": "be.internal",
+                    "backend_port": 443
+                }},
+                "x-ferrum-upstream": {{
+                    "id": "hash-upstream",
+                    "targets": [{{"host": "t.internal", "port": 443}}]
+                }},
+                "x-ferrum-plugins": [{{
+                    "id": "hash-plugin",
+                    "plugin_name": "cors",
+                    "scope": "proxy",
+                    "config": {{"origins": ["https://example.com"]}}
+                }}]
+            }}"#
+        );
+        let (mut bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap();
+
+        // Stamp api_spec_id if requested (simulating post-extraction handler behavior).
+        if let Some(spec_id) = api_spec_id {
+            bundle.proxy.api_spec_id = Some(spec_id.to_string());
+            if let Some(ref mut u) = bundle.upstream {
+                u.api_spec_id = Some(spec_id.to_string());
+            }
+            for p in &mut bundle.plugins {
+                p.api_spec_id = Some(spec_id.to_string());
+            }
+        }
+
+        bundle
+    }
+
+    #[test]
+    fn test_hash_same_resources_produces_same_hash() {
+        let bundle1 = build_test_bundle("hash-proxy", None);
+        let bundle2 = build_test_bundle("hash-proxy", None);
+
+        let hash1 = hash_resource_bundle(&bundle1).unwrap();
+        let hash2 = hash_resource_bundle(&bundle2).unwrap();
+
+        assert_eq!(hash1, hash2, "identical bundles must produce the same hash");
+    }
+
+    #[test]
+    fn test_hash_different_resources_produces_different_hash() {
+        let bundle1 = build_test_bundle("hash-proxy-a", None);
+        let bundle2 = build_test_bundle("hash-proxy-b", None);
+
+        let hash1 = hash_resource_bundle(&bundle1).unwrap();
+        let hash2 = hash_resource_bundle(&bundle2).unwrap();
+
+        assert_ne!(
+            hash1, hash2,
+            "different proxy IDs must produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_hash_ignores_api_spec_id() {
+        let bundle_without = build_test_bundle("hash-proxy", None);
+        let bundle_with_a = build_test_bundle("hash-proxy", Some("spec-aaa"));
+        let bundle_with_b = build_test_bundle("hash-proxy", Some("spec-bbb"));
+
+        let hash_without = hash_resource_bundle(&bundle_without).unwrap();
+        let hash_a = hash_resource_bundle(&bundle_with_a).unwrap();
+        let hash_b = hash_resource_bundle(&bundle_with_b).unwrap();
+
+        assert_eq!(
+            hash_without, hash_a,
+            "api_spec_id must not affect resource hash"
+        );
+        assert_eq!(
+            hash_a, hash_b,
+            "different api_spec_id values must produce the same hash"
+        );
+    }
+
+    #[test]
+    fn test_hash_ignores_created_at_and_updated_at() {
+        use chrono::{TimeZone, Utc};
+
+        let mut bundle1 = build_test_bundle("hash-proxy", None);
+        let mut bundle2 = build_test_bundle("hash-proxy", None);
+
+        // Stamp different timestamps — hash_resource_bundle strips
+        // created_at / updated_at via strip_metadata, so these must not
+        // affect the hash.
+        bundle1.proxy.created_at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        bundle1.proxy.updated_at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        bundle2.proxy.created_at = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+        bundle2.proxy.updated_at = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+
+        let hash1 = hash_resource_bundle(&bundle1).unwrap();
+        let hash2 = hash_resource_bundle(&bundle2).unwrap();
+
+        assert_eq!(
+            hash1, hash2,
+            "different created_at/updated_at must not affect resource hash"
+        );
+    }
+
+    #[test]
+    fn test_hash_is_valid_hex_sha256() {
+        let bundle = build_test_bundle("hash-proxy", None);
+        let hash = hash_resource_bundle(&bundle).unwrap();
+
+        // SHA-256 hex digest is exactly 64 hex characters.
+        assert_eq!(
+            hash.len(),
+            64,
+            "hash must be 64 hex chars; got {}",
+            hash.len()
+        );
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash must be valid hex; got: {hash}"
+        );
+    }
+
+    #[test]
+    fn test_hash_without_upstream_differs_from_with_upstream() {
+        let bundle_with = build_test_bundle("hash-proxy", None);
+
+        // Build a bundle without upstream.
+        let spec_no_upstream = r#"{
+            "openapi": "3.1.0",
+            "info": {"title": "Hash Test", "version": "1"},
+            "x-ferrum-proxy": {
+                "id": "hash-proxy",
+                "backend_host": "be.internal",
+                "backend_port": 443
+            },
+            "x-ferrum-plugins": [{
+                "id": "hash-plugin",
+                "plugin_name": "cors",
+                "scope": "proxy",
+                "config": {"origins": ["https://example.com"]}
+            }]
+        }"#;
+        let (bundle_without, _) =
+            extract(spec_no_upstream.as_bytes(), Some(SpecFormat::Json), "test").unwrap();
+
+        let hash_with = hash_resource_bundle(&bundle_with).unwrap();
+        let hash_without = hash_resource_bundle(&bundle_without).unwrap();
+
+        assert_ne!(
+            hash_with, hash_without,
+            "bundle with upstream must hash differently from bundle without"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Basic extraction: doc missing x-ferrum-proxy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_doc_missing_proxy_extension_returns_error() {
+        let spec = r#"{
+            "openapi": "3.1.0",
+            "info": {"title": "No Proxy", "version": "1"},
+            "x-ferrum-upstream": {
+                "id": "orphan-upstream",
+                "targets": [{"host": "t.internal", "port": 443}]
+            }
+        }"#;
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap_err();
+        assert!(
+            matches!(err, ExtractError::MissingProxyExtension),
+            "got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Basic extraction: doc with only x-ferrum-upstream extracts upstream
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_upstream_sets_namespace() {
+        let spec = r#"{
+            "openapi": "3.1.0",
+            "info": {"title": "T", "version": "1"},
+            "x-ferrum-proxy": {
+                "id": "up-ns-proxy",
+                "backend_host": "be.internal",
+                "backend_port": 443
+            },
+            "x-ferrum-upstream": {
+                "id": "up-ns-upstream",
+                "targets": [{"host": "t.internal", "port": 443}]
+            }
+        }"#;
+        let (bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "custom-ns").unwrap();
+        let upstream = bundle.upstream.as_ref().expect("upstream must be present");
+        assert_eq!(
+            upstream.namespace, "custom-ns",
+            "upstream namespace must be overridden to the caller's namespace"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Basic extraction: plugins get namespace stamped
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_plugins_get_namespace_stamped() {
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "1"}},
+                "x-ferrum-proxy": {},
+                "x-ferrum-plugins": [{{
+                    "id": "ns-plugin",
+                    "plugin_name": "cors",
+                    "scope": "proxy",
+                    "config": {{}}
+                }}]
+            }}"#,
+            minimal_proxy()
+        );
+        let (bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "my-namespace").unwrap();
+        assert_eq!(bundle.plugins.len(), 1);
+        assert_eq!(
+            bundle.plugins[0].namespace, "my-namespace",
+            "plugin namespace must be stamped with the caller's namespace"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Operation count extraction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_operation_count_from_paths() {
+        let spec = format!(
+            r#"{{
+                "openapi": "3.1.0",
+                "info": {{"title": "T", "version": "1"}},
+                "paths": {{
+                    "/users": {{
+                        "get": {{"summary": "List users"}},
+                        "post": {{"summary": "Create user"}}
+                    }},
+                    "/users/{{id}}": {{
+                        "get": {{"summary": "Get user"}},
+                        "put": {{"summary": "Update user"}},
+                        "delete": {{"summary": "Delete user"}}
+                    }}
+                }},
+                "x-ferrum-proxy": {}
+            }}"#,
+            minimal_proxy()
+        );
+        let (_, meta) = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap();
+        assert_eq!(
+            meta.operation_count, 5,
+            "operation_count must be 5 (2 + 3 HTTP methods); got {}",
+            meta.operation_count
+        );
+    }
 }
