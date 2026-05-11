@@ -916,7 +916,13 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
 }
 
 fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, K8sTranslateError> {
-    let service_account_raw = string_field(&object.spec, "serviceAccount");
+    // Treat empty-string `serviceAccount` as missing (Istio semantics: missing
+    // or empty → fall back to `"default"` for SVID issuance). Without this
+    // collapse, an empty string would propagate into the SPIFFE path
+    // `ns/{ns}/sa/`, which the SPIFFE parser rejects as a trailing-slash error
+    // and surfaces a confusing translation failure to operators.
+    let service_account_raw =
+        string_field(&object.spec, "serviceAccount").filter(|s| !s.is_empty());
     let path = format!(
         "ns/{}/sa/{}",
         object.metadata.namespace,
@@ -945,6 +951,12 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         })
         .transpose()?;
 
+    // Empty-string `locality` is operator intent for "unset"; collapse to
+    // None so downstream consumers don't need to special-case empty strings.
+    let locality = string_field(&object.spec, "locality")
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+
     Ok(Workload {
         spiffe_id: spiffe_id.clone(),
         selector: WorkloadSelector {
@@ -970,7 +982,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         network: string_field(&object.spec, "network").map(ToOwned::to_owned),
         cluster: string_field(&object.spec, "cluster").map(ToOwned::to_owned),
         weight,
-        locality: string_field(&object.spec, "locality").map(ToOwned::to_owned),
+        locality,
         service_account: service_account_raw.map(ToOwned::to_owned),
     })
 }
@@ -2612,6 +2624,100 @@ mod tests {
         assert!(workload.service_account.is_none());
         // SPIFFE still falls back to "default" SA for SVID issuance.
         assert!(workload.spiffe_id.as_str().ends_with("/sa/default"));
+    }
+
+    #[test]
+    fn workload_entry_weight_zero_is_accepted() {
+        // Istio uses `weight: 0` to mean "drain / no traffic". The translator
+        // must not reject it; the runtime LB layer is responsible for
+        // interpreting the value once locality-aware routing is wired.
+        let result = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5",
+                    "weight": 0
+                }),
+            )],
+            options(),
+        )
+        .expect("weight=0 must translate");
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.workloads[0].weight, Some(0));
+    }
+
+    #[test]
+    fn workload_entry_empty_service_account_falls_back_to_default() {
+        // Istio treats missing OR empty `serviceAccount` as `"default"` for
+        // SVID issuance. The translator must not surface the SPIFFE parser's
+        // trailing-slash error to operators when YAML serialization yields
+        // `serviceAccount: ""`.
+        let result = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5",
+                    "serviceAccount": ""
+                }),
+            )],
+            options(),
+        )
+        .expect("empty serviceAccount must translate");
+        let mesh = result.config.mesh.expect("mesh config");
+        let workload = &mesh.workloads[0];
+        assert!(workload.service_account.is_none());
+        assert!(workload.spiffe_id.as_str().ends_with("/sa/default"));
+    }
+
+    #[test]
+    fn workload_entry_empty_locality_collapses_to_none() {
+        // Empty-string locality is operator intent for "unset"; downstream
+        // consumers should not have to special-case it.
+        let result = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5",
+                    "locality": ""
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let mesh = result.config.mesh.expect("mesh config");
+        assert!(mesh.workloads[0].locality.is_none());
+    }
+
+    #[test]
+    fn workload_entry_locality_is_free_form() {
+        // The translator stores `locality` verbatim — it does not validate the
+        // `region/zone/subzone` slash convention. Locality-aware routing (when
+        // wired) is responsible for any parsing.
+        for raw in [
+            "us-west-2/us-west-2a/sub-a",
+            "us-west-2/us-west-2a",
+            "us-west-2",
+            "single-token-no-slashes",
+            "//empty/region",
+        ] {
+            let result = translate_k8s_objects(
+                &[object(
+                    "WorkloadEntry",
+                    serde_json::json!({
+                        "address": "10.0.1.5",
+                        "locality": raw
+                    }),
+                )],
+                options(),
+            )
+            .unwrap_or_else(|e| panic!("locality {raw:?} must translate: {e}"));
+            let mesh = result.config.mesh.expect("mesh config");
+            assert_eq!(
+                mesh.workloads[0].locality.as_deref(),
+                Some(raw),
+                "locality must be stored verbatim",
+            );
+        }
     }
 
     #[test]

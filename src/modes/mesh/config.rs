@@ -69,8 +69,9 @@ pub struct Workload {
     pub cluster: Option<String>,
     /// Istio `WorkloadEntry.weight` — load-balancing weight for traffic
     /// splitting between multiple workloads of the same service. Absent
-    /// here means "use the default" — equivalent to today's behavior.
-    /// Capped at `MAX_TARGET_WEIGHT` (256) at translation time.
+    /// here means "use the default" — equivalent to today's behavior. A
+    /// value of `0` is accepted (Istio "no traffic" / drain). Capped at
+    /// `MAX_TARGET_WEIGHT` (65_535) at translation time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
     /// Istio `WorkloadEntry.locality` — slash-delimited
