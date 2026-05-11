@@ -253,3 +253,83 @@ async fn loki_logging_accepts_schema() {
         }),
     );
 }
+
+#[test]
+fn failed_cache_build_does_not_leak_registry_changes() {
+    // Atomicity guarantee: when PluginCache::new rejects a config because
+    // a downstream plugin fails to construct, the named-schema registry
+    // must still reflect the LAST successfully-applied config — not the
+    // staging that was being built for the rejected reload.
+    use chrono::Utc;
+    use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
+    use ferrum_edge::plugin_cache::PluginCache;
+
+    fn schema_plugin(id: &str, schema_name: &str) -> PluginConfig {
+        PluginConfig {
+            id: id.into(),
+            plugin_name: "transaction_log_schema".into(),
+            namespace: "ferrum".into(),
+            config: json!({
+                "schemas": { schema_name: { "summary_type": "http" } }
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn broken_keyauth() -> PluginConfig {
+        PluginConfig {
+            id: "broken-keyauth".into(),
+            plugin_name: "key_auth".into(),
+            namespace: "ferrum".into(),
+            // Empty key_location triggers "must not be empty" from
+            // KeyAuth::new() — security_errors path in build_cache.
+            config: json!({ "key_location": "" }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    let _g = registry_lock();
+    registry::reset_for_tests();
+
+    // 1. Seed a successful baseline registry containing schema "baseline".
+    let baseline_cfg = GatewayConfig {
+        plugin_configs: vec![schema_plugin("tls-baseline", "baseline")],
+        ..GatewayConfig::default()
+    };
+    PluginCache::new(&baseline_cfg).expect("baseline build succeeds");
+    assert!(
+        registry::lookup_named("baseline").is_some(),
+        "baseline schema is live after first build"
+    );
+
+    // 2. Attempt a second build that defines schema "rejected" alongside
+    //    an invalid plugin, so the build fails at security validation.
+    let bad_cfg = GatewayConfig {
+        plugin_configs: vec![schema_plugin("tls-rejected", "rejected"), broken_keyauth()],
+        ..GatewayConfig::default()
+    };
+    let result = PluginCache::new(&bad_cfg);
+    assert!(result.is_err(), "build must fail when a plugin is invalid");
+
+    // 3. Atomicity: registry matches the BASELINE, not the rejected reload.
+    assert!(
+        registry::lookup_named("baseline").is_some(),
+        "baseline schema survives a rejected reload (pre-fix this was wiped)"
+    );
+    assert!(
+        registry::lookup_named("rejected").is_none(),
+        "rejected reload's staged schema must NOT leak into the live registry"
+    );
+}

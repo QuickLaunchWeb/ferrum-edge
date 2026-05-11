@@ -160,15 +160,31 @@ pub fn register_named(name: &str, schema: Arc<SummarySchema>) -> Result<(), Stri
 }
 
 /// Promote the staging area to be the live map. Called after all
-/// `transaction_log_schema` plugins for this reload pass have constructed.
-/// Decrements the bracket depth (releases the serializer on outermost
-/// exit).
+/// `transaction_log_schema` plugins for this reload pass have constructed
+/// AND the rest of the plugin-cache build has succeeded. Decrements the
+/// bracket depth (releases the serializer on outermost exit).
 pub fn commit_reload() {
     {
         let mut state = write_lock();
         if let Some(staging) = state.staging.take() {
             state.schemas = staging;
         }
+    }
+    leave_bracket();
+}
+
+/// Discard the staging area without promoting it. Called when the rest
+/// of the plugin-cache build fails after schemas have been staged, so
+/// the process-global live `schemas` map keeps reflecting the last
+/// successfully-applied config. Decrements the bracket depth (releases
+/// the serializer on outermost exit).
+///
+/// Always pair `begin_reload` with exactly one of `commit_reload` or
+/// `abort_reload` on the same thread.
+pub fn abort_reload() {
+    {
+        let mut state = write_lock();
+        state.staging = None;
     }
     leave_bracket();
 }
@@ -204,8 +220,21 @@ impl Drop for ReloadBracketTestGuard {
 
 /// Look up a named schema. Returns `None` if no schema with this name
 /// is registered (either never registered, or removed by a reload).
+///
+/// If the calling thread is itself in the middle of a reload bracket
+/// (between [`begin_reload`] and [`commit_reload`] / [`abort_reload`]),
+/// the staging area is the authoritative new state — it shadows the
+/// live `schemas` map. This lets the second pass of a plugin-cache
+/// build resolve `schema_ref` against the not-yet-committed schemas.
+/// External threads (admin API, concurrent reads) continue to see the
+/// live committed map, so the atomic-swap-at-commit semantic holds for
+/// every reader outside the reload.
 pub fn lookup_named(name: &str) -> Option<Arc<SummarySchema>> {
+    let on_reload_thread = KEEPER.with(|k| k.borrow().depth > 0);
     let state = read_lock();
+    if on_reload_thread && let Some(staging) = &state.staging {
+        return staging.get(name).cloned();
+    }
     state.schemas.get(name).cloned()
 }
 
@@ -273,10 +302,53 @@ mod tests {
         reset_for_tests();
         begin_reload();
         register_named("a", empty_schema()).unwrap();
-        // Not yet live.
-        assert!(lookup_named("a").is_none());
+        // The reload thread sees its own staging so plugin construction
+        // in the second pass can resolve `schema_ref` before commit.
+        assert!(lookup_named("a").is_some());
+        // External readers (other threads) still see the live map,
+        // which is empty until commit.
+        let on_other_thread = std::thread::spawn(lookup_named_a).join().unwrap();
+        assert!(
+            on_other_thread.is_none(),
+            "external readers see only the committed map"
+        );
         commit_reload();
         assert!(lookup_named("a").is_some());
+        // After commit, external readers see the promoted schemas too.
+        let on_other_thread = std::thread::spawn(lookup_named_a).join().unwrap();
+        assert!(on_other_thread.is_some());
+    }
+
+    fn lookup_named_a() -> Option<Arc<SummarySchema>> {
+        lookup_named("a")
+    }
+
+    #[test]
+    fn abort_discards_staging() {
+        let _g = lock();
+        reset_for_tests();
+        // Seed a live schema so we can confirm it survives the aborted
+        // reload.
+        begin_reload();
+        register_named("keep", empty_schema()).unwrap();
+        commit_reload();
+        assert!(lookup_named("keep").is_some());
+
+        // Start a reload that registers a new schema, then abort.
+        begin_reload();
+        register_named("transient", empty_schema()).unwrap();
+        abort_reload();
+
+        // The aborted reload's staged schema must NOT leak into the live map.
+        assert!(
+            lookup_named("transient").is_none(),
+            "abort discards staging"
+        );
+        // The previously-committed schema must survive.
+        assert!(
+            lookup_named("keep").is_some(),
+            "abort preserves last commit"
+        );
     }
 
     #[test]
