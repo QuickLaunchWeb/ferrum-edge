@@ -318,7 +318,7 @@ Pre-built hash map indexes for O(1) credential lookup during authentication. The
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `tracked_key_count` | integer | Total rate-limit keys currently tracked across all `rate_limiting` plugin instances. Each key represents a unique client (by IP or consumer identity) with an active rate-limit window. Bounded to 100K entries per plugin instance with automatic stale entry eviction |
+| `tracked_key_count` | integer | Total rate-limit keys currently tracked across all `rate_limiting` plugin instances. Each key represents a unique client (by IP, consumer identity, or SPIFFE identity) with an active rate-limit window. Bounded to 100K entries per plugin instance with automatic stale entry eviction |
 
 **What to look for:**
 

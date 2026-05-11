@@ -481,12 +481,13 @@ async fn wait_for_initial_mesh_config(
     mesh_state: &MeshRuntimeState,
     runtime: &MeshRuntimeConfig,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<(GatewayConfig, MeshSlice), anyhow::Error> {
+) -> Result<(GatewayConfig, Arc<MeshSlice>), anyhow::Error> {
     let mut updates = mesh_state.subscribe();
     loop {
-        if let Some(slice) = mesh_state.snapshot().as_ref().as_ref().cloned() {
-            match gateway_config_from_mesh_slice(&slice, runtime) {
-                Ok(config) => return Ok((config, slice)),
+        let snapshot = mesh_state.snapshot();
+        if let Some(slice) = snapshot.as_ref().as_ref() {
+            match gateway_config_from_mesh_slice(slice, runtime) {
+                Ok(config) => return Ok((config, Arc::new(slice.clone()))),
                 Err(e) => {
                     warn!(
                         mesh_slice_version = %slice.version,
@@ -1394,7 +1395,7 @@ async fn serve_mesh_runtime(
     config: GatewayConfig,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     mesh_state: MeshRuntimeState,
-    initial_applied_mesh_slice: Option<MeshSlice>,
+    initial_applied_mesh_slice: Option<Arc<MeshSlice>>,
     mut mesh_background_handles: Vec<JoinHandle<()>>,
 ) -> Result<(), anyhow::Error> {
     let dns_cache = DnsCache::new(DnsConfig {
@@ -1732,7 +1733,7 @@ fn start_mesh_slice_apply_task(
     mesh_state: MeshRuntimeState,
     proxy_state: ProxyState,
     runtime: MeshRuntimeConfig,
-    initial_applied_mesh_slice: Option<MeshSlice>,
+    initial_applied_mesh_slice: Option<Arc<MeshSlice>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     dns_proxy: Option<Arc<MeshDnsProxy>>,
 ) -> JoinHandle<()> {
@@ -1744,14 +1745,15 @@ fn start_mesh_slice_apply_task(
                 return;
             }
 
-            if let Some(slice) = mesh_state.snapshot().as_ref().as_ref().cloned() {
-                if mesh_slice_matches_last_applied(last_applied_slice.as_ref(), &slice) {
+            let snapshot = mesh_state.snapshot();
+            if let Some(slice) = snapshot.as_ref().as_ref() {
+                if mesh_slice_matches_last_applied(last_applied_slice.as_deref(), slice) {
                     debug!(
                         mesh_slice_version = %slice.version,
                         "Skipping no-op mesh slice update"
                     );
                 } else {
-                    match gateway_config_from_mesh_slice(&slice, &runtime) {
+                    match gateway_config_from_mesh_slice(slice, &runtime) {
                         Ok(config) => {
                             let previous_loaded_at = proxy_state.config.load_full().loaded_at;
                             let candidate_loaded_at = config.loaded_at;
@@ -1765,11 +1767,11 @@ fn start_mesh_slice_apply_task(
                             );
                             record_mesh_slice_apply_result(
                                 &mut last_applied_slice,
-                                &slice,
+                                slice,
                                 accepted,
                             );
                             if accepted && let Some(ref dns_proxy) = dns_proxy {
-                                dns_proxy.update_from_slice(&slice);
+                                dns_proxy.update_from_slice(slice);
                             }
                             if applied {
                                 info!(
@@ -1819,12 +1821,12 @@ fn mesh_slice_matches_last_applied(
 }
 
 fn record_mesh_slice_apply_result(
-    last_applied_slice: &mut Option<MeshSlice>,
+    last_applied_slice: &mut Option<Arc<MeshSlice>>,
     slice: &MeshSlice,
     applied: bool,
 ) {
     if applied {
-        *last_applied_slice = Some(slice.clone());
+        *last_applied_slice = Some(Arc::new(slice.clone()));
     }
 }
 
@@ -2941,7 +2943,7 @@ mod tests {
         record_mesh_slice_apply_result(&mut last_applied_slice, &rejected, false);
         assert!(last_applied_slice.is_none());
         assert!(!mesh_slice_matches_last_applied(
-            last_applied_slice.as_ref(),
+            last_applied_slice.as_deref(),
             &MeshSlice {
                 version: "bad-v2".to_string(),
                 labels: [("app".to_string(), "api".to_string())].into(),
@@ -2951,7 +2953,7 @@ mod tests {
 
         record_mesh_slice_apply_result(&mut last_applied_slice, &rejected, true);
         assert!(mesh_slice_matches_last_applied(
-            last_applied_slice.as_ref(),
+            last_applied_slice.as_deref(),
             &MeshSlice {
                 version: "bad-v2".to_string(),
                 labels: [("app".to_string(), "api".to_string())].into(),

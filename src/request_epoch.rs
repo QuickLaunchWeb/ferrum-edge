@@ -151,6 +151,7 @@ mod tests {
             upstreams,
             loaded_at: Utc::now(),
             known_namespaces: Vec::new(),
+            trust_bundles: None,
             mesh: None,
         }
     }

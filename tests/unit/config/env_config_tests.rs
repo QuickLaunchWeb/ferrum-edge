@@ -950,6 +950,51 @@ fn test_env_config_tls_flags_default_false() {
 }
 
 #[test]
+fn test_env_config_gateway_svid_paths() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            (
+                "FERRUM_GATEWAY_SVID_CERT_PATH",
+                "/etc/ferrum/svid/gateway-chain.pem",
+            ),
+            (
+                "FERRUM_GATEWAY_SVID_KEY_PATH",
+                "/etc/ferrum/svid/gateway-key.pem",
+            ),
+            (
+                "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                "/etc/ferrum/svid/trust-bundle.pem",
+            ),
+            (
+                "FERRUM_GATEWAY_SPIFFE_ID",
+                "spiffe://corp.example/ns/gateway/sa/edge",
+            ),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.gateway_svid_cert_path.as_deref(),
+                Some("/etc/ferrum/svid/gateway-chain.pem")
+            );
+            assert_eq!(
+                config.gateway_svid_key_path.as_deref(),
+                Some("/etc/ferrum/svid/gateway-key.pem")
+            );
+            assert_eq!(
+                config.gateway_svid_trust_bundle_path.as_deref(),
+                Some("/etc/ferrum/svid/trust-bundle.pem")
+            );
+            assert_eq!(
+                config.gateway_spiffe_id.as_deref(),
+                Some("spiffe://corp.example/ns/gateway/sa/edge")
+            );
+        },
+    );
+}
+
+#[test]
 fn test_env_config_request_limits_defaults() {
     with_env_vars(
         &[
