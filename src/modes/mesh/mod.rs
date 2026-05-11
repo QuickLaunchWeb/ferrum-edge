@@ -464,7 +464,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     }
 
     inject_mesh_global_plugins(&mut config, runtime, mesh_slice);
-    materialize_east_west_gateway_proxies(&mut config, runtime);
+    materialize_east_west_gateway_proxies(&mut config, runtime, mesh_slice);
     materialize_egress_gateway_proxies(&mut config, runtime, mesh_slice);
     config.normalize_fields();
     Ok(config)
@@ -539,27 +539,71 @@ async fn wait_for_mesh_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<b
     }
 }
 
-fn materialize_east_west_gateway_proxies(config: &mut GatewayConfig, runtime: &MeshRuntimeConfig) {
+fn materialize_east_west_gateway_proxies(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
     if runtime.topology != MeshTopology::EastWestGateway {
         return;
     }
 
-    let Some(mesh) = config.mesh.as_ref() else {
-        warn!("east-west gateway topology has no mesh.multi_cluster configuration");
-        return;
-    };
-    let Some(multi_cluster) = mesh.multi_cluster.as_ref() else {
-        warn!("east-west gateway topology has no mesh.multi_cluster configuration");
-        return;
-    };
+    // Materialize proxies from explicit EastWestGateway config entries (remote
+    // gateway backends).
+    if let Some(mesh) = config.mesh.as_ref()
+        && let Some(multi_cluster) = mesh.multi_cluster.as_ref()
+    {
+        for gateway in &multi_cluster.east_west_gateways {
+            if gateway.namespace != runtime.namespace {
+                continue;
+            }
 
-    for gateway in &multi_cluster.east_west_gateways {
-        if gateway.namespace != runtime.namespace {
-            continue;
+            let proxy = east_west_gateway_proxy(gateway, runtime.east_west_listen_port);
+
+            if let Some(existing) = config
+                .proxies
+                .iter_mut()
+                .find(|candidate| candidate.id == proxy.id)
+            {
+                *existing = proxy;
+            } else {
+                config.proxies.push(proxy);
+            }
         }
+    }
 
-        let proxy = east_west_gateway_proxy(gateway, runtime.east_west_listen_port);
+    // Materialize SNI-routed TCP passthrough proxies for each local mesh
+    // service so that inbound cross-cluster traffic on the east-west listen
+    // port reaches the correct workload. Each service gets one proxy (SNI host
+    // = service FQDN) and one upstream (targets = workload addresses).
+    let (proxies, upstreams) = build_east_west_service_proxies_and_upstreams(
+        mesh_slice,
+        runtime.east_west_listen_port,
+        &runtime.namespace,
+        &runtime.cluster_domain,
+    );
 
+    if !proxies.is_empty() {
+        info!(
+            east_west_service_proxies = proxies.len(),
+            east_west_service_upstreams = upstreams.len(),
+            "Materializing east-west gateway proxies for local mesh services"
+        );
+    }
+
+    for upstream in upstreams {
+        if let Some(existing) = config
+            .upstreams
+            .iter_mut()
+            .find(|candidate| candidate.id == upstream.id)
+        {
+            *existing = upstream;
+        } else {
+            config.upstreams.push(upstream);
+        }
+    }
+
+    for proxy in proxies {
         if let Some(existing) = config
             .proxies
             .iter_mut()
@@ -633,6 +677,215 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
 
 fn mesh_east_west_proxy_id(namespace: &str, name: &str) -> String {
     format!("__mesh-east-west-{namespace}-{name}").replace(['/', '.'], "-")
+}
+
+// ── East-west service proxy materialization ──────────────────────────────
+
+/// Build TCP passthrough proxies and upstreams for local mesh services so that
+/// inbound cross-cluster traffic on the east-west listen port is SNI-routed to
+/// the correct local workload.
+///
+/// For each service in the mesh slice:
+///   - SNI hostname = `{name}.{namespace}.svc.{cluster_domain}`
+///   - One upstream with targets from workload addresses
+///   - One TCP passthrough proxy on the east-west listen port
+fn build_east_west_service_proxies_and_upstreams(
+    mesh_slice: &MeshSlice,
+    listen_port: u16,
+    namespace: &str,
+    cluster_domain: &str,
+) -> (Vec<Proxy>, Vec<Upstream>) {
+    let mut proxies = Vec::new();
+    let mut upstreams = Vec::new();
+    let now = chrono::Utc::now();
+
+    for service in &mesh_slice.services {
+        // Build upstream targets from workloads that belong to this service.
+        let targets = build_east_west_service_targets(
+            service,
+            &mesh_slice.workloads,
+            mesh_slice
+                .multi_cluster
+                .as_ref()
+                .and_then(|multi_cluster| multi_cluster.local_cluster.as_deref()),
+        );
+        if targets.is_empty() {
+            debug!(
+                service = %service.name,
+                namespace = %service.namespace,
+                "Skipping east-west service with no reachable workload targets"
+            );
+            continue;
+        }
+
+        let sni_hostname = format!(
+            "{}.{}.svc.{}",
+            service.name, service.namespace, cluster_domain
+        );
+        let upstream_id = mesh_east_west_service_upstream_id(&service.namespace, &service.name);
+
+        let upstream = Upstream {
+            id: upstream_id.clone(),
+            name: Some(upstream_id.clone()),
+            namespace: namespace.to_string(),
+            targets,
+            algorithm: LoadBalancerAlgorithm::RoundRobin,
+            hash_on: None,
+            hash_on_cookie_config: None,
+            health_checks: Some(HealthCheckConfig {
+                active: None,
+                passive: Some(PassiveHealthCheck::default()),
+            }),
+            service_discovery: None,
+            subsets: None,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        upstreams.push(upstream);
+
+        let proxy_id = mesh_east_west_service_proxy_id(&service.namespace, &service.name);
+        let proxy = east_west_service_proxy(
+            &proxy_id,
+            &sni_hostname,
+            namespace,
+            &upstream_id,
+            listen_port,
+            now,
+        );
+        proxies.push(proxy);
+    }
+
+    (proxies, upstreams)
+}
+
+/// Build upstream targets from workloads that belong to the given service.
+///
+/// Matches workloads by SPIFFE ID against the service's `WorkloadRef` list.
+/// Each workload address + first port produces one `UpstreamTarget`. When a
+/// workload has no addresses, it is skipped (pod IP not yet assigned).
+fn build_east_west_service_targets(
+    service: &crate::modes::mesh::config::MeshService,
+    workloads: &[crate::modes::mesh::config::Workload],
+    local_cluster: Option<&str>,
+) -> Vec<UpstreamTarget> {
+    let mut targets = Vec::new();
+
+    for workload_ref in &service.workloads {
+        let Some(workload) = workloads
+            .iter()
+            .find(|w| w.spiffe_id == workload_ref.spiffe_id)
+        else {
+            continue;
+        };
+        if local_cluster.is_some_and(|local_cluster| {
+            workload
+                .cluster
+                .as_deref()
+                .is_some_and(|cluster| cluster != local_cluster)
+        }) {
+            continue;
+        }
+
+        // Use the first service port as the target port. If the service has no
+        // ports, fall back to the workload's first port.
+        let target_port = service
+            .ports
+            .first()
+            .map(|p| p.port)
+            .or_else(|| workload.ports.first().map(|p| p.port))
+            .unwrap_or(80);
+
+        for address in &workload.addresses {
+            targets.push(UpstreamTarget {
+                host: address.clone(),
+                port: target_port,
+                weight: 1,
+                tags: workload.selector.labels.clone(),
+                path: None,
+            });
+        }
+    }
+
+    targets
+}
+
+/// Construct a TCP passthrough proxy for east-west service routing.
+fn east_west_service_proxy(
+    id: &str,
+    sni_hostname: &str,
+    namespace: &str,
+    upstream_id: &str,
+    listen_port: u16,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Proxy {
+    Proxy {
+        id: id.to_string(),
+        name: Some(format!("mesh east-west svc {sni_hostname}")),
+        namespace: namespace.to_string(),
+        hosts: vec![sni_hostname.to_string()],
+        listen_path: None,
+        backend_scheme: Some(BackendScheme::Tcp),
+        dispatch_kind: Default::default(),
+        backend_host: String::new(),
+        backend_port: 0,
+        backend_path: None,
+        strip_listen_path: false,
+        preserve_host_header: false,
+        backend_connect_timeout_ms: 30_000,
+        backend_read_timeout_ms: 30_000,
+        backend_write_timeout_ms: 30_000,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: false,
+        backend_tls_server_ca_cert_path: None,
+        resolved_tls: BackendTlsConfig::default(),
+        dns_override: None,
+        dns_cache_ttl_seconds: None,
+        auth_mode: Default::default(),
+        plugins: Vec::<PluginAssociation>::new(),
+        pool_idle_timeout_seconds: None,
+        pool_enable_http_keep_alive: None,
+        pool_enable_http2: None,
+        pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
+        pool_http2_initial_stream_window_size: None,
+        pool_http2_initial_connection_window_size: None,
+        pool_http2_adaptive_window: None,
+        pool_http2_max_frame_size: None,
+        pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
+        pool_max_requests_per_connection: None,
+        upstream_id: Some(upstream_id.to_string()),
+        upstream_subset: None,
+        api_spec_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: ResponseBodyMode::Stream,
+        listen_port: Some(listen_port),
+        frontend_tls: false,
+        passthrough: true,
+        udp_idle_timeout_seconds: 60,
+        udp_max_response_amplification_factor: None,
+        tcp_idle_timeout_seconds: None,
+        allowed_methods: None,
+        allowed_ws_origins: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn mesh_east_west_service_proxy_id(namespace: &str, name: &str) -> String {
+    format!("__mesh-ew-svc-{namespace}-{name}").replace(['/', '.'], "-")
+}
+
+fn mesh_east_west_service_upstream_id(namespace: &str, name: &str) -> String {
+    format!("__mesh-ew-upstream-{namespace}-{name}").replace(['/', '.'], "-")
 }
 
 // ── Egress gateway proxy materialization ─────────────────────────────────
@@ -2770,6 +3023,337 @@ mod tests {
                 assert!(proxy.passthrough);
                 assert_eq!(proxy.backend_host, "eastwest.remote.example");
                 assert_eq!(proxy.hosts, vec!["api.remote.example"]);
+            },
+        );
+    }
+
+    #[test]
+    fn east_west_gateway_materializes_service_proxies_from_slice() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_NAMESPACE", "default"),
+                ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
+                ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "15443"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                let config = GatewayConfig {
+                    mesh: Some(Box::new(MeshConfig {
+                        services: vec![MeshService {
+                            name: "reviews".to_string(),
+                            namespace: "default".to_string(),
+                            ports: vec![ServicePort {
+                                port: 9080,
+                                protocol: AppProtocol::Http,
+                                name: Some("http".to_string()),
+                            }],
+                            workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                                spiffe_id: SpiffeId::new(
+                                    "spiffe://cluster.local/ns/default/sa/reviews",
+                                )
+                                .unwrap(),
+                            }],
+                            protocol_overrides: HashMap::new(),
+                        }],
+                        workloads: vec![{
+                            let mut wl = workload("reviews", "reviews");
+                            wl.addresses = vec!["10.0.0.5".to_string()];
+                            wl
+                        }],
+                        ..MeshConfig::default()
+                    })),
+                    ..GatewayConfig::default()
+                };
+
+                let prepared =
+                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+
+                // Verify service proxy was materialized.
+                let proxy = prepared
+                    .proxies
+                    .iter()
+                    .find(|p| p.id == "__mesh-ew-svc-default-reviews")
+                    .expect("east-west service proxy");
+
+                assert_eq!(proxy.listen_port, Some(15443));
+                assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
+                assert!(proxy.passthrough);
+                assert_eq!(proxy.hosts, vec!["reviews.default.svc.cluster.local"]);
+                assert_eq!(
+                    proxy.upstream_id.as_deref(),
+                    Some("__mesh-ew-upstream-default-reviews")
+                );
+
+                // Verify upstream was materialized.
+                let upstream = prepared
+                    .upstreams
+                    .iter()
+                    .find(|u| u.id == "__mesh-ew-upstream-default-reviews")
+                    .expect("east-west service upstream");
+
+                assert_eq!(upstream.targets.len(), 1);
+                assert_eq!(upstream.targets[0].host, "10.0.0.5");
+                assert_eq!(upstream.targets[0].port, 9080);
+            },
+        );
+    }
+
+    #[test]
+    fn east_west_gateway_skips_services_without_workload_addresses() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_NAMESPACE", "default"),
+                ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                let config = GatewayConfig {
+                    mesh: Some(Box::new(MeshConfig {
+                        services: vec![MeshService {
+                            name: "pending".to_string(),
+                            namespace: "default".to_string(),
+                            ports: vec![ServicePort {
+                                port: 8080,
+                                protocol: AppProtocol::Http,
+                                name: None,
+                            }],
+                            workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                                spiffe_id: SpiffeId::new(
+                                    "spiffe://cluster.local/ns/default/sa/pending",
+                                )
+                                .unwrap(),
+                            }],
+                            protocol_overrides: HashMap::new(),
+                        }],
+                        // Workload exists but has no addresses (pod IP not yet assigned).
+                        workloads: vec![workload("pending", "pending")],
+                        ..MeshConfig::default()
+                    })),
+                    ..GatewayConfig::default()
+                };
+
+                let prepared =
+                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+
+                assert!(
+                    !prepared
+                        .proxies
+                        .iter()
+                        .any(|p| p.id == "__mesh-ew-svc-default-pending"),
+                    "service with no reachable targets should not produce a proxy"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn east_west_gateway_multiple_services_correct_upstream_targets() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_NAMESPACE", "default"),
+                ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
+                ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "15443"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                let config = GatewayConfig {
+                    mesh: Some(Box::new(MeshConfig {
+                        services: vec![
+                            MeshService {
+                                name: "reviews".to_string(),
+                                namespace: "default".to_string(),
+                                ports: vec![ServicePort {
+                                    port: 9080,
+                                    protocol: AppProtocol::Http,
+                                    name: None,
+                                }],
+                                workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                                    spiffe_id: SpiffeId::new(
+                                        "spiffe://cluster.local/ns/default/sa/reviews",
+                                    )
+                                    .unwrap(),
+                                }],
+                                protocol_overrides: HashMap::new(),
+                            },
+                            MeshService {
+                                name: "ratings".to_string(),
+                                namespace: "default".to_string(),
+                                ports: vec![ServicePort {
+                                    port: 3000,
+                                    protocol: AppProtocol::Http,
+                                    name: None,
+                                }],
+                                workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                                    spiffe_id: SpiffeId::new(
+                                        "spiffe://cluster.local/ns/default/sa/ratings",
+                                    )
+                                    .unwrap(),
+                                }],
+                                protocol_overrides: HashMap::new(),
+                            },
+                        ],
+                        workloads: vec![
+                            {
+                                let mut wl = workload("reviews", "reviews");
+                                wl.addresses = vec!["10.0.0.5".to_string()];
+                                wl
+                            },
+                            {
+                                let mut wl = workload("ratings", "ratings");
+                                wl.addresses = vec!["10.0.0.6".to_string(), "10.0.0.7".to_string()];
+                                wl
+                            },
+                        ],
+                        ..MeshConfig::default()
+                    })),
+                    ..GatewayConfig::default()
+                };
+
+                let prepared =
+                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+
+                // Both services should produce proxies.
+                let reviews_proxy = prepared
+                    .proxies
+                    .iter()
+                    .find(|p| p.id == "__mesh-ew-svc-default-reviews")
+                    .expect("reviews proxy");
+                assert_eq!(reviews_proxy.listen_port, Some(15443));
+                assert_eq!(
+                    reviews_proxy.hosts,
+                    vec!["reviews.default.svc.cluster.local"]
+                );
+
+                let ratings_proxy = prepared
+                    .proxies
+                    .iter()
+                    .find(|p| p.id == "__mesh-ew-svc-default-ratings")
+                    .expect("ratings proxy");
+                assert_eq!(ratings_proxy.listen_port, Some(15443));
+                assert_eq!(
+                    ratings_proxy.hosts,
+                    vec!["ratings.default.svc.cluster.local"]
+                );
+
+                // Ratings upstream should have 2 targets (two addresses).
+                let ratings_upstream = prepared
+                    .upstreams
+                    .iter()
+                    .find(|u| u.id == "__mesh-ew-upstream-default-ratings")
+                    .expect("ratings upstream");
+                assert_eq!(ratings_upstream.targets.len(), 2);
+                assert_eq!(ratings_upstream.targets[0].host, "10.0.0.6");
+                assert_eq!(ratings_upstream.targets[1].host, "10.0.0.7");
+                assert_eq!(ratings_upstream.targets[0].port, 3000);
+            },
+        );
+    }
+
+    #[test]
+    fn east_west_gateway_service_targets_ignore_remote_cluster_workloads() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_NAMESPACE", "default"),
+                ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                let mut local = workload("reviews-local", "reviews");
+                local.addresses = vec!["10.0.0.5".to_string()];
+                local.cluster = Some("cluster-a".to_string());
+                let mut remote = workload("reviews-remote", "reviews");
+                remote.addresses = vec!["172.16.0.5".to_string()];
+                remote.cluster = Some("cluster-b".to_string());
+                let mut clusterless = workload("reviews-clusterless", "reviews");
+                clusterless.addresses = vec!["10.0.0.6".to_string()];
+
+                let config = GatewayConfig {
+                    mesh: Some(Box::new(MeshConfig {
+                        services: vec![MeshService {
+                            name: "reviews".to_string(),
+                            namespace: "default".to_string(),
+                            ports: vec![ServicePort {
+                                port: 9080,
+                                protocol: AppProtocol::Http,
+                                name: None,
+                            }],
+                            workloads: vec![
+                                crate::modes::mesh::config::WorkloadRef {
+                                    spiffe_id: local.spiffe_id.clone(),
+                                },
+                                crate::modes::mesh::config::WorkloadRef {
+                                    spiffe_id: remote.spiffe_id.clone(),
+                                },
+                                crate::modes::mesh::config::WorkloadRef {
+                                    spiffe_id: clusterless.spiffe_id.clone(),
+                                },
+                            ],
+                            protocol_overrides: HashMap::new(),
+                        }],
+                        workloads: vec![local, remote, clusterless],
+                        multi_cluster: Some(MultiClusterConfig {
+                            local_cluster: Some("cluster-a".to_string()),
+                            ..MultiClusterConfig::default()
+                        }),
+                        ..MeshConfig::default()
+                    })),
+                    ..GatewayConfig::default()
+                };
+
+                let prepared =
+                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                let upstream = prepared
+                    .upstreams
+                    .iter()
+                    .find(|u| u.id == "__mesh-ew-upstream-default-reviews")
+                    .expect("reviews upstream");
+                let hosts: Vec<&str> = upstream
+                    .targets
+                    .iter()
+                    .map(|target| target.host.as_str())
+                    .collect();
+
+                assert_eq!(hosts, vec!["10.0.0.5", "10.0.0.6"]);
+                assert!(
+                    !hosts.contains(&"172.16.0.5"),
+                    "remote-cluster workloads should not become local east-west targets"
+                );
             },
         );
     }
