@@ -3545,7 +3545,7 @@ components:
       properties:
         provider:
           type: string
-          enum: [dns_sd, kubernetes, consul]
+          enum: [dns_sd, kubernetes, consul, mesh]
           description: Service discovery provider type
         dns_sd:
           type: object
@@ -3607,6 +3607,24 @@ components:
             token:
               type: [string, "null"]
               description: Consul ACL token for authentication
+            poll_interval_seconds:
+              type: integer
+              format: uint64
+              default: 30
+        mesh:
+          type: object
+          description: Ferrum mesh service configuration. Required when provider is `mesh`.
+          properties:
+            service_name:
+              type: string
+              description: Mesh service name from the CP-delivered mesh model
+            namespace:
+              type: [string, "null"]
+              description: Mesh namespace override. Defaults to the upstream namespace when omitted.
+            port:
+              type: [integer, "null"]
+              format: uint16
+              description: Mesh service port to select. Defaults to the first service/workload port.
             poll_interval_seconds:
               type: integer
               format: uint64

@@ -557,6 +557,12 @@ The CP tracks connected mesh nodes in `MeshNodeRegistry` (DashMap, `src/grpc/mes
 - `touch_all()` updates `last_update_at` on every broadcast.
 - Stale removal uses `remove_if_stale()` with timestamp comparison to handle reconnects that raced with the old stream's drop.
 
+### Gateway Mesh Service Discovery
+
+Gateway database/file/DP modes can resolve mesh services through an upstream `service_discovery` block with `provider: mesh`. The provider reads the current CP-delivered `GatewayConfig.mesh` snapshot, finds a `MeshService` by `service_name` and namespace, resolves its workload SPIFFE references to workload addresses, and publishes ordinary `UpstreamTarget` entries into the existing load balancer cache.
+
+Generated targets are tagged with `mesh.spiffe_id`, `mesh.namespace`, `mesh.service`, `mesh.trust_domain`, and `mesh.hbone=true`. This keeps the north-south gateway on the same discovery model as mesh mode while giving later gateway-to-mesh transport phases enough metadata to prefer HBONE/mTLS paths.
+
 ### Auto-Injected Plugins
 
 Mesh mode automatically injects these global plugins with reserved IDs:
