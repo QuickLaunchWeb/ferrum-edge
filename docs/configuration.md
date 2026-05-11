@@ -261,9 +261,10 @@ Injected sidecars run as the configured mesh proxy UID with `runAsNonRoot=true`,
 | `FERRUM_NODE_AGENT_BPF_ELF_PATH` | Linux `ebpf` feature | build-tree eBPF target path | Compiled `ferrum-ebpf` ELF loaded by the aya backend |
 | `FERRUM_NODE_AGENT_FALLBACK_MODE` | No | `iptables` | Behavior on kernel < 5.7: `iptables` or `fail` |
 | `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES` | No | — | Extra namespaces to exclude from capture (comma-separated; `kube-system`, `kube-public`, `kube-node-lease` always excluded) |
-| `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | No | `0.0.0.0/0` | CIDRs to capture for outbound traffic (comma-separated) |
-| `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | No | — | CIDRs to exclude from outbound capture (comma-separated, highest priority) |
-| `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | No | `15001,15006,15008,15020` | Destination ports to exclude from capture (comma-separated) |
+| `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | No | `0.0.0.0/0` | CIDRs to capture for outbound traffic (comma-separated). Per-pod annotation `traffic.sidecar.istio.io/includeOutboundIPRanges` REPLACES this value when present |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | No | — | CIDRs to exclude from outbound capture (comma-separated, highest priority). Per-pod annotation `traffic.sidecar.istio.io/excludeOutboundIPRanges` APPENDS to this value |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | No | `15001,15006,15008,15020` | Destination TCP ports excluded from outbound capture (comma-separated) |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` | No | — | Destination TCP ports excluded from inbound capture (comma-separated; mirrors Istio `excludeInboundPorts`). Per-pod annotation `traffic.sidecar.istio.io/excludeInboundPorts` is additive. RETURN rules are emitted before the inbound REDIRECT so the exclusion is honored |
 
 ### Migration
 

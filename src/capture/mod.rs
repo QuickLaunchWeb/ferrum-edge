@@ -39,6 +39,10 @@ pub struct CaptureConfig {
     pub include_cidrs: Vec<String>,
     pub exclude_cidrs: Vec<String>,
     pub exclude_ports: Vec<u16>,
+    /// TCP destination ports excluded from the inbound capture chain. Each
+    /// listed port emits a `RETURN` rule placed BEFORE the inbound REDIRECT,
+    /// so traffic to the port bypasses the mesh sidecar entirely.
+    pub exclude_inbound_ports: Vec<u16>,
 }
 
 impl CaptureConfig {
@@ -51,6 +55,7 @@ impl CaptureConfig {
             include_cidrs: vec!["0.0.0.0/0".to_string()],
             exclude_cidrs: Vec::new(),
             exclude_ports: Vec::new(),
+            exclude_inbound_ports: Vec::new(),
         }
     }
 
@@ -78,6 +83,9 @@ impl CaptureConfig {
             &resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_PORTS")
                 .unwrap_or_else(|| "15001,15006,15008,15020".to_string()),
         )?;
+        let exclude_inbound_ports = parse_port_list(
+            &resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS").unwrap_or_default(),
+        )?;
         Ok(Self {
             mode,
             proxy_uid,
@@ -86,6 +94,7 @@ impl CaptureConfig {
             include_cidrs,
             exclude_cidrs,
             exclude_ports,
+            exclude_inbound_ports,
         })
     }
 }
@@ -159,6 +168,16 @@ impl IptablesPlan {
                     "-p tcp -d {cidr} -j REDIRECT --to-ports {}",
                     config.outbound_port
                 ),
+            ));
+        }
+        // Inbound port exclusions MUST be appended before the catch-all
+        // REDIRECT below — once REDIRECT fires the chain returns, so any
+        // RETURN rule placed after it would be silently bypassed.
+        for port in &config.exclude_inbound_ports {
+            commands.push(idempotent_append(
+                "nat",
+                "FERRUM_MESH_INBOUND",
+                &format!("-p tcp --dport {port} -j RETURN"),
             ));
         }
         commands.push(idempotent_append(
@@ -602,5 +621,125 @@ mod tests {
     #[test]
     fn parse_proxy_uid_empty_uses_default() {
         assert_eq!(parse_proxy_uid("").unwrap(), DEFAULT_PROXY_UID);
+    }
+
+    #[test]
+    fn iptables_plan_emits_inbound_exclude_return_rules_before_redirect() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.exclude_inbound_ports = vec![15090, 22];
+
+        let plan = IptablesPlan::for_config(&config);
+
+        for port in [15090, 22] {
+            assert!(
+                plan.commands
+                    .iter()
+                    .any(|cmd| cmd.contains("FERRUM_MESH_INBOUND")
+                        && cmd.contains(&format!("--dport {port} -j RETURN"))),
+                "inbound RETURN rule missing for port {port}"
+            );
+        }
+
+        // CRITICAL: every RETURN rule must precede the inbound REDIRECT,
+        // otherwise the catch-all REDIRECT fires first and the exclusion is
+        // silently bypassed.
+        let redirect_pos = plan
+            .commands
+            .iter()
+            .position(|cmd| {
+                cmd.contains("FERRUM_MESH_INBOUND")
+                    && cmd.contains(&format!("REDIRECT --to-ports {}", config.inbound_port))
+            })
+            .expect("inbound REDIRECT command");
+        for port in [15090, 22] {
+            let return_pos = plan
+                .commands
+                .iter()
+                .position(|cmd| {
+                    cmd.contains("FERRUM_MESH_INBOUND")
+                        && cmd.contains(&format!("--dport {port} -j RETURN"))
+                })
+                .expect("inbound RETURN command");
+            assert!(
+                return_pos < redirect_pos,
+                "inbound RETURN for port {port} must precede the REDIRECT"
+            );
+        }
+    }
+
+    #[test]
+    fn iptables_plan_omits_inbound_returns_when_empty() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+
+        let plan = IptablesPlan::for_config(&config);
+
+        assert!(
+            !plan
+                .commands
+                .iter()
+                .any(|cmd| cmd.contains("FERRUM_MESH_INBOUND") && cmd.contains("-j RETURN")),
+            "no inbound RETURN rules expected when exclude_inbound_ports is empty"
+        );
+    }
+
+    // Serialize env-driven tests in this module so parallel cargo test runs do
+    // not race on the same `FERRUM_MESH_CAPTURE_*` vars consumed by `from_env`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_capture_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let keys = [
+            "FERRUM_MESH_CAPTURE_MODE",
+            "FERRUM_MESH_PROXY_UID",
+            "FERRUM_MESH_CAPTURE_INCLUDE_CIDRS",
+            "FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS",
+            "FERRUM_MESH_CAPTURE_EXCLUDE_PORTS",
+            "FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS",
+        ];
+        for key in keys {
+            // SAFETY: test-only env mutation, serialized by ENV_LOCK above.
+            unsafe { std::env::remove_var(key) };
+        }
+        for (key, value) in vars {
+            // SAFETY: test-only env mutation, serialized by ENV_LOCK above.
+            unsafe { std::env::set_var(key, value) };
+        }
+        f();
+        for key in keys {
+            // SAFETY: test-only env mutation, serialized by ENV_LOCK above.
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    #[test]
+    fn from_env_parses_exclude_inbound_ports() {
+        with_capture_env(
+            &[("FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS", "15090, 22")],
+            || {
+                let config = CaptureConfig::from_env().expect("config");
+                assert_eq!(config.exclude_inbound_ports, vec![15090, 22]);
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_defaults_exclude_inbound_ports_to_empty() {
+        with_capture_env(&[], || {
+            let config = CaptureConfig::from_env().expect("config");
+            assert!(config.exclude_inbound_ports.is_empty());
+        });
+    }
+
+    #[test]
+    fn from_env_rejects_invalid_exclude_inbound_ports() {
+        with_capture_env(
+            &[("FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS", "not-a-port")],
+            || {
+                let result = CaptureConfig::from_env();
+                assert!(result.is_err());
+            },
+        );
     }
 }
