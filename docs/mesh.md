@@ -843,7 +843,6 @@ The following Istio mesh surfaces are **not yet supported** and should be treate
 | `DestinationRule.trafficPolicy.tls` | Deferred | Use per-proxy `backend_tls_*` fields |
 | `DestinationRule` port-level traffic policy | Deferred | Top-level traffic policy applies to all ports |
 | Outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`) | Deferred | Unknown outbound destinations are not blocked today |
-| `AuthorizationPolicy` negative-match fields (`notMethods`, `notPaths`, `notHosts`, `notPorts`) | Rejected at translation | Split into separate DENY policies |
 | `VirtualService` header/method-only matches | Skipped | Ferrum route proxies do not encode header/method predicates |
 | Inbound port exclusions (`excludeInboundPorts`) | Deferred | |
 | IP-range capture exclusions (`excludeOutboundIPRanges`, `includeOutboundIPRanges`) | Deferred | |
