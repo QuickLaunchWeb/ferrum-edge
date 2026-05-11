@@ -172,6 +172,9 @@ With the xDS ADS protocol, invalid resource updates are NACKed and the last acce
 | `FERRUM_MESH_DNS_TTL_SECONDS` | No | `60` | TTL used for synthetic A/AAAA records resolved from mesh ServiceEntry and MeshService state |
 | `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` | No | `1024` | Maximum admitted DNS query tasks and outstanding upstream UDP forwards before the proxy returns SERVFAIL |
 | `FERRUM_MESH_CLUSTER_DOMAIN` | No | `cluster.local` | Kubernetes cluster DNS domain used when synthesizing `{service}.{namespace}.svc.<domain>` names |
+| `FERRUM_MESH_CA_BACKEND` | No | `none` | CA backend for mesh SVID issuance: `none` (no automatic identity), `internal` (self-signed dev CA), `spire_agent` (SPIRE Workload API) |
+| `FERRUM_MESH_SPIRE_AGENT_SOCKET` | No | `/run/spire/sockets/agent.sock` | SPIRE Agent Workload API Unix socket path. Only used when `FERRUM_MESH_CA_BACKEND=spire_agent` |
+| `FERRUM_MESH_CERT_TTL_SECONDS` | No | `3600` | Requested certificate TTL for issued SVIDs |
 
 Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Prometheus plugin when mesh metadata is present. The added series are `ferrum_mesh_requests_total` and `ferrum_mesh_request_duration_ms`, labelled with source/destination workload, namespace, principal, app, service, request protocol, response code, response flags, and connection security policy. HBONE tunnel copy failures after a CONNECT response has already been sent increment `ferrum_mesh_hbone_relay_failures_total` with `proxy_id`, `direction`, and `error_class` labels.
 
@@ -188,6 +191,14 @@ Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the can
 ### Kubernetes Mesh Integration
 
 Phase D adds Kubernetes source translation and sidecar-injector scaffolding. Kubernetes resources translate into `GatewayConfig` / `MeshConfig`; no config source talks directly to the proxy runtime or xDS server.
+
+Istio `DestinationRule` resources are translated: `connectionPool.tcp.connectTimeout` maps to `backend_connect_timeout_ms`, `outlierDetection` maps to passive health checks (`consecutive5xxErrors`, `interval`, `baseEjectionTime`), `loadBalancer` maps to Ferrum algorithms (`ROUND_ROBIN`, `LEAST_REQUEST`/`LEAST_CONN`, `RANDOM`, `consistentHash`), and `subsets` are preserved with per-subset traffic policy overrides. DestinationRule TLS settings (`trafficPolicy.tls`) and port-level traffic policy overrides are deferred — use per-proxy `backend_tls_*` fields.
+
+Istio `VirtualService` per-route features are translated: `retries` maps to Ferrum `RetryConfig` (with `retryOn` tokens for `5xx`, `gateway-error`, `connect-failure`, `reset`, `retriable-4xx`, and numeric status codes), `timeout` maps to `backend_read_timeout_ms` (Go-style duration strings: `10s`, `500ms`, `1m`, `1h`), and `fault` injection maps to proxy-scoped `fault_injection` plugin instances (`abort.httpStatus`/`percentage` and `delay.fixedDelay`/`percentage`).
+
+Istio `AuthorizationPolicy` `requestPrincipals` field is enforced: the `jwks_auth` plugin emits `{issuer}/{subject}` as `request_principal` metadata, and `mesh_authz` evaluates `request_principals` glob patterns against it. Non-empty `request_principals` with no JWT present results in implicit deny (Istio semantics for anonymous requests).
+
+The following Istio surfaces remain deferred: `Sidecar` (egress scoping), `EnvoyFilter`, `ProxyConfig`, `WasmPlugin`, mesh-wide outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`), `AuthorizationPolicy` negative-match fields (`notMethods`, `notPaths`, `notHosts`, `notPorts` — rejected at translation time), `excludeInboundPorts`, `excludeOutboundIPRanges`, and `includeOutboundIPRanges`. Configure equivalent behavior with Ferrum proxy/upstream fields where available. Outbound port exclusion annotations (`traffic.sidecar.istio.io/excludeOutboundPorts` and `ferrum.io/exclude-outbound-ports`) are supported and merged into the iptables capture plan.
 
 Gateway API `HTTPRoute.backendRefs` and Istio `VirtualService.http[].route` splits are preserved during translation. A single backend becomes a direct Ferrum proxy backend; multiple non-zero backends create a generated `Upstream` and the proxy references it through `upstream_id`. Generated upstreams use `weighted_round_robin` only when backend weights differ, otherwise `round_robin`. Each HTTPRoute `matches[]` path and each VirtualService `match[]` URI, including regex URI matches, becomes its own proxy, so path alternatives are not collapsed into the first match. Empty HTTPRoute match entries and omitted `matches` / `match` fields create the route's default catch-all `/` proxy. Explicit HTTPRoute header/method-only and VirtualService header/method-only match entries are skipped because Ferrum route proxies do not encode those predicates yet. GRPCRoute method/service matches continue to translate to a deduplicated catch-all `/` proxy because gRPC method selection is encoded in the HTTP path at request time. Gateway API `weight: 0` backendRefs are skipped; if every backendRef in a matched rule has `weight: 0`, Ferrum emits a generated `ferrum-zero-weight.invalid:65535` blackhole backend so the rule still captures traffic instead of falling through to a later route. That blackhole currently fails as a backend/DNS resolution failure, typically a 502, rather than a synthesized 503. In Istio multi-destination splits, omitted weights and `weight: 0` destinations are inactive; a lone Istio destination still receives all traffic. Malformed or out-of-range route weights are rejected during translation. Kubernetes route translation currently supports numeric backend ports only; resolving `Service.spec.ports[].name` from a backendRef or VirtualService destination is not implemented.
 
@@ -223,6 +234,21 @@ The Istio `AuthorizationPolicy` translator only consumes the four positive-match
 The injector copies non-secret mesh sidecar control-plane env vars from its own environment into injected containers when set: `FERRUM_DP_CP_GRPC_URLS`, `FERRUM_CP_DP_GRPC_JWT_ISSUER`, DP gRPC TLS vars, and `FERRUM_MESH_CONFIG_PROTOCOL`. It does not copy plaintext `FERRUM_CP_DP_GRPC_JWT_SECRET`; set `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` and `FERRUM_INJECTOR_JWT_SECRET_REF_KEY` to inject that variable via `valueFrom.secretKeyRef`.
 
 Injected sidecars run as the configured mesh proxy UID with `runAsNonRoot=true`, `allowPrivilegeEscalation=false`, `readOnlyRootFilesystem=true`, `seccompProfile=RuntimeDefault`, and all Linux capabilities dropped. `FERRUM_MESH_PROXY_UID=0` is rejected at injector startup because Kubernetes would reject a sidecar that combines UID 0 with `runAsNonRoot=true`. The iptables init container explicitly sets `runAsUser=0`, `runAsNonRoot=false`, and `seccompProfile=RuntimeDefault`; it runs as root only long enough to program capture rules, drops all capabilities before adding back `NET_ADMIN` and `NET_RAW`, disables privilege escalation, and receives bounded CPU/memory requests and limits. Injector startup validates those resource quantity env vars so malformed values fail before admission requests are served. Its root filesystem remains writable because iptables needs the xtables lock path while programming capture rules.
+
+### Node Agent
+
+`FERRUM_MODE=node_agent` runs a per-node DaemonSet agent that manages eBPF-based traffic capture for mesh sidecars, replacing the per-pod privileged init container. See [mesh.md](mesh.md#node-agent-mode) for architecture details.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FERRUM_NODE_AGENT_NODE_NAME` | Yes | — | Kubernetes node name (typically from downward API `spec.nodeName`) for pod filtering |
+| `FERRUM_NODE_AGENT_CGROUP_ROOT` | No | `/sys/fs/cgroup` | Cgroup v2 filesystem root for BPF program attachment |
+| `FERRUM_NODE_AGENT_BPF_FS_PATH` | No | `/sys/fs/bpf` | BPF filesystem mount path for pinned maps |
+| `FERRUM_NODE_AGENT_FALLBACK_MODE` | No | `iptables` | Fallback capture method when eBPF is unavailable: `iptables` or `none` |
+| `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES` | No | `kube-system` | Comma-separated Kubernetes namespaces to exclude from capture enrollment |
+| `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | No | (empty) | CIDRs to include in traffic capture (empty = capture all). Inserted into BPF LPM-trie maps |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | No | (empty) | CIDRs to exclude from traffic capture |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | No | (empty) | Ports to exclude from traffic capture |
 
 ### Migration
 
