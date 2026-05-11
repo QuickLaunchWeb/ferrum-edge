@@ -8,8 +8,11 @@
 pub mod consul;
 pub mod dns_sd;
 pub mod kubernetes;
+pub mod mesh;
 
-use crate::config::types::{GatewayConfig, SdProvider, ServiceDiscoveryConfig, UpstreamTarget};
+use crate::config::types::{
+    GatewayConfig, SdProvider, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
+};
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::load_balancer::LoadBalancerCache;
@@ -84,14 +87,7 @@ impl ServiceDiscoveryManager {
     ) {
         for upstream in &config.upstreams {
             if let Some(sd_config) = &upstream.service_discovery {
-                self.start_upstream_task(
-                    &upstream.id,
-                    sd_config,
-                    &upstream.targets,
-                    upstream.algorithm,
-                    upstream.hash_on.clone(),
-                    shutdown_rx.clone(),
-                );
+                self.start_upstream_task(upstream, sd_config, shutdown_rx.clone());
             }
         }
     }
@@ -132,14 +128,7 @@ impl ServiceDiscoveryManager {
                 if let Some((_, entry)) = self.tasks.remove(&upstream.id) {
                     graceful_stop_task(entry, &upstream.id);
                 }
-                self.start_upstream_task(
-                    &upstream.id,
-                    sd_config,
-                    &upstream.targets,
-                    upstream.algorithm,
-                    upstream.hash_on.clone(),
-                    shutdown_rx.clone(),
-                );
+                self.start_upstream_task(upstream, sd_config, shutdown_rx.clone());
             }
         }
     }
@@ -196,13 +185,12 @@ impl ServiceDiscoveryManager {
 
     fn start_upstream_task(
         &self,
-        upstream_id: &str,
+        upstream: &Upstream,
         sd_config: &ServiceDiscoveryConfig,
-        static_targets: &[UpstreamTarget],
-        algorithm: crate::config::types::LoadBalancerAlgorithm,
-        hash_on: Option<String>,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) {
+        let upstream_id = upstream.id.as_str();
+        let upstream_namespace = upstream.namespace.as_str();
         let discoverer: Box<dyn ServiceDiscoverer> = match sd_config.provider {
             SdProvider::DnsSd => {
                 if let Some(dns_config) = &sd_config.dns_sd {
@@ -257,6 +245,34 @@ impl ServiceDiscoveryManager {
                     return;
                 }
             }
+            SdProvider::Mesh => {
+                if let Some(mesh_config) = &sd_config.mesh {
+                    if let Some(request_epoch) = &self.request_epoch {
+                        Box::new(mesh::MeshServiceDiscoverer::new(
+                            request_epoch.clone(),
+                            mesh_config.service_name.clone(),
+                            mesh_config
+                                .namespace
+                                .clone()
+                                .unwrap_or_else(|| upstream_namespace.to_string()),
+                            mesh_config.port,
+                            sd_config.default_weight,
+                        ))
+                    } else {
+                        warn!(
+                            "Service discovery: upstream {} has mesh provider but no request epoch is available",
+                            upstream_id
+                        );
+                        return;
+                    }
+                } else {
+                    warn!(
+                        "Service discovery: upstream {} has mesh provider but no mesh config",
+                        upstream_id
+                    );
+                    return;
+                }
+            }
         };
 
         let poll_interval = match sd_config.provider {
@@ -272,12 +288,18 @@ impl ServiceDiscoveryManager {
                 .consul
                 .as_ref()
                 .map_or(30, |c| c.poll_interval_seconds),
+            SdProvider::Mesh => sd_config
+                .mesh
+                .as_ref()
+                .map_or(30, |c| c.poll_interval_seconds),
         };
 
         let upstream_id_owned = upstream_id.to_string();
         let lb_cache = self.load_balancer_cache.clone();
         let request_epoch = self.request_epoch.clone();
-        let static_targets = static_targets.to_vec();
+        let static_targets = upstream.targets.clone();
+        let algorithm = upstream.algorithm;
+        let hash_on = upstream.hash_on.clone();
         let dns_cache = self.dns_cache.clone();
         let health_checker = self.health_checker.clone();
 
@@ -325,6 +347,7 @@ impl SdProvider {
             SdProvider::DnsSd => "dns_sd",
             SdProvider::Kubernetes => "kubernetes",
             SdProvider::Consul => "consul",
+            SdProvider::Mesh => "mesh",
         }
     }
 }

@@ -3402,6 +3402,7 @@ mod tests {
             upstreams: vec![],
             loaded_at: chrono::Utc::now(),
             known_namespaces: Vec::new(),
+            trust_bundles: None,
             mesh: None,
         };
         ProxyState::new(config, dns_cache, EnvConfig::default(), None, None)

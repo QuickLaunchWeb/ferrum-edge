@@ -26,8 +26,8 @@
 #[allow(dead_code)] // MongoStore is wired up in mode dispatch (database.rs, control_plane.rs)
 mod inner {
     use crate::config::db_backend::{
-        ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult, PaginatedResult,
-        SortOrder,
+        ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, GatewayTrustBundlePoll,
+        IncrementalResult, PaginatedResult, SortOrder,
     };
     use crate::config::types::{
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, Proxy, Upstream,
@@ -1178,6 +1178,17 @@ mod inner {
                 known_namespaces: Vec::new(),
                 ..Default::default()
             })
+        }
+
+        async fn load_gateway_trust_bundles(
+            &self,
+            _namespace: &str,
+        ) -> Result<GatewayTrustBundlePoll, anyhow::Error> {
+            // Mongo backends currently persist gateway resources as separate
+            // collections and do not store top-level GatewayConfig trust
+            // bundles. Preserve whatever trust material the initial config load
+            // supplied instead of clearing it on the first empty poll.
+            Ok(GatewayTrustBundlePoll::Unchanged)
         }
 
         async fn load_incremental_config(

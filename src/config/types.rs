@@ -538,6 +538,8 @@ pub enum SdProvider {
     Kubernetes,
     /// HashiCorp Consul service discovery via HTTP API.
     Consul,
+    /// Ferrum mesh service discovery from the CP-delivered mesh model.
+    Mesh,
 }
 
 /// DNS-SD specific configuration (SRV record-based discovery).
@@ -593,6 +595,23 @@ pub struct ConsulConfig {
     pub poll_interval_seconds: u64,
 }
 
+/// Ferrum mesh service discovery configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshSdConfig {
+    /// Mesh service name to resolve from the CP-delivered mesh model.
+    pub service_name: String,
+    /// Mesh namespace. Defaults to the upstream's namespace when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// Service port to select. If omitted, uses the first service port, then
+    /// falls back to the first advertised workload port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Poll interval in seconds for checking the local mesh snapshot. Default: 30.
+    #[serde(default = "default_sd_poll_interval")]
+    pub poll_interval_seconds: u64,
+}
+
 /// Service discovery configuration for an upstream.
 ///
 /// Attaches a dynamic service discovery source to an upstream. Discovered
@@ -612,6 +631,9 @@ pub struct ServiceDiscoveryConfig {
     /// Consul provider configuration. Required when `provider` is `consul`.
     #[serde(default)]
     pub consul: Option<ConsulConfig>,
+    /// Ferrum mesh provider configuration. Required when `provider` is `mesh`.
+    #[serde(default)]
+    pub mesh: Option<MeshSdConfig>,
     /// Default weight assigned to discovered targets. Default: 1.
     #[serde(default = "default_weight")]
     pub default_weight: u32,
@@ -1344,6 +1366,13 @@ pub struct GatewayConfig {
     /// resources. DB-backed modes use `list_namespaces()` instead.
     #[serde(default)]
     pub known_namespaces: Vec<String>,
+    /// Gateway-consumable mesh trust material delivered by CPs to DPs.
+    ///
+    /// This mirrors the mesh config trust-bundle shape, but sits at the
+    /// gateway config top level so non-mesh gateway DPs can verify mesh peer
+    /// certificates without loading the entire mesh model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_bundles: Option<Box<crate::modes::mesh::config::TrustBundleSet>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
 }
@@ -4008,6 +4037,45 @@ impl ServiceDiscoveryConfig {
                     }
                 } else {
                     errors.push("consul config is required when provider is consul".to_string());
+                }
+            }
+            SdProvider::Mesh => {
+                if let Some(ref mesh) = self.mesh {
+                    if let Err(e) = validate_string_field(
+                        "mesh.service_name",
+                        &mesh.service_name,
+                        MAX_NAME_LENGTH,
+                    ) {
+                        errors.push(e);
+                    }
+                    if mesh.service_name.is_empty() {
+                        errors.push("mesh.service_name must not be empty".to_string());
+                    }
+                    if let Some(ref namespace) = mesh.namespace {
+                        if let Err(e) =
+                            validate_string_field("mesh.namespace", namespace, MAX_NAMESPACE_LENGTH)
+                        {
+                            errors.push(e);
+                        }
+                        if namespace.is_empty() {
+                            errors.push("mesh.namespace must not be empty".to_string());
+                        }
+                    }
+                    if let Some(port) = mesh.port
+                        && port == 0
+                    {
+                        errors.push("mesh.port must be between 1 and 65535".to_string());
+                    }
+                    if let Err(e) = validate_u64_range(
+                        "mesh.poll_interval_seconds",
+                        mesh.poll_interval_seconds,
+                        1,
+                        MAX_SD_POLL_INTERVAL,
+                    ) {
+                        errors.push(e);
+                    }
+                } else {
+                    errors.push("mesh config is required when provider is mesh".to_string());
                 }
             }
         }

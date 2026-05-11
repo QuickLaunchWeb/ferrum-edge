@@ -214,6 +214,10 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 | `consul.tag` | 255 chars | Optional service tag filter |
 | `consul.token` | 4096 chars | Optional ACL token |
 | `consul.poll_interval_seconds` | 1–3,600 | Consul poll interval |
+| `mesh.service_name` | 255 chars, non-empty | Mesh service name |
+| `mesh.namespace` | 254 chars | Optional mesh namespace override |
+| `mesh.port` | 1–65,535 | Optional mesh service port |
+| `mesh.poll_interval_seconds` | 1–3,600 | Mesh snapshot poll interval |
 
 ### Plugin Config Fields
 

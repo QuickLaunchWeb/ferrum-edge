@@ -144,7 +144,9 @@ See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_
 
 Mesh mode consumes Layer 2 mesh slices from the control protocols and prepares the shared sidecar/ambient data-plane listeners. Non-mesh modes do not instantiate this runtime.
 
-With the native `MeshSubscribe` protocol, mesh mode waits for the first delivered mesh slice before serving, builds the proxy/plugin runtime from that slice, and hot-applies later valid slices atomically. Invalid slice updates are logged and ignored so the last accepted runtime config keeps serving. The xDS ADS consumer coalesces bursts with a short debounce and a bounded max-delay cap, so continuous control-plane churn cannot indefinitely postpone applying the latest valid snapshot.
+With the native `MeshSubscribe` protocol, mesh mode waits for the first delivered mesh slice before serving, builds the proxy/plugin runtime from that slice, and hot-applies later valid slices atomically. Duplicate-content slices are skipped before rebuilding the proxy runtime. Invalid slice updates are logged and ignored so the last accepted runtime config keeps serving. The xDS ADS consumer coalesces bursts with a short debounce and a bounded max-delay cap, so continuous control-plane churn cannot indefinitely postpone applying the latest valid snapshot.
+
+With the xDS ADS protocol, invalid resource updates are NACKed and the last accepted snapshot remains active. If one known xDS resource type produces 5 consecutive NACKs without an ACK, the mesh client closes that ADS stream and relies on the existing reconnect/failover loop instead of NACKing the same bad control-plane state forever. In a single-CP deployment that keeps serving the same invalid resource, this becomes a bounded reconnect/NACK cycle governed by the normal jittered backoff until the CP config is corrected. Unknown type URLs are NACKed but not counted in the breaker because this client can never ACK them. Any already-ACKed slice waiting in the debounce window is applied before the stream is closed so reconnect version hints cannot advance past the local runtime.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -171,7 +173,9 @@ With the native `MeshSubscribe` protocol, mesh mode waits for the first delivere
 | `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` | No | `1024` | Maximum admitted DNS query tasks and outstanding upstream UDP forwards before the proxy returns SERVFAIL |
 | `FERRUM_MESH_CLUSTER_DOMAIN` | No | `cluster.local` | Kubernetes cluster DNS domain used when synthesizing `{service}.{namespace}.svc.<domain>` names |
 
-Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Prometheus plugin when mesh metadata is present. The added series are `ferrum_mesh_requests_total` and `ferrum_mesh_request_duration_ms`, labelled with source/destination workload, namespace, principal, app, service, request protocol, response code, response flags, and connection security policy.
+Mesh DNS forwards non-mesh UDP queries through a shared upstream socket with rewritten transaction IDs. If all 65,536 upstream IDs are simultaneously in flight, the proxy SERVFAILs the new query and increments `ferrum_mesh_dns_upstream_id_exhaustions_total` in the Prometheus registry so resolver outages or pathological query bursts are visible. The counter is process-wide and intentionally has no namespace label because the upstream UDP socket is process-wide. The counter is emitted from startup with value `0` so first-event alerting has a stable series.
+
+Mesh observability emits Istio/GAMMA-shaped RED metrics through the existing Prometheus plugin when mesh metadata is present. The added series are `ferrum_mesh_requests_total` and `ferrum_mesh_request_duration_ms`, labelled with source/destination workload, namespace, principal, app, service, request protocol, response code, response flags, and connection security policy. HBONE tunnel copy failures after a CONNECT response has already been sent increment `ferrum_mesh_hbone_relay_failures_total` with `proxy_id`, `direction`, and `error_class` labels.
 
 HBONE identity metadata is read from all `baggage` headers on authenticated HBONE requests where the peer already presented a SPIFFE identity. Baggage values may be percent-encoded, and Ferrum decodes them before extracting `source.principal` or `destination.principal`. Baggage parsing and egress stripping are quoted-value aware, so user-defined members with quoted commas are preserved. Plain HTTP requests, or requests without an authenticated peer, cannot supply `source.principal` through baggage for `mesh_authz` or `workload_metrics`; when unauthenticated HBONE baggage is present, Ferrum stamps `mesh_authz.ignored_baggage.unauthenticated = "true"` and `mesh.ignored_baggage = "unauthenticated_hbone"` for log triage.
 
@@ -186,6 +190,10 @@ Layer 10 multi-cluster configuration lives under `mesh.multi_cluster` in the can
 ### Kubernetes Mesh Integration
 
 Phase D adds Kubernetes source translation and sidecar-injector scaffolding. Kubernetes resources translate into `GatewayConfig` / `MeshConfig`; no config source talks directly to the proxy runtime or xDS server.
+
+Current Kubernetes/Istio compatibility is intentionally translation-focused. Ferrum does not yet model Istio `DestinationRule` (subsets, outlier detection, connection pools, or TLS settings), `Sidecar` egress scoping, `EnvoyFilter`, `ProxyConfig`, `WasmPlugin`, `WorkloadEntry` extensions beyond address/labels/network/cluster metadata, `Telemetry` provider-specific config beyond the basic tracing/metrics/access-log envelopes, or mesh-wide outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`). Configure equivalent behavior with Ferrum proxy/upstream fields where available, and treat the unsupported CRDs as deferred rather than silently enforced. Unknown outbound destinations are not blocked by a mesh-wide registry-only policy today.
+
+Istio sidecar capture annotations are also intentionally narrow today: Ferrum honors the outbound port exclusion documented below, but `excludeInboundPorts`, `excludeOutboundIPRanges`, and `includeOutboundIPRanges` remain deferred and should not be relied on for traffic capture behavior.
 
 Gateway API `HTTPRoute.backendRefs` and Istio `VirtualService.http[].route` splits are preserved during translation. A single backend becomes a direct Ferrum proxy backend; multiple non-zero backends create a generated `Upstream` and the proxy references it through `upstream_id`. Generated upstreams use `weighted_round_robin` only when backend weights differ, otherwise `round_robin`. Each HTTPRoute `matches[]` path and each VirtualService `match[]` URI, including regex URI matches, becomes its own proxy, so path alternatives are not collapsed into the first match. Empty HTTPRoute match entries and omitted `matches` / `match` fields create the route's default catch-all `/` proxy. Explicit HTTPRoute header/method-only and VirtualService header/method-only match entries are skipped because Ferrum route proxies do not encode those predicates yet. GRPCRoute method/service matches continue to translate to a deduplicated catch-all `/` proxy because gRPC method selection is encoded in the HTTP path at request time. Gateway API `weight: 0` backendRefs are skipped; if every backendRef in a matched rule has `weight: 0`, Ferrum emits a generated `ferrum-zero-weight.invalid:65535` blackhole backend so the rule still captures traffic instead of falling through to a later route. That blackhole currently fails as a backend/DNS resolution failure, typically a 502, rather than a synthesized 503. In Istio multi-destination splits, omitted weights and `weight: 0` destinations are inactive; a lone Istio destination still receives all traffic. Malformed or out-of-range route weights are rejected during translation. Kubernetes route translation currently supports numeric backend ports only; resolving `Service.spec.ports[].name` from a backendRef or VirtualService destination is not implemented.
 
@@ -207,10 +215,23 @@ The Istio `AuthorizationPolicy` translator only consumes the four positive-match
 | `FERRUM_INJECTOR_TRUST_DOMAIN` | No | `cluster.local` | Trust domain used to derive injected sidecar `FERRUM_MESH_WORKLOAD_SPIFFE_ID` from pod namespace and service account |
 | `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` | No | — | Kubernetes Secret name used as the injected sidecar `FERRUM_CP_DP_GRPC_JWT_SECRET` source |
 | `FERRUM_INJECTOR_JWT_SECRET_REF_KEY` | No | — | Key inside `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` used as the injected sidecar `FERRUM_CP_DP_GRPC_JWT_SECRET` source |
+| `FERRUM_MESH_EXCLUDE_OUTBOUND_PORTS` | No | — | Comma-separated TCP destination ports that the injector excludes from outbound iptables capture |
+| `FERRUM_INJECTOR_SIDECAR_CPU_REQUEST` | No | `25m` | CPU request injected for the Ferrum sidecar container |
+| `FERRUM_INJECTOR_SIDECAR_MEMORY_REQUEST` | No | `64Mi` | Memory request injected for the Ferrum sidecar container |
+| `FERRUM_INJECTOR_SIDECAR_CPU_LIMIT` | No | `250m` | CPU limit injected for the Ferrum sidecar container |
+| `FERRUM_INJECTOR_SIDECAR_MEMORY_LIMIT` | No | `256Mi` | Memory limit injected for the Ferrum sidecar container |
+| `FERRUM_INJECTOR_INIT_CPU_REQUEST` | No | `10m` | CPU request injected for the iptables init container |
+| `FERRUM_INJECTOR_INIT_MEMORY_REQUEST` | No | `32Mi` | Memory request injected for the iptables init container |
+| `FERRUM_INJECTOR_INIT_CPU_LIMIT` | No | `100m` | CPU limit injected for the iptables init container |
+| `FERRUM_INJECTOR_INIT_MEMORY_LIMIT` | No | `128Mi` | Memory limit injected for the iptables init container |
 | `FERRUM_INJECTOR_TLS_CERT_PATH` | Kubernetes webhook deployments | — | TLS certificate presented by the injector webhook server |
 | `FERRUM_INJECTOR_TLS_KEY_PATH` | Kubernetes webhook deployments | — | TLS private key for `FERRUM_INJECTOR_TLS_CERT_PATH` |
 
 The injector copies non-secret mesh sidecar control-plane env vars from its own environment into injected containers when set: `FERRUM_DP_CP_GRPC_URLS`, `FERRUM_CP_DP_GRPC_JWT_ISSUER`, DP gRPC TLS vars, and `FERRUM_MESH_CONFIG_PROTOCOL`. It does not copy plaintext `FERRUM_CP_DP_GRPC_JWT_SECRET`; set `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` and `FERRUM_INJECTOR_JWT_SECRET_REF_KEY` to inject that variable via `valueFrom.secretKeyRef`.
+
+Outbound capture exclusions can also be set per pod with `traffic.sidecar.istio.io/excludeOutboundPorts` or `ferrum.io/excludeOutboundPorts`, using comma-separated TCP ports. Global and pod-local lists are merged and deduplicated before the init container renders iptables `RETURN` rules. Other Istio capture annotations such as `excludeInboundPorts`, `includeOutboundPorts`, `excludeOutboundIPRanges`, and `includeOutboundIPRanges` are not implemented yet.
+
+Injected sidecars run as the configured mesh proxy UID with `runAsNonRoot=true`, `allowPrivilegeEscalation=false`, `readOnlyRootFilesystem=true`, `seccompProfile=RuntimeDefault`, and all Linux capabilities dropped. `FERRUM_MESH_PROXY_UID=0` is rejected at injector startup because Kubernetes would reject a sidecar that combines UID 0 with `runAsNonRoot=true`. The iptables init container explicitly sets `runAsUser=0`, `runAsNonRoot=false`, and `seccompProfile=RuntimeDefault`; it runs as root only long enough to program capture rules, drops all capabilities before adding back `NET_ADMIN` and `NET_RAW`, disables privilege escalation, and receives bounded CPU/memory requests and limits. Injector startup validates those resource quantity env vars so malformed values fail before admission requests are served. Its root filesystem remains writable because iptables needs the xtables lock path while programming capture rules.
 
 ### Migration
 
@@ -271,6 +292,10 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 | `FERRUM_TLS_CA_BUNDLE_PATH` | No | — | Path to PEM CA bundle for all outbound TLS verification |
 | `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for backend mTLS |
 | `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for backend mTLS |
+| `FERRUM_GATEWAY_SVID_CERT_PATH` | No | — | Leaf-first PEM X.509-SVID certificate chain used as the gateway's SPIFFE identity for gateway-to-mesh TLS |
+| `FERRUM_GATEWAY_SVID_KEY_PATH` | No | — | PKCS#8 private key for `FERRUM_GATEWAY_SVID_CERT_PATH` |
+| `FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH` | No | — | PEM trust bundle used to verify mesh SPIFFE peers for gateway-to-mesh TLS |
+| `FERRUM_GATEWAY_SPIFFE_ID` | No | — | Explicit SPIFFE URI fallback when the gateway SVID certificate has no SPIFFE URI SAN |
 | `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | Path to client CA bundle for mTLS verification |
 | `FERRUM_TLS_NO_VERIFY` | No | `false` | Disable outbound TLS verification for all connections (testing only) |
 | `FERRUM_TLS_CRL_FILE_PATH` | No | — | PEM CRL bundle for revocation checks across TLS/DTLS surfaces |
@@ -284,6 +309,10 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 | `FERRUM_TLS_EARLY_DATA_METHODS` | No | — | Comma-separated methods allowed as TLS 1.3 0-RTT early data |
 
 These TLS policy settings apply uniformly to both inbound (frontend) and outbound (backend) connections across all TLS-capable protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP-TLS). DTLS uses a separate library and is not affected. See [frontend_tls.md](frontend_tls.md) and [backend_mtls.md](backend_mtls.md) for detailed TLS configuration guides.
+
+Gateway SVID files are static startup inputs. Set all three SVID path variables together; the gateway rejects partial configuration and validates the leaf certificate, intermediate certificate freshness, PKCS#8 key match, and trust bundle before serving. The SPIFFE ID is read from the leaf URI SAN when present; `FERRUM_GATEWAY_SPIFFE_ID` is only a fallback for file bundles without a SPIFFE URI SAN. Private keys must be PKCS#8 PEM (`BEGIN PRIVATE KEY`); legacy `BEGIN RSA PRIVATE KEY` or `BEGIN EC PRIVATE KEY` files are rejected.
+
+Gateway DPs can also receive mesh SPIFFE trust bundles from the CP. `GatewayConfig.trust_bundles` uses the same serializable `TrustBundleSet` shape as mesh config on the CP side, but CP `ConfigUpdate` and `FullConfigResponse` messages carry that material only in the `trust_bundles_json` side channel so older DPs can keep deserializing full snapshot `GatewayConfig` JSON safely. Stream snapshots, stream deltas, and unary full snapshots all refresh gateway-to-mesh trust material; JSON `null` explicitly clears previously delivered CP trust, including when the CP rejects invalid trust-bundle material and must revoke stale anchors instead of leaving them unchanged. When a gateway SVID is loaded from files, received trust bundles temporarily override the SVID bundle's trust material in the lock-free slot; if a later authoritative CP update clears them, the DP restores the startup file trust. Without a local SVID, the DP still stores CP-delivered bundles for later gateway-mesh features.
 
 Admin listener TLS and mTLS variables are listed in [Admin API](#admin-api).
 
@@ -558,7 +587,7 @@ proxies:
 
 ### Service Discovery
 
-Upstreams can discover targets dynamically using a `service_discovery` block. Three providers are supported:
+Upstreams can discover targets dynamically using a `service_discovery` block. Four providers are supported:
 
 **DNS-SD** (DNS Service Discovery):
 ```yaml
@@ -606,6 +635,23 @@ upstreams:
         poll_interval_seconds: 10
         token: "consul-acl-token"
 ```
+
+**Ferrum Mesh**:
+```yaml
+upstreams:
+  - id: "mesh-payments"
+    targets: []
+    algorithm: round_robin
+    service_discovery:
+      provider: mesh
+      mesh:
+        service_name: "payments"
+        namespace: "backend"   # optional; defaults to the upstream namespace
+        port: 8080             # optional; defaults to the first mesh service port
+        poll_interval_seconds: 5
+```
+
+The mesh provider reads the CP-delivered `mesh.services` and `mesh.workloads` snapshot already present in gateway DP config. It converts matching workload addresses into upstream targets tagged with `mesh.spiffe_id`, `mesh.namespace`, and `mesh.hbone=true`, allowing later gateway-to-mesh transport features to select mesh-aware backends without a separate registry.
 
 Discovered targets are merged with any statically defined `targets`. If the provider is unreachable, the upstream keeps its last-known targets to maintain availability.
 
