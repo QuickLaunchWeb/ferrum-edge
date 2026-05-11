@@ -65,13 +65,13 @@ struct DnsQuery {
     /// Original flags from the query (we copy RD etc.).
     flags: u16,
     /// Normalized hostname: lowercase, trailing dot stripped.
-    name: String,
+    name: Arc<str>,
     /// Query type (1 = A, 28 = AAAA).
     qtype: u16,
     /// Query class (1 = IN).
     qclass: u16,
     /// EDNS(0) OPT pseudo-record from the query, echoed when it fits.
-    opt_record: Option<Vec<u8>>,
+    opt_record: Option<Arc<[u8]>>,
     /// Client-advertised UDP response size from EDNS(0), clamped at response time.
     udp_payload_size: usize,
 }
@@ -88,22 +88,29 @@ struct WildcardRecordSet {
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct DnsResponseCacheKey {
-    name: String,
+    name: Arc<str>,
     qtype: u16,
     qclass: u16,
     rd: bool,
+    cd: bool,
+    ad: bool,
     ttl: u32,
     max_response_size: usize,
-    opt_record: Option<Vec<u8>>,
+    opt_record: Option<Arc<[u8]>>,
 }
+
+const FLAGS_CD: u16 = 0x0010;
+const FLAGS_AD: u16 = 0x0020;
 
 impl DnsResponseCacheKey {
     fn from_query(query: &DnsQuery, ttl: u32, max_response_size: usize) -> Self {
         Self {
-            name: query.name.clone(),
+            name: Arc::clone(&query.name),
             qtype: query.qtype,
             qclass: query.qclass,
             rd: query.flags & FLAGS_RD != 0,
+            cd: query.flags & FLAGS_CD != 0,
+            ad: query.flags & FLAGS_AD != 0,
             ttl,
             max_response_size,
             opt_record: query.opt_record.clone(),
@@ -1175,7 +1182,9 @@ fn upstream_response_matches_pending_query(response: &[u8], pending: &DnsQuery) 
     let qtype = u16::from_be_bytes([response[offset], response[offset + 1]]);
     let qclass = u16::from_be_bytes([response[offset + 2], response[offset + 3]]);
 
-    normalize_dns_name(&name) == pending.name && qtype == pending.qtype && qclass == pending.qclass
+    *normalize_dns_name(&name) == *pending.name
+        && qtype == pending.qtype
+        && qclass == pending.qclass
 }
 
 async fn send_udp_servfail(socket: &UdpSocket, query: &DnsQuery, client: SocketAddr) {
@@ -1278,10 +1287,10 @@ fn parse_dns_query(packet: &[u8]) -> Option<DnsQuery> {
     Some(DnsQuery {
         id,
         flags,
-        name: normalized,
+        name: Arc::from(normalized.as_str()),
         qtype,
         qclass,
-        opt_record,
+        opt_record: opt_record.map(|v| Arc::from(v.into_boxed_slice())),
         udp_payload_size,
     })
 }
@@ -1379,7 +1388,7 @@ fn build_dns_response(
     response.extend_from_slice(&query.qtype.to_be_bytes());
     response.extend_from_slice(&query.qclass.to_be_bytes());
 
-    let opt_len = query.opt_record.as_ref().map_or(0, Vec::len);
+    let opt_len = query.opt_record.as_ref().map_or(0, |r| r.len());
     let mut answer_count = 0u16;
     let mut truncated = false;
 
@@ -1658,7 +1667,7 @@ mod tests {
         let packet = build_a_query("example.com");
         let query = parse_dns_query(&packet).expect("should parse");
         assert_eq!(query.id, 0x1234);
-        assert_eq!(query.name, "example.com");
+        assert_eq!(&*query.name, "example.com");
         assert_eq!(query.qtype, QTYPE_A);
         assert_eq!(query.qclass, QCLASS_IN);
     }
@@ -1667,7 +1676,7 @@ mod tests {
     fn parse_dns_query_valid_aaaa_query() {
         let packet = build_aaaa_query("ipv6.example.com");
         let query = parse_dns_query(&packet).expect("should parse");
-        assert_eq!(query.name, "ipv6.example.com");
+        assert_eq!(&*query.name, "ipv6.example.com");
         assert_eq!(query.qtype, QTYPE_AAAA);
     }
 
@@ -1969,10 +1978,12 @@ mod tests {
 
         for index in 0..(DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES + 16) {
             let key = DnsResponseCacheKey {
-                name: format!("svc-{index}.example.com"),
+                name: Arc::from(format!("svc-{index}.example.com").as_str()),
                 qtype: QTYPE_A,
                 qclass: QCLASS_IN,
                 rd: true,
+                cd: false,
+                ad: false,
                 ttl: 60,
                 max_response_size: DNS_UDP_SAFE_PACKET_SIZE,
                 opt_record: None,
@@ -1992,10 +2003,12 @@ mod tests {
 
         for index in 0..4 {
             let key = DnsResponseCacheKey {
-                name: format!("svc-{index}.example.com"),
+                name: Arc::from(format!("svc-{index}.example.com").as_str()),
                 qtype: QTYPE_A,
                 qclass: QCLASS_IN,
                 rd: true,
+                cd: false,
+                ad: false,
                 ttl: 60,
                 max_response_size: DNS_UDP_SAFE_PACKET_SIZE,
                 opt_record: None,
@@ -2004,6 +2017,34 @@ mod tests {
         }
 
         assert_eq!(table.response_cache_len(), 2);
+    }
+
+    #[test]
+    fn mesh_response_cache_differentiates_cd_ad_flags() {
+        let table = DnsResolutionTable::empty();
+        let base = || DnsResponseCacheKey {
+            name: Arc::from("svc.example.com"),
+            qtype: QTYPE_A,
+            qclass: QCLASS_IN,
+            rd: true,
+            cd: false,
+            ad: false,
+            ttl: 60,
+            max_response_size: DNS_UDP_SAFE_PACKET_SIZE,
+            opt_record: None,
+        };
+
+        let _ = table.cached_mesh_response(base(), 0x1234, || vec![0x00, 0x00, 0xAA]);
+
+        let mut cd_key = base();
+        cd_key.cd = true;
+        let _ = table.cached_mesh_response(cd_key, 0x1234, || vec![0x00, 0x00, 0xBB]);
+
+        let mut ad_key = base();
+        ad_key.ad = true;
+        let _ = table.cached_mesh_response(ad_key, 0x1234, || vec![0x00, 0x00, 0xCC]);
+
+        assert_eq!(table.response_cache_len(), 3);
     }
 
     #[tokio::test]
