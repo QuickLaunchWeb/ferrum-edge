@@ -148,6 +148,11 @@ pub(crate) struct K8sAccumulator {
     reference_grants: HashSet<ReferenceGrantPermission>,
     proxy_sources: HashMap<String, SourceKind>,
     known_namespaces: HashSet<String>,
+    /// Port-name → port-number index for collected `Service` objects, keyed
+    /// by `(namespace, service_name)`. Built in the translator pre-pass so
+    /// VirtualService destinations carrying `port.name` (not `port.number`)
+    /// can be resolved against the workload's actual Service.
+    service_port_names: HashMap<(String, String), HashMap<String, u16>>,
 }
 
 impl K8sAccumulator {
@@ -160,7 +165,22 @@ impl K8sAccumulator {
             reference_grants: HashSet::new(),
             proxy_sources: HashMap::new(),
             known_namespaces: HashSet::new(),
+            service_port_names: HashMap::new(),
         }
+    }
+
+    /// Resolve a Service port name to its `port` value. Returns `None` when
+    /// the service was never collected (cluster-external host, foreign
+    /// namespace, etc.) or when the named port isn't on that service.
+    pub(crate) fn lookup_service_port(
+        &self,
+        namespace: &str,
+        service: &str,
+        port_name: &str,
+    ) -> Option<u16> {
+        self.service_port_names
+            .get(&(namespace.to_string(), service.to_string()))
+            .and_then(|ports| ports.get(port_name).copied())
     }
 
     fn observe_namespace(&mut self, namespace: &str) {
@@ -304,6 +324,8 @@ where
         acc.observe_namespace(&object.metadata.namespace);
         if object.kind == "ReferenceGrant" {
             gateway_api::collect_reference_grant(&mut acc, object)?;
+        } else if object.kind == "Service" {
+            collect_service(&mut acc, object)?;
         }
     }
 
@@ -322,6 +344,12 @@ where
             }));
         }
 
+        // Service objects are consumed by the pre-pass for port-name resolution;
+        // they do not produce Ferrum proxies/upstreams directly.
+        if object.kind == "Service" {
+            continue;
+        }
+
         if istio::translate(&mut acc, object)? || gateway_api::translate(&mut acc, object)? {
             continue;
         }
@@ -333,6 +361,41 @@ where
     }
 
     Ok(acc.finish())
+}
+
+/// Collect the `ports[].name → port` map from a core/v1 Service so later
+/// translation passes can resolve Istio `destination.port.name` references.
+/// Services with no named ports populate an empty entry — callers can still
+/// distinguish "service exists, port name unknown" from "service unknown".
+pub(crate) fn collect_service(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+) -> Result<(), K8sTranslateError> {
+    let ports = object
+        .spec
+        .get("ports")
+        .and_then(Value::as_array)
+        .map(|arr| arr.as_slice())
+        .unwrap_or(&[]);
+    let mut port_names: HashMap<String, u16> = HashMap::new();
+    for port_entry in ports {
+        let Some(name) = string_field(port_entry, "name") else {
+            continue;
+        };
+        let Some(raw) = port_entry.get("port").and_then(Value::as_u64) else {
+            continue;
+        };
+        let port = port_from_u64(object, raw, "Service.spec.ports[].port")?;
+        port_names.insert(name.to_string(), port);
+    }
+    acc.service_port_names.insert(
+        (
+            object.metadata.namespace.clone(),
+            object.metadata.name.clone(),
+        ),
+        port_names,
+    );
+    Ok(())
 }
 
 pub(crate) fn invalid_resource(

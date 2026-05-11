@@ -958,12 +958,7 @@ fn route_backends(
                 "VirtualService route.destination.host is required",
             ));
         };
-        let port = optional_port_field(
-            object,
-            destination.get("port").and_then(|p| p.get("number")),
-            "route.destination.port.number",
-        )?
-        .unwrap_or(80);
+        let port = resolve_destination_port(object, destination, host, acc)?.unwrap_or(80);
         backends.push(RouteBackend {
             host: host.to_string(),
             port,
@@ -984,6 +979,58 @@ fn route_backends(
         }
     }
     Ok(backends)
+}
+
+/// Resolve `destination.port` to a numeric port. Accepts either
+/// `port.number` (integer) or `port.name` (string), with the latter looked
+/// up against the `Service.spec.ports[].name` index built in the
+/// translator pre-pass. Hosts that point at a service outside the loaded
+/// namespace set (cluster-external hosts, foreign namespaces) and lack a
+/// numeric port fall back to the caller's default — matching today's
+/// behavior of "no port specified".
+fn resolve_destination_port(
+    object: &K8sObject,
+    destination: &Value,
+    host: &str,
+    acc: &K8sAccumulator,
+) -> Result<Option<u16>, K8sTranslateError> {
+    let Some(port_value) = destination.get("port") else {
+        return Ok(None);
+    };
+    if let Some(numeric) = port_value.get("number") {
+        return optional_port_field(object, Some(numeric), "route.destination.port.number");
+    }
+    let Some(name) = string_field(port_value, "name") else {
+        return Ok(None);
+    };
+    let (svc, ns) = service_host_components(host, &object.metadata.namespace);
+    match acc.lookup_service_port(&ns, &svc, name) {
+        Some(port) => Ok(Some(port)),
+        None => Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService route.destination.port.name '{}' did not match any port on Service {}/{}",
+                name, ns, svc
+            ),
+        )),
+    }
+}
+
+/// Parse an Istio destination host into `(service_name, namespace)`.
+/// Accepts:
+///   - `<svc>` (short form; falls back to the resource's own namespace)
+///   - `<svc>.<ns>` (two-label form)
+///   - `<svc>.<ns>.svc.cluster.local` (FQDN form — only the first two
+///     labels are inspected; the cluster-local suffix is discarded)
+///
+/// Anything that doesn't match these patterns returns the full host as the
+/// service name and the resource's namespace — `lookup_service_port` will
+/// miss, the caller emits an actionable error.
+fn service_host_components(host: &str, default_namespace: &str) -> (String, String) {
+    let mut parts = host.split('.');
+    let service = parts.next().unwrap_or(host).to_string();
+    let namespace = parts.next().unwrap_or(default_namespace).to_string();
+    (service, namespace)
 }
 
 fn route_weight(object: &K8sObject, route: &Value) -> Result<u32, K8sTranslateError> {
@@ -4000,6 +4047,139 @@ mod tests {
                 .and_then(|policy| policy.outlier_detection.as_ref())
                 .and_then(|outlier| outlier.interval_seconds),
             Some(1)
+        );
+    }
+
+    // ── Service.spec.ports[].name resolution ──────────────────────────────
+
+    fn service_with_named_ports(name: &str, namespace: &str, ports: &[(&str, u16)]) -> K8sObject {
+        let ports_json: Vec<Value> = ports
+            .iter()
+            .map(|(name, port)| serde_json::json!({"name": name, "port": *port}))
+            .collect();
+        K8sObject {
+            api_version: "v1".to_string(),
+            kind: "Service".to_string(),
+            metadata: K8sMetadata {
+                name: name.to_string(),
+                namespace: namespace.to_string(),
+                labels: HashMap::new(),
+            },
+            spec: serde_json::json!({ "ports": ports_json }),
+        }
+    }
+
+    fn virtual_service_with_destination(name: &str, destination: Value) -> K8sObject {
+        K8sObject {
+            api_version: "networking.istio.io/v1".to_string(),
+            kind: "VirtualService".to_string(),
+            metadata: K8sMetadata {
+                name: name.to_string(),
+                namespace: "default".to_string(),
+                labels: HashMap::new(),
+            },
+            spec: serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/api"}}],
+                    "route": [{"destination": destination}]
+                }]
+            }),
+        }
+    }
+
+    #[test]
+    fn vs_destination_port_name_resolves_against_collected_service() {
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080), ("grpc", 9090)]);
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "port": {"name": "http"}
+            }),
+        );
+
+        let result = translate_k8s_objects(&[svc, vs], options()).expect("translation succeeds");
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn vs_destination_port_number_still_wins_over_name() {
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "port": {"number": 7777, "name": "http"}
+            }),
+        );
+
+        let result = translate_k8s_objects(&[svc, vs], options()).expect("translation succeeds");
+        // Explicit `number` takes precedence even when both are set.
+        assert_eq!(result.config.proxies[0].backend_port, 7777);
+    }
+
+    #[test]
+    fn vs_destination_port_name_short_host_uses_vs_namespace() {
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews",
+                "port": {"name": "http"}
+            }),
+        );
+
+        let result = translate_k8s_objects(&[svc, vs], options()).expect("translation succeeds");
+        assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn vs_destination_port_name_unknown_fails_closed() {
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "port": {"name": "missing-port"}
+            }),
+        );
+
+        let err = translate_k8s_objects(&[svc, vs], options())
+            .expect_err("unknown port name must fail closed");
+        assert!(
+            err.to_string().contains("missing-port"),
+            "error must name the missing port: {err}"
+        );
+    }
+
+    #[test]
+    fn vs_destination_no_port_defaults_to_80() {
+        // No port block at all — preserve today's "default to 80" behavior
+        // regardless of whether a matching Service exists.
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local"
+            }),
+        );
+
+        let result = translate_k8s_objects(&[vs], options()).expect("translation succeeds");
+        assert_eq!(result.config.proxies[0].backend_port, 80);
+    }
+
+    #[test]
+    fn service_object_is_not_translated_as_warning() {
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let result = translate_k8s_objects(&[svc], options()).expect("translation succeeds");
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("Ignoring unsupported Kubernetes resource kind 'Service'")),
+            "Service kind must be consumed by the port-name pre-pass, not warned: {:?}",
+            result.warnings
         );
     }
 }

@@ -830,6 +830,10 @@ Per-route `fault` configuration is translated to proxy-scoped `fault_injection` 
 - `fault.abort.httpStatus` + `fault.abort.percentage` -> abort with status code at the configured rate.
 - `fault.delay.fixedDelay` + `fault.delay.percentage` -> inject latency at the configured rate.
 
+### Destination Port Resolution
+
+`route.destination.port` accepts either `number` (integer) or `name` (string). When a name is given, the translator resolves it against the `Service.spec.ports[].name` index built from collected core/v1 `Service` objects in the same translation batch. `port.number` always wins when both are set. An unknown port name fails translation closed with the offending name in the error. Hosts are parsed as `<svc>`, `<svc>.<ns>`, or `<svc>.<ns>.svc.cluster.local`; short hosts fall back to the VirtualService's own namespace. Numeric-port-only deployments need no changes.
+
 ## Istio Compatibility Gaps
 
 The following Istio mesh surfaces are **not yet supported** and should be treated as deferred:
@@ -847,7 +851,6 @@ The following Istio mesh surfaces are **not yet supported** and should be treate
 | `VirtualService` header/method-only matches | Skipped | Ferrum route proxies do not encode header/method predicates |
 | Inbound port exclusions (`excludeInboundPorts`) | Deferred | |
 | IP-range capture exclusions (`excludeOutboundIPRanges`, `includeOutboundIPRanges`) | Deferred | |
-| `Service.spec.ports[].name` resolution | Deferred | Use numeric ports in backendRefs and VirtualService destinations |
 | `WorkloadEntry` beyond address/labels/network/cluster | Partial | Basic fields supported; full VM lifecycle deferred |
 | `Telemetry` provider-specific config | Partial | Basic tracing/metrics/access-log envelopes supported |
 
