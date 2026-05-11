@@ -501,10 +501,19 @@ pub struct PeerAuthentication {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MtlsMode {
+    // ── PeerAuthentication server-side modes ──
     Strict,
     #[default]
     Permissive,
     Disable,
+    // ── DestinationRule client-side modes (Istio `ClientTLSSettings.mode`) ──
+    /// SIMPLE: originate TLS to the backend, verify the server certificate.
+    Simple,
+    /// MUTUAL: originate mTLS with operator-provided client cert/key.
+    Mutual,
+    /// ISTIO_MUTUAL: originate mTLS using the workload's SPIFFE identity
+    /// material (no explicit cert/key in the DR).
+    IstioMutual,
 }
 
 // ── ServiceEntry ──────────────────────────────────────────────────────────
@@ -733,6 +742,66 @@ pub struct MeshTrafficPolicy {
     /// Load balancer configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_balancer: Option<MeshLoadBalancer>,
+    /// Optional backend TLS override from `DestinationRule.trafficPolicy.tls`.
+    ///
+    /// When `None` (default) the workload's `PeerAuthentication`-derived
+    /// mTLS posture continues to apply. When `Some(...)` the DR settings
+    /// win at cold-path apply time: `apply_traffic_policy_to_upstream`
+    /// projects them onto the matching `Upstream`'s `backend_tls_*` fields.
+    /// Old DPs reading new slices see this as a no-op (serde defaults to
+    /// `None`); new DPs reading old slices behave identically to today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<MeshTrafficPolicyTls>,
+}
+
+/// `DestinationRule.trafficPolicy.tls` settings mapped from Istio's
+/// `ClientTLSSettings` (`networking.istio.io/v1beta1`).
+///
+/// Carries the originating-client TLS mode plus optional SNI, CA, client
+/// cert/key, SAN verification list, and an `insecureSkipVerify` escape
+/// hatch. The cold-path apply at `apply_traffic_policy_to_upstream`
+/// projects these onto the `Upstream` `backend_tls_*` fields when set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshTrafficPolicyTls {
+    /// DR client-side TLS mode: `Disable` / `Simple` / `Mutual` / `IstioMutual`.
+    pub mode: MtlsMode,
+    /// Optional Server Name Indication value sent on the backend handshake.
+    /// Today this is a schema-compatibility field — `Upstream` does not yet
+    /// have a per-upstream SNI override (Ferrum's reqwest path derives SNI
+    /// from the host header / target address). Captured here so cold-path
+    /// apply can warn when set and future work can wire it through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    /// Optional path to a PEM CA bundle for verifying the backend server's
+    /// certificate (Istio `caCertificates`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_certificates: Option<String>,
+    /// Optional path to a PEM client certificate for mTLS with the backend
+    /// (Istio `clientCertificate`). Required when `mode == Mutual`; must be
+    /// absent when `mode == IstioMutual`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_certificate: Option<String>,
+    /// Optional path to a PEM private key for mTLS with the backend
+    /// (Istio `privateKey`). Required when `mode == Mutual`; must be
+    /// absent when `mode == IstioMutual`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    /// Optional list of acceptable Subject Alternative Names for the
+    /// backend's server certificate (Istio `subjectAltNames`). Today this
+    /// is a schema-compatibility field — Ferrum's `backend_tls_*` surface
+    /// does not yet expose a per-upstream SAN allow-list. Captured here
+    /// so cold-path apply can warn when set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subject_alt_names: Vec<String>,
+    /// When true, suppress server-cert verification on the backend handshake
+    /// (Istio `insecureSkipVerify`). Maps to
+    /// `Upstream.backend_tls_verify_server_cert = false`.
+    #[serde(default = "default_insecure_skip_verify")]
+    pub insecure_skip_verify: bool,
+}
+
+fn default_insecure_skip_verify() -> bool {
+    false
 }
 
 /// Outlier detection settings from Istio DestinationRule.

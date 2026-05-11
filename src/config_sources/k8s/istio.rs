@@ -8,9 +8,10 @@ use crate::modes::mesh::config::{
     MeshConsistentHash, MeshDestinationRule, MeshEndpoint, MeshJwtRule, MeshLoadBalancer,
     MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshRequestAuthentication, MeshRule,
     MeshSimpleLb, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
-    MeshTrafficPolicy, MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope,
-    PrincipalMatch, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
-    TagOverrideOperation, Workload, WorkloadPort, WorkloadSelector,
+    MeshTrafficPolicy, MeshTrafficPolicyTls, MetricTagOverride, MtlsMode, PeerAuthentication,
+    PolicyAction, PolicyScope, PrincipalMatch, RequestMatch, Resolution, ServiceEntry,
+    ServiceEntryLocation, ServicePort, TagOverrideOperation, Workload, WorkloadPort,
+    WorkloadSelector,
 };
 
 use super::{
@@ -566,10 +567,103 @@ fn translate_traffic_policy(
         .map(|lb| translate_load_balancer(acc, object, lb))
         .transpose()?;
 
+    let tls = value
+        .get("tls")
+        .map(|tls| translate_client_tls_settings(object, tls))
+        .transpose()?;
+
     Ok(MeshTrafficPolicy {
         connect_timeout_ms,
         outlier_detection,
         load_balancer,
+        tls,
+    })
+}
+
+/// Translate Istio `DestinationRule.trafficPolicy.tls` (a.k.a.
+/// `ClientTLSSettings`) into a `MeshTrafficPolicyTls`.
+///
+/// `mode` maps:
+/// - `DISABLE` -> `MtlsMode::Disable`
+/// - `SIMPLE` -> `MtlsMode::Simple`
+/// - `MUTUAL` -> `MtlsMode::Mutual`
+/// - `ISTIO_MUTUAL` -> `MtlsMode::IstioMutual`
+///
+/// Validation:
+/// - `ISTIO_MUTUAL` rejects explicit `clientCertificate`/`privateKey`/
+///   `caCertificates` — Istio reuses the workload's SPIFFE identity material.
+/// - `MUTUAL` requires both `clientCertificate` AND `privateKey` (matches
+///   Istio's `pilot-validation`).
+fn translate_client_tls_settings(
+    object: &K8sObject,
+    value: &Value,
+) -> Result<MeshTrafficPolicyTls, K8sTranslateError> {
+    let mode_raw = string_field(value, "mode").unwrap_or("SIMPLE");
+    let mode = match mode_raw {
+        "DISABLE" => MtlsMode::Disable,
+        "SIMPLE" => MtlsMode::Simple,
+        "MUTUAL" => MtlsMode::Mutual,
+        "ISTIO_MUTUAL" => MtlsMode::IstioMutual,
+        other => {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "trafficPolicy.tls.mode '{other}' is unsupported (expected one of \
+                     DISABLE, SIMPLE, MUTUAL, ISTIO_MUTUAL)"
+                ),
+            ));
+        }
+    };
+
+    let sni = string_field(value, "sni").map(ToOwned::to_owned);
+    let ca_certificates = string_field(value, "caCertificates").map(ToOwned::to_owned);
+    let client_certificate = string_field(value, "clientCertificate").map(ToOwned::to_owned);
+    let private_key = string_field(value, "privateKey").map(ToOwned::to_owned);
+    let subject_alt_names = string_array(value, "subjectAltNames");
+    let insecure_skip_verify = value
+        .get("insecureSkipVerify")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    match mode {
+        MtlsMode::IstioMutual => {
+            if client_certificate.is_some() || private_key.is_some() || ca_certificates.is_some() {
+                return Err(invalid_resource(
+                    object,
+                    "trafficPolicy.tls.mode=ISTIO_MUTUAL must not set \
+                     clientCertificate/privateKey/caCertificates — Istio reuses the \
+                     workload's SPIFFE identity material",
+                ));
+            }
+        }
+        MtlsMode::Mutual => {
+            if client_certificate.is_none() || private_key.is_none() {
+                return Err(invalid_resource(
+                    object,
+                    "trafficPolicy.tls.mode=MUTUAL requires both clientCertificate and \
+                     privateKey",
+                ));
+            }
+        }
+        MtlsMode::Disable | MtlsMode::Simple => {}
+        // PeerAuthentication-side modes can't be set via DR.tls.mode in Istio;
+        // translation above only emits the four client-side modes.
+        MtlsMode::Strict | MtlsMode::Permissive => {
+            return Err(invalid_resource(
+                object,
+                format!("trafficPolicy.tls.mode '{mode_raw}' is not a client-side TLS mode"),
+            ));
+        }
+    }
+
+    Ok(MeshTrafficPolicyTls {
+        mode,
+        sni,
+        ca_certificates,
+        client_certificate,
+        private_key,
+        subject_alt_names,
+        insecure_skip_verify,
     })
 }
 
@@ -700,6 +794,12 @@ fn translate_subset(
         if policy.outlier_detection.is_some() {
             acc.warnings.push(format!(
                 "DestinationRule {}/{} subset '{}' outlierDetection is currently ignored; only the top-level trafficPolicy outlierDetection applies",
+                object.metadata.namespace, object.metadata.name, name
+            ));
+        }
+        if policy.tls.is_some() {
+            acc.warnings.push(format!(
+                "DestinationRule {}/{} subset '{}' trafficPolicy.tls is parsed but not yet applied per-subset; only the top-level trafficPolicy.tls projects onto the resolved Upstream's backend_tls_* fields",
                 object.metadata.namespace, object.metadata.name, name
             ));
         }
@@ -4001,5 +4101,405 @@ mod tests {
                 .and_then(|outlier| outlier.interval_seconds),
             Some(1)
         );
+    }
+
+    // ── DestinationRule trafficPolicy.tls ───────────────────────────────
+
+    #[test]
+    fn translates_destination_rule_tls_simple_with_ca() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "caCertificates": "/etc/certs/ca.pem",
+                            "sni": "reviews.example.com"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tls = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .tls
+            .as_ref()
+            .expect("tls block");
+        assert_eq!(tls.mode, MtlsMode::Simple);
+        assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/ca.pem"));
+        assert_eq!(tls.sni.as_deref(), Some("reviews.example.com"));
+        assert!(tls.client_certificate.is_none());
+        assert!(tls.private_key.is_none());
+        assert!(!tls.insecure_skip_verify);
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_mutual_with_cert_and_key() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "MUTUAL",
+                            "caCertificates": "/etc/certs/ca.pem",
+                            "clientCertificate": "/etc/certs/client.pem",
+                            "privateKey": "/etc/certs/client.key",
+                            "subjectAltNames": ["spiffe://example/sa/reviews"],
+                            "insecureSkipVerify": false
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tls = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .tls
+            .as_ref()
+            .expect("tls block");
+        assert_eq!(tls.mode, MtlsMode::Mutual);
+        assert_eq!(
+            tls.client_certificate.as_deref(),
+            Some("/etc/certs/client.pem")
+        );
+        assert_eq!(tls.private_key.as_deref(), Some("/etc/certs/client.key"));
+        assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/ca.pem"));
+        assert_eq!(
+            tls.subject_alt_names,
+            vec!["spiffe://example/sa/reviews".to_string()]
+        );
+        assert!(!tls.insecure_skip_verify);
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_mutual_rejects_missing_cert_or_key() {
+        // MUTUAL requires BOTH clientCertificate AND privateKey.
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "MUTUAL",
+                            "clientCertificate": "/etc/certs/client.pem"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("MUTUAL without privateKey must fail");
+        assert!(
+            err.to_string()
+                .contains("MUTUAL requires both clientCertificate and privateKey"),
+            "got: {err}"
+        );
+
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "MUTUAL",
+                            "privateKey": "/etc/certs/client.key"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("MUTUAL without clientCertificate must fail");
+        assert!(
+            err.to_string()
+                .contains("MUTUAL requires both clientCertificate and privateKey"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_istio_mutual() {
+        // ISTIO_MUTUAL must not carry explicit cert/key/CA — Istio reuses
+        // the workload's SPIFFE identity material.
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "ISTIO_MUTUAL",
+                            "sni": "reviews.example.com"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tls = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .tls
+            .as_ref()
+            .expect("tls block");
+        assert_eq!(tls.mode, MtlsMode::IstioMutual);
+        assert!(tls.client_certificate.is_none());
+        assert!(tls.private_key.is_none());
+        assert!(tls.ca_certificates.is_none());
+        assert_eq!(tls.sni.as_deref(), Some("reviews.example.com"));
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_istio_mutual_rejects_explicit_cert() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "ISTIO_MUTUAL",
+                            "clientCertificate": "/etc/certs/client.pem",
+                            "privateKey": "/etc/certs/client.key"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("ISTIO_MUTUAL with explicit cert/key must fail");
+        assert!(
+            err.to_string()
+                .contains("ISTIO_MUTUAL must not set clientCertificate/privateKey/caCertificates"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_istio_mutual_rejects_explicit_ca() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "ISTIO_MUTUAL",
+                            "caCertificates": "/etc/certs/ca.pem"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("ISTIO_MUTUAL with explicit CA must fail");
+        assert!(
+            err.to_string()
+                .contains("ISTIO_MUTUAL must not set clientCertificate/privateKey/caCertificates"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_disable() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {"mode": "DISABLE"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tls = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .tls
+            .as_ref()
+            .expect("tls block");
+        assert_eq!(tls.mode, MtlsMode::Disable);
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_insecure_skip_verify() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "insecureSkipVerify": true
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tls = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .tls
+            .as_ref()
+            .expect("tls block");
+        assert!(tls.insecure_skip_verify);
+    }
+
+    #[test]
+    fn destination_rule_without_tls_translates_to_none() {
+        // Preserves today's behavior: no tls block in DR -> MeshTrafficPolicy.tls is None.
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {"simple": "ROUND_ROBIN"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tp = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy");
+        assert!(tp.tls.is_none());
+    }
+
+    #[test]
+    fn destination_rule_rejects_unsupported_tls_mode() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {"mode": "BANANA"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("unsupported TLS mode must fail");
+        assert!(
+            err.to_string()
+                .contains("trafficPolicy.tls.mode 'BANANA' is unsupported"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_subset_tls_is_parsed_and_warns() {
+        // Per-subset trafficPolicy.tls is parsed onto the MeshSubset but not
+        // yet projected onto a per-subset Upstream-TLS view — surface a warning.
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "subsets": [{
+                        "name": "v1",
+                        "labels": {"version": "v1"},
+                        "trafficPolicy": {
+                            "tls": {
+                                "mode": "SIMPLE",
+                                "caCertificates": "/etc/certs/v1-ca.pem"
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let subset = &mesh.destination_rules[0].subsets[0];
+        let tls = subset
+            .traffic_policy
+            .as_ref()
+            .expect("subset traffic policy")
+            .tls
+            .as_ref()
+            .expect("subset tls");
+        assert_eq!(tls.mode, MtlsMode::Simple);
+        assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/v1-ca.pem"));
+
+        // And a translator-level warning surfaced so operators know it isn't
+        // applied per-subset on the cold path yet.
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("trafficPolicy.tls is parsed but not yet applied per-subset")),
+            "expected per-subset tls warning, got: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn destination_rule_tls_defaults_to_simple_mode() {
+        // Istio defaults `tls.mode` to SIMPLE when the field is omitted from
+        // the block. Preserve that semantics.
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {"caCertificates": "/etc/certs/ca.pem"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tls = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .tls
+            .as_ref()
+            .expect("tls block");
+        assert_eq!(tls.mode, MtlsMode::Simple);
     }
 }
