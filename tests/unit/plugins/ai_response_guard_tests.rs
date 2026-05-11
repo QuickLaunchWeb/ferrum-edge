@@ -475,6 +475,24 @@ fn test_requires_response_body_buffering() {
     assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "text/plain")));
     assert!(plugin.should_buffer_response_body(&ctx_without_content_type("POST")));
     assert!(!plugin.should_buffer_response_body(&ctx_with_content_type("GET", "application/json")));
+
+    let mut sse_accept = ctx_with_content_type("POST", "application/json");
+    sse_accept
+        .headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+    assert!(
+        !plugin.should_buffer_response_body(&sse_accept),
+        "SSE clients must keep the response streaming instead of forcing a full-body buffer"
+    );
+
+    let mut stream_true = ctx_with_content_type("POST", "application/json");
+    stream_true
+        .metadata
+        .insert("ai_request_streaming".to_string(), "true".to_string());
+    assert!(
+        !plugin.should_buffer_response_body(&stream_true),
+        "prompt-shield stream:true metadata must prevent unbounded response buffering"
+    );
 }
 
 #[test]

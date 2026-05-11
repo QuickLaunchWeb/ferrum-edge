@@ -59,7 +59,35 @@ pub fn parse_sse_data_frames(body: &[u8]) -> Vec<Value> {
         Err(_) => return Vec::new(),
     };
     let mut frames = Vec::new();
-    for line in body_str.lines() {
+    let mut event_data = Vec::new();
+
+    fn flush_event(event_data: &mut Vec<&str>, frames: &mut Vec<Value>) {
+        if event_data.is_empty() {
+            return;
+        }
+        let data = if event_data.len() == 1 {
+            event_data[0].to_string()
+        } else {
+            event_data.join("\n")
+        };
+        event_data.clear();
+
+        let trimmed = data.trim();
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            return;
+        }
+        if let Ok(json) = serde_json::from_str::<Value>(trimmed) {
+            frames.push(json);
+        }
+    }
+
+    for raw_line in body_str.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() {
+            flush_event(&mut event_data, &mut frames);
+            continue;
+        }
+
         let data = if let Some(rest) = line.strip_prefix("data: ") {
             rest
         } else if let Some(rest) = line.strip_prefix("data:") {
@@ -67,14 +95,10 @@ pub fn parse_sse_data_frames(body: &[u8]) -> Vec<Value> {
         } else {
             continue;
         };
-        let trimmed = data.trim();
-        if trimmed.is_empty() || trimmed == "[DONE]" {
-            continue;
-        }
-        if let Ok(json) = serde_json::from_str::<Value>(trimmed) {
-            frames.push(json);
-        }
+        event_data.push(data);
     }
+    flush_event(&mut event_data, &mut frames);
+
     frames
 }
 
@@ -177,7 +201,7 @@ mod tests {
 
     #[test]
     fn parse_sse_frames_skips_done_and_comments() {
-        let body = b": comment\ndata: [DONE]\ndata: {\"ok\":true}\n";
+        let body = b": comment\ndata: [DONE]\n\ndata: {\"ok\":true}\n";
         let frames = parse_sse_data_frames(body);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["ok"], true);
@@ -192,8 +216,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_sse_frames_multiline_data_event() {
+        let body = b"data: {\"id\":\"1\",\ndata: \"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"id\":\"2\"}\n\n";
+        let frames = parse_sse_data_frames(body);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0]["id"], "1");
+        assert_eq!(frames[0]["choices"][0]["delta"]["content"], "Hello");
+        assert_eq!(frames[1]["id"], "2");
+    }
+
+    #[test]
     fn parse_sse_frames_skips_invalid_json() {
-        let body = b"data: not-json\ndata: {\"ok\":true}\n";
+        let body = b"data: not-json\n\ndata: {\"ok\":true}\n";
         let frames = parse_sse_data_frames(body);
         assert_eq!(frames.len(), 1);
     }
