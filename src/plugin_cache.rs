@@ -810,6 +810,12 @@ impl PluginCache {
             // delta build has succeeded or failed (see security_errors
             // handling below), so the registry stays atomically tied to
             // the PluginCache that gets swapped in.
+            //
+            // This runs for every global-plugin rebuild, not just when
+            // `transaction_log_schema` itself changed — the bracket is
+            // cheap (one Mutex acquire + empty HashMap) and guarantees
+            // the registry stays in sync even if a sibling global plugin
+            // was the trigger for the rebuild.
             crate::plugins::utils::log_schema::registry::begin_reload();
             for pc in &config.plugin_configs {
                 if !pc.enabled || pc.scope != PluginScope::Global {

@@ -30,11 +30,16 @@ fn registry() -> &'static RwLock<RegistryState> {
 }
 
 // Lock helpers recover from poisoning by extracting the inner guard.
-// A panic in a thread holding the registry lock is rare (no fallible work
-// happens while held), but if it ever occurs the registry data itself is
-// still valid — the bool poison flag is the only thing wrong. Treating
-// poison as fatal would brick every future `schema_ref` lookup across the
-// process; recovering keeps the gateway serving from cached state.
+//
+// SAFETY rationale: the critical sections under this lock perform only
+// HashMap inserts/removes and Option swaps — no I/O, no fallible
+// allocations, no `?` propagation. A panic while held is therefore
+// unlikely, but if it ever occurs the registry data itself is still
+// structurally valid (the poison flag is the only thing wrong). Treating
+// poison as fatal would brick every future `schema_ref` lookup across
+// the process; recovering keeps the gateway serving from cached state.
+// If fallible work is ever added inside these locks, reconsider this
+// recovery strategy.
 fn read_lock() -> RwLockReadGuard<'static, RegistryState> {
     registry().read().unwrap_or_else(PoisonError::into_inner)
 }
