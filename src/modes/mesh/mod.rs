@@ -63,6 +63,7 @@ pub const MESH_AUTHZ_PLUGIN_ID: &str = "__mesh_authz";
 pub const MESH_WORKLOAD_METRICS_PLUGIN_ID: &str = "__mesh_workload_metrics";
 pub const MESH_REQUEST_AUTH_PLUGIN_ID: &str = "__mesh_request_auth";
 pub const MESH_ACCESS_LOG_PLUGIN_ID: &str = "__mesh_access_log";
+pub const MESH_OUTBOUND_REGISTRY_PLUGIN_ID: &str = "__mesh_outbound_registry";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshTrafficDirection {
@@ -215,6 +216,11 @@ pub struct MeshRuntimeConfig {
     /// behavior — listeners are topology-driven. Sourced from
     /// `FERRUM_MESH_CAPTURE_MODE` (default `explicit`).
     pub capture_mode: crate::capture::CaptureMode,
+    /// Operator-set outbound traffic policy. Sourced from
+    /// `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY`. When `RegistryOnly`, the
+    /// slice-apply path injects the `mesh_outbound_registry` plugin with a
+    /// registry built from the slice's known destinations.
+    pub outbound_traffic_policy: crate::modes::mesh::config::OutboundTrafficPolicy,
 }
 
 impl MeshRuntimeConfig {
@@ -318,6 +324,21 @@ impl MeshRuntimeConfig {
             &resolve_ferrum_var("FERRUM_MESH_CAPTURE_MODE")
                 .unwrap_or_else(|| "explicit".to_string()),
         )?;
+        let outbound_traffic_policy = match env_config
+            .mesh_outbound_traffic_policy
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "" | "allow_any" => crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
+            "registry_only" => crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly,
+            other => {
+                return Err(format!(
+                    "Invalid FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY '{other}'. Expected: \
+                     allow_any or registry_only"
+                ));
+            }
+        };
 
         Ok(Self {
             node_id,
@@ -345,6 +366,7 @@ impl MeshRuntimeConfig {
             dns_response_cache_max_entries,
             cluster_domain,
             capture_mode,
+            outbound_traffic_policy,
         })
     }
 
@@ -492,6 +514,7 @@ fn gateway_config_from_mesh_slice(
             proxy_configs: slice.proxy_configs.clone(),
             trust_bundles: slice.trust_bundles.clone(),
             multi_cluster: slice.multi_cluster.clone(),
+            outbound_traffic_policy: slice.outbound_traffic_policy,
         })),
         loaded_at,
         ..GatewayConfig::default()
@@ -1680,6 +1703,33 @@ fn inject_mesh_global_plugins(
         }),
         &runtime.namespace,
     );
+
+    // Outbound registry: inject the `mesh_outbound_registry` plugin when
+    // either the slice (CRD path) OR the runtime env var declares
+    // REGISTRY_ONLY. Both default to AllowAny (no plugin) so non-mesh
+    // and permissive deployments pay zero per-request cost.
+    let effective_outbound_policy = mesh_slice
+        .outbound_traffic_policy
+        .unwrap_or(runtime.outbound_traffic_policy);
+    if matches!(
+        effective_outbound_policy,
+        crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly
+    ) {
+        let registry = mesh_slice.build_known_destinations(&runtime.cluster_domain);
+        ensure_global_plugin(
+            config,
+            MESH_OUTBOUND_REGISTRY_PLUGIN_ID,
+            "mesh_outbound_registry",
+            serde_json::json!({ "registry": registry }),
+            &runtime.namespace,
+        );
+    } else {
+        // Remove any stale instance (e.g., operator flipped policy back).
+        config
+            .plugin_configs
+            .retain(|p| p.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID);
+    }
+
     // Merge applicable Telemetry resources (most specific scope wins per section).
     let merged_telemetry = merge_applicable_telemetry(mesh_slice);
 
@@ -3198,6 +3248,7 @@ mod tests {
             dns_response_cache_max_entries: dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
             cluster_domain: dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
             capture_mode: crate::capture::CaptureMode::Explicit,
+            outbound_traffic_policy: crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
         let mesh_state = MeshRuntimeState::new();
@@ -3284,6 +3335,7 @@ mod tests {
             dns_response_cache_max_entries: dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
             cluster_domain: dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
             capture_mode: crate::capture::CaptureMode::Explicit,
+            outbound_traffic_policy: crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
         }
     }
 
@@ -3886,6 +3938,7 @@ mod tests {
             proxy_configs: Vec::new(),
             trust_bundles: None,
             multi_cluster: None,
+            outbound_traffic_policy: None,
         };
 
         let merged = merge_applicable_telemetry(&mesh_slice);

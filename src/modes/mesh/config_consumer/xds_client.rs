@@ -847,6 +847,7 @@ fn reverse_translate(
         proxy_configs: Vec::new(),
         trust_bundles: None,
         multi_cluster: None,
+        outbound_traffic_policy: None,
     })
 }
 

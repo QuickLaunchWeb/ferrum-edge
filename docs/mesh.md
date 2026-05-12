@@ -924,7 +924,7 @@ The following Istio mesh surfaces are **not yet supported** and should be treate
 | `Sidecar` (egress scoping) | Deferred | Use Ferrum proxy routing and upstream configuration |
 | `EnvoyFilter` | Not planned | Use Ferrum custom plugins |
 | `WasmPlugin` | Not planned | Use Ferrum custom plugins (`custom_plugins/`) |
-| Outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`) | Deferred | Unknown outbound destinations are not blocked today |
+| Outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`) | Supported | `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY=registry_only` (or slice-supplied `outbound_traffic_policy`) auto-injects the `mesh_outbound_registry` plugin; unknown destinations are rejected at the outbound gate with the configured status (default 502) |
 | `VirtualService` header/method-only matches | Skipped | Ferrum route proxies do not encode header/method predicates |
 | Inbound port exclusions (`excludeInboundPorts`) | Deferred | |
 | IP-range capture exclusions (`excludeOutboundIPRanges`, `includeOutboundIPRanges`) | Deferred | |

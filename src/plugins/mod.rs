@@ -998,6 +998,12 @@ pub mod priority {
     pub const OTEL_TRACING: u16 = 25;
     pub const CORRELATION_ID: u16 = 50;
     pub const REQUEST_TERMINATION: u16 = 125;
+    /// `mesh_outbound_registry`: rejects outbound requests whose
+    /// destination is not in the mesh registry. Auto-injected only when
+    /// `MeshConfig.outbound_traffic_policy == RegistryOnly`. Runs in the
+    /// `on_request_received` band so the rejection is visible to all
+    /// downstream observability without engaging the auth pipeline.
+    pub const MESH_OUTBOUND_REGISTRY: u16 = 130;
     pub const CORS: u16 = 100;
     pub const IP_RESTRICTION: u16 = 150;
     pub const GEO_RESTRICTION: u16 = 175;
@@ -1550,6 +1556,9 @@ pub fn create_plugin_with_http_client(
             tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
         ))),
         "mesh_authz" => Ok(Some(Arc::new(mesh::authz::MeshAuthz::new(config)?))),
+        "mesh_outbound_registry" => Ok(Some(Arc::new(
+            mesh::outbound_registry::OutboundRegistry::new(config)?,
+        ))),
         "ip_restriction" => Ok(Some(Arc::new(ip_restriction::IpRestriction::new(config)?))),
         "geo_restriction" => Ok(Some(Arc::new(geo_restriction::GeoRestriction::new(
             config,
@@ -1728,6 +1737,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "mtls_auth",
         "spiffe_identity",
         "mesh_authz",
+        "mesh_outbound_registry",
         "compression",
         "cors",
         "access_control",

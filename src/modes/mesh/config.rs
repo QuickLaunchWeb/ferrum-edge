@@ -1065,6 +1065,33 @@ pub struct MeshConfig {
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_cluster: Option<MultiClusterConfig>,
+    /// Mirrors Istio `MeshConfig.outboundTrafficPolicy.mode`. `None` keeps
+    /// the legacy `AllowAny` behavior (no gate). When set to `RegistryOnly`,
+    /// the mesh outbound dispatcher rejects requests whose destination does
+    /// not appear in the slice-derived known-destinations registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_traffic_policy: Option<OutboundTrafficPolicy>,
+}
+
+/// Istio mesh-wide outbound traffic policy. Mirrors
+/// `MeshConfig.outboundTrafficPolicy.mode` in the upstream API.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundTrafficPolicy {
+    /// Sidecar accepts traffic to any destination (no gate). Existing default.
+    #[default]
+    AllowAny,
+    /// Sidecar only accepts traffic to destinations resolved in the mesh
+    /// registry (services, service entries, workload addresses) plus their
+    /// declared ports. Unknown destinations are rejected at the proxy entry
+    /// point with a configurable 4xx/5xx status (default 502).
+    ///
+    /// HTTP-family only: the gate relies on the `Host` header, so raw TCP
+    /// and UDP outbound traffic bypass this policy. When the
+    /// `MeshSidecar`-egress feature lands the slice's known-destinations
+    /// set narrows automatically (slice projection runs first), so no
+    /// changes are needed here at that time.
+    RegistryOnly,
 }
 
 impl MeshConfig {

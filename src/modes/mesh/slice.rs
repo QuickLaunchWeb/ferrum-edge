@@ -4,10 +4,10 @@ use std::collections::{BTreeMap, HashMap};
 use crate::config::types::GatewayConfig;
 use crate::modes::mesh::config::{
     MeshDestinationRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshService,
-    MeshTelemetryResource, MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyScope,
-    ServiceEntry, TrustBundleSet, Workload, WorkloadLabels, policy_scope_applies_to_workload,
-    proxy_config_applies_to_workload, scope_applies_to_workload, service_entry_applies_to_workload,
-    workload_selector_matches,
+    MeshTelemetryResource, MtlsMode, MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication,
+    PolicyScope, ServiceEntry, TrustBundleSet, Workload, WorkloadLabels,
+    policy_scope_applies_to_workload, proxy_config_applies_to_workload, scope_applies_to_workload,
+    service_entry_applies_to_workload, workload_selector_matches,
 };
 
 /// Node/workload selector used by both ADS and native `MeshSubscribe`.
@@ -82,6 +82,13 @@ pub struct MeshSlice {
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_cluster: Option<MultiClusterConfig>,
+    /// Mesh-wide outbound traffic policy. `None` keeps the legacy
+    /// `AllowAny` behavior. When `Some(RegistryOnly)`, the slice-apply
+    /// path auto-injects the `mesh_outbound_registry` plugin with a
+    /// registry built from `services` ∪ `service_entries` ∪
+    /// `workloads.addresses`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_traffic_policy: Option<OutboundTrafficPolicy>,
 }
 
 impl MeshSlice {
@@ -105,6 +112,58 @@ impl MeshSlice {
             && self.proxy_configs == other.proxy_configs
             && self.trust_bundles == other.trust_bundles
             && self.multi_cluster == other.multi_cluster
+            && self.outbound_traffic_policy == other.outbound_traffic_policy
+    }
+
+    /// Build the set of known mesh destinations from this slice. Used by
+    /// the auto-injected `mesh_outbound_registry` plugin when
+    /// `outbound_traffic_policy == RegistryOnly`. Includes:
+    ///   - `services.{name}.{namespace}.svc.cluster.local` and bare
+    ///     `{name}.{namespace}` and `{name}` forms with their declared ports
+    ///   - `service_entries.hosts` with their declared ports
+    ///   - `workloads.addresses`
+    ///
+    /// Returned entries are alphabetically sorted so the plugin config is
+    /// deterministic across reloads (preventing spurious slice-update
+    /// re-broadcasts via `content_eq`).
+    pub fn build_known_destinations(&self, cluster_domain: &str) -> Vec<String> {
+        let mut entries: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for service in &self.services {
+            let fqdn = format!(
+                "{}.{}.svc.{}",
+                service.name, service.namespace, cluster_domain
+            );
+            entries.insert(fqdn.to_ascii_lowercase());
+            entries.insert(format!("{}.{}", service.name, service.namespace).to_ascii_lowercase());
+            entries.insert(service.name.to_ascii_lowercase());
+            for port in &service.ports {
+                entries.insert(format!("{}:{}", fqdn, port.port).to_ascii_lowercase());
+                entries.insert(
+                    format!("{}.{}:{}", service.name, service.namespace, port.port)
+                        .to_ascii_lowercase(),
+                );
+            }
+        }
+        for entry in &self.service_entries {
+            for host in &entry.hosts {
+                let host_lc = host.to_ascii_lowercase();
+                entries.insert(host_lc.clone());
+                for port in &entry.ports {
+                    entries.insert(format!("{}:{}", host_lc, port.port));
+                }
+            }
+        }
+        for workload in &self.workloads {
+            for addr in &workload.addresses {
+                entries.insert(addr.to_ascii_lowercase());
+                for port in &workload.ports {
+                    entries.insert(format!("{}:{}", addr.to_ascii_lowercase(), port.port));
+                }
+            }
+        }
+        let mut sorted: Vec<String> = entries.into_iter().collect();
+        sorted.sort();
+        sorted
     }
 
     /// Resolve the effective mTLS mode for a given port on this workload.
@@ -270,6 +329,7 @@ impl MeshSlice {
             proxy_configs,
             trust_bundles: mesh.trust_bundles.clone(),
             multi_cluster: mesh.multi_cluster.clone(),
+            outbound_traffic_policy: mesh.outbound_traffic_policy,
         }
     }
 }
@@ -592,6 +652,7 @@ mod tests {
             telemetry_resources: vec![make_telemetry("t1", "ns", PolicyScope::MeshWide)],
             trust_bundles: Some(make_trust_bundle_set()),
             multi_cluster: Some(make_multi_cluster()),
+            outbound_traffic_policy: None,
         };
         assert!(slice.content_eq(&slice.clone()));
     }
@@ -702,6 +763,7 @@ mod tests {
     fn content_eq_detects_multi_cluster_change() {
         let a = MeshSlice {
             multi_cluster: Some(make_multi_cluster()),
+            outbound_traffic_policy: None,
             ..MeshSlice::default()
         };
         let b = MeshSlice::default();
@@ -1198,6 +1260,7 @@ mod tests {
         let mesh = MeshConfig {
             trust_bundles: Some(make_trust_bundle_set()),
             multi_cluster: Some(make_multi_cluster()),
+            outbound_traffic_policy: None,
             ..MeshConfig::default()
         };
         let config = config_with_mesh(mesh);
@@ -1998,5 +2061,112 @@ mod tests {
         let resolved = slice.resolved_proxy_config().expect("resolved present");
         assert_eq!(resolved.name, "zzz-workload");
         assert_eq!(resolved.tracing_sampling, Some(90.0));
+    }
+
+    // ── Outbound registry builder ─────────────────────────────────────────
+
+    #[test]
+    fn build_known_destinations_emits_service_forms_and_ports() {
+        use crate::modes::mesh::config::AppProtocol;
+
+        let slice = MeshSlice {
+            services: vec![MeshService {
+                name: "reviews".into(),
+                namespace: "default".into(),
+                ports: vec![crate::modes::mesh::config::ServicePort {
+                    port: 8080,
+                    protocol: AppProtocol::Http,
+                    name: Some("http".into()),
+                }],
+                workloads: Vec::new(),
+                protocol_overrides: HashMap::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        let entries = slice.build_known_destinations("cluster.local");
+        assert!(entries.contains(&"reviews".to_string()));
+        assert!(entries.contains(&"reviews.default".to_string()));
+        assert!(entries.contains(&"reviews.default.svc.cluster.local".to_string()));
+        assert!(entries.contains(&"reviews.default.svc.cluster.local:8080".to_string()));
+        assert!(entries.contains(&"reviews.default:8080".to_string()));
+    }
+
+    #[test]
+    fn build_known_destinations_includes_service_entries() {
+        use crate::modes::mesh::config::{
+            AppProtocol, MeshEndpoint, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+        };
+
+        let slice = MeshSlice {
+            service_entries: vec![ServiceEntry {
+                name: "external-api".into(),
+                namespace: "default".into(),
+                hosts: vec!["api.example.com".into()],
+                endpoints: vec![MeshEndpoint {
+                    address: "10.0.0.1".into(),
+                    ports: HashMap::new(),
+                    labels: HashMap::new(),
+                    network: None,
+                }],
+                resolution: Resolution::Static,
+                location: ServiceEntryLocation::MeshExternal,
+                ports: vec![ServicePort {
+                    port: 443,
+                    protocol: AppProtocol::Tls,
+                    name: Some("https".into()),
+                }],
+                export_to: Vec::new(),
+                workload_selector: None,
+            }],
+            ..MeshSlice::default()
+        };
+
+        let entries = slice.build_known_destinations("cluster.local");
+        assert!(entries.contains(&"api.example.com".to_string()));
+        assert!(entries.contains(&"api.example.com:443".to_string()));
+    }
+
+    #[test]
+    fn build_known_destinations_is_sorted_and_deduplicated() {
+        use crate::modes::mesh::config::{AppProtocol, ServicePort};
+
+        let slice = MeshSlice {
+            services: vec![
+                MeshService {
+                    name: "zzz".into(),
+                    namespace: "default".into(),
+                    ports: vec![ServicePort {
+                        port: 8080,
+                        protocol: AppProtocol::Http,
+                        name: None,
+                    }],
+                    workloads: Vec::new(),
+                    protocol_overrides: HashMap::new(),
+                },
+                MeshService {
+                    name: "aaa".into(),
+                    namespace: "default".into(),
+                    ports: vec![ServicePort {
+                        port: 8080,
+                        protocol: AppProtocol::Http,
+                        name: None,
+                    }],
+                    workloads: Vec::new(),
+                    protocol_overrides: HashMap::new(),
+                },
+            ],
+            ..MeshSlice::default()
+        };
+
+        let entries = slice.build_known_destinations("cluster.local");
+        let aaa_idx = entries.iter().position(|e| e == "aaa").expect("aaa");
+        let zzz_idx = entries.iter().position(|e| e == "zzz").expect("zzz");
+        assert!(aaa_idx < zzz_idx, "entries must be sorted alphabetically");
+        // No duplicates (HashSet → Vec)
+        let mut dedup = entries.clone();
+        dedup.sort();
+        dedup.dedup();
+        assert_eq!(dedup.len(), entries.len());
     }
 }
