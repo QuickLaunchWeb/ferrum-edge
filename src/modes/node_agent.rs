@@ -661,6 +661,7 @@ mod tests {
                 include_cidrs: vec!["10.0.0.0/8".to_string()],
                 exclude_cidrs: vec!["10.0.0.1/32".to_string()],
                 exclude_ports: vec![15020],
+                exclude_inbound_ports: Vec::new(),
             },
             cgroup_root: "/sys/fs/cgroup".to_string(),
             bpf_fs_path: "/sys/fs/bpf".to_string(),
