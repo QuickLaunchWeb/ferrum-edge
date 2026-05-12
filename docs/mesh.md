@@ -694,7 +694,7 @@ Port-list annotations merge with each other and with the injector-level `FERRUM_
 
 **Pod-restart caveat:** annotations are evaluated at pod admission time only. Existing pods retain their previous capture rules until restart; bouncing affected workloads is required for previously-ignored annotations to take effect.
 
-**IPv6 CIDRs:** `includeOutboundIPRanges` / `excludeOutboundIPRanges` accept IPv6 CIDR literals (e.g. `fd00::/8`) at admission, but the init container only invokes `iptables` -- `ip6tables` fan-out is deferred. IPv6 traffic capture rules from these annotations are no-ops at runtime today.
+**IPv6 CIDRs:** `includeOutboundIPRanges` / `excludeOutboundIPRanges` accept IPv6 CIDR literals (e.g. `fd00::/8`) at admission for forward compatibility, but `IptablesPlan::for_config` strips non-IPv4 CIDRs before emitting rules (with a `warn!` log naming each skipped CIDR). The init container only invokes the IPv4 `iptables` binary; feeding it a raw `-d fd00::/8` would fail the rule append and leave the capture chain half-populated. `ip6tables` fan-out is deferred. If an include list contains ONLY IPv6 CIDRs the outbound REDIRECT will not be emitted at all, so outbound capture is disabled for that pod — check init-container logs for the skip warning.
 
 ### SPIFFE ID Derivation
 

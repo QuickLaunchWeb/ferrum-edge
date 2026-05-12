@@ -1781,10 +1781,13 @@ mod tests {
     }
 
     // IPv6 CIDR in the annotation passes admission today (the validator only
-    // checks shape, not address family). The init container only invokes
-    // `iptables` — not `ip6tables` — so the rule would no-op at runtime. This
-    // test documents the current behavior so a deliberate future change
-    // (reject vs. fan out to ip6tables) is a conscious choice.
+    // checks shape, not address family) and survives into `CaptureConfig` so
+    // operators can observe the configured intent. The init container only
+    // invokes IPv4 `iptables`, so feeding `-d fd00::/8` directly to it would
+    // fail the rule append at runtime and leave the capture chain partially
+    // populated. To prevent that, `IptablesPlan::for_config` strips non-IPv4
+    // CIDRs before emitting commands — admission acceptance is purely for
+    // forward compatibility with a future `ip6tables` fan-out.
     #[test]
     fn capture_config_accepts_ipv6_cidr_in_exclude_annotation_today() {
         let pod = json!({
@@ -1800,5 +1803,49 @@ mod tests {
 
         let capture = capture_config(&config, &pod).expect("IPv6 CIDR currently passes admission");
         assert!(capture.exclude_cidrs.iter().any(|c| c == "fd00::/8"));
+    }
+
+    // The full webhook patch must never ship an IPv6 CIDR into the iptables
+    // init script. Otherwise the init container exits non-zero on rule append
+    // and the pod fails to start (or, with the current best-effort error
+    // handling, starts with a half-populated capture chain). This is the
+    // end-to-end regression guard for the `IptablesPlan` filter.
+    #[test]
+    fn patch_strips_ipv6_cidr_from_init_container_iptables_script() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/excludeOutboundIPRanges": "10.0.0.0/8, fd00::/8",
+                    "traffic.sidecar.istio.io/includeOutboundIPRanges": "172.16.0.0/12, 2001:db8::/32"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+        let init = patch
+            .iter()
+            .find(|op| op.path == "/spec/initContainers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("init container");
+        let commands = init
+            .pointer("/args/0")
+            .and_then(Value::as_str)
+            .expect("iptables plan");
+
+        for ipv4 in ["10.0.0.0/8", "172.16.0.0/12"] {
+            assert!(
+                commands.contains(ipv4),
+                "IPv4 CIDR {ipv4} must remain in the init script"
+            );
+        }
+        for ipv6 in ["fd00::/8", "2001:db8::/32"] {
+            assert!(
+                !commands.contains(ipv6),
+                "IPv6 CIDR {ipv6} must NOT appear in the iptables init script (would fail at -A): {commands}"
+            );
+        }
     }
 }
