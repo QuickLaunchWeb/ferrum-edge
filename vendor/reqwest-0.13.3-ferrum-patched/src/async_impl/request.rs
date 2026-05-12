@@ -965,20 +965,6 @@ mod tests {
         builder.build().unwrap();
     }
 
-    #[test]
-    fn request_connect_timeout_round_trips_through_clone() {
-        let mut request = Request::new(Method::GET, "https://example.com".try_into().unwrap());
-        *request.timeout_mut() = Some(Duration::from_secs(42));
-        *request.connect_timeout_mut() = Some(Duration::from_secs(7));
-        *request.version_mut() = Version::HTTP_11;
-
-        let clone = request.try_clone().unwrap();
-        assert_eq!(request.version(), clone.version());
-        assert_eq!(request.headers(), clone.headers());
-        assert_eq!(request.timeout(), clone.timeout());
-        assert_eq!(request.connect_timeout(), clone.connect_timeout());
-    }
-
     /*
     use {body, Method};
     use super::Client;

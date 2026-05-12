@@ -442,6 +442,7 @@ Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the h
 |-------|------|
 | Full configuration reference | [docs/configuration.md](docs/configuration.md) |
 | Plugin reference | [docs/plugins.md](docs/plugins.md) |
+| Transaction log schema customization | [docs/log_schema.md](docs/log_schema.md) |
 | Admin API | [docs/admin_api.md](docs/admin_api.md) |
 | Connection pooling | [docs/connection_pooling.md](docs/connection_pooling.md) |
 | Load balancing | [docs/load_balancing.md](docs/load_balancing.md) |

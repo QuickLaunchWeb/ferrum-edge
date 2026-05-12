@@ -85,9 +85,36 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+  build-gateway-binary:
+    name: Build Gateway Binary (functional tests)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-test-functional"
+
+      - name: Build gateway binary
+        run: cargo build --bin ferrum-edge
+
+      - name: Upload gateway binary
+        # Shared across every test-functional shard via download-artifact so
+        # the ~60s `cargo build --bin ferrum-edge` step runs once instead of
+        # six times. Functional tests look for ./target/debug/ferrum-edge;
+        # shards re-create that path on download.
+        uses: actions/upload-artifact@v7
+        with:
+          name: ferrum-edge-debug
+          path: target/debug/ferrum-edge
+          retention-days: 1
+          if-no-files-found: error
+
   test-functional:
     name: Functional Tests (${{ matrix.shard }})
     if: github.event_name == 'pull_request'
+    needs: build-gateway-binary
     runs-on: ubuntu-latest
     environment: ci-tests
     strategy:
@@ -197,41 +224,62 @@ jobs:
         with:
           shared-key: "ci-test-functional"
 
-      - name: Build gateway binary for end-to-end tests
-        run: cargo build --bin ferrum-edge
+      - name: Install cargo-nextest
+        # Prebuilt binaries from taiki-e/install-action — no compile time.
+        # Nextest's process-per-test model isolates port/process contention
+        # and ships built-in slow-test + retry support, which fits this E2E
+        # suite better than libtest's shared-process scheduler.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Download prebuilt gateway binary
+        uses: actions/download-artifact@v8
+        with:
+          name: ferrum-edge-debug
+          path: target/debug
+
+      - name: Mark gateway binary executable
+        # actions/download-artifact does not preserve the executable bit.
+        run: chmod +x target/debug/ferrum-edge
 
       - name: Run functional test shard
-        # `--include-ignored` runs BOTH the ignored E2E tests and the
-        # non-ignored unit tests bundled into the functional_tests binary
-        # (e.g. the `common::config_builder::tests::*` module that
-        # regression-guards the shared test harness's builder API). Without
-        # `--include-ignored` those 10 tests would be silently filtered out
-        # (the functional-tests binary is the only place they're compiled —
-        # `tests/unit/` is a separate binary that cannot import tests/common).
+        # ── Single nextest invocation per shard ───────────────────────────
+        # The old loop ran `cargo test` once per filter line, paying cargo's
+        # fingerprint-check + libtest startup (~3–5s) every iteration. With
+        # 7–13 filters per shard that was 30–60s of pure overhead. Here we
+        # collect the filters into an argv array and let nextest OR them.
         #
-        # `--skip` uses substring matching against the full test path, so the
-        # two skip terms must be specific enough to drop ONLY the long stress
-        # suites and not future lighter additions:
-        #   - `test_scale_perf_30k_proxies` — matches both
-        #     `test_scale_perf_30k_proxies` and `test_scale_perf_30k_proxies_postgres`
-        #     (both 30k-proxy variants are intentionally skipped here; they
-        #     run locally via the resilience suite).
-        #   - `test_load_stress_10k_proxies` — the single ignored test in
-        #     functional_load_stress_test today. Specific so any new lighter
-        #     test added to that file (e.g. a smoke check) actually runs.
+        # `--run-ignored=all` mirrors libtest's `--include-ignored` so the
+        # non-ignored harness unit tests bundled into the functional_tests
+        # binary (e.g. `common::config_builder::tests::*`) run alongside the
+        # ignored E2E tests.
+        #
+        # The filter expression excludes the long stress suites that are
+        # intentionally local-only:
+        #   - test_scale_perf_30k_proxies (matches both base + _postgres)
+        #   - test_load_stress_10k_proxies (single ignored test in that file)
+        #
+        # `FERRUM_SKIP_GATEWAY_BUILD=1` makes `ensure_gateway_built()` in the
+        # harness skip its per-process `cargo build --bin ferrum-edge` and
+        # trust the artifact we just downloaded. Critical with nextest's
+        # one-process-per-test model — otherwise every test would pay the
+        # cargo fingerprint check on first call.
         run: |
-          exit_code=0
+          set -e
+          filters=()
           while IFS= read -r filter; do
-            if [ -z "$filter" ]; then
-              continue
-            fi
-            echo "::group::functional_tests filter: ${filter}"
-            cargo test --test functional_tests "$filter" -- --include-ignored --skip test_scale_perf_30k_proxies --skip test_load_stress_10k_proxies || exit_code=$?
-            echo "::endgroup::"
+            [ -z "$filter" ] && continue
+            filters+=("$filter")
           done <<< "$FUNCTIONAL_FILTERS"
-          exit $exit_code
+          cargo nextest run --test functional_tests \
+            --run-ignored=all \
+            --no-fail-fast \
+            -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)' \
+            "${filters[@]}"
         env:
           FUNCTIONAL_FILTERS: ${{ matrix.filters }}
+          FERRUM_SKIP_GATEWAY_BUILD: "1"
           RUST_BACKTRACE: 1
         timeout-minutes: 30
 
@@ -253,6 +301,7 @@ jobs:
       - test-unit
       - test-lib
       - test-integration
+      - build-gateway-binary
       - test-functional
     runs-on: ubuntu-latest
     steps:
@@ -265,11 +314,13 @@ jobs:
           echo "| Unit | ${{ needs.test-unit.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Inline lib | ${{ needs.test-lib.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Integration | ${{ needs.test-integration.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Gateway binary build | ${{ needs.build-gateway-binary.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Functional shards | ${{ needs.test-functional.result }} |" >> $GITHUB_STEP_SUMMARY
 
           if [ "${{ needs.test-unit.result }}" != "success" ] ||
              [ "${{ needs.test-lib.result }}" != "success" ] ||
              [ "${{ needs.test-integration.result }}" != "success" ] ||
+             [ "${{ needs.build-gateway-binary.result }}" != "success" ] ||
              [ "${{ needs.test-functional.result }}" != "success" ]; then
             exit 1
           fi

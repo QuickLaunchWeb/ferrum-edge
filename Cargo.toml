@@ -55,8 +55,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 
 # gRPC
-tonic = { version = "0.14.5", features = ["tls-ring", "tls-webpki-roots"] }
-tonic-prost = "0.14.5"
+tonic = { version = "0.14.6", features = ["tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14.6"
 prost = "0.14.3"
 tower = { version = "0.5", features = ["util"] }
 
@@ -143,8 +143,8 @@ glob = "0.3"
 # Kubernetes controller (Layer 8) — async K8s client with watch/informer/reflector
 # support. Used by the CRD reconciliation loop in CP mode when
 # FERRUM_K8S_CONTROLLER_ENABLED=true.
-kube = { version = "0.99", features = ["runtime", "client", "derive", "ws"] }
-k8s-openapi = { version = "0.24", features = ["latest"] }
+kube = { version = "3.1", features = ["runtime", "client", "derive", "ws"] }
+k8s-openapi = { version = "0.27", features = ["latest"] }
 # Used by `rcgen::CertificateParams::not_before` / `not_after` (rcgen's
 # choice — it needs `time::OffsetDateTime`). Already in `[dev-dependencies]`
 # for testing; promoting to a regular dep so the mesh CA can reference it.
@@ -154,7 +154,7 @@ time = "0.3"
 vaultrs = { version = "0.8", optional = true }
 aws-config = { version = "1.8", features = ["behavior-version-latest"], optional = true }
 aws-sdk-secretsmanager = { version = "1", optional = true }
-google-cloud-secretmanager-v1 = { version = "1.8", optional = true }
+google-cloud-secretmanager-v1 = { version = "1.9", optional = true }
 azure_security_keyvault_secrets = { version = "0.14", optional = true }
 azure_identity = { version = "0.35", optional = true }
 azure_core = { version = "0.35", optional = true }
@@ -241,7 +241,7 @@ codegen-units = 1       # single codegen unit for maximum optimiser visibility
 panic = "abort"         # skip unwind tables — smaller binary, faster panics
 
 [build-dependencies]
-tonic-prost-build = "0.14.5"
+tonic-prost-build = "0.14.6"
 
 [dev-dependencies]
 tempfile = "3"
@@ -260,7 +260,7 @@ paste = "1"
 tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }
 
 # ── Vendored upstream patches ──────────────────────────────────────────────
-# We carry a vendored copy of reqwest 0.13.2 with PR seanmonstar/reqwest#3017
+# We carry a vendored copy of reqwest 0.13.3 with PR seanmonstar/reqwest#3017
 # applied so each request can override the client-level connect timeout via
 # `RequestBuilder::connect_timeout(Duration)`. Without the patch, two proxies
 # sharing the same connection-pool key (which intentionally excludes policy
@@ -268,7 +268,7 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }
 # connect timeout the underlying `reqwest::Client` was first built with.
 #
 # Retirement plan: when reqwest#3017 merges and ships in a release we use,
-# remove this `[patch.crates-io]` entry, drop `vendor/reqwest-0.13.2-ferrum-patched/`,
+# remove this `[patch.crates-io]` entry, drop `vendor/reqwest-0.13.3-ferrum-patched/`,
 # and unpin the dependency. The call-site change in `src/connection_pool.rs`
 # uses the upstream API as proposed in the PR, so it stays intact.
 # See `docs/upstream-reqwest-patches/001-per-request-connect-timeout/README.md`.
@@ -290,5 +290,5 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }
 # underlying h3 library can recover the response.
 # See `docs/upstream-h3-patches/001-recv-frame-drain-on-quic-close/README.md`.
 [patch.crates-io]
-reqwest = { path = "vendor/reqwest-0.13.2-ferrum-patched" }
+reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }
 h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }

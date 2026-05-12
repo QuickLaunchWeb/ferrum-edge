@@ -32,8 +32,8 @@ they're applied per-request and override the (now absent) client default.
 
 ## Vendored crate
 
-- Path: `vendor/reqwest-0.13.2-ferrum-patched/`
-- Base release: reqwest **v0.13.2** (matches the version in `Cargo.lock`
+- Path: `vendor/reqwest-0.13.3-ferrum-patched/`
+- Base release: reqwest **v0.13.3** (matches the version in `Cargo.lock`
   before vendoring)
 - Wired in via `[patch.crates-io]` in the workspace `Cargo.toml`
 
@@ -55,7 +55,7 @@ the v0.13.2 context. The original PR diff is preserved verbatim in
 
 No other deviations.
 
-## Files copied into `vendor/reqwest-0.13.2-ferrum-patched/`
+## Files copied into `vendor/reqwest-0.13.3-ferrum-patched/`
 
 - `src/` — the entire crate source (with the patch applied)
 - `Cargo.toml` — patched to set `autotests = false` and `autoexamples = false`
@@ -79,7 +79,7 @@ to consume:
    to whatever release contains the merged PR.
 2. **Drop the `[patch.crates-io]` block** from the workspace `Cargo.toml`
    (the block is at the bottom of the file, separated by a comment header).
-3. **Delete the vendor directory**: `rm -rf vendor/reqwest-0.13.2-ferrum-patched/`.
+3. **Delete the vendor directory**: `rm -rf vendor/reqwest-0.13.3-ferrum-patched/`.
    If `vendor/` becomes empty, delete it too.
 4. **Delete this docs directory**: `rm -rf docs/upstream-reqwest-patches/001-per-request-connect-timeout/`.
    If `docs/upstream-reqwest-patches/` becomes empty, delete it too.

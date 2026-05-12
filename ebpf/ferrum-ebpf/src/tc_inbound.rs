@@ -1,14 +1,19 @@
-//! tc/ingress — inbound packet redirect to HBONE port.
+//! tc/ingress — inbound packet classification for enrolled pods.
 //!
 //! Attached to the host-side veth interface of enrolled pods. Parses the
-//! IPv4 header, checks whether the destination IP is in `FERRUM_POD_IPS`,
-//! and if so redirects the packet to the proxy's HBONE port (15008) using
-//! `bpf_redirect`.
+//! IPv4 header and checks whether the destination IP is in `FERRUM_POD_IPS`.
+//! When matched, returns `TC_ACT_PIPE` so later tc actions can continue
+//! processing the packet while the current phase avoids in-BPF destination
+//! rewrites.
 //!
-//! Only IPv4 TCP packets are redirected in this phase. IPv6 and non-TCP
-//! traffic passes through unmodified.
+//! Direct destination rewrite via `bpf_skb_store_bytes` + `bpf_l4_csum_replace`
+//! requires recalculating TCP/IP checksums in BPF — deferred to a future phase
+//! once the L4 checksum helpers are wired.
+//!
+//! Only IPv4 TCP packets are considered. IPv6 and non-TCP traffic passes
+//! through unmodified.
 
-use aya_ebpf::bindings::TC_ACT_OK;
+use aya_ebpf::bindings::{TC_ACT_OK, TC_ACT_PIPE};
 use aya_ebpf::macros::classifier;
 use aya_ebpf::programs::TcContext;
 
@@ -41,7 +46,7 @@ fn try_tc_inbound(ctx: &TcContext) -> Result<i32, i64> {
     let dst_ip: u32 = ctx.load(ETH_HDR_LEN + 16).map_err(|_| -1i64)?;
 
     if unsafe { FERRUM_POD_IPS.get(&dst_ip) }.is_some() {
-        return Ok(TC_ACT_OK);
+        return Ok(TC_ACT_PIPE);
     }
 
     Ok(TC_ACT_OK)
