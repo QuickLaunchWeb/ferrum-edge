@@ -50,6 +50,7 @@ pub struct K8sTranslationOptions {
     pub trust_domain: TrustDomain,
     pub prefer_istio_on_overlap: bool,
     pub istio_root_namespace: String,
+    pub cluster_domain: String,
     source_namespaces: Option<HashSet<String>>,
 }
 
@@ -61,6 +62,7 @@ impl K8sTranslationOptions {
             trust_domain,
             prefer_istio_on_overlap: true,
             istio_root_namespace: "istio-system".to_string(),
+            cluster_domain: "cluster.local".to_string(),
             source_namespaces: Some(source_namespaces),
         }
     }
@@ -68,6 +70,13 @@ impl K8sTranslationOptions {
     pub fn with_istio_root_namespace(mut self, namespace: String) -> Self {
         if !namespace.trim().is_empty() {
             self.istio_root_namespace = namespace;
+        }
+        self
+    }
+
+    pub fn with_cluster_domain(mut self, domain: String) -> Self {
+        if !domain.trim().is_empty() {
+            self.cluster_domain = domain;
         }
         self
     }

@@ -1039,13 +1039,16 @@ fn resolve_destination_port(
     let Some(name) = string_field(port_value, "name") else {
         return Ok(None);
     };
-    let Some((svc, ns)) = service_host_components(host, &object.metadata.namespace) else {
+    let cluster_domain = &acc.options.cluster_domain;
+    let Some((svc, ns)) = service_host_components(host, &object.metadata.namespace, cluster_domain)
+    else {
         return Err(invalid_resource(
             object,
             format!(
                 "VirtualService route.destination.host '{}' is not a recognized in-cluster service form; \
-                 port.name resolution only supports <svc>, <svc>.<ns>, <svc>.<ns>.svc, or <svc>.<ns>.svc.cluster.local (optional trailing dot)",
-                host
+                 port.name resolution only supports <svc>, <svc>.<ns>, <svc>.<ns>.svc, or \
+                 <svc>.<ns>.svc.{} (optional trailing dot)",
+                host, cluster_domain
             ),
         ));
     };
@@ -1067,18 +1070,21 @@ fn resolve_destination_port(
 ///   - `<svc>` — short form; inherits the caller's default namespace
 ///   - `<svc>.<ns>` — two-label form
 ///   - `<svc>.<ns>.svc` — three-label form (final label MUST be `svc`)
-///   - `<svc>.<ns>.svc.cluster.local` — FQDN form
+///   - `<svc>.<ns>.svc.<cluster_domain>` — FQDN form (cluster_domain is
+///     configurable via `FERRUM_MESH_CLUSTER_DOMAIN`, default `cluster.local`)
 ///
 /// Any other shape — including external hosts (`api.example.com`), foreign
 /// FQDNs (`foo.bar.tld.invalid`), partial suffixes (`<svc>.<ns>.cluster.local`,
-/// `<svc>.<ns>.svc.cluster`), or any label count not in `{1, 2, 3, 5}` —
-/// returns `None`. Empty labels (leading/trailing dots that aren't the root
-/// anchor, consecutive dots) are also rejected. Callers MUST treat `None`
-/// as "this host is not a Kubernetes service reference" and surface a clear
-/// error instead of attempting a service lookup.
-fn service_host_components(host: &str, default_namespace: &str) -> Option<(String, String)> {
-    // Strip a single trailing dot (DNS root anchor); reject anything still
-    // ending in `.` afterward (`foo..` etc).
+/// `<svc>.<ns>.svc.cluster`), or hosts whose FQDN suffix doesn't match the
+/// configured cluster domain — returns `None`. Empty labels (leading/trailing
+/// dots that aren't the root anchor, consecutive dots) are also rejected.
+/// Callers MUST treat `None` as "this host is not a Kubernetes service
+/// reference" and surface a clear error instead of attempting a service lookup.
+fn service_host_components(
+    host: &str,
+    default_namespace: &str,
+    cluster_domain: &str,
+) -> Option<(String, String)> {
     let trimmed = host.strip_suffix('.').unwrap_or(host);
     if trimmed.is_empty() {
         return None;
@@ -1091,7 +1097,14 @@ fn service_host_components(host: &str, default_namespace: &str) -> Option<(Strin
         [svc] => Some(((*svc).to_string(), default_namespace.to_string())),
         [svc, ns] => Some(((*svc).to_string(), (*ns).to_string())),
         [svc, ns, "svc"] => Some(((*svc).to_string(), (*ns).to_string())),
-        [svc, ns, "svc", "cluster", "local"] => Some(((*svc).to_string(), (*ns).to_string())),
+        [svc, ns, "svc", domain_labels @ ..] if !domain_labels.is_empty() => {
+            let suffix = domain_labels.join(".");
+            if suffix.eq_ignore_ascii_case(cluster_domain) {
+                Some(((*svc).to_string(), (*ns).to_string()))
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -5117,5 +5130,50 @@ mod tests {
                 .unwrap_or_else(|e| panic!("trailing-dot host '{host}' must resolve: {e}"));
             assert_eq!(result.config.proxies[0].backend_port, 8080);
         }
+    }
+
+    #[test]
+    fn vs_destination_port_name_resolves_custom_cluster_domain() {
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let opts = options().with_cluster_domain("corp.example".to_string());
+        for host in [
+            "reviews.default.svc.corp.example",
+            "reviews.default.svc.corp.example.",
+        ] {
+            let vs = virtual_service_with_destination(
+                "reviews-vs",
+                serde_json::json!({
+                    "host": host,
+                    "port": {"name": "http"}
+                }),
+            );
+            let result = translate_k8s_objects(&[svc.clone(), vs], opts.clone())
+                .unwrap_or_else(|e| panic!("custom domain host '{host}' must resolve: {e}"));
+            assert_eq!(result.config.proxies[0].backend_port, 8080);
+        }
+    }
+
+    #[test]
+    fn vs_destination_port_name_rejects_wrong_cluster_domain() {
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let opts = options().with_cluster_domain("corp.example".to_string());
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "port": {"name": "http"}
+            }),
+        );
+        let err = translate_k8s_objects(&[svc, vs], opts)
+            .expect_err("cluster.local must be rejected when domain is corp.example");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a recognized in-cluster service form"),
+            "error must explain shape rejection: {msg}"
+        );
+        assert!(
+            msg.contains("corp.example"),
+            "error must show the configured cluster domain: {msg}"
+        );
     }
 }
