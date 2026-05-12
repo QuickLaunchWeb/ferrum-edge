@@ -4810,7 +4810,9 @@ mod tests {
                 },
                 spec: serde_json::json!({"tracing": {"sampling": 5.0}}),
             }],
-            options_for_namespace("default").with_istio_root_namespace("istio-config".to_string()),
+            options_for_namespace("default")
+                .with_istio_root_namespace("istio-config".to_string())
+                .with_source_namespaces(vec!["default".to_string(), "istio-config".to_string()]),
         )
         .expect("translation succeeds");
 
@@ -4845,7 +4847,9 @@ mod tests {
                     "tracing": {"sampling": 50.0}
                 }),
             }],
-            options_for_namespace("default").with_istio_root_namespace("istio-config".to_string()),
+            options_for_namespace("default")
+                .with_istio_root_namespace("istio-config".to_string())
+                .with_source_namespaces(vec!["default".to_string(), "istio-config".to_string()]),
         )
         .expect("translation succeeds");
 
