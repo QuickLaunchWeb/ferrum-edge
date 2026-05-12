@@ -6,15 +6,19 @@
 //! Optional filter support (from Telemetry CRD): status code ranges,
 //! latency threshold, errors-only mode.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use tracing::warn;
 
+use super::utils::log_schema::{SchemaView, SummarySchema, resolve_schema};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
 pub struct AccessLog {
     /// When set, only log transactions matching all filter predicates.
     filter: Option<Filter>,
+    schema: Option<Arc<SummarySchema>>,
 }
 
 struct Filter {
@@ -38,7 +42,8 @@ impl AccessLog {
             }),
             _ => None,
         };
-        Ok(Self { filter })
+        let schema = resolve_schema(config, "access_log")?;
+        Ok(Self { filter, schema })
     }
 
     fn should_log_http(&self, summary: &TransactionSummary) -> bool {
@@ -116,7 +121,11 @@ impl Plugin for AccessLog {
         if !self.should_log_http(summary) {
             return;
         }
-        match serde_json::to_string(summary) {
+        let result = match self.schema.as_ref().filter(|s| s.applies_to_http()) {
+            Some(schema) => serde_json::to_string(&SchemaView { summary, schema }),
+            None => serde_json::to_string(summary),
+        };
+        match result {
             Ok(json) => tracing::info!(target: "mesh_access_log", "{}", json),
             Err(e) => warn!("access_log: failed to serialize transaction summary: {e}"),
         }
@@ -126,7 +135,11 @@ impl Plugin for AccessLog {
         if !self.should_log_stream(summary) {
             return;
         }
-        match serde_json::to_string(summary) {
+        let result = match self.schema.as_ref().filter(|s| s.applies_to_stream()) {
+            Some(schema) => serde_json::to_string(&SchemaView { summary, schema }),
+            None => serde_json::to_string(summary),
+        };
+        match result {
             Ok(json) => tracing::info!(target: "mesh_access_log", "{}", json),
             Err(e) => warn!("access_log: failed to serialize stream summary: {e}"),
         }
