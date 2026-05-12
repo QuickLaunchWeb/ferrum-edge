@@ -41,6 +41,7 @@ fn make_upstream(
         health_checks: None,
         service_discovery: sd,
         subsets: None,
+        port_overrides: std::collections::HashMap::new(),
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
@@ -80,6 +81,9 @@ fn mesh_workload(id: &str, service_name: &str, address: &str, port: u16) -> Work
         namespace: default_namespace(),
         network: None,
         cluster: None,
+        weight: None,
+        locality: None,
+        service_account: None,
     }
 }
 

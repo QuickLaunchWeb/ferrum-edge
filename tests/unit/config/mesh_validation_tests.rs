@@ -26,6 +26,9 @@ fn fresh_workload() -> Workload {
         namespace: "svc".into(),
         network: None,
         cluster: None,
+        weight: None,
+        locality: None,
+        service_account: None,
     }
 }
 
@@ -517,6 +520,9 @@ fn gateway_config_validate_mesh_fields_dispatches() {
                 namespace: "default".into(),
                 network: None,
                 cluster: None,
+                weight: None,
+                locality: None,
+                service_account: None,
             }],
             ..Default::default()
         })),
