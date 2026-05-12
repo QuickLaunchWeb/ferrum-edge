@@ -1569,7 +1569,9 @@ fn telemetry_provider_string_field(
 }
 
 /// Read a required string field, trying the canonical (camelCase) name first
-/// then any provided aliases. Non-empty after trim is required.
+/// then any provided aliases. Non-empty after trim is required. The returned
+/// value is trimmed so stray whitespace in CRDs (e.g. `"url": " http://zipkin:9411 "`)
+/// does not propagate into pool keys, DNS resolvers, or URL parsers downstream.
 fn telemetry_provider_string_field_aliased(
     object: &K8sObject,
     entry: &Value,
@@ -1583,7 +1585,8 @@ fn telemetry_provider_string_field_aliased(
             entry
                 .get(name)
                 .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
                 .map(str::to_string)
         })
         .ok_or_else(|| {
