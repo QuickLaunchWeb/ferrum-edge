@@ -1158,7 +1158,7 @@ fn resolve_destination_port(
             ),
         ));
     };
-    match acc.lookup_service_port(&ns, &svc, name) {
+    match acc.lookup_service_port(ns, svc, name) {
         Some(port) => Ok(Some(port)),
         None => Err(invalid_resource(
             object,
@@ -1170,7 +1170,8 @@ fn resolve_destination_port(
     }
 }
 
-/// Parse an Istio destination host into `(service_name, namespace)`.
+/// Parse an Istio destination host into `(service_name, namespace)` as borrowed
+/// slices of either `host` or `default_namespace` — no allocation.
 ///
 /// Accepted shapes (all may carry an optional trailing `.` root anchor):
 ///   - `<svc>` — short form; inherits the caller's default namespace
@@ -1186,32 +1187,43 @@ fn resolve_destination_port(
 /// dots that aren't the root anchor, consecutive dots) are also rejected.
 /// Callers MUST treat `None` as "this host is not a Kubernetes service
 /// reference" and surface a clear error instead of attempting a service lookup.
-fn service_host_components(
-    host: &str,
-    default_namespace: &str,
+fn service_host_components<'a>(
+    host: &'a str,
+    default_namespace: &'a str,
     cluster_domain: &str,
-) -> Option<(String, String)> {
+) -> Option<(&'a str, &'a str)> {
     let trimmed = host.strip_suffix('.').unwrap_or(host);
-    if trimmed.is_empty() {
+    // Reject empty strings, leading/trailing dots, and consecutive dots in one
+    // pass over the borrowed slice — avoids the Vec<&str> allocation the old
+    // `split('.').collect()` + `any(empty)` shape required.
+    if trimmed.is_empty()
+        || trimmed.starts_with('.')
+        || trimmed.ends_with('.')
+        || trimmed.contains("..")
+    {
         return None;
     }
-    let labels: Vec<&str> = trimmed.split('.').collect();
-    if labels.iter().any(|l| l.is_empty()) {
+    // Limit to four splits: <svc>.<ns>.svc.<domain-rest>. The fourth split
+    // captures the entire cluster-domain suffix verbatim so we can compare it
+    // against `cluster_domain` with `eq_ignore_ascii_case` and no `join(".")`.
+    let mut labels = trimmed.splitn(4, '.');
+    let svc = labels.next()?;
+    let Some(ns) = labels.next() else {
+        return Some((svc, default_namespace));
+    };
+    let Some(third) = labels.next() else {
+        return Some((svc, ns));
+    };
+    if third != "svc" {
         return None;
     }
-    match labels.as_slice() {
-        [svc] => Some(((*svc).to_string(), default_namespace.to_string())),
-        [svc, ns] => Some(((*svc).to_string(), (*ns).to_string())),
-        [svc, ns, "svc"] => Some(((*svc).to_string(), (*ns).to_string())),
-        [svc, ns, "svc", domain_labels @ ..] if !domain_labels.is_empty() => {
-            let suffix = domain_labels.join(".");
-            if suffix.eq_ignore_ascii_case(cluster_domain) {
-                Some(((*svc).to_string(), (*ns).to_string()))
-            } else {
-                None
-            }
-        }
-        _ => None,
+    let Some(domain) = labels.next() else {
+        return Some((svc, ns));
+    };
+    if domain.eq_ignore_ascii_case(cluster_domain) {
+        Some((svc, ns))
+    } else {
+        None
     }
 }
 

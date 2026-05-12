@@ -162,11 +162,13 @@ pub(crate) struct K8sAccumulator {
     reference_grants: HashSet<ReferenceGrantPermission>,
     proxy_sources: HashMap<String, SourceKind>,
     known_namespaces: HashSet<String>,
-    /// Port-name → port-number index for collected `Service` objects, keyed
-    /// by `(namespace, service_name)`. Built in the translator pre-pass so
-    /// VirtualService destinations carrying `port.name` (not `port.number`)
-    /// can be resolved against the workload's actual Service.
-    service_port_names: HashMap<(String, String), HashMap<String, u16>>,
+    /// Port-name → port-number index for collected `Service` objects, nested
+    /// `namespace → service_name → port_name → port`. Built in the translator
+    /// pre-pass so VirtualService destinations carrying `port.name` (not
+    /// `port.number`) can be resolved against the workload's actual Service.
+    /// The nested shape lets `lookup_service_port` borrow `&str` arguments
+    /// directly — no per-lookup `.to_string()` allocations.
+    service_port_names: HashMap<String, HashMap<String, HashMap<String, u16>>>,
 }
 
 impl K8sAccumulator {
@@ -193,8 +195,10 @@ impl K8sAccumulator {
         port_name: &str,
     ) -> Option<u16> {
         self.service_port_names
-            .get(&(namespace.to_string(), service.to_string()))
-            .and_then(|ports| ports.get(port_name).copied())
+            .get(namespace)
+            .and_then(|by_svc| by_svc.get(service))
+            .and_then(|ports| ports.get(port_name))
+            .copied()
     }
 
     fn observe_namespace(&mut self, namespace: &str) {
@@ -405,13 +409,10 @@ pub(crate) fn collect_service(
         let port = port_from_u64(object, raw, "Service.spec.ports[].port")?;
         port_names.insert(name.to_string(), port);
     }
-    acc.service_port_names.insert(
-        (
-            object.metadata.namespace.clone(),
-            object.metadata.name.clone(),
-        ),
-        port_names,
-    );
+    acc.service_port_names
+        .entry(object.metadata.namespace.clone())
+        .or_default()
+        .insert(object.metadata.name.clone(), port_names);
     Ok(())
 }
 
