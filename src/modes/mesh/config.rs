@@ -451,6 +451,7 @@ pub enum TracingProvider {
         collector_url: String,
         access_token: String,
     },
+    #[serde(rename = "opentelemetry")]
     OpenTelemetry {
         endpoint: String,
     },

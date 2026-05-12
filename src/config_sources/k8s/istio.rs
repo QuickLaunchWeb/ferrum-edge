@@ -1446,21 +1446,33 @@ fn telemetry(
 ///
 /// Mirrors Istio's Telemetry CRD: `providers[]` is a list of named provider
 /// references. Today we surface only the first entry; multi-provider fan-out
-/// is deferred. Unknown provider kinds (any string outside the four supported
-/// backends) and provider entries missing their required URL/endpoint field
-/// fail closed with the offending name in the error so operators can fix
-/// their manifests rather than silently dropping observability config.
+/// is deferred.
+///
+/// Istio's standard provider model defines providers once at the mesh-config
+/// level (`meshConfig.extensionProviders`) and references them by name from
+/// Telemetry resources. This translator supports **inline** provider config
+/// only (provider type inferred from `name`, required fields on the entry
+/// itself). Name-only references (`{name: "my-zipkin"}` with no inline
+/// fields) and unrecognised provider names are gracefully skipped with a
+/// warning — `meshConfig.extensionProviders` lookup is deferred.
 fn telemetry_tracing_provider(
     object: &K8sObject,
     tracing_entry: &Value,
 ) -> Result<Option<TracingProvider>, K8sTranslateError> {
-    let Some(first) = tracing_entry
-        .get("providers")
-        .and_then(Value::as_array)
-        .and_then(|arr| arr.first())
-    else {
+    let Some(providers) = tracing_entry.get("providers").and_then(Value::as_array) else {
         return Ok(None);
     };
+    let Some(first) = providers.first() else {
+        return Ok(None);
+    };
+    if providers.len() > 1 {
+        tracing::warn!(
+            resource = %object.metadata.name,
+            namespace = %object.metadata.namespace,
+            count = providers.len(),
+            "Telemetry tracing.providers[] has multiple entries; only the first is surfaced (multi-provider fan-out is deferred)"
+        );
+    }
     let name = first
         .get("name")
         .and_then(Value::as_str)
@@ -1472,16 +1484,27 @@ fn telemetry_tracing_provider(
             "Telemetry tracing.providers[].name must not be empty",
         ));
     }
+    let is_reference_only = first
+        .as_object()
+        .map(|obj| obj.keys().all(|k| k == "name"))
+        .unwrap_or(false);
+    if is_reference_only {
+        tracing::warn!(
+            resource = %object.metadata.name,
+            namespace = %object.metadata.namespace,
+            provider_name = name,
+            "Telemetry tracing.providers[] entry is a name-only reference \
+             (no inline config fields); meshConfig.extensionProviders lookup \
+             is not yet supported — provider skipped"
+        );
+        return Ok(None);
+    }
     let provider = match name {
         "zipkin" => {
             let url = telemetry_provider_string_field(object, first, "zipkin", "url")?;
             TracingProvider::Zipkin { url }
         }
         "datadog" => {
-            // K8s/Istio CRDs use camelCase, matching the rest of the translator
-            // (`randomSamplingPercentage`, `customTags`, ...). The trailing
-            // snake_case alias preserves the original PR field name so any
-            // operator manifest written against the first draft still applies.
             let agent_url = telemetry_provider_string_field_aliased(
                 object,
                 first,
@@ -1521,12 +1544,16 @@ fn telemetry_tracing_provider(
             TracingProvider::OpenTelemetry { endpoint }
         }
         other => {
-            return Err(invalid_resource(
-                object,
-                format!(
-                    "Telemetry tracing.providers[].name '{other}' is not a supported provider (expected zipkin/datadog/lightstep/opentelemetry)"
-                ),
-            ));
+            tracing::warn!(
+                resource = %object.metadata.name,
+                namespace = %object.metadata.namespace,
+                provider_name = other,
+                "Telemetry tracing.providers[] name '{other}' is not a recognised \
+                 inline provider type (supported: zipkin/datadog/lightstep/opentelemetry); \
+                 if this references a meshConfig.extensionProviders entry, that lookup \
+                 is not yet supported — provider skipped"
+            );
+            return Ok(None);
         }
     };
     Ok(Some(provider))
@@ -3385,8 +3412,8 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_tracing_unknown_provider_kind_fails_closed() {
-        let err = translate_k8s_objects(
+    fn telemetry_tracing_unknown_provider_name_gracefully_skipped() {
+        let result = translate_k8s_objects(
             &[object(
                 "Telemetry",
                 serde_json::json!({
@@ -3400,16 +3427,81 @@ mod tests {
             )],
             options(),
         )
-        .expect_err("unknown provider kind should fail closed");
+        .expect("unknown provider name should not fail translation");
 
-        let msg = err.to_string();
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
         assert!(
-            msg.contains("stackdriver"),
-            "error must mention offending name: {msg}"
+            tracing.provider.is_none(),
+            "unrecognised provider name should be skipped, not surfaced"
         );
+    }
+
+    #[test]
+    fn telemetry_tracing_name_only_reference_gracefully_skipped() {
+        // Standard Istio pattern: providers[].name references a
+        // meshConfig.extensionProviders entry with no inline fields.
+        // Since extensionProviders lookup is deferred, the translator
+        // should gracefully skip these rather than failing.
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "zipkin"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("name-only reference should not fail translation");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
         assert!(
-            msg.contains("not a supported provider"),
-            "error must explain the kind is unsupported: {msg}"
+            tracing.provider.is_none(),
+            "name-only reference should be skipped (extensionProviders lookup deferred)"
+        );
+    }
+
+    #[test]
+    fn telemetry_tracing_custom_extension_provider_name_gracefully_skipped() {
+        // Custom extensionProvider names like "my-zipkin" are valid Istio
+        // references but not one of the four inline provider types.
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "my-zipkin"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("custom provider name should not fail translation");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        assert!(
+            tracing.provider.is_none(),
+            "custom extensionProvider reference should be skipped"
         );
     }
 

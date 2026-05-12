@@ -701,7 +701,7 @@ mod tests {
     fn tracing_provider_opentelemetry_round_trips() {
         let metrics = WorkloadMetrics::new(&json!({
             "tracing_provider": {
-                "kind": "open_telemetry",
+                "kind": "opentelemetry",
                 "config": {
                     "endpoint": "http://otel-collector:4317"
                 }
