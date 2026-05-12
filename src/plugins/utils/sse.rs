@@ -23,6 +23,7 @@
 //! check still streams the body via the existing escape hatch. This helper
 //! covers the request-side case.
 use super::super::RequestContext;
+use serde_json::Value;
 use std::collections::HashMap;
 
 /// Returns `true` when the request's `Accept` header indicates Server-Sent
@@ -44,6 +45,61 @@ pub fn headers_accept_sse(headers: &HashMap<String, String>) -> bool {
     headers
         .get("accept")
         .is_some_and(|accept| accept_includes_event_stream(accept))
+}
+
+/// Parse SSE `data:` frames from a buffered SSE response body into JSON values.
+///
+/// Iterates lines, strips the `data: ` (or `data:`) prefix, skips empty data,
+/// the `[DONE]` sentinel, and frames that are not valid JSON. Returns the
+/// parsed frames in order. Returns an empty `Vec` if the body is not valid
+/// UTF-8 — callers receive no JSON frames but no error either.
+pub fn parse_sse_data_frames(body: &[u8]) -> Vec<Value> {
+    let body_str = match std::str::from_utf8(body) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut frames = Vec::new();
+    let mut event_data = Vec::new();
+
+    fn flush_event(event_data: &mut Vec<&str>, frames: &mut Vec<Value>) {
+        if event_data.is_empty() {
+            return;
+        }
+        let data = if event_data.len() == 1 {
+            event_data[0].to_string()
+        } else {
+            event_data.join("\n")
+        };
+        event_data.clear();
+
+        let trimmed = data.trim();
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            return;
+        }
+        if let Ok(json) = serde_json::from_str::<Value>(trimmed) {
+            frames.push(json);
+        }
+    }
+
+    for raw_line in body_str.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() {
+            flush_event(&mut event_data, &mut frames);
+            continue;
+        }
+
+        let data = if let Some(rest) = line.strip_prefix("data: ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            rest
+        } else {
+            continue;
+        };
+        event_data.push(data);
+    }
+    flush_event(&mut event_data, &mut frames);
+
+    frames
 }
 
 /// Returns `true` when an `Accept` header value (which may be a comma-separated
@@ -127,5 +183,58 @@ mod tests {
         assert!(is_sse_request(&ctx_with_accept(Some(
             "text/event-stream ; q=0.9"
         ))));
+    }
+
+    #[test]
+    fn parse_sse_frames_basic() {
+        let body = b"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"id\":\"2\",\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\ndata: [DONE]\n\n";
+        let frames = parse_sse_data_frames(body);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0]["id"], "1");
+        assert_eq!(frames[1]["id"], "2");
+    }
+
+    #[test]
+    fn parse_sse_frames_empty_body() {
+        assert!(parse_sse_data_frames(b"").is_empty());
+    }
+
+    #[test]
+    fn parse_sse_frames_skips_done_and_comments() {
+        let body = b": comment\ndata: [DONE]\n\ndata: {\"ok\":true}\n";
+        let frames = parse_sse_data_frames(body);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["ok"], true);
+    }
+
+    #[test]
+    fn parse_sse_frames_no_space_after_colon() {
+        let body = b"data:{\"v\":1}\n";
+        let frames = parse_sse_data_frames(body);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["v"], 1);
+    }
+
+    #[test]
+    fn parse_sse_frames_multiline_data_event() {
+        let body = b"data: {\"id\":\"1\",\ndata: \"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"id\":\"2\"}\n\n";
+        let frames = parse_sse_data_frames(body);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0]["id"], "1");
+        assert_eq!(frames[0]["choices"][0]["delta"]["content"], "Hello");
+        assert_eq!(frames[1]["id"], "2");
+    }
+
+    #[test]
+    fn parse_sse_frames_skips_invalid_json() {
+        let body = b"data: not-json\n\ndata: {\"ok\":true}\n";
+        let frames = parse_sse_data_frames(body);
+        assert_eq!(frames.len(), 1);
+    }
+
+    #[test]
+    fn parse_sse_frames_invalid_utf8() {
+        let body: &[u8] = &[0xff, 0xfe, 0xfd];
+        assert!(parse_sse_data_frames(body).is_empty());
     }
 }

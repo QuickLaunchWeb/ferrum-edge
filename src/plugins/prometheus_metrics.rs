@@ -883,6 +883,14 @@ impl PrometheusMetrics {
         if !(config.is_object() || config.is_null()) {
             return Err("prometheus_metrics: config must be an object".to_string());
         }
+        if config.get("schema").is_some() || config.get("schema_ref").is_some() {
+            return Err(
+                "prometheus_metrics: 'schema' / 'schema_ref' is not supported \
+                 (transaction-log schema customization applies only to log-shipping plugins; \
+                 see docs/plugins.md)"
+                    .to_string(),
+            );
+        }
 
         let registry = global_registry();
 

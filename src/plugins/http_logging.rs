@@ -10,10 +10,13 @@
 //! `LogEntry` union type, and uses the shared `PluginHttpClient` for
 //! connection pooling and DNS cache integration.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 
+use super::utils::log_schema::{SummaryLogEntryBatchView, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry, build_batch_config,
     handle_http_batch_response, parse_http_endpoint, validate_batch_config,
@@ -25,6 +28,7 @@ struct HttpFlushConfig {
     endpoint_url: String,
     custom_headers: Vec<(HeaderName, HeaderValue)>,
     http_client: PluginHttpClient,
+    schema: Option<Arc<SummarySchema>>,
 }
 
 pub struct HttpLogging {
@@ -74,10 +78,12 @@ impl HttpLogging {
         };
         validate_batch_config(config, "http_logging", batch_defaults)?;
 
+        let schema = resolve_schema(config, "http_logging")?;
         let flush_config = HttpFlushConfig {
             endpoint_url,
             custom_headers,
             http_client,
+            schema,
         };
         let logger = BatchingLogger::spawn(
             // Config remains `max_retries`; the shared retry policy counts the
@@ -125,7 +131,11 @@ impl Plugin for HttpLogging {
 
 async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<SummaryLogEntry>) -> Result<(), String> {
     let entry_count = batch.len();
-    let mut req = cfg.http_client.get().post(&cfg.endpoint_url).json(&batch);
+    let view = SummaryLogEntryBatchView {
+        entries: &batch,
+        schema: cfg.schema.as_deref(),
+    };
+    let mut req = cfg.http_client.get().post(&cfg.endpoint_url).json(&view);
     for (name, value) in &cfg.custom_headers {
         req = req.header(name.clone(), value.clone());
     }

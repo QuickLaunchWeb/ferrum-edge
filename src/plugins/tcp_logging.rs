@@ -25,6 +25,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 
+use super::utils::log_schema::{SummaryLogEntryView, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry, build_batch_config,
     resolve_tcp_endpoint, validate_batch_config,
@@ -51,6 +52,7 @@ struct TcpFlushConfig {
     /// when the plugin was constructed via the test/fallback `PluginHttpClient`
     /// path that has no cache attached.
     dns_cache: Option<DnsCache>,
+    schema: Option<Arc<SummarySchema>>,
 }
 
 pub struct TcpLogging {
@@ -103,6 +105,7 @@ impl TcpLogging {
         };
         validate_batch_config(config, "tcp_logging", batch_defaults)?;
 
+        let schema = resolve_schema(config, "tcp_logging")?;
         let flush_config = TcpFlushConfig {
             host: host.clone(),
             port,
@@ -113,6 +116,7 @@ impl TcpLogging {
             tls_crls: http_client.tls_crls().to_vec(),
             connect_timeout: Duration::from_millis(connect_timeout_ms),
             dns_cache: http_client.dns_cache().cloned(),
+            schema,
         };
         let writer = Arc::new(Mutex::new(None));
         let logger = BatchingLogger::spawn(
@@ -372,7 +376,11 @@ async fn send_batch(
 ) -> Result<(), String> {
     let mut payload = Vec::with_capacity(batch.len() * 256);
     for entry in &batch {
-        if let Ok(json) = serde_json::to_vec(entry) {
+        let result = match cfg.schema.as_deref() {
+            Some(schema) => serde_json::to_vec(&SummaryLogEntryView { entry, schema }),
+            None => serde_json::to_vec(entry),
+        };
+        if let Ok(json) = result {
             payload.extend_from_slice(&json);
             payload.push(b'\n');
         }
@@ -639,6 +647,7 @@ mod tests {
             tls_crls: (*crl_list).clone(),
             connect_timeout: Duration::from_secs(2),
             dns_cache: None,
+            schema: None,
         };
         let result = connect_tcp(&cfg).await;
         let err = match result {
@@ -680,6 +689,7 @@ mod tests {
             tls_crls: Vec::new(),
             connect_timeout: Duration::from_secs(2),
             dns_cache: None,
+            schema: None,
         };
         let result = connect_tcp(&cfg).await;
         assert!(

@@ -211,6 +211,22 @@ pub struct RequestMatch {
     /// Glob port patterns, used for Istio string-match ports such as "*".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub port_patterns: Vec<String>,
+    /// Istio `notMethods` — conjunctive negative-match: when any value
+    /// matches the request method, the rule fails. Empty means "no
+    /// negative filter".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_methods: Vec<String>,
+    /// Istio `notPaths` — conjunctive negative-match for the request path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_paths: Vec<String>,
+    /// Istio `notHosts` — conjunctive negative-match for the request host.
+    /// Normalised at config-load time identical to `hosts` so the hot path
+    /// stays allocation-free.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_hosts: Vec<String>,
+    /// Istio `notPorts` — conjunctive negative-match for the request port.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -314,10 +330,7 @@ pub fn workload_selector_matches<L: WorkloadLabels + ?Sized>(
     {
         return false;
     }
-    selector
-        .labels
-        .iter()
-        .all(|(key, value)| proxy_labels.lookup(key) == Some(value.as_str()))
+    labels_match_subset(&selector.labels, proxy_labels)
 }
 
 // ── RequestAuthentication ─────────────────────────────────────────────────
@@ -401,6 +414,47 @@ pub struct MeshTracingConfig {
     /// Custom tags resolved from request headers at runtime.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_header_tags: HashMap<String, String>,
+    /// Provider-specific tracing backend (Zipkin / Datadog / Lightstep / OpenTelemetry).
+    ///
+    /// Mirrors Istio's `Telemetry.tracing[].providers[]`. Old DPs reading new
+    /// slices ignore this field (serde defaults to `None`); new DPs reading
+    /// old slices behave identically to today (provider is `None`, no
+    /// behavior change). A future mesh-wide-default surface (Istio
+    /// `meshConfig.defaultProviders`) can be threaded in alongside without
+    /// changing this field — the slice merge already picks the most-specific
+    /// applicable Telemetry's provider, and the default-providers map would
+    /// simply seed `None` slots before merge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<TracingProvider>,
+}
+
+/// Tracing backend selection for a `MeshTracingConfig`.
+///
+/// Mirrors Istio's `Tracing.providers[]` provider definitions for the four
+/// most common backends. Serialised with `kind` discriminator + `config`
+/// payload so a future variant can be appended without an `unknown`-handling
+/// shim on older DPs (serde will simply fail to deserialise an unknown
+/// variant and the slice update is rejected at slice-apply time, consistent
+/// with the rest of the mesh slice contract).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "config")]
+pub enum TracingProvider {
+    Zipkin {
+        url: String,
+    },
+    Datadog {
+        agent_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service: Option<String>,
+    },
+    Lightstep {
+        collector_url: String,
+        access_token: String,
+    },
+    #[serde(rename = "opentelemetry")]
+    OpenTelemetry {
+        endpoint: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -456,6 +510,78 @@ pub struct AccessLogFilter {
     pub errors_only: bool,
 }
 
+// ── ProxyConfig ───────────────────────────────────────────────────────────
+
+/// Represents an Istio `ProxyConfig` (`networking.istio.io/v1beta1`) resource
+/// translated into Ferrum's model.
+///
+/// ProxyConfig carries config-time, read-only settings for a workload's
+/// data plane: `concurrency`, `image`, `environmentVariables`, and tracing
+/// `sampling`. It has **no data-plane request-path impact** — values are
+/// applied at slice-apply time (cold path) and surfaced to operator
+/// tooling. Tracing `sampling` flows into the injected `workload_metrics`
+/// plugin's `sampling_percentage` field.
+///
+/// Scope resolution mirrors the canonical [`PolicyScope`] used by
+/// `PeerAuthentication`, `RequestAuthentication`, and `Telemetry`: a
+/// resource in the Istio root namespace with no selector is `MeshWide`; a
+/// resource in any other namespace with no selector is `Namespace`-scoped;
+/// any resource with a selector is `WorkloadSelector`-scoped (with the
+/// `namespace` set when not in the root namespace, mirroring the Istio
+/// "root-namespace selectors apply mesh-wide" rule used by Telemetry / RA).
+/// Most-specific match wins per workload (WorkloadSelector > Namespace >
+/// MeshWide); same-specificity ties are broken by ASCII-ordered name.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MeshProxyConfig {
+    pub name: String,
+    pub namespace: String,
+    /// Resolved [`PolicyScope`] capturing Istio's root-namespace +
+    /// selector semantics. See struct docs for the full table.
+    #[serde(default)]
+    pub scope: PolicyScope,
+    /// `spec.concurrency` — informational; surfaced to operator tooling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u32>,
+    /// `spec.image.imageType` — informational; surfaced to operator tooling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// `spec.environmentVariables` — informational; surfaced to operator tooling.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub environment: HashMap<String, String>,
+    /// `spec.tracing.sampling` — percentage 0-100; merged into
+    /// `workload_metrics.sampling_percentage` at slice-apply time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracing_sampling: Option<f64>,
+}
+
+/// Returns `true` when a [`MeshProxyConfig`] applies to a workload whose
+/// namespace is `proxy_namespace` and whose labels are `proxy_labels`.
+///
+/// Delegates to the canonical [`scope_applies_to_workload`] helper so
+/// ProxyConfig honors the same root-namespace + selector semantics as
+/// every other Istio mesh resource (PeerAuthentication, Telemetry,
+/// RequestAuthentication, AuthorizationPolicy).
+pub fn proxy_config_applies_to_workload<L: WorkloadLabels + ?Sized>(
+    config: &MeshProxyConfig,
+    proxy_namespace: &str,
+    proxy_labels: &L,
+) -> bool {
+    scope_applies_to_workload(&config.scope, proxy_namespace, proxy_labels)
+}
+
+/// Returns `true` when every `(key, value)` in `selector_labels` is present
+/// in `proxy_labels` with the same value. Empty `selector_labels` always
+/// matches (subset semantics). Shared by [`workload_selector_matches`].
+#[inline]
+fn labels_match_subset<L: WorkloadLabels + ?Sized>(
+    selector_labels: &HashMap<String, String>,
+    proxy_labels: &L,
+) -> bool {
+    selector_labels
+        .iter()
+        .all(|(key, value)| proxy_labels.lookup(key) == Some(value.as_str()))
+}
+
 /// Returns true when a ServiceEntry is visible to a workload namespace under
 /// Ferrum's egress materialization rules. Empty `export_to` is intentionally
 /// namespace-local to avoid cross-tenant exposure by omission. Istio
@@ -501,10 +627,19 @@ pub struct PeerAuthentication {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MtlsMode {
+    // ── PeerAuthentication server-side modes ──
     Strict,
     #[default]
     Permissive,
     Disable,
+    // ── DestinationRule client-side modes (Istio `ClientTLSSettings.mode`) ──
+    /// SIMPLE: originate TLS to the backend, verify the server certificate.
+    Simple,
+    /// MUTUAL: originate mTLS with operator-provided client cert/key.
+    Mutual,
+    /// ISTIO_MUTUAL: originate mTLS using the workload's SPIFFE identity
+    /// material (no explicit cert/key in the DR).
+    IstioMutual,
 }
 
 // ── ServiceEntry ──────────────────────────────────────────────────────────
@@ -742,6 +877,104 @@ pub struct MeshTrafficPolicy {
     /// Load balancer configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_balancer: Option<MeshLoadBalancer>,
+    /// Optional backend TLS override from `DestinationRule.trafficPolicy.tls`.
+    ///
+    /// When `None` (default) the workload's `PeerAuthentication`-derived
+    /// mTLS posture continues to apply. When `Some(...)` the DR settings
+    /// win at cold-path apply time: `apply_traffic_policy_to_upstream`
+    /// projects them onto the matching `Upstream`'s `backend_tls_*` fields.
+    /// Old DPs reading new slices see this as a no-op (serde defaults to
+    /// `None`); new DPs reading old slices behave identically to today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<MeshTrafficPolicyTls>,
+}
+
+/// `DestinationRule.trafficPolicy.tls` settings mapped from Istio's
+/// `ClientTLSSettings` (`networking.istio.io/v1beta1`).
+///
+/// Carries the originating-client TLS mode plus optional SNI, CA, client
+/// cert/key, SAN verification list, and an `insecureSkipVerify` escape
+/// hatch. The cold-path apply at `apply_traffic_policy_to_upstream`
+/// projects these onto the `Upstream` `backend_tls_*` fields when set.
+///
+/// `Default::default()` returns a `Simple`-mode block (matches Istio's
+/// `ClientTLSSettings.mode` default and avoids the `MtlsMode::Permissive`
+/// server-side default that the derived `Default` would otherwise produce —
+/// a `MeshTrafficPolicyTls` with a server-side mode is treated as a
+/// programming error by the cold-path apply).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshTrafficPolicyTls {
+    /// DR client-side TLS mode: `Disable` / `Simple` / `Mutual` / `IstioMutual`.
+    ///
+    /// Defaults to `Simple` when omitted, matching Istio's `ClientTLSSettings.mode`
+    /// default and the `translate_client_tls_settings` translator behavior. Without
+    /// this default, a hand-authored or partially-updated slice such as
+    /// `{ "tls": { "sni": "..." } }` would fail to deserialize even though Istio
+    /// defaulting semantics treat it as `SIMPLE`.
+    #[serde(default = "default_client_tls_mode")]
+    pub mode: MtlsMode,
+    /// Optional Server Name Indication value sent on the backend handshake.
+    /// Today this is a schema-compatibility field — `Upstream` does not yet
+    /// have a per-upstream SNI override (Ferrum's reqwest path derives SNI
+    /// from the host header / target address). Captured here so cold-path
+    /// apply can warn when set and future work can wire it through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    /// Optional path to a PEM CA bundle for verifying the backend server's
+    /// certificate (Istio `caCertificates`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_certificates: Option<String>,
+    /// Optional path to a PEM client certificate for mTLS with the backend
+    /// (Istio `clientCertificate`). Required when `mode == Mutual`; must be
+    /// absent when `mode == IstioMutual`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_certificate: Option<String>,
+    /// Optional path to a PEM private key for mTLS with the backend
+    /// (Istio `privateKey`). Required when `mode == Mutual`; must be
+    /// absent when `mode == IstioMutual`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    /// Optional list of acceptable Subject Alternative Names for the
+    /// backend's server certificate (Istio `subjectAltNames`). Today this
+    /// is a schema-compatibility field — Ferrum's `backend_tls_*` surface
+    /// does not yet expose a per-upstream SAN allow-list. Captured here
+    /// so cold-path apply can warn when set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subject_alt_names: Vec<String>,
+    /// When true, suppress server-cert verification on the backend handshake
+    /// (Istio `insecureSkipVerify`). Maps to
+    /// `Upstream.backend_tls_verify_server_cert = false`.
+    #[serde(default = "default_insecure_skip_verify")]
+    pub insecure_skip_verify: bool,
+}
+
+fn default_insecure_skip_verify() -> bool {
+    false
+}
+
+fn default_client_tls_mode() -> MtlsMode {
+    MtlsMode::Simple
+}
+
+impl Default for MeshTrafficPolicyTls {
+    fn default() -> Self {
+        // Use a client-side default (`Simple`) instead of the derived
+        // `MtlsMode::default() == Permissive` so that `..Default::default()`
+        // in callers / tests always produces a value that the cold-path
+        // apply treats as a valid DR.tls mode. `Simple` also matches Istio's
+        // own `ClientTLSSettings.mode` default when the block is present but
+        // `mode` is omitted. Shares the `default_client_tls_mode` helper with
+        // the serde field default so the two cannot drift.
+        Self {
+            mode: default_client_tls_mode(),
+            sni: None,
+            ca_certificates: None,
+            client_certificate: None,
+            private_key: None,
+            subject_alt_names: Vec::new(),
+            insecure_skip_verify: default_insecure_skip_verify(),
+        }
+    }
 }
 
 /// Outlier detection settings from Istio DestinationRule.
@@ -826,6 +1059,8 @@ pub struct MeshConfig {
     pub telemetry_resources: Vec<MeshTelemetryResource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub destination_rules: Vec<MeshDestinationRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_configs: Vec<MeshProxyConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1006,10 +1241,15 @@ fn validate_mesh_config_internal(
                 let any_host = !request.hosts.is_empty();
                 let any_header = !request.headers.is_empty();
                 let any_port = !request.ports.is_empty() || !request.port_patterns.is_empty();
-                if !(any_method || any_path || any_host || any_header || any_port) {
+                let any_not = !request.not_methods.is_empty()
+                    || !request.not_paths.is_empty()
+                    || !request.not_hosts.is_empty()
+                    || !request.not_ports.is_empty();
+                if !(any_method || any_path || any_host || any_header || any_port || any_not) {
                     errors.push(format!(
                         "MeshPolicy '{}'.rules[{}].to[{}]: at least one of \
-                         methods/paths/hosts/headers/ports must be non-empty",
+                         methods/paths/hosts/headers/ports or their negated \
+                         counterparts must be non-empty",
                         policy.name, i, j
                     ));
                 }
@@ -1017,6 +1257,17 @@ fn validate_mesh_config_internal(
                     if !is_valid_request_match_host_pattern(host) {
                         errors.push(format!(
                             "MeshPolicy '{}'.rules[{}].to[{}].hosts[{}] \
+                             '{}' is not a valid host pattern \
+                             (expected hostname, [ipv6], or host:port/host:* \
+                             with u16 numeric or '*' port)",
+                            policy.name, i, j, k, host
+                        ));
+                    }
+                }
+                for (k, host) in request.not_hosts.iter().enumerate() {
+                    if !is_valid_request_match_host_pattern(host) {
+                        errors.push(format!(
+                            "MeshPolicy '{}'.rules[{}].to[{}].not_hosts[{}] \
                              '{}' is not a valid host pattern \
                              (expected hostname, [ipv6], or host:port/host:* \
                              with u16 numeric or '*' port)",
@@ -1328,6 +1579,9 @@ fn normalize_mesh_policy_fields(policies: &mut [MeshPolicy]) {
         for rule in &mut policy.rules {
             for request in &mut rule.to {
                 for host in &mut request.hosts {
+                    *host = normalize_request_match_host_pattern(host);
+                }
+                for host in &mut request.not_hosts {
                     *host = normalize_request_match_host_pattern(host);
                 }
                 for pattern in &mut request.port_patterns {

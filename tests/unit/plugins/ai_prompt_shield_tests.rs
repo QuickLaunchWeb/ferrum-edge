@@ -722,3 +722,92 @@ async fn test_rejection_body_format() {
         _ => panic!("Expected Reject"),
     }
 }
+
+// ─── Streaming awareness ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_streaming_metadata_set_when_stream_true() {
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let body = json!({
+        "model": "gpt-4",
+        "stream": true,
+        "messages": [{"role": "user", "content": "Hello, how are you?"}]
+    });
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata.get("ai_request_streaming").map(|s| s.as_str()),
+        Some("true"),
+        "stream:true should set metadata"
+    );
+}
+
+#[tokio::test]
+async fn test_streaming_metadata_not_set_when_stream_false() {
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let body = json!({
+        "model": "gpt-4",
+        "stream": false,
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        !ctx.metadata.contains_key("ai_request_streaming"),
+        "stream:false should not set metadata"
+    );
+}
+
+#[tokio::test]
+async fn test_streaming_metadata_not_set_when_absent() {
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let body = json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(!ctx.metadata.contains_key("ai_request_streaming"));
+}
+
+#[tokio::test]
+async fn test_pii_detection_still_works_with_stream_true() {
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"], "action": "reject"})).unwrap();
+    let body = json!({
+        "model": "gpt-4",
+        "stream": true,
+        "messages": [{"role": "user", "content": "My SSN is 123-45-6789"}]
+    });
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    // Streaming metadata should be set
+    assert_eq!(
+        ctx.metadata.get("ai_request_streaming").map(|s| s.as_str()),
+        Some("true")
+    );
+    // PII should still be detected
+    assert!(matches!(result, PluginResult::Reject { .. }));
+}
+
+#[tokio::test]
+async fn test_streaming_metadata_with_scan_all_mode() {
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"], "scan_fields": "all"})).unwrap();
+    let body = json!({
+        "model": "gpt-4",
+        "stream": true,
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata.get("ai_request_streaming").map(|s| s.as_str()),
+        Some("true"),
+        "scan_all mode should still detect streaming intent"
+    );
+}

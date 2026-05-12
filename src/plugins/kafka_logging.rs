@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::task::spawn_blocking;
 use tracing::warn;
 
+use super::utils::log_schema::{SummaryLogEntryView, SummarySchema, resolve_schema};
 use super::utils::{BatchConfig, BatchingLogger, PluginHttpClient, RetryPolicy, SummaryLogEntry};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
@@ -218,6 +219,7 @@ impl KafkaLogging {
             producer,
             flush_timeout: Duration::from_secs(flush_timeout_seconds),
         });
+        let schema = resolve_schema(config, "kafka_logging")?;
         let logger = BatchingLogger::spawn(
             BatchConfig {
                 // Kafka flushes one userspace message at a time here. Larger
@@ -237,7 +239,8 @@ impl KafkaLogging {
             move |batch| {
                 let state = Arc::clone(&state);
                 let topic = topic.clone();
-                async move { send_batch(&state, &topic, key_field, batch).await }
+                let schema = schema.clone();
+                async move { send_batch(&state, &topic, key_field, batch, schema.as_deref()).await }
             },
         );
 
@@ -323,9 +326,17 @@ async fn send_batch(
     topic: &str,
     key_field: KeyField,
     batch: Vec<SummaryLogEntry>,
+    schema: Option<&SummarySchema>,
 ) -> Result<(), String> {
     for entry in batch {
-        let payload = match serde_json::to_string(&entry) {
+        let serialized = match schema {
+            Some(schema) => serde_json::to_string(&SummaryLogEntryView {
+                entry: &entry,
+                schema,
+            }),
+            None => serde_json::to_string(&entry),
+        };
+        let payload = match serialized {
             Ok(json) => json,
             Err(error) => {
                 warn!("Kafka logging: failed to serialize log entry: {error}");

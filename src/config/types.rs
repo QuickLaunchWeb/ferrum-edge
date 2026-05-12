@@ -1879,6 +1879,16 @@ impl GatewayConfig {
         let mut errors = Vec::new();
 
         for plugin in &self.plugin_configs {
+            // `transaction_log_schema` is process-global by design (it
+            // registers named schemas into a single registry); reject
+            // proxy / proxy_group scopes explicitly so the error is clear.
+            if plugin.plugin_name == "transaction_log_schema" && plugin.scope != PluginScope::Global
+            {
+                errors.push(format!(
+                    "PluginConfig '{}' (transaction_log_schema) must have scope 'global'",
+                    plugin.id
+                ));
+            }
             match plugin.scope {
                 PluginScope::Global => {
                     if plugin.proxy_id.is_some() {

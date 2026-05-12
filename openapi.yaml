@@ -1184,6 +1184,7 @@ paths:
                 - soap_ws_security
                 - spec_expose
                 - api_chargeback
+                - transaction_log_schema
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -4345,6 +4346,106 @@ components:
             type: string
           description: Present only on 207 Multi-Status; lists per-type error messages
 
+    # ── Shared: Transaction-Log Schema Customization ──────────────────
+    # Shape of the `schema:` block (and the entries inside
+    # `transaction_log_schema.schemas`). See docs/log_schema.md for the
+    # operator-facing reference, validation rules, and cookbook.
+    SummaryLogSchema:
+      type: object
+      description: >-
+        Customizable output schema for transaction-log JSON / line
+        protocol. Rename keys, drop fields, reorder, inject static
+        stamping, emit derived fields, flatten metadata. Metadata
+        redaction always applies on every code path — sensitive
+        substrings (`authorization`, `cookie`, `password`, `token`, …)
+        cannot be introduced via `static_fields` or `derived_fields`
+        (rejected at construction). See docs/log_schema.md.
+      additionalProperties: false
+      properties:
+        summary_type:
+          type: string
+          enum: [http, stream, both]
+          default: both
+          description: >-
+            Which summary type(s) this schema applies to. Summaries of
+            the other type fall back to native serialization (the schema
+            only customizes types it claims to handle).
+        omit:
+          type: array
+          items: { type: string }
+          description: Native field names to drop from output.
+        rename:
+          type: object
+          additionalProperties: { type: string }
+          description: Map of native field name -> output key.
+        order:
+          type: array
+          items: { type: string }
+          description: >-
+            Explicit output order, by output key. May contain `"*"` once
+            as a wildcard for "every unlisted entry in natural order."
+            Without `"*"`, every field must be listed.
+        static_fields:
+          type: object
+          additionalProperties: true
+          description: >-
+            Literal JSON values injected at top level. Keys / nested
+            keys matching sensitive substrings are rejected at
+            compile time.
+        derived_fields:
+          type: array
+          description: Computed values; emitted alongside native fields.
+          items:
+            type: object
+            required: [name, kind]
+            additionalProperties: false
+            properties:
+              name:
+                type: string
+                description: Output key for the derived value.
+              kind:
+                type: string
+                enum: [status_class, backend_host, summary_kind, outcome]
+                description: >-
+                  `status_class`: `"1xx"`–`"5xx"` from
+                  `response_status_code` (stream: `"none"`).
+                  `backend_host`: hostname from `backend_target_url` /
+                  `backend_target`. `summary_kind`: `"http"` or
+                  `"stream"`. `outcome`: `"ok"` / `"error"`.
+        metadata:
+          type: object
+          description: How to render the `metadata` map.
+          additionalProperties: false
+          properties:
+            mode:
+              type: string
+              enum: [nested, omit, flatten]
+              default: nested
+            prefix:
+              type: string
+              description: >-
+                Flatten mode only. Prepended to each metadata key when
+                promoted to top-level (e.g. `"meta_"`). Control
+                characters are rejected.
+            on_collision:
+              type: string
+              enum: [skip, overwrite]
+              default: skip
+              description: >-
+                Flatten mode only. Behavior when a metadata key collides
+                with an already-emitted field. `skip` keeps the existing
+                value; `overwrite` emits a duplicate JSON key (last
+                value wins per parser convention).
+        timestamp_format:
+          type: string
+          enum: [rfc3339, epoch_ms, epoch_s]
+          default: rfc3339
+          description: >-
+            Conversion applied to timestamp string fields
+            (`timestamp_received`, `timestamp_connected`,
+            `timestamp_disconnected`). Parse failures fall back to the
+            raw RFC3339 string.
+
     # ── Plugin Config Schemas ──────────────────────────────────────────
     # Per-plugin configuration schemas. The `config` field on PluginConfig
     # accepts one of these depending on the `plugin_name` value.
@@ -4352,7 +4453,14 @@ components:
     StdoutLoggingConfig:
       type: object
       description: "Plugin: stdout_logging — Logs JSON transaction summaries to stdout."
-      properties: {}
+      properties:
+        schema:
+          $ref: "#/components/schemas/SummaryLogSchema"
+        schema_ref:
+          type: string
+          description: >-
+            Name of a schema registered by a `transaction_log_schema` plugin.
+            Mutually exclusive with `schema`. See docs/log_schema.md.
 
     HttpLoggingConfig:
       type: object
@@ -4389,6 +4497,13 @@ components:
           type: integer
           default: 10000
           description: Channel capacity — new entries are dropped when full
+        schema:
+          $ref: "#/components/schemas/SummaryLogSchema"
+        schema_ref:
+          type: string
+          description: >-
+            Name of a schema registered by a `transaction_log_schema` plugin.
+            Mutually exclusive with `schema`. See docs/log_schema.md.
 
     TcpLoggingConfig:
       type: object
@@ -4438,6 +4553,13 @@ components:
           default: 5000
           minimum: 100
           description: TCP connection timeout in milliseconds
+        schema:
+          $ref: "#/components/schemas/SummaryLogSchema"
+        schema_ref:
+          type: string
+          description: >-
+            Name of a schema registered by a `transaction_log_schema` plugin.
+            Mutually exclusive with `schema`. See docs/log_schema.md.
 
     UdpLoggingConfig:
       type: object
@@ -4492,6 +4614,13 @@ components:
           type: integer
           default: 10000
           description: Channel capacity — new entries are dropped when full
+        schema:
+          $ref: "#/components/schemas/SummaryLogSchema"
+        schema_ref:
+          type: string
+          description: >-
+            Name of a schema registered by a `transaction_log_schema` plugin.
+            Mutually exclusive with `schema`. See docs/log_schema.md.
 
     KafkaLoggingConfig:
       type: object
@@ -4563,6 +4692,15 @@ components:
           additionalProperties:
             type: string
           description: "Escape hatch: arbitrary librdkafka producer properties as key-value pairs"
+        schema:
+          $ref: "#/components/schemas/SummaryLogSchema"
+        schema_ref:
+          type: string
+          description: >-
+            Name of a schema registered by a `transaction_log_schema` plugin.
+            Mutually exclusive with `schema`. Note: Kafka partition keys
+            (`client_ip` / `proxy_id`) read typed summary fields and are NOT
+            affected by `rename:`. See docs/log_schema.md.
 
     WsLoggingConfig:
       type: object
@@ -4598,6 +4736,15 @@ components:
           type: integer
           default: 10000
           description: Channel capacity — new entries are dropped when full
+        schema:
+          $ref: "#/components/schemas/SummaryLogSchema"
+        schema_ref:
+          type: string
+          description: >-
+            Name of a schema registered by a `transaction_log_schema` plugin.
+            Mutually exclusive with `schema`. Note: WebSocket disconnect
+            entries are emitted in their native format regardless of schema
+            in v1. See docs/log_schema.md.
 
     LokiLoggingConfig:
       type: object
@@ -4658,6 +4805,15 @@ components:
           default: 10000
           minimum: 1
           description: Channel capacity — new entries are dropped when full
+        schema:
+          $ref: "#/components/schemas/SummaryLogSchema"
+        schema_ref:
+          type: string
+          description: >-
+            Name of a schema registered by a `transaction_log_schema` plugin.
+            Mutually exclusive with `schema`. Note: Loki labels
+            (`build_http_labels` / `build_stream_labels`) read typed summary
+            fields and are NOT affected by `rename:`. See docs/log_schema.md.
 
     StatsdLoggingConfig:
       type: object
@@ -4696,6 +4852,48 @@ components:
           type: integer
           default: 50
           description: Max metric entries to batch before flushing
+        schema:
+          allOf:
+            - $ref: "#/components/schemas/SummaryLogSchema"
+          description: >-
+            Only `rename` and `omit` apply to statsd output — they operate on
+            tag keys that map 1:1 to a native summary field:
+            HTTP: `method`↔`http_method`, `status`↔`response_status_code`,
+            `proxy`↔`proxy_id`.
+            Stream: `protocol`↔`protocol`, `proxy`↔`proxy_id`,
+            `cause`↔`disconnect_cause`, `direction`↔`disconnect_direction`.
+            `static_fields`, `derived_fields`, `metadata`, and
+            `timestamp_format` are no-ops for statsd (line protocol, not JSON).
+            See docs/log_schema.md.
+        schema_ref:
+          type: string
+          description: >-
+            Name of a schema registered by a `transaction_log_schema` plugin.
+            Mutually exclusive with `schema`. Same statsd caveats as above.
+
+    TransactionLogSchemaConfig:
+      type: object
+      description: >-
+        Plugin: transaction_log_schema — Config-only plugin that registers
+        named `SummaryLogSchema` definitions into a process-global registry
+        for other logging plugins to consume via `schema_ref:`. Required
+        scope is `global`; constructed by the loader BEFORE any plugin that
+        uses `schema_ref:` so resolution always succeeds. The registry is
+        atomically replaced on every config reload — renamed or removed
+        schemas do not leak. See docs/log_schema.md.
+      required: [schemas]
+      additionalProperties: false
+      properties:
+        schemas:
+          type: object
+          minProperties: 1
+          additionalProperties:
+            $ref: "#/components/schemas/SummaryLogSchema"
+          description: >-
+            Map of schema name → schema definition. Names are referenced
+            by other plugins as `schema_ref: <name>`. Duplicate names
+            across multiple `transaction_log_schema` plugins in the same
+            config are rejected at load time.
 
     TransactionDebuggerConfig:
       type: object
