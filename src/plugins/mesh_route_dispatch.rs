@@ -26,7 +26,9 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::plugins::{Plugin, PluginResult, RequestContext, priority};
+use crate::plugins::{
+    HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
+};
 
 /// Top-level config for the plugin.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -104,6 +106,13 @@ impl MeshRouteDispatch {
             return Err("mesh_route_dispatch.rules cannot be empty".to_string());
         }
         for (idx, rule) in parsed.rules.iter().enumerate() {
+            if rule.match_.is_empty() {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{idx}].match requires at least one of \
+                     methods / headers / query_params (an empty match would silently \
+                     never fire, contradicting first-match-wins semantics)"
+                ));
+            }
             if rule.destination.is_empty() {
                 return Err(format!(
                     "mesh_route_dispatch.rules[{idx}].destination requires at least one of \
@@ -138,6 +147,15 @@ impl Plugin for MeshRouteDispatch {
         priority::MESH_ROUTE_DISPATCH
     }
 
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        // Istio `VirtualService.http[]` covers HTTP, gRPC, and WebSocket
+        // upgrade requests. The dispatch shadow runs on all three before
+        // backend selection, so the override channel applies uniformly.
+        // Defaulting to HTTP-only would silently drop predicates for
+        // gRPC and WS — the plugin would never run on those protocols.
+        HTTP_FAMILY_PROTOCOLS
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -167,9 +185,9 @@ fn rule_matches(
     headers: &HashMap<String, String>,
 ) -> bool {
     if m.is_empty() {
-        // A rule with no match criteria would always fire and effectively
-        // pin every request to its destination. `new()` rejects this at
-        // config load — defense in depth here.
+        // Unreachable in normal config — `new()` rejects empty match at
+        // load time. Defense in depth in case a construction path skips
+        // the constructor (e.g., a future hot-reload that mutates rules).
         return false;
     }
     if !m.methods.is_empty()
@@ -216,6 +234,47 @@ mod tests {
     fn rejects_empty_rules() {
         let err = MeshRouteDispatch::new(&json!({"rules": []})).unwrap_err();
         assert!(err.contains("cannot be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_rule_with_empty_match_criteria() {
+        // A rule with `match: {}` would never fire (defense-in-depth in
+        // `rule_matches`) but accepting it would let operator misconfig
+        // silently disable header/method routing without an error.
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{"match": {}, "destination": {"upstream_id": "x"}}]
+        }))
+        .unwrap_err();
+        assert!(err.contains("match requires at least one"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_rule_with_missing_match_field() {
+        // Omitting `match` entirely is also caught (defaults to empty
+        // MatchCriteria via `#[serde(default)]`).
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{"destination": {"upstream_id": "x"}}]
+        }))
+        .unwrap_err();
+        assert!(err.contains("match requires at least one"), "got: {err}");
+    }
+
+    #[test]
+    fn declares_http_family_protocols() {
+        // Istio VirtualService.http[] covers HTTP/gRPC/WebSocket. The
+        // plugin must apply to all three or it silently drops predicates
+        // for non-plain-HTTP requests.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "x"}
+            }]
+        }))
+        .unwrap();
+        let protocols = plugin.supported_protocols();
+        assert!(protocols.contains(&ProxyProtocol::Http));
+        assert!(protocols.contains(&ProxyProtocol::Grpc));
+        assert!(protocols.contains(&ProxyProtocol::WebSocket));
     }
 
     #[test]
