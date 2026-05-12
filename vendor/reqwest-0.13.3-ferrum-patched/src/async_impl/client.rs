@@ -4,7 +4,7 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 use std::{collections::HashMap, convert::TryInto, net::SocketAddr};
 use std::{fmt, str};
@@ -1082,9 +1082,9 @@ impl ClientBuilder {
                 },
                 headers: config.headers,
                 referer: config.referer,
-                connect_timeout: RequestConfig::new(config.connect_timeout),
                 read_timeout: config.read_timeout,
                 total_timeout: RequestConfig::new(config.timeout),
+                connect_timeout: RequestConfig::new(config.connect_timeout),
                 hyper,
                 proxies,
                 proxies_maybe_http_auth,
@@ -1567,7 +1567,7 @@ impl ClientBuilder {
 
     /// Sets the `SETTINGS_INITIAL_WINDOW_SIZE` option for HTTP2 stream-level flow control.
     ///
-    /// Default is currently 65,535 but may change internally to optimize for common uses.
+    /// Default may change internally to optimize for common uses.
     #[cfg(feature = "http2")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
     pub fn http2_initial_stream_window_size(mut self, sz: impl Into<Option<u32>>) -> ClientBuilder {
@@ -1577,7 +1577,7 @@ impl ClientBuilder {
 
     /// Sets the max connection-level flow control for HTTP2
     ///
-    /// Default is currently 65,535 but may change internally to optimize for common uses.
+    /// Default may change internally to optimize for common uses.
     #[cfg(feature = "http2")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
     pub fn http2_initial_connection_window_size(
@@ -2629,6 +2629,7 @@ impl Client {
             .copied()
             .map(tokio::time::sleep)
             .map(Box::pin);
+
         let connect_timeout = self.inner.connect_timeout.fetch(&extensions).copied();
 
         let read_timeout_fut = self
@@ -2915,8 +2916,8 @@ struct ClientRef {
     #[cfg(feature = "http3")]
     h3_client: Option<LayeredService<H3Client>>,
     referer: bool,
-    connect_timeout: RequestConfig<ConnectTimeout>,
     total_timeout: RequestConfig<TotalTimeout>,
+    connect_timeout: RequestConfig<ConnectTimeout>,
     read_timeout: Option<Duration>,
     proxies: Arc<Vec<ProxyMatcher>>,
     proxies_maybe_http_auth: bool,
@@ -2953,8 +2954,8 @@ impl ClientRef {
 
         f.field("default_headers", &self.headers);
 
-        self.connect_timeout.fmt_as_field(f);
         self.total_timeout.fmt_as_field(f);
+        self.connect_timeout.fmt_as_field(f);
 
         if let Some(ref d) = self.read_timeout {
             f.field("read_timeout", d);
@@ -3063,7 +3064,6 @@ impl Future for PendingRequest {
             let this = self.as_mut().project();
             *this.connect_timeout
         };
-
         let res = crate::connect::with_connect_timeout_override(connect_timeout, || {
             match self.as_mut().in_flight().get_mut() {
                 ResponseFuture::Default(r) => match Pin::new(r).poll(cx) {
