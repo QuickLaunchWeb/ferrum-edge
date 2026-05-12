@@ -269,7 +269,7 @@ subsets:
 | `subsets[].trafficPolicy.outlierDetection` | Ignored (warns) | Top-level `trafficPolicy.outlierDetection` is the only path to passive health checks |
 | `trafficPolicy.connectionPool.http.*` | Ignored | Per-protocol connection pool not surfaced |
 | `trafficPolicy.connectionPool.tcp.maxConnections` / `tcpKeepalive` | Ignored | Pool sizing handled globally via `FERRUM_POOL_*` |
-| `trafficPolicy.tls` | Ignored | mTLS posture comes from `PeerAuthentication` |
+| `trafficPolicy.tls` | Supported | Overrides the `PeerAuthentication`-derived backend posture per matching `Upstream` when set. Mode mapping: `DISABLE` → clears `Upstream.backend_tls_*`; `SIMPLE` → enables server-cert verify + `backend_tls_server_ca_cert_path = caCertificates` (client cert/key cleared); `MUTUAL` → enables server-cert verify + projects `caCertificates`/`clientCertificate`/`privateKey` onto `Upstream.backend_tls_server_ca_cert_path`/`_client_cert_path`/`_client_key_path`; `ISTIO_MUTUAL` → enables server-cert verify and leaves any existing client material untouched (Ferrum's `spiffe_identity`/`mtls_auth` plugins continue to supply the workload SVID — DR.tls does not yet project SPIFFE material onto `Upstream.backend_tls_*` directly). `insecureSkipVerify: true` forces `backend_tls_verify_server_cert = false`. `sni` and `subjectAltNames` are parsed and warned (no per-`Upstream` SNI/SAN override field today). When the field is unset, behavior is identical to today and `PeerAuthentication` continues to drive the default mTLS posture. |
 | `trafficPolicy.portLevelSettings` | Ignored | Per-port traffic policy not modeled |
 | `exportTo` | Ignored | DRs are scoped to their declared namespace at slice-filter time |
 
@@ -887,7 +887,6 @@ The following Istio mesh surfaces are **not yet supported** and should be treate
 | `Sidecar` (egress scoping) | Deferred | Use Ferrum proxy routing and upstream configuration |
 | `EnvoyFilter` | Not planned | Use Ferrum custom plugins |
 | `WasmPlugin` | Not planned | Use Ferrum custom plugins (`custom_plugins/`) |
-| `DestinationRule.trafficPolicy.tls` | Deferred | Use per-proxy `backend_tls_*` fields |
 | `DestinationRule` port-level traffic policy | Deferred | Top-level traffic policy applies to all ports |
 | Outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`) | Deferred | Unknown outbound destinations are not blocked today |
 | `VirtualService` header/method-only matches | Skipped | Ferrum route proxies do not encode header/method predicates |

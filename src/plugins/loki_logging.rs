@@ -23,9 +23,11 @@ use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 
+use super::utils::log_schema::{SchemaView, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLogger, PluginHttpClient, RetryPolicy,
     build_batch_config, handle_http_batch_response, parse_http_endpoint, validate_batch_config,
@@ -68,6 +70,7 @@ pub struct LokiLogging {
     logger: BatchingLogger<LokiEntry>,
     endpoint_hostname: String,
     label_config: LabelConfig,
+    schema: Option<Arc<SummarySchema>>,
 }
 
 impl LokiLogging {
@@ -180,10 +183,12 @@ impl LokiLogging {
             },
         );
 
+        let schema = resolve_schema(config, "loki_logging")?;
         Ok(Self {
             logger,
             endpoint_hostname,
             label_config,
+            schema,
         })
     }
 
@@ -314,21 +319,31 @@ impl Plugin for LokiLogging {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        self.queue_entry(
-            summary,
-            self.build_stream_labels(summary),
-            &summary.timestamp_disconnected,
-            "stream summary",
-        );
+        let labels = self.build_stream_labels(summary);
+        let ts = &summary.timestamp_disconnected;
+        match self.schema.as_ref().filter(|s| s.applies_to_stream()) {
+            Some(schema) => self.queue_entry(
+                &SchemaView { summary, schema },
+                labels,
+                ts,
+                "stream summary",
+            ),
+            None => self.queue_entry(summary, labels, ts, "stream summary"),
+        }
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        self.queue_entry(
-            summary,
-            self.build_http_labels(summary),
-            &summary.timestamp_received,
-            "transaction summary",
-        );
+        let labels = self.build_http_labels(summary);
+        let ts = &summary.timestamp_received;
+        match self.schema.as_ref().filter(|s| s.applies_to_http()) {
+            Some(schema) => self.queue_entry(
+                &SchemaView { summary, schema },
+                labels,
+                ts,
+                "transaction summary",
+            ),
+            None => self.queue_entry(summary, labels, ts, "transaction summary"),
+        }
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {

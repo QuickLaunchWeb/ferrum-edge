@@ -27,6 +27,7 @@ use tokio::net::UdpSocket;
 use tokio::time::Instant;
 use tracing::warn;
 
+use super::utils::log_schema::{SummaryLogEntryBatchView, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry,
     UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, resolve_udp_endpoint,
@@ -50,6 +51,7 @@ struct UdpFlushConfig {
     /// Empty when no CRL file is configured.
     dtls_crls: Vec<CertificateRevocationListDer<'static>>,
     dns_cache: Option<DnsCache>,
+    schema: Option<Arc<SummarySchema>>,
 }
 
 struct UdpFlushState {
@@ -109,6 +111,7 @@ impl UdpLogging {
         };
         validate_batch_config(config, "udp_logging", batch_defaults)?;
 
+        let schema = resolve_schema(config, "udp_logging")?;
         let flush_config = UdpFlushConfig {
             host: host.clone(),
             port: port as u16,
@@ -119,6 +122,7 @@ impl UdpLogging {
             dtls_no_verify,
             dtls_crls: http_client.tls_crls().to_vec(),
             dns_cache: http_client.dns_cache().cloned(),
+            schema,
         };
         let state = Arc::new(Mutex::new(UdpFlushState {
             sender: None,
@@ -295,7 +299,11 @@ async fn send_batch(
     state: &Mutex<UdpFlushState>,
     batch: Vec<SummaryLogEntry>,
 ) -> Result<(), String> {
-    let payload = match serde_json::to_vec(&batch) {
+    let view = SummaryLogEntryBatchView {
+        entries: &batch,
+        schema: cfg.schema.as_deref(),
+    };
+    let payload = match serde_json::to_vec(&view) {
         Ok(payload) => payload,
         Err(error) => {
             warn!("udp_logging: failed to serialize batch: {error}");

@@ -27,6 +27,7 @@ use tokio::time::Duration;
 use tracing::warn;
 use url::Url;
 
+use super::utils::log_schema::{SchemaView, SummarySchema, resolve_schema};
 use super::utils::{BatchConfigDefaults, PluginHttpClient, validate_batch_config};
 use super::{
     ALL_PROTOCOLS, Direction, Plugin, ProxyProtocol, StreamTransactionSummary, TransactionSummary,
@@ -98,6 +99,34 @@ struct WsConfig {
     max_retries: u32,
     retry_delay: Duration,
     reconnect_delay: Duration,
+    schema: Option<Arc<SummarySchema>>,
+}
+
+/// Serialize-time wrapper: emits the LogEntry slice as a JSON array,
+/// applying `schema` to HTTP / Stream entries when its `summary_type`
+/// matches. WebSocket disconnect entries keep their native format.
+struct WsBatchView<'a> {
+    entries: &'a [LogEntry],
+    schema: Option<&'a SummarySchema>,
+}
+
+impl<'a> serde::Serialize for WsBatchView<'a> {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = ser.serialize_seq(Some(self.entries.len()))?;
+        for entry in self.entries {
+            match (entry, self.schema) {
+                (LogEntry::Http(summary), Some(schema)) if schema.applies_to_http() => {
+                    seq.serialize_element(&SchemaView { summary, schema })?;
+                }
+                (LogEntry::Stream(summary), Some(schema)) if schema.applies_to_stream() => {
+                    seq.serialize_element(&SchemaView { summary, schema })?;
+                }
+                _ => seq.serialize_element(entry)?,
+            }
+        }
+        seq.end()
+    }
 }
 
 pub struct WsLogging {
@@ -173,6 +202,7 @@ impl WsLogging {
         let retry_delay_ms = optional_u64(config, "retry_delay_ms", batch_defaults.retry_delay_ms)?;
         let reconnect_delay_ms = optional_u64(config, "reconnect_delay_ms", 5000)?;
 
+        let schema = resolve_schema(config, "ws_logging")?;
         let ws_config = WsConfig {
             endpoint_url,
             connector,
@@ -181,6 +211,7 @@ impl WsLogging {
             max_retries,
             retry_delay: Duration::from_millis(retry_delay_ms),
             reconnect_delay: Duration::from_millis(reconnect_delay_ms),
+            schema,
         };
 
         let endpoint_hostname = parsed_url.host_str().map(|h| h.to_string());
@@ -393,7 +424,11 @@ async fn send_batch(
     let total_attempts = cfg.max_retries.saturating_add(1);
     let entry_count = batch.len();
 
-    let payload = match serde_json::to_string(&batch) {
+    let view = WsBatchView {
+        entries: &batch,
+        schema: cfg.schema.as_deref(),
+    };
+    let payload = match serde_json::to_string(&view) {
         Ok(json) => json,
         Err(e) => {
             warn!("WebSocket logging: failed to serialize batch: {e}");

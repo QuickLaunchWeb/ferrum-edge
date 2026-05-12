@@ -44,6 +44,14 @@ impl TransactionDebugger {
         if !config.is_object() {
             return Err("transaction_debugger: config must be an object".to_string());
         }
+        if config.get("schema").is_some() || config.get("schema_ref").is_some() {
+            return Err(
+                "transaction_debugger: 'schema' / 'schema_ref' is not supported \
+                 (transaction-log schema customization applies only to log-shipping plugins; \
+                 see docs/plugins.md)"
+                    .to_string(),
+            );
+        }
 
         let extra_redacted_headers =
             optional_header_names(config, "redacted_headers")?.unwrap_or_default();

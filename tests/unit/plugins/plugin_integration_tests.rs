@@ -187,6 +187,7 @@ async fn test_all_plugins_available() {
         "http_logging",
         "tcp_logging",
         "transaction_debugger",
+        "transaction_log_schema",
         "jwks_auth",
         "jwt_auth",
         "key_auth",
@@ -334,6 +335,9 @@ async fn test_plugin_creation_all_plugins() {
             "request_deduplication" => json!({}),
             "fault_injection" => {
                 json!({"abort": {"status_code": 503, "percentage": 50.0}})
+            }
+            "transaction_log_schema" => {
+                json!({"schemas": {"default": {"summary_type": "both"}}})
             }
             _ => json!({}),
         };

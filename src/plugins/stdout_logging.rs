@@ -5,20 +5,26 @@
 //! Vector, etc.) to capture per-request access logs without additional I/O.
 //! Supports all proxy protocols (HTTP, gRPC, WebSocket, TCP, UDP).
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use tracing::warn;
 
+use super::utils::log_schema::{SchemaView, SummarySchema, resolve_schema};
 use super::{Plugin, TransactionSummary};
 
-pub struct StdoutLogging;
+pub struct StdoutLogging {
+    schema: Option<Arc<SummarySchema>>,
+}
 
 impl StdoutLogging {
     pub fn new(config: &Value) -> Result<Self, String> {
         if !(config.is_object() || config.is_null()) {
             return Err("stdout_logging: config must be an object".to_string());
         }
-        Ok(Self)
+        let schema = resolve_schema(config, "stdout_logging")?;
+        Ok(Self { schema })
     }
 }
 
@@ -37,14 +43,22 @@ impl Plugin for StdoutLogging {
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        match serde_json::to_string(summary) {
+        let result = match self.schema.as_ref().filter(|s| s.applies_to_http()) {
+            Some(schema) => serde_json::to_string(&SchemaView { summary, schema }),
+            None => serde_json::to_string(summary),
+        };
+        match result {
             Ok(json) => tracing::info!(target: "access_log", "{}", json),
             Err(e) => warn!("stdout_logging: failed to serialize transaction summary: {e}"),
         }
     }
 
     async fn on_stream_disconnect(&self, summary: &super::StreamTransactionSummary) {
-        match serde_json::to_string(summary) {
+        let result = match self.schema.as_ref().filter(|s| s.applies_to_stream()) {
+            Some(schema) => serde_json::to_string(&SchemaView { summary, schema }),
+            None => serde_json::to_string(summary),
+        };
+        match result {
             Ok(json) => tracing::info!(target: "access_log", "{}", json),
             Err(e) => warn!("stdout_logging: failed to serialize stream summary: {e}"),
         }
