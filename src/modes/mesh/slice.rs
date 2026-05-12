@@ -1406,6 +1406,7 @@ mod tests {
                     namespace: "ns".into(),
                     host: "reviews.ns.svc.cluster.local".into(),
                     traffic_policy: None,
+                    port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
                 },
                 MeshDestinationRule {
@@ -1413,6 +1414,7 @@ mod tests {
                     namespace: "other".into(),
                     host: "reviews.other.svc.cluster.local".into(),
                     traffic_policy: None,
+                    port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
                 },
             ],

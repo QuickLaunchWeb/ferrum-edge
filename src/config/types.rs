@@ -196,6 +196,26 @@ pub struct SubsetTrafficPolicy {
     pub load_balancer_algorithm: Option<LoadBalancerAlgorithm>,
 }
 
+/// Per-destination-port traffic policy overrides on an upstream.
+///
+/// Populated from an Istio DestinationRule's `trafficPolicy.portLevelSettings[]`
+/// (see [`crate::modes::mesh::config::MeshDestinationRule::port_level_settings`]).
+/// Currently only `connect_timeout_ms` is enforced at request time — it is
+/// resolved by [`Upstream::effective_connect_timeout_ms`] which the dispatch
+/// path consults via the helper in `crate::proxy::port_override`. Per-port LB
+/// algorithm / hash-key overrides are not yet enforced (one `LoadBalancer`
+/// per upstream today, not per upstream+port) and are intentionally absent
+/// from this struct — the translator emits a warning when Istio operators
+/// configure them so they know the gap.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct UpstreamPortOverride {
+    /// Per-port backend connect timeout override (milliseconds). Consulted on
+    /// the dispatch hot path when the resolved destination port matches a key
+    /// in `Upstream.port_overrides`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+}
+
 /// A named subset of upstream targets identified by label selectors.
 ///
 /// Targets whose `tags` are a superset of `labels` belong to this subset.
@@ -505,6 +525,12 @@ pub struct Upstream {
     /// are a superset of a subset's `labels` belong to that subset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subsets: Option<Vec<SubsetDefinition>>,
+    /// Per-destination-port traffic policy overrides populated by Istio
+    /// `DestinationRule.trafficPolicy.portLevelSettings[]`. Keyed by
+    /// destination port number; empty by default. Round-trips identically to
+    /// the prior schema when empty (via `skip_serializing_if`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub port_overrides: HashMap<u16, UpstreamPortOverride>,
     /// Path to a PEM client certificate for mTLS with backend targets.
     #[serde(default)]
     pub backend_tls_client_cert_path: Option<String>,
@@ -1067,6 +1093,15 @@ pub struct Proxy {
     /// Not serialized — derived from the upstream or proxy fields.
     #[serde(skip)]
     pub resolved_tls: BackendTlsConfig,
+    /// Per-destination-port `connect_timeout_ms` overrides projected from the
+    /// referenced upstream's `port_overrides` at config-resolve time. `None`
+    /// when the proxy has no upstream or the upstream has no per-port
+    /// overrides — the common case, so the dispatch hot path skips the lookup
+    /// entirely with a single field read. Populated by
+    /// `GatewayConfig::resolve_dispatch_port_overrides()` after mesh
+    /// `apply_destination_rules` has written into `Upstream.port_overrides`.
+    #[serde(skip)]
+    pub dispatch_port_overrides: Option<HashMap<u16, u64>>,
     #[serde(default)]
     pub dns_override: Option<String>,
     #[serde(default)]
@@ -1583,6 +1618,12 @@ impl GatewayConfig {
         // proxy at load time, so the request hot path never does any
         // scheme branching.
         self.resolve_dispatch_kind();
+        // Project per-port `connect_timeout_ms` overrides from each proxy's
+        // upstream onto a flat `Proxy.dispatch_port_overrides` map so the
+        // request hot path skips the `ArcSwap` + `DashMap` lookup. No-op for
+        // the non-mesh common case (all `Upstream.port_overrides` empty →
+        // every proxy gets `None`).
+        self.resolve_dispatch_port_overrides();
     }
 
     /// Resolve each proxy's `dispatch_kind` from `backend_scheme`, applying
@@ -1638,6 +1679,42 @@ impl GatewayConfig {
                     verify_server_cert: proxy.backend_tls_verify_server_cert,
                 }
             };
+        }
+    }
+
+    /// Project per-port `connect_timeout_ms` overrides from each proxy's
+    /// referenced upstream onto `Proxy.dispatch_port_overrides` for O(1)
+    /// hot-path resolution.
+    ///
+    /// Must be called AFTER `apply_destination_rules` has populated
+    /// `Upstream.port_overrides`. With this precomputed map on `Proxy`,
+    /// `resolve_effective_proxy_for_target` does a single field read instead
+    /// of an `ArcSwap` load + `DashMap` traversal per request.
+    ///
+    /// Same pattern as `resolve_upstream_tls` — derived projection cached on
+    /// the proxy so the request path never re-derives it.
+    pub fn resolve_dispatch_port_overrides(&mut self) {
+        let by_upstream: HashMap<&str, HashMap<u16, u64>> = self
+            .upstreams
+            .iter()
+            .filter(|u| !u.port_overrides.is_empty())
+            .map(|u| {
+                let ports: HashMap<u16, u64> = u
+                    .port_overrides
+                    .iter()
+                    .filter_map(|(port, ovr)| ovr.connect_timeout_ms.map(|t| (*port, t)))
+                    .collect();
+                (u.id.as_str(), ports)
+            })
+            .filter(|(_, m)| !m.is_empty())
+            .collect();
+
+        for proxy in &mut self.proxies {
+            proxy.dispatch_port_overrides = proxy
+                .upstream_id
+                .as_deref()
+                .and_then(|uid| by_upstream.get(uid))
+                .cloned();
         }
     }
 
@@ -3270,6 +3347,21 @@ impl Upstream {
         }
     }
 
+    /// Resolve the effective backend connect timeout for a request destined to
+    /// `port`. Per-port `port_overrides[port].connect_timeout_ms` wins over
+    /// `proxy_default_ms` (the Proxy's own `backend_connect_timeout_ms`).
+    ///
+    /// Used by the dispatch hot path so DestinationRule per-port settings
+    /// translated by the Istio config source actually take effect at request
+    /// time. `0` from either source means "disabled".
+    #[inline]
+    pub fn effective_connect_timeout_ms(&self, port: u16, proxy_default_ms: u64) -> u64 {
+        self.port_overrides
+            .get(&port)
+            .and_then(|ovr| ovr.connect_timeout_ms)
+            .unwrap_or(proxy_default_ms)
+    }
+
     /// Validate all fields of an upstream for correctness and safe lengths.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
@@ -3359,6 +3451,24 @@ impl Upstream {
                 MAX_TARGETS_PER_UPSTREAM,
                 self.targets.len()
             ));
+        }
+
+        // `port_overrides` is mesh-derived state populated at apply time by
+        // `apply_destination_rules` from `DestinationRule.portLevelSettings`.
+        // Admin POST/PUT setting it directly is rejected because (a) the SQL
+        // / MongoDB schemas do not persist this field — INSERT/UPDATE drops
+        // it silently, leaving operators with a "successful write" that
+        // didn't take effect, and (b) the canonical place to express per-
+        // port traffic policy is a DestinationRule, not a back-channel POST
+        // to /upstreams. Mesh-injected upstreams populate this in-memory and
+        // skip admin admission entirely.
+        if !self.port_overrides.is_empty() {
+            errors.push(
+                "port_overrides is populated by mesh DestinationRule \
+                 portLevelSettings and cannot be set directly via the admin \
+                 API — express per-port traffic policy as a DestinationRule"
+                    .to_string(),
+            );
         }
 
         // Validate individual targets
