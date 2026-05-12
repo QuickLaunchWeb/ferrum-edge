@@ -39,6 +39,9 @@ fn workload(name: &str, app: &str) -> Workload {
         namespace: "default".to_string(),
         network: None,
         cluster: None,
+        weight: None,
+        locality: None,
+        service_account: None,
     }
 }
 

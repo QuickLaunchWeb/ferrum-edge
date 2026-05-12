@@ -928,7 +928,8 @@ The following Istio mesh surfaces are **not yet supported** and should be treate
 | `VirtualService` header/method-only matches | Skipped | Ferrum route proxies do not encode header/method predicates |
 | Inbound port exclusions (`excludeInboundPorts`) | Deferred | |
 | IP-range capture exclusions (`excludeOutboundIPRanges`, `includeOutboundIPRanges`) | Deferred | |
-| `WorkloadEntry` beyond address/labels/network/cluster | Partial | Basic fields supported; full VM lifecycle deferred |
+| Pod auto-discovery (K8s native service registry) | Deferred | Declare `WorkloadEntry` / `ServiceEntry` explicitly until a Pod watcher lands |
+| `WorkloadEntry` `weight` / `locality` / `serviceAccount` | Partial | Translated as workload metadata; locality-aware load balancing not yet wired (consumed by an upcoming PR). `serviceAccount` is kept separately from the SPIFFE path so introspection/audit doesn't need to parse it. |
 | `Telemetry.tracing[].providers[]` span emission | Partial | **Inline provider config only** — provider type inferred from the `name` field (`zipkin`/`datadog`/`lightstep`/`opentelemetry`) with required URL/endpoint fields on the entry itself; captured into the mesh slice and merged into `workload_metrics.tracing_provider`. Name-only references (`{name: "my-zipkin"}`) that rely on `meshConfig.extensionProviders` / `meshConfig.defaultProviders` lookup are **not yet supported** — they are gracefully skipped with a warning. Unrecognised provider names are also skipped (not hard-failed). Only the first `providers[]` entry is surfaced; multi-provider fan-out is deferred. Span emission to provider backends is not yet wired — sink-plugin follow-up. `Telemetry.tracing[].disableSpanReporting` and per-tag `CLIENT`/`SERVER` modes are deferred. |
 
 ## Environment Variables

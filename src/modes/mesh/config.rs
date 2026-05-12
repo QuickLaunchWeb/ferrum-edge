@@ -67,6 +67,24 @@ pub struct Workload {
     /// Cluster name for CP-to-CP exchange and VM workloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster: Option<String>,
+    /// Istio `WorkloadEntry.weight` — load-balancing weight for traffic
+    /// splitting between multiple workloads of the same service. Absent
+    /// here means "use the default" — equivalent to today's behavior. A
+    /// value of `0` is accepted (Istio "no traffic" / drain). Capped at
+    /// `MAX_TARGET_WEIGHT` (65_535) at translation time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
+    /// Istio `WorkloadEntry.locality` — slash-delimited
+    /// `region/zone/subzone` string for locality-aware routing. Pure
+    /// metadata at this phase; locality-aware LB consumes it once wired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locality: Option<String>,
+    /// Istio `WorkloadEntry.serviceAccount` — kept separately from
+    /// `spiffe_id` so introspection and audit don't need to parse the
+    /// SPIFFE path. None when the source omits it; the SPIFFE translation
+    /// still falls back to `"default"` for SVID issuance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_account: Option<String>,
 }
 
 /// A port advertised by a workload.

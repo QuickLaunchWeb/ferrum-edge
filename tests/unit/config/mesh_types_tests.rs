@@ -50,6 +50,9 @@ fn mesh_config_round_trips_through_serde() {
                 namespace: "svc".into(),
                 network: None,
                 cluster: None,
+                weight: None,
+                locality: None,
+                service_account: None,
             }],
             services: vec![MeshService {
                 name: "api".into(),

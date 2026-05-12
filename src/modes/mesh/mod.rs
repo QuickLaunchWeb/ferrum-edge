@@ -3254,6 +3254,9 @@ mod tests {
             namespace: "default".to_string(),
             network: None,
             cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
         }
     }
 
