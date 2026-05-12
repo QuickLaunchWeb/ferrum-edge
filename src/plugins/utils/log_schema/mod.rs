@@ -567,16 +567,21 @@ fn detect_credential_scheme(value: &str) -> Option<&'static str> {
         ("aws4-hmac-sha256", "AWS4-HMAC-SHA256"),
     ];
     let trimmed = value.trim_start();
+    let bytes = trimmed.as_bytes();
     for (scheme, label) in SCHEMES {
-        let bytes = trimmed.as_bytes();
         if bytes.len() <= scheme.len() {
             continue;
         }
         if !bytes[..scheme.len()].eq_ignore_ascii_case(scheme.as_bytes()) {
             continue;
         }
+        // Safe to slice at `scheme.len()`: the ASCII-equal-ignoring-case
+        // check above guarantees those bytes are ASCII, so the index is
+        // on a UTF-8 char boundary.
         let rest = &trimmed[scheme.len()..];
-        // First char after the scheme must be ASCII whitespace.
+        // Scheme must be followed by RFC 7230 OWS — space or HTAB only.
+        // CR/LF/FF cannot legally appear in a header value, and rejecting
+        // them keeps the prose-vs-credential distinction crisp.
         let next = rest.chars().next();
         if !matches!(next, Some(' ' | '\t')) {
             continue;
