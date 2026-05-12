@@ -1366,17 +1366,27 @@ fn proxy_config(
 ) -> Result<MeshProxyConfig, K8sTranslateError> {
     let scope = istio_policy_scope(options, object, object.spec.get("selector"));
 
-    let concurrency = match object.spec.get("concurrency").and_then(Value::as_u64) {
-        Some(raw) => Some(u32::try_from(raw).map_err(|_| {
-            invalid_resource(
-                object,
-                format!(
-                    "ProxyConfig spec.concurrency must fit in u32 (0..={}), got {raw}",
-                    u32::MAX
-                ),
-            )
-        })?),
-        None => None,
+    let concurrency = match object.spec.get("concurrency") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let raw = value.as_u64().ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    format!(
+                        "ProxyConfig spec.concurrency must be a non-negative integer (got {value})"
+                    ),
+                )
+            })?;
+            Some(u32::try_from(raw).map_err(|_| {
+                invalid_resource(
+                    object,
+                    format!(
+                        "ProxyConfig spec.concurrency must fit in u32 (0..={}), got {raw}",
+                        u32::MAX
+                    ),
+                )
+            })?)
+        }
     };
 
     let image = object
@@ -4878,6 +4888,59 @@ mod tests {
             }
             other => panic!("expected InvalidResource, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn proxy_config_concurrency_invalid_json_forms_are_rejected() {
+        // A present-but-invalid concurrency value must surface as
+        // InvalidResource — not silently dropped via the `as_u64` filter.
+        let bad_values = [
+            ("string", serde_json::json!("4")),
+            ("float", serde_json::json!(4.5)),
+            ("negative", serde_json::json!(-1)),
+            ("bool", serde_json::json!(true)),
+            ("array", serde_json::json!([4])),
+            ("object", serde_json::json!({"n": 4})),
+        ];
+
+        for (label, bad) in bad_values {
+            let err = translate_k8s_objects(
+                &[object(
+                    "ProxyConfig",
+                    serde_json::json!({"concurrency": bad}),
+                )],
+                options(),
+            )
+            .expect_err(&format!("expected InvalidResource for {label}"));
+            match err {
+                K8sTranslateError::InvalidResource { kind, message, .. } => {
+                    assert_eq!(kind, "ProxyConfig", "case {label}");
+                    assert!(
+                        message.contains("concurrency"),
+                        "case {label}: error must mention concurrency: {message}"
+                    );
+                }
+                other => panic!("case {label}: expected InvalidResource, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_config_concurrency_null_is_treated_as_unset() {
+        // Explicit JSON null is semantically equivalent to omitting the
+        // field — both mean "use the data plane default."
+        let result = translate_k8s_objects(
+            &[object(
+                "ProxyConfig",
+                serde_json::json!({"concurrency": serde_json::Value::Null}),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.proxy_configs.len(), 1);
+        assert!(mesh.proxy_configs[0].concurrency.is_none());
     }
 
     #[test]
