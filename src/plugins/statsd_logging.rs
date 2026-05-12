@@ -17,12 +17,54 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::time::Instant;
 
+use super::utils::log_schema::{SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry,
     UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, resolve_udp_endpoint,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
+
+/// Mapping from a default statsd tag key to its backing native field on
+/// [`TransactionSummary`]. Schema `rename` / `omit` consult the native
+/// column; tags without a native backing (e.g. `status_class`) are not
+/// configurable. Documented in [docs/plugins.md] under `statsd_logging`.
+const HTTP_TAG_NATIVE: &[(&str, &str)] = &[
+    ("method", "http_method"),
+    ("status", "response_status_code"),
+    ("proxy", "proxy_id"),
+];
+
+const STREAM_TAG_NATIVE: &[(&str, &str)] = &[
+    ("protocol", "protocol"),
+    ("proxy", "proxy_id"),
+    ("cause", "disconnect_cause"),
+    ("direction", "disconnect_direction"),
+];
+
+/// Resolve a statsd tag key honoring the schema's rename rule for the
+/// backing native field. Returns `None` when the schema omits the field.
+fn resolve_tag_key<'a>(
+    schema: Option<&'a SummarySchema>,
+    default_key: &'a str,
+    mapping: &[(&'static str, &'static str)],
+) -> Option<&'a str> {
+    let Some(native) = mapping
+        .iter()
+        .find_map(|(d, n)| (*d == default_key).then_some(*n))
+    else {
+        // Default key has no native backing — never renameable / omittable
+        // through schema; always emit with the default key.
+        return Some(default_key);
+    };
+    let Some(schema) = schema else {
+        return Some(default_key);
+    };
+    if schema.omits_tag(native) {
+        return None;
+    }
+    Some(schema.rename_for_tag(native).unwrap_or(default_key))
+}
 
 /// Sanitize a value used in a StatsD tag: strip the delimiters that would break
 /// the line protocol (`,`, `|`, `#`, `:`) and trim surrounding whitespace.
@@ -52,6 +94,7 @@ struct StatsdFlushConfig {
     prefix: String,
     global_tags: String,
     dns_cache: Option<DnsCache>,
+    schema: Option<Arc<SummarySchema>>,
 }
 
 struct StatsdFlushState {
@@ -140,12 +183,14 @@ impl StatsdLogging {
             }
         };
 
+        let schema = resolve_schema(config, "statsd_logging")?;
         let flush_config = StatsdFlushConfig {
             hostname: host.clone(),
             port: port as u16,
             prefix,
             global_tags,
             dns_cache: http_client.dns_cache().cloned(),
+            schema,
         };
         let state = Arc::new(Mutex::new(StatsdFlushState {
             socket: None,
@@ -214,8 +259,14 @@ fn format_http_metrics(
     summary: &TransactionSummary,
     prefix: &str,
     global_tags: &str,
+    schema: Option<&SummarySchema>,
     buf: &mut String,
 ) {
+    use std::fmt::Write;
+
+    // Only consult HTTP schemas for HTTP metrics — a stream-only schema
+    // is unrelated.
+    let effective_schema = schema.filter(|s| s.applies_to_http());
     let method = sanitize_tag_value(&summary.http_method);
     let status = summary.response_status_code;
     let status_class = format!("{}xx", status / 100);
@@ -226,16 +277,24 @@ fn format_http_metrics(
         .unwrap_or("none");
     let proxy_tag = sanitize_tag_value(proxy_raw);
 
-    let tags = format!(
-        "|#method:{method},status:{status},status_class:{status_class},proxy:{proxy_tag}{extra}",
-        extra = if global_tags.is_empty() {
-            String::new()
-        } else {
-            format!(",{}", &global_tags[2..])
-        }
-    );
+    // Build the trailing `|#k:v,k:v,...` block directly into a reusable
+    // String, avoiding the Vec<String> + per-tag format! + join pattern
+    // (one small heap allocation per tag → one allocation total).
+    let mut builder = TagBlockBuilder::new();
+    if let Some(k) = resolve_tag_key(effective_schema, "method", HTTP_TAG_NATIVE) {
+        let _ = builder.push(k, format_args!("{method}"));
+    }
+    if let Some(k) = resolve_tag_key(effective_schema, "status", HTTP_TAG_NATIVE) {
+        let _ = builder.push(k, format_args!("{status}"));
+    }
+    if let Some(k) = resolve_tag_key(effective_schema, "status_class", HTTP_TAG_NATIVE) {
+        let _ = builder.push(k, format_args!("{status_class}"));
+    }
+    if let Some(k) = resolve_tag_key(effective_schema, "proxy", HTTP_TAG_NATIVE) {
+        let _ = builder.push(k, format_args!("{proxy_tag}"));
+    }
+    let tags = builder.finish(global_tags);
 
-    use std::fmt::Write;
     let _ = writeln!(buf, "{prefix}.request.count:1|c{tags}");
     let _ = writeln!(
         buf,
@@ -268,8 +327,12 @@ fn format_stream_metrics(
     summary: &StreamTransactionSummary,
     prefix: &str,
     global_tags: &str,
+    schema: Option<&SummarySchema>,
     buf: &mut String,
 ) {
+    use std::fmt::Write;
+
+    let effective_schema = schema.filter(|s| s.applies_to_stream());
     let protocol = sanitize_tag_value(&summary.protocol);
     let proxy_raw = summary.proxy_name.as_deref().unwrap_or(&summary.proxy_id);
     let proxy_tag = sanitize_tag_value(proxy_raw);
@@ -293,16 +356,24 @@ fn format_stream_metrics(
         None => "unknown",
     };
 
-    let tags = format!(
-        "|#protocol:{protocol},proxy:{proxy_tag},error:{has_error},cause:{cause_tag},direction:{direction_tag}{extra}",
-        extra = if global_tags.is_empty() {
-            String::new()
-        } else {
-            format!(",{}", &global_tags[2..])
-        }
-    );
+    let mut builder = TagBlockBuilder::new();
+    if let Some(k) = resolve_tag_key(effective_schema, "protocol", STREAM_TAG_NATIVE) {
+        let _ = builder.push(k, format_args!("{protocol}"));
+    }
+    if let Some(k) = resolve_tag_key(effective_schema, "proxy", STREAM_TAG_NATIVE) {
+        let _ = builder.push(k, format_args!("{proxy_tag}"));
+    }
+    if let Some(k) = resolve_tag_key(effective_schema, "error", STREAM_TAG_NATIVE) {
+        let _ = builder.push(k, format_args!("{has_error}"));
+    }
+    if let Some(k) = resolve_tag_key(effective_schema, "cause", STREAM_TAG_NATIVE) {
+        let _ = builder.push(k, format_args!("{cause_tag}"));
+    }
+    if let Some(k) = resolve_tag_key(effective_schema, "direction", STREAM_TAG_NATIVE) {
+        let _ = builder.push(k, format_args!("{direction_tag}"));
+    }
+    let tags = builder.finish(global_tags);
 
-    use std::fmt::Write;
     let _ = writeln!(buf, "{prefix}.stream.count:1|c{tags}");
     let _ = writeln!(
         buf,
@@ -322,6 +393,56 @@ fn format_stream_metrics(
     let _ = writeln!(buf, "{prefix}.stream.disconnect:1|c{tags}");
 }
 
+/// Single-allocation builder for the trailing `|#k:v,k:v,…` block.
+///
+/// Replaces the prior `Vec<String> + per-tag format! + join` pattern,
+/// which allocated once per tag plus once for the joined string. Tags are
+/// written directly into one growing `String` via `fmt::Write`, so the
+/// total allocation count is bounded by `String`'s growth strategy —
+/// effectively one allocation per call site (the buffer reservation),
+/// regardless of tag count.
+struct TagBlockBuilder {
+    out: String,
+    has_entries: bool,
+}
+
+impl TagBlockBuilder {
+    fn new() -> Self {
+        Self {
+            out: String::new(),
+            has_entries: false,
+        }
+    }
+
+    fn push(&mut self, key: &str, value: std::fmt::Arguments<'_>) -> std::fmt::Result {
+        use std::fmt::Write;
+        if !self.has_entries {
+            self.out.push_str("|#");
+            self.has_entries = true;
+        } else {
+            self.out.push(',');
+        }
+        write!(self.out, "{key}:")?;
+        self.out.write_fmt(value)
+    }
+
+    fn finish(mut self, global_tags: &str) -> String {
+        if global_tags.is_empty() {
+            return self.out;
+        }
+        // `global_tags` begins with "|#"; skip those when we already have
+        // an open block.
+        let stripped = &global_tags[2..];
+        if !self.has_entries {
+            self.out.push_str("|#");
+        } else if !stripped.is_empty() {
+            self.out.push(',');
+        }
+        self.out.push_str(stripped);
+        self.out
+    }
+}
+
 async fn send_batch(
     cfg: &StatsdFlushConfig,
     state: &Mutex<StatsdFlushState>,
@@ -331,10 +452,22 @@ async fn send_batch(
     for entry in &batch {
         match entry {
             MetricEntry::Http(summary) => {
-                format_http_metrics(summary, &cfg.prefix, &cfg.global_tags, &mut payload);
+                format_http_metrics(
+                    summary,
+                    &cfg.prefix,
+                    &cfg.global_tags,
+                    cfg.schema.as_deref(),
+                    &mut payload,
+                );
             }
             MetricEntry::Stream(summary) => {
-                format_stream_metrics(summary, &cfg.prefix, &cfg.global_tags, &mut payload);
+                format_stream_metrics(
+                    summary,
+                    &cfg.prefix,
+                    &cfg.global_tags,
+                    cfg.schema.as_deref(),
+                    &mut payload,
+                );
             }
         }
     }

@@ -802,9 +802,44 @@ impl PluginCache {
         // Rebuild globals if any global plugin config changed
         let new_globals = if rebuild_globals {
             let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+
+            // Stage the named-schema registry first so subsequent global /
+            // proxy plugins can resolve `schema_ref` against the new state
+            // via the reload thread's staging-visibility. The bracket is
+            // left OPEN here — commit/abort runs once the rest of the
+            // delta build has succeeded or failed (see security_errors
+            // handling below), so the registry stays atomically tied to
+            // the PluginCache that gets swapped in.
+            //
+            // This runs for every global-plugin rebuild, not just when
+            // `transaction_log_schema` itself changed — the bracket is
+            // cheap (one Mutex acquire + empty HashMap) and guarantees
+            // the registry stays in sync even if a sibling global plugin
+            // was the trigger for the rebuild.
+            crate::plugins::utils::log_schema::registry::begin_reload();
+            for pc in &config.plugin_configs {
+                if !pc.enabled || pc.scope != PluginScope::Global {
+                    continue;
+                }
+                if pc.plugin_name != "transaction_log_schema" {
+                    continue;
+                }
+                match try_create_plugin(pc, &self.http_client) {
+                    Ok(Some(plugin)) => global_plugins.push(plugin),
+                    Ok(None) => {}
+                    Err(e) => {
+                        error!("Config reload: {}", e);
+                        security_errors.push(e);
+                    }
+                }
+            }
+
             for pc in &config.plugin_configs {
                 if !pc.enabled {
                     continue;
+                }
+                if pc.plugin_name == "transaction_log_schema" {
+                    continue; // already constructed
                 }
                 if pc.scope == PluginScope::Global {
                     match try_create_plugin(pc, &self.http_client) {
@@ -990,8 +1025,14 @@ impl PluginCache {
             }
         }
 
-        // Reject the delta if any security plugin failed validation
+        // Reject the delta if any security plugin failed validation.
+        // When `rebuild_globals` was true, we opened a registry reload
+        // bracket above — abort it so the process-global named-schema
+        // registry doesn't get mutated by a config that's being rejected.
         if !security_errors.is_empty() {
+            if rebuild_globals {
+                crate::plugins::utils::log_schema::registry::abort_reload();
+            }
             return Err(format!(
                 "Config reload rejected: {} security plugin(s) failed validation",
                 security_errors.len()
@@ -1044,6 +1085,13 @@ impl PluginCache {
         } else {
             current.global_requires_ws_frame
         };
+
+        // Delta build succeeded. If a registry reload bracket was opened
+        // above (rebuild_globals == true), promote the staged named
+        // schemas now — pairs with the `begin_reload` at the top.
+        if rebuild_globals {
+            crate::plugins::utils::log_schema::registry::commit_reload();
+        }
 
         Ok(Arc::new(PluginCacheInner::new(
             new_map,
@@ -1280,9 +1328,37 @@ impl PluginCache {
         let mut proxy_group_configs: HashMap<&str, &crate::config::types::PluginConfig> =
             HashMap::new();
 
+        // First pass: stage the named-schema registry from
+        // `transaction_log_schema` global plugins so subsequent plugins
+        // can resolve `schema_ref:` against the new state via the
+        // reload thread's staging-visibility (see `registry::lookup_named`).
+        // The bracket is left OPEN here — `commit_reload` only runs after
+        // the rest of the plugin-cache build succeeds; `abort_reload`
+        // runs if any plugin fails validation, so the process-global
+        // registry stays atomically tied to the cache.
+        crate::plugins::utils::log_schema::registry::begin_reload();
+        for pc in &config.plugin_configs {
+            if !pc.enabled || pc.scope != PluginScope::Global {
+                continue;
+            }
+            if pc.plugin_name != "transaction_log_schema" {
+                continue;
+            }
+            match try_create_plugin(pc, http_client) {
+                Ok(Some(plugin)) => global_plugins.push(plugin),
+                Ok(None) => {}
+                Err(e) => security_errors.push(e),
+            }
+        }
+
+        // Second pass: everything else, including other globals,
+        // proxy-scoped, and proxy_group-scoped configs.
         for pc in &config.plugin_configs {
             if !pc.enabled {
                 continue;
+            }
+            if pc.plugin_name == "transaction_log_schema" {
+                continue; // already constructed above
             }
             if pc.scope == PluginScope::Global {
                 match try_create_plugin(pc, http_client) {
@@ -1411,8 +1487,13 @@ impl PluginCache {
             proxy_map.insert(proxy.id.clone(), Arc::new(merged));
         }
 
-        // If any security plugins failed validation, refuse to build the cache
+        // If any security plugins failed validation, refuse to build the cache.
+        // Abort the named-schema reload bracket so the process-global registry
+        // is NOT mutated by a config that's being rejected — otherwise the
+        // live PluginCache stays on the old plugins while the registry
+        // already reflects the rejected reload's schemas.
         if !security_errors.is_empty() {
+            crate::plugins::utils::log_schema::registry::abort_reload();
             for err in &security_errors {
                 error!("{}", err);
             }
@@ -1421,6 +1502,10 @@ impl PluginCache {
                 security_errors.len()
             ));
         }
+
+        // All plugins validated — promote the staged named schemas to live.
+        // Pairs with the `begin_reload` at the start of this function.
+        crate::plugins::utils::log_schema::registry::commit_reload();
 
         // Sort global fallback list too
         global_plugins.sort_by_key(|p| p.priority());

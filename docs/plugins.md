@@ -133,6 +133,16 @@ These headers are injected on all proxy paths (HTTP, gRPC, and WebSocket).
 
 ## Logging Plugins
 
+> **Customizing transaction log output**: every logging plugin below
+> (plus `access_log`) accepts an optional `schema:` block (or
+> `schema_ref:` against a named `transaction_log_schema` plugin) to
+> rename keys, drop fields, reorder output, add static stamping, and
+> emit a few derived fields. Metadata redaction always applies on every
+> path. See **[docs/log_schema.md](log_schema.md)** for the full
+> reference, including the per-plugin caveats (statsd's tag-name
+> mapping, Kafka partition keys, Loki labels, WebSocket-disconnect
+> entries).
+
 ### `stdout_logging`
 
 Logs a JSON transaction summary to stdout for each request via `tracing::info!` on the `access_log` target. Output flows through the non-blocking writer, so logging never blocks request-processing threads.

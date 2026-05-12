@@ -506,6 +506,12 @@ impl ApiChargeback {
         if !config.is_object() {
             return Err("api_chargeback: config must be an object".to_string());
         }
+        if config.get("schema").is_some() || config.get("schema_ref").is_some() {
+            return Err("api_chargeback: 'schema' / 'schema_ref' is not supported \
+                 (transaction-log schema customization applies only to log-shipping plugins; \
+                 see docs/plugins.md)"
+                .to_string());
+        }
 
         let registry = global_registry();
 

@@ -69,6 +69,7 @@ pub mod stdout_logging;
 pub mod tcp_connection_throttle;
 pub mod tcp_logging;
 pub mod transaction_debugger;
+pub mod transaction_log_schema;
 pub mod udp_logging;
 pub mod udp_rate_limiting;
 pub mod utils;
@@ -1052,6 +1053,11 @@ pub mod priority {
     pub const API_CHARGEBACK: u16 = 9350;
     pub const WORKLOAD_METRICS: u16 = 9360;
     pub const ACCESS_LOG: u16 = 9375;
+    /// `transaction_log_schema` is a config-only plugin with no lifecycle
+    /// hooks; its priority is irrelevant in practice but is kept at the
+    /// top of the logging band so any future hook would run after all
+    /// observability sinks.
+    pub const TRANSACTION_LOG_SCHEMA: u16 = 9999;
     pub const WS_MESSAGE_SIZE_LIMITING: u16 = 2810;
     pub const WS_RATE_LIMITING: u16 = 2910;
     pub const WS_LOGGING: u16 = 9175;
@@ -1487,6 +1493,9 @@ pub fn create_plugin_with_http_client(
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
     match name {
         "stdout_logging" => Ok(Some(Arc::new(stdout_logging::StdoutLogging::new(config)?))),
+        "transaction_log_schema" => Ok(Some(Arc::new(
+            transaction_log_schema::TransactionLogSchema::new(config)?,
+        ))),
         "statsd_logging" => Ok(Some(Arc::new(statsd_logging::StatsdLogging::new(
             config,
             http_client.clone(),
@@ -1703,6 +1712,7 @@ pub fn is_security_plugin(name: &str) -> bool {
 
 pub fn available_plugins() -> Vec<&'static str> {
     let mut plugins = vec![
+        "transaction_log_schema",
         "stdout_logging",
         "http_logging",
         "tcp_logging",
