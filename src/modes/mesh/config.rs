@@ -67,6 +67,24 @@ pub struct Workload {
     /// Cluster name for CP-to-CP exchange and VM workloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster: Option<String>,
+    /// Istio `WorkloadEntry.weight` — load-balancing weight for traffic
+    /// splitting between multiple workloads of the same service. Absent
+    /// here means "use the default" — equivalent to today's behavior. A
+    /// value of `0` is accepted (Istio "no traffic" / drain). Capped at
+    /// `MAX_TARGET_WEIGHT` (65_535) at translation time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
+    /// Istio `WorkloadEntry.locality` — slash-delimited
+    /// `region/zone/subzone` string for locality-aware routing. Pure
+    /// metadata at this phase; locality-aware LB consumes it once wired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locality: Option<String>,
+    /// Istio `WorkloadEntry.serviceAccount` — kept separately from
+    /// `spiffe_id` so introspection and audit don't need to parse the
+    /// SPIFFE path. None when the source omits it; the SPIFFE translation
+    /// still falls back to `"default"` for SVID issuance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_account: Option<String>,
 }
 
 /// A port advertised by a workload.
@@ -849,6 +867,15 @@ pub struct MeshDestinationRule {
     /// Top-level traffic policy applied to all targets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_policy: Option<MeshTrafficPolicy>,
+    /// Per-destination-port traffic policy overrides. Keyed by destination
+    /// port number; values override the corresponding fields of
+    /// `traffic_policy` for traffic landing on that port. Mirrors Istio's
+    /// `trafficPolicy.portLevelSettings[]`.
+    ///
+    /// Default empty → old DPs reading new slices ignore the field; new DPs
+    /// reading old slices see an empty map (same behaviour as today).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub port_level_settings: HashMap<u16, MeshTrafficPolicy>,
     /// Named subsets with per-subset label selectors and optional policy
     /// overrides. Proxies reference these via `upstream_subset`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

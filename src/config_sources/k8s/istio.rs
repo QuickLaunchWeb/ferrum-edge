@@ -557,6 +557,14 @@ fn destination_rule(
         .map(|tp| translate_traffic_policy(acc, object, tp))
         .transpose()?;
 
+    let port_level_settings = object
+        .spec
+        .get("trafficPolicy")
+        .and_then(|tp| tp.get("portLevelSettings"))
+        .map(|pls| translate_port_level_settings(acc, object, pls))
+        .transpose()?
+        .unwrap_or_default();
+
     let subsets = object
         .spec
         .get("subsets")
@@ -571,8 +579,87 @@ fn destination_rule(
         namespace: object.metadata.namespace.clone(),
         host,
         traffic_policy,
+        port_level_settings,
         subsets,
     })
+}
+
+/// Parse Istio `trafficPolicy.portLevelSettings` into a per-port
+/// [`MeshTrafficPolicy`] map keyed by port number. Each entry is a regular
+/// traffic-policy block scoped to one port; the cold-path apply pass layers
+/// the resolved policy onto the matching upstream's `port_overrides`.
+///
+/// Today only `connectionPool.tcp.connectTimeout` is actually enforced
+/// per-port — see `Upstream::effective_connect_timeout_ms` and the dispatch
+/// call to `resolve_effective_proxy_for_target`. Per-port `loadBalancer`
+/// and `outlierDetection` fields ARE parsed (so the slice round-trips), but
+/// the gateway keeps a single `LoadBalancer` and `PassiveHealthCheck` per
+/// upstream — switching algorithm/hash-ring or thresholds per destination
+/// port would require per-port balancer instances and is out of scope here.
+/// We emit translator warnings so operators see the gap at apply time.
+fn translate_port_level_settings(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+    value: &Value,
+) -> Result<HashMap<u16, MeshTrafficPolicy>, K8sTranslateError> {
+    let entries = value.as_array().ok_or_else(|| {
+        invalid_resource(object, "trafficPolicy.portLevelSettings must be an array")
+    })?;
+
+    let mut out = HashMap::with_capacity(entries.len());
+    for entry in entries {
+        let port_value = entry
+            .get("port")
+            .and_then(|p| p.get("number"))
+            .ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    "trafficPolicy.portLevelSettings[].port.number is required",
+                )
+            })?;
+        let port_u64 = port_value.as_u64().ok_or_else(|| {
+            invalid_resource(
+                object,
+                "trafficPolicy.portLevelSettings[].port.number must be an integer",
+            )
+        })?;
+        if port_u64 == 0 || port_u64 > u16::MAX as u64 {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "trafficPolicy.portLevelSettings[].port.number must be 1-65535 (got {port_u64})"
+                ),
+            ));
+        }
+        let port = port_u64 as u16;
+
+        // Warn for parsed-but-not-enforced per-port fields so operators see
+        // the gap at apply time instead of silently expecting per-port LB
+        // / outlier behaviour. `connectTimeout` IS enforced and stays
+        // silent.
+        if entry.get("loadBalancer").is_some() {
+            acc.warnings.push(format!(
+                "DestinationRule {}/{}: trafficPolicy.portLevelSettings[].loadBalancer is parsed but not enforced per-port today (gateway keeps a single load balancer per upstream); only connectTimeout is applied at request time",
+                object.metadata.namespace, object.metadata.name
+            ));
+        }
+        if entry.get("outlierDetection").is_some() {
+            acc.warnings.push(format!(
+                "DestinationRule {}/{}: trafficPolicy.portLevelSettings[].outlierDetection is parsed but not enforced per-port today (gateway keeps a single passive health check per upstream); only connectTimeout is applied at request time",
+                object.metadata.namespace, object.metadata.name
+            ));
+        }
+
+        let policy = translate_traffic_policy(acc, object, entry)?;
+
+        if out.insert(port, policy).is_some() {
+            return Err(invalid_resource(
+                object,
+                format!("trafficPolicy.portLevelSettings has duplicate port {port}"),
+            ));
+        }
+    }
+    Ok(out)
 }
 
 fn translate_traffic_policy(
@@ -917,10 +1004,46 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
 }
 
 fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, K8sTranslateError> {
-    let service_account = string_field(&object.spec, "serviceAccount").unwrap_or("default");
-    let path = format!("ns/{}/sa/{service_account}", object.metadata.namespace);
+    // Treat empty-string `serviceAccount` as missing (Istio semantics: missing
+    // or empty → fall back to `"default"` for SVID issuance). Without this
+    // collapse, an empty string would propagate into the SPIFFE path
+    // `ns/{ns}/sa/`, which the SPIFFE parser rejects as a trailing-slash error
+    // and surfaces a confusing translation failure to operators.
+    let service_account_raw =
+        string_field(&object.spec, "serviceAccount").filter(|s| !s.is_empty());
+    let path = format!(
+        "ns/{}/sa/{}",
+        object.metadata.namespace,
+        service_account_raw.unwrap_or("default")
+    );
     let spiffe_id = SpiffeId::from_parts(&acc.options.trust_domain, &path)
         .map_err(|e| invalid_resource(object, format!("invalid workload SPIFFE ID: {e}")))?;
+
+    let weight = object
+        .spec
+        .get("weight")
+        .map(|w| {
+            let raw = w.as_u64().ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    "WorkloadEntry.weight must be a non-negative integer",
+                )
+            })?;
+            if raw > u64::from(MAX_TARGET_WEIGHT) {
+                return Err(invalid_resource(
+                    object,
+                    format!("WorkloadEntry.weight must be 0..={MAX_TARGET_WEIGHT} (got {raw})"),
+                ));
+            }
+            Ok(raw as u32)
+        })
+        .transpose()?;
+
+    // Empty-string `locality` is operator intent for "unset"; collapse to
+    // None so downstream consumers don't need to special-case empty strings.
+    let locality = string_field(&object.spec, "locality")
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
 
     Ok(Workload {
         spiffe_id: spiffe_id.clone(),
@@ -946,6 +1069,9 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         namespace: object.metadata.namespace.clone(),
         network: string_field(&object.spec, "network").map(ToOwned::to_owned),
         cluster: string_field(&object.spec, "cluster").map(ToOwned::to_owned),
+        weight,
+        locality,
+        service_account: service_account_raw.map(ToOwned::to_owned),
     })
 }
 
@@ -2542,6 +2668,166 @@ mod tests {
             workload.spiffe_id.as_str(),
             "spiffe://cluster.local/ns/default/sa/api"
         );
+        assert_eq!(workload.service_account.as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn workload_entry_weight_and_locality_translate() {
+        let result = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5",
+                    "serviceAccount": "api",
+                    "weight": 42,
+                    "locality": "us-west-2/us-west-2a/sub-a"
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let workload = &mesh.workloads[0];
+        assert_eq!(workload.weight, Some(42));
+        assert_eq!(
+            workload.locality.as_deref(),
+            Some("us-west-2/us-west-2a/sub-a")
+        );
+    }
+
+    #[test]
+    fn workload_entry_weight_above_max_target_weight_fails_closed() {
+        let err = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5",
+                    "weight": 70_000
+                }),
+            )],
+            options(),
+        )
+        .expect_err("weight exceeds MAX_TARGET_WEIGHT must fail");
+        assert!(
+            err.to_string().contains("WorkloadEntry.weight"),
+            "error should mention WorkloadEntry.weight: {err}"
+        );
+    }
+
+    #[test]
+    fn workload_entry_omitted_optionals_are_none() {
+        let result = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5"
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let mesh = result.config.mesh.expect("mesh config");
+        let workload = &mesh.workloads[0];
+        assert!(workload.weight.is_none());
+        assert!(workload.locality.is_none());
+        assert!(workload.service_account.is_none());
+        // SPIFFE still falls back to "default" SA for SVID issuance.
+        assert!(workload.spiffe_id.as_str().ends_with("/sa/default"));
+    }
+
+    #[test]
+    fn workload_entry_weight_zero_is_accepted() {
+        // Istio uses `weight: 0` to mean "drain / no traffic". The translator
+        // must not reject it; the runtime LB layer is responsible for
+        // interpreting the value once locality-aware routing is wired.
+        let result = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5",
+                    "weight": 0
+                }),
+            )],
+            options(),
+        )
+        .expect("weight=0 must translate");
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.workloads[0].weight, Some(0));
+    }
+
+    #[test]
+    fn workload_entry_empty_service_account_falls_back_to_default() {
+        // Istio treats missing OR empty `serviceAccount` as `"default"` for
+        // SVID issuance. The translator must not surface the SPIFFE parser's
+        // trailing-slash error to operators when YAML serialization yields
+        // `serviceAccount: ""`.
+        let result = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5",
+                    "serviceAccount": ""
+                }),
+            )],
+            options(),
+        )
+        .expect("empty serviceAccount must translate");
+        let mesh = result.config.mesh.expect("mesh config");
+        let workload = &mesh.workloads[0];
+        assert!(workload.service_account.is_none());
+        assert!(workload.spiffe_id.as_str().ends_with("/sa/default"));
+    }
+
+    #[test]
+    fn workload_entry_empty_locality_collapses_to_none() {
+        // Empty-string locality is operator intent for "unset"; downstream
+        // consumers should not have to special-case it.
+        let result = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5",
+                    "locality": ""
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let mesh = result.config.mesh.expect("mesh config");
+        assert!(mesh.workloads[0].locality.is_none());
+    }
+
+    #[test]
+    fn workload_entry_locality_is_free_form() {
+        // The translator stores `locality` verbatim — it does not validate the
+        // `region/zone/subzone` slash convention. Locality-aware routing (when
+        // wired) is responsible for any parsing.
+        for raw in [
+            "us-west-2/us-west-2a/sub-a",
+            "us-west-2/us-west-2a",
+            "us-west-2",
+            "single-token-no-slashes",
+            "//empty/region",
+        ] {
+            let result = translate_k8s_objects(
+                &[object(
+                    "WorkloadEntry",
+                    serde_json::json!({
+                        "address": "10.0.1.5",
+                        "locality": raw
+                    }),
+                )],
+                options(),
+            )
+            .unwrap_or_else(|e| panic!("locality {raw:?} must translate: {e}"));
+            let mesh = result.config.mesh.expect("mesh config");
+            assert_eq!(
+                mesh.workloads[0].locality.as_deref(),
+                Some(raw),
+                "locality must be stored verbatim",
+            );
+        }
     }
 
     #[test]
@@ -6786,6 +7072,162 @@ mod tests {
         assert!(
             msg.contains("corp.example"),
             "error must show the configured cluster domain: {msg}"
+        );
+    }
+
+    // ── DestinationRule portLevelSettings ────────────────────────────────
+
+    #[test]
+    fn destination_rule_translates_single_port_level_setting() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "portLevelSettings": [
+                            {
+                                "port": {"number": 8080},
+                                "connectionPool": {"tcp": {"connectTimeout": "750ms"}},
+                                "loadBalancer": {"simple": "LEAST_REQUEST"}
+                            }
+                        ]
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let dr = &mesh.destination_rules[0];
+        assert_eq!(dr.port_level_settings.len(), 1);
+        let policy = dr.port_level_settings.get(&8080).expect("port 8080 entry");
+        assert_eq!(policy.connect_timeout_ms, Some(750));
+        assert!(matches!(
+            policy.load_balancer,
+            Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest))
+        ));
+    }
+
+    #[test]
+    fn destination_rule_translates_two_distinct_port_level_settings() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "portLevelSettings": [
+                            {
+                                "port": {"number": 8080},
+                                "connectionPool": {"tcp": {"connectTimeout": "750ms"}},
+                                "loadBalancer": {"simple": "LEAST_REQUEST"}
+                            },
+                            {
+                                "port": {"number": 9090},
+                                "connectionPool": {"tcp": {"connectTimeout": "2s"}},
+                                "loadBalancer": {"simple": "RANDOM"}
+                            }
+                        ]
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let dr = &mesh.destination_rules[0];
+        assert_eq!(dr.port_level_settings.len(), 2);
+
+        let p8080 = dr.port_level_settings.get(&8080).expect("port 8080 entry");
+        assert_eq!(p8080.connect_timeout_ms, Some(750));
+        assert!(matches!(
+            p8080.load_balancer,
+            Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest))
+        ));
+
+        let p9090 = dr.port_level_settings.get(&9090).expect("port 9090 entry");
+        assert_eq!(p9090.connect_timeout_ms, Some(2000));
+        assert!(matches!(
+            p9090.load_balancer,
+            Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random))
+        ));
+    }
+
+    #[test]
+    fn destination_rule_rejects_port_level_settings_port_out_of_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "portLevelSettings": [
+                            {
+                                "port": {"number": 70000},
+                                "connectionPool": {"tcp": {"connectTimeout": "1s"}}
+                            }
+                        ]
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("port out of range must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("portLevelSettings") && msg.contains("1-65535"),
+            "expected port out-of-range error, got {msg}"
+        );
+
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "portLevelSettings": [
+                            {
+                                "port": {"number": 0},
+                                "connectionPool": {"tcp": {"connectTimeout": "1s"}}
+                            }
+                        ]
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("port zero must fail");
+        assert!(
+            err.to_string().contains("1-65535"),
+            "expected port zero error, got {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_port_level_settings_without_port_number() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "portLevelSettings": [
+                            {
+                                "connectionPool": {"tcp": {"connectTimeout": "1s"}}
+                            }
+                        ]
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("port.number missing must fail");
+        assert!(
+            err.to_string().contains("port.number is required"),
+            "expected port.number required error, got {err}"
         );
     }
 }

@@ -142,6 +142,14 @@ async fn connect_backend(
         .unwrap_or((proxy.backend_host.as_str(), proxy.backend_port));
     let target_url = format!("tcp://{host}:{port}");
 
+    // Honor DestinationRule per-port `connect_timeout_ms` overrides on the
+    // HBONE (ambient mesh) path. Single field read from the precomputed map.
+    let effective_connect_timeout_ms = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|m| m.get(&port).copied())
+        .unwrap_or(proxy.backend_connect_timeout_ms);
+
     let resolved_ip = state
         .dns_cache
         .resolve(
@@ -162,8 +170,8 @@ async fn connect_backend(
     let addr = SocketAddr::new(resolved_ip, port);
 
     let connect = crate::socket_opts::connect_with_socket_opts(addr);
-    let stream = if proxy.backend_connect_timeout_ms > 0 {
-        let timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+    let stream = if effective_connect_timeout_ms > 0 {
+        let timeout = Duration::from_millis(effective_connect_timeout_ms);
         match tokio::time::timeout(timeout, connect).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(err)) => {
@@ -189,7 +197,7 @@ async fn connect_backend(
                     class: retry::ErrorClass::ConnectionTimeout,
                     message: format!(
                         "backend connect timeout after {}ms",
-                        proxy.backend_connect_timeout_ms
+                        effective_connect_timeout_ms
                     ),
                     target_url: Some(target_url),
                     resolved_ip: Some(resolved_ip.to_string()),

@@ -276,6 +276,9 @@ mod tests {
             namespace: default_namespace(),
             network: None,
             cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
         }
     }
 
