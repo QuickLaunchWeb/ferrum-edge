@@ -71,6 +71,46 @@
 //! semantics automatically — frame-level plugins (`on_ws_frame`,
 //! `ws_rate_limit`, `ws_message_size_limiting`, `ws_frame_logging`) work
 //! on H3 sessions whether or not tunnel mode is set globally.
+//!
+//! ## Circuit breaker + load balancer accounting
+//!
+//! The H3 path applies the same circuit-breaker + load-balancer
+//! accounting as the H1/H2 path so backend isolation and target-level
+//! connection counts stay consistent across frontends:
+//!
+//! - Backend connect failure → `record_failure(502, is_pre_wire, is_half_open_probe)`
+//!   using the same `request_reached_wire` boundary as the H1/H2 retry
+//!   loop. A backend that received the upgrade and rejected it (post-wire)
+//!   does NOT charge passive health as a connect-class failure.
+//! - Successful 200 upgrade response → `record_success(is_half_open_probe)`
+//!   so a half-open probe that bootstraps a WebSocket counts as a
+//!   recovery sample.
+//! - `LoadBalancerConnectionGuard` is captured for the session lifetime;
+//!   it increments the per-target connection counter on construction
+//!   and decrements on drop, so a long-lived H3 WebSocket session
+//!   correctly weights least-connection load balancing.
+//!
+//! Single-attempt only: full retry-with-target-rotation is left to a
+//! follow-up that mirrors `handle_websocket_request_authenticated`'s
+//! retry loop. The single attempt is documented at `docs/http3.md`.
+//!
+//! ## Graceful shutdown
+//!
+//! The H3 WS session captures a fresh `ConnectionGuard` (the same RAII
+//! type the H1/H2 path uses for its long-lived sessions) so `SIGTERM`
+//! drain waits for in-flight H3 WebSocket sessions to close before
+//! exit, matching `FERRUM_SHUTDOWN_DRAIN_SECONDS` semantics. The
+//! caller's `RequestGuard` (held by `handle_h3_request`) also stays
+//! alive for the await; both counters block drain, which is intentional.
+//!
+//! ## 0-RTT
+//!
+//! Extended CONNECT is NOT a default 0-RTT method — operators who
+//! enable QUIC early data via `FERRUM_TLS_EARLY_DATA_METHODS` must
+//! opt in by listing `CONNECT` explicitly. The gateway forwards
+//! `Early-Data: 1` to the backend on 0-RTT replays as documented in
+//! the global H3 architecture section; backends decide whether to
+//! honor or reject WebSocket upgrades carried in early data.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -254,6 +294,19 @@ pub(crate) async fn handle_h3_websocket(
                 websocket_limit = state.env_config.websocket_max_connections,
                 "Rejecting H3 WebSocket upgrade: connection limit reached"
             );
+            // Log the rejection through the same `log_rejected_request`
+            // helper the H1/H2 path uses so transaction logs are uniform
+            // across frontends (rejection_phase = "websocket_connection_limit",
+            // metadata redaction, log_with_mirror, etc.).
+            crate::proxy::log_rejected_request(
+                &plugins,
+                &ctx,
+                503,
+                start_time,
+                "websocket_connection_limit",
+                plugin_execution_ns,
+            )
+            .await;
             crate::proxy::record_request(&state, 503);
             send_h3_error_body(
                 &mut stream,
@@ -280,16 +333,18 @@ pub(crate) async fn handle_h3_websocket(
 
     // ── Backend WebSocket handshake (reuses H1.1 Upgrade path) ──────
     //
-    // Note on scope: full retry / circuit-breaker rotation is
-    // implemented for the H1/H2 frontend path in
+    // Note on scope: full retry / target rotation is implemented for the
+    // H1/H2 frontend path in
     // `proxy/mod.rs::handle_websocket_request_authenticated`. The H3
     // frontend currently uses a single backend attempt — production
     // operators typically configure WebSocket clients to retry the
-    // handshake from the application layer, and the underlying
-    // backend infra is shared with the H1/H2 path that already has
-    // retry. The single-attempt simplification is documented at
-    // `docs/http3.md` (WebSocket over HTTP/3 section); future work
-    // can mirror the retry loop here.
+    // handshake from the application layer, and the underlying backend
+    // infra is shared with the H1/H2 path that already has retry. The
+    // single-attempt simplification is documented at `docs/http3.md`
+    // (WebSocket over HTTP/3 section); future work can mirror the retry
+    // loop here. Circuit-breaker accounting still runs — see comments
+    // around `record_failure` below — so backend isolation is enforced
+    // even without retry-with-rotation.
     let backend_ws_stream = match crate::proxy::connect_websocket_backend(
         &backend_url,
         &proxy,
@@ -304,7 +359,16 @@ pub(crate) async fn handle_h3_websocket(
     {
         Ok(s) => s,
         Err(e) => {
+            // `connect_websocket_backend` covers more than TCP+TLS setup:
+            // it ALSO sends the WebSocket upgrade request and reads the
+            // backend's response. Use the same unified
+            // `request_reached_wire` boundary as the H1/H2 path so a
+            // backend-side upgrade rejection (post-wire) does NOT charge
+            // the breaker as a connect-class failure, matching
+            // `circuit_breaker::trip_on_connection_errors` semantics.
             let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
+            let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
+
             error!(
                 proxy_id = %proxy.id,
                 backend_url = %backend_url,
@@ -313,6 +377,22 @@ pub(crate) async fn handle_h3_websocket(
                 error = %e,
                 "H3 WebSocket backend connection failed"
             );
+
+            // Record circuit-breaker failure for the resolved target.
+            // Uses `cb_target_key` from the dispatcher (built from the
+            // same `upstream_target` we just attempted) so the breaker
+            // is keyed identically to retries on other paths. The
+            // `cb_is_half_open_probe` flag is preserved so a probe that
+            // failed correctly releases its half-open slot.
+            if let Some(cb_config) = &proxy.circuit_breaker {
+                let cb = state.circuit_breaker_cache.get_or_create(
+                    &proxy.id,
+                    cb_target_key.as_deref(),
+                    cb_config,
+                );
+                cb.record_failure(502, ws_is_pre_wire, cb_is_half_open_probe);
+            }
+
             crate::proxy::record_request(&state, 502);
 
             // Emit the TransactionSummary for the failed upgrade so
@@ -341,6 +421,34 @@ pub(crate) async fn handle_h3_websocket(
             return Ok(());
         }
     };
+
+    // Backend handshake succeeded. If this request was admitted as a
+    // half-open probe, record the success so the breaker can close.
+    // Matches the H1/H2 path's behavior on the successful upgrade hop.
+    if let Some(cb_config) = &proxy.circuit_breaker {
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.id,
+            cb_target_key.as_deref(),
+            cb_config,
+        );
+        cb.record_success(cb_is_half_open_probe);
+    }
+
+    // Capture the LB connection guard NOW — before the 200 is sent — so
+    // a panic anywhere below still releases the per-target connection
+    // count. The guard is moved into the session task below.
+    let ws_lb_guard = crate::proxy::LoadBalancerConnectionGuard::new(
+        upstream_target.clone(),
+        upstream_balancer.clone(),
+    );
+
+    // Track the upgraded WS session in `OverloadState.active_connections`
+    // so `FERRUM_SHUTDOWN_DRAIN_SECONDS` waits for in-flight H3
+    // WebSocket sessions before exiting. Matches the H1/H2 path's
+    // separate `ws_session_guard` (see `proxy/mod.rs` ~4419 for the
+    // rationale on why WS sessions are tracked as connections rather
+    // than reusing the request-side accounting).
+    let _ws_session_guard = crate::overload::ConnectionGuard::new(&state.overload);
 
     // ── Send 200 OK response on the H3 stream (RFC 9220 §4) ─────────
     //
@@ -389,10 +497,11 @@ pub(crate) async fn handle_h3_websocket(
 
     // Emit the successful-upgrade TransactionSummary now — same shape
     // the H1/H2 path emits at upgrade time.
-    let _ = upstream_balancer;
+    //
+    // `lb_hash_key` and `upstream_target` are recorded for future
+    // retry-with-rotation work (mirroring the H1/H2 retry loop). For
+    // the current single-attempt path the LB rotation is unused.
     let _ = lb_hash_key;
-    let _ = cb_target_key;
-    let _ = cb_is_half_open_probe;
     emit_successful_upgrade_summary(
         &state,
         &proxy,
@@ -554,16 +663,36 @@ pub(crate) async fn handle_h3_websocket(
         );
     }
 
-    // ── Wait for pump tasks to drain before returning ──────────────
+    // ── Tear down pump tasks ─────────────────────────────────────────
     //
-    // The pumps exit naturally when their duplex half is dropped (the
-    // WS framer drops both halves when `run_websocket_proxy` returns).
-    // Awaiting them ensures the H3 RequestStream halves they own are
-    // properly closed before we return — without this, the QUIC stream
-    // could be force-dropped mid-write and the peer would see a
-    // protocol-level abort instead of a clean FIN.
+    // The send pump exits naturally when its duplex half (`pump_read`)
+    // sees EOF — which happens as soon as `run_websocket_proxy`
+    // returns and drops `client_io` (the other end of the duplex
+    // pair). Awaiting it ensures the H3 send side calls `finish()` so
+    // the peer sees a clean FIN rather than a force-drop / protocol
+    // abort.
+    //
+    // The recv pump, however, is blocked in
+    // `h3_recv.recv_data().await`. For a cooperative client this
+    // unblocks promptly when the client closes its sending half after
+    // the WebSocket close handshake — but a non-cooperative client
+    // that exchanges close frames without closing the QUIC stream
+    // would leave the recv pump pinned until quinn's idle timeout
+    // expires (worst case: tens of seconds). We have no more user
+    // data to forward (the WS framer is gone), so abort the pump
+    // explicitly to release the QUIC stream resources promptly.
+    // `JoinHandle::abort()` is safe — the task owns only the recv
+    // half of the QUIC stream + the duplex write half; both will be
+    // dropped cleanly.
+    recv_pump.abort();
     let _ = recv_pump.await;
     let _ = send_pump.await;
+
+    // Drop guards explicitly so their `Drop` impl runs before the
+    // info!() below — keeps the "session ended" log adjacent to the
+    // accounting release in interleaved tracing output.
+    drop(_ws_session_guard);
+    drop(ws_lb_guard);
 
     info!(
         proxy_id = %proxy.id,

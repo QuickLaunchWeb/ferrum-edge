@@ -1162,13 +1162,16 @@ impl Drop for PerIpRequestGuard {
 /// WebSocket proxying runs in a spawned task after the HTTP handler returns.
 /// Keeping the accounting in a guard makes the end event fire on normal close,
 /// upgrade failure, task cancellation, or panic unwind.
-struct LoadBalancerConnectionGuard {
+pub(crate) struct LoadBalancerConnectionGuard {
     target: Option<Arc<UpstreamTarget>>,
     balancer: Option<Arc<LoadBalancer>>,
 }
 
 impl LoadBalancerConnectionGuard {
-    fn new(target: Option<Arc<UpstreamTarget>>, balancer: Option<Arc<LoadBalancer>>) -> Self {
+    pub(crate) fn new(
+        target: Option<Arc<UpstreamTarget>>,
+        balancer: Option<Arc<LoadBalancer>>,
+    ) -> Self {
         if let (Some(target), Some(balancer)) = (target.as_ref(), balancer.as_ref()) {
             balancer.record_connection_start(target);
         }
@@ -4980,6 +4983,21 @@ pub(crate) async fn run_websocket_proxy<C>(
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    // Invariant: the tunnel-mode raw-copy fast path is only reachable from H1
+    // frontends. RFC 6455 (H1.1) and RFC 8441 (H2 Extended CONNECT) mandate
+    // masked client frames, so H1/H2 always pass `accept_unmasked_client_frames
+    // = false`. RFC 9220 (H3 Extended CONNECT) reverses the rule and the H3
+    // caller passes `true` — but H3 cannot tunnel raw bytes (there is no TCP
+    // underneath QUIC) so the caller also passes `websocket_tunnel_mode =
+    // false`. If both are ever `true` simultaneously, a refactor has wired a
+    // non-TCP transport into the tunnel branch and `copy_bidirectional` would
+    // silently elide frame parsing on traffic that needs it.
+    debug_assert!(
+        !(websocket_tunnel_mode && accept_unmasked_client_frames),
+        "run_websocket_proxy: tunnel mode is incompatible with unmasked client \
+         frames (H3 caller must pass websocket_tunnel_mode=false)"
+    );
+
     // When tunnel mode is enabled and no plugins need frame-level hooks, bypass
     // WebSocket frame parsing entirely and do raw TCP bidirectional copy. This
     // avoids per-frame header parsing, masking validation, and opcode dispatch —

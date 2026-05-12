@@ -257,6 +257,54 @@ apply to H3 sessions. The H3 frontend has no raw TCP underneath QUIC to
 splice; bytes always pass through the pump tasks. Operators who set
 tunnel mode for H1/H2 throughput automatically get frame-parsing
 semantics on H3 — frame-level plugins continue to work regardless.
+The generic `run_websocket_proxy` carries a `debug_assert!` enforcing
+this invariant (`websocket_tunnel_mode` and `accept_unmasked_client_frames`
+are mutually exclusive) so a future refactor that wires a non-TCP
+transport into the raw-copy fast path fails loudly in debug builds.
+
+### Circuit breaker, load balancer, graceful drain
+
+H3 WebSocket sessions participate in the same backend-isolation +
+session-accounting infrastructure the H1/H2 path uses:
+
+- **Circuit breaker** — backend connect failure records
+  `record_failure(502, is_pre_wire, is_half_open_probe)` against
+  the resolved target, where `is_pre_wire` follows the unified
+  `retry::request_reached_wire` boundary (a backend that received the
+  upgrade and rejected it post-wire does NOT charge the breaker's
+  connect-error counter). Successful 200 upgrades record
+  `record_success(is_half_open_probe)` so a half-open probe that
+  bootstraps a WebSocket counts as a recovery sample.
+- **Load balancer** — `LoadBalancerConnectionGuard` increments the
+  per-target connection count on construction (just before the 200 is
+  sent) and decrements on drop, so a long-lived H3 WebSocket session
+  correctly weights least-connection load balancing.
+- **Graceful drain** — a fresh `ConnectionGuard` is captured for the
+  session lifetime; `SIGTERM` drain waits for in-flight H3 WebSocket
+  sessions before exit, honoring `FERRUM_SHUTDOWN_DRAIN_SECONDS`.
+- **Single-attempt** — full retry-with-target-rotation is a follow-up
+  that will mirror `handle_websocket_request_authenticated`'s retry
+  loop. The current path attempts the backend once; CB accounting still
+  runs so backend isolation works even without retry.
+
+### Pump task teardown
+
+The recv pump (QUIC → WS framer) is `abort()`ed after
+`run_websocket_proxy` returns, before joining. The send pump (WS framer
+→ QUIC) is awaited normally — it exits on EOF when the framer drops
+its sink half, and the await ensures `finish()` runs so the peer sees
+a clean FIN. Aborting the recv pump prevents a non-cooperative client
+(one that exchanges close frames without closing the QUIC stream) from
+pinning the recv task for the QUIC idle-timeout window.
+
+### 0-RTT (TLS 1.3 early data)
+
+RFC 9220 Extended CONNECT can in principle be carried in QUIC 0-RTT
+early data, but `FERRUM_TLS_EARLY_DATA_METHODS` does NOT list `CONNECT`
+by default — operators who want WebSocket upgrades via 0-RTT must opt
+in explicitly. On accepted 0-RTT requests the gateway forwards
+`Early-Data: 1` to the backend (same shim as plain H3 / cross-protocol
+bridge) so origins can apply their own replay-safety policy.
 
 ### Disabling H3 WebSocket
 
