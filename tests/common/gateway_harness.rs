@@ -1023,9 +1023,27 @@ fn locate_binary(
 /// tests never run against a stale binary after a source edit. Callers that
 /// want to skip the build entirely (e.g. when the binary was built by an
 /// outer CI step) can opt out via [`TestGatewayBuilder::skip_auto_build`].
+///
+/// Setting `FERRUM_SKIP_GATEWAY_BUILD=1` short-circuits the cargo invocation
+/// globally — used in CI when a prebuilt binary has already been downloaded
+/// into `target/debug/` (or `target/release/`) by an upstream job. With
+/// nextest (one process per test) that single env var saves N cargo
+/// fingerprint checks per shard, where N is the number of tests.
 fn ensure_gateway_built() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
     let result = RESULT.get_or_init(|| -> Result<(), String> {
+        if std::env::var_os("FERRUM_SKIP_GATEWAY_BUILD").is_some() {
+            let debug = PathBuf::from("./target/debug/ferrum-edge");
+            let release = PathBuf::from("./target/release/ferrum-edge");
+            if !debug.exists() && !release.exists() {
+                return Err(
+                    "FERRUM_SKIP_GATEWAY_BUILD set but ferrum-edge binary not found in \
+                     ./target/debug/ or ./target/release/"
+                        .to_string(),
+                );
+            }
+            return Ok(());
+        }
         let status = Command::new("cargo")
             .args(["build", "--bin", "ferrum-edge"])
             .stdout(Stdio::null())
