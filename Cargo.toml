@@ -55,7 +55,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 
 # gRPC
-tonic = { version = "0.14.5", features = ["tls-ring", "tls-webpki-roots"] }
+tonic = { version = "0.14.6", features = ["tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14.5"
 prost = "0.14.3"
 tower = { version = "0.5", features = ["util"] }
