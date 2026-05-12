@@ -241,7 +241,7 @@ codegen-units = 1       # single codegen unit for maximum optimiser visibility
 panic = "abort"         # skip unwind tables — smaller binary, faster panics
 
 [build-dependencies]
-tonic-prost-build = "0.14.5"
+tonic-prost-build = "0.14.6"
 
 [dev-dependencies]
 tempfile = "3"
