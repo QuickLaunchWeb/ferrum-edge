@@ -103,6 +103,29 @@ or removed schemas do not leak.
 
 `schema:` and `schema_ref:` are mutually exclusive on a single plugin.
 
+### Admin-API single-plugin updates
+
+`POST /plugins` and `PUT /plugins/{id}` validate one plugin at a time,
+which has implications for `schema_ref:` resolution:
+
+- `schema_ref` validation consults the **currently committed** named-
+  schemas registry — the same map that's serving live traffic. It is NOT
+  re-derived from the request payload.
+- Result: a single-plugin POST/PUT carrying `schema_ref: foo` succeeds
+  iff some prior config-load pass committed a `transaction_log_schema`
+  defining `foo`. If you submit a `transaction_log_schema` and a
+  referencing plugin in two separate admin calls, send the
+  `transaction_log_schema` first.
+- Inline `schema:` blocks do not have this dependency — they compile
+  against the static field metadata in `fields.rs` and are reproducible
+  from the request alone.
+
+Full multi-resource updates (file mode SIGHUP, DB-mode poll cycle,
+control-plane snapshot push) always rebuild the registry atomically
+within one bracket, so cross-plugin `schema_ref:` resolves correctly
+regardless of declaration order in the config source. The ordering
+caveat applies only to incremental admin-API edits.
+
 ## Schema Fields
 
 | Key | Type | Default | Description |
@@ -111,7 +134,7 @@ or removed schemas do not leak.
 | `omit` | `[String]` | `[]` | Native field names to drop. |
 | `rename` | `{old: new}` | `{}` | Map native field names to output keys. |
 | `order` | `[String]` | – | Explicit output order. May contain `"*"` once as a wildcard for "all unlisted entries in natural order." Without `"*"`, every field must be listed. |
-| `static_fields` | `{key: value}` | `{}` | Literal JSON values injected at top level. Keys matching sensitive substrings (`authorization`, `cookie`, `password`, `token`, …) are rejected. |
+| `static_fields` | `{key: value}` | `{}` | Literal JSON values injected at top level. Keys matching sensitive substrings (see [Sensitive substrings](#sensitive-substrings)) are rejected. String values that begin with an HTTP auth scheme token (`Bearer xxx`, `Basic xxx`, `AWS4-HMAC-SHA256 ...`, etc.) are also rejected as a defense-in-depth check against literal credential copy-paste. |
 | `derived_fields` | `[{name, kind}]` | `[]` | Computed values; see [Derived Kinds](#derived-kinds). |
 | `metadata` | object | `{mode: nested}` | How to render the `metadata` map: `nested` / `omit` / `flatten`. |
 | `timestamp_format` | `rfc3339` / `epoch_ms` / `epoch_s` | `rfc3339` | Conversion for timestamp string fields. Parse failures fall back to the raw string. |
@@ -143,6 +166,53 @@ Sensitive keys (`authorization`, `cookie`, credential tokens, etc.) are
 operator renames the outer `metadata` field via `rename:`. There is no
 way to bypass redaction through the schema.
 
+### Sensitive substrings
+
+The full canonical list (`DEFAULT_SENSITIVE_METADATA_KEYS` in
+`src/plugins/utils/metadata_redaction.rs`):
+
+| Substring     | Matches (examples)                                       |
+|---------------|----------------------------------------------------------|
+| `authorization` | `authorization`, `request_authorization_header`, `downstream_authorization` |
+| `cookie`      | `cookie`, `legacy.cookie.value`                          |
+| `set-cookie`  | `set-cookie`                                             |
+| `x-api-key`   | `x-api-key`, `X-API-KEY`                                 |
+| `x-auth-token`| `x-auth-token`                                           |
+| `x-csrf-token`| `x-csrf-token`                                           |
+| `bearer`      | `bearer`, `auth.bearer.value`                            |
+| `password`    | `password`, `user_password`                              |
+| `secret`      | `secret`, `api_secret`, `secret_count` *(also matched — see below)* |
+
+Matching is **case-insensitive substring**, not exact match. That means
+operator-chosen rename targets / `static_fields` keys / `derived_fields`
+names that *contain* one of these substrings will be rejected at compile
+time — even if the operator's intent is benign. For example:
+
+- `secret_count` is rejected because it contains `secret`.
+- `secrets_loaded` is rejected for the same reason.
+- `cookie_count_per_request` is rejected because it contains `cookie`.
+
+This is **intentional defense-in-depth**: the read-path redactor uses
+the same substring rule, so a benign-named field would be silently
+replaced with `[REDACTED]` at every log sink. Erroring at compile time
+is louder than letting the operator deploy a field that vanishes from
+logs.
+
+Workaround: rename the field to drop the substring (e.g.
+`secret_count` → `total_credentials` or `num_secrets_present`).
+
+Singular `token` keys go through a narrower per-segment classifier
+(`is_sensitive_token_metadata_key`) so usage metrics like
+`ai_total_tokens` / `prompt_tokens` stay visible; see
+`src/plugins/utils/metadata_redaction.rs` for the exact rules.
+
+Operator-supplied extras may be added via the
+`FERRUM_LOG_REDACT_METADATA_KEYS` env var (comma-separated, also
+substring-matched). Those apply to the redaction path only — schema
+compile-time rejection runs against the env-extras too, so adding a
+substring there will start rejecting matching schema names on the next
+reload.
+
 ## Per-Plugin Notes
 
 | Plugin | Schema-aware output | Notes |
@@ -155,7 +225,7 @@ way to bypass redaction through the schema.
 | `ws_logging` | Full for HTTP / stream summaries; WebSocket disconnect entries are out of scope in v1 | A future release may extend the schema to `WsDisconnectLogEntry`. |
 | `kafka_logging` | Full | One JSON message per summary. Partition key (`client_ip` / `proxy_id`) still reads typed fields, so partition keys are NOT affected by `rename:`. |
 | `loki_logging` | Full | Schema-customized JSON appears inside the Loki log line. Loki **labels** (`build_http_labels` / `build_stream_labels`) keep reading typed fields, so labels are NOT affected by `rename:`. |
-| `statsd_logging` | Tag rename / omit only | Static / derived / flatten / timestamp parts of a schema are no-ops here (statsd is line protocol, not JSON). The schema's `rename` and `omit` operate on the native field names backing the statsd tags. The supported mappings are: HTTP — `http_method`↔`method`, `response_status_code`↔`status`, `proxy_id`↔`proxy`. Stream — `protocol`↔`protocol`, `proxy_id`↔`proxy`, `disconnect_cause`↔`cause`, `disconnect_direction`↔`direction`. Computed statsd tags without native-field backing (`status_class`, `error`) are always emitted with their default names — `omit` and `rename` have no effect on them since they are derived at format time, not read from a summary field. |
+| `statsd_logging` | Tag rename / omit only | Static / derived / flatten / timestamp parts of a schema are no-ops here (statsd is line protocol, not JSON). When an inline `schema:` carries any of those keys, the plugin emits a `warn!` at construction time so operators don't ship a schema that silently throws fields away (per-referrer warnings would be noisy, so `schema_ref:` is not inspected — verify the shared schema's intent at the `transaction_log_schema` definition). The schema's `rename` and `omit` operate on the native field names backing the statsd tags. The supported mappings are: HTTP — `http_method`↔`method`, `response_status_code`↔`status`, `proxy_id`↔`proxy`. Stream — `protocol`↔`protocol`, `proxy_id`↔`proxy`, `disconnect_cause`↔`cause`, `disconnect_direction`↔`direction`. Computed statsd tags without native-field backing (`status_class`, `error`) are always emitted with their default names — `omit` and `rename` have no effect on them since they are derived at format time, not read from a summary field. |
 
 `prometheus_metrics`, `api_chargeback`, `transaction_debugger` reject
 `schema:` and `schema_ref:` at construction time. Prometheus exposes
@@ -178,18 +248,19 @@ suggestion where applicable):
 7. `summary_type: http` referring to stream-only fields, and vice versa.
 8. `static_fields` keys that match sensitive substrings.
 9. `static_fields` values containing nested keys with sensitive substrings.
-10. `static_fields` values that are `null`.
-11. `metadata.prefix` containing control characters.
-12. Unknown derived `kind`.
-13. Unknown top-level schema keys (typo guard).
-14. `schema:` and `schema_ref:` both present on the same plugin.
-15. `schema_ref:` pointing at an unregistered name.
+10. `static_fields` string values that begin with an HTTP auth scheme token (`Bearer xxx`, `Basic xxx`, `Digest`, `Negotiate`, `NTLM`, `HOBA`, `Mutual`, `SCRAM-SHA-1`, `SCRAM-SHA-256`, `vapid`, `AWS4-HMAC-SHA256`). Defense-in-depth against literal credential copy-paste.
+11. `static_fields` values that are `null`.
+12. `metadata.prefix` containing control characters.
+13. Unknown derived `kind`.
+14. Unknown top-level schema keys (typo guard).
+15. `schema:` and `schema_ref:` both present on the same plugin.
+16. `schema_ref:` pointing at an unregistered name.
 
 For named schemas:
 
-16. `transaction_log_schema` with `scope: proxy` or `scope: proxy_group`
+17. `transaction_log_schema` with `scope: proxy` or `scope: proxy_group`
     is rejected by `validate_plugin_references`.
-17. Two `transaction_log_schema` plugins in the same config defining the
+18. Two `transaction_log_schema` plugins in the same config defining the
     same name.
 
 ## Performance

@@ -272,3 +272,43 @@ async fn test_statsd_logging_warmup_hostnames() {
     let hosts = plugin.warmup_hostnames();
     assert_eq!(hosts, vec!["statsd.internal.example.com".to_string()]);
 }
+
+#[tokio::test]
+async fn test_statsd_logging_accepts_rename_and_omit_schema() {
+    // rename + omit are supported; construction succeeds without warnings.
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "schema": {
+                "summary_type": "http",
+                "rename": { "proxy_id": "route_id" },
+                "omit": ["response_status_code"]
+            }
+        }),
+        default_client(),
+    )
+    .unwrap();
+    assert_eq!(plugin.name(), "statsd_logging");
+}
+
+#[tokio::test]
+async fn test_statsd_logging_accepts_unsupported_schema_keys_with_warning() {
+    // static_fields / metadata / timestamp_format / order / derived_fields
+    // are no-ops for statsd, but construction still succeeds — the plugin
+    // just emits a `warn!` for visibility. Verify here that they do not
+    // hard-error.
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "schema": {
+                "summary_type": "http",
+                "static_fields": { "env": "prod" },
+                "timestamp_format": "epoch_ms",
+                "metadata": { "mode": "omit" }
+            }
+        }),
+        default_client(),
+    )
+    .unwrap();
+    assert_eq!(plugin.name(), "statsd_logging");
+}

@@ -517,9 +517,95 @@ fn reject_sensitive_in_value(value: &Value, plugin_name: &str, parent: &str) -> 
                 reject_sensitive_in_value(v, plugin_name, parent)?;
             }
         }
+        Value::String(s) => {
+            if let Some(scheme) = detect_credential_scheme(s) {
+                return Err(format!(
+                    "{plugin_name}: schema 'static_fields' value for '{parent}' looks like an HTTP {scheme} credential — refusing to ship a literal token through the log pipeline; pass a placeholder or non-secret descriptor instead"
+                ));
+            }
+        }
         _ => {}
     }
     Ok(())
+}
+
+/// Defense-in-depth scan for literal HTTP auth-scheme credentials pasted
+/// into a `static_fields` value.
+///
+/// Detection rule: the value (after trimming leading whitespace) must
+///   1. start with one of the recognized HTTP auth-scheme tokens
+///      (case-insensitive),
+///   2. be followed by ASCII whitespace,
+///   3. and then either
+///      - a single non-whitespace credential token (`Bearer eyJ...`,
+///        `Basic dXNlcjp...`, `NTLM TlRMTV...`), or
+///      - a `key=value` parameter list (`Digest username="..."`,
+///        `AWS4-HMAC-SHA256 Credential=...`).
+///
+/// Prose that happens to contain a scheme name plus a multi-word
+/// continuation passes through (`"bearer of bad news"`,
+/// `"We use Basic Auth internally"`, `"escalate to digest auth later"`)
+/// because the post-scheme content has internal whitespace AND no
+/// `key=value` opener.
+///
+/// Schemes covered are the IANA-registered HTTP Authentication schemes
+/// most likely to be copy-pasted from a request log: `Basic`, `Bearer`,
+/// `Digest`, `Negotiate`, `NTLM`, `Hoba`, `Mutual`, `SCRAM-SHA-1`,
+/// `SCRAM-SHA-256`, `Vapid`, plus AWS SigV4 (`AWS4-HMAC-SHA256`).
+fn detect_credential_scheme(value: &str) -> Option<&'static str> {
+    const SCHEMES: &[(&str, &str)] = &[
+        ("basic", "Basic"),
+        ("bearer", "Bearer"),
+        ("digest", "Digest"),
+        ("negotiate", "Negotiate"),
+        ("ntlm", "NTLM"),
+        ("hoba", "HOBA"),
+        ("mutual", "Mutual"),
+        ("scram-sha-1", "SCRAM-SHA-1"),
+        ("scram-sha-256", "SCRAM-SHA-256"),
+        ("vapid", "vapid"),
+        ("aws4-hmac-sha256", "AWS4-HMAC-SHA256"),
+    ];
+    let trimmed = value.trim_start();
+    for (scheme, label) in SCHEMES {
+        let bytes = trimmed.as_bytes();
+        if bytes.len() <= scheme.len() {
+            continue;
+        }
+        if !bytes[..scheme.len()].eq_ignore_ascii_case(scheme.as_bytes()) {
+            continue;
+        }
+        let rest = &trimmed[scheme.len()..];
+        // First char after the scheme must be ASCII whitespace.
+        let next = rest.chars().next();
+        if !matches!(next, Some(' ' | '\t')) {
+            continue;
+        }
+        // Strip leading whitespace and require a non-empty payload.
+        let payload = rest.trim_start();
+        if payload.is_empty() {
+            continue;
+        }
+        // Pattern A: single non-whitespace credential token.
+        if !payload.chars().any(char::is_whitespace) {
+            return Some(label);
+        }
+        // Pattern B: `key=value` opener (Digest, AWS4 SigV4 style),
+        // where `key` is a contiguous identifier-shaped run before `=`.
+        if let Some(eq_idx) = payload.find('=') {
+            let key = &payload[..eq_idx];
+            if !key.is_empty()
+                && !key.chars().any(char::is_whitespace)
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return Some(label);
+            }
+        }
+        // Multi-word continuation without a key=value opener — prose.
+    }
+    None
 }
 
 fn parse_derived_fields(
@@ -1157,5 +1243,122 @@ mod tests {
         let cfg = json!({ "schema": {}, "schema_ref": "x" });
         let r = resolve_schema(&cfg, "test");
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn static_fields_string_value_with_bearer_token_rejected() {
+        let e = err(json!({
+            "static_fields": { "audit_note": "Bearer eyJhbGciOiJIUzI1NiJ9.xxx.yyy" }
+        }));
+        assert!(
+            e.contains("looks like an HTTP Bearer credential"),
+            "got: {e}"
+        );
+    }
+
+    #[test]
+    fn static_fields_string_value_with_basic_auth_rejected() {
+        let e = err(json!({
+            "static_fields": { "note": "Basic dXNlcjpwYXNz" }
+        }));
+        assert!(
+            e.contains("looks like an HTTP Basic credential"),
+            "got: {e}"
+        );
+    }
+
+    #[test]
+    fn static_fields_string_value_with_aws_sigv4_rejected() {
+        let e = err(json!({
+            "static_fields": { "note": "AWS4-HMAC-SHA256 Credential=AKIA.../..." }
+        }));
+        assert!(e.contains("AWS4-HMAC-SHA256"), "got: {e}");
+    }
+
+    #[test]
+    fn static_fields_string_value_case_insensitive_rejected() {
+        let e = err(json!({
+            "static_fields": { "note": "bearer abc" }
+        }));
+        assert!(
+            e.contains("looks like an HTTP Bearer credential"),
+            "got: {e}"
+        );
+    }
+
+    #[test]
+    fn static_fields_nested_string_value_with_credential_rejected() {
+        // Nested under an array — must still be caught.
+        let e = err(json!({
+            "static_fields": {
+                "notes": ["normal text", "Bearer leaked-secret"]
+            }
+        }));
+        assert!(
+            e.contains("looks like an HTTP Bearer credential"),
+            "got: {e}"
+        );
+    }
+
+    #[test]
+    fn static_fields_prose_mentioning_scheme_names_accepted() {
+        // The scheme keyword on its own (no whitespace + token after) is fine —
+        // operators describing auth strategies should not be rejected.
+        ok(json!({
+            "static_fields": {
+                "auth_strategy": "We use bearer tokens internally",
+                "phrase": "bearer of bad news",
+                "config": "escalate to digest auth later"
+            }
+        }));
+    }
+
+    #[test]
+    fn static_fields_short_value_starting_with_scheme_accepted() {
+        // "Bearer" alone (no following credential) is not flagged.
+        ok(json!({
+            "static_fields": {
+                "label": "Bearer"
+            }
+        }));
+    }
+
+    #[test]
+    fn detect_credential_scheme_single_token() {
+        // Direct unit tests on the helper — single-token credential payload.
+        assert!(detect_credential_scheme("Bearer ").is_none());
+        assert!(detect_credential_scheme("Bearer  ").is_none()); // only whitespace after
+        assert_eq!(detect_credential_scheme("Bearer x"), Some("Bearer"));
+        assert_eq!(detect_credential_scheme("  bearer  abc"), Some("Bearer"));
+        assert!(detect_credential_scheme("bearerof").is_none()); // no whitespace separator
+        assert_eq!(detect_credential_scheme("Basic dXNlcg=="), Some("Basic"));
+    }
+
+    #[test]
+    fn detect_credential_scheme_multi_word_prose_passes() {
+        // Multi-word continuation without key=value is prose, not a credential.
+        assert!(detect_credential_scheme("bearer of bad news").is_none());
+        assert!(detect_credential_scheme("Bearer Token Authentication").is_none());
+        assert!(detect_credential_scheme("Basic auth is enabled").is_none());
+        assert!(detect_credential_scheme("escalate to digest auth later").is_none());
+    }
+
+    #[test]
+    fn detect_credential_scheme_key_value_pattern() {
+        // Digest / AWS4 SigV4 carry comma-separated key=value pairs that
+        // contain internal whitespace; the key=value opener marks them as
+        // credentials.
+        assert_eq!(
+            detect_credential_scheme("Digest username=\"foo\", realm=\"bar\""),
+            Some("Digest")
+        );
+        assert_eq!(
+            detect_credential_scheme(
+                "AWS4-HMAC-SHA256 Credential=AKIA.../foo, SignedHeaders=host, Signature=abc123"
+            ),
+            Some("AWS4-HMAC-SHA256")
+        );
+        // No `=` opener → still treated as prose even with multi-word.
+        assert!(detect_credential_scheme("Digest auth is configured").is_none());
     }
 }
