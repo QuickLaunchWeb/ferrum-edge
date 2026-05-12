@@ -414,6 +414,47 @@ pub struct MeshTracingConfig {
     /// Custom tags resolved from request headers at runtime.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_header_tags: HashMap<String, String>,
+    /// Provider-specific tracing backend (Zipkin / Datadog / Lightstep / OpenTelemetry).
+    ///
+    /// Mirrors Istio's `Telemetry.tracing[].providers[]`. Old DPs reading new
+    /// slices ignore this field (serde defaults to `None`); new DPs reading
+    /// old slices behave identically to today (provider is `None`, no
+    /// behavior change). A future mesh-wide-default surface (Istio
+    /// `meshConfig.defaultProviders`) can be threaded in alongside without
+    /// changing this field — the slice merge already picks the most-specific
+    /// applicable Telemetry's provider, and the default-providers map would
+    /// simply seed `None` slots before merge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<TracingProvider>,
+}
+
+/// Tracing backend selection for a `MeshTracingConfig`.
+///
+/// Mirrors Istio's `Tracing.providers[]` provider definitions for the four
+/// most common backends. Serialised with `kind` discriminator + `config`
+/// payload so a future variant can be appended without an `unknown`-handling
+/// shim on older DPs (serde will simply fail to deserialise an unknown
+/// variant and the slice update is rejected at slice-apply time, consistent
+/// with the rest of the mesh slice contract).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "config")]
+pub enum TracingProvider {
+    Zipkin {
+        url: String,
+    },
+    Datadog {
+        agent_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service: Option<String>,
+    },
+    Lightstep {
+        collector_url: String,
+        access_token: String,
+    },
+    #[serde(rename = "opentelemetry")]
+    OpenTelemetry {
+        endpoint: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
