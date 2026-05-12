@@ -479,6 +479,7 @@ pub async fn run(
         let controller_config = crate::k8s_controller::K8sControllerConfig {
             namespace: env_config.namespace.clone(),
             trust_domain: env_config.k8s_trust_domain.clone(),
+            cluster_domain: env_config.k8s_cluster_domain.clone(),
             watch_namespaces: env_config.k8s_watch_namespaces.clone(),
             watch_istio: env_config.k8s_watch_istio_crds,
             watch_gateway_api: env_config.k8s_watch_gateway_api_crds,

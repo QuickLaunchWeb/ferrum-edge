@@ -11,7 +11,7 @@ use crate::modes::mesh::config::{
     MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy, MeshTrafficPolicyTls,
     MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch,
     RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
-    TagOverrideOperation, Workload, WorkloadPort, WorkloadSelector,
+    TagOverrideOperation, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
 };
 
 use super::{
@@ -1100,12 +1100,7 @@ fn route_backends(
                 "VirtualService route.destination.host is required",
             ));
         };
-        let port = optional_port_field(
-            object,
-            destination.get("port").and_then(|p| p.get("number")),
-            "route.destination.port.number",
-        )?
-        .unwrap_or(80);
+        let port = resolve_destination_port(object, destination, host, acc)?.unwrap_or(80);
         backends.push(RouteBackend {
             host: host.to_string(),
             port,
@@ -1126,6 +1121,110 @@ fn route_backends(
         }
     }
     Ok(backends)
+}
+
+/// Resolve `destination.port` to a numeric port. Accepts either
+/// `port.number` (integer) or `port.name` (string), with the latter looked
+/// up against the `Service.spec.ports[].name` index built in the
+/// translator pre-pass. Hosts that point at a service outside the loaded
+/// namespace set (cluster-external hosts, foreign namespaces) and lack a
+/// numeric port fall back to the caller's default — matching today's
+/// behavior of "no port specified".
+fn resolve_destination_port(
+    object: &K8sObject,
+    destination: &Value,
+    host: &str,
+    acc: &K8sAccumulator,
+) -> Result<Option<u16>, K8sTranslateError> {
+    let Some(port_value) = destination.get("port") else {
+        return Ok(None);
+    };
+    if let Some(numeric) = port_value.get("number") {
+        return optional_port_field(object, Some(numeric), "route.destination.port.number");
+    }
+    let Some(name) = string_field(port_value, "name") else {
+        return Ok(None);
+    };
+    let cluster_domain = &acc.options.cluster_domain;
+    let Some((svc, ns)) = service_host_components(host, &object.metadata.namespace, cluster_domain)
+    else {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService route.destination.host '{}' is not a recognized in-cluster service form; \
+                 port.name resolution only supports <svc>, <svc>.<ns>, <svc>.<ns>.svc, or \
+                 <svc>.<ns>.svc.{} (optional trailing dot)",
+                host, cluster_domain
+            ),
+        ));
+    };
+    match acc.lookup_service_port(ns, svc, name) {
+        Some(port) => Ok(Some(port)),
+        None => Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService route.destination.port.name '{}' did not match any port on Service {}/{}",
+                name, ns, svc
+            ),
+        )),
+    }
+}
+
+/// Parse an Istio destination host into `(service_name, namespace)` as borrowed
+/// slices of either `host` or `default_namespace` — no allocation.
+///
+/// Accepted shapes (all may carry an optional trailing `.` root anchor):
+///   - `<svc>` — short form; inherits the caller's default namespace
+///   - `<svc>.<ns>` — two-label form
+///   - `<svc>.<ns>.svc` — three-label form (final label MUST be `svc`)
+///   - `<svc>.<ns>.svc.<cluster_domain>` — FQDN form (cluster_domain is
+///     configurable via `FERRUM_K8S_CLUSTER_DOMAIN`, default `cluster.local`)
+///
+/// Any other shape — including external hosts (`api.example.com`), foreign
+/// FQDNs (`foo.bar.tld.invalid`), partial suffixes (`<svc>.<ns>.cluster.local`,
+/// `<svc>.<ns>.svc.cluster`), or hosts whose FQDN suffix doesn't match the
+/// configured cluster domain — returns `None`. Empty labels (leading/trailing
+/// dots that aren't the root anchor, consecutive dots) are also rejected.
+/// Callers MUST treat `None` as "this host is not a Kubernetes service
+/// reference" and surface a clear error instead of attempting a service lookup.
+fn service_host_components<'a>(
+    host: &'a str,
+    default_namespace: &'a str,
+    cluster_domain: &str,
+) -> Option<(&'a str, &'a str)> {
+    let trimmed = host.strip_suffix('.').unwrap_or(host);
+    // Reject empty strings, leading/trailing dots, and consecutive dots in one
+    // pass over the borrowed slice — avoids the Vec<&str> allocation the old
+    // `split('.').collect()` + `any(empty)` shape required.
+    if trimmed.is_empty()
+        || trimmed.starts_with('.')
+        || trimmed.ends_with('.')
+        || trimmed.contains("..")
+    {
+        return None;
+    }
+    // Limit to four splits: <svc>.<ns>.svc.<domain-rest>. The fourth split
+    // captures the entire cluster-domain suffix verbatim so we can compare it
+    // against `cluster_domain` with `eq_ignore_ascii_case` and no `join(".")`.
+    let mut labels = trimmed.splitn(4, '.');
+    let svc = labels.next()?;
+    let Some(ns) = labels.next() else {
+        return Some((svc, default_namespace));
+    };
+    let Some(third) = labels.next() else {
+        return Some((svc, ns));
+    };
+    if third != "svc" {
+        return None;
+    }
+    let Some(domain) = labels.next() else {
+        return Some((svc, ns));
+    };
+    if domain.eq_ignore_ascii_case(cluster_domain) {
+        Some((svc, ns))
+    } else {
+        None
+    }
 }
 
 fn route_weight(object: &K8sObject, route: &Value) -> Result<u32, K8sTranslateError> {
@@ -1342,12 +1441,15 @@ fn telemetry(
                         .collect()
                 })
                 .unwrap_or_default();
-            MeshTracingConfig {
+            let provider = telemetry_tracing_provider(object, t)?;
+            Ok::<_, K8sTranslateError>(MeshTracingConfig {
                 sampling_percentage: sampling,
                 custom_tags,
                 custom_header_tags,
-            }
-        });
+                provider,
+            })
+        })
+        .transpose()?;
 
     let metrics = object
         .spec
@@ -1437,6 +1539,163 @@ fn telemetry(
             access_logging,
         },
     })
+}
+
+/// Extract the first `tracing[].providers[]` entry as a [`TracingProvider`].
+///
+/// Mirrors Istio's Telemetry CRD: `providers[]` is a list of named provider
+/// references. Today we surface only the first entry; multi-provider fan-out
+/// is deferred.
+///
+/// Istio's standard provider model defines providers once at the mesh-config
+/// level (`meshConfig.extensionProviders`) and references them by name from
+/// Telemetry resources. This translator supports **inline** provider config
+/// only (provider type inferred from `name`, required fields on the entry
+/// itself). Name-only references (`{name: "my-zipkin"}` with no inline
+/// fields) and unrecognised provider names are gracefully skipped with a
+/// warning — `meshConfig.extensionProviders` lookup is deferred.
+fn telemetry_tracing_provider(
+    object: &K8sObject,
+    tracing_entry: &Value,
+) -> Result<Option<TracingProvider>, K8sTranslateError> {
+    let Some(providers) = tracing_entry.get("providers").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let Some(first) = providers.first() else {
+        return Ok(None);
+    };
+    if providers.len() > 1 {
+        tracing::warn!(
+            resource = %object.metadata.name,
+            namespace = %object.metadata.namespace,
+            count = providers.len(),
+            "Telemetry tracing.providers[] has multiple entries; only the first is surfaced (multi-provider fan-out is deferred)"
+        );
+    }
+    let name = first
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_resource(object, "Telemetry tracing.providers[].name is required"))?
+        .trim();
+    if name.is_empty() {
+        return Err(invalid_resource(
+            object,
+            "Telemetry tracing.providers[].name must not be empty",
+        ));
+    }
+    let is_reference_only = first
+        .as_object()
+        .map(|obj| obj.keys().all(|k| k == "name"))
+        .unwrap_or(false);
+    if is_reference_only {
+        tracing::warn!(
+            resource = %object.metadata.name,
+            namespace = %object.metadata.namespace,
+            provider_name = name,
+            "Telemetry tracing.providers[] entry is a name-only reference \
+             (no inline config fields); meshConfig.extensionProviders lookup \
+             is not yet supported — provider skipped"
+        );
+        return Ok(None);
+    }
+    let provider = match name {
+        "zipkin" => {
+            let url = telemetry_provider_string_field(object, first, "zipkin", "url")?;
+            TracingProvider::Zipkin { url }
+        }
+        "datadog" => {
+            let agent_url = telemetry_provider_string_field_aliased(
+                object,
+                first,
+                "datadog",
+                "agentUrl",
+                &["agent_url"],
+            )?;
+            let service = first
+                .get("service")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            TracingProvider::Datadog { agent_url, service }
+        }
+        "lightstep" => {
+            let collector_url = telemetry_provider_string_field_aliased(
+                object,
+                first,
+                "lightstep",
+                "collectorUrl",
+                &["collector_url"],
+            )?;
+            let access_token = telemetry_provider_string_field_aliased(
+                object,
+                first,
+                "lightstep",
+                "accessToken",
+                &["access_token"],
+            )?;
+            TracingProvider::Lightstep {
+                collector_url,
+                access_token,
+            }
+        }
+        "opentelemetry" => {
+            let endpoint =
+                telemetry_provider_string_field(object, first, "opentelemetry", "endpoint")?;
+            TracingProvider::OpenTelemetry { endpoint }
+        }
+        other => {
+            tracing::warn!(
+                resource = %object.metadata.name,
+                namespace = %object.metadata.namespace,
+                provider_name = other,
+                "Telemetry tracing.providers[] name '{other}' is not a recognised \
+                 inline provider type (supported: zipkin/datadog/lightstep/opentelemetry); \
+                 if this references a meshConfig.extensionProviders entry, that lookup \
+                 is not yet supported — provider skipped"
+            );
+            return Ok(None);
+        }
+    };
+    Ok(Some(provider))
+}
+
+fn telemetry_provider_string_field(
+    object: &K8sObject,
+    entry: &Value,
+    provider_name: &str,
+    field: &str,
+) -> Result<String, K8sTranslateError> {
+    telemetry_provider_string_field_aliased(object, entry, provider_name, field, &[])
+}
+
+/// Read a required string field, trying the canonical (camelCase) name first
+/// then any provided aliases. Non-empty after trim is required. The returned
+/// value is trimmed so stray whitespace in CRDs (e.g. `"url": " http://zipkin:9411 "`)
+/// does not propagate into pool keys, DNS resolvers, or URL parsers downstream.
+fn telemetry_provider_string_field_aliased(
+    object: &K8sObject,
+    entry: &Value,
+    provider_name: &str,
+    field: &str,
+    aliases: &[&str],
+) -> Result<String, K8sTranslateError> {
+    std::iter::once(field)
+        .chain(aliases.iter().copied())
+        .find_map(|name| {
+            entry
+                .get(name)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!(
+                    "Telemetry tracing.providers[] '{provider_name}' is missing required field '{field}'"
+                ),
+            )
+        })
 }
 
 /// Translate an Istio `ProxyConfig` (`networking.istio.io/v1beta1`) CRD into a
@@ -3023,6 +3282,410 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("response.code filter must use a numeric comparison")
+        );
+    }
+
+    #[test]
+    fn telemetry_tracing_zipkin_provider_translates() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "zipkin",
+                            "url": "http://zipkin.istio-system:9411/api/v2/spans"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        match tracing.provider.as_ref().expect("provider translated") {
+            TracingProvider::Zipkin { url } => {
+                assert_eq!(url, "http://zipkin.istio-system:9411/api/v2/spans");
+            }
+            other => panic!("expected Zipkin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telemetry_tracing_datadog_provider_translates() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "datadog",
+                            "agentUrl": "http://datadog-agent:8126",
+                            "service": "reviews"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        match tracing.provider.as_ref().expect("provider translated") {
+            TracingProvider::Datadog { agent_url, service } => {
+                assert_eq!(agent_url, "http://datadog-agent:8126");
+                assert_eq!(service.as_deref(), Some("reviews"));
+            }
+            other => panic!("expected Datadog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telemetry_tracing_datadog_snake_case_alias_still_accepted() {
+        // Backward compat: operators who wrote against the first draft used
+        // `agent_url`. The translator accepts both spellings so manifests
+        // captured before the camelCase canonicalisation keep working.
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "datadog",
+                            "agent_url": "http://datadog-agent:8126"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        match tracing.provider.as_ref().expect("provider translated") {
+            TracingProvider::Datadog { agent_url, service } => {
+                assert_eq!(agent_url, "http://datadog-agent:8126");
+                assert!(service.is_none(), "service omitted in manifest");
+            }
+            other => panic!("expected Datadog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telemetry_tracing_datadog_missing_agent_url_fails_closed() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "datadog",
+                            "service": "reviews"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("missing required field should fail closed");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("datadog"),
+            "error must mention provider: {msg}"
+        );
+        assert!(
+            msg.contains("agentUrl"),
+            "error must mention missing field: {msg}"
+        );
+    }
+
+    #[test]
+    fn telemetry_tracing_lightstep_provider_translates() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "lightstep",
+                            "collectorUrl": "https://ingest.lightstep.com:443",
+                            "accessToken": "secret-token"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        match tracing.provider.as_ref().expect("provider translated") {
+            TracingProvider::Lightstep {
+                collector_url,
+                access_token,
+            } => {
+                assert_eq!(collector_url, "https://ingest.lightstep.com:443");
+                assert_eq!(access_token, "secret-token");
+            }
+            other => panic!("expected Lightstep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telemetry_tracing_opentelemetry_provider_translates() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "opentelemetry",
+                            "endpoint": "http://otel-collector.istio-system:4317"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        match tracing.provider.as_ref().expect("provider translated") {
+            TracingProvider::OpenTelemetry { endpoint } => {
+                assert_eq!(endpoint, "http://otel-collector.istio-system:4317");
+            }
+            other => panic!("expected OpenTelemetry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telemetry_tracing_without_providers_block_has_no_provider() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "randomSamplingPercentage": 25.0
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        assert_eq!(tracing.sampling_percentage, Some(25.0));
+        assert!(
+            tracing.provider.is_none(),
+            "providers omitted, provider should be None"
+        );
+    }
+
+    #[test]
+    fn telemetry_tracing_unknown_provider_name_gracefully_skipped() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "stackdriver",
+                            "endpoint": "https://example.com"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("unknown provider name should not fail translation");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        assert!(
+            tracing.provider.is_none(),
+            "unrecognised provider name should be skipped, not surfaced"
+        );
+    }
+
+    #[test]
+    fn telemetry_tracing_name_only_reference_gracefully_skipped() {
+        // Standard Istio pattern: providers[].name references a
+        // meshConfig.extensionProviders entry with no inline fields.
+        // Since extensionProviders lookup is deferred, the translator
+        // should gracefully skip these rather than failing.
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "zipkin"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("name-only reference should not fail translation");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        assert!(
+            tracing.provider.is_none(),
+            "name-only reference should be skipped (extensionProviders lookup deferred)"
+        );
+    }
+
+    #[test]
+    fn telemetry_tracing_custom_extension_provider_name_gracefully_skipped() {
+        // Custom extensionProvider names like "my-zipkin" are valid Istio
+        // references but not one of the four inline provider types.
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "my-zipkin"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("custom provider name should not fail translation");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        assert!(
+            tracing.provider.is_none(),
+            "custom extensionProvider reference should be skipped"
+        );
+    }
+
+    #[test]
+    fn telemetry_tracing_multiple_providers_takes_first() {
+        // Istio's Telemetry CRD allows `providers[]` to list multiple entries.
+        // Multi-provider fan-out is deferred; today we surface only the first
+        // entry. This test pins that behavior so the limitation cannot drift
+        // silently as later providers (Stackdriver/SkyWalking) are added — a
+        // future change that needs to surface every entry should also update
+        // this test.
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [
+                            {
+                                "name": "zipkin",
+                                "url": "http://zipkin.istio-system:9411/api/v2/spans"
+                            },
+                            {
+                                "name": "datadog",
+                                "agentUrl": "http://datadog-agent:8126"
+                            }
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        match tracing.provider.as_ref().expect("provider translated") {
+            TracingProvider::Zipkin { url } => {
+                assert_eq!(url, "http://zipkin.istio-system:9411/api/v2/spans");
+            }
+            other => panic!("expected first-entry Zipkin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telemetry_tracing_provider_without_sampling_still_surfaces() {
+        // Provider configuration is independent from sampling. A Telemetry
+        // block with only `providers[]` (no `randomSamplingPercentage`)
+        // should still surface the provider — sampling is allowed to come
+        // from a less-specific Telemetry resource via merge_tracing_config.
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "providers": [{
+                            "name": "zipkin",
+                            "url": "http://zipkin.istio-system:9411/api/v2/spans"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        assert!(
+            tracing.sampling_percentage.is_none(),
+            "sampling omitted in manifest"
+        );
+        assert!(
+            tracing.provider.is_some(),
+            "provider should surface independently of sampling"
         );
     }
 
@@ -4799,6 +5462,7 @@ mod tests {
             Some(1)
         );
     }
+
     // ── ProxyConfig translation ─────────────────────────────────────────
 
     #[test]
@@ -5494,5 +6158,480 @@ mod tests {
             .as_ref()
             .expect("tls block");
         assert_eq!(tls.mode, MtlsMode::Simple);
+    }
+
+    // ── Service.spec.ports[].name resolution ──────────────────────────────
+
+    fn service_with_named_ports(name: &str, namespace: &str, ports: &[(&str, u16)]) -> K8sObject {
+        let ports_json: Vec<Value> = ports
+            .iter()
+            .map(|(name, port)| serde_json::json!({"name": name, "port": *port}))
+            .collect();
+        K8sObject {
+            api_version: "v1".to_string(),
+            kind: "Service".to_string(),
+            metadata: K8sMetadata {
+                name: name.to_string(),
+                namespace: namespace.to_string(),
+                labels: HashMap::new(),
+            },
+            spec: serde_json::json!({ "ports": ports_json }),
+        }
+    }
+
+    fn virtual_service_with_destination(name: &str, destination: Value) -> K8sObject {
+        K8sObject {
+            api_version: "networking.istio.io/v1".to_string(),
+            kind: "VirtualService".to_string(),
+            metadata: K8sMetadata {
+                name: name.to_string(),
+                namespace: "default".to_string(),
+                labels: HashMap::new(),
+            },
+            spec: serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/api"}}],
+                    "route": [{"destination": destination}]
+                }]
+            }),
+        }
+    }
+
+    #[test]
+    fn vs_destination_port_name_resolves_against_collected_service() {
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080), ("grpc", 9090)]);
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "port": {"name": "http"}
+            }),
+        );
+
+        let result = translate_k8s_objects(&[svc, vs], options()).expect("translation succeeds");
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn vs_destination_port_number_still_wins_over_name() {
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "port": {"number": 7777, "name": "http"}
+            }),
+        );
+
+        let result = translate_k8s_objects(&[svc, vs], options()).expect("translation succeeds");
+        // Explicit `number` takes precedence even when both are set.
+        assert_eq!(result.config.proxies[0].backend_port, 7777);
+    }
+
+    #[test]
+    fn vs_destination_port_name_short_host_uses_vs_namespace() {
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews",
+                "port": {"name": "http"}
+            }),
+        );
+
+        let result = translate_k8s_objects(&[svc, vs], options()).expect("translation succeeds");
+        assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn vs_destination_port_name_unknown_fails_closed() {
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "port": {"name": "missing-port"}
+            }),
+        );
+
+        let err = translate_k8s_objects(&[svc, vs], options())
+            .expect_err("unknown port name must fail closed");
+        assert!(
+            err.to_string().contains("missing-port"),
+            "error must name the missing port: {err}"
+        );
+    }
+
+    #[test]
+    fn vs_destination_no_port_defaults_to_80() {
+        // No port block at all — preserve today's "default to 80" behavior
+        // regardless of whether a matching Service exists.
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local"
+            }),
+        );
+
+        let result = translate_k8s_objects(&[vs], options()).expect("translation succeeds");
+        assert_eq!(result.config.proxies[0].backend_port, 80);
+    }
+
+    #[test]
+    fn service_object_is_not_translated_as_warning() {
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let result = translate_k8s_objects(&[svc], options()).expect("translation succeeds");
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("Ignoring unsupported Kubernetes resource kind 'Service'")),
+            "Service kind must be consumed by the port-name pre-pass, not warned: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn vs_destination_port_name_isolates_services_by_namespace() {
+        // Two services named `reviews` in different namespaces with the same
+        // port name but different port numbers; lookup must resolve against
+        // the namespace embedded in the destination host, not the first match.
+        let svc_default = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let svc_prod = service_with_named_ports("reviews", "prod", &[("http", 9090)]);
+        let vs_default = virtual_service_with_destination(
+            "reviews-default",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "port": {"name": "http"}
+            }),
+        );
+        let mut vs_prod = virtual_service_with_destination(
+            "reviews-prod",
+            serde_json::json!({
+                "host": "reviews.prod.svc.cluster.local",
+                "port": {"name": "http"}
+            }),
+        );
+        // Cross-namespace destination is allowed: VS in `default` pointing at
+        // a Service in `prod` — must resolve to the prod port number.
+        vs_prod.metadata.namespace = "default".to_string();
+        let result = translate_k8s_objects(
+            &[svc_default, svc_prod, vs_default, vs_prod],
+            options().with_source_namespaces(vec!["default".to_string(), "prod".to_string()]),
+        )
+        .expect("translation succeeds");
+        let default_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.id.contains("reviews-default"))
+            .expect("default-namespace proxy materialized");
+        let prod_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.id.contains("reviews-prod"))
+            .expect("prod-namespace proxy materialized");
+        assert_eq!(default_proxy.backend_port, 8080);
+        assert_eq!(prod_proxy.backend_port, 9090);
+    }
+
+    #[test]
+    fn vs_destination_short_host_isolates_services_by_vs_namespace() {
+        // Short host (`reviews`) must inherit the VS's own namespace, NOT the
+        // first matching service in any namespace. Two services with the same
+        // name in different namespaces; the short-host VS in `prod` must pick
+        // the `prod` service.
+        let svc_default = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let svc_prod = service_with_named_ports("reviews", "prod", &[("http", 9090)]);
+        let mut vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews",
+                "port": {"name": "http"}
+            }),
+        );
+        vs.metadata.namespace = "prod".to_string();
+        let result = translate_k8s_objects(
+            &[svc_default, svc_prod, vs],
+            options().with_source_namespaces(vec!["default".to_string(), "prod".to_string()]),
+        )
+        .expect("translation succeeds");
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].backend_port, 9090);
+    }
+
+    #[test]
+    fn service_with_unnamed_ports_does_not_panic_and_lookup_misses() {
+        // K8s allows Service ports without a `name` field. Those entries are
+        // silently skipped by the indexer (no panic, no error). A VS that
+        // references such a Service by port name must still fail closed
+        // because the name was never indexed.
+        let svc = K8sObject {
+            api_version: "v1".to_string(),
+            kind: "Service".to_string(),
+            metadata: K8sMetadata {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                labels: HashMap::new(),
+            },
+            spec: serde_json::json!({
+                "ports": [
+                    {"port": 8080},                           // no name
+                    {"name": "grpc", "port": 9090}            // named entry survives
+                ]
+            }),
+        };
+        let vs_missing = virtual_service_with_destination(
+            "vs-missing",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "port": {"name": "http"}
+            }),
+        );
+        let err = translate_k8s_objects(&[svc.clone(), vs_missing], options())
+            .expect_err("unnamed Service ports must not satisfy a name lookup");
+        assert!(
+            err.to_string().contains("http"),
+            "error must name the missing port: {err}"
+        );
+
+        // The named entry is still indexed and resolvable.
+        let vs_grpc = virtual_service_with_destination(
+            "vs-grpc",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "port": {"name": "grpc"}
+            }),
+        );
+        let result =
+            translate_k8s_objects(&[svc, vs_grpc], options()).expect("named entry still resolves");
+        assert_eq!(result.config.proxies[0].backend_port, 9090);
+    }
+
+    #[test]
+    fn service_with_no_ports_field_does_not_panic() {
+        // Service objects with no `spec.ports` array at all must not panic
+        // the pre-pass — we just index an empty entry.
+        let svc = K8sObject {
+            api_version: "v1".to_string(),
+            kind: "Service".to_string(),
+            metadata: K8sMetadata {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                labels: HashMap::new(),
+            },
+            spec: serde_json::json!({}),
+        };
+        let result =
+            translate_k8s_objects(&[svc], options()).expect("Service with no ports must not panic");
+        assert!(result.config.proxies.is_empty());
+    }
+
+    #[test]
+    fn vs_destination_port_name_resolves_with_trailing_dot_fqdn() {
+        // Trailing dot is a valid DNS-FQDN form (root anchor); the host parser
+        // must treat `reviews.default.svc.cluster.local.` the same as the
+        // non-anchored FQDN. Otherwise hand-written Istio configs that copy
+        // from `dig` output fail closed for no good reason.
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local.",
+                "port": {"name": "http"}
+            }),
+        );
+        let result = translate_k8s_objects(&[svc, vs], options()).expect("translation succeeds");
+        assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn vs_destination_port_name_resolves_with_svc_only_suffix() {
+        // `<svc>.<ns>.svc` (no cluster domain) is another canonical short
+        // form Istio docs reference — the parser must take only the first
+        // two labels and discard the `.svc` suffix.
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews.default.svc",
+                "port": {"name": "http"}
+            }),
+        );
+        let result = translate_k8s_objects(&[svc, vs], options()).expect("translation succeeds");
+        assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn service_objects_are_processed_regardless_of_input_order() {
+        // The pre-pass design must tolerate arbitrary input order — a
+        // VirtualService that appears BEFORE its Service in the input slice
+        // must still resolve the port name. Two-pass translation guarantees
+        // this, but a regression to single-pass would silently fail closed.
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "port": {"name": "http"}
+            }),
+        );
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let result = translate_k8s_objects(&[vs, svc], options()).expect("translation succeeds");
+        assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn vs_destination_port_name_rejects_external_host() {
+        // External hosts that happen to share a first/second label with a
+        // real in-cluster Service must NOT trigger a service lookup. Before
+        // this guard, `api.example.com` would silently parse as service=api,
+        // namespace=example and either resolve against an unrelated Service
+        // or emit a misleading "Service example/api not found" error.
+        let svc = service_with_named_ports("api", "example", &[("http", 8080)]);
+        let vs = virtual_service_with_destination(
+            "external-vs",
+            serde_json::json!({
+                "host": "api.example.com",
+                "port": {"name": "http"}
+            }),
+        );
+        let err = translate_k8s_objects(&[svc, vs], options())
+            .expect_err("external host must not be resolved against a Service");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a recognized in-cluster service form"),
+            "error must explain the host shape rejection: {msg}"
+        );
+        assert!(
+            msg.contains("api.example.com"),
+            "error must echo the offending host: {msg}"
+        );
+    }
+
+    #[test]
+    fn vs_destination_port_name_rejects_partial_cluster_suffix() {
+        // `<svc>.<ns>.cluster.local` (missing the `.svc.` infix) and
+        // `<svc>.<ns>.svc.cluster` (missing the `.local` tail) are NOT valid
+        // Kubernetes service DNS forms — accepting them silently encourages
+        // operator typos to resolve against real services.
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        for host in [
+            "reviews.default.cluster.local",
+            "reviews.default.svc.cluster",
+            "reviews.default.svc.cluster.local.extra",
+        ] {
+            let vs = virtual_service_with_destination(
+                "reviews-vs",
+                serde_json::json!({
+                    "host": host,
+                    "port": {"name": "http"}
+                }),
+            );
+            let err = translate_k8s_objects(&[svc.clone(), vs], options())
+                .err()
+                .unwrap_or_else(|| panic!("host '{host}' must be rejected"));
+            assert!(
+                err.to_string()
+                    .contains("not a recognized in-cluster service form"),
+                "host '{host}' must hit shape rejection: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn vs_destination_port_name_rejects_empty_labels() {
+        // Leading dots, consecutive dots, and lone-dot hosts produce empty
+        // labels — the parser must reject these rather than picking the empty
+        // string up as a service name.
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        for host in [".reviews", "reviews..default", "."] {
+            let vs = virtual_service_with_destination(
+                "reviews-vs",
+                serde_json::json!({
+                    "host": host,
+                    "port": {"name": "http"}
+                }),
+            );
+            let err = translate_k8s_objects(&[svc.clone(), vs], options())
+                .expect_err("empty-label host must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("not a recognized in-cluster service form"),
+                "host '{host}' must hit shape rejection: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn vs_destination_port_name_accepts_trailing_dot_on_short_forms() {
+        // Trailing dot must apply uniformly across all accepted shapes, not
+        // only the 5-label FQDN. Otherwise an operator typing `reviews.` or
+        // `reviews.default.` gets an inconsistent rejection vs. the FQDN.
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        for host in [
+            "reviews.",
+            "reviews.default.",
+            "reviews.default.svc.",
+            "reviews.default.svc.cluster.local.",
+        ] {
+            let vs = virtual_service_with_destination(
+                "reviews-vs",
+                serde_json::json!({
+                    "host": host,
+                    "port": {"name": "http"}
+                }),
+            );
+            let result = translate_k8s_objects(&[svc.clone(), vs], options())
+                .unwrap_or_else(|e| panic!("trailing-dot host '{host}' must resolve: {e}"));
+            assert_eq!(result.config.proxies[0].backend_port, 8080);
+        }
+    }
+
+    #[test]
+    fn vs_destination_port_name_resolves_custom_cluster_domain() {
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let opts = options().with_cluster_domain("corp.example".to_string());
+        for host in [
+            "reviews.default.svc.corp.example",
+            "reviews.default.svc.corp.example.",
+        ] {
+            let vs = virtual_service_with_destination(
+                "reviews-vs",
+                serde_json::json!({
+                    "host": host,
+                    "port": {"name": "http"}
+                }),
+            );
+            let result = translate_k8s_objects(&[svc.clone(), vs], opts.clone())
+                .unwrap_or_else(|e| panic!("custom domain host '{host}' must resolve: {e}"));
+            assert_eq!(result.config.proxies[0].backend_port, 8080);
+        }
+    }
+
+    #[test]
+    fn vs_destination_port_name_rejects_wrong_cluster_domain() {
+        let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
+        let opts = options().with_cluster_domain("corp.example".to_string());
+        let vs = virtual_service_with_destination(
+            "reviews-vs",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "port": {"name": "http"}
+            }),
+        );
+        let err = translate_k8s_objects(&[svc, vs], opts)
+            .expect_err("cluster.local must be rejected when domain is corp.example");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a recognized in-cluster service form"),
+            "error must explain shape rejection: {msg}"
+        );
+        assert!(
+            msg.contains("corp.example"),
+            "error must show the configured cluster domain: {msg}"
+        );
     }
 }

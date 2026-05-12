@@ -30,6 +30,7 @@ use watcher::{spawn_crd_reprobe_task, start_crd_watchers};
 pub struct K8sControllerConfig {
     pub namespace: String,
     pub trust_domain: String,
+    pub cluster_domain: String,
     pub watch_namespaces: Vec<String>,
     pub watch_istio: bool,
     pub watch_gateway_api: bool,
@@ -92,6 +93,7 @@ pub async fn start_k8s_controller(
     let reconciler_config = ReconcilerConfig {
         namespace: controller_config.namespace,
         trust_domain: controller_config.trust_domain,
+        cluster_domain: controller_config.cluster_domain,
         watch_namespaces: controller_config.watch_namespaces.clone(),
         debounce_ms: controller_config.debounce_ms,
         full_sync_interval_secs: controller_config.full_sync_interval_secs,

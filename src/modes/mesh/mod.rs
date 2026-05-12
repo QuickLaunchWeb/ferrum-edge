@@ -1629,6 +1629,9 @@ fn inject_mesh_global_plugins(
             workload_metrics_config["custom_header_tags"] =
                 serde_json::json!(tracing.custom_header_tags);
         }
+        if let Some(provider) = &tracing.provider {
+            workload_metrics_config["tracing_provider"] = serde_json::json!(provider);
+        }
     }
     if let Some(metrics) = &merged_telemetry.metrics {
         workload_metrics_config["metrics"] = serde_json::json!(metrics);
@@ -1722,6 +1725,7 @@ fn merge_tracing_config(
         sampling_percentage: None,
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
+        provider: None,
     });
 
     if next.sampling_percentage.is_some() {
@@ -1734,6 +1738,9 @@ fn merge_tracing_config(
         current
             .custom_header_tags
             .clone_from(&next.custom_header_tags);
+    }
+    if next.provider.is_some() {
+        current.provider.clone_from(&next.provider);
     }
 }
 
@@ -2691,8 +2698,8 @@ mod tests {
         AccessLogFilter, AppProtocol, EastWestGateway, MeshAccessLoggingConfig, MeshConfig,
         MeshEndpoint, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule, MeshService,
         MeshTelemetryResource, MeshTracingConfig, MultiClusterConfig, PolicyAction, PolicyScope,
-        PrincipalMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, Workload,
-        WorkloadPort, WorkloadSelector,
+        PrincipalMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+        TracingProvider, Workload, WorkloadPort, WorkloadSelector,
     };
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
@@ -3620,6 +3627,7 @@ mod tests {
                             sampling_percentage: Some(100.0),
                             custom_tags: HashMap::new(),
                             custom_header_tags: HashMap::new(),
+                            provider: None,
                         }),
                         ..MeshTelemetryConfig::default()
                     },
@@ -3641,6 +3649,7 @@ mod tests {
                                 "tenant".to_string(),
                                 "x-tenant".to_string(),
                             )]),
+                            provider: None,
                         }),
                         ..MeshTelemetryConfig::default()
                     },
@@ -3708,6 +3717,67 @@ mod tests {
             .expect("access_log plugin injected");
 
         assert_eq!(access_log.config["filter"]["status_code_min"], 500);
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_merges_zipkin_provider_into_workload_metrics() {
+        let runtime = test_mesh_runtime_config();
+        let mesh_slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            version: chrono::Utc::now().to_rfc3339(),
+            telemetry_resources: vec![MeshTelemetryResource {
+                name: "api-tracing".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
+                config: MeshTelemetryConfig {
+                    tracing: Some(MeshTracingConfig {
+                        sampling_percentage: Some(10.0),
+                        custom_tags: HashMap::new(),
+                        custom_header_tags: HashMap::new(),
+                        provider: Some(TracingProvider::Zipkin {
+                            url: "http://zipkin.istio-system:9411/api/v2/spans".to_string(),
+                        }),
+                    }),
+                    ..MeshTelemetryConfig::default()
+                },
+            }],
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+        let workload_metrics = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+            .expect("workload_metrics plugin injected");
+
+        let provider = workload_metrics
+            .config
+            .get("tracing_provider")
+            .expect("tracing_provider merged into workload_metrics");
+        assert_eq!(
+            provider.get("kind").and_then(serde_json::Value::as_str),
+            Some("zipkin")
+        );
+        assert_eq!(
+            provider
+                .pointer("/config/url")
+                .and_then(serde_json::Value::as_str),
+            Some("http://zipkin.istio-system:9411/api/v2/spans")
+        );
+        // Sampling percentage from the same Telemetry block is still applied.
+        assert_eq!(
+            workload_metrics.config["sampling_percentage"],
+            serde_json::json!(10.0)
+        );
     }
 
     async fn wait_for_mesh_authz_label(proxy_state: &ProxyState, key: &str, expected: &str) {
