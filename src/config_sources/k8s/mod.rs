@@ -776,8 +776,8 @@ pub(crate) fn upstream_for_route(
     }
 }
 
-pub(crate) fn service_dns_name(name: &str, namespace: &str) -> String {
-    format!("{name}.{namespace}.svc.cluster.local")
+pub(crate) fn service_dns_name(name: &str, namespace: &str, cluster_domain: &str) -> String {
+    format!("{name}.{namespace}.svc.{cluster_domain}")
 }
 
 pub(crate) fn exact_path_listen_path(path: &str) -> String {
