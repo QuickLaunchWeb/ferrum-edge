@@ -220,8 +220,11 @@ Kubernetes Gateway API and Istio mesh translators fail closed when a resource de
 
 The Istio `AuthorizationPolicy` translator only consumes the four positive-match operation fields Ferrum can enforce: `methods`, `paths`, `hosts`, and `ports`. Any other field on `rules[].to[].operation` — including the negative-match siblings `notMethods`, `notPaths`, `notHosts`, and `notPorts` — is rejected at translation time so policies do not silently weaken authorization. Operators who relied on those fields being silently dropped by older Ferrum builds must drop them from the AuthorizationPolicy (or split the policy) before upgrading; otherwise the entire mesh translation fails closed and the gateway keeps its previous cached config. `RequestMatch.hosts` host patterns submitted directly to mesh config are likewise validated at config-load — bare hostnames, bracketed IPv6 literals, and `host:port` / `host:*` are accepted, while `host:`, `host:abc`, or values with multiple unbracketed colons are rejected.
 
+Service / namespace names embedded in destination hosts are matched case-sensitively against the collected Kubernetes object metadata (matching how the API server stores those names). The trailing cluster-domain suffix is matched case-insensitively per DNS semantics, so `<svc>.<ns>.svc.Cluster.Local` resolves the same as `<svc>.<ns>.svc.cluster.local`, but `Reviews.Default.svc.cluster.local` will not match a Service whose stored name is `reviews` in namespace `default`.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
+| `FERRUM_K8S_CLUSTER_DOMAIN` | No | `cluster.local` | Kubernetes cluster DNS domain used by the source translator for FQDN host matching. VirtualService destinations of the form `<svc>.<ns>.svc.<cluster_domain>` (and bare/short forms) resolve port names against the matching `Service` |
 | `FERRUM_INJECTOR_LISTEN_ADDR` | Injector mode | `0.0.0.0:9443` | Admission webhook bind address for `POST /mutate` |
 | `FERRUM_INJECTOR_SIDECAR_IMAGE` | No | `ferrum-edge:latest` | Image injected into workload pods as the Ferrum mesh sidecar |
 | `FERRUM_INJECTOR_REQUIRE_ANNOTATION` | No | `true` | Require pod label `ferrum.io/mesh=enabled` or annotation `ferrum.io/inject=true` before injecting |

@@ -75,6 +75,8 @@ impl K8sTranslationOptions {
     }
 
     pub fn with_cluster_domain(mut self, domain: String) -> Self {
+        // Empty/whitespace falls back to the existing default (`cluster.local`)
+        // rather than producing a translator that can never match a FQDN host.
         if !domain.trim().is_empty() {
             self.cluster_domain = domain;
         }
