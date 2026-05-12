@@ -76,6 +76,10 @@ pub struct XdsAdsServer {
     snapshot_cache: Arc<XdsSnapshotCache>,
     nonce_tracker: Arc<XdsNonceTracker>,
     active_streams: Arc<XdsStreamRegistry>,
+    /// Mirror of `EnvConfig.mesh_sidecar_enforced`. When `true`, the slice
+    /// builder applies Istio `Sidecar` egress scope narrowing. Default
+    /// `false` preserves existing CP behavior.
+    sidecar_enforced: bool,
 }
 
 #[derive(Default)]
@@ -173,6 +177,26 @@ impl XdsAdsServer {
         namespace: String,
         stream_channel_capacity: usize,
     ) -> Self {
+        Self::with_sidecar_enforcement(
+            config,
+            update_tx,
+            jwt_secret,
+            expected_issuer,
+            namespace,
+            stream_channel_capacity,
+            false,
+        )
+    }
+
+    pub fn with_sidecar_enforcement(
+        config: Arc<ArcSwap<GatewayConfig>>,
+        update_tx: broadcast::Sender<ConfigUpdate>,
+        jwt_secret: String,
+        expected_issuer: String,
+        namespace: String,
+        stream_channel_capacity: usize,
+        sidecar_enforced: bool,
+    ) -> Self {
         Self {
             config,
             update_tx,
@@ -183,6 +207,7 @@ impl XdsAdsServer {
             snapshot_cache: Arc::new(XdsSnapshotCache::new()),
             nonce_tracker: Arc::new(XdsNonceTracker::new()),
             active_streams: Arc::new(XdsStreamRegistry::default()),
+            sidecar_enforced,
         }
     }
 
@@ -209,7 +234,8 @@ impl XdsAdsServer {
     }
 
     fn rebuild_snapshot_from_config(&self, node_id: &str, config: &GatewayConfig) -> XdsSnapshot {
-        let request = MeshSliceRequest::from_xds_node(node_id.to_string(), self.namespace.clone());
+        let request = MeshSliceRequest::from_xds_node(node_id.to_string(), self.namespace.clone())
+            .with_enforce_sidecar_egress(self.sidecar_enforced);
         let slice = MeshSlice::from_gateway_config(config, request);
         translate_mesh_slice_to_snapshot(&slice)
     }

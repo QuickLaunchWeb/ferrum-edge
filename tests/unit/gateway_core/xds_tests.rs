@@ -95,6 +95,7 @@ fn mesh_config() -> MeshConfig {
         telemetry_resources: Vec::new(),
         destination_rules: Vec::new(),
         proxy_configs: Vec::new(),
+        sidecars: Vec::new(),
         trust_bundles: None,
         multi_cluster: None,
     }
@@ -115,6 +116,7 @@ fn mesh_slice_is_per_namespace_and_policy_scoped() {
         namespace: "default".to_string(),
         workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/api".to_string()),
         labels: BTreeMap::new(),
+        enforce_sidecar_egress: false,
     };
     let slice = MeshSlice::from_gateway_config(&gateway_config(), request);
 
@@ -212,6 +214,7 @@ fn service_entry_workload_selector_does_not_hide_visible_entry() {
         namespace: "default".to_string(),
         workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/api".to_string()),
         labels: BTreeMap::new(),
+        enforce_sidecar_egress: false,
     };
 
     let slice = MeshSlice::from_gateway_config(&config, request);

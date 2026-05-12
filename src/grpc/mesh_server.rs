@@ -75,6 +75,10 @@ pub struct MeshGrpcServer {
     mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
     registry: Arc<MeshNodeRegistry>,
     namespace: String,
+    /// Mirror of `EnvConfig.mesh_sidecar_enforced`. Threaded through every
+    /// per-subscriber slice request so DP-facing slices honor the operator's
+    /// rollout decision. Default `false` preserves existing CP behavior.
+    sidecar_enforced: bool,
 }
 
 impl MeshGrpcServer {
@@ -110,6 +114,26 @@ impl MeshGrpcServer {
         expected_issuer: String,
         namespace: String,
     ) -> (Self, broadcast::Sender<MeshConfigBroadcast>) {
+        Self::with_channel_capacity_registry_issuer_namespace_and_sidecar(
+            config,
+            jwt_secret,
+            channel_capacity,
+            registry,
+            expected_issuer,
+            namespace,
+            false,
+        )
+    }
+
+    pub fn with_channel_capacity_registry_issuer_namespace_and_sidecar(
+        config: Arc<ArcSwap<GatewayConfig>>,
+        jwt_secret: String,
+        channel_capacity: usize,
+        registry: Arc<MeshNodeRegistry>,
+        expected_issuer: String,
+        namespace: String,
+        sidecar_enforced: bool,
+    ) -> (Self, broadcast::Sender<MeshConfigBroadcast>) {
         let (tx, _) = broadcast::channel(channel_capacity.max(1));
         let tx_clone = tx.clone();
         (
@@ -120,6 +144,7 @@ impl MeshGrpcServer {
                 mesh_update_tx: tx,
                 registry,
                 namespace,
+                sidecar_enforced,
             },
             tx_clone,
         )
@@ -259,7 +284,8 @@ impl MeshConfigSync for MeshGrpcServer {
             node_namespace.clone(),
             inner.workload_spiffe_id,
             inner.labels,
-        );
+        )
+        .with_enforce_sidecar_egress(self.sidecar_enforced);
         // Register the receiver before loading the initial snapshot so a
         // concurrent CP broadcast is either captured by this stream or already
         // reflected in the loaded snapshot.
@@ -484,5 +510,73 @@ mod tests {
         assert_eq!(heartbeat.version, "v1");
         assert!(heartbeat.mesh_slice_json.is_empty());
         assert_eq!(heartbeat.ferrum_version, crate::FERRUM_VERSION);
+    }
+
+    #[test]
+    fn mesh_subscribe_sidecar_narrowing_survives_wire_serialization() {
+        // Verifies that when `sidecar_enforced=true`, the slice the CP emits
+        // on the wire is already narrowed: only the egress-admitted resources
+        // survive, and the `sidecars` array itself is empty on the DP side
+        // (DPs do not need the originals — the slice they receive is the
+        // authoritative view).
+        use crate::modes::mesh::config::{MeshSidecar, MeshSidecarEgress};
+
+        let mut mesh = MeshConfig {
+            services: vec![
+                MeshService {
+                    name: "reviews".to_string(),
+                    namespace: "alpha".to_string(),
+                    ports: vec![ServicePort {
+                        port: 8080,
+                        protocol: AppProtocol::Http,
+                        name: Some("http".to_string()),
+                    }],
+                    workloads: Vec::new(),
+                    protocol_overrides: std::collections::HashMap::new(),
+                },
+                MeshService {
+                    name: "checkout".to_string(),
+                    namespace: "alpha".to_string(),
+                    ports: vec![ServicePort {
+                        port: 8080,
+                        protocol: AppProtocol::Http,
+                        name: Some("http".to_string()),
+                    }],
+                    workloads: Vec::new(),
+                    protocol_overrides: std::collections::HashMap::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        mesh.sidecars = vec![MeshSidecar {
+            name: "default-sc".to_string(),
+            namespace: "alpha".to_string(),
+            workload_selector: None,
+            egress: vec![MeshSidecarEgress {
+                hosts: vec!["./reviews".to_string()],
+                port: None,
+            }],
+        }];
+        let config = GatewayConfig {
+            mesh: Some(Box::new(mesh)),
+            loaded_at: Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap(),
+            ..GatewayConfig::default()
+        };
+        let slice_request = MeshSliceRequest::from_native(
+            "node-a".to_string(),
+            "alpha".to_string(),
+            String::new(),
+            std::collections::HashMap::new(),
+        )
+        .with_enforce_sidecar_egress(true);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request);
+        // The CP narrowed the slice before serialization — only `reviews`
+        // should survive, and no Sidecar resource is carried on the wire.
+        let update = MeshGrpcServer::build_mesh_config_update_from_slice(slice.clone())
+            .expect("update builds");
+        let parsed: MeshSlice = serde_json::from_str(&update.mesh_slice_json)
+            .expect("mesh slice round-trips through JSON");
+        assert_eq!(parsed.services.len(), 1);
+        assert_eq!(parsed.services[0].name, "reviews");
     }
 }

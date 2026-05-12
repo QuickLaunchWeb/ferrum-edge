@@ -778,6 +778,94 @@ impl TrustBundleSet {
     }
 }
 
+// ── Sidecar (Istio egress scoping) ───────────────────────────────────────
+
+/// Istio `Sidecar` resource. Narrows which services / service-entries /
+/// destination-rules a workload may reach via egress. Mirror of Istio's
+/// `networking.istio.io/v1.Sidecar` for `egress` scoping; ingress listener
+/// configuration is intentionally not modeled.
+///
+/// Resolution order at slice build time (most specific wins):
+/// 1. Workload-scoped (non-empty `workload_selector` whose labels match)
+/// 2. Namespace-default (empty / `None` `workload_selector`)
+///
+/// Behavior is gated by `FERRUM_MESH_SIDECAR_ENFORCED` (default `false`).
+/// When the flag is unset, sidecars are accepted and persisted in
+/// `MeshConfig` but slice narrowing is not applied (existing behavior).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshSidecar {
+    pub name: String,
+    pub namespace: String,
+    /// Empty / `None` = namespace-default; non-empty = workload-scoped via labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_selector: Option<WorkloadSelector>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress: Vec<MeshSidecarEgress>,
+}
+
+/// A single egress listener entry under a [`MeshSidecar`]. Carries the
+/// Istio scope-host syntax (`namespace/host`) plus an optional port narrowing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshSidecarEgress {
+    /// Egress hosts in Istio scope-host syntax:
+    ///   - `*/*`           — allow everything (effectively no narrowing)
+    ///   - `*/host`        — `host` in any namespace
+    ///   - `./host`        — `host` in the Sidecar's own namespace
+    ///   - `namespace/host` — `host` in the specified namespace
+    ///   - `namespace/*`   — anything in the specified namespace
+    pub hosts: Vec<String>,
+    /// Optional Istio Port object; when set, narrows by listener port too.
+    ///
+    /// TODO: this field is parsed from `spec.egress[].port.number` and round-
+    /// trips through the slice, but `sidecar_egress_includes_service` does
+    /// NOT yet consult it — slice narrowing today is host-only. Setting
+    /// `port` on a Sidecar egress entry does not constrain traffic; the
+    /// follow-up is tracked in `docs/mesh.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+/// Parsed Istio scope-host pattern (`<namespace_part>/<host_part>`).
+///
+/// Returned by [`MeshSidecarEgress::parse_host_pattern`]; centralises the
+/// pattern-form for downstream matchers in [`crate::modes::mesh::slice`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidecarHostPattern<'a> {
+    /// `*/*` — allow everything.
+    AllowAll,
+    /// `*/host` — `host` in any namespace.
+    AnyNamespaceHost { host: &'a str },
+    /// `./host` — `host` in the Sidecar's own namespace.
+    SameNamespaceHost { host: &'a str },
+    /// `namespace/*` — anything in the specified namespace.
+    NamespaceWildcard { namespace: &'a str },
+    /// `namespace/host` — exact namespace + host.
+    NamespaceHost { namespace: &'a str, host: &'a str },
+    /// Bare `host` (no `/`): treated as same-namespace, matching the
+    /// Istio convention when the namespace prefix is omitted.
+    SameNamespaceHostBare { host: &'a str },
+}
+
+impl MeshSidecarEgress {
+    /// Parse one `egress.hosts` entry into a [`SidecarHostPattern`].
+    pub fn parse_host_pattern(host: &str) -> SidecarHostPattern<'_> {
+        let trimmed = host.trim();
+        match trimmed.split_once('/') {
+            Some(("*", "*")) => SidecarHostPattern::AllowAll,
+            Some(("*", host)) if !host.is_empty() => SidecarHostPattern::AnyNamespaceHost { host },
+            Some((".", host)) if !host.is_empty() => SidecarHostPattern::SameNamespaceHost { host },
+            Some((namespace, "*")) if !namespace.is_empty() => {
+                SidecarHostPattern::NamespaceWildcard { namespace }
+            }
+            Some((namespace, host)) if !namespace.is_empty() && !host.is_empty() => {
+                SidecarHostPattern::NamespaceHost { namespace, host }
+            }
+            // Fallback: bare host — treat as same-namespace host.
+            _ => SidecarHostPattern::SameNamespaceHostBare { host: trimmed },
+        }
+    }
+}
+
 // ── Multi-cluster ────────────────────────────────────────────────────────
 
 /// Layer-10 multi-cluster mesh settings.
@@ -1061,6 +1149,13 @@ pub struct MeshConfig {
     pub destination_rules: Vec<MeshDestinationRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxy_configs: Vec<MeshProxyConfig>,
+    /// Istio `Sidecar` egress-scoping resources. Used by the slice builder
+    /// to narrow which services / service-entries / destination-rules a
+    /// workload sees. Narrowing is gated by `FERRUM_MESH_SIDECAR_ENFORCED`
+    /// (default `false`) — when disabled the field is parsed and persisted
+    /// but slice narrowing is skipped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidecars: Vec<MeshSidecar>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
