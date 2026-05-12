@@ -239,9 +239,9 @@ fn parse_port_list(raw: Option<&str>) -> Result<Vec<u16>, String> {
     {
         let port = token
             .parse::<u16>()
-            .map_err(|e| format!("mesh outbound port exclusion '{token}': {e}"))?;
+            .map_err(|e| format!("port exclusion '{token}': {e}"))?;
         if port == 0 {
-            return Err("mesh outbound port exclusion '0': port must be 1-65535".to_string());
+            return Err("port exclusion '0': port must be 1-65535".to_string());
         }
         ports.push(port);
     }
@@ -1191,7 +1191,7 @@ mod tests {
             .expect_err("invalid annotation rejected");
 
         assert!(err.contains("traffic.sidecar.istio.io/excludeOutboundPorts"));
-        assert!(!err.contains(": invalid mesh outbound port exclusion"));
+        assert!(!err.contains(": invalid port exclusion"));
     }
 
     #[test]
@@ -1229,7 +1229,7 @@ mod tests {
             .and_then(Value::as_str)
             .expect("denial message");
         assert!(message.contains("traffic.sidecar.istio.io/excludeOutboundPorts"));
-        assert!(!message.contains(": invalid mesh outbound port exclusion"));
+        assert!(!message.contains(": invalid port exclusion"));
     }
 
     #[test]
