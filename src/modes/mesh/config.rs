@@ -849,6 +849,15 @@ pub struct MeshDestinationRule {
     /// Top-level traffic policy applied to all targets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_policy: Option<MeshTrafficPolicy>,
+    /// Per-destination-port traffic policy overrides. Keyed by destination
+    /// port number; values override the corresponding fields of
+    /// `traffic_policy` for traffic landing on that port. Mirrors Istio's
+    /// `trafficPolicy.portLevelSettings[]`.
+    ///
+    /// Default empty → old DPs reading new slices ignore the field; new DPs
+    /// reading old slices see an empty map (same behaviour as today).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub port_level_settings: HashMap<u16, MeshTrafficPolicy>,
     /// Named subsets with per-subset label selectors and optional policy
     /// overrides. Proxies reference these via `upstream_subset`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

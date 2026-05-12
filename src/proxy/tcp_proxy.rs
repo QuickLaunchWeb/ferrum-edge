@@ -1299,13 +1299,25 @@ async fn handle_tcp_connection_inner(
             is_half_open_probe: false,
         };
 
+        // Honor DestinationRule per-port `connect_timeout_ms` overrides on the
+        // L4/TCP path. The override is keyed by destination port and lives on
+        // the proxy's pre-computed `dispatch_port_overrides` map — single
+        // field read, no DashMap/ArcSwap traversal. Pre-port DR
+        // connectTimeouts for TCP services (e.g. MySQL on 3306 with a
+        // tighter budget than the proxy default) now flow into the relay.
+        let effective_backend_connect_timeout_ms = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|m| m.get(&backend_port).copied())
+            .unwrap_or(proxy.backend_connect_timeout_ms);
+
         let params = TcpConnParams {
             backend_host,
             backend_port,
             backend_scheme: proxy.effective_scheme(),
             dns_override: proxy.dns_override.clone(),
             dns_cache_ttl_seconds: proxy.dns_cache_ttl_seconds,
-            backend_connect_timeout_ms: proxy.backend_connect_timeout_ms,
+            backend_connect_timeout_ms: effective_backend_connect_timeout_ms,
             backend_read_timeout_ms: proxy.backend_read_timeout_ms,
             backend_write_timeout_ms: proxy.backend_write_timeout_ms,
             tcp_idle_timeout_seconds: proxy

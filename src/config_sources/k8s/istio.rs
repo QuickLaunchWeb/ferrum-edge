@@ -556,6 +556,14 @@ fn destination_rule(
         .map(|tp| translate_traffic_policy(acc, object, tp))
         .transpose()?;
 
+    let port_level_settings = object
+        .spec
+        .get("trafficPolicy")
+        .and_then(|tp| tp.get("portLevelSettings"))
+        .map(|pls| translate_port_level_settings(acc, object, pls))
+        .transpose()?
+        .unwrap_or_default();
+
     let subsets = object
         .spec
         .get("subsets")
@@ -570,8 +578,87 @@ fn destination_rule(
         namespace: object.metadata.namespace.clone(),
         host,
         traffic_policy,
+        port_level_settings,
         subsets,
     })
+}
+
+/// Parse Istio `trafficPolicy.portLevelSettings` into a per-port
+/// [`MeshTrafficPolicy`] map keyed by port number. Each entry is a regular
+/// traffic-policy block scoped to one port; the cold-path apply pass layers
+/// the resolved policy onto the matching upstream's `port_overrides`.
+///
+/// Today only `connectionPool.tcp.connectTimeout` is actually enforced
+/// per-port — see `Upstream::effective_connect_timeout_ms` and the dispatch
+/// call to `resolve_effective_proxy_for_target`. Per-port `loadBalancer`
+/// and `outlierDetection` fields ARE parsed (so the slice round-trips), but
+/// the gateway keeps a single `LoadBalancer` and `PassiveHealthCheck` per
+/// upstream — switching algorithm/hash-ring or thresholds per destination
+/// port would require per-port balancer instances and is out of scope here.
+/// We emit translator warnings so operators see the gap at apply time.
+fn translate_port_level_settings(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+    value: &Value,
+) -> Result<HashMap<u16, MeshTrafficPolicy>, K8sTranslateError> {
+    let entries = value.as_array().ok_or_else(|| {
+        invalid_resource(object, "trafficPolicy.portLevelSettings must be an array")
+    })?;
+
+    let mut out = HashMap::with_capacity(entries.len());
+    for entry in entries {
+        let port_value = entry
+            .get("port")
+            .and_then(|p| p.get("number"))
+            .ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    "trafficPolicy.portLevelSettings[].port.number is required",
+                )
+            })?;
+        let port_u64 = port_value.as_u64().ok_or_else(|| {
+            invalid_resource(
+                object,
+                "trafficPolicy.portLevelSettings[].port.number must be an integer",
+            )
+        })?;
+        if port_u64 == 0 || port_u64 > u16::MAX as u64 {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "trafficPolicy.portLevelSettings[].port.number must be 1-65535 (got {port_u64})"
+                ),
+            ));
+        }
+        let port = port_u64 as u16;
+
+        // Warn for parsed-but-not-enforced per-port fields so operators see
+        // the gap at apply time instead of silently expecting per-port LB
+        // / outlier behaviour. `connectTimeout` IS enforced and stays
+        // silent.
+        if entry.get("loadBalancer").is_some() {
+            acc.warnings.push(format!(
+                "DestinationRule {}/{}: trafficPolicy.portLevelSettings[].loadBalancer is parsed but not enforced per-port today (gateway keeps a single load balancer per upstream); only connectTimeout is applied at request time",
+                object.metadata.namespace, object.metadata.name
+            ));
+        }
+        if entry.get("outlierDetection").is_some() {
+            acc.warnings.push(format!(
+                "DestinationRule {}/{}: trafficPolicy.portLevelSettings[].outlierDetection is parsed but not enforced per-port today (gateway keeps a single passive health check per upstream); only connectTimeout is applied at request time",
+                object.metadata.namespace, object.metadata.name
+            ));
+        }
+
+        let policy = translate_traffic_policy(acc, object, entry)?;
+
+        if out.insert(port, policy).is_some() {
+            return Err(invalid_resource(
+                object,
+                format!("trafficPolicy.portLevelSettings has duplicate port {port}"),
+            ));
+        }
+    }
+    Ok(out)
 }
 
 fn translate_traffic_policy(
@@ -6632,6 +6719,162 @@ mod tests {
         assert!(
             msg.contains("corp.example"),
             "error must show the configured cluster domain: {msg}"
+        );
+    }
+
+    // ── DestinationRule portLevelSettings ────────────────────────────────
+
+    #[test]
+    fn destination_rule_translates_single_port_level_setting() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "portLevelSettings": [
+                            {
+                                "port": {"number": 8080},
+                                "connectionPool": {"tcp": {"connectTimeout": "750ms"}},
+                                "loadBalancer": {"simple": "LEAST_REQUEST"}
+                            }
+                        ]
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let dr = &mesh.destination_rules[0];
+        assert_eq!(dr.port_level_settings.len(), 1);
+        let policy = dr.port_level_settings.get(&8080).expect("port 8080 entry");
+        assert_eq!(policy.connect_timeout_ms, Some(750));
+        assert!(matches!(
+            policy.load_balancer,
+            Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest))
+        ));
+    }
+
+    #[test]
+    fn destination_rule_translates_two_distinct_port_level_settings() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "portLevelSettings": [
+                            {
+                                "port": {"number": 8080},
+                                "connectionPool": {"tcp": {"connectTimeout": "750ms"}},
+                                "loadBalancer": {"simple": "LEAST_REQUEST"}
+                            },
+                            {
+                                "port": {"number": 9090},
+                                "connectionPool": {"tcp": {"connectTimeout": "2s"}},
+                                "loadBalancer": {"simple": "RANDOM"}
+                            }
+                        ]
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let dr = &mesh.destination_rules[0];
+        assert_eq!(dr.port_level_settings.len(), 2);
+
+        let p8080 = dr.port_level_settings.get(&8080).expect("port 8080 entry");
+        assert_eq!(p8080.connect_timeout_ms, Some(750));
+        assert!(matches!(
+            p8080.load_balancer,
+            Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest))
+        ));
+
+        let p9090 = dr.port_level_settings.get(&9090).expect("port 9090 entry");
+        assert_eq!(p9090.connect_timeout_ms, Some(2000));
+        assert!(matches!(
+            p9090.load_balancer,
+            Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random))
+        ));
+    }
+
+    #[test]
+    fn destination_rule_rejects_port_level_settings_port_out_of_range() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "portLevelSettings": [
+                            {
+                                "port": {"number": 70000},
+                                "connectionPool": {"tcp": {"connectTimeout": "1s"}}
+                            }
+                        ]
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("port out of range must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("portLevelSettings") && msg.contains("1-65535"),
+            "expected port out-of-range error, got {msg}"
+        );
+
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "portLevelSettings": [
+                            {
+                                "port": {"number": 0},
+                                "connectionPool": {"tcp": {"connectTimeout": "1s"}}
+                            }
+                        ]
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("port zero must fail");
+        assert!(
+            err.to_string().contains("1-65535"),
+            "expected port zero error, got {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_port_level_settings_without_port_number() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "portLevelSettings": [
+                            {
+                                "connectionPool": {"tcp": {"connectTimeout": "1s"}}
+                            }
+                        ]
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("port.number missing must fail");
+        assert!(
+            err.to_string().contains("port.number is required"),
+            "expected port.number required error, got {err}"
         );
     }
 }

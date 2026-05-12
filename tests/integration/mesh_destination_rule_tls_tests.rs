@@ -70,6 +70,7 @@ fn build_matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        port_overrides: HashMap::new(),
         api_spec_id: None,
         created_at: now,
         updated_at: now,
