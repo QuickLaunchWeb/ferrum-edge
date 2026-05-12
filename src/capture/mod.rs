@@ -112,8 +112,15 @@ fn parse_port_list(raw: &str) -> Result<Vec<u16>, String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| {
-            s.parse::<u16>()
-                .map_err(|_| format!("Invalid port '{s}' in capture exclude ports"))
+            let port = s
+                .parse::<u16>()
+                .map_err(|_| format!("Invalid port '{s}' in capture exclude ports"))?;
+            if port == 0 {
+                return Err(format!(
+                    "Invalid port '{s}' in capture exclude ports: port must be 1-65535"
+                ));
+            }
+            Ok(port)
         })
         .collect()
 }
@@ -606,6 +613,12 @@ mod tests {
     #[test]
     fn parse_port_list_empty_string_returns_empty() {
         assert!(parse_port_list("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_port_list_rejects_port_zero() {
+        let err = parse_port_list("15001,0,15006").unwrap_err();
+        assert!(err.contains("port must be 1-65535"), "actual: {err}");
     }
 
     #[test]

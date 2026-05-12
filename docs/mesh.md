@@ -691,6 +691,10 @@ The injector supports per-pod capture overrides via annotations. The Istio annot
 
 Port-list annotations merge with each other and with the injector-level `FERRUM_MESH_EXCLUDE_OUTBOUND_PORTS` / `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` defaults; results are deduplicated. CIDR annotations are validated at admission time -- invalid ports or CIDRs are rejected with a webhook error that names the offending annotation, so a typo cannot silently produce a broken iptables plan.
 
+**Pod-restart caveat:** annotations are evaluated at pod admission time only. Existing pods retain their previous capture rules until restart; bouncing affected workloads is required for previously-ignored annotations to take effect.
+
+**IPv6 CIDRs:** `includeOutboundIPRanges` / `excludeOutboundIPRanges` accept IPv6 CIDR literals (e.g. `fd00::/8`) at admission, but the init container only invokes `iptables` -- `ip6tables` fan-out is deferred. IPv6 traffic capture rules from these annotations are no-ops at runtime today.
+
 ### SPIFFE ID Derivation
 
 The injector derives the workload SPIFFE ID from the pod's service account:
