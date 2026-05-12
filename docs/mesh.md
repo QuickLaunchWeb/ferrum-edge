@@ -878,6 +878,42 @@ Per-route `fault` configuration is translated to proxy-scoped `fault_injection` 
 - `fault.abort.httpStatus` + `fault.abort.percentage` -> abort with status code at the configured rate.
 - `fault.delay.fixedDelay` + `fault.delay.percentage` -> inject latency at the configured rate.
 
+### Destination Port Resolution
+
+`route.destination.port` accepts either `number` (integer) or `name` (string). When a name is given, the translator resolves it against the `Service.spec.ports[].name` index built from collected core/v1 `Service` objects in the same translation batch (input order is irrelevant — Services are gathered in a pre-pass). `port.number` always wins when both are set. An unknown port name fails translation closed with the offending name in the error. Hosts are parsed as `<svc>`, `<svc>.<ns>`, `<svc>.<ns>.svc`, or `<svc>.<ns>.svc.cluster.local` (with or without a trailing dot); short hosts fall back to the VirtualService's own namespace, so port-name lookups for the same short host resolve differently depending on which namespace the VS lives in. Service ports without a `name` are silently skipped by the indexer (no panic). Numeric-port-only deployments need no changes.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: reviews
+  namespace: default
+spec:
+  ports:
+    - name: http
+      port: 8080
+    - name: grpc
+      port: 9090
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: reviews-vs
+  namespace: default
+spec:
+  hosts:
+    - reviews.default.svc.cluster.local
+  http:
+    - match:
+        - uri:
+            prefix: /api
+      route:
+        - destination:
+            host: reviews.default.svc.cluster.local
+            port:
+              name: http        # resolves to 8080 via the Service index above
+```
+
 ## Istio Compatibility Gaps
 
 The following Istio mesh surfaces are **not yet supported** and should be treated as deferred:
@@ -892,7 +928,6 @@ The following Istio mesh surfaces are **not yet supported** and should be treate
 | `VirtualService` header/method-only matches | Skipped | Ferrum route proxies do not encode header/method predicates |
 | Inbound port exclusions (`excludeInboundPorts`) | Deferred | |
 | IP-range capture exclusions (`excludeOutboundIPRanges`, `includeOutboundIPRanges`) | Deferred | |
-| `Service.spec.ports[].name` resolution | Deferred | Use numeric ports in backendRefs and VirtualService destinations |
 | `WorkloadEntry` beyond address/labels/network/cluster | Partial | Basic fields supported; full VM lifecycle deferred |
 | `Telemetry` provider-specific config | Partial | Basic tracing/metrics/access-log envelopes supported |
 

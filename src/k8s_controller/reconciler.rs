@@ -25,6 +25,7 @@ const INITIAL_STORE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ReconcilerConfig {
     pub namespace: String,
     pub trust_domain: String,
+    pub cluster_domain: String,
     pub watch_namespaces: Vec<String>,
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
@@ -88,6 +89,7 @@ pub fn spawn_reconcile_loop(
                 mesh_update_tx: &broadcasters.mesh_update_tx,
                 mesh_registry: &broadcasters.mesh_registry,
                 namespace: &reconciler_config.namespace,
+                cluster_domain: &reconciler_config.cluster_domain,
                 watch_namespaces: &reconciler_config.watch_namespaces,
                 trust_domain: &trust_domain,
                 metrics: &metrics,
@@ -116,6 +118,7 @@ pub fn spawn_reconcile_loop(
                             mesh_update_tx: &broadcasters.mesh_update_tx,
                             mesh_registry: &broadcasters.mesh_registry,
                             namespace: &reconciler_config.namespace,
+                            cluster_domain: &reconciler_config.cluster_domain,
                             watch_namespaces: &reconciler_config.watch_namespaces,
                             trust_domain: &trust_domain,
                             metrics: &metrics,
@@ -138,6 +141,7 @@ pub fn spawn_reconcile_loop(
                             mesh_update_tx: &broadcasters.mesh_update_tx,
                             mesh_registry: &broadcasters.mesh_registry,
                             namespace: &reconciler_config.namespace,
+                            cluster_domain: &reconciler_config.cluster_domain,
                             watch_namespaces: &reconciler_config.watch_namespaces,
                             trust_domain: &trust_domain,
                             metrics: &metrics,
@@ -297,6 +301,7 @@ struct ReconcileContext<'a> {
     mesh_update_tx: &'a broadcast::Sender<MeshConfigBroadcast>,
     mesh_registry: &'a Arc<MeshNodeRegistry>,
     namespace: &'a str,
+    cluster_domain: &'a str,
     watch_namespaces: &'a [String],
     trust_domain: &'a TrustDomain,
     metrics: &'a ControllerMetrics,
@@ -320,6 +325,7 @@ async fn do_reconcile(
     debug!(resource_count, "Starting reconciliation");
 
     let options = K8sTranslationOptions::new(ctx.namespace.to_string(), ctx.trust_domain.clone())
+        .with_cluster_domain(ctx.cluster_domain.to_string())
         .with_source_namespaces(ctx.watch_namespaces.to_vec());
     let Some(translation) = translate_with_skip_retries(&objects, options, ctx.metrics) else {
         return;
