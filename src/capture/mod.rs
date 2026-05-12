@@ -6,6 +6,8 @@
 
 use std::net::IpAddr;
 
+use tracing::warn;
+
 use crate::config::conf_file::resolve_ferrum_var;
 
 pub const DEFAULT_PROXY_UID: u32 = 1337;
@@ -39,6 +41,10 @@ pub struct CaptureConfig {
     pub include_cidrs: Vec<String>,
     pub exclude_cidrs: Vec<String>,
     pub exclude_ports: Vec<u16>,
+    /// TCP destination ports excluded from the inbound capture chain. Each
+    /// listed port emits a `RETURN` rule placed BEFORE the inbound REDIRECT,
+    /// so traffic to the port bypasses the mesh sidecar entirely.
+    pub exclude_inbound_ports: Vec<u16>,
 }
 
 impl CaptureConfig {
@@ -51,6 +57,7 @@ impl CaptureConfig {
             include_cidrs: vec!["0.0.0.0/0".to_string()],
             exclude_cidrs: Vec::new(),
             exclude_ports: Vec::new(),
+            exclude_inbound_ports: Vec::new(),
         }
     }
 
@@ -78,6 +85,9 @@ impl CaptureConfig {
             &resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_PORTS")
                 .unwrap_or_else(|| "15001,15006,15008,15020".to_string()),
         )?;
+        let exclude_inbound_ports = parse_port_list(
+            &resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS").unwrap_or_default(),
+        )?;
         Ok(Self {
             mode,
             proxy_uid,
@@ -86,6 +96,7 @@ impl CaptureConfig {
             include_cidrs,
             exclude_cidrs,
             exclude_ports,
+            exclude_inbound_ports,
         })
     }
 }
@@ -103,8 +114,15 @@ fn parse_port_list(raw: &str) -> Result<Vec<u16>, String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| {
-            s.parse::<u16>()
-                .map_err(|_| format!("Invalid port '{s}' in capture exclude ports"))
+            let port = s
+                .parse::<u16>()
+                .map_err(|_| format!("Invalid port '{s}' in capture exclude ports"))?;
+            if port == 0 {
+                return Err(format!(
+                    "Invalid port '{s}' in capture exclude ports: port must be 1-65535"
+                ));
+            }
+            Ok(port)
         })
         .collect()
 }
@@ -130,7 +148,20 @@ impl IptablesPlan {
         commands.push(idempotent_new_chain("nat", "FERRUM_MESH_INBOUND"));
         commands.push(idempotent_new_chain("nat", "FERRUM_MESH_OUTBOUND"));
 
+        // IPv6 CIDRs are skipped because the init container only invokes the
+        // IPv4 `iptables` binary — feeding a literal `-d fd00::/8` would make
+        // the rule append fail at runtime, leaving the capture chain partially
+        // populated (rules already appended stay, later rules never fire). A
+        // future change can fan these out to `ip6tables`. Until then, dropping
+        // them with a warning is safer than emitting a broken plan.
         for cidr in &config.exclude_cidrs {
+            if !is_ipv4_cidr(cidr) {
+                warn!(
+                    cidr = %cidr,
+                    "Skipping non-IPv4 CIDR in outbound exclude list (ip6tables fan-out not yet implemented)"
+                );
+                continue;
+            }
             commands.push(idempotent_append(
                 "nat",
                 "FERRUM_MESH_OUTBOUND",
@@ -152,6 +183,13 @@ impl IptablesPlan {
             ));
         }
         for cidr in &config.include_cidrs {
+            if !is_ipv4_cidr(cidr) {
+                warn!(
+                    cidr = %cidr,
+                    "Skipping non-IPv4 CIDR in outbound include list (ip6tables fan-out not yet implemented)"
+                );
+                continue;
+            }
             commands.push(idempotent_append(
                 "nat",
                 "FERRUM_MESH_OUTBOUND",
@@ -159,6 +197,16 @@ impl IptablesPlan {
                     "-p tcp -d {cidr} -j REDIRECT --to-ports {}",
                     config.outbound_port
                 ),
+            ));
+        }
+        // Inbound port exclusions MUST be appended before the catch-all
+        // REDIRECT below — once REDIRECT fires the chain returns, so any
+        // RETURN rule placed after it would be silently bypassed.
+        for port in &config.exclude_inbound_ports {
+            commands.push(idempotent_append(
+                "nat",
+                "FERRUM_MESH_INBOUND",
+                &format!("-p tcp --dport {port} -j RETURN"),
             ));
         }
         commands.push(idempotent_append(
@@ -284,6 +332,18 @@ pub fn validate_cidr_list(cidrs: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Returns true when `cidr` parses as a syntactically valid IPv4 CIDR. Used to
+/// keep IPv6 CIDRs out of the iptables-IPv4 plan; admission validation has
+/// already rejected malformed shapes, so a `false` here means a well-formed
+/// IPv6 CIDR (or — defensively — anything else `validate_cidr_list` would have
+/// accepted that is not IPv4). The IPv4 init container can only program IPv4
+/// rules, so non-IPv4 CIDRs are skipped at plan-build time with a warning.
+fn is_ipv4_cidr(cidr: &str) -> bool {
+    cidr.split_once('/')
+        .and_then(|(addr, _)| addr.parse::<IpAddr>().ok())
+        .is_some_and(|ip| ip.is_ipv4())
 }
 
 fn idempotent_new_chain(table: &str, chain: &str) -> String {
@@ -590,6 +650,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_port_list_rejects_port_zero() {
+        let err = parse_port_list("15001,0,15006").unwrap_err();
+        assert!(err.contains("port must be 1-65535"), "actual: {err}");
+    }
+
+    #[test]
     fn parse_proxy_uid_rejects_invalid_env_value() {
         assert!(parse_proxy_uid("not-a-uid").is_err());
     }
@@ -602,5 +668,212 @@ mod tests {
     #[test]
     fn parse_proxy_uid_empty_uses_default() {
         assert_eq!(parse_proxy_uid("").unwrap(), DEFAULT_PROXY_UID);
+    }
+
+    #[test]
+    fn iptables_plan_emits_inbound_exclude_return_rules_before_redirect() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.exclude_inbound_ports = vec![15090, 22];
+
+        let plan = IptablesPlan::for_config(&config);
+
+        for port in [15090, 22] {
+            assert!(
+                plan.commands
+                    .iter()
+                    .any(|cmd| cmd.contains("FERRUM_MESH_INBOUND")
+                        && cmd.contains(&format!("--dport {port} -j RETURN"))),
+                "inbound RETURN rule missing for port {port}"
+            );
+        }
+
+        // CRITICAL: every RETURN rule must precede the inbound REDIRECT,
+        // otherwise the catch-all REDIRECT fires first and the exclusion is
+        // silently bypassed.
+        let redirect_pos = plan
+            .commands
+            .iter()
+            .position(|cmd| {
+                cmd.contains("FERRUM_MESH_INBOUND")
+                    && cmd.contains(&format!("REDIRECT --to-ports {}", config.inbound_port))
+            })
+            .expect("inbound REDIRECT command");
+        for port in [15090, 22] {
+            let return_pos = plan
+                .commands
+                .iter()
+                .position(|cmd| {
+                    cmd.contains("FERRUM_MESH_INBOUND")
+                        && cmd.contains(&format!("--dport {port} -j RETURN"))
+                })
+                .expect("inbound RETURN command");
+            assert!(
+                return_pos < redirect_pos,
+                "inbound RETURN for port {port} must precede the REDIRECT"
+            );
+        }
+    }
+
+    #[test]
+    fn iptables_plan_omits_inbound_returns_when_empty() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+
+        let plan = IptablesPlan::for_config(&config);
+
+        assert!(
+            !plan
+                .commands
+                .iter()
+                .any(|cmd| cmd.contains("FERRUM_MESH_INBOUND") && cmd.contains("-j RETURN")),
+            "no inbound RETURN rules expected when exclude_inbound_ports is empty"
+        );
+    }
+
+    // The init container only invokes the IPv4 `iptables` binary. Passing an
+    // IPv6 CIDR like `fd00::/8` as a raw `-d` argument makes the append fail
+    // at runtime, which silently leaves the capture chain partially populated
+    // (later rules in the same script never get applied if `set -e` is ever
+    // added; today the operator only sees a stderr error and a half-built
+    // chain). Drop non-IPv4 CIDRs from the plan and let the warn log surface
+    // them — admission still accepts the annotation for forward compatibility
+    // with the future ip6tables fan-out.
+    #[test]
+    fn iptables_plan_skips_ipv6_exclude_cidr() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.exclude_cidrs = vec!["10.0.0.0/8".to_string(), "fd00::/8".to_string()];
+
+        let plan = IptablesPlan::for_config(&config);
+
+        assert!(
+            plan.commands
+                .iter()
+                .any(|cmd| cmd.contains("-d 10.0.0.0/8 -j RETURN")),
+            "IPv4 exclude CIDR must still appear in the plan"
+        );
+        assert!(
+            !plan.commands.iter().any(|cmd| cmd.contains("fd00::/8")),
+            "IPv6 exclude CIDR must NOT appear in the plan (would fail at iptables -A): {:?}",
+            plan.commands
+        );
+    }
+
+    #[test]
+    fn iptables_plan_skips_ipv6_include_cidr() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.include_cidrs = vec!["10.0.0.0/8".to_string(), "2001:db8::/32".to_string()];
+
+        let plan = IptablesPlan::for_config(&config);
+
+        assert!(
+            plan.commands
+                .iter()
+                .any(|cmd| cmd.contains("-d 10.0.0.0/8 -j REDIRECT --to-ports 15001")),
+            "IPv4 include CIDR must still appear in the plan"
+        );
+        assert!(
+            !plan
+                .commands
+                .iter()
+                .any(|cmd| cmd.contains("2001:db8::/32")),
+            "IPv6 include CIDR must NOT appear in the plan (would fail at iptables -A): {:?}",
+            plan.commands
+        );
+    }
+
+    // Regression: an include list containing ONLY IPv6 CIDRs must not produce
+    // any outbound REDIRECT rule. Earlier behavior would have emitted a single
+    // broken `iptables -A ... -d {ipv6}/N -j REDIRECT` that left the OUTBOUND
+    // chain redirect-less while the rest of the script (PREROUTING, INBOUND)
+    // still applied — silently breaking outbound capture.
+    #[test]
+    fn iptables_plan_omits_outbound_redirect_when_only_ipv6_include() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.include_cidrs = vec!["fd00::/8".to_string()];
+
+        let plan = IptablesPlan::for_config(&config);
+
+        assert!(
+            !plan.commands.iter().any(|cmd| {
+                cmd.contains("FERRUM_MESH_OUTBOUND") && cmd.contains("REDIRECT --to-ports 15001")
+            }),
+            "no outbound REDIRECT should be emitted when the only include CIDR is IPv6"
+        );
+    }
+
+    #[test]
+    fn is_ipv4_cidr_classifies_families() {
+        assert!(is_ipv4_cidr("10.0.0.0/8"));
+        assert!(is_ipv4_cidr("0.0.0.0/0"));
+        assert!(is_ipv4_cidr("127.0.0.0/8"));
+        assert!(!is_ipv4_cidr("fd00::/8"));
+        assert!(!is_ipv4_cidr("2001:db8::/32"));
+        assert!(!is_ipv4_cidr("::/0"));
+        // Malformed shapes are not IPv4; admission validator catches these earlier.
+        assert!(!is_ipv4_cidr("not-a-cidr"));
+        assert!(!is_ipv4_cidr("10.0.0.0"));
+    }
+
+    // Serialize env-driven tests in this module so parallel cargo test runs do
+    // not race on the same `FERRUM_MESH_CAPTURE_*` vars consumed by `from_env`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_capture_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let keys = [
+            "FERRUM_MESH_CAPTURE_MODE",
+            "FERRUM_MESH_PROXY_UID",
+            "FERRUM_MESH_CAPTURE_INCLUDE_CIDRS",
+            "FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS",
+            "FERRUM_MESH_CAPTURE_EXCLUDE_PORTS",
+            "FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS",
+        ];
+        for key in keys {
+            // SAFETY: test-only env mutation, serialized by ENV_LOCK above.
+            unsafe { std::env::remove_var(key) };
+        }
+        for (key, value) in vars {
+            // SAFETY: test-only env mutation, serialized by ENV_LOCK above.
+            unsafe { std::env::set_var(key, value) };
+        }
+        f();
+        for key in keys {
+            // SAFETY: test-only env mutation, serialized by ENV_LOCK above.
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    #[test]
+    fn from_env_parses_exclude_inbound_ports() {
+        with_capture_env(
+            &[("FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS", "15090, 22")],
+            || {
+                let config = CaptureConfig::from_env().expect("config");
+                assert_eq!(config.exclude_inbound_ports, vec![15090, 22]);
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_defaults_exclude_inbound_ports_to_empty() {
+        with_capture_env(&[], || {
+            let config = CaptureConfig::from_env().expect("config");
+            assert!(config.exclude_inbound_ports.is_empty());
+        });
+    }
+
+    #[test]
+    fn from_env_rejects_invalid_exclude_inbound_ports() {
+        with_capture_env(
+            &[("FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS", "not-a-port")],
+            || {
+                let result = CaptureConfig::from_env();
+                assert!(result.is_err());
+            },
+        );
     }
 }

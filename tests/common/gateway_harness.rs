@@ -33,7 +33,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 
 /// Database backend used by a [`TestGateway`] in `database`/`cp` mode.
@@ -162,6 +162,20 @@ impl TestGateway {
         timeout: Duration,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         wait_for_admin_auth_inner(self.admin_port, &self.auth_header(), timeout).await
+    }
+
+    /// Poll the proxy port with a raw TCP connect until it accepts or the
+    /// deadline expires. Tests that bypass `reqwest` (raw HTTP, hyper H2 prior
+    /// knowledge, TCP/UDP listeners) should call this after `spawn` because
+    /// `wait_for_health` only verifies the admin port — the proxy listener is
+    /// bound on a separate spawned task and there is a brief window where
+    /// `/health` returns 200 but the proxy port hasn't propagated through the
+    /// kernel's accept queue yet on a loaded CI runner.
+    pub async fn wait_for_proxy_port(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        wait_for_tcp_port_inner("proxy", self.proxy_port, timeout).await
     }
 
     /// Explicit shutdown. Safe to call multiple times; subsequent calls are
@@ -948,6 +962,36 @@ async fn wait_for_admin_auth_inner(
             Err(err) => {
                 last_observation = err.to_string();
                 tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+}
+
+async fn wait_for_tcp_port_inner(
+    label: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let deadline = Instant::now() + timeout;
+    let mut last_err: Option<std::io::Error> = None;
+    loop {
+        if Instant::now() >= deadline {
+            let observation = last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "no response yet".to_string());
+            return Err(format!(
+                "gateway {label} port {port} did not accept TCP connections within {timeout:?} (last observation: {observation})"
+            )
+            .into());
+        }
+        match TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(stream) => {
+                drop(stream);
+                return Ok(());
+            }
+            Err(err) => {
+                last_err = Some(err);
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
     }
