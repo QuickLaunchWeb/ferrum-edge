@@ -1000,31 +1000,22 @@ fn apply_destination_rules(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
 
 /// Project a `MeshTrafficPolicy` onto a per-port `UpstreamPortOverride` slot.
 ///
-/// Only the strict subset of fields that the top-level DR policy already
-/// installs on the upstream is mirrored here (LB algorithm + hash key +
-/// connect timeout). Outlier detection is intentionally not split per-port —
-/// it produces a single `PassiveHealthCheck` on the upstream.
+/// Only `connect_timeout_ms` is wired into the dispatch hot path today
+/// (`Upstream::effective_connect_timeout_ms`). Per-port LB algorithm and
+/// hash-key are intentionally NOT applied — the gateway keeps a single
+/// `LoadBalancer` per upstream and switching algorithm/ring per destination
+/// port would require per-port balancer instances (different counters /
+/// hash rings). The translator emits a warning when operators set these on
+/// `portLevelSettings[].loadBalancer` so they know the gap.
+///
+/// Per-port `outlierDetection` is also not split out — it produces a single
+/// `PassiveHealthCheck` on the upstream via the top-level policy.
 fn apply_traffic_policy_to_port_override(
     slot: &mut UpstreamPortOverride,
     policy: &MeshTrafficPolicy,
 ) {
     if let Some(timeout_ms) = policy.connect_timeout_ms {
         slot.connect_timeout_ms = Some(timeout_ms);
-    }
-
-    if let Some(lb) = &policy.load_balancer {
-        if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
-            slot.algorithm = Some(algorithm);
-        }
-        if let MeshLoadBalancer::ConsistentHash(ch) = lb {
-            if let Some(header) = &ch.http_header_name {
-                slot.hash_on = Some(format!("header:{header}"));
-            } else if let Some(cookie) = &ch.http_cookie_name {
-                slot.hash_on = Some(format!("cookie:{cookie}"));
-            } else if ch.use_source_ip {
-                slot.hash_on = Some("ip".to_string());
-            }
-        }
     }
 }
 
@@ -3301,16 +3292,23 @@ mod tests {
         );
         assert_eq!(config.proxies[0].backend_connect_timeout_ms, 1111);
 
-        // Per-port 8080 override lands on port_overrides[8080] without
-        // disturbing the upstream-level fields.
+        // Per-port 8080 connect-timeout override lands on port_overrides[8080]
+        // without disturbing the upstream-level fields or the proxy-default
+        // connect timeout. The LB algorithm in `portLevelSettings[].loadBalancer`
+        // is intentionally NOT mirrored here today — see
+        // `apply_traffic_policy_to_port_override` rationale.
         let port_8080 = config.upstreams[0]
             .port_overrides
             .get(&8080)
             .expect("port 8080 override");
         assert_eq!(port_8080.connect_timeout_ms, Some(2222));
-        assert_eq!(port_8080.algorithm, Some(LoadBalancerAlgorithm::Random));
-        // Hash key not set in this policy; should remain None.
-        assert_eq!(port_8080.hash_on, None);
+
+        // Proof that the override is actually consulted at dispatch time via
+        // the helper the hot path uses — port 8080 wins, other ports fall
+        // back to the proxy default.
+        let upstream = &config.upstreams[0];
+        assert_eq!(upstream.effective_connect_timeout_ms(8080, 1111), 2222);
+        assert_eq!(upstream.effective_connect_timeout_ms(9090, 1111), 1111);
     }
 
     #[test]
@@ -3365,21 +3363,20 @@ mod tests {
             .get(&8080)
             .expect("port 8080 override");
         assert_eq!(p8080.connect_timeout_ms, Some(750));
-        assert_eq!(
-            p8080.algorithm,
-            Some(LoadBalancerAlgorithm::LeastConnections)
-        );
 
         let p9090 = config.upstreams[0]
             .port_overrides
             .get(&9090)
             .expect("port 9090 override");
         assert_eq!(p9090.connect_timeout_ms, Some(3000));
-        assert_eq!(
-            p9090.algorithm,
-            Some(LoadBalancerAlgorithm::ConsistentHashing)
-        );
-        assert_eq!(p9090.hash_on.as_deref(), Some("header:x-user"));
+
+        // Effective-timeout helper is what the dispatch hot path consults.
+        // Each port's own override wins; an unrelated port falls back to the
+        // proxy default (here passed in as 5000ms).
+        let upstream = &config.upstreams[0];
+        assert_eq!(upstream.effective_connect_timeout_ms(8080, 5000), 750);
+        assert_eq!(upstream.effective_connect_timeout_ms(9090, 5000), 3000);
+        assert_eq!(upstream.effective_connect_timeout_ms(7777, 5000), 5000);
     }
 
     #[test]

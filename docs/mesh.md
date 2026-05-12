@@ -223,7 +223,8 @@ subsets:
 | `trafficPolicy.connectionPool.http.*` | Ignored | Per-protocol connection pool not surfaced |
 | `trafficPolicy.connectionPool.tcp.maxConnections` / `tcpKeepalive` | Ignored | Pool sizing handled globally via `FERRUM_POOL_*` |
 | `trafficPolicy.tls` | Ignored | mTLS posture comes from `PeerAuthentication` |
-| `trafficPolicy.portLevelSettings[].port.number` + nested `connectionPool` / `outlierDetection` / `loadBalancer` | Supported | Top-level policy applies first; per-port entries override matching fields on `Upstream.port_overrides[port]` (LB algorithm, hash key, connect timeout). Ports outside 1-65535 rejected; duplicate port entries rejected |
+| `trafficPolicy.portLevelSettings[].port.number` + nested `connectionPool.tcp.connectTimeout` | Supported | Top-level policy applies first; per-port `connectTimeout` overrides on `Upstream.port_overrides[port]` and is consulted on the dispatch hot path via `Upstream::effective_connect_timeout_ms`. Ports outside 1-65535 rejected; duplicate port entries rejected |
+| `trafficPolicy.portLevelSettings[].loadBalancer` / `outlierDetection` | Parsed but not enforced (warns) | Gateway keeps a single `LoadBalancer` and `PassiveHealthCheck` per upstream — switching algorithm / hash ring / outlier thresholds per destination port is not yet wired up. The translator emits a warning so operators see the gap |
 | `exportTo` | Ignored | DRs are scoped to their declared namespace at slice-filter time |
 
 Translator warnings surface in the `K8sTranslation.warnings` returned from `translate_k8s_objects`, so operators see them at apply time.

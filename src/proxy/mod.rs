@@ -9215,6 +9215,51 @@ pub fn build_backend_url_with_target(
     url
 }
 
+/// Resolve the effective `Proxy` for one backend dispatch, honoring an
+/// upstream's per-destination-port `connect_timeout_ms` override (Istio
+/// `DestinationRule.trafficPolicy.portLevelSettings[].connectionPool.tcp.connectTimeout`).
+///
+/// Hot-path discipline: returns a `Cow::Borrowed` (zero-alloc) when no
+/// upstream is configured, when the upstream has no `port_overrides`, or
+/// when the override resolves to the same value as the proxy default. The
+/// owned-clone branch only fires for the rare case where (a) the request
+/// targets an upstream with at least one port override AND (b) the resolved
+/// destination port matches a configured override key AND (c) the override's
+/// `connect_timeout_ms` differs from `proxy.backend_connect_timeout_ms`.
+///
+/// `upstream_target` is the LB-selected target whose port we'll connect to;
+/// when `None` the call is a direct-backend proxy with no upstream, so no
+/// per-port lookup is possible.
+fn resolve_effective_proxy_for_target<'a>(
+    state: &ProxyState,
+    proxy: &'a Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> std::borrow::Cow<'a, Proxy> {
+    let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target) else {
+        return std::borrow::Cow::Borrowed(proxy);
+    };
+
+    let snapshot = state.request_epoch.load();
+    let Some(upstream) = LoadBalancerCache::get_upstream_from(&snapshot.load_balancer, upstream_id)
+    else {
+        return std::borrow::Cow::Borrowed(proxy);
+    };
+
+    if upstream.port_overrides.is_empty() {
+        return std::borrow::Cow::Borrowed(proxy);
+    }
+
+    let effective =
+        upstream.effective_connect_timeout_ms(target.port, proxy.backend_connect_timeout_ms);
+    if effective == proxy.backend_connect_timeout_ms {
+        return std::borrow::Cow::Borrowed(proxy);
+    }
+
+    let mut owned = proxy.clone();
+    owned.backend_connect_timeout_ms = effective;
+    std::borrow::Cow::Owned(owned)
+}
+
 /// Retry a backend request, replaying the original request body if available.
 /// The body bytes were collected and retained on the first attempt so they
 /// can be replayed on connection-failure retries without data loss.
@@ -9232,6 +9277,13 @@ pub(crate) async fn proxy_to_backend_retry(
     is_tls: bool,
     inbound_version: hyper::Version,
 ) -> retry::BackendResponse {
+    // Honor DestinationRule per-port `connect_timeout_ms` overrides for this
+    // specific destination port. Borrowed when no override applies (zero-alloc
+    // hot path); cloned only when an override actually differs from
+    // `proxy.backend_connect_timeout_ms`.
+    let effective_proxy = resolve_effective_proxy_for_target(state, proxy, upstream_target);
+    let proxy: &Proxy = effective_proxy.as_ref();
+
     // All reqwest clients use our DnsCacheResolver, so DNS resolution is
     // always served from the warmed cache — never hitting DNS on the hot path.
     // For both single-backend and load-balanced proxies, the client transparently
@@ -9577,6 +9629,15 @@ async fn proxy_to_backend(
     ctx_request_bytes_observed: &Arc<std::sync::atomic::AtomicU64>,
     inbound_version: hyper::Version,
 ) -> (retry::BackendResponse, Option<Bytes>) {
+    // Honor DestinationRule per-port `connect_timeout_ms` overrides for this
+    // dispatch. Borrowed when no override applies (zero-alloc hot path);
+    // cloned only when a port override differs from the proxy default.
+    // Threading through `&Proxy` for the rest of this function means every
+    // downstream call (reqwest, H2 pool, H3 pool, gRPC pool, HBONE) inherits
+    // the effective timeout automatically.
+    let effective_proxy = resolve_effective_proxy_for_target(state, proxy, upstream_target);
+    let proxy: &Proxy = effective_proxy.as_ref();
+
     // When retain_request_body is true (retries configured), the collected
     // body bytes are retained alongside the response so the caller can replay
     // them on connection-failure retries. `Bytes` is shared via Arc so the
@@ -12406,6 +12467,11 @@ async fn proxy_to_backend_http3_retry(
     client_ip: &str,
     is_tls: bool,
 ) -> retry::BackendResponse {
+    // Honor DestinationRule per-port `connect_timeout_ms` overrides — see
+    // `resolve_effective_proxy_for_target` for the Cow-Borrowed fast path.
+    let effective_proxy = resolve_effective_proxy_for_target(state, proxy, upstream_target);
+    let proxy: &Proxy = effective_proxy.as_ref();
+
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);

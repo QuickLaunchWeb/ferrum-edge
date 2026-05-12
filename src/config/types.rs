@@ -200,22 +200,20 @@ pub struct SubsetTrafficPolicy {
 ///
 /// Populated from an Istio DestinationRule's `trafficPolicy.portLevelSettings[]`
 /// (see [`crate::modes::mesh::config::MeshDestinationRule::port_level_settings`]).
-/// Fields are a strict subset of the upstream-level policy: only fields the
-/// existing top-level DR policy already sets on `Upstream` are surfaced here.
-/// Connect timeout is included for forward-compat with pool-level per-port
-/// lookups even though it is currently only consumed at the proxy level.
+/// Currently only `connect_timeout_ms` is enforced at request time — it is
+/// resolved by [`Upstream::effective_connect_timeout_ms`] which the dispatch
+/// path consults via the helper in `crate::proxy::port_override`. Per-port LB
+/// algorithm / hash-key overrides are not yet enforced (one `LoadBalancer`
+/// per upstream today, not per upstream+port) and are intentionally absent
+/// from this struct — the translator emits a warning when Istio operators
+/// configure them so they know the gap.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct UpstreamPortOverride {
-    /// Per-port backend connect timeout override (milliseconds).
+    /// Per-port backend connect timeout override (milliseconds). Consulted on
+    /// the dispatch hot path when the resolved destination port matches a key
+    /// in `Upstream.port_overrides`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_timeout_ms: Option<u64>,
-    /// Override the upstream's load balancer algorithm for this port.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub algorithm: Option<LoadBalancerAlgorithm>,
-    /// Override the upstream's `hash_on` selector for this port. Same format
-    /// as `Upstream.hash_on`: `"ip"`, `"header:<name>"`, or `"cookie:<name>"`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hash_on: Option<String>,
 }
 
 /// A named subset of upstream targets identified by label selectors.
@@ -3286,6 +3284,21 @@ impl Upstream {
         for target in &mut self.targets {
             target.host = target.host.to_ascii_lowercase();
         }
+    }
+
+    /// Resolve the effective backend connect timeout for a request destined to
+    /// `port`. Per-port `port_overrides[port].connect_timeout_ms` wins over
+    /// `proxy_default_ms` (the Proxy's own `backend_connect_timeout_ms`).
+    ///
+    /// Used by the dispatch hot path so DestinationRule per-port settings
+    /// translated by the Istio config source actually take effect at request
+    /// time. `0` from either source means "disabled".
+    #[inline]
+    pub fn effective_connect_timeout_ms(&self, port: u16, proxy_default_ms: u64) -> u64 {
+        self.port_overrides
+            .get(&port)
+            .and_then(|ovr| ovr.connect_timeout_ms)
+            .unwrap_or(proxy_default_ms)
     }
 
     /// Validate all fields of an upstream for correctness and safe lengths.
