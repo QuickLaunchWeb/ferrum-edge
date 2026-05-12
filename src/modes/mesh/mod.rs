@@ -489,6 +489,7 @@ fn gateway_config_from_mesh_slice(
             request_authentications: slice.request_authentications.clone(),
             telemetry_resources: slice.telemetry_resources.clone(),
             destination_rules: slice.destination_rules.clone(),
+            proxy_configs: slice.proxy_configs.clone(),
             trust_bundles: slice.trust_bundles.clone(),
             multi_cluster: slice.multi_cluster.clone(),
         })),
@@ -1609,6 +1610,13 @@ fn inject_mesh_global_plugins(
         "labels": mesh_slice.labels.clone(),
         "trust_domain_aliases": trust_domain_aliases,
     });
+    // Apply ProxyConfig sampling as a baseline. The more granular Telemetry
+    // resource below may override on the `sampling_percentage` key.
+    if let Some(proxy_cfg) = mesh_slice.resolved_proxy_config()
+        && let Some(sampling) = proxy_cfg.tracing_sampling
+    {
+        workload_metrics_config["sampling_percentage"] = serde_json::json!(sampling);
+    }
     // Apply tracing config from Telemetry CRD
     if let Some(tracing) = &merged_telemetry.tracing {
         if let Some(sampling_percentage) = tracing.sampling_percentage {
@@ -3639,6 +3647,7 @@ mod tests {
                 },
             ],
             destination_rules: Vec::new(),
+            proxy_configs: Vec::new(),
             trust_bundles: None,
             multi_cluster: None,
         };

@@ -330,10 +330,7 @@ pub fn workload_selector_matches<L: WorkloadLabels + ?Sized>(
     {
         return false;
     }
-    selector
-        .labels
-        .iter()
-        .all(|(key, value)| proxy_labels.lookup(key) == Some(value.as_str()))
+    labels_match_subset(&selector.labels, proxy_labels)
 }
 
 // ── RequestAuthentication ─────────────────────────────────────────────────
@@ -470,6 +467,78 @@ pub struct AccessLogFilter {
     /// Only log requests that resulted in an error.
     #[serde(default)]
     pub errors_only: bool,
+}
+
+// ── ProxyConfig ───────────────────────────────────────────────────────────
+
+/// Represents an Istio `ProxyConfig` (`networking.istio.io/v1beta1`) resource
+/// translated into Ferrum's model.
+///
+/// ProxyConfig carries config-time, read-only settings for a workload's
+/// data plane: `concurrency`, `image`, `environmentVariables`, and tracing
+/// `sampling`. It has **no data-plane request-path impact** — values are
+/// applied at slice-apply time (cold path) and surfaced to operator
+/// tooling. Tracing `sampling` flows into the injected `workload_metrics`
+/// plugin's `sampling_percentage` field.
+///
+/// Scope resolution mirrors the canonical [`PolicyScope`] used by
+/// `PeerAuthentication`, `RequestAuthentication`, and `Telemetry`: a
+/// resource in the Istio root namespace with no selector is `MeshWide`; a
+/// resource in any other namespace with no selector is `Namespace`-scoped;
+/// any resource with a selector is `WorkloadSelector`-scoped (with the
+/// `namespace` set when not in the root namespace, mirroring the Istio
+/// "root-namespace selectors apply mesh-wide" rule used by Telemetry / RA).
+/// Most-specific match wins per workload (WorkloadSelector > Namespace >
+/// MeshWide); same-specificity ties are broken by ASCII-ordered name.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MeshProxyConfig {
+    pub name: String,
+    pub namespace: String,
+    /// Resolved [`PolicyScope`] capturing Istio's root-namespace +
+    /// selector semantics. See struct docs for the full table.
+    #[serde(default)]
+    pub scope: PolicyScope,
+    /// `spec.concurrency` — informational; surfaced to operator tooling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u32>,
+    /// `spec.image.imageType` — informational; surfaced to operator tooling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// `spec.environmentVariables` — informational; surfaced to operator tooling.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub environment: HashMap<String, String>,
+    /// `spec.tracing.sampling` — percentage 0-100; merged into
+    /// `workload_metrics.sampling_percentage` at slice-apply time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracing_sampling: Option<f64>,
+}
+
+/// Returns `true` when a [`MeshProxyConfig`] applies to a workload whose
+/// namespace is `proxy_namespace` and whose labels are `proxy_labels`.
+///
+/// Delegates to the canonical [`scope_applies_to_workload`] helper so
+/// ProxyConfig honors the same root-namespace + selector semantics as
+/// every other Istio mesh resource (PeerAuthentication, Telemetry,
+/// RequestAuthentication, AuthorizationPolicy).
+pub fn proxy_config_applies_to_workload<L: WorkloadLabels + ?Sized>(
+    config: &MeshProxyConfig,
+    proxy_namespace: &str,
+    proxy_labels: &L,
+) -> bool {
+    scope_applies_to_workload(&config.scope, proxy_namespace, proxy_labels)
+}
+
+/// Returns `true` when every `(key, value)` in `selector_labels` is present
+/// in `proxy_labels` with the same value. Empty `selector_labels` always
+/// matches (subset semantics). Shared by [`workload_selector_matches`].
+#[inline]
+fn labels_match_subset<L: WorkloadLabels + ?Sized>(
+    selector_labels: &HashMap<String, String>,
+    proxy_labels: &L,
+) -> bool {
+    selector_labels
+        .iter()
+        .all(|(key, value)| proxy_labels.lookup(key) == Some(value.as_str()))
 }
 
 /// Returns true when a ServiceEntry is visible to a workload namespace under
@@ -940,6 +1009,8 @@ pub struct MeshConfig {
     pub telemetry_resources: Vec<MeshTelemetryResource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub destination_rules: Vec<MeshDestinationRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_configs: Vec<MeshProxyConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
