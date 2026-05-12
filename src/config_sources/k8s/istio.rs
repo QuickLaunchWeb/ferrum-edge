@@ -6,10 +6,11 @@ use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
     AccessLogFilter, AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig,
     MeshConsistentHash, MeshDestinationRule, MeshEndpoint, MeshJwtRule, MeshLoadBalancer,
-    MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshRequestAuthentication, MeshRule,
-    MeshSimpleLb, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
-    MeshTrafficPolicy, MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope,
-    PrincipalMatch, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+    MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshProxyConfig,
+    MeshRequestAuthentication, MeshRule, MeshSimpleLb, MeshSubset, MeshTelemetryConfig,
+    MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy, MeshTrafficPolicyTls,
+    MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch,
+    RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
     TagOverrideOperation, Workload, WorkloadPort, WorkloadSelector,
 };
 
@@ -76,6 +77,12 @@ pub(super) fn translate(
         }
         "Telemetry" => {
             acc.mesh.telemetry_resources.push(telemetry(acc, object)?);
+            Ok(true)
+        }
+        "ProxyConfig" => {
+            acc.mesh
+                .proxy_configs
+                .push(proxy_config(&acc.options, object)?);
             Ok(true)
         }
         _ => Ok(false),
@@ -588,10 +595,103 @@ fn translate_traffic_policy(
         .map(|lb| translate_load_balancer(acc, object, lb))
         .transpose()?;
 
+    let tls = value
+        .get("tls")
+        .map(|tls| translate_client_tls_settings(object, tls))
+        .transpose()?;
+
     Ok(MeshTrafficPolicy {
         connect_timeout_ms,
         outlier_detection,
         load_balancer,
+        tls,
+    })
+}
+
+/// Translate Istio `DestinationRule.trafficPolicy.tls` (a.k.a.
+/// `ClientTLSSettings`) into a `MeshTrafficPolicyTls`.
+///
+/// `mode` maps:
+/// - `DISABLE` -> `MtlsMode::Disable`
+/// - `SIMPLE` -> `MtlsMode::Simple`
+/// - `MUTUAL` -> `MtlsMode::Mutual`
+/// - `ISTIO_MUTUAL` -> `MtlsMode::IstioMutual`
+///
+/// Validation:
+/// - `ISTIO_MUTUAL` rejects explicit `clientCertificate`/`privateKey`/
+///   `caCertificates` — Istio reuses the workload's SPIFFE identity material.
+/// - `MUTUAL` requires both `clientCertificate` AND `privateKey` (matches
+///   Istio's `pilot-validation`).
+fn translate_client_tls_settings(
+    object: &K8sObject,
+    value: &Value,
+) -> Result<MeshTrafficPolicyTls, K8sTranslateError> {
+    let mode_raw = string_field(value, "mode").unwrap_or("SIMPLE");
+    let mode = match mode_raw {
+        "DISABLE" => MtlsMode::Disable,
+        "SIMPLE" => MtlsMode::Simple,
+        "MUTUAL" => MtlsMode::Mutual,
+        "ISTIO_MUTUAL" => MtlsMode::IstioMutual,
+        other => {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "trafficPolicy.tls.mode '{other}' is unsupported (expected one of \
+                     DISABLE, SIMPLE, MUTUAL, ISTIO_MUTUAL)"
+                ),
+            ));
+        }
+    };
+
+    let sni = string_field(value, "sni").map(ToOwned::to_owned);
+    let ca_certificates = string_field(value, "caCertificates").map(ToOwned::to_owned);
+    let client_certificate = string_field(value, "clientCertificate").map(ToOwned::to_owned);
+    let private_key = string_field(value, "privateKey").map(ToOwned::to_owned);
+    let subject_alt_names = string_array(value, "subjectAltNames");
+    let insecure_skip_verify = value
+        .get("insecureSkipVerify")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    match mode {
+        MtlsMode::IstioMutual => {
+            if client_certificate.is_some() || private_key.is_some() || ca_certificates.is_some() {
+                return Err(invalid_resource(
+                    object,
+                    "trafficPolicy.tls.mode=ISTIO_MUTUAL must not set \
+                     clientCertificate/privateKey/caCertificates — Istio reuses the \
+                     workload's SPIFFE identity material",
+                ));
+            }
+        }
+        MtlsMode::Mutual => {
+            if client_certificate.is_none() || private_key.is_none() {
+                return Err(invalid_resource(
+                    object,
+                    "trafficPolicy.tls.mode=MUTUAL requires both clientCertificate and \
+                     privateKey",
+                ));
+            }
+        }
+        MtlsMode::Disable | MtlsMode::Simple => {}
+        // PeerAuthentication-side modes can't be set via DR.tls.mode in Istio;
+        // translation above only emits the four client-side modes.
+        MtlsMode::Strict | MtlsMode::Permissive => {
+            return Err(invalid_resource(
+                object,
+                format!("trafficPolicy.tls.mode '{mode_raw}' is not a client-side TLS mode"),
+            ));
+        }
+    }
+
+    Ok(MeshTrafficPolicyTls {
+        mode,
+        sni,
+        ca_certificates,
+        client_certificate,
+        private_key,
+        subject_alt_names,
+        insecure_skip_verify,
     })
 }
 
@@ -722,6 +822,12 @@ fn translate_subset(
         if policy.outlier_detection.is_some() {
             acc.warnings.push(format!(
                 "DestinationRule {}/{} subset '{}' outlierDetection is currently ignored; only the top-level trafficPolicy outlierDetection applies",
+                object.metadata.namespace, object.metadata.name, name
+            ));
+        }
+        if policy.tls.is_some() {
+            acc.warnings.push(format!(
+                "DestinationRule {}/{} subset '{}' trafficPolicy.tls is parsed but not yet applied per-subset; only the top-level trafficPolicy.tls projects onto the resolved Upstream's backend_tls_* fields",
                 object.metadata.namespace, object.metadata.name, name
             ));
         }
@@ -1071,7 +1177,7 @@ fn resolve_destination_port(
 ///   - `<svc>.<ns>` — two-label form
 ///   - `<svc>.<ns>.svc` — three-label form (final label MUST be `svc`)
 ///   - `<svc>.<ns>.svc.<cluster_domain>` — FQDN form (cluster_domain is
-///     configurable via `FERRUM_MESH_CLUSTER_DOMAIN`, default `cluster.local`)
+///     configurable via `FERRUM_K8S_CLUSTER_DOMAIN`, default `cluster.local`)
 ///
 /// Any other shape — including external hosts (`api.example.com`), foreign
 /// FQDNs (`foo.bar.tld.invalid`), partial suffixes (`<svc>.<ns>.cluster.local`,
@@ -1417,6 +1523,85 @@ fn telemetry(
             metrics,
             access_logging,
         },
+    })
+}
+
+/// Translate an Istio `ProxyConfig` (`networking.istio.io/v1beta1`) CRD into a
+/// [`MeshProxyConfig`].
+///
+/// ProxyConfig fields are config-time only — they shape the data plane's
+/// startup posture (concurrency, image) and tracing sampling but do not
+/// affect the request path. Fields:
+///
+/// - `metadata.name` -> `name`
+/// - `metadata.namespace` -> `namespace`
+/// - `spec.selector` + root-namespace rule -> [`PolicyScope`] (via
+///   [`istio_policy_scope`]). A ProxyConfig in the Istio root namespace
+///   with no selector applies mesh-wide; with a selector it applies to
+///   matching workloads across the mesh. In any other namespace, no
+///   selector means namespace-default and a selector narrows further.
+/// - `spec.concurrency` -> `concurrency` (rejected as invalid if outside
+///   `u32` range)
+/// - `spec.image.imageType` -> `image` (informational)
+/// - `spec.environmentVariables` -> `environment`
+/// - `spec.tracing.sampling` -> `tracing_sampling` (percentage 0-100,
+///   merged into `workload_metrics.sampling_percentage` at slice-apply time)
+fn proxy_config(
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+) -> Result<MeshProxyConfig, K8sTranslateError> {
+    let scope = istio_policy_scope(options, object, object.spec.get("selector"));
+
+    let concurrency = match object.spec.get("concurrency") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let raw = value.as_u64().ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    format!(
+                        "ProxyConfig spec.concurrency must be a non-negative integer (got {value})"
+                    ),
+                )
+            })?;
+            Some(u32::try_from(raw).map_err(|_| {
+                invalid_resource(
+                    object,
+                    format!(
+                        "ProxyConfig spec.concurrency must fit in u32 (0..={}), got {raw}",
+                        u32::MAX
+                    ),
+                )
+            })?)
+        }
+    };
+
+    let image = object
+        .spec
+        .get("image")
+        .and_then(|img| img.get("imageType"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    let environment = object
+        .spec
+        .get("environmentVariables")
+        .map(string_map)
+        .unwrap_or_default();
+
+    let tracing_sampling = object
+        .spec
+        .get("tracing")
+        .and_then(|tracing| tracing.get("sampling"))
+        .and_then(Value::as_f64);
+
+    Ok(MeshProxyConfig {
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        scope,
+        concurrency,
+        image,
+        environment,
+        tracing_sampling,
     })
 }
 
@@ -4700,6 +4885,703 @@ mod tests {
                 .and_then(|outlier| outlier.interval_seconds),
             Some(1)
         );
+    }
+
+    // ── ProxyConfig translation ─────────────────────────────────────────
+
+    #[test]
+    fn translates_proxy_config_with_all_fields_populated() {
+        let result = translate_k8s_objects(
+            &[object(
+                "ProxyConfig",
+                serde_json::json!({
+                    "selector": {"matchLabels": {"app": "api"}},
+                    "concurrency": 4,
+                    "image": {"imageType": "distroless"},
+                    "environmentVariables": {
+                        "GOMAXPROCS": "4",
+                        "PILOT_ENABLE_FOO": "true"
+                    },
+                    "tracing": {"sampling": 42.5}
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.proxy_configs.len(), 1);
+        let pc = &mesh.proxy_configs[0];
+        assert_eq!(pc.name, "sample");
+        assert_eq!(pc.namespace, "default");
+        match &pc.scope {
+            PolicyScope::WorkloadSelector { selector } => {
+                assert_eq!(selector.labels.get("app").map(String::as_str), Some("api"));
+                assert_eq!(selector.namespace.as_deref(), Some("default"));
+            }
+            other => panic!("expected WorkloadSelector scope, got {other:?}"),
+        }
+        assert_eq!(pc.concurrency, Some(4));
+        assert_eq!(pc.image.as_deref(), Some("distroless"));
+        assert_eq!(
+            pc.environment.get("GOMAXPROCS").map(String::as_str),
+            Some("4")
+        );
+        assert_eq!(
+            pc.environment.get("PILOT_ENABLE_FOO").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(pc.tracing_sampling, Some(42.5));
+    }
+
+    #[test]
+    fn translates_proxy_config_without_selector_is_namespace_default() {
+        let result = translate_k8s_objects(
+            &[object(
+                "ProxyConfig",
+                serde_json::json!({
+                    "concurrency": 2
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.proxy_configs.len(), 1);
+        let pc = &mesh.proxy_configs[0];
+        match &pc.scope {
+            PolicyScope::Namespace { namespace } => {
+                assert_eq!(namespace, "default");
+            }
+            other => panic!("expected Namespace scope, got {other:?}"),
+        }
+        assert_eq!(pc.namespace, "default");
+        assert_eq!(pc.concurrency, Some(2));
+    }
+
+    #[test]
+    fn translates_proxy_config_omits_unset_fields() {
+        let result =
+            translate_k8s_objects(&[object("ProxyConfig", serde_json::json!({}))], options())
+                .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.proxy_configs.len(), 1);
+        let pc = &mesh.proxy_configs[0];
+        match &pc.scope {
+            PolicyScope::Namespace { namespace } => assert_eq!(namespace, "default"),
+            other => panic!("expected Namespace scope, got {other:?}"),
+        }
+        assert!(pc.concurrency.is_none());
+        assert!(pc.image.is_none());
+        assert!(pc.environment.is_empty());
+        assert!(pc.tracing_sampling.is_none());
+    }
+
+    #[test]
+    fn translates_root_namespace_proxy_config_without_selector_is_mesh_wide() {
+        // A ProxyConfig in the Istio root namespace with no selector is the
+        // canonical Istio pattern for a mesh-wide default. The previous
+        // namespace-only filter dropped this entirely; PolicyScope::MeshWide
+        // is the fix.
+        let result = translate_k8s_objects(
+            &[K8sObject {
+                api_version: "networking.istio.io/v1beta1".to_string(),
+                kind: "ProxyConfig".to_string(),
+                metadata: K8sMetadata {
+                    name: "mesh-default".to_string(),
+                    namespace: "istio-config".to_string(),
+                    labels: HashMap::new(),
+                },
+                spec: serde_json::json!({"tracing": {"sampling": 5.0}}),
+            }],
+            options_for_namespace("default")
+                .with_istio_root_namespace("istio-config".to_string())
+                .with_source_namespaces(vec!["default".to_string(), "istio-config".to_string()]),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.proxy_configs.len(), 1);
+        let pc = &mesh.proxy_configs[0];
+        assert!(
+            matches!(pc.scope, PolicyScope::MeshWide),
+            "expected MeshWide, got {:?}",
+            pc.scope
+        );
+        assert_eq!(pc.tracing_sampling, Some(5.0));
+    }
+
+    #[test]
+    fn translates_root_namespace_proxy_config_with_selector_is_mesh_wide_selector() {
+        // A ProxyConfig in the Istio root namespace with a selector applies
+        // to matching workloads across all namespaces. Encoded as
+        // PolicyScope::WorkloadSelector with namespace=None — same pattern
+        // as Telemetry / RequestAuthentication.
+        let result = translate_k8s_objects(
+            &[K8sObject {
+                api_version: "networking.istio.io/v1beta1".to_string(),
+                kind: "ProxyConfig".to_string(),
+                metadata: K8sMetadata {
+                    name: "mesh-api".to_string(),
+                    namespace: "istio-config".to_string(),
+                    labels: HashMap::new(),
+                },
+                spec: serde_json::json!({
+                    "selector": {"matchLabels": {"app": "api"}},
+                    "tracing": {"sampling": 50.0}
+                }),
+            }],
+            options_for_namespace("default")
+                .with_istio_root_namespace("istio-config".to_string())
+                .with_source_namespaces(vec!["default".to_string(), "istio-config".to_string()]),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.proxy_configs.len(), 1);
+        let pc = &mesh.proxy_configs[0];
+        match &pc.scope {
+            PolicyScope::WorkloadSelector { selector } => {
+                assert_eq!(selector.labels.get("app").map(String::as_str), Some("api"));
+                assert!(
+                    selector.namespace.is_none(),
+                    "root-namespace selector must drop namespace pin"
+                );
+            }
+            other => panic!("expected WorkloadSelector with no namespace, got {other:?}"),
+        }
+        assert_eq!(pc.tracing_sampling, Some(50.0));
+    }
+
+    #[test]
+    fn proxy_config_concurrency_overflow_is_rejected() {
+        // Out-of-range concurrency must surface as an InvalidResource error
+        // instead of silently clamping to u32::MAX.
+        let err = translate_k8s_objects(
+            &[object(
+                "ProxyConfig",
+                serde_json::json!({"concurrency": 9_999_999_999_u64}),
+            )],
+            options(),
+        )
+        .expect_err("overflow must be rejected");
+
+        match err {
+            K8sTranslateError::InvalidResource { kind, message, .. } => {
+                assert_eq!(kind, "ProxyConfig");
+                assert!(
+                    message.contains("concurrency"),
+                    "error message must mention concurrency: {message}"
+                );
+            }
+            other => panic!("expected InvalidResource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proxy_config_concurrency_invalid_json_forms_are_rejected() {
+        // A present-but-invalid concurrency value must surface as
+        // InvalidResource — not silently dropped via the `as_u64` filter.
+        let bad_values = [
+            ("string", serde_json::json!("4")),
+            ("float", serde_json::json!(4.5)),
+            ("negative", serde_json::json!(-1)),
+            ("bool", serde_json::json!(true)),
+            ("array", serde_json::json!([4])),
+            ("object", serde_json::json!({"n": 4})),
+        ];
+
+        for (label, bad) in bad_values {
+            let err = translate_k8s_objects(
+                &[object(
+                    "ProxyConfig",
+                    serde_json::json!({"concurrency": bad}),
+                )],
+                options(),
+            )
+            .expect_err(&format!("expected InvalidResource for {label}"));
+            match err {
+                K8sTranslateError::InvalidResource { kind, message, .. } => {
+                    assert_eq!(kind, "ProxyConfig", "case {label}");
+                    assert!(
+                        message.contains("concurrency"),
+                        "case {label}: error must mention concurrency: {message}"
+                    );
+                }
+                other => panic!("case {label}: expected InvalidResource, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_config_concurrency_null_is_treated_as_unset() {
+        // Explicit JSON null is semantically equivalent to omitting the
+        // field — both mean "use the data plane default."
+        let result = translate_k8s_objects(
+            &[object(
+                "ProxyConfig",
+                serde_json::json!({"concurrency": serde_json::Value::Null}),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.proxy_configs.len(), 1);
+        assert!(mesh.proxy_configs[0].concurrency.is_none());
+    }
+
+    #[test]
+    fn proxy_config_workload_selector_wins_over_namespace_default() {
+        // Two ProxyConfigs in same namespace: one namespace-default (no
+        // selector), one with a workload selector. Slice resolution must
+        // prefer the workload-scoped one for a matching workload.
+        use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+        use std::collections::BTreeMap;
+
+        let result = translate_k8s_objects(
+            &[
+                object(
+                    "ProxyConfig",
+                    serde_json::json!({"tracing": {"sampling": 10.0}}),
+                ),
+                K8sObject {
+                    api_version: "networking.istio.io/v1beta1".to_string(),
+                    kind: "ProxyConfig".to_string(),
+                    metadata: K8sMetadata {
+                        name: "api-overrides".to_string(),
+                        namespace: "default".to_string(),
+                        labels: HashMap::new(),
+                    },
+                    spec: serde_json::json!({
+                        "selector": {"matchLabels": {"app": "api"}},
+                        "tracing": {"sampling": 99.0}
+                    }),
+                },
+            ],
+            options(),
+        )
+        .expect("translation succeeds");
+        let gateway_config = result.config;
+        assert_eq!(gateway_config.mesh.as_ref().unwrap().proxy_configs.len(), 2);
+
+        let request = MeshSliceRequest {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            workload_spiffe_id: None,
+            labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+        };
+        let slice = MeshSlice::from_gateway_config(&gateway_config, request);
+        // Both should match — namespace-default applies to any workload, and
+        // the workload-scoped one applies to `app=api`.
+        assert_eq!(slice.proxy_configs.len(), 2);
+
+        let resolved = slice
+            .resolved_proxy_config()
+            .expect("expected resolved proxy_config");
+        assert_eq!(resolved.tracing_sampling, Some(99.0));
+        assert_eq!(resolved.name, "api-overrides");
+    }
+    // ── DestinationRule trafficPolicy.tls ───────────────────────────────
+
+    #[test]
+    fn translates_destination_rule_tls_simple_with_ca() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "caCertificates": "/etc/certs/ca.pem",
+                            "sni": "reviews.example.com"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tls = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .tls
+            .as_ref()
+            .expect("tls block");
+        assert_eq!(tls.mode, MtlsMode::Simple);
+        assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/ca.pem"));
+        assert_eq!(tls.sni.as_deref(), Some("reviews.example.com"));
+        assert!(tls.client_certificate.is_none());
+        assert!(tls.private_key.is_none());
+        assert!(!tls.insecure_skip_verify);
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_mutual_with_cert_and_key() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "MUTUAL",
+                            "caCertificates": "/etc/certs/ca.pem",
+                            "clientCertificate": "/etc/certs/client.pem",
+                            "privateKey": "/etc/certs/client.key",
+                            "subjectAltNames": ["spiffe://example/sa/reviews"],
+                            "insecureSkipVerify": false
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tls = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .tls
+            .as_ref()
+            .expect("tls block");
+        assert_eq!(tls.mode, MtlsMode::Mutual);
+        assert_eq!(
+            tls.client_certificate.as_deref(),
+            Some("/etc/certs/client.pem")
+        );
+        assert_eq!(tls.private_key.as_deref(), Some("/etc/certs/client.key"));
+        assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/ca.pem"));
+        assert_eq!(
+            tls.subject_alt_names,
+            vec!["spiffe://example/sa/reviews".to_string()]
+        );
+        assert!(!tls.insecure_skip_verify);
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_mutual_rejects_missing_cert_or_key() {
+        // MUTUAL requires BOTH clientCertificate AND privateKey.
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "MUTUAL",
+                            "clientCertificate": "/etc/certs/client.pem"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("MUTUAL without privateKey must fail");
+        assert!(
+            err.to_string()
+                .contains("MUTUAL requires both clientCertificate and privateKey"),
+            "got: {err}"
+        );
+
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "MUTUAL",
+                            "privateKey": "/etc/certs/client.key"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("MUTUAL without clientCertificate must fail");
+        assert!(
+            err.to_string()
+                .contains("MUTUAL requires both clientCertificate and privateKey"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_istio_mutual() {
+        // ISTIO_MUTUAL must not carry explicit cert/key/CA — Istio reuses
+        // the workload's SPIFFE identity material.
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "ISTIO_MUTUAL",
+                            "sni": "reviews.example.com"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tls = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .tls
+            .as_ref()
+            .expect("tls block");
+        assert_eq!(tls.mode, MtlsMode::IstioMutual);
+        assert!(tls.client_certificate.is_none());
+        assert!(tls.private_key.is_none());
+        assert!(tls.ca_certificates.is_none());
+        assert_eq!(tls.sni.as_deref(), Some("reviews.example.com"));
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_istio_mutual_rejects_explicit_cert() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "ISTIO_MUTUAL",
+                            "clientCertificate": "/etc/certs/client.pem",
+                            "privateKey": "/etc/certs/client.key"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("ISTIO_MUTUAL with explicit cert/key must fail");
+        assert!(
+            err.to_string()
+                .contains("ISTIO_MUTUAL must not set clientCertificate/privateKey/caCertificates"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_istio_mutual_rejects_explicit_ca() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "ISTIO_MUTUAL",
+                            "caCertificates": "/etc/certs/ca.pem"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("ISTIO_MUTUAL with explicit CA must fail");
+        assert!(
+            err.to_string()
+                .contains("ISTIO_MUTUAL must not set clientCertificate/privateKey/caCertificates"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_disable() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {"mode": "DISABLE"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tls = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .tls
+            .as_ref()
+            .expect("tls block");
+        assert_eq!(tls.mode, MtlsMode::Disable);
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_insecure_skip_verify() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "insecureSkipVerify": true
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tls = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .tls
+            .as_ref()
+            .expect("tls block");
+        assert!(tls.insecure_skip_verify);
+    }
+
+    #[test]
+    fn destination_rule_without_tls_translates_to_none() {
+        // Preserves today's behavior: no tls block in DR -> MeshTrafficPolicy.tls is None.
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {"simple": "ROUND_ROBIN"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tp = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy");
+        assert!(tp.tls.is_none());
+    }
+
+    #[test]
+    fn destination_rule_rejects_unsupported_tls_mode() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {"mode": "BANANA"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("unsupported TLS mode must fail");
+        assert!(
+            err.to_string()
+                .contains("trafficPolicy.tls.mode 'BANANA' is unsupported"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_subset_tls_is_parsed_and_warns() {
+        // Per-subset trafficPolicy.tls is parsed onto the MeshSubset but not
+        // yet projected onto a per-subset Upstream-TLS view — surface a warning.
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "subsets": [{
+                        "name": "v1",
+                        "labels": {"version": "v1"},
+                        "trafficPolicy": {
+                            "tls": {
+                                "mode": "SIMPLE",
+                                "caCertificates": "/etc/certs/v1-ca.pem"
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let subset = &mesh.destination_rules[0].subsets[0];
+        let tls = subset
+            .traffic_policy
+            .as_ref()
+            .expect("subset traffic policy")
+            .tls
+            .as_ref()
+            .expect("subset tls");
+        assert_eq!(tls.mode, MtlsMode::Simple);
+        assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/v1-ca.pem"));
+
+        // And a translator-level warning surfaced so operators know it isn't
+        // applied per-subset on the cold path yet.
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("trafficPolicy.tls is parsed but not yet applied per-subset")),
+            "expected per-subset tls warning, got: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn destination_rule_tls_defaults_to_simple_mode() {
+        // Istio defaults `tls.mode` to SIMPLE when the field is omitted from
+        // the block. Preserve that semantics.
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {"caCertificates": "/etc/certs/ca.pem"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tls = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .tls
+            .as_ref()
+            .expect("tls block");
+        assert_eq!(tls.mode, MtlsMode::Simple);
     }
 
     // ── Service.spec.ports[].name resolution ──────────────────────────────

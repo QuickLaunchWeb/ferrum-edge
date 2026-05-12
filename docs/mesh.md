@@ -164,6 +164,53 @@ Declares valid JWTs for a workload scope. Permissive by default (see [RequestAut
 
 Per-scope telemetry configuration for tracing, metrics, and access logging (see [Observability](#observability)).
 
+### MeshProxyConfig (Istio ProxyConfig)
+
+Maps an Istio `ProxyConfig` (`networking.istio.io/v1beta1`) onto a config-time, read-only data structure consumed by the mesh runtime at slice-apply time. ProxyConfig has **no data-plane request-path impact** — it shapes startup posture (concurrency, image, environment variables) and tracing sampling.
+
+```yaml
+name: "api-defaults"
+namespace: "default"
+scope:                  # resolved from spec.selector + Istio root-namespace rule
+  workload_selector:
+    selector:
+      labels: { app: "api" }
+      namespace: "default"  # absent when the resource lives in the Istio root namespace
+concurrency: 4          # spec.concurrency (informational; rejected if outside u32 range)
+image: "distroless"     # spec.image.imageType (informational)
+environment:            # spec.environmentVariables (informational)
+  GOMAXPROCS: "4"
+tracing_sampling: 42.5  # spec.tracing.sampling — percentage 0-100
+```
+
+**Honored fields**:
+
+| Istio field | MeshProxyConfig field | Notes |
+|---|---|---|
+| `metadata.name` | `name` | |
+| `metadata.namespace` | `namespace` | |
+| `spec.selector` + root-namespace rule | `scope` ([`PolicyScope`](#policyscope)) | See "Scope resolution" below — same semantics as Telemetry / PeerAuthentication |
+| `spec.concurrency` | `concurrency` | Informational; rejected as `InvalidResource` if it does not fit in `u32` |
+| `spec.image.imageType` | `image` | Informational; surfaced to operator tooling |
+| `spec.environmentVariables` | `environment` | Informational; surfaced to operator tooling |
+| `spec.tracing.sampling` | `tracing_sampling` | Percentage 0-100; merged into the injected `workload_metrics` plugin's `sampling_percentage` |
+
+**Scope resolution**: ProxyConfig honors the same Istio root-namespace + selector rules used by `Telemetry`, `RequestAuthentication`, and `PeerAuthentication`. The K8s translator routes through the shared `istio_policy_scope` helper, so [`scope`](../src/modes/mesh/config.rs) ends up as:
+
+- `MeshWide` — resource in the Istio root namespace (`FERRUM_K8S_ISTIO_ROOT_NAMESPACE`, default `istio-system`) with no selector. Applies to every workload in the mesh.
+- `WorkloadSelector { namespace: None, labels: ... }` — resource in the Istio root namespace with a selector. Applies to matching workloads across all namespaces.
+- `Namespace { namespace }` — resource in any other namespace with no selector. Applies to all workloads in that namespace.
+- `WorkloadSelector { namespace: Some(ns), labels: ... }` — resource in any other namespace with a selector. Applies to matching workloads in that namespace.
+
+Within the resolved slice, [`MeshSlice::resolved_proxy_config()`](../src/modes/mesh/slice.rs) returns the most-specific applicable entry:
+
+1. `WorkloadSelector` > `Namespace` > `MeshWide`.
+2. Among same-tier matches, the ASCII-smallest `name` wins (deterministic tiebreaker mirroring the accumulator's `(namespace, name)` sort).
+
+**`tracing.sampling` merge with `Telemetry`**: ProxyConfig `tracing_sampling` is applied first as a baseline, then `Telemetry.tracing.randomSamplingPercentage` overrides on the same `sampling_percentage` key when both are present. The more granular Telemetry API wins because it can be per-section scoped; ProxyConfig provides a per-workload-config-level default.
+
+**xDS protocol**: ProxyConfig is config-time and not exposed via standard xDS. Operators relying on ProxyConfig translation must use `FERRUM_MESH_CONFIG_PROTOCOL=native`.
+
 ### TrustBundleSet
 
 Local and federated X.509/JWT authority bundles for cross-cluster trust.
@@ -222,7 +269,7 @@ subsets:
 | `subsets[].trafficPolicy.outlierDetection` | Ignored (warns) | Top-level `trafficPolicy.outlierDetection` is the only path to passive health checks |
 | `trafficPolicy.connectionPool.http.*` | Ignored | Per-protocol connection pool not surfaced |
 | `trafficPolicy.connectionPool.tcp.maxConnections` / `tcpKeepalive` | Ignored | Pool sizing handled globally via `FERRUM_POOL_*` |
-| `trafficPolicy.tls` | Ignored | mTLS posture comes from `PeerAuthentication` |
+| `trafficPolicy.tls` | Supported | Overrides the `PeerAuthentication`-derived backend posture per matching `Upstream` when set. Mode mapping: `DISABLE` → clears `Upstream.backend_tls_*`; `SIMPLE` → enables server-cert verify + `backend_tls_server_ca_cert_path = caCertificates` (client cert/key cleared); `MUTUAL` → enables server-cert verify + projects `caCertificates`/`clientCertificate`/`privateKey` onto `Upstream.backend_tls_server_ca_cert_path`/`_client_cert_path`/`_client_key_path`; `ISTIO_MUTUAL` → enables server-cert verify and leaves any existing client material untouched (Ferrum's `spiffe_identity`/`mtls_auth` plugins continue to supply the workload SVID — DR.tls does not yet project SPIFFE material onto `Upstream.backend_tls_*` directly). `insecureSkipVerify: true` forces `backend_tls_verify_server_cert = false`. `sni` and `subjectAltNames` are parsed and warned (no per-`Upstream` SNI/SAN override field today). When the field is unset, behavior is identical to today and `PeerAuthentication` continues to drive the default mTLS posture. |
 | `trafficPolicy.portLevelSettings` | Ignored | Per-port traffic policy not modeled |
 | `exportTo` | Ignored | DRs are scoped to their declared namespace at slice-filter time |
 
@@ -241,6 +288,7 @@ The slice builder:
 5. Filters `ServiceEntry` entries by `export_to` visibility.
 6. Filters `MeshRequestAuthentication` entries by scope.
 7. Filters `MeshTelemetryResource` entries by scope.
+8. Filters `MeshProxyConfig` entries by [`PolicyScope`](#policyscope) — same predicate as `MeshPolicy`, so root-namespace ProxyConfigs apply mesh-wide.
 
 ## Authorization
 
@@ -874,9 +922,7 @@ The following Istio mesh surfaces are **not yet supported** and should be treate
 |---|---|---|
 | `Sidecar` (egress scoping) | Deferred | Use Ferrum proxy routing and upstream configuration |
 | `EnvoyFilter` | Not planned | Use Ferrum custom plugins |
-| `ProxyConfig` | Deferred | Configure via `FERRUM_*` environment variables |
 | `WasmPlugin` | Not planned | Use Ferrum custom plugins (`custom_plugins/`) |
-| `DestinationRule.trafficPolicy.tls` | Deferred | Use per-proxy `backend_tls_*` fields |
 | `DestinationRule` port-level traffic policy | Deferred | Top-level traffic policy applies to all ports |
 | Outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`) | Deferred | Unknown outbound destinations are not blocked today |
 | `VirtualService` header/method-only matches | Skipped | Ferrum route proxies do not encode header/method predicates |

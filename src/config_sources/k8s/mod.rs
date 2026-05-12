@@ -288,6 +288,9 @@ impl K8sAccumulator {
         self.mesh.telemetry_resources.sort_by(|left, right| {
             (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
         });
+        self.mesh.proxy_configs.sort_by(|left, right| {
+            (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
+        });
         if self.mesh != MeshConfig::default() {
             self.config.mesh = Some(Box::new(self.mesh));
         }
