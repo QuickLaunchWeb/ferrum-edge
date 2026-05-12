@@ -327,7 +327,7 @@ See [docs/routing.md](docs/routing.md) for detailed routing behavior.
 | **HTTP/1.1** | `backend_scheme: http` / `https` | Default, with connection pooling |
 | **HTTP/2** | ALPN-negotiated on `https` | Automatic via `pool_enable_http2: true`; startup capability classification decides when the direct H2 pool is used |
 | **HTTP/3** | `backend_scheme: https` | Startup capability classification probes HTTPS backends for H3 support and plain HTTP traffic uses QUIC automatically when supported |
-| **WebSocket** | Runtime-detected from `Upgrade: websocket` on any HTTP-family proxy | `backend_scheme: http` → `ws://` upstream; `https` → `wss://` |
+| **WebSocket** | Runtime-detected from `Upgrade: websocket` (H1.1) or `:protocol=websocket` Extended CONNECT (H2 RFC 8441, H3 RFC 9220) on any HTTP-family proxy | `backend_scheme: http` → `ws://` upstream; `https` → `wss://`. Same plugin pipeline across all three frontends; H3 sessions controlled by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default on) |
 | **gRPC** | Runtime-detected from `content-type: application/grpc*` on any HTTP-family proxy | HTTP/2 with trailer support on both `http` (h2c) and `https` (ALPN) schemes |
 | **TCP** | `backend_scheme: tcp` / `tcps` | Dedicated-port stream proxy (plaintext or TLS) |
 | **UDP** | `backend_scheme: udp` / `dtls` | Datagram proxy with session tracking (plaintext or DTLS) |

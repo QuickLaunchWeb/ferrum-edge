@@ -2258,11 +2258,17 @@ components:
             is classified as H3-capable.
 
 
-            **WebSocket requests arriving over HTTP/3** are rejected with
-            501 regardless of backend capability. H3 Extended CONNECT for
-            WebSocket (RFC 9220) is not widely deployed by clients or
-            backends; operators should send WebSocket upgrades over
-            HTTP/1.1 or HTTP/2.
+            **WebSocket requests arriving over HTTP/3** are supported via
+            RFC 9220 Extended CONNECT (`:method=CONNECT`,
+            `:protocol=websocket`). The H3 frontend bridges to an HTTP/1.1
+            Upgrade backend connection — the same `connect_websocket_backend()`
+            helper the H1/H2 frontends use — so the backend sees a normal
+            HTTP/1.1 WebSocket regardless of the frontend transport.
+            Same plugin pipeline (`on_ws_frame`, `on_ws_disconnect`,
+            sticky-session cookies). Gated by
+            `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default `true`); when
+            false the H3 server does not advertise
+            `SETTINGS_ENABLE_CONNECT_PROTOCOL` and the bridge returns 501.
         backend_host:
           type: [string, "null"]
           description: >-
@@ -2501,13 +2507,12 @@ components:
             one of these values (case-insensitive comparison). Empty array (default) means
             no origin check. Protects against Cross-Site WebSocket Hijacking (CSWSH).
 
-            WebSocket over HTTP/1.1 (`Upgrade: websocket`) and HTTP/2 (RFC
-            8441 Extended CONNECT) are both supported. WebSocket over
-            HTTP/3 (RFC 9220 Extended CONNECT) is NOT supported —
-            requests arriving as WS upgrades on the H3 listener receive
-            a 501 Not Implemented response. See `docs/http3.md` for
-            rationale; operators should have clients issue WebSocket
-            upgrades over H1/H2.
+            WebSocket over HTTP/1.1 (`Upgrade: websocket`), HTTP/2
+            (RFC 8441 Extended CONNECT), and HTTP/3 (RFC 9220 Extended
+            CONNECT) are all supported and use the same Origin check.
+            The H3 path is gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED`
+            (default `true`); see `docs/http3.md` for the H3-specific
+            bridge architecture.
         circuit_breaker:
           oneOf:
             - $ref: "#/components/schemas/CircuitBreakerConfig"

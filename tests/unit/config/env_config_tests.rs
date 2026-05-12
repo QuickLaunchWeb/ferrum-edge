@@ -153,6 +153,61 @@ fn test_xds_enabled_parsed_from_env() {
 }
 
 #[test]
+fn test_http3_websocket_enabled_defaults_true() {
+    // RFC 9220 WebSocket-over-HTTP/3 Extended CONNECT defaults to enabled.
+    // Operators who run an H3 listener want WebSocket-over-H3 to "just work"
+    // out of the box, matching the H2 default
+    // (`enable_connect_protocol()` is unconditionally called on the H2 builder).
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_HTTP3_WEBSOCKET_ENABLED");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(
+                config.http3_websocket_enabled,
+                "Missing FERRUM_HTTP3_WEBSOCKET_ENABLED must default to true"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_http3_websocket_enabled_parses_false() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_HTTP3_WEBSOCKET_ENABLED", "false"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(
+                !config.http3_websocket_enabled,
+                "FERRUM_HTTP3_WEBSOCKET_ENABLED=false must disable the path"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_http3_websocket_enabled_parses_true() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_HTTP3_WEBSOCKET_ENABLED", "true"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.http3_websocket_enabled);
+        },
+    );
+}
+
+#[test]
 fn test_env_config_file_mode_missing_path() {
     with_env_vars(&[("FERRUM_MODE", "file")], || {
         remove_var("FERRUM_FILE_CONFIG_PATH");

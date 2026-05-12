@@ -53,7 +53,7 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode, upgrade::OnUpgrade, upgrade::Upgraded};
+use hyper::{Request, Response, StatusCode, upgrade::OnUpgrade};
 use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -4452,8 +4452,15 @@ async fn handle_websocket_request_authenticated(
         let _ws_session_guard = ws_session_guard;
         match on_upgrade.await {
             Ok(upgraded) => {
+                // H1/H2 frontends adapt hyper's `Upgraded` (which is
+                // `AsyncRead + AsyncWrite` in hyper-1 land) into the
+                // tokio AsyncRead/AsyncWrite vocabulary via `TokioIo`.
+                // The H3 frontend (`src/http3/websocket.rs`) bypasses
+                // this wrap and passes its own duplex adapter directly
+                // to `run_websocket_proxy`, which is now generic over
+                // the client transport type.
                 if let Err(e) = run_websocket_proxy(
-                    upgraded,
+                    TokioIo::new(upgraded),
                     backend_ws_stream,
                     &proxy_id,
                     ws_conn_id,
@@ -4464,6 +4471,11 @@ async fn handle_websocket_request_authenticated(
                     max_ws_frame,
                     ws_write_buf,
                     ws_tunnel,
+                    // H1/H2: RFC 6455 / RFC 8441 mandate masked
+                    // client-to-server frames. The H3 caller in
+                    // `src/http3/websocket.rs` passes `true` for
+                    // RFC 9220 §5 compliance.
+                    false,
                     &adaptive_buf,
                 )
                 .await
@@ -4925,9 +4937,33 @@ fn guard_ws_control_transform(
     }
 }
 
+/// Generic over the client transport type `C`. The H1/H2 frontend passes
+/// `TokioIo::new(upgraded)` (hyper's `Upgraded` adapted to tokio AsyncRead+AsyncWrite);
+/// the H3 frontend (RFC 9220 Extended CONNECT) passes a `tokio::io::DuplexStream`
+/// half that is bridged to the QUIC stream by a pair of pump tasks in
+/// `src/http3/websocket.rs`. The function is generic so both frontends share
+/// the same frame relay, plugin pipeline, and disconnect bookkeeping —
+/// only the bytes-on-the-wire transport differs.
+///
+/// `websocket_tunnel_mode` is a no-op for transports that aren't underpinned by
+/// a single TCP socket (the early-return below still works generically — both
+/// frontends pass `AsyncRead + AsyncWrite + Unpin + Send`, so
+/// `copy_bidirectional_with_sizes` accepts both — but the tunnel-mode
+/// caveats about server-push frame loss only apply to the H1 path that
+/// drops down to raw TCP). H3 callers pass `websocket_tunnel_mode = false`.
+///
+/// `accept_unmasked_client_frames` controls whether the WebSocket framer
+/// accepts client-to-server frames without the RFC 6455 mask bit set.
+/// HTTP/1.1 and HTTP/2 callers pass `false` (RFC 6455 / RFC 8441 mandate
+/// masked client frames). HTTP/3 callers pass `true` — RFC 9220 §5
+/// REVERSES the masking requirement: client-to-server frames MUST NOT
+/// be masked when the WebSocket runs over HTTP/3. tungstenite does not
+/// have a "reject masked frames" mode, so this knob accepts both shapes
+/// on the H3 path; strict RFC 9220 §5 enforcement (close 1002 on a
+/// masked H3 frame) is a future-work follow-up.
 #[allow(clippy::too_many_arguments)]
-async fn run_websocket_proxy(
-    upgraded: Upgraded,
+pub(crate) async fn run_websocket_proxy<C>(
+    client_io: C,
     backend_ws_stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     proxy_id: &str,
     connection_id: u64,
@@ -4938,8 +4974,12 @@ async fn run_websocket_proxy(
     max_websocket_frame_size_bytes: usize,
     websocket_write_buffer_size: usize,
     websocket_tunnel_mode: bool,
+    accept_unmasked_client_frames: bool,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     // When tunnel mode is enabled and no plugins need frame-level hooks, bypass
     // WebSocket frame parsing entirely and do raw TCP bidirectional copy. This
     // avoids per-frame header parsing, masking validation, and opcode dispatch —
@@ -4969,7 +5009,7 @@ async fn run_websocket_proxy(
         // sends immediately after upgrade should use frame-parsing mode (set
         // a frame-level plugin or disable `FERRUM_WEBSOCKET_TUNNEL_MODE`).
         let mut backend = backend_ws_stream.into_inner();
-        let mut client_io = TokioIo::new(upgraded);
+        let mut client_io = client_io;
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
         let result = tokio::io::copy_bidirectional_with_sizes(
             &mut client_io,
@@ -5013,9 +5053,13 @@ async fn run_websocket_proxy(
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
     ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
     ws_config.write_buffer_size = websocket_write_buffer_size;
+    // RFC 9220 §5: frames over HTTP/3 are NOT masked. H1/H2 callers
+    // pass `false` (RFC 6455 / RFC 8441 mandate masked client frames);
+    // H3 callers pass `true`.
+    ws_config.accept_unmasked_frames = accept_unmasked_client_frames;
 
     let ws_stream = WebSocketStream::from_raw_socket(
-        TokioIo::new(upgraded),
+        client_io,
         tokio_tungstenite::tungstenite::protocol::Role::Server,
         Some(ws_config),
     )
@@ -10416,11 +10460,11 @@ pub(crate) fn build_sticky_cookie_header(
     cookie
 }
 
-fn strip_query_params(url: &str) -> &str {
+pub(crate) fn strip_query_params(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
 }
 
-fn record_status(state: &ProxyState, status: u16) {
+pub(crate) fn record_status(state: &ProxyState, status: u16) {
     // Fast path: get() uses a read lock (shared), which is much cheaper than
     // entry() which always takes a write lock. Since status codes are a small
     // fixed set, the entry almost always exists after the first request.
@@ -10438,7 +10482,7 @@ fn record_status(state: &ProxyState, status: u16) {
     // else: silently drop — rare status code and map is at capacity
 }
 
-fn record_request(state: &ProxyState, status: u16) {
+pub(crate) fn record_request(state: &ProxyState, status: u16) {
     state.request_count.fetch_add(1, Ordering::Relaxed);
     record_status(state, status);
 }

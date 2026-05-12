@@ -1,0 +1,68 @@
+diff --git a/h3/src/ext.rs b/h3/src/ext.rs
+--- a/h3/src/ext.rs
++++ b/h3/src/ext.rs
+@@ -13,6 +13,11 @@ impl Protocol {
+     pub const WEB_TRANSPORT: Protocol = Protocol(ProtocolInner::WebTransport);
+     /// RFC 9298 protocol
+     pub const CONNECT_UDP: Protocol = Protocol(ProtocolInner::ConnectUdp);
++    /// RFC 9220 — Bootstrapping WebSockets with HTTP/3 (`:protocol = "websocket"`).
++    ///
++    /// Mirrors RFC 8441's HTTP/2 Extended CONNECT, applied to HTTP/3.
++    /// See: <https://www.rfc-editor.org/rfc/rfc9220>
++    pub const WEB_SOCKET: Protocol = Protocol(ProtocolInner::WebSocket);
+
+     /// Return a &str representation of the `:protocol` pseudo-header value
+     #[inline]
+@@ -20,6 +25,7 @@ impl Protocol {
+         match self.0 {
+             ProtocolInner::WebTransport => "webtransport",
+             ProtocolInner::ConnectUdp => "connect-udp",
++            ProtocolInner::WebSocket => "websocket",
+         }
+     }
+ }
+@@ -28,6 +34,7 @@ impl Protocol {
+ enum ProtocolInner {
+     WebTransport,
+     ConnectUdp,
++    WebSocket,
+ }
+
+ /// Error when parsing the protocol
+@@ -40,7 +47,32 @@ impl FromStr for Protocol {
+         match s {
+             "webtransport" => Ok(Self(ProtocolInner::WebTransport)),
+             "connect-udp" => Ok(Self(ProtocolInner::ConnectUdp)),
++            "websocket" => Ok(Self(ProtocolInner::WebSocket)),
+             _ => Err(InvalidProtocol),
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn websocket_from_str_round_trip() {
++        let p: Protocol = "websocket".parse().expect("parse websocket");
++        assert_eq!(p.as_str(), "websocket");
++        assert_eq!(p, Protocol::WEB_SOCKET);
++    }
++
++    #[test]
++    fn unknown_protocol_still_rejected() {
++        assert!("unknownproto".parse::<Protocol>().is_err());
++    }
++
++    #[test]
++    fn existing_protocols_unaffected() {
++        let wt: Protocol = "webtransport".parse().expect("parse webtransport");
++        assert_eq!(wt.as_str(), "webtransport");
++        assert_eq!(wt, Protocol::WEB_TRANSPORT);
++
++        let cu: Protocol = "connect-udp".parse().expect("parse connect-udp");
++        assert_eq!(cu.as_str(), "connect-udp");
++        assert_eq!(cu, Protocol::CONNECT_UDP);
++    }
++}

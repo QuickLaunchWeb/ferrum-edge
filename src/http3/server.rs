@@ -466,7 +466,16 @@ async fn handle_h3_connection(
     // the IP string on the rare occasion it changes. This prevents stale IPs
     // from poisoning rate-limit keys and access logs after migration.
     let quinn_conn = connection.clone();
-    let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(connection)).await?;
+    // RFC 9220: advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so H3 clients can
+    // bootstrap a WebSocket via Extended CONNECT (:method=CONNECT,
+    // :protocol=websocket). Mirrors the H2 listener's `enable_connect_protocol()`
+    // call. Gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED` so operators can disable
+    // the path without disabling HTTP/3 entirely; the dispatch site still
+    // returns 501 if a client manages to send the Extended CONNECT anyway.
+    let mut h3_conn = h3::server::builder()
+        .enable_extended_connect(state.env_config.http3_websocket_enabled)
+        .build(h3_quinn::Connection::new(connection))
+        .await?;
 
     // Pre-format socket IP string once per connection — shared across all streams
     // to avoid per-request String allocation from SocketAddr::ip().to_string().
@@ -1497,6 +1506,43 @@ async fn handle_h3_request(
     // buffered, response streamed) and why that matches the rest of the
     // codebase's two-tier buffering logic. gRPC still uses this bridge
     // because the native H3 pool is plain-HTTP only today.
+    // RFC 9220: HTTP/3 Extended CONNECT for WebSocket. The request was
+    // classified as `HttpFlavor::WebSocket` by `detect_http_flavor` (which
+    // accepts both H2 and H3 Extended CONNECT). Dispatch into the
+    // dedicated H3 WebSocket bridge: it takes ownership of the QUIC
+    // stream so it can `.split()` into independent send/recv halves
+    // for full-duplex frame relay. Plugin pipeline (authn / authz /
+    // before_proxy) has already run by this point — same contract as
+    // the H1/H2 path's `handle_websocket_request_authenticated`.
+    //
+    // When `FERRUM_HTTP3_WEBSOCKET_ENABLED=false` the H3 server's
+    // `enable_extended_connect(false)` setting prevents most clients
+    // from reaching this branch, but the dedicated handler also emits
+    // a 501 itself as defense in depth.
+    if http_flavor == HttpFlavor::WebSocket {
+        let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
+        return crate::http3::websocket::handle_h3_websocket(
+            stream,
+            state,
+            epoch,
+            proxy,
+            ctx,
+            plugins,
+            plugin_execution_ns,
+            upstream_target,
+            upstream_balancer,
+            lb_hash_key,
+            sticky_cookie_needed,
+            start_time,
+            cb_target_key,
+            cb_is_half_open_probe,
+            backend_url,
+            proxy_headers,
+            requires_ws_frame_hooks,
+        )
+        .await;
+    }
+
     let use_native_h3_pool = http_flavor == HttpFlavor::Plain
         && crate::proxy::supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     if !use_native_h3_pool {
