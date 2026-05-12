@@ -7312,6 +7312,14 @@ async fn handle_proxy_request_inner(
         } else {
             (proxy.backend_host.as_str(), proxy.backend_port)
         };
+        // Honor DestinationRule per-port `connect_timeout_ms` overrides on
+        // the gRPC path — the gRPC transport reads
+        // `proxy.backend_connect_timeout_ms` directly (grpc_proxy.rs), so we
+        // must pass the resolved Cow<Proxy> through dispatch. Borrowed when
+        // no override applies; cloned only when an override differs.
+        let grpc_effective_proxy =
+            resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref());
+        let grpc_dispatch_proxy: &Proxy = grpc_effective_proxy.as_ref();
         let mut grpc_backend_url = build_backend_url_with_target(
             &proxy,
             &path,
@@ -7457,7 +7465,7 @@ async fn handle_proxy_request_inner(
                 grpc_method,
                 grpc_headers,
                 grpc_req_body.clone(),
-                &proxy,
+                grpc_dispatch_proxy,
                 &grpc_backend_url,
                 &state.grpc_pool,
                 &state.dns_cache,
@@ -7484,7 +7492,7 @@ async fn handle_proxy_request_inner(
                 // body consumed on wire) and no body plugins.
                 let result = grpc_proxy::proxy_grpc_request_streaming(
                     request,
-                    &proxy,
+                    grpc_dispatch_proxy,
                     &grpc_backend_url,
                     &state.grpc_pool,
                     &state.dns_cache,
@@ -7500,7 +7508,7 @@ async fn handle_proxy_request_inner(
                 // the response path is safe to stream.
                 grpc_proxy::proxy_grpc_request(
                     request,
-                    &proxy,
+                    grpc_dispatch_proxy,
                     &grpc_backend_url,
                     &state.grpc_pool,
                     &state.dns_cache,
@@ -7642,11 +7650,18 @@ async fn handle_proxy_request_inner(
                 // motivates this PR working when the very first connect
                 // hiccups (otherwise a transient TCP RST silently downgrades
                 // a streaming RPC to fully buffered).
+                //
+                // Re-resolve the effective proxy for the (possibly rotated)
+                // current target so per-port `connect_timeout_ms` overrides
+                // apply to the retried backend. Same per-target-rotation
+                // contract as `proxy_to_backend_inner`.
+                let grpc_retry_effective_proxy =
+                    resolve_effective_proxy_for_target(&proxy, grpc_current_target.as_deref());
                 grpc_result = grpc_proxy::proxy_grpc_request_from_bytes(
                     grpc_method.clone(),
                     grpc_req_headers.clone(),
                     grpc_body_bytes.clone(),
-                    &proxy,
+                    grpc_retry_effective_proxy.as_ref(),
                     &grpc_backend_url,
                     &state.grpc_pool,
                     &state.dns_cache,
@@ -9219,44 +9234,37 @@ pub fn build_backend_url_with_target(
 /// upstream's per-destination-port `connect_timeout_ms` override (Istio
 /// `DestinationRule.trafficPolicy.portLevelSettings[].connectionPool.tcp.connectTimeout`).
 ///
-/// Hot-path discipline: returns a `Cow::Borrowed` (zero-alloc) when no
-/// upstream is configured, when the upstream has no `port_overrides`, or
-/// when the override resolves to the same value as the proxy default. The
-/// owned-clone branch only fires for the rare case where (a) the request
-/// targets an upstream with at least one port override AND (b) the resolved
-/// destination port matches a configured override key AND (c) the override's
+/// Hot-path discipline: single field read on `Proxy.dispatch_port_overrides`
+/// (precomputed at config-resolve time by
+/// `GatewayConfig::resolve_dispatch_port_overrides()`). No `ArcSwap` load,
+/// no `DashMap` lookup — the common no-override case is a borrowed `Proxy`.
+/// The owned-clone branch only fires for the rare case where (a) the proxy
+/// has at least one port override AND (b) the resolved destination port
+/// matches a configured override key AND (c) the override's
 /// `connect_timeout_ms` differs from `proxy.backend_connect_timeout_ms`.
 ///
 /// `upstream_target` is the LB-selected target whose port we'll connect to;
 /// when `None` the call is a direct-backend proxy with no upstream, so no
 /// per-port lookup is possible.
-fn resolve_effective_proxy_for_target<'a>(
-    state: &ProxyState,
+pub(crate) fn resolve_effective_proxy_for_target<'a>(
     proxy: &'a Proxy,
     upstream_target: Option<&UpstreamTarget>,
 ) -> std::borrow::Cow<'a, Proxy> {
-    let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target) else {
+    let Some(overrides) = proxy.dispatch_port_overrides.as_ref() else {
         return std::borrow::Cow::Borrowed(proxy);
     };
-
-    let snapshot = state.request_epoch.load();
-    let Some(upstream) = LoadBalancerCache::get_upstream_from(&snapshot.load_balancer, upstream_id)
-    else {
+    let Some(target) = upstream_target else {
         return std::borrow::Cow::Borrowed(proxy);
     };
-
-    if upstream.port_overrides.is_empty() {
+    let Some(&override_ms) = overrides.get(&target.port) else {
         return std::borrow::Cow::Borrowed(proxy);
-    }
-
-    let effective =
-        upstream.effective_connect_timeout_ms(target.port, proxy.backend_connect_timeout_ms);
-    if effective == proxy.backend_connect_timeout_ms {
+    };
+    if override_ms == proxy.backend_connect_timeout_ms {
         return std::borrow::Cow::Borrowed(proxy);
     }
 
     let mut owned = proxy.clone();
-    owned.backend_connect_timeout_ms = effective;
+    owned.backend_connect_timeout_ms = override_ms;
     std::borrow::Cow::Owned(owned)
 }
 
@@ -9281,7 +9289,7 @@ pub(crate) async fn proxy_to_backend_retry(
     // specific destination port. Borrowed when no override applies (zero-alloc
     // hot path); cloned only when an override actually differs from
     // `proxy.backend_connect_timeout_ms`.
-    let effective_proxy = resolve_effective_proxy_for_target(state, proxy, upstream_target);
+    let effective_proxy = resolve_effective_proxy_for_target(proxy, upstream_target);
     let proxy: &Proxy = effective_proxy.as_ref();
 
     // All reqwest clients use our DnsCacheResolver, so DNS resolution is
@@ -9635,7 +9643,7 @@ async fn proxy_to_backend(
     // Threading through `&Proxy` for the rest of this function means every
     // downstream call (reqwest, H2 pool, H3 pool, gRPC pool, HBONE) inherits
     // the effective timeout automatically.
-    let effective_proxy = resolve_effective_proxy_for_target(state, proxy, upstream_target);
+    let effective_proxy = resolve_effective_proxy_for_target(proxy, upstream_target);
     let proxy: &Proxy = effective_proxy.as_ref();
 
     // When retain_request_body is true (retries configured), the collected
@@ -12469,7 +12477,7 @@ async fn proxy_to_backend_http3_retry(
 ) -> retry::BackendResponse {
     // Honor DestinationRule per-port `connect_timeout_ms` overrides — see
     // `resolve_effective_proxy_for_target` for the Cow-Borrowed fast path.
-    let effective_proxy = resolve_effective_proxy_for_target(state, proxy, upstream_target);
+    let effective_proxy = resolve_effective_proxy_for_target(proxy, upstream_target);
     let proxy: &Proxy = effective_proxy.as_ref();
 
     let effective_host = upstream_target
@@ -14740,5 +14748,187 @@ mod tests {
             "valid config must be swapped into hot state"
         );
         assert_eq!(post.proxies[0].id, "p1");
+    }
+
+    // ── DestinationRule per-port connect-timeout dispatch wiring ──────────
+    //
+    // Verifies the hot-path helper actually returns the override for the
+    // matching destination port (Cow::Owned) and falls back to the proxy
+    // default for non-overridden ports (Cow::Borrowed). All four dispatch
+    // families — HTTP/H2/H3, gRPC, TCP, HBONE — read the proxy returned by
+    // (or the precomputed field consulted by) this helper to compute their
+    // backend connect timeout, so this single test exercises the contract
+    // that backs the higher-level dispatch sites.
+
+    fn proxy_with_port_overrides_for_test(default_ms: u64, overrides: &[(u16, u64)]) -> Proxy {
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "id": "p1",
+            "backend_host": "backend.local",
+            "backend_port": 8080,
+            "backend_connect_timeout_ms": default_ms,
+            "upstream_id": "u1",
+        }))
+        .expect("test proxy should deserialize");
+        proxy.dispatch_port_overrides = if overrides.is_empty() {
+            None
+        } else {
+            Some(overrides.iter().copied().collect())
+        };
+        proxy
+    }
+
+    fn target_for_test(port: u16) -> UpstreamTarget {
+        UpstreamTarget {
+            host: "backend.local".to_string(),
+            port,
+            weight: 1,
+            tags: HashMap::new(),
+            path: None,
+        }
+    }
+
+    #[test]
+    fn resolve_effective_proxy_returns_borrowed_when_no_overrides() {
+        let proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Borrowed(_)),
+            "no-overrides case must take the zero-alloc borrowed branch"
+        );
+        assert_eq!(effective.backend_connect_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn resolve_effective_proxy_returns_borrowed_for_unknown_port() {
+        let proxy = proxy_with_port_overrides_for_test(5000, &[(8080, 750)]);
+        let target = target_for_test(9090); // not in overrides
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Borrowed(_)),
+            "port-not-in-overrides must take the borrowed branch"
+        );
+        assert_eq!(effective.backend_connect_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn resolve_effective_proxy_returns_borrowed_when_override_matches_default() {
+        // Override equals proxy default → no work needed.
+        let proxy = proxy_with_port_overrides_for_test(5000, &[(8080, 5000)]);
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Borrowed(_)),
+            "override == default must take the borrowed branch"
+        );
+        assert_eq!(effective.backend_connect_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn resolve_effective_proxy_clones_when_port_override_differs() {
+        let proxy = proxy_with_port_overrides_for_test(5000, &[(8080, 750)]);
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Owned(_)),
+            "differing override must take the owned-clone branch"
+        );
+        assert_eq!(effective.backend_connect_timeout_ms, 750);
+        // Original is untouched — only the returned Cow carries the override.
+        assert_eq!(proxy.backend_connect_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn resolve_effective_proxy_returns_borrowed_when_no_upstream_target() {
+        // Direct-backend proxy (no upstream) → no per-target lookup possible.
+        let proxy = proxy_with_port_overrides_for_test(5000, &[(8080, 750)]);
+        let effective = resolve_effective_proxy_for_target(&proxy, None);
+        assert!(
+            matches!(effective, std::borrow::Cow::Borrowed(_)),
+            "missing upstream_target must take the borrowed branch"
+        );
+        assert_eq!(effective.backend_connect_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn resolve_dispatch_port_overrides_projects_upstream_map_onto_proxies() {
+        // Cold-path projection: the field on Proxy is populated from the
+        // referenced Upstream's `port_overrides`. Hot-path lookup is then a
+        // single field read.
+        use crate::config::types::{Upstream, UpstreamPortOverride};
+        let mut upstream = Upstream {
+            id: "u1".to_string(),
+            namespace: "ferrum".to_string(),
+            name: Some("u1".to_string()),
+            targets: vec![target_for_test(8080)],
+            algorithm: Default::default(),
+            hash_on: None,
+            hash_on_cookie_config: None,
+            health_checks: None,
+            service_discovery: None,
+            subsets: None,
+            port_overrides: HashMap::new(),
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            api_spec_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        upstream.port_overrides.insert(
+            8080,
+            UpstreamPortOverride {
+                connect_timeout_ms: Some(750),
+            },
+        );
+
+        let proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        let mut config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream],
+            ..GatewayConfig::default()
+        };
+        // Wipe the field so the resolve pass has to populate it from scratch.
+        config.proxies[0].dispatch_port_overrides = None;
+        config.resolve_dispatch_port_overrides();
+        let projected = config.proxies[0]
+            .dispatch_port_overrides
+            .as_ref()
+            .expect("upstream has overrides → proxy must get the map");
+        assert_eq!(projected.get(&8080).copied(), Some(750));
+
+        // Upstreams without overrides should NOT install an empty map on the
+        // proxy — that would defeat the fast-path None check.
+        let mut config_no_overrides = GatewayConfig {
+            proxies: vec![proxy_with_port_overrides_for_test(5000, &[])],
+            upstreams: vec![Upstream {
+                id: "u1".to_string(),
+                namespace: "ferrum".to_string(),
+                name: Some("u1".to_string()),
+                targets: vec![target_for_test(8080)],
+                algorithm: Default::default(),
+                hash_on: None,
+                hash_on_cookie_config: None,
+                health_checks: None,
+                service_discovery: None,
+                subsets: None,
+                port_overrides: HashMap::new(),
+                backend_tls_client_cert_path: None,
+                backend_tls_client_key_path: None,
+                backend_tls_verify_server_cert: true,
+                backend_tls_server_ca_cert_path: None,
+                api_spec_id: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            }],
+            ..GatewayConfig::default()
+        };
+        config_no_overrides.resolve_dispatch_port_overrides();
+        assert!(
+            config_no_overrides.proxies[0]
+                .dispatch_port_overrides
+                .is_none()
+        );
     }
 }

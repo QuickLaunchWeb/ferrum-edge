@@ -643,6 +643,7 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
+        dispatch_port_overrides: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -849,6 +850,7 @@ fn east_west_service_proxy(
         backend_tls_verify_server_cert: false,
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
+        dispatch_port_overrides: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -943,6 +945,17 @@ fn apply_destination_rules(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
                 apply_traffic_policy_to_upstream(upstream, policy);
             }
 
+            // Build a set of ports actually exposed by this upstream's
+            // targets. Used to filter phantom DR entries whose port is not
+            // served by any backend — misconfigured DRs (typo in port
+            // number) would otherwise silently bloat
+            // `Upstream.port_overrides`. Upstreams using service discovery
+            // resolve target ports at runtime, so we keep all entries when
+            // service_discovery is configured.
+            let upstream_target_ports: std::collections::HashSet<u16> =
+                upstream.targets.iter().map(|t| t.port).collect();
+            let has_service_discovery = upstream.service_discovery.is_some();
+
             // Second pass: per-port traffic policy overrides land on the
             // upstream's `port_overrides` slot. Pool-level dispatch already
             // keys per destination port, so per-port policy naturally scopes
@@ -950,6 +963,39 @@ fn apply_destination_rules(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
             // first so per-port acts as an additive override of the same
             // fields.
             for (port, port_policy) in &dr.port_level_settings {
+                if !has_service_discovery && !upstream_target_ports.contains(port) {
+                    warn!(
+                        rule = %dr.name,
+                        upstream = %upstream.id,
+                        port = port,
+                        "DestinationRule portLevelSettings entry references a port not used by any target; skipping"
+                    );
+                    continue;
+                }
+
+                // The K8s translator emits warnings for
+                // `portLevelSettings[].loadBalancer` / `outlierDetection` at
+                // translate time (src/config_sources/k8s/istio.rs), but
+                // native MeshSubscribe / xDS slices bypass that path. Surface
+                // the same gap here so operators see the unenforced fields
+                // regardless of how the slice arrives at the data plane.
+                if port_policy.load_balancer.is_some() {
+                    warn!(
+                        rule = %dr.name,
+                        upstream = %upstream.id,
+                        port = port,
+                        "DestinationRule portLevelSettings.loadBalancer is parsed but not enforced per-port today (gateway keeps a single load balancer per upstream); only connectTimeout is applied"
+                    );
+                }
+                if port_policy.outlier_detection.is_some() {
+                    warn!(
+                        rule = %dr.name,
+                        upstream = %upstream.id,
+                        port = port,
+                        "DestinationRule portLevelSettings.outlierDetection is parsed but not enforced per-port today (gateway keeps a single passive health check per upstream); only connectTimeout is applied"
+                    );
+                }
+
                 let override_slot = upstream.port_overrides.entry(*port).or_default();
                 apply_traffic_policy_to_port_override(override_slot, port_policy);
             }
@@ -1499,6 +1545,7 @@ fn egress_gateway_proxy(
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
+        dispatch_port_overrides: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -3707,12 +3754,22 @@ mod tests {
 
     #[test]
     fn destination_rule_two_per_port_overrides_land_on_distinct_slots() {
+        // Upstream must expose BOTH ports the DR references — the phantom-
+        // port filter in `apply_destination_rules` rejects per-port settings
+        // whose port is not served by any target. Add a 9090 target so the
+        // second DR entry has somewhere to land.
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        upstream.targets.push(UpstreamTarget {
+            host: "reviews.default.svc.cluster.local".to_string(),
+            port: 9090,
+            weight: 1,
+            tags: HashMap::new(),
+            path: None,
+        });
         let mut config = GatewayConfig {
             proxies: vec![destination_rule_test_proxy("p1", "u1")],
-            upstreams: vec![destination_rule_test_upstream(
-                "u1",
-                "reviews.default.svc.cluster.local",
-            )],
+            upstreams: vec![upstream],
             ..GatewayConfig::default()
         };
         let mut port_level = HashMap::new();
