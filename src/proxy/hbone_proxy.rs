@@ -238,6 +238,18 @@ pub(super) async fn handle_hbone_request(
     method: &str,
     plugin_execution_ns: u64,
 ) -> Response<ProxyBody> {
+    // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
+    // Istio VirtualService header/method match). When no overrides are set,
+    // this is an `Arc::clone` — no per-request allocation. When overrides
+    // are set, the override values are baked into a fresh `Arc<Proxy>` so
+    // downstream pool keys, capability-registry lookups, URL construction,
+    // and circuit-breaker target keys all derive from the effective
+    // destination (pool-poisoning invariant). Keep in sync with the H1/H2
+    // dispatch path in `src/proxy/mod.rs::handle_proxy_request_inner` and
+    // the HTTP/3 server in `src/http3/server.rs`.
+    let proxy_arc = ctx.apply_route_overrides(Arc::clone(proxy));
+    let proxy: &Arc<Proxy> = &proxy_arc;
+
     let selection = backend_dispatch::select_upstream_target(
         proxy,
         ctx.route_override_upstream_id.as_deref(),
