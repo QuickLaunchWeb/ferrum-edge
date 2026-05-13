@@ -551,6 +551,55 @@ When `FERRUM_MESH_TOPOLOGY=egress_gateway`, the mesh runtime materializes HTTP-f
 
 `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS` configures baggage header keys to strip before forwarding to external backends, preventing identity leakage outside the mesh.
 
+## Sidecar Egress Scoping
+
+Istio `Sidecar` resources narrow which mesh service configuration a workload receives for egress. Ferrum translates the egress portion of a `Sidecar` into a `MeshSidecar` record and applies it at slice build time. Ingress listener configuration on `Sidecar` is intentionally not modeled — egress config scoping is the immediate compatibility gap.
+
+### Behavior
+
+When `FERRUM_MESH_SIDECAR_ENFORCED=true`, the `MeshSlice` projection narrows `services`, `service_entries`, and `destination_rules` to the set admitted by the workload's applicable `Sidecar`. When `false` (the default), `Sidecar` resources are still parsed and persisted in `MeshConfig` for future use, but slice narrowing is skipped and behavior is identical to today.
+
+### Resolution Precedence
+
+Most specific wins:
+
+1. **Workload-scoped** Sidecar (`spec.workloadSelector.matchLabels` matches the workload's labels)
+2. **Namespace-default** Sidecar (no `workloadSelector`)
+3. **No Sidecar applies** → no narrowing (existing behavior)
+
+### Host Pattern Syntax
+
+Each `spec.egress[].hosts` entry follows Istio scope-host syntax:
+
+| Pattern | Meaning |
+|---|---|
+| `*/*` | Allow everything (effective no-op) |
+| `*/host` | `host` in any namespace |
+| `./host` | `host` in the Sidecar's own namespace |
+| `namespace/host` | Exact namespace + host match |
+| `namespace/*` | Anything in the specified namespace |
+| `~/*` | No namespace; trims all service config from the slice |
+| `host` (bare) | Treated as `./host` — current Sidecar's namespace |
+
+The `host` portion may itself be a single-label DNS wildcard (e.g. `*/*.example.com` admits `api.example.com` but not `example.com` nor `a.b.example.com`). This is the same single-label wildcard semantic Ferrum uses elsewhere (`config::types::wildcard_matches`, mesh DNS proxy); operators relying on deeper-than-one-label wildcards should list the additional surfaces explicitly. `MeshService` entries match their short name, `{name}.{namespace}`, `{name}.{namespace}.svc`, and `{name}.{namespace}.svc.{cluster_domain}` aliases. On the control plane this suffix follows `FERRUM_K8S_CLUSTER_DOMAIN`; in local mesh mode it follows `FERRUM_MESH_CLUSTER_DOMAIN`.
+
+When Kubernetes `spec.egress` is omitted, Istio inherits the namespace-default outbound scope; Ferrum preserves that distinction so an ingress-only workload Sidecar does not override a namespace default. If no namespace default Sidecar exists, omitted egress is treated as no narrowing. An explicit native/file `egress: []` or `~/*` trims all service config from the slice. The optional `spec.egress[].port.number` is parsed and recorded but does not yet narrow by listener port — port matching for egress is a follow-up.
+
+When multiple `Sidecar` resources in the same namespace apply at the same scope tier (two namespace-defaults, or two workload-scoped Sidecars both matching the same workload), the resolver picks the ASCII-smallest `name` as the deterministic tiebreak so reconciles are stable across pods and restarts.
+
+### Known Limitations
+
+- `Sidecar` resources placed in the Istio root namespace (`istio-system` by default) are not yet treated as cluster-wide defaults. They apply only to workloads in their own namespace. Operators relying on a mesh-wide default `Sidecar` should declare a namespace-default `Sidecar` in each workload namespace until the root-namespace plumbing lands.
+- Slice narrowing today filters `services`, `service_entries`, and `destination_rules`. **Workload identity entries are not filtered** by Sidecar scope — every workload in the workload's own namespace continues to appear in the slice even when the applicable Sidecar only allows egress to a subset of services. This avoids breaking introspection and mTLS peer-identity lookups; workload-identity narrowing is tracked as a follow-up.
+
+### Migration Notes
+
+The flag defaults `false` so existing deployments see zero behavior change on upgrade. Operators should:
+
+1. Apply `Sidecar` CRDs and verify the translator parses them without errors.
+2. Inspect mesh slices (via the CP debug endpoint) to confirm the expected narrowing would apply.
+3. Set `FERRUM_MESH_SIDECAR_ENFORCED=true` on the CP and roll. DPs receive the already-narrowed slice — no DP-side configuration is required.
+
 ## DestinationRule
 
 Istio `DestinationRule` resources are translated into Ferrum upstream and proxy configuration at the Kubernetes translation layer. The following fields are supported:
@@ -928,7 +977,6 @@ The following Istio mesh surfaces are **not yet supported** and should be treate
 
 | Surface | Status | Workaround |
 |---|---|---|
-| `Sidecar` (egress scoping) | Deferred | Use Ferrum proxy routing and upstream configuration |
 | `EnvoyFilter` | Not planned | Use Ferrum custom plugins |
 | `WasmPlugin` | Not planned | Use Ferrum custom plugins (`custom_plugins/`) |
 | Outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`) | Deferred | Unknown outbound destinations are not blocked today |
@@ -951,6 +999,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_WORKLOAD_SPIFFE_ID` | (none) | SPIFFE ID of this mesh workload |
 | `FERRUM_MESH_WORKLOAD_LABELS` | (none) | Comma-separated `key=value` workload labels for PolicyScope matching |
 | `FERRUM_MESH_TRUST_DOMAIN_ALIASES` | (none) | Additional trust domains for HBONE baggage validation |
+| `FERRUM_MESH_SIDECAR_ENFORCED` | `false` | When `true`, applies Istio `Sidecar` egress scope narrowing to `services` / `service_entries` / `destination_rules` per workload. Sidecars are always parsed; this flag gates only the slice-narrowing pass. Opt in after vetting your `Sidecar` resources |
 
 ### Listeners
 

@@ -1621,6 +1621,15 @@ impl ProxyState {
         tls_policy: Option<TlsPolicy>,
         health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
+        if let Err(errors) = validate_mesh_route_dispatch_upstream_references(&config) {
+            for msg in &errors {
+                error!("Initial config rejected: {}", msg);
+            }
+            return Err(anyhow::anyhow!(
+                "Initial config has invalid mesh_route_dispatch upstream references"
+            ));
+        }
+
         let alt_svc_header = if env_config.enable_http3 {
             Some(format!("h3=\":{}\"; ma=86400", env_config.proxy_https_port))
         } else {
@@ -15141,6 +15150,47 @@ mod tests {
         assert!(
             err.iter().any(|e| e.contains("mesh_route_dispatch")),
             "error must identify the plugin family; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_state_new_rejects_dangling_mesh_route_dispatch_upstream_id() {
+        // The same reject contract must hold for the initial constructor, not
+        // only reloads. File/database/mesh startup call ProxyState::new()
+        // directly after loader validation, and the loader pipeline does not
+        // inspect mesh_route_dispatch destinations.
+        let proxy = make_validation_proxy("p1", "/api");
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "mrd-p1".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "does-not-exist"}
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p1".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut bad_config = make_validation_config(vec![proxy]);
+        bad_config.plugin_configs = vec![plugin];
+
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let result = ProxyState::new(bad_config, dns_cache, env_config, None, None);
+
+        assert!(result.is_err(), "constructor must reject dangling upstream");
+        let err = result.err().expect("error present").to_string();
+        assert!(
+            err.contains("mesh_route_dispatch"),
+            "error must identify the invalid plugin family; got {err}"
         );
     }
 

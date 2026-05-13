@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -7,21 +7,24 @@ use crate::modes::mesh::config::{
     AccessLogFilter, AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig,
     MeshConsistentHash, MeshDestinationRule, MeshEndpoint, MeshJwtRule, MeshLoadBalancer,
     MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshProxyConfig,
-    MeshRequestAuthentication, MeshRule, MeshSimpleLb, MeshSubset, MeshTelemetryConfig,
-    MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy, MeshTrafficPolicyTls,
-    MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch,
-    RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
-    TagOverrideOperation, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
+    MeshRequestAuthentication, MeshRule, MeshSidecar, MeshSidecarEgress, MeshSimpleLb, MeshSubset,
+    MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy,
+    MeshTrafficPolicyTls, MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction,
+    PolicyScope, PrincipalMatch, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation,
+    ServicePort, TagOverrideOperation, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
 };
 
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions, RouteBackend,
     RouteProxySpec, SourceKind, exact_path_listen_path, fault_injection_plugin_for_proxy,
-    invalid_resource, mesh_route_dispatch_plugin_for_proxy, optional_port_field,
-    parse_istio_duration_ms, port_from_u64, proxy_for_route, resource_id, selector_from_istio,
-    string_array, string_field, string_map, upstream_for_route,
+    invalid_resource, mesh_route_dispatch_can_emit_rule,
+    mesh_route_dispatch_has_unsupported_predicate, mesh_route_dispatch_plugin_for_proxy,
+    optional_port_field, parse_istio_duration_ms, port_from_u64, proxy_for_route, resource_id,
+    selector_from_istio, string_array, string_field, string_map, upstream_for_route,
 };
 use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT, PluginConfig, RetryConfig};
+
+const URI_LESS_MATCH_LISTEN_PATH: &str = "~.*";
 
 pub(super) fn translate(
     acc: &mut K8sAccumulator,
@@ -70,10 +73,8 @@ pub(super) fn translate(
             Ok(true)
         }
         "Sidecar" => {
-            acc.warnings.push(format!(
-                "Sidecar {}/{} accepted; egress listener scoping is tracked for the Phase D reconciler and has no direct proxy output yet",
-                object.metadata.namespace, object.metadata.name
-            ));
+            let sidecar = sidecar(acc, object)?;
+            acc.mesh.sidecars.push(sidecar);
             Ok(true)
         }
         "Telemetry" => {
@@ -370,6 +371,119 @@ fn peer_authentication(
         selector,
         mtls_mode: effective_mtls_mode,
         port_overrides,
+    })
+}
+
+/// Translate an Istio `Sidecar` resource into a [`MeshSidecar`].
+///
+/// Parses:
+///   - `spec.workloadSelector.matchLabels` → [`MeshSidecar::workload_selector`]
+///     with the Sidecar's own namespace (a `Sidecar` only ever targets
+///     workloads in its own namespace, per Istio semantics).
+///   - `spec.egress[].hosts` → [`MeshSidecarEgress::hosts`] (verbatim — the
+///     slice builder parses each entry via `MeshSidecarEgress::parse_host_pattern`).
+///   - `spec.egress[].port.number` → [`MeshSidecarEgress::port`] (optional).
+///
+/// Ingress listener configuration (`spec.ingress[]`) and `outboundTrafficPolicy`
+/// are deliberately not translated yet — egress scoping is the immediate
+/// compatibility gap; the other surfaces stay in the documented "deferred"
+/// table until separate PRs land them.
+fn sidecar(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
+    if object.metadata.namespace == acc.options.istio_root_namespace {
+        acc.warnings.push(format!(
+            "Sidecar {}/{} is in the Istio root namespace '{}', but Ferrum Sidecar egress scoping is namespace-local today; it will not act as a mesh-wide default",
+            object.metadata.namespace, object.metadata.name, acc.options.istio_root_namespace
+        ));
+    }
+
+    let workload_selector = match object.spec.get("workloadSelector") {
+        Some(selector_value) => {
+            let labels = selector_from_istio(Some(selector_value));
+            if labels.is_empty() {
+                None
+            } else {
+                Some(WorkloadSelector {
+                    labels,
+                    namespace: Some(object.metadata.namespace.clone()),
+                })
+            }
+        }
+        None => None,
+    };
+
+    let mut egress = Vec::new();
+    let mut egress_inherits_defaults = false;
+    let mut port_scopes = BTreeSet::new();
+    match object.spec.get("egress") {
+        None => {
+            // Istio: omitted egress inherits the namespace default outbound
+            // scope. Keep it distinct from an explicit empty `egress: []`,
+            // which means block all.
+            egress_inherits_defaults = true;
+        }
+        Some(raw_egress) => {
+            let entries = raw_egress
+                .as_array()
+                .ok_or_else(|| invalid_resource(object, "Sidecar egress must be an array"))?;
+            for entry in entries {
+                let hosts_value = entry.get("hosts").ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        "Sidecar egress[].hosts must be a non-empty array of strings",
+                    )
+                })?;
+                let hosts_array = hosts_value.as_array().ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        "Sidecar egress[].hosts must be a non-empty array of strings",
+                    )
+                })?;
+                if hosts_array.is_empty() {
+                    return Err(invalid_resource(
+                        object,
+                        "Sidecar egress[].hosts must be a non-empty array of strings",
+                    ));
+                }
+                let hosts: Vec<String> = hosts_array
+                    .iter()
+                    .map(|host| {
+                        host.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                            invalid_resource(
+                                object,
+                                "Sidecar egress[].hosts must be a non-empty array of strings",
+                            )
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+                let port = match entry.get("port") {
+                    Some(port_obj) => optional_port_field(
+                        object,
+                        port_obj.get("number"),
+                        "Sidecar egress[].port.number",
+                    )?,
+                    None => None,
+                };
+                if let Some(port) = port {
+                    port_scopes.insert(port);
+                }
+                egress.push(MeshSidecarEgress { hosts, port });
+            }
+        }
+    }
+
+    if !port_scopes.is_empty() {
+        acc.warnings.push(format!(
+            "Sidecar {}/{} uses egress port scoping {:?}, but Ferrum currently narrows Sidecar egress by host only; the port field is parsed and preserved but not enforced",
+            object.metadata.namespace, object.metadata.name, port_scopes
+        ));
+    }
+
+    Ok(MeshSidecar {
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        workload_selector,
+        egress_inherits_defaults,
+        egress,
     })
 }
 
@@ -1219,13 +1333,16 @@ fn match_paths(http: &Value, vs_header_routing_experimental: bool) -> Vec<Option
         // Istio forbids empty HTTPMatchRequest blocks; URI-less entries depend on
         // unsupported predicates such as headers/method/queryParams, so do not
         // broaden them into Ferrum catch-all routes.
+        .filter(|m| {
+            !vs_header_routing_experimental || !mesh_route_dispatch_has_unsupported_predicate(m)
+        })
         .filter_map(|m| m.get("uri").and_then(path_match).map(Some))
         .filter(|listen_path| seen_paths.insert(listen_path.clone()))
         .collect();
 
     // Codex P2 (#3237631709): with `vs_header_routing_experimental=true`,
-    // materialize a `/` catch-all listen_path when at least one match
-    // entry has NO URI predicate but DOES carry a supported non-URI
+    // materialize a regex catch-all listen_path when at least one match
+    // entry has NO URI predicate but DOES carry a fully-supported non-URI
     // predicate (`method.exact`, `headers.X.exact`, `queryParams.X.exact`).
     // Without this, an `http.match[]` consisting only of header/method/
     // queryParam predicates produces no listen_path → no proxy → the
@@ -1233,52 +1350,19 @@ fn match_paths(http: &Value, vs_header_routing_experimental: bool) -> Vec<Option
     // have been routed by header is unroutable. The mesh_route_dispatch
     // plugin scopes match entries to the listen_path it's installed on,
     // so any URI-bearing siblings stay on their own proxy and do not
-    // bleed onto the catch-all.
+    // bleed onto the catch-all. The synthetic path is regex (`~.*`) rather
+    // than prefix `/` so Ferrum's prefix-before-regex router does not let
+    // a URI-less sibling shadow real regex URI routes.
     if vs_header_routing_experimental
-        && !seen_paths.contains(&Some("/".to_string()))
+        && !seen_paths.contains(&Some(URI_LESS_MATCH_LISTEN_PATH.to_string()))
         && matches
             .iter()
-            .any(|m| m.get("uri").is_none() && entry_has_supported_non_uri_predicates(m))
+            .any(|m| m.get("uri").is_none() && mesh_route_dispatch_can_emit_rule(m))
     {
-        paths.push(Some("/".to_string()));
+        paths.push(Some(URI_LESS_MATCH_LISTEN_PATH.to_string()));
     }
 
     paths
-}
-
-/// Returns true when an Istio HTTPMatchRequest entry has at least one
-/// supported non-URI predicate that mesh_route_dispatch can enforce —
-/// `method.exact`, `headers.X.exact`, or `queryParams.X.exact`. Used to
-/// decide whether materializing a `/` catch-all listen_path for a
-/// URI-less entry would actually produce an enforceable plugin rule.
-/// Returning `false` for unsupported-only entries (e.g., `method.regex`)
-/// prevents the translator from emitting a catch-all proxy that would
-/// then have no plugin attached, silently widening traffic.
-fn entry_has_supported_non_uri_predicates(entry: &Value) -> bool {
-    if entry
-        .get("method")
-        .and_then(Value::as_object)
-        .and_then(|m| m.get("exact"))
-        .and_then(Value::as_str)
-        .is_some()
-    {
-        return true;
-    }
-    if let Some(headers) = entry.get("headers").and_then(Value::as_object)
-        && headers
-            .values()
-            .any(|v| v.get("exact").and_then(Value::as_str).is_some())
-    {
-        return true;
-    }
-    if let Some(qp) = entry.get("queryParams").and_then(Value::as_object)
-        && qp
-            .values()
-            .any(|v| v.get("exact").and_then(Value::as_str).is_some())
-    {
-        return true;
-    }
-    false
 }
 
 fn route_backends(
@@ -5717,11 +5801,12 @@ mod tests {
     }
 
     #[test]
-    fn virtual_service_regex_uri_with_ignored_predicates_does_not_emit_plugin() {
+    fn virtual_service_regex_uri_with_ignored_predicates_does_not_materialize_route() {
         // Unsupported non-URI match shapes (regex method/header/queryParam)
-        // are intentionally ignored by the current translator. A match entry
-        // with only URI plus ignored predicate types must not emit an empty
-        // mesh_route_dispatch rule.
+        // cannot be enforced by mesh_route_dispatch. A match entry with URI
+        // plus only unsupported predicate types must not materialize a naked
+        // URI proxy, because that would forward every regex-URI request
+        // without the method/header/query gates.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -5749,9 +5834,9 @@ mod tests {
                 .all(|p| p.plugin_name != "mesh_route_dispatch"),
             "URI plus ignored predicates should not emit mesh_route_dispatch"
         );
-        assert_eq!(
-            result.config.proxies[0].listen_path.as_deref(),
-            Some("~/v[0-9]+/api")
+        assert!(
+            result.config.proxies.is_empty(),
+            "URI plus unsupported predicates must not materialize an unguarded proxy"
         );
     }
 
@@ -6039,9 +6124,9 @@ mod tests {
         // legitimate Istio configuration -- it routes "any URI with these
         // predicates" on the listed hosts. Previously the translator
         // dropped such routes entirely because match_paths was URI-driven.
-        // With the experimental flag on, materialize a `/` catch-all
+        // With the experimental flag on, materialize a regex catch-all
         // proxy + mesh_route_dispatch plugin so the operator's predicates
-        // are actually enforced.
+        // are actually enforced without shadowing real prefix/regex routes.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -6063,8 +6148,8 @@ mod tests {
             .config
             .proxies
             .iter()
-            .find(|p| p.listen_path.as_deref() == Some("/"))
-            .expect("`/` catch-all proxy materialized for header-only match");
+            .find(|p| p.listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH))
+            .expect("regex catch-all proxy materialized for header-only match");
         assert_eq!(proxy.hosts, vec!["api.example.com".to_string()]);
 
         let plugin = result
@@ -6122,7 +6207,7 @@ mod tests {
                 .config
                 .proxies
                 .iter()
-                .any(|p| p.listen_path.as_deref() == Some("/")),
+                .any(|p| p.listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH)),
             "no catch-all materialized when experimental flag is off"
         );
         assert!(
@@ -6138,7 +6223,7 @@ mod tests {
     #[test]
     fn virtual_service_header_only_match_with_unsupported_predicates_skipped() {
         // A header-only entry whose only header predicate is `regex`
-        // cannot be enforced by mesh_route_dispatch. Materializing a `/`
+        // cannot be enforced by mesh_route_dispatch. Materializing a
         // catch-all with no rule would route ALL traffic to the route's
         // backend, silently widening past the operator's intent. Skip
         // materialization entirely; today's drop behaviour is the
@@ -6164,15 +6249,51 @@ mod tests {
                 .config
                 .proxies
                 .iter()
-                .any(|p| p.listen_path.as_deref() == Some("/")),
+                .any(|p| p.listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH)),
             "header-only match with only unsupported predicates does not materialize a catch-all"
+        );
+    }
+
+    #[test]
+    fn virtual_service_header_only_match_with_partial_unsupported_predicates_skipped() {
+        // A URI-less entry with one exact predicate and one unsupported
+        // predicate is unsafe to materialize: mesh_route_dispatch would skip
+        // the partial rule, leaving an unguarded catch-all proxy behind.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {
+                                "headers": {
+                                    "x-canary": {"exact": "v2"},
+                                    "x-tier": {"regex": "gold|platinum"}
+                                }
+                            }
+                        ],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+        assert!(
+            result.config.proxies.is_empty(),
+            "partial URI-less predicates must not materialize an unguarded catch-all"
+        );
+        assert!(
+            result.config.plugin_configs.is_empty(),
+            "partial URI-less predicates must not emit a dispatch plugin"
         );
     }
 
     #[test]
     fn virtual_service_mixed_uri_and_header_only_match_emits_both_proxies() {
         // A `match[]` mixing one URI entry and one URI-less header entry
-        // must produce BOTH proxies: the URI-derived `/api` AND the `/`
+        // must produce BOTH proxies: the URI-derived `/api` AND a regex
         // catch-all for the URI-less header rule. Without the catch-all,
         // `/other` requests carrying the header would 404 even though
         // Istio semantics route them via the URI-less branch.
@@ -6204,7 +6325,7 @@ mod tests {
             .config
             .proxies
             .iter()
-            .find(|p| p.listen_path.as_deref() == Some("/"))
+            .find(|p| p.listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH))
             .expect("URI-less catch-all proxy");
         assert_ne!(api_proxy.id, catch_all.id);
 
@@ -6245,6 +6366,55 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true),
             "catch-all proxy has no URI-only sibling in scope, so reject_unmatched stays on"
+        );
+    }
+
+    #[test]
+    fn virtual_service_mixed_regex_uri_and_header_only_uses_regex_catch_all() {
+        // Ferrum routes prefixes before regexes. If the URI-less header
+        // branch were materialized as prefix `/`, it would shadow the real
+        // regex URI branch and reject requests that should match it.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"regex": "/v[0-9]+/api"}},
+                            {"headers": {"x-canary": {"exact": "v2"}}}
+                        ],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+
+        assert!(
+            result
+                .config
+                .proxies
+                .iter()
+                .any(|p| p.listen_path.as_deref() == Some("~/v[0-9]+/api")),
+            "regex URI branch must still materialize"
+        );
+        assert!(
+            result
+                .config
+                .proxies
+                .iter()
+                .any(|p| p.listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH)),
+            "URI-less branch should use regex catch-all"
+        );
+        assert!(
+            !result
+                .config
+                .proxies
+                .iter()
+                .any(|p| p.listen_path.as_deref() == Some("/")),
+            "URI-less branch must not become prefix `/`, which shadows regex routes"
         );
     }
 
@@ -6866,6 +7036,8 @@ mod tests {
             namespace: "default".to_string(),
             workload_spiffe_id: None,
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            cluster_domain: "cluster.local".to_string(),
+            enforce_sidecar_egress: false,
         };
         let slice = MeshSlice::from_gateway_config(&gateway_config, request);
         // Both should match — namespace-default applies to any workload, and
@@ -7906,6 +8078,276 @@ mod tests {
         assert!(
             err.to_string().contains("port.number is required"),
             "expected port.number required error, got {err}"
+        );
+    }
+
+    // ── Sidecar translator ──────────────────────────────────────────────
+
+    #[test]
+    fn sidecar_with_workload_selector_and_egress_translates_correctly() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "workloadSelector": {
+                        "matchLabels": {"app": "frontend"}
+                    },
+                    "egress": [
+                        {
+                            "hosts": [
+                                "./reviews.default.svc.cluster.local",
+                                "*/external.example.com"
+                            ],
+                            "port": {"number": 8080}
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        // Sidecar must NOT produce the old Phase-D warning. Port scoping is
+        // parsed but not enforced yet, so that unsupported field gets a focused
+        // warning instead.
+        assert!(
+            !result.warnings.iter().any(|w| w.contains("Phase D")),
+            "Sidecar translation must not emit the deferred warning; warnings = {:?}",
+            result.warnings
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| { w.contains("egress port scoping") && w.contains("host only") }),
+            "Sidecar egress port should emit a host-only warning; warnings = {:?}",
+            result.warnings
+        );
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.sidecars.len(), 1);
+        let sc = &mesh.sidecars[0];
+        assert_eq!(sc.name, "sample");
+        assert_eq!(sc.namespace, "default");
+        let selector = sc
+            .workload_selector
+            .as_ref()
+            .expect("workload selector parsed");
+        assert_eq!(
+            selector.labels.get("app").map(String::as_str),
+            Some("frontend")
+        );
+        assert_eq!(selector.namespace.as_deref(), Some("default"));
+        assert!(!sc.egress_inherits_defaults);
+        assert_eq!(sc.egress.len(), 1);
+        assert_eq!(
+            sc.egress[0].hosts,
+            vec![
+                "./reviews.default.svc.cluster.local".to_string(),
+                "*/external.example.com".to_string(),
+            ]
+        );
+        assert_eq!(sc.egress[0].port, Some(8080));
+    }
+
+    #[test]
+    fn sidecar_without_workload_selector_is_namespace_default() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {"hosts": ["./reviews.default.svc.cluster.local"]}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.sidecars.len(), 1);
+        assert!(mesh.sidecars[0].workload_selector.is_none());
+        assert!(!mesh.sidecars[0].egress_inherits_defaults);
+        assert_eq!(mesh.sidecars[0].egress[0].port, None);
+    }
+
+    #[test]
+    fn sidecar_with_omitted_egress_inherits_outbound_defaults() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "workloadSelector": {"matchLabels": {"app": "frontend"}},
+                    "ingress": [
+                        {"port": {"number": 8080, "protocol": "HTTP", "name": "http"}}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.sidecars.len(), 1);
+        assert!(mesh.sidecars[0].egress_inherits_defaults);
+        assert!(mesh.sidecars[0].egress.is_empty());
+    }
+
+    #[test]
+    fn sidecar_translator_emits_no_warning_for_valid_resource() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {"hosts": ["*/*"]}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(
+            result.warnings.is_empty(),
+            "valid Sidecar must produce no warnings; got {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn sidecar_in_root_namespace_emits_scope_warning() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {"hosts": ["*/*"]}
+                    ]
+                }),
+            )],
+            options().with_istio_root_namespace("default".to_string()),
+        )
+        .expect("translation succeeds");
+
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| { w.contains("root namespace") && w.contains("namespace-local") }),
+            "root namespace Sidecar should emit scope warning; got {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn sidecar_with_empty_workload_selector_matchlabels_is_namespace_default() {
+        // workloadSelector present but matchLabels empty → treat as no
+        // selector. Mirrors Istio: a Sidecar with an empty selector applies
+        // to every workload in the namespace (i.e. namespace-default).
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "workloadSelector": {"matchLabels": {}},
+                    "egress": [
+                        {"hosts": ["*/*"]}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.sidecars.len(), 1);
+        assert!(
+            mesh.sidecars[0].workload_selector.is_none(),
+            "empty matchLabels should round-trip to no selector"
+        );
+    }
+
+    #[test]
+    fn sidecar_with_invalid_port_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {
+                            "hosts": ["./svc.default.svc.cluster.local"],
+                            "port": {"number": 0}
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("port 0 should be rejected");
+        assert!(
+            err.to_string().contains("Sidecar egress[].port.number"),
+            "error must reference the field; got {err}"
+        );
+    }
+
+    #[test]
+    fn sidecar_egress_missing_hosts_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {"port": {"number": 8080}}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("missing hosts should be rejected");
+        assert!(
+            err.to_string().contains("Sidecar egress[].hosts"),
+            "error must reference hosts; got {err}"
+        );
+    }
+
+    #[test]
+    fn sidecar_egress_empty_hosts_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {"hosts": []}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("empty hosts should be rejected");
+        assert!(
+            err.to_string().contains("Sidecar egress[].hosts"),
+            "error must reference hosts; got {err}"
+        );
+    }
+
+    #[test]
+    fn sidecar_egress_non_string_hosts_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {"hosts": ["./svc.default.svc.cluster.local", 42]}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("non-string hosts should be rejected");
+        assert!(
+            err.to_string().contains("Sidecar egress[].hosts"),
+            "error must reference hosts; got {err}"
         );
     }
 }

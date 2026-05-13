@@ -716,26 +716,16 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
 
         let mut match_criteria = serde_json::Map::new();
         // Track whether this entry carries any non-URI predicate that we
-        // cannot represent in the mesh_route_dispatch rule. Examples:
-        // `method.regex` / `method.prefix` (we only support `.exact`),
-        // `headers.X.regex` / `headers.X.prefix`, `queryParams.X.regex`,
-        // and entirely-unsupported keys (`authority`, `scheme`, `port`,
-        // `sourceLabels`, `gateways`, `withoutHeaders`, `sourceNamespace`).
-        // When set, emitting a partial rule would silently widen traffic
-        // (e.g., `method=GET + headers.X.regex` would treat ALL GET as a
-        // match), so we skip the entry and let `reject_unmatched: true`
-        // 404 the request. Critically, an unsupported-predicate entry
-        // must NOT collapse onto the URI-only catch-all branch — that
-        // would disable `reject_unmatched` and forward exactly the
-        // traffic the operator gated.
-        let mut had_unsupported_predicate = false;
+        // cannot represent in the mesh_route_dispatch rule. Keep this
+        // classification in one helper so path materialization and plugin
+        // rule emission agree: a URI-less entry that would be skipped here
+        // must not create an unguarded catch-all proxy in `match_paths`.
+        let had_unsupported_predicate = mesh_route_dispatch_has_unsupported_predicate(entry);
 
-        if let Some(method_obj) = entry.get("method").and_then(Value::as_object) {
-            if let Some(method) = method_obj.get("exact").and_then(Value::as_str) {
-                match_criteria.insert("methods".to_string(), serde_json::json!([method]));
-            } else {
-                had_unsupported_predicate = true;
-            }
+        if let Some(method_obj) = entry.get("method").and_then(Value::as_object)
+            && let Some(method) = method_obj.get("exact").and_then(Value::as_str)
+        {
+            match_criteria.insert("methods".to_string(), serde_json::json!([method]));
         }
 
         if let Some(headers_obj) = entry.get("headers").and_then(Value::as_object) {
@@ -743,8 +733,6 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
             for (name, value) in headers_obj {
                 if let Some(exact) = value.get("exact").and_then(Value::as_str) {
                     headers.insert(name.to_ascii_lowercase(), Value::String(exact.to_string()));
-                } else {
-                    had_unsupported_predicate = true;
                 }
             }
             if !headers.is_empty() {
@@ -757,30 +745,10 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
             for (name, value) in qp_obj {
                 if let Some(exact) = value.get("exact").and_then(Value::as_str) {
                     params.insert(name.to_string(), Value::String(exact.to_string()));
-                } else {
-                    had_unsupported_predicate = true;
                 }
             }
             if !params.is_empty() {
                 match_criteria.insert("query_params".to_string(), Value::Object(params));
-            }
-        }
-
-        if let Some(obj) = entry.as_object() {
-            for key in obj.keys() {
-                if matches!(
-                    key.as_str(),
-                    "authority"
-                        | "scheme"
-                        | "port"
-                        | "sourceLabels"
-                        | "gateways"
-                        | "withoutHeaders"
-                        | "sourceNamespace"
-                ) {
-                    had_unsupported_predicate = true;
-                    break;
-                }
             }
         }
 
@@ -853,6 +821,90 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
         created_at: now,
         updated_at: now,
     })
+}
+
+pub(crate) fn mesh_route_dispatch_has_supported_non_uri_predicate(entry: &Value) -> bool {
+    if entry
+        .get("method")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get("exact"))
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return true;
+    }
+    if let Some(headers) = entry.get("headers").and_then(Value::as_object)
+        && headers
+            .values()
+            .any(|v| v.get("exact").and_then(Value::as_str).is_some())
+    {
+        return true;
+    }
+    if let Some(qp) = entry.get("queryParams").and_then(Value::as_object)
+        && qp
+            .values()
+            .any(|v| v.get("exact").and_then(Value::as_str).is_some())
+    {
+        return true;
+    }
+    false
+}
+
+pub(crate) fn mesh_route_dispatch_has_unsupported_predicate(entry: &Value) -> bool {
+    if entry.get("method").is_some()
+        && entry
+            .get("method")
+            .and_then(Value::as_object)
+            .and_then(|m| m.get("exact"))
+            .and_then(Value::as_str)
+            .is_none()
+    {
+        return true;
+    }
+
+    if let Some(headers) = entry.get("headers") {
+        let Some(headers) = headers.as_object() else {
+            return true;
+        };
+        if headers
+            .values()
+            .any(|v| v.get("exact").and_then(Value::as_str).is_none())
+        {
+            return true;
+        }
+    }
+
+    if let Some(qp) = entry.get("queryParams") {
+        let Some(qp) = qp.as_object() else {
+            return true;
+        };
+        if qp
+            .values()
+            .any(|v| v.get("exact").and_then(Value::as_str).is_none())
+        {
+            return true;
+        }
+    }
+
+    entry.as_object().is_some_and(|obj| {
+        obj.keys().any(|key| {
+            matches!(
+                key.as_str(),
+                "authority"
+                    | "scheme"
+                    | "port"
+                    | "sourceLabels"
+                    | "gateways"
+                    | "withoutHeaders"
+                    | "sourceNamespace"
+            )
+        })
+    })
+}
+
+pub(crate) fn mesh_route_dispatch_can_emit_rule(entry: &Value) -> bool {
+    mesh_route_dispatch_has_supported_non_uri_predicate(entry)
+        && !mesh_route_dispatch_has_unsupported_predicate(entry)
 }
 
 /// Parse an Istio duration string to milliseconds. Supports the same suffix

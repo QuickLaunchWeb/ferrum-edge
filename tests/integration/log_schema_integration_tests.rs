@@ -255,6 +255,75 @@ async fn loki_logging_accepts_schema() {
 }
 
 #[test]
+fn access_log_accepts_schema() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    create_ok(
+        "access_log",
+        json!({
+            "schema": {
+                "summary_type": "both",
+                "rename": { "proxy_id": "route_id" }
+            }
+        }),
+    );
+}
+
+#[test]
+fn access_log_accepts_schema_ref() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    registry::begin_reload();
+    create_ok(
+        "transaction_log_schema",
+        json!({
+            "schemas": {
+                "shared": { "summary_type": "both" }
+            }
+        }),
+    );
+    registry::commit_reload();
+    create_ok("access_log", json!({ "schema_ref": "shared" }));
+}
+
+#[test]
+fn static_fields_literal_bearer_token_rejected_via_create_plugin() {
+    // End-to-end: the bearer-detection guard fires through the full
+    // create_plugin construction path, not just SummarySchema::compile.
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    let err = create_err(
+        "stdout_logging",
+        json!({
+            "schema": {
+                "static_fields": { "audit_note": "Bearer leaked.jwt.token" }
+            }
+        }),
+    );
+    assert!(
+        err.contains("looks like an HTTP Bearer credential"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn static_fields_aws_sigv4_value_rejected_via_create_plugin() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    let err = create_err(
+        "stdout_logging",
+        json!({
+            "schema": {
+                "static_fields": {
+                    "operator_note": "AWS4-HMAC-SHA256 Credential=AKIA.../...,SignedHeaders=...,Signature=..."
+                }
+            }
+        }),
+    );
+    assert!(err.contains("AWS4-HMAC-SHA256"), "got: {err}");
+}
+
+#[test]
 fn failed_cache_build_does_not_leak_registry_changes() {
     // Atomicity guarantee: when PluginCache::new rejects a config because
     // a downstream plugin fails to construct, the named-schema registry
