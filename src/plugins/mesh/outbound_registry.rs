@@ -21,12 +21,13 @@
 //!   checks both `host` and `host:port` against the registry so operators
 //!   can register either form.
 //! - Mesh-internal service-cluster-local hostnames are matched as-is; the
-//!   registry-build helper records the FQDN.
-//! - Wildcard ServiceEntry hosts (`*.example.com`) are currently inserted
-//!   verbatim into the registry, so an exact-match request to
-//!   `client.example.com` does NOT match a wildcard registration. Suffix
-//!   matching is a tracked follow-up; until then operators with wildcard
-//!   ServiceEntry hosts should register the concrete hosts they expect.
+//!   registry-build helper records the short, namespace-qualified, `.svc`,
+//!   and FQDN forms.
+//! - Wildcard ServiceEntry hosts (`*.example.com`) match one DNS label below
+//!   the suffix, consistent with Ferrum's host wildcard semantics.
+//! - An empty registry is valid and fails closed: every request is rejected,
+//!   but the plugin remains installed so REGISTRY_ONLY never silently falls
+//!   back to ALLOW_ANY.
 //!
 //! ## Wire compatibility
 //!
@@ -37,6 +38,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::net::IpAddr;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -85,6 +87,11 @@ pub struct OutboundRegistry {
     /// two zero-allocation `contains` lookups instead of building a single
     /// formatted key per request.
     host_ports: HashSet<String>,
+    /// Suffixes from wildcard host entries such as `*.example.com`.
+    wildcard_suffixes: Vec<String>,
+    /// Port-specific wildcard host suffixes from entries like
+    /// `*.example.com:443`.
+    wildcard_port_suffixes: HashMap<u16, Vec<String>>,
     reject_status: u16,
 }
 
@@ -92,13 +99,6 @@ impl OutboundRegistry {
     pub fn new(config: &Value) -> Result<Self, String> {
         let parsed: OutboundRegistryConfig = serde_json::from_value(config.clone())
             .map_err(|e| format!("mesh_outbound_registry: {e}"))?;
-        if parsed.registry.is_empty() {
-            return Err(
-                "mesh_outbound_registry: registry must not be empty (use AllowAny policy to \
-                 disable the gate)"
-                    .to_string(),
-            );
-        }
         if !(400..=599).contains(&parsed.reject_status) {
             return Err(format!(
                 "mesh_outbound_registry: reject_status must be 4xx/5xx (got {})",
@@ -107,33 +107,52 @@ impl OutboundRegistry {
         }
         let mut hosts: HashSet<String> = HashSet::with_capacity(parsed.registry.len());
         let mut host_ports: HashSet<String> = HashSet::new();
+        let mut wildcard_suffixes: Vec<String> = Vec::new();
+        let mut wildcard_port_suffixes: HashMap<u16, Vec<String>> = HashMap::new();
         for entry in parsed.registry {
-            let normalised = entry.trim().to_ascii_lowercase();
-            if normalised.is_empty() {
+            let Some(normalised) = normalise_registry_entry(&entry) else {
                 continue;
-            }
-            if is_host_port_entry(&normalised) {
-                host_ports.insert(normalised);
+            };
+            if let Some((host, port)) = split_registry_host_port(&normalised) {
+                if let Some(suffix) = wildcard_suffix(host) {
+                    wildcard_port_suffixes
+                        .entry(port)
+                        .or_default()
+                        .push(suffix.to_string());
+                } else {
+                    host_ports.insert(format!("{host}:{port}"));
+                }
+            } else if let Some(suffix) = wildcard_suffix(&normalised) {
+                wildcard_suffixes.push(suffix.to_string());
             } else {
                 hosts.insert(normalised);
             }
         }
-        if hosts.is_empty() && host_ports.is_empty() {
-            return Err(
-                "mesh_outbound_registry: registry must contain at least one non-empty entry"
-                    .to_string(),
-            );
+        wildcard_suffixes.sort();
+        wildcard_suffixes.dedup();
+        for suffixes in wildcard_port_suffixes.values_mut() {
+            suffixes.sort();
+            suffixes.dedup();
         }
         Ok(Self {
             hosts,
             host_ports,
+            wildcard_suffixes,
+            wildcard_port_suffixes,
             reject_status: parsed.reject_status,
         })
     }
 
     #[allow(dead_code)]
     pub fn registry_size(&self) -> usize {
-        self.hosts.len() + self.host_ports.len()
+        self.hosts.len()
+            + self.host_ports.len()
+            + self.wildcard_suffixes.len()
+            + self
+                .wildcard_port_suffixes
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
     }
 
     /// Per-request hot-path lookup. Uses a thread-local scratch `String` so
@@ -145,15 +164,26 @@ impl OutboundRegistry {
             let mut buf = cell.borrow_mut();
             buf.clear();
             buf.reserve(host.len() + 6); // host + ':' + up to 5-digit port
-            for byte in host.bytes() {
-                buf.push(byte.to_ascii_lowercase() as char);
+            normalise_request_host_into(host, &mut buf);
+            if buf.is_empty() {
+                return false;
             }
             if self.hosts.contains(buf.as_str()) {
+                return true;
+            }
+            if wildcard_suffix_matches_any(buf.as_str(), &self.wildcard_suffixes) {
                 return true;
             }
             let Some(port) = port else {
                 return false;
             };
+            if self
+                .wildcard_port_suffixes
+                .get(&port)
+                .is_some_and(|suffixes| wildcard_suffix_matches_any(buf.as_str(), suffixes))
+            {
+                return true;
+            }
             // Empty `host_ports` is common (operators register bare hosts
             // most often). Skip the format!-equivalent write entirely.
             if self.host_ports.is_empty() {
@@ -167,22 +197,100 @@ impl OutboundRegistry {
     }
 }
 
-/// Classify a normalised registry entry as a `host:port` pair (port is a
-/// 1-5 digit u16 suffix after a final `:`) or a bare hostname. IPv6
-/// literals registered without brackets would tickle this heuristic, but
-/// the canonical Host-header form is bracketed (`[::1]:8080`) and the
-/// `build_known_destinations` helper never emits unbracketed IPv6.
-fn is_host_port_entry(entry: &str) -> bool {
-    // Bracketed IPv6 literal: `[::1]` (no port) — not a host:port pair.
-    // `[::1]:8080` — *is* a host:port pair, distinguished by `]:` suffix.
-    if entry.starts_with('[') {
-        return entry.rsplit_once("]:").is_some_and(|(_, p)| {
-            !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok()
-        });
+fn normalise_registry_entry(entry: &str) -> Option<String> {
+    let entry = entry.trim().to_ascii_lowercase();
+    if entry.is_empty() {
+        return None;
     }
-    entry.rsplit_once(':').is_some_and(|(_, p)| {
-        !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok()
-    })
+    if let Some((host, port)) = split_registry_host_port(&entry) {
+        return normalise_host_part(host).map(|host| format!("{host}:{port}"));
+    }
+    normalise_host_part(&entry)
+}
+
+fn normalise_host_part(host: &str) -> Option<String> {
+    let host = host.trim().trim_end_matches('.');
+    if host.is_empty() {
+        return None;
+    }
+    if host.starts_with('[') {
+        if host.ends_with(']')
+            && let Ok(IpAddr::V6(addr)) = host[1..host.len() - 1].parse::<IpAddr>()
+        {
+            return Some(format!("[{addr}]"));
+        }
+        return Some(host.to_string());
+    }
+    if let Ok(IpAddr::V6(addr)) = host.parse::<IpAddr>() {
+        return Some(format!("[{addr}]"));
+    }
+    Some(host.to_string())
+}
+
+fn normalise_request_host_into(host: &str, buf: &mut String) {
+    let host = host.trim();
+    let host = if host.starts_with('[') {
+        host
+    } else {
+        host.trim_end_matches('.')
+    };
+    if host.starts_with('[')
+        && host.ends_with(']')
+        && let Ok(IpAddr::V6(addr)) = host[1..host.len() - 1].parse::<IpAddr>()
+    {
+        let _ = write!(buf, "[{addr}]");
+        return;
+    }
+    for byte in host.bytes() {
+        buf.push(byte.to_ascii_lowercase() as char);
+    }
+}
+
+fn wildcard_suffix(host: &str) -> Option<&str> {
+    let suffix = host.strip_prefix("*.")?;
+    if suffix.is_empty() || suffix.contains('*') {
+        return None;
+    }
+    Some(suffix)
+}
+
+fn wildcard_suffix_matches_any(host: &str, suffixes: &[String]) -> bool {
+    suffixes
+        .iter()
+        .any(|suffix| single_label_wildcard_suffix_matches(host, suffix))
+}
+
+fn single_label_wildcard_suffix_matches(host: &str, suffix: &str) -> bool {
+    if host == suffix {
+        return false;
+    }
+    let Some(prefix) = host.strip_suffix(suffix) else {
+        return false;
+    };
+    prefix.ends_with('.')
+        && !prefix[..prefix.len() - 1].is_empty()
+        && !prefix[..prefix.len() - 1].contains('.')
+}
+
+fn split_registry_host_port(entry: &str) -> Option<(&str, u16)> {
+    if entry.starts_with('[') {
+        let end = entry.rfind("]:")?;
+        let port = entry[end + 2..].parse::<u16>().ok()?;
+        return Some((&entry[..end + 1], port));
+    }
+    let (host, port_str) = entry.rsplit_once(':')?;
+    if host.contains(':') {
+        return None;
+    }
+    let port = port_str.parse::<u16>().ok()?;
+    Some((host, port))
+}
+
+/// Classify a normalised registry entry as a `host:port` pair (port is a
+/// 1-5 digit u16 suffix after a final `:`) or a bare hostname.
+#[cfg(test)]
+fn is_host_port_entry(entry: &str) -> bool {
+    split_registry_host_port(entry).is_some()
 }
 
 #[async_trait]
@@ -257,9 +365,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_registry_rejected() {
-        let err = OutboundRegistry::new(&json!({"registry": []})).unwrap_err();
-        assert!(err.contains("must not be empty"), "got: {err}");
+    fn empty_registry_matches_nothing() {
+        let plugin = registry_plugin(&[]);
+        assert_eq!(plugin.registry_size(), 0);
+        assert!(!plugin.contains("reviews.svc", None));
+        assert!(!plugin.contains("reviews.svc", Some(8080)));
     }
 
     #[test]
@@ -291,6 +401,40 @@ mod tests {
         let plugin = registry_plugin(&["Reviews.Default.Svc.Cluster.Local"]);
         assert!(plugin.contains("reviews.default.svc.cluster.local", None));
         assert!(plugin.contains("REVIEWS.DEFAULT.SVC.CLUSTER.LOCAL", None));
+    }
+
+    #[test]
+    fn trailing_dot_match() {
+        let plugin = registry_plugin(&["Reviews.Default.Svc.Cluster.Local."]);
+        assert!(plugin.contains("reviews.default.svc.cluster.local", None));
+        assert!(plugin.contains("reviews.default.svc.cluster.local.", Some(8080)));
+    }
+
+    #[test]
+    fn wildcard_host_matches_one_label() {
+        let plugin = registry_plugin(&["*.example.com"]);
+        assert!(plugin.contains("api.example.com", None));
+        assert!(plugin.contains("API.EXAMPLE.COM.", Some(443)));
+        assert!(!plugin.contains("example.com", None));
+        assert!(!plugin.contains("a.b.example.com", None));
+    }
+
+    #[test]
+    fn wildcard_host_port_is_specific() {
+        let plugin = registry_plugin(&["*.example.com:443"]);
+        assert!(plugin.contains("api.example.com", Some(443)));
+        assert!(!plugin.contains("api.example.com", None));
+        assert!(!plugin.contains("api.example.com", Some(80)));
+        assert!(!plugin.contains("a.b.example.com", Some(443)));
+    }
+
+    #[test]
+    fn unbracketed_ipv6_registry_entry_is_canonicalized() {
+        let plugin = registry_plugin(&["2001:db8::1"]);
+        assert!(plugin.contains("[2001:db8::1]", None));
+        assert!(plugin.contains("[2001:0DB8::1]", None));
+        assert!(plugin.contains("[2001:db8::1]", Some(8080)));
+        assert!(!is_host_port_entry("2001:db8::1"));
     }
 
     #[test]
@@ -376,18 +520,17 @@ mod tests {
         // Bracketed IPv6 literals.
         assert!(is_host_port_entry("[::1]:8080"));
         assert!(!is_host_port_entry("[::1]"));
+        assert!(!is_host_port_entry("2001:db8::1"));
     }
 
     #[test]
-    fn registry_with_only_whitespace_entries_rejected() {
+    fn registry_with_only_whitespace_entries_matches_nothing() {
         // After trim+lowercase normalisation every entry is empty — the
-        // construct should refuse instead of silently accepting an
-        // unreachable plugin.
-        let err = OutboundRegistry::new(&json!({"registry": ["", "  ", "\t"]})).unwrap_err();
-        assert!(
-            err.contains("at least one non-empty"),
-            "expected non-empty error, got: {err}"
-        );
+        // plugin stays installed and rejects every destination.
+        let plugin = OutboundRegistry::new(&json!({"registry": ["", "  ", "\t"]}))
+            .expect("empty effective registry is valid");
+        assert_eq!(plugin.registry_size(), 0);
+        assert!(!plugin.contains("reviews.svc", Some(8080)));
     }
 
     #[test]
@@ -406,8 +549,14 @@ mod tests {
     fn registry_size_reflects_dual_buckets() {
         // Mixed bare-host + host:port entries are placed into separate
         // buckets internally; `registry_size()` reports the sum.
-        let plugin = registry_plugin(&["reviews.svc", "reviews.svc:8080", "api:443"]);
-        assert_eq!(plugin.registry_size(), 3);
+        let plugin = registry_plugin(&[
+            "reviews.svc",
+            "reviews.svc:8080",
+            "api:443",
+            "*.example.com",
+            "*.example.com:443",
+        ]);
+        assert_eq!(plugin.registry_size(), 5);
     }
 
     #[test]
@@ -438,6 +587,22 @@ mod tests {
             "/api".to_string(),
         );
         ctx.headers = HashMap::from([("host".to_string(), String::new())]);
+        let result = plugin.on_request_received(&mut ctx).await;
+        match result {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 502),
+            other => panic!("expected reject, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_registry_rejects_all_requests() {
+        let plugin = registry_plugin(&[]);
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        ctx.headers = HashMap::from([("host".to_string(), "reviews.svc".to_string())]);
         let result = plugin.on_request_received(&mut ctx).await;
         match result {
             PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 502),

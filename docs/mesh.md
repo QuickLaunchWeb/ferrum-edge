@@ -917,14 +917,14 @@ spec:
 
 ## Istio Compatibility Gaps
 
-The following Istio mesh surfaces are **not yet supported** and should be treated as deferred:
+The following Istio mesh surfaces are either deferred or have Ferrum-specific support notes:
 
 | Surface | Status | Workaround |
 |---|---|---|
 | `Sidecar` (egress scoping) | Deferred | Use Ferrum proxy routing and upstream configuration |
 | `EnvoyFilter` | Not planned | Use Ferrum custom plugins |
 | `WasmPlugin` | Not planned | Use Ferrum custom plugins (`custom_plugins/`) |
-| Outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`) | Supported | `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY=registry_only` (or slice-supplied `outbound_traffic_policy`) auto-injects the `mesh_outbound_registry` plugin; unknown destinations are rejected at the outbound gate with the configured status (default 502) |
+| Outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`) | Supported | `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY=registry_only` (or slice-supplied `outbound_traffic_policy`) auto-injects the `mesh_outbound_registry` plugin; unknown destinations are rejected at the outbound gate with the configured status (default 502), wildcard ServiceEntry hosts match one DNS label, and empty registries fail closed |
 | `VirtualService` header/method-only matches | Skipped | Ferrum route proxies do not encode header/method predicates |
 | Inbound port exclusions (`excludeInboundPorts`) | Deferred | |
 | IP-range capture exclusions (`excludeOutboundIPRanges`, `includeOutboundIPRanges`) | Deferred | |

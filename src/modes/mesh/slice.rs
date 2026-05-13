@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::IpAddr;
 
 use crate::config::types::GatewayConfig;
 use crate::modes::mesh::config::{
@@ -118,8 +119,10 @@ impl MeshSlice {
     /// Build the set of known mesh destinations from this slice. Used by
     /// the auto-injected `mesh_outbound_registry` plugin when
     /// `outbound_traffic_policy == RegistryOnly`. Includes:
-    ///   - `services.{name}.{namespace}.svc.cluster.local` and bare
-    ///     `{name}.{namespace}` and `{name}` forms with their declared ports
+    ///   - service `{name}`, `{name}.{namespace}`,
+    ///     `{name}.{namespace}.svc`, and
+    ///     `{name}.{namespace}.svc.{cluster_domain}` forms with their
+    ///     declared ports
     ///   - `service_entries.hosts` with their declared ports
     ///   - `workloads.addresses`
     ///
@@ -127,38 +130,44 @@ impl MeshSlice {
     /// deterministic across reloads (preventing spurious slice-update
     /// re-broadcasts via `content_eq`).
     pub fn build_known_destinations(&self, cluster_domain: &str) -> Vec<String> {
-        let mut entries: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut entries: HashSet<String> = HashSet::new();
+        let cluster_domain = normalize_known_destination_host(cluster_domain).unwrap_or_default();
         for service in &self.services {
-            let fqdn = format!(
-                "{}.{}.svc.{}",
-                service.name, service.namespace, cluster_domain
-            );
-            entries.insert(fqdn.to_ascii_lowercase());
-            entries.insert(format!("{}.{}", service.name, service.namespace).to_ascii_lowercase());
-            entries.insert(service.name.to_ascii_lowercase());
-            for port in &service.ports {
-                entries.insert(format!("{}:{}", fqdn, port.port).to_ascii_lowercase());
-                entries.insert(
-                    format!("{}.{}:{}", service.name, service.namespace, port.port)
-                        .to_ascii_lowercase(),
-                );
+            let Some(service_name) = normalize_known_destination_host(&service.name) else {
+                continue;
+            };
+            let Some(namespace) = normalize_known_destination_host(&service.namespace) else {
+                continue;
+            };
+            let namespaced = format!("{service_name}.{namespace}");
+            let svc = format!("{namespaced}.svc");
+            let fqdn = if cluster_domain.is_empty() {
+                svc.clone()
+            } else {
+                format!("{svc}.{cluster_domain}")
+            };
+            for host in [&service_name, &namespaced, &svc, &fqdn] {
+                insert_known_destination(&mut entries, host, service.ports.iter().map(|p| p.port));
             }
         }
         for entry in &self.service_entries {
             for host in &entry.hosts {
-                let host_lc = host.to_ascii_lowercase();
-                entries.insert(host_lc.clone());
-                for port in &entry.ports {
-                    entries.insert(format!("{}:{}", host_lc, port.port));
-                }
+                let Some(host) = normalize_known_destination_host(host) else {
+                    continue;
+                };
+                insert_known_destination(&mut entries, &host, entry.ports.iter().map(|p| p.port));
             }
         }
         for workload in &self.workloads {
             for addr in &workload.addresses {
-                entries.insert(addr.to_ascii_lowercase());
-                for port in &workload.ports {
-                    entries.insert(format!("{}:{}", addr.to_ascii_lowercase(), port.port));
-                }
+                let Some(addr) = normalize_known_destination_host(addr) else {
+                    continue;
+                };
+                insert_known_destination(
+                    &mut entries,
+                    &addr,
+                    workload.ports.iter().map(|p| p.port),
+                );
             }
         }
         let mut sorted: Vec<String> = entries.into_iter().collect();
@@ -331,6 +340,36 @@ impl MeshSlice {
             multi_cluster: mesh.multi_cluster.clone(),
             outbound_traffic_policy: mesh.outbound_traffic_policy,
         }
+    }
+}
+
+fn normalize_known_destination_host(value: &str) -> Option<String> {
+    let value = value.trim().trim_matches('.').to_ascii_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+    if value.starts_with('[') {
+        if value.ends_with(']')
+            && let Ok(IpAddr::V6(addr)) = value[1..value.len() - 1].parse::<IpAddr>()
+        {
+            return Some(format!("[{addr}]"));
+        }
+        return Some(value);
+    }
+    if let Ok(IpAddr::V6(addr)) = value.parse::<IpAddr>() {
+        return Some(format!("[{addr}]"));
+    }
+    Some(value)
+}
+
+fn insert_known_destination(
+    entries: &mut HashSet<String>,
+    host: &str,
+    ports: impl Iterator<Item = u16>,
+) {
+    entries.insert(host.to_string());
+    for port in ports {
+        entries.insert(format!("{host}:{port}"));
     }
 }
 
@@ -2087,9 +2126,35 @@ mod tests {
         let entries = slice.build_known_destinations("cluster.local");
         assert!(entries.contains(&"reviews".to_string()));
         assert!(entries.contains(&"reviews.default".to_string()));
+        assert!(entries.contains(&"reviews.default.svc".to_string()));
         assert!(entries.contains(&"reviews.default.svc.cluster.local".to_string()));
         assert!(entries.contains(&"reviews.default.svc.cluster.local:8080".to_string()));
+        assert!(entries.contains(&"reviews.default.svc:8080".to_string()));
         assert!(entries.contains(&"reviews.default:8080".to_string()));
+    }
+
+    #[test]
+    fn build_known_destinations_normalizes_cluster_domain_and_trailing_dots() {
+        use crate::modes::mesh::config::{AppProtocol, ServicePort};
+
+        let slice = MeshSlice {
+            services: vec![MeshService {
+                name: "Reviews".into(),
+                namespace: "Default".into(),
+                ports: vec![ServicePort {
+                    port: 8080,
+                    protocol: AppProtocol::Http,
+                    name: None,
+                }],
+                workloads: Vec::new(),
+                protocol_overrides: HashMap::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        let entries = slice.build_known_destinations("Cluster.Local.");
+        assert!(entries.contains(&"reviews.default.svc.cluster.local".to_string()));
+        assert!(entries.contains(&"reviews.default.svc.cluster.local:8080".to_string()));
     }
 
     #[test]
@@ -2102,7 +2167,7 @@ mod tests {
             service_entries: vec![ServiceEntry {
                 name: "external-api".into(),
                 namespace: "default".into(),
-                hosts: vec!["api.example.com".into()],
+                hosts: vec!["API.EXAMPLE.COM.".into()],
                 endpoints: vec![MeshEndpoint {
                     address: "10.0.0.1".into(),
                     ports: HashMap::new(),
@@ -2125,6 +2190,65 @@ mod tests {
         let entries = slice.build_known_destinations("cluster.local");
         assert!(entries.contains(&"api.example.com".to_string()));
         assert!(entries.contains(&"api.example.com:443".to_string()));
+    }
+
+    #[test]
+    fn build_known_destinations_brackets_workload_ipv6_addresses() {
+        let trust_domain = TrustDomain::new("cluster.local").unwrap();
+        let slice = MeshSlice {
+            workloads: vec![Workload {
+                spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/default")
+                    .expect("valid spiffe id"),
+                selector: WorkloadSelector {
+                    labels: HashMap::new(),
+                    namespace: Some("default".into()),
+                },
+                service_name: "v6".into(),
+                addresses: vec!["2001:db8::10".into()],
+                ports: vec![WorkloadPort {
+                    port: 8080,
+                    protocol: crate::modes::mesh::config::AppProtocol::Http,
+                    name: Some("http".into()),
+                }],
+                trust_domain,
+                namespace: "default".into(),
+                network: None,
+                cluster: None,
+            }],
+            ..MeshSlice::default()
+        };
+
+        let entries = slice.build_known_destinations("cluster.local");
+        assert!(entries.contains(&"[2001:db8::10]".to_string()));
+        assert!(entries.contains(&"[2001:db8::10]:8080".to_string()));
+        assert!(!entries.contains(&"2001:db8::10".to_string()));
+    }
+
+    #[test]
+    fn build_known_destinations_canonicalizes_bracketed_ipv6_addresses() {
+        let trust_domain = TrustDomain::new("cluster.local").unwrap();
+        let slice = MeshSlice {
+            workloads: vec![Workload {
+                spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/default")
+                    .expect("valid spiffe id"),
+                selector: WorkloadSelector {
+                    labels: HashMap::new(),
+                    namespace: Some("default".into()),
+                },
+                service_name: "v6".into(),
+                addresses: vec!["[2001:0DB8::10]".into()],
+                ports: Vec::new(),
+                trust_domain,
+                namespace: "default".into(),
+                network: None,
+                cluster: None,
+            }],
+            ..MeshSlice::default()
+        };
+
+        let entries = slice.build_known_destinations("cluster.local");
+        assert!(entries.contains(&"[2001:db8::10]".to_string()));
+        assert!(!entries.contains(&"[2001:0db8::10]".to_string()));
     }
 
     #[test]
