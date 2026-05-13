@@ -135,6 +135,14 @@ impl MeshRouteDispatch {
                     "mesh_route_dispatch.rules[{idx}].destination.backend_port must be 1-65535"
                 ));
             }
+            let has_backend_host = rule.destination.backend_host.is_some();
+            let has_backend_port = rule.destination.backend_port.is_some();
+            if has_backend_host != has_backend_port {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{idx}].destination.backend_host and \
+                     backend_port must be set together for direct-backend overrides"
+                ));
+            }
         }
         Ok(Self { config: parsed })
     }
@@ -349,6 +357,30 @@ mod tests {
         assert!(err.contains("1-65535"), "got: {err}");
     }
 
+    #[test]
+    fn rejects_backend_host_without_backend_port() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"backend_host": "canary.svc"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("must be set together"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_backend_port_without_backend_host() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"backend_port": 9090}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("must be set together"), "got: {err}");
+    }
+
     #[tokio::test]
     async fn method_match_routes_to_override_upstream() {
         let plugin = MeshRouteDispatch::new(&json!({
@@ -424,7 +456,7 @@ mod tests {
         let plugin = MeshRouteDispatch::new(&json!({
             "rules": [{
                 "match": {"headers": {"x-canary": "v2"}},
-                "destination": {"backend_host": "canary.svc"}
+                "destination": {"backend_host": "canary.svc", "backend_port": 9090}
             }]
         }))
         .unwrap();
@@ -439,7 +471,7 @@ mod tests {
         let plugin = MeshRouteDispatch::new(&json!({
             "rules": [{
                 "match": {"headers": {"x-canary": "v2"}},
-                "destination": {"backend_host": "canary.svc"}
+                "destination": {"backend_host": "canary.svc", "backend_port": 9090}
             }]
         }))
         .unwrap();
