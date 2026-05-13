@@ -1,13 +1,14 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::config::types::GatewayConfig;
 use crate::modes::mesh::config::{
-    MeshDestinationRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshService,
-    MeshSidecar, MeshSidecarEgress, MeshTelemetryResource, MtlsMode, MultiClusterConfig,
-    PeerAuthentication, PolicyScope, ServiceEntry, SidecarHostPattern, TrustBundleSet, Workload,
-    WorkloadLabels, policy_scope_applies_to_workload, proxy_config_applies_to_workload,
-    scope_applies_to_workload, service_entry_applies_to_workload, workload_selector_matches,
+    MeshConfig, MeshDestinationRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication,
+    MeshService, MeshSidecar, MeshSidecarEgress, MeshTelemetryResource, MtlsMode,
+    MultiClusterConfig, PeerAuthentication, PolicyScope, ServiceEntry, SidecarHostPattern,
+    TrustBundleSet, Workload, WorkloadLabels, policy_scope_applies_to_workload,
+    proxy_config_applies_to_workload, scope_applies_to_workload, service_entry_applies_to_workload,
+    workload_selector_matches,
 };
 use crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
 
@@ -211,6 +212,7 @@ impl MeshSlice {
 
         let namespace = request.namespace.clone();
         let cluster_domain = request.cluster_domain.clone();
+        let known_mesh_namespaces = mesh_known_namespaces(mesh, namespace.as_str());
         let workloads: Vec<Workload> = mesh
             .workloads
             .iter()
@@ -328,8 +330,11 @@ impl MeshSlice {
             .filter(|dr| {
                 applicable_sidecar
                     .map(|sidecar| {
-                        let (resource_namespace, host_candidates) =
-                            destination_rule_host_scope(dr, &cluster_domain);
+                        let (resource_namespace, host_candidates) = destination_rule_host_scope(
+                            dr,
+                            &cluster_domain,
+                            &known_mesh_namespaces,
+                        );
                         let host_refs: Vec<&str> =
                             host_candidates.iter().map(String::as_str).collect();
                         sidecar_egress_includes_service(sidecar, &resource_namespace, &host_refs)
@@ -368,6 +373,34 @@ impl MeshSlice {
     }
 }
 
+fn mesh_known_namespaces(mesh: &MeshConfig, request_namespace: &str) -> BTreeSet<String> {
+    let mut namespaces = BTreeSet::new();
+    insert_normalized_namespace(&mut namespaces, request_namespace);
+    for workload in &mesh.workloads {
+        insert_normalized_namespace(&mut namespaces, &workload.namespace);
+    }
+    for service in &mesh.services {
+        insert_normalized_namespace(&mut namespaces, &service.namespace);
+    }
+    for entry in &mesh.service_entries {
+        insert_normalized_namespace(&mut namespaces, &entry.namespace);
+    }
+    for rule in &mesh.destination_rules {
+        insert_normalized_namespace(&mut namespaces, &rule.namespace);
+    }
+    for sidecar in &mesh.sidecars {
+        insert_normalized_namespace(&mut namespaces, &sidecar.namespace);
+    }
+    namespaces
+}
+
+fn insert_normalized_namespace(namespaces: &mut BTreeSet<String>, namespace: &str) {
+    let namespace = namespace.trim().trim_end_matches('.').to_ascii_lowercase();
+    if !namespace.is_empty() {
+        namespaces.insert(namespace);
+    }
+}
+
 fn mesh_service_host_candidates(service: &MeshService, cluster_domain: &str) -> Vec<String> {
     service_host_aliases(&service.name, &service.namespace, cluster_domain)
 }
@@ -393,6 +426,7 @@ fn service_host_aliases(name: &str, namespace: &str, cluster_domain: &str) -> Ve
 fn destination_rule_host_scope(
     rule: &MeshDestinationRule,
     cluster_domain: &str,
+    known_mesh_namespaces: &BTreeSet<String>,
 ) -> (String, Vec<String>) {
     let host = rule.host.trim().trim_end_matches('.').to_ascii_lowercase();
     let rule_namespace = rule
@@ -405,19 +439,24 @@ fn destination_rule_host_scope(
         .trim_end_matches('.')
         .to_ascii_lowercase();
 
-    destination_rule_service_ref_from_host(&host, &rule_namespace, &cluster_domain)
-        .map(|(service_name, service_namespace)| {
-            let candidates =
-                service_host_aliases(&service_name, &service_namespace, &cluster_domain);
-            (service_namespace, candidates)
-        })
-        .unwrap_or_else(|| (rule_namespace, vec![host]))
+    destination_rule_service_ref_from_host(
+        &host,
+        &rule_namespace,
+        &cluster_domain,
+        known_mesh_namespaces,
+    )
+    .map(|(service_name, service_namespace)| {
+        let candidates = service_host_aliases(&service_name, &service_namespace, &cluster_domain);
+        (service_namespace, candidates)
+    })
+    .unwrap_or_else(|| (rule_namespace, vec![host]))
 }
 
 fn destination_rule_service_ref_from_host(
     host: &str,
     rule_namespace: &str,
     cluster_domain: &str,
+    known_mesh_namespaces: &BTreeSet<String>,
 ) -> Option<(String, String)> {
     if host.is_empty() || rule_namespace.is_empty() || host.contains('*') {
         return None;
@@ -431,6 +470,12 @@ fn destination_rule_service_ref_from_host(
         && !name.contains('.')
     {
         return Some((name.to_string(), rule_namespace.to_string()));
+    }
+
+    if let Some((name, namespace)) = split_service_host(host)
+        && known_mesh_namespaces.contains(namespace)
+    {
+        return Some((name.to_string(), namespace.to_string()));
     }
 
     if let Some((name, namespace)) = host.strip_suffix(".svc").and_then(split_service_host) {
@@ -2832,6 +2877,67 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
         assert_eq!(slice.destination_rules.len(), 1);
         assert_eq!(slice.destination_rules[0].name, "beta-reviews-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_matches_destination_rule_namespace_qualified_host() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["beta/*"]],
+            )],
+            services: vec![make_service("beta", "reviews")],
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "beta-reviews-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "reviews.beta".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "gamma-checkout-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "checkout.gamma".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "beta-reviews-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_keeps_external_two_label_destination_rule_literal() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./example.com"]],
+            )],
+            destination_rules: vec![MeshDestinationRule {
+                name: "external-dr".into(),
+                namespace: "alpha".into(),
+                host: "example.com".into(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "external-dr");
     }
 
     #[test]
