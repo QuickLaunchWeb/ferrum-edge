@@ -1574,6 +1574,7 @@ async fn handle_h3_request(
             cb_target_key,
             cb_is_half_open_probe,
             backend_url,
+            query_string,
             proxy_headers,
             requires_ws_frame_hooks,
             is_early_data,

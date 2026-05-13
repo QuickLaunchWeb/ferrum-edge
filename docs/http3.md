@@ -276,16 +276,16 @@ session-accounting infrastructure the H1/H2 path uses:
   `record_success(is_half_open_probe)` so a half-open probe that
   bootstraps a WebSocket counts as a recovery sample.
 - **Load balancer** — `LoadBalancerConnectionGuard` increments the
-  per-target connection count on construction (just before the 200 is
-  sent) and decrements on drop, so a long-lived H3 WebSocket session
-  correctly weights least-connection load balancing.
+  final selected target's connection count on construction (just before
+  the 200 is sent) and decrements on drop, so a long-lived H3 WebSocket
+  session correctly weights least-connection load balancing.
 - **Graceful drain** — a fresh `ConnectionGuard` is captured for the
   session lifetime; `SIGTERM` drain waits for in-flight H3 WebSocket
   sessions before exit, honoring `FERRUM_SHUTDOWN_DRAIN_SECONDS`.
-- **Single-attempt** — full retry-with-target-rotation is a follow-up
-  that will mirror `handle_websocket_request_authenticated`'s retry
-  loop. The current path attempts the backend once; CB accounting still
-  runs so backend isolation works even without retry.
+- **Retry / target rotation** — pre-wire backend setup failures honor
+  `retry_on_connect_failure` and rotate upstream targets using the same
+  load-balancer snapshot as H1/H2 WebSockets. Backend-side upgrade
+  rejections are post-wire and are not replayed.
 
 ### Pump task teardown
 

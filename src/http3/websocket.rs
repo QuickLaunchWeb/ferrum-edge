@@ -85,14 +85,14 @@
 //! - Successful 200 upgrade response → `record_success(is_half_open_probe)`
 //!   so a half-open probe that bootstraps a WebSocket counts as a
 //!   recovery sample.
+//! - Pre-wire backend connect failures honor the proxy retry policy and
+//!   rotate upstream targets using the same load-balancer snapshot as the
+//!   H1/H2 WebSocket path. Backend-side upgrade rejections are post-wire
+//!   and are not retried.
 //! - `LoadBalancerConnectionGuard` is captured for the session lifetime;
-//!   it increments the per-target connection counter on construction
-//!   and decrements on drop, so a long-lived H3 WebSocket session
-//!   correctly weights least-connection load balancing.
-//!
-//! Single-attempt only: full retry-with-target-rotation is left to a
-//! follow-up that mirrors `handle_websocket_request_authenticated`'s
-//! retry loop. The single attempt is documented at `docs/http3.md`.
+//!   it increments the final selected target's connection counter on
+//!   construction and decrements on drop, so a long-lived H3 WebSocket
+//!   session correctly weights least-connection load balancing.
 //!
 //! ## Graceful shutdown
 //!
@@ -271,6 +271,7 @@ pub(crate) async fn handle_h3_websocket(
     cb_target_key: Option<String>,
     cb_is_half_open_probe: bool,
     backend_url: String,
+    query_string: String,
     proxy_headers: HashMap<String, String>,
     requires_ws_frame_hooks: bool,
     is_early_data: bool,
@@ -357,93 +358,164 @@ pub(crate) async fn handle_h3_websocket(
 
     // ── Backend WebSocket handshake (reuses H1.1 Upgrade path) ──────
     //
-    // Note on scope: full retry / target rotation is implemented for the
-    // H1/H2 frontend path in
-    // `proxy/mod.rs::handle_websocket_request_authenticated`. The H3
-    // frontend currently uses a single backend attempt — production
-    // operators typically configure WebSocket clients to retry the
-    // handshake from the application layer, and the underlying backend
-    // infra is shared with the H1/H2 path that already has retry. The
-    // single-attempt simplification is documented at `docs/http3.md`
-    // (WebSocket over HTTP/3 section); future work can mirror the retry
-    // loop here. Circuit-breaker accounting still runs — see comments
-    // around `record_failure` below — so backend isolation is enforced
-    // even without retry-with-rotation.
-    let backend_handshake = match crate::proxy::connect_websocket_backend(
-        &backend_url,
-        &proxy,
-        &state.env_config,
-        &client_headers,
-        state.tls_policy.as_deref(),
-        &state.crls,
-        state.max_websocket_frame_size_bytes,
-        state.websocket_write_buffer_size,
-    )
-    .await
-    {
-        Ok(handshake) => handshake,
-        Err(e) => {
-            // `connect_websocket_backend` covers more than TCP+TLS setup:
-            // it ALSO sends the WebSocket upgrade request and reads the
-            // backend's response. Use the same unified
-            // `request_reached_wire` boundary as the H1/H2 path so a
-            // backend-side upgrade rejection (post-wire) does NOT charge
-            // the breaker as a connect-class failure, matching
-            // `circuit_breaker::trip_on_connection_errors` semantics.
-            let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
-            let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
+    // H3 mirrors H1/H2 WebSocket retry semantics: retry only pre-wire
+    // setup failures when `retry_on_connect_failure` is enabled, and rotate
+    // upstream targets through the same load-balancer cache. Backend-side
+    // upgrade rejections are post-wire and must not be replayed.
+    let mut current_backend_url = backend_url;
+    let mut current_target = upstream_target;
+    let mut current_cb_target_key = cb_target_key;
+    let mut ws_attempt = 0u32;
 
-            error!(
-                proxy_id = %proxy.id,
-                backend_url = %backend_url,
-                error_kind = retry::error_class_log_kind(ws_error_class),
-                error_class = %ws_error_class,
-                error = %e,
-                "H3 WebSocket backend connection failed"
-            );
+    let backend_handshake = loop {
+        match crate::proxy::connect_websocket_backend(
+            &current_backend_url,
+            &proxy,
+            &state.env_config,
+            &client_headers,
+            state.tls_policy.as_deref(),
+            &state.crls,
+            state.max_websocket_frame_size_bytes,
+            state.websocket_write_buffer_size,
+        )
+        .await
+        {
+            Ok(handshake) => break handshake,
+            Err(e) => {
+                // `connect_websocket_backend` covers more than TCP+TLS setup:
+                // it ALSO sends the WebSocket upgrade request and reads the
+                // backend's response. Use the same unified
+                // `request_reached_wire` boundary as the H1/H2 path so a
+                // backend-side upgrade rejection (post-wire) does NOT retry
+                // and does NOT charge the breaker as a connect-class failure.
+                let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
+                let is_ws_dns_error = ws_error_class == retry::ErrorClass::DnsLookupError;
+                let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
+                let retry_delay = proxy.retry.as_ref().and_then(|retry_config| {
+                    (ws_attempt < retry_config.max_retries
+                        && retry_config.retry_on_connect_failure
+                        && ws_is_pre_wire)
+                        .then(|| retry::retry_delay(retry_config, ws_attempt))
+                });
 
-            // Record circuit-breaker failure for the resolved target.
-            // Uses `cb_target_key` from the dispatcher (built from the
-            // same `upstream_target` we just attempted) so the breaker
-            // is keyed identically to retries on other paths. The
-            // `cb_is_half_open_probe` flag is preserved so a probe that
-            // failed correctly releases its half-open slot.
-            if let Some(cb_config) = &proxy.circuit_breaker {
-                let cb = state.circuit_breaker_cache.get_or_create(
-                    &proxy.id,
-                    cb_target_key.as_deref(),
-                    cb_config,
+                if let Some(delay) = retry_delay {
+                    if let Some(cb_config) = &proxy.circuit_breaker {
+                        let cb = state.circuit_breaker_cache.get_or_create(
+                            &proxy.id,
+                            current_cb_target_key.as_deref(),
+                            cb_config,
+                        );
+                        cb.record_failure(502, ws_is_pre_wire, cb_is_half_open_probe);
+                    }
+
+                    tokio::time::sleep(delay).await;
+                    ws_attempt += 1;
+
+                    if let (Some(upstream_id), Some(prev_target), Some(hash_key)) =
+                        (&proxy.upstream_id, &current_target, lb_hash_key.as_deref())
+                        && let Some(next) = {
+                            let health_ctx = crate::load_balancer::HealthContext {
+                                active_unhealthy: &state.health_checker.active_unhealthy_targets,
+                                proxy_passive: state
+                                    .health_checker
+                                    .passive_health
+                                    .get(&proxy.id)
+                                    .map(|r| r.value().clone()),
+                                max_ejection_percent:
+                                    crate::load_balancer::LoadBalancerCache::max_ejection_percent_from(
+                                        &epoch.load_balancer,
+                                        upstream_id,
+                                    ),
+                            };
+                            if let Some(subset_name) = proxy.upstream_subset.as_deref() {
+                                crate::load_balancer::LoadBalancerCache::select_next_target_subset_from(
+                                    &epoch.load_balancer,
+                                    upstream_id,
+                                    hash_key,
+                                    subset_name,
+                                    prev_target,
+                                    Some(&health_ctx),
+                                )
+                            } else {
+                                crate::load_balancer::LoadBalancerCache::select_next_target_from(
+                                    &epoch.load_balancer,
+                                    upstream_id,
+                                    hash_key,
+                                    prev_target,
+                                    Some(&health_ctx),
+                                )
+                            }
+                        }
+                    {
+                        current_backend_url = crate::proxy::build_websocket_backend_url_with_target(
+                            &proxy,
+                            &ctx.path,
+                            &query_string,
+                            &next.host,
+                            next.port,
+                            next.path.as_deref(),
+                        );
+                        current_cb_target_key =
+                            Some(crate::circuit_breaker::target_key(&next.host, next.port));
+                        current_target = Some(next);
+                    }
+
+                    warn!(
+                        proxy_id = %proxy.id,
+                        attempt = ws_attempt,
+                        max_retries = proxy.retry.as_ref().map(|r| r.max_retries).unwrap_or(0),
+                        error_class = %ws_error_class,
+                        "Retrying H3 WebSocket backend connection"
+                    );
+                    continue;
+                }
+
+                error!(
+                    proxy_id = %proxy.id,
+                    backend_url = %current_backend_url,
+                    error_kind = retry::error_class_log_kind(ws_error_class),
+                    error_class = %ws_error_class,
+                    error = %e,
+                    "H3 WebSocket backend connection failed"
                 );
-                cb.record_failure(502, ws_is_pre_wire, cb_is_half_open_probe);
+
+                if let Some(cb_config) = &proxy.circuit_breaker {
+                    let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.id,
+                        current_cb_target_key.as_deref(),
+                        cb_config,
+                    );
+                    cb.record_failure(502, ws_is_pre_wire, cb_is_half_open_probe);
+                }
+
+                crate::proxy::record_request(&state, 502);
+
+                // Emit the TransactionSummary for the failed upgrade so
+                // log plugins see the rejection.
+                if !plugins.is_empty() {
+                    emit_failed_upgrade_summary(
+                        &state,
+                        &proxy,
+                        &ctx,
+                        &proxy_headers,
+                        &plugins,
+                        plugin_execution_ns,
+                        start_time,
+                        &current_backend_url,
+                        ws_error_class,
+                    )
+                    .await;
+                }
+
+                let ws_body = if is_ws_dns_error {
+                    r#"{"error":"DNS resolution for backend failed"}"#
+                } else {
+                    r#"{"error":"Backend WebSocket connection failed"}"#
+                };
+                send_h3_error_body(&mut stream, StatusCode::BAD_GATEWAY, ws_body).await;
+                drop(ws_connection_permit);
+                return Ok(());
             }
-
-            crate::proxy::record_request(&state, 502);
-
-            // Emit the TransactionSummary for the failed upgrade so
-            // log plugins see the rejection.
-            if !plugins.is_empty() {
-                emit_failed_upgrade_summary(
-                    &state,
-                    &proxy,
-                    &ctx,
-                    &proxy_headers,
-                    &plugins,
-                    plugin_execution_ns,
-                    start_time,
-                    &backend_url,
-                    ws_error_class,
-                )
-                .await;
-            }
-
-            send_h3_error_body(
-                &mut stream,
-                StatusCode::BAD_GATEWAY,
-                r#"{"error":"Backend WebSocket connection failed"}"#,
-            )
-            .await;
-            drop(ws_connection_permit);
-            return Ok(());
         }
     };
 
@@ -453,7 +525,7 @@ pub(crate) async fn handle_h3_websocket(
     if let Some(cb_config) = &proxy.circuit_breaker {
         let cb = state.circuit_breaker_cache.get_or_create(
             &proxy.id,
-            cb_target_key.as_deref(),
+            current_cb_target_key.as_deref(),
             cb_config,
         );
         cb.record_success(cb_is_half_open_probe);
@@ -463,7 +535,7 @@ pub(crate) async fn handle_h3_websocket(
     // a panic anywhere below still releases the per-target connection
     // count. The guard is moved into the session task below.
     let ws_lb_guard = crate::proxy::LoadBalancerConnectionGuard::new(
-        upstream_target.clone(),
+        current_target.clone(),
         upstream_balancer.clone(),
     );
 
@@ -485,7 +557,7 @@ pub(crate) async fn handle_h3_websocket(
     // Sticky session cookie on the WS upgrade response, mirroring the
     // H1/H2 path.
     if sticky_cookie_needed
-        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
+        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
         let strategy = crate::load_balancer::LoadBalancerCache::get_hash_on_strategy_from(
             &epoch.load_balancer,
@@ -536,11 +608,6 @@ pub(crate) async fn handle_h3_websocket(
 
     // Emit the successful-upgrade TransactionSummary now — same shape
     // the H1/H2 path emits at upgrade time.
-    //
-    // `lb_hash_key` and `upstream_target` are recorded for future
-    // retry-with-rotation work (mirroring the H1/H2 retry loop). For
-    // the current single-attempt path the LB rotation is unused.
-    let _ = lb_hash_key;
     emit_successful_upgrade_summary(
         &state,
         &proxy,
@@ -549,7 +616,7 @@ pub(crate) async fn handle_h3_websocket(
         &plugins,
         plugin_execution_ns,
         start_time,
-        &backend_url,
+        &current_backend_url,
     )
     .await;
 
@@ -656,7 +723,7 @@ pub(crate) async fn handle_h3_websocket(
         namespace: proxy.namespace.clone(),
         proxy_name: proxy.name.clone(),
         client_ip: ctx.client_ip.clone(),
-        backend_target: crate::proxy::strip_query_params(&backend_url).to_string(),
+        backend_target: crate::proxy::strip_query_params(&current_backend_url).to_string(),
         listen_port: h3_listen_port(&state),
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
