@@ -81,6 +81,9 @@ fn mesh_workload(id: &str, service_name: &str, address: &str, port: u16) -> Work
         namespace: default_namespace(),
         network: None,
         cluster: None,
+        weight: None,
+        locality: None,
+        service_account: None,
     }
 }
 
