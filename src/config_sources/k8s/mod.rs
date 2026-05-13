@@ -667,6 +667,16 @@ pub(crate) fn fault_injection_plugin_for_proxy(
 /// entry carries non-URI predicates, `reject_unmatched: true` is kept so
 /// e.g. a GET-only route does not silently serve POST traffic.
 ///
+/// Entries carrying predicates we cannot represent in the rule
+/// (`method.regex` / `.prefix`, `headers.X.regex` / `.prefix`,
+/// `queryParams.X.regex`, or fully-unsupported keys like `authority`,
+/// `scheme`, `port`, `sourceLabels`, `gateways`, `withoutHeaders`,
+/// `sourceNamespace`) are skipped entirely — they do NOT collapse onto
+/// the URI-only catch-all branch. If they did, a mixed `match[]` with
+/// one supported exact rule plus one unsupported regex sibling would
+/// disable `reject_unmatched` and silently forward exactly the requests
+/// the operator gated.
+///
 /// The rule's destination overrides to the route's own destination
 /// (`backend_host`/`backend_port` or `upstream_id`). The destination is
 /// effectively the proxy's default backend, so the override is a no-op for
@@ -705,11 +715,27 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
         }
 
         let mut match_criteria = serde_json::Map::new();
+        // Track whether this entry carries any non-URI predicate that we
+        // cannot represent in the mesh_route_dispatch rule. Examples:
+        // `method.regex` / `method.prefix` (we only support `.exact`),
+        // `headers.X.regex` / `headers.X.prefix`, `queryParams.X.regex`,
+        // and entirely-unsupported keys (`authority`, `scheme`, `port`,
+        // `sourceLabels`, `gateways`, `withoutHeaders`, `sourceNamespace`).
+        // When set, emitting a partial rule would silently widen traffic
+        // (e.g., `method=GET + headers.X.regex` would treat ALL GET as a
+        // match), so we skip the entry and let `reject_unmatched: true`
+        // 404 the request. Critically, an unsupported-predicate entry
+        // must NOT collapse onto the URI-only catch-all branch — that
+        // would disable `reject_unmatched` and forward exactly the
+        // traffic the operator gated.
+        let mut had_unsupported_predicate = false;
 
-        if let Some(method_obj) = entry.get("method").and_then(Value::as_object)
-            && let Some(method) = method_obj.get("exact").and_then(Value::as_str)
-        {
-            match_criteria.insert("methods".to_string(), serde_json::json!([method]));
+        if let Some(method_obj) = entry.get("method").and_then(Value::as_object) {
+            if let Some(method) = method_obj.get("exact").and_then(Value::as_str) {
+                match_criteria.insert("methods".to_string(), serde_json::json!([method]));
+            } else {
+                had_unsupported_predicate = true;
+            }
         }
 
         if let Some(headers_obj) = entry.get("headers").and_then(Value::as_object) {
@@ -717,6 +743,8 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
             for (name, value) in headers_obj {
                 if let Some(exact) = value.get("exact").and_then(Value::as_str) {
                     headers.insert(name.to_ascii_lowercase(), Value::String(exact.to_string()));
+                } else {
+                    had_unsupported_predicate = true;
                 }
             }
             if !headers.is_empty() {
@@ -729,6 +757,8 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
             for (name, value) in qp_obj {
                 if let Some(exact) = value.get("exact").and_then(Value::as_str) {
                     params.insert(name.to_string(), Value::String(exact.to_string()));
+                } else {
+                    had_unsupported_predicate = true;
                 }
             }
             if !params.is_empty() {
@@ -736,8 +766,35 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
             }
         }
 
+        if let Some(obj) = entry.as_object() {
+            for key in obj.keys() {
+                if matches!(
+                    key.as_str(),
+                    "authority"
+                        | "scheme"
+                        | "port"
+                        | "sourceLabels"
+                        | "gateways"
+                        | "withoutHeaders"
+                        | "sourceNamespace"
+                ) {
+                    had_unsupported_predicate = true;
+                    break;
+                }
+            }
+        }
+
+        if had_unsupported_predicate {
+            // Entry has predicates we can't represent. Emitting a partial
+            // rule would widen traffic; classifying as URI-only would
+            // disable reject_unmatched and forward gated traffic. Skip the
+            // entry — with reject_unmatched: true, unmatched requests get
+            // a 404, which is the fail-closed VirtualService semantic.
+            continue;
+        }
+
         if match_criteria.is_empty() {
-            // In-scope entry with no extractable non-URI predicates: its
+            // In-scope entry with no non-URI predicate keys at all: its
             // URI already matched at proxy level, so this is an
             // unconditional catch-all branch for `listen_path`. Mark it so
             // `reject_unmatched` is disabled below; otherwise a co-located

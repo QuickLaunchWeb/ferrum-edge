@@ -1098,7 +1098,7 @@ fn virtual_service_routes(
         .flatten()
         .enumerate()
     {
-        let match_paths = match_paths(http);
+        let match_paths = match_paths(http, acc.options.vs_header_routing_experimental);
         if match_paths.is_empty() {
             continue;
         }
@@ -1205,7 +1205,7 @@ fn virtual_service_routes(
     Ok((proxies, upstreams, plugins))
 }
 
-fn match_paths(http: &Value) -> Vec<Option<String>> {
+fn match_paths(http: &Value, vs_header_routing_experimental: bool) -> Vec<Option<String>> {
     let Some(matches) = http.get("match").and_then(Value::as_array) else {
         return vec![Some("/".to_string())];
     };
@@ -1213,15 +1213,72 @@ fn match_paths(http: &Value) -> Vec<Option<String>> {
         return vec![Some("/".to_string())];
     }
 
-    let mut seen_paths = HashSet::new();
-    matches
+    let mut seen_paths: HashSet<Option<String>> = HashSet::new();
+    let mut paths: Vec<Option<String>> = matches
         .iter()
         // Istio forbids empty HTTPMatchRequest blocks; URI-less entries depend on
         // unsupported predicates such as headers/method/queryParams, so do not
         // broaden them into Ferrum catch-all routes.
         .filter_map(|m| m.get("uri").and_then(path_match).map(Some))
         .filter(|listen_path| seen_paths.insert(listen_path.clone()))
-        .collect()
+        .collect();
+
+    // Codex P2 (#3237631709): with `vs_header_routing_experimental=true`,
+    // materialize a `/` catch-all listen_path when at least one match
+    // entry has NO URI predicate but DOES carry a supported non-URI
+    // predicate (`method.exact`, `headers.X.exact`, `queryParams.X.exact`).
+    // Without this, an `http.match[]` consisting only of header/method/
+    // queryParam predicates produces no listen_path → no proxy → the
+    // operator's predicates are silently dropped and traffic that should
+    // have been routed by header is unroutable. The mesh_route_dispatch
+    // plugin scopes match entries to the listen_path it's installed on,
+    // so any URI-bearing siblings stay on their own proxy and do not
+    // bleed onto the catch-all.
+    if vs_header_routing_experimental
+        && !seen_paths.contains(&Some("/".to_string()))
+        && matches
+            .iter()
+            .any(|m| m.get("uri").is_none() && entry_has_supported_non_uri_predicates(m))
+    {
+        paths.push(Some("/".to_string()));
+    }
+
+    paths
+}
+
+/// Returns true when an Istio HTTPMatchRequest entry has at least one
+/// supported non-URI predicate that mesh_route_dispatch can enforce —
+/// `method.exact`, `headers.X.exact`, or `queryParams.X.exact`. Used to
+/// decide whether materializing a `/` catch-all listen_path for a
+/// URI-less entry would actually produce an enforceable plugin rule.
+/// Returning `false` for unsupported-only entries (e.g., `method.regex`)
+/// prevents the translator from emitting a catch-all proxy that would
+/// then have no plugin attached, silently widening traffic.
+fn entry_has_supported_non_uri_predicates(entry: &Value) -> bool {
+    if entry
+        .get("method")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get("exact"))
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return true;
+    }
+    if let Some(headers) = entry.get("headers").and_then(Value::as_object)
+        && headers
+            .values()
+            .any(|v| v.get("exact").and_then(Value::as_str).is_some())
+    {
+        return true;
+    }
+    if let Some(qp) = entry.get("queryParams").and_then(Value::as_object)
+        && qp
+            .values()
+            .any(|v| v.get("exact").and_then(Value::as_str).is_some())
+    {
+        return true;
+    }
+    false
 }
 
 fn route_backends(
@@ -5869,6 +5926,390 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true),
             "/v2 has no URI-only sibling -- reject_unmatched stays on so traffic without x-canary 404s"
+        );
+    }
+
+    #[test]
+    fn virtual_service_unsupported_method_regex_does_not_disable_reject_unmatched() {
+        // Codex P1 (#3237631705): a `match[]` mixing one supported
+        // `method.exact` rule with one unsupported `method.regex` rule
+        // must NOT collapse the regex entry onto the URI-only catch-all
+        // branch. Doing so would flip `reject_unmatched` to false and
+        // forward requests the operator gated (e.g., DELETE traffic
+        // sneaking past a route that only allows GET via `.exact` and
+        // hoped to allow POST/PUT via `.regex`).
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/api"}, "method": {"exact": "GET"}},
+                            {"uri": {"prefix": "/api"}, "method": {"regex": "PO.*"}}
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin should be emitted for the GET branch");
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules array");
+        assert_eq!(
+            rules.len(),
+            1,
+            "supported method.exact rule emitted; unsupported method.regex sibling skipped"
+        );
+        assert_eq!(rules[0]["match"]["methods"][0].as_str(), Some("GET"));
+        assert_eq!(
+            plugin
+                .config
+                .get("reject_unmatched")
+                .and_then(Value::as_bool),
+            Some(true),
+            "unsupported predicate sibling must NOT relax reject_unmatched -- DELETE traffic should 404 instead of leaking through"
+        );
+    }
+
+    #[test]
+    fn virtual_service_unsupported_authority_predicate_does_not_disable_reject_unmatched() {
+        // Codex P1 (#3237631705): `authority` is a non-URI predicate we
+        // don't currently extract. An entry consisting of `uri` plus
+        // `authority` is NOT a URI-only catch-all -- it's URI plus an
+        // unsupported predicate. Treating it as URI-only would forward
+        // requests that don't carry the gated authority.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/api"}, "headers": {"x-canary": {"exact": "v2"}}},
+                            {"uri": {"prefix": "/api"}, "authority": {"exact": "internal.example.com"}}
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin should be emitted");
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules array");
+        assert_eq!(
+            rules.len(),
+            1,
+            "only the supported header rule survives; authority-bearing sibling is skipped"
+        );
+        assert_eq!(
+            plugin
+                .config
+                .get("reject_unmatched")
+                .and_then(Value::as_bool),
+            Some(true),
+            "unsupported authority predicate must NOT collapse onto URI-only catch-all"
+        );
+    }
+
+    #[test]
+    fn virtual_service_header_only_match_materializes_catch_all() {
+        // Codex P2 (#3237631709): a VirtualService whose `match[]`
+        // contains only non-URI predicates (no `uri` block at all) is a
+        // legitimate Istio configuration -- it routes "any URI with these
+        // predicates" on the listed hosts. Previously the translator
+        // dropped such routes entirely because match_paths was URI-driven.
+        // With the experimental flag on, materialize a `/` catch-all
+        // proxy + mesh_route_dispatch plugin so the operator's predicates
+        // are actually enforced.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"headers": {"x-canary": {"exact": "v2"}}}
+                        ],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some("/"))
+            .expect("`/` catch-all proxy materialized for header-only match");
+        assert_eq!(proxy.hosts, vec!["api.example.com".to_string()]);
+
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+            })
+            .expect("plugin attached to the catch-all proxy");
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules array");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0]["match"]["headers"]["x-canary"].as_str(),
+            Some("v2")
+        );
+        assert_eq!(
+            plugin
+                .config
+                .get("reject_unmatched")
+                .and_then(Value::as_bool),
+            Some(true),
+            "header-only match with no URI-only sibling keeps reject_unmatched on"
+        );
+    }
+
+    #[test]
+    fn virtual_service_header_only_match_skipped_without_experimental_flag() {
+        // The experimental flag still gates this materialization. With it
+        // off, behaviour matches today's wire output: no proxy is emitted
+        // for a header-only match block.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"headers": {"x-canary": {"exact": "v2"}}}
+                        ],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        assert!(
+            !result
+                .config
+                .proxies
+                .iter()
+                .any(|p| p.listen_path.as_deref() == Some("/")),
+            "no catch-all materialized when experimental flag is off"
+        );
+        assert!(
+            !result
+                .config
+                .plugin_configs
+                .iter()
+                .any(|p| p.plugin_name == "mesh_route_dispatch"),
+            "no plugin emitted when experimental flag is off"
+        );
+    }
+
+    #[test]
+    fn virtual_service_header_only_match_with_unsupported_predicates_skipped() {
+        // A header-only entry whose only header predicate is `regex`
+        // cannot be enforced by mesh_route_dispatch. Materializing a `/`
+        // catch-all with no rule would route ALL traffic to the route's
+        // backend, silently widening past the operator's intent. Skip
+        // materialization entirely; today's drop behaviour is the
+        // fail-closed default.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"headers": {"x-tier": {"regex": "gold|platinum"}}}
+                        ],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+        assert!(
+            !result
+                .config
+                .proxies
+                .iter()
+                .any(|p| p.listen_path.as_deref() == Some("/")),
+            "header-only match with only unsupported predicates does not materialize a catch-all"
+        );
+    }
+
+    #[test]
+    fn virtual_service_mixed_uri_and_header_only_match_emits_both_proxies() {
+        // A `match[]` mixing one URI entry and one URI-less header entry
+        // must produce BOTH proxies: the URI-derived `/api` AND the `/`
+        // catch-all for the URI-less header rule. Without the catch-all,
+        // `/other` requests carrying the header would 404 even though
+        // Istio semantics route them via the URI-less branch.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/api"}},
+                            {"headers": {"x-canary": {"exact": "v2"}}}
+                        ],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+
+        let api_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some("/api"))
+            .expect("URI-derived /api proxy");
+        let catch_all = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some("/"))
+            .expect("URI-less catch-all proxy");
+        assert_ne!(api_proxy.id, catch_all.id);
+
+        // The catch-all proxy MUST have a plugin (the URI-less header
+        // rule). The `/api` proxy ALSO has a plugin because the URI-less
+        // header entry applies to every listen_path of this http rule,
+        // and the URI-only `/api` entry triggers has_uri_only_match.
+        let api_plugin = result.config.plugin_configs.iter().find(|p| {
+            p.plugin_name == "mesh_route_dispatch"
+                && p.proxy_id.as_deref() == Some(api_proxy.id.as_str())
+        });
+        let catch_all_plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(catch_all.id.as_str())
+            })
+            .expect("catch-all proxy has the URI-less header rule attached");
+
+        // /api proxy: URI-only branch keeps reject_unmatched off so
+        // unrelated traffic to /api still routes.
+        if let Some(plugin) = api_plugin {
+            assert_eq!(
+                plugin
+                    .config
+                    .get("reject_unmatched")
+                    .and_then(Value::as_bool),
+                Some(false),
+                "URI-only sibling on /api proxy disables reject_unmatched"
+            );
+        }
+        assert_eq!(
+            catch_all_plugin
+                .config
+                .get("reject_unmatched")
+                .and_then(Value::as_bool),
+            Some(true),
+            "catch-all proxy has no URI-only sibling in scope, so reject_unmatched stays on"
+        );
+    }
+
+    #[test]
+    fn virtual_service_partial_predicate_extraction_skips_rule() {
+        // Codex P1 (#3237631705) follow-on: an entry with one supported
+        // and one unsupported predicate is also unsafe to emit as a
+        // partial rule. `method=GET + headers.X.regex` cannot be honored
+        // (the regex header predicate is dropped), so emitting a rule
+        // with only `methods=[GET]` would silently widen the route to
+        // match GET regardless of the gated header value. Skip the entry
+        // entirely; `reject_unmatched: true` 404s the request, which is
+        // the fail-closed VirtualService semantic.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/api"}, "headers": {"x-canary": {"exact": "v2"}}},
+                            {
+                                "uri": {"prefix": "/api"},
+                                "method": {"exact": "GET"},
+                                "headers": {"x-tier": {"regex": "gold|platinum"}}
+                            }
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin should be emitted");
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules array");
+        assert_eq!(
+            rules.len(),
+            1,
+            "only the fully-supported header rule emits; the partial-extraction entry is skipped"
+        );
+        assert_eq!(
+            rules[0]["match"]["headers"]["x-canary"].as_str(),
+            Some("v2"),
+            "the emitted rule is the fully-supported one"
+        );
+        assert!(
+            rules[0]["match"].get("methods").is_none(),
+            "method=GET from the partial entry must NOT leak onto the surviving rule"
+        );
+        assert_eq!(
+            plugin
+                .config
+                .get("reject_unmatched")
+                .and_then(Value::as_bool),
+            Some(true),
         );
     }
 
