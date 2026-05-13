@@ -328,11 +328,10 @@ impl MeshSlice {
             .filter(|dr| {
                 applicable_sidecar
                     .map(|sidecar| {
-                        sidecar_egress_includes_service(
-                            sidecar,
-                            dr.namespace.as_str(),
-                            &[dr.host.as_str()],
-                        )
+                        let host_candidates = destination_rule_host_candidates(dr, &cluster_domain);
+                        let host_refs: Vec<&str> =
+                            host_candidates.iter().map(String::as_str).collect();
+                        sidecar_egress_includes_service(sidecar, dr.namespace.as_str(), &host_refs)
                     })
                     .unwrap_or(true)
             })
@@ -369,16 +368,12 @@ impl MeshSlice {
 }
 
 fn mesh_service_host_candidates(service: &MeshService, cluster_domain: &str) -> Vec<String> {
-    let name = service
-        .name
-        .trim()
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    let namespace = service
-        .namespace
-        .trim()
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+    service_host_aliases(&service.name, &service.namespace, cluster_domain)
+}
+
+fn service_host_aliases(name: &str, namespace: &str, cluster_domain: &str) -> Vec<String> {
+    let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    let namespace = namespace.trim().trim_end_matches('.').to_ascii_lowercase();
     let cluster_domain = cluster_domain
         .trim()
         .trim_end_matches('.')
@@ -392,6 +387,63 @@ fn mesh_service_host_candidates(service: &MeshService, cluster_domain: &str) -> 
         candidates.push(format!("{name}.{namespace}.svc.{cluster_domain}"));
     }
     candidates
+}
+
+fn destination_rule_host_candidates(
+    rule: &MeshDestinationRule,
+    cluster_domain: &str,
+) -> Vec<String> {
+    let host = rule.host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let namespace = rule
+        .namespace
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let cluster_domain = cluster_domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+
+    destination_rule_service_name_from_host(&host, &namespace, &cluster_domain)
+        .map(|service_name| service_host_aliases(&service_name, &namespace, &cluster_domain))
+        .unwrap_or_else(|| vec![host])
+}
+
+fn destination_rule_service_name_from_host(
+    host: &str,
+    namespace: &str,
+    cluster_domain: &str,
+) -> Option<String> {
+    if host.is_empty() || namespace.is_empty() || host.contains('*') {
+        return None;
+    }
+    if !host.contains('.') {
+        return Some(host.to_string());
+    }
+
+    if let Some(name) = host.strip_suffix(&format!(".{namespace}"))
+        && !name.is_empty()
+        && !name.contains('.')
+    {
+        return Some(name.to_string());
+    }
+
+    if let Some(name) = host.strip_suffix(&format!(".{namespace}.svc"))
+        && !name.is_empty()
+        && !name.contains('.')
+    {
+        return Some(name.to_string());
+    }
+
+    if !cluster_domain.is_empty()
+        && let Some(name) = host.strip_suffix(&format!(".{namespace}.svc.{cluster_domain}"))
+        && !name.is_empty()
+        && !name.contains('.')
+    {
+        return Some(name.to_string());
+    }
+
+    None
 }
 
 /// Resolve the most-specific applicable Sidecar for a workload.
@@ -2665,6 +2717,76 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, request);
         assert_eq!(slice.services.len(), 1);
         assert_eq!(slice.services[0].name, "reviews");
+    }
+
+    #[test]
+    fn sidecar_narrowing_matches_destination_rule_short_host_against_fqdn_scope() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews.alpha.svc.cluster.local"]],
+            )],
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "reviews-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "reviews".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "checkout-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "checkout".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "reviews-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_matches_destination_rule_fqdn_host_against_short_scope() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews"]],
+            )],
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "reviews-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "reviews.alpha.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "checkout-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "checkout.alpha.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "reviews-dr");
     }
 
     #[test]
