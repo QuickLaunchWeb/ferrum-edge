@@ -4003,6 +4003,139 @@ mod tests {
     }
 
     #[test]
+    fn inject_mesh_global_plugins_injects_outbound_registry_from_slice_policy() {
+        let runtime = test_mesh_runtime_config();
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            services: vec![MeshService {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                ports: vec![ServicePort {
+                    port: 8080,
+                    protocol: AppProtocol::Http,
+                    name: Some("http".to_string()),
+                }],
+                workloads: Vec::new(),
+                protocol_overrides: HashMap::new(),
+            }],
+            outbound_traffic_policy: Some(
+                crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly,
+            ),
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+        let registry_plugin = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+            .expect("outbound registry plugin injected");
+        let registry = registry_plugin.config["registry"]
+            .as_array()
+            .expect("registry array");
+
+        assert_eq!(registry_plugin.plugin_name, "mesh_outbound_registry");
+        assert!(registry.iter().any(|entry| entry == "reviews"));
+        assert!(registry.iter().any(|entry| entry == "reviews.default"));
+        assert!(
+            registry
+                .iter()
+                .any(|entry| entry == "reviews.default.svc.cluster.local:8080")
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_runtime_registry_only_applies_when_slice_policy_absent() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.outbound_traffic_policy =
+            crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly;
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            services: vec![MeshService {
+                name: "ratings".to_string(),
+                namespace: "default".to_string(),
+                ports: Vec::new(),
+                workloads: Vec::new(),
+                protocol_overrides: HashMap::new(),
+            }],
+            outbound_traffic_policy: None,
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id == MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_slice_allow_any_overrides_runtime_registry_only() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.outbound_traffic_policy =
+            crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly;
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            outbound_traffic_policy: Some(
+                crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
+            ),
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_removes_stale_outbound_registry_when_allow_any() {
+        let runtime = test_mesh_runtime_config();
+        let now = chrono::Utc::now();
+        let mut config = GatewayConfig {
+            plugin_configs: vec![crate::config::types::PluginConfig {
+                id: MESH_OUTBOUND_REGISTRY_PLUGIN_ID.to_string(),
+                plugin_name: "mesh_outbound_registry".to_string(),
+                namespace: "default".to_string(),
+                config: serde_json::json!({"registry": ["stale.default"]}),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: now,
+                updated_at: now,
+            }],
+            ..GatewayConfig::default()
+        };
+        let mesh_slice = MeshSlice {
+            outbound_traffic_policy: Some(
+                crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
+            ),
+            ..MeshSlice::default()
+        };
+
+        inject_mesh_global_plugins(&mut config, &runtime, &mesh_slice);
+
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+        );
+    }
+
+    #[test]
     fn inject_mesh_global_plugins_merges_zipkin_provider_into_workload_metrics() {
         let runtime = test_mesh_runtime_config();
         let mesh_slice = MeshSlice {
