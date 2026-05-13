@@ -413,7 +413,35 @@ fn sidecar(object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
                 .as_array()
                 .ok_or_else(|| invalid_resource(object, "Sidecar egress must be an array"))?;
             for entry in entries {
-                let hosts = string_array(entry, "hosts");
+                let hosts_value = entry.get("hosts").ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        "Sidecar egress[].hosts must be a non-empty array of strings",
+                    )
+                })?;
+                let hosts_array = hosts_value.as_array().ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        "Sidecar egress[].hosts must be a non-empty array of strings",
+                    )
+                })?;
+                if hosts_array.is_empty() {
+                    return Err(invalid_resource(
+                        object,
+                        "Sidecar egress[].hosts must be a non-empty array of strings",
+                    ));
+                }
+                let hosts: Vec<String> = hosts_array
+                    .iter()
+                    .map(|host| {
+                        host.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                            invalid_resource(
+                                object,
+                                "Sidecar egress[].hosts must be a non-empty array of strings",
+                            )
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
                 let port = match entry.get("port") {
                     Some(port_obj) => optional_port_field(
                         object,
@@ -422,12 +450,6 @@ fn sidecar(object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
                     )?,
                     None => None,
                 };
-                if hosts.is_empty() && port.is_none() {
-                    // Empty entry — skip silently. An Istio Sidecar with no
-                    // egress hosts and no port is a no-op and Istio itself
-                    // ignores it.
-                    continue;
-                }
                 egress.push(MeshSidecarEgress { hosts, port });
             }
         }
@@ -7324,6 +7346,66 @@ mod tests {
         assert!(
             err.to_string().contains("Sidecar egress[].port.number"),
             "error must reference the field; got {err}"
+        );
+    }
+
+    #[test]
+    fn sidecar_egress_missing_hosts_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {"port": {"number": 8080}}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("missing hosts should be rejected");
+        assert!(
+            err.to_string().contains("Sidecar egress[].hosts"),
+            "error must reference hosts; got {err}"
+        );
+    }
+
+    #[test]
+    fn sidecar_egress_empty_hosts_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {"hosts": []}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("empty hosts should be rejected");
+        assert!(
+            err.to_string().contains("Sidecar egress[].hosts"),
+            "error must reference hosts; got {err}"
+        );
+    }
+
+    #[test]
+    fn sidecar_egress_non_string_hosts_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {"hosts": ["./svc.default.svc.cluster.local", 42]}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("non-string hosts should be rejected");
+        assert!(
+            err.to_string().contains("Sidecar egress[].hosts"),
+            "error must reference hosts; got {err}"
         );
     }
 }
