@@ -536,7 +536,8 @@ pub struct EnvConfig {
     /// `allow_any` (default — sidecar accepts traffic to any destination),
     /// `registry_only` (sidecar only accepts traffic to mesh-registered
     /// destinations; unknown destinations are rejected at the outbound
-    /// gate via the auto-injected `mesh_outbound_registry` plugin).
+    /// capture listener via the auto-injected `mesh_outbound_registry`
+    /// plugin).
     pub mesh_outbound_traffic_policy: String,
 
     // Kubernetes CRD controller (Layer 8)

@@ -28,6 +28,10 @@
 //! - An empty registry is valid and fails closed: every request is rejected,
 //!   but the plugin remains installed so REGISTRY_ONLY never silently falls
 //!   back to ALLOW_ANY.
+//! - Auto-injected mesh instances are scoped to the outbound capture listener
+//!   port, so inbound sidecar/ambient traffic is not gated by an outbound
+//!   policy. Operator-managed instances without `outbound_listen_ports`
+//!   preserve the historical behavior and enforce wherever the plugin runs.
 //!
 //! ## Wire compatibility
 //!
@@ -69,6 +73,13 @@ pub struct OutboundRegistryConfig {
     /// to 404 when they prefer to mask unknown destinations.
     #[serde(default = "default_reject_status")]
     pub reject_status: u16,
+    /// Optional frontend listener ports where the registry should be enforced.
+    /// Mesh auto-injection sets this to the outbound capture listener port so
+    /// the global plugin does not apply to inbound listeners. Empty keeps
+    /// operator-managed plugin instances backwards compatible and enforces on
+    /// every HTTP-family request that reaches this plugin.
+    #[serde(default)]
+    pub outbound_listen_ports: Vec<u16>,
 }
 
 fn default_reject_status() -> u16 {
@@ -92,6 +103,7 @@ pub struct OutboundRegistry {
     /// Port-specific wildcard host suffixes from entries like
     /// `*.example.com:443`.
     wildcard_port_suffixes: HashMap<u16, Vec<String>>,
+    outbound_listen_ports: Vec<u16>,
     reject_status: u16,
 }
 
@@ -134,11 +146,16 @@ impl OutboundRegistry {
             suffixes.sort();
             suffixes.dedup();
         }
+        let mut outbound_listen_ports = parsed.outbound_listen_ports;
+        outbound_listen_ports.retain(|port| *port != 0);
+        outbound_listen_ports.sort_unstable();
+        outbound_listen_ports.dedup();
         Ok(Self {
             hosts,
             host_ports,
             wildcard_suffixes,
             wildcard_port_suffixes,
+            outbound_listen_ports,
             reject_status: parsed.reject_status,
         })
     }
@@ -194,6 +211,14 @@ impl OutboundRegistry {
             let _ = write!(buf, ":{port}");
             self.host_ports.contains(buf.as_str())
         })
+    }
+
+    #[inline]
+    fn should_enforce_for_request(&self, ctx: &RequestContext) -> bool {
+        self.outbound_listen_ports.is_empty()
+            || ctx
+                .frontend_listen_port
+                .is_some_and(|port| self.outbound_listen_ports.binary_search(&port).is_ok())
     }
 }
 
@@ -313,6 +338,9 @@ impl Plugin for OutboundRegistry {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
+        if !self.should_enforce_for_request(ctx) {
+            return PluginResult::Continue;
+        }
         let Some(host_header) = ctx.headers.get("host") else {
             return reject(self.reject_status, "host header required");
         };
@@ -358,8 +386,16 @@ mod tests {
     use serde_json::json;
 
     fn registry_plugin(entries: &[&str]) -> OutboundRegistry {
+        registry_plugin_with_ports(entries, &[])
+    }
+
+    fn registry_plugin_with_ports(
+        entries: &[&str],
+        outbound_listen_ports: &[u16],
+    ) -> OutboundRegistry {
         let config = json!({
             "registry": entries,
+            "outbound_listen_ports": outbound_listen_ports,
         });
         OutboundRegistry::new(&config).expect("valid registry")
     }
@@ -468,6 +504,56 @@ mod tests {
         );
         let headers = HashMap::from([("host".to_string(), "evil.external.com:443".to_string())]);
         ctx.headers = headers;
+        let result = plugin.on_request_received(&mut ctx).await;
+        match result {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 502),
+            other => panic!("expected reject, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_plugin_skips_non_outbound_listener() {
+        let plugin = registry_plugin_with_ports(&["reviews.svc"], &[15001]);
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        ctx.frontend_listen_port = Some(15006);
+        ctx.headers = HashMap::from([("host".to_string(), "unknown.example.com".to_string())]);
+
+        let result = plugin.on_request_received(&mut ctx).await;
+        assert!(matches!(result, PluginResult::Continue));
+    }
+
+    #[tokio::test]
+    async fn scoped_plugin_enforces_outbound_listener() {
+        let plugin = registry_plugin_with_ports(&["reviews.svc"], &[15001]);
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        ctx.frontend_listen_port = Some(15001);
+        ctx.headers = HashMap::from([("host".to_string(), "unknown.example.com".to_string())]);
+
+        let result = plugin.on_request_received(&mut ctx).await;
+        match result {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 502),
+            other => panic!("expected reject, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn unscoped_plugin_enforces_without_frontend_port() {
+        let plugin = registry_plugin(&["reviews.svc"]);
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        ctx.headers = HashMap::from([("host".to_string(), "unknown.example.com".to_string())]);
+
         let result = plugin.on_request_received(&mut ctx).await;
         match result {
             PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 502),

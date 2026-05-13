@@ -1716,13 +1716,24 @@ fn inject_mesh_global_plugins(
         crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly
     ) {
         let registry = mesh_slice.build_known_destinations(&runtime.cluster_domain);
-        ensure_global_plugin(
-            config,
-            MESH_OUTBOUND_REGISTRY_PLUGIN_ID,
-            "mesh_outbound_registry",
-            serde_json::json!({ "registry": registry }),
-            &runtime.namespace,
-        );
+        let outbound_listen_ports = mesh_outbound_registry_listen_ports(runtime);
+        if outbound_listen_ports.is_empty() && !mesh_has_outbound_listener(runtime) {
+            config
+                .plugin_configs
+                .retain(|p| p.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID);
+        } else {
+            let mut plugin_config = serde_json::json!({ "registry": registry });
+            if !outbound_listen_ports.is_empty() {
+                plugin_config["outbound_listen_ports"] = serde_json::json!(outbound_listen_ports);
+            }
+            ensure_global_plugin(
+                config,
+                MESH_OUTBOUND_REGISTRY_PLUGIN_ID,
+                "mesh_outbound_registry",
+                plugin_config,
+                &runtime.namespace,
+            );
+        }
     } else {
         // Remove any stale instance (e.g., operator flipped policy back).
         config
@@ -1799,6 +1810,28 @@ fn inject_mesh_global_plugins(
         access_log_config,
         &runtime.namespace,
     );
+}
+
+fn mesh_has_outbound_listener(runtime: &MeshRuntimeConfig) -> bool {
+    runtime
+        .listener_plan()
+        .iter()
+        .any(|listener| listener.direction == MeshTrafficDirection::Outbound)
+}
+
+fn mesh_outbound_registry_listen_ports(runtime: &MeshRuntimeConfig) -> Vec<u16> {
+    let mut ports: Vec<u16> = runtime
+        .listener_plan()
+        .into_iter()
+        .filter(|listener| listener.direction == MeshTrafficDirection::Outbound)
+        .filter_map(|listener| {
+            let port = listener.addr.port();
+            (port != 0).then_some(port)
+        })
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 /// Merge applicable `MeshTelemetryResource` entries by scope specificity.
@@ -4004,7 +4037,8 @@ mod tests {
 
     #[test]
     fn inject_mesh_global_plugins_injects_outbound_registry_from_slice_policy() {
-        let runtime = test_mesh_runtime_config();
+        let mut runtime = test_mesh_runtime_config();
+        runtime.outbound_listen_addr = "127.0.0.1:15001".parse().unwrap();
         let mesh_slice = MeshSlice {
             namespace: "default".to_string(),
             services: vec![MeshService {
@@ -4036,12 +4070,39 @@ mod tests {
             .expect("registry array");
 
         assert_eq!(registry_plugin.plugin_name, "mesh_outbound_registry");
+        assert_eq!(
+            registry_plugin.config["outbound_listen_ports"],
+            serde_json::json!([15001])
+        );
         assert!(registry.iter().any(|entry| entry == "reviews"));
         assert!(registry.iter().any(|entry| entry == "reviews.default"));
         assert!(
             registry
                 .iter()
                 .any(|entry| entry == "reviews.default.svc.cluster.local:8080")
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_skips_outbound_registry_without_outbound_listener() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.topology = MeshTopology::EgressGateway;
+        runtime.outbound_traffic_policy =
+            crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly;
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            outbound_traffic_policy: None,
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
         );
     }
 
