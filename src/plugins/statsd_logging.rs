@@ -16,6 +16,7 @@ use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::time::Instant;
+use tracing::warn;
 
 use super::utils::log_schema::{SummarySchema, resolve_schema};
 use super::utils::{
@@ -41,6 +42,44 @@ const STREAM_TAG_NATIVE: &[(&str, &str)] = &[
     ("cause", "disconnect_cause"),
     ("direction", "disconnect_direction"),
 ];
+
+/// Emit a `warn!` for any inline `schema:` keys that the statsd
+/// emitter does not honor. Only `rename`, `omit`, and `summary_type`
+/// have an effect — everything else (`static_fields`, `derived_fields`,
+/// `metadata`, `timestamp_format`, `order`) is silently dropped because
+/// statsd is line protocol, not JSON. Documenting this in
+/// `docs/log_schema.md` isn't enough on its own: operators copying a
+/// working JSON-logger schema across to statsd would otherwise have no
+/// indication their `static_fields` are being thrown away. The schema
+/// itself still constructs (the keys are valid in the abstract); we
+/// just point out they will be no-ops here.
+///
+/// Schema-by-reference (`schema_ref:`) is intentionally not inspected:
+/// the named schema is shared across many sinks and warning per
+/// referrer would be noisy.
+fn warn_on_unsupported_inline_schema_keys(config: &Value) {
+    const UNSUPPORTED: &[&str] = &[
+        "static_fields",
+        "derived_fields",
+        "metadata",
+        "timestamp_format",
+        "order",
+    ];
+    let Some(inline) = config.get("schema").and_then(Value::as_object) else {
+        return;
+    };
+    let present: Vec<&str> = UNSUPPORTED
+        .iter()
+        .copied()
+        .filter(|k| inline.contains_key(*k))
+        .collect();
+    if !present.is_empty() {
+        warn!(
+            "statsd_logging: schema keys {:?} are no-ops for statsd (line protocol, not JSON) — only `rename`, `omit`, and `summary_type` affect statsd output. See docs/log_schema.md.",
+            present
+        );
+    }
+}
 
 /// Resolve a statsd tag key honoring the schema's rename rule for the
 /// backing native field. Returns `None` when the schema omits the field.
@@ -183,6 +222,7 @@ impl StatsdLogging {
             }
         };
 
+        warn_on_unsupported_inline_schema_keys(config);
         let schema = resolve_schema(config, "statsd_logging")?;
         let flush_config = StatsdFlushConfig {
             hostname: host.clone(),
