@@ -586,8 +586,8 @@ fn detect_credential_scheme(value: &str) -> Option<&'static str> {
         if !matches!(next, Some(' ' | '\t')) {
             continue;
         }
-        // Strip leading whitespace and require a non-empty payload.
-        let payload = rest.trim_start();
+        // Strip surrounding whitespace and require a non-empty payload.
+        let payload = rest.trim();
         if payload.is_empty() {
             continue;
         }
@@ -1336,6 +1336,8 @@ mod tests {
         assert!(detect_credential_scheme("Bearer ").is_none());
         assert!(detect_credential_scheme("Bearer  ").is_none()); // only whitespace after
         assert_eq!(detect_credential_scheme("Bearer x"), Some("Bearer"));
+        assert_eq!(detect_credential_scheme("Bearer x "), Some("Bearer"));
+        assert_eq!(detect_credential_scheme("Basic dXNlcg==\t"), Some("Basic"));
         assert_eq!(detect_credential_scheme("  bearer  abc"), Some("Bearer"));
         assert!(detect_credential_scheme("bearerof").is_none()); // no whitespace separator
         assert_eq!(detect_credential_scheme("Basic dXNlcg=="), Some("Basic"));
