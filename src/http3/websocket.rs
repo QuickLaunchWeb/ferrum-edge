@@ -96,12 +96,13 @@
 //!
 //! ## Graceful shutdown
 //!
-//! The H3 WS session captures a fresh `ConnectionGuard` (the same RAII
-//! type the H1/H2 path uses for its long-lived sessions) so `SIGTERM`
-//! drain waits for in-flight H3 WebSocket sessions to close before
-//! exit, matching `FERRUM_SHUTDOWN_DRAIN_SECONDS` semantics. The
-//! caller drops its request-side guard before entering the relay so a
-//! long-lived upgraded socket is not also counted as an active request.
+//! The caller transfers its request-side `RequestGuard` to this module.
+//! After WebSocket connection-limit admission succeeds, the H3 WS session
+//! captures a fresh `ConnectionGuard` (the same RAII type the H1/H2 path
+//! uses for its long-lived sessions) and then drops the request guard.
+//! That handoff keeps backend handshake failures visible to overload
+//! pressure and `SIGTERM` drain while avoiding counting an established,
+//! long-lived upgraded socket as an active request.
 //!
 //! ## 0-RTT
 //!
@@ -255,6 +256,7 @@ async fn send_h3_error_body<S>(
 pub(crate) async fn handle_h3_websocket(
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     state: ProxyState,
+    request_guard: crate::overload::RequestGuard,
     epoch: Arc<RequestEpoch>,
     proxy: Arc<Proxy>,
     ctx: RequestContext,
@@ -330,6 +332,14 @@ pub(crate) async fn handle_h3_websocket(
             return Ok(());
         }
     };
+
+    // Handoff overload accounting from "active request/stream" to
+    // "long-lived WebSocket connection" before the backend handshake. This
+    // keeps slow or failing backend connects visible to graceful drain and
+    // connection pressure, while avoiding request-count double accounting for
+    // the established session lifetime.
+    let ws_session_guard = crate::overload::ConnectionGuard::new(&state.overload);
+    drop(request_guard);
 
     // ── Build forwardable header list for the backend handshake ─────
     let mut client_headers = collect_forwardable_h3_headers(&proxy_headers, is_early_data);
@@ -455,14 +465,6 @@ pub(crate) async fn handle_h3_websocket(
         upstream_target.clone(),
         upstream_balancer.clone(),
     );
-
-    // Track the upgraded WS session in `OverloadState.active_connections`
-    // so `FERRUM_SHUTDOWN_DRAIN_SECONDS` waits for in-flight H3
-    // WebSocket sessions before exiting. Matches the H1/H2 path's
-    // separate `ws_session_guard` (see `proxy/mod.rs` ~4419 for the
-    // rationale on why WS sessions are tracked as connections rather
-    // than reusing the request-side accounting).
-    let _ws_session_guard = crate::overload::ConnectionGuard::new(&state.overload);
 
     // ── Send 200 OK response on the H3 stream (RFC 9220 §4) ─────────
     //
@@ -706,7 +708,7 @@ pub(crate) async fn handle_h3_websocket(
     // Drop guards explicitly so their `Drop` impl runs before the
     // info!() below — keeps the "session ended" log adjacent to the
     // accounting release in interleaved tracing output.
-    drop(_ws_session_guard);
+    drop(ws_session_guard);
     drop(ws_lb_guard);
 
     info!(

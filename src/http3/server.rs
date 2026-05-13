@@ -1513,16 +1513,15 @@ async fn handle_h3_request(
     // a 501 itself as defense in depth.
     if http_flavor == HttpFlavor::WebSocket {
         let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
-        // The HTTP request admission phase is complete once the H3 200
-        // upgrade response is about to be delegated to the long-lived
-        // WebSocket relay. From here the session is accounted as an active
-        // connection by `handle_h3_websocket`, matching H1/H2 WebSocket
-        // overload semantics and avoiding double-counting one socket as both
-        // an active request and an active connection for its full lifetime.
-        drop(request_guard);
+        // Transfer request-side accounting to the H3 WebSocket bridge. The
+        // bridge starts its long-lived `ConnectionGuard` before dropping this
+        // `RequestGuard`, so backend handshakes stay visible to overload
+        // pressure and graceful drain while the established session is not
+        // double-counted as both a request and a connection.
         return crate::http3::websocket::handle_h3_websocket(
             stream,
             state,
+            request_guard,
             epoch,
             proxy,
             ctx,
