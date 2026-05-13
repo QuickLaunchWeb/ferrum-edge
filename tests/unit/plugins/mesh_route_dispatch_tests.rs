@@ -92,7 +92,17 @@ fn backend_host_and_port_override_apply_to_clone() {
 
 #[test]
 fn direct_backend_override_clears_existing_upstream_id() {
-    let proxy = upstream_proxy();
+    let mut proxy_template = (*upstream_proxy()).clone();
+    proxy_template.backend_tls_client_cert_path = Some("/certs/direct.pem".to_string());
+    proxy_template.backend_tls_client_key_path = Some("/certs/direct.key".to_string());
+    proxy_template.backend_tls_server_ca_cert_path = Some("/certs/direct-ca.pem".to_string());
+    proxy_template.resolved_tls = BackendTlsConfig {
+        client_cert_path: Some("/certs/upstream.pem".to_string()),
+        client_key_path: Some("/certs/upstream.key".to_string()),
+        server_ca_cert_path: Some("/certs/upstream-ca.pem".to_string()),
+        verify_server_cert: false,
+    };
+    let proxy = Arc::new(proxy_template);
     let mut ctx = ctx();
     ctx.route_override_backend_host = Some("canary.svc".to_string());
     ctx.route_override_backend_port = Some(9090);
@@ -102,6 +112,22 @@ fn direct_backend_override_clears_existing_upstream_id() {
     assert_eq!(result.upstream_id, None);
     assert_eq!(result.backend_host, "canary.svc");
     assert_eq!(result.backend_port, 9090);
+    assert_eq!(
+        result.resolved_tls.client_cert_path.as_deref(),
+        Some("/certs/direct.pem")
+    );
+    assert_eq!(
+        result.resolved_tls.client_key_path.as_deref(),
+        Some("/certs/direct.key")
+    );
+    assert_eq!(
+        result.resolved_tls.server_ca_cert_path.as_deref(),
+        Some("/certs/direct-ca.pem")
+    );
+    assert!(
+        result.resolved_tls.verify_server_cert,
+        "direct backend override should reset inherited upstream verify policy"
+    );
 }
 
 #[test]

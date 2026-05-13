@@ -2135,7 +2135,11 @@ impl ProxyState {
                     effective_proxy.backend_port = port;
                 }
                 if direct_backend_override {
+                    let reset_direct_tls = effective_proxy.upstream_id.is_some();
                     effective_proxy.upstream_id = None;
+                    if reset_direct_tls {
+                        effective_proxy.resolved_tls = BackendTlsConfig::from_proxy(base_proxy);
+                    }
                 }
                 if let Some(tls) = destination.backend_tls {
                     effective_proxy.resolved_tls = tls;
@@ -13730,6 +13734,74 @@ mod tests {
             Some("/certs/canary-ca.pem")
         );
         assert!(!canary.proxy.resolved_tls.verify_server_cert);
+    }
+
+    #[tokio::test]
+    async fn capability_targets_reset_tls_for_mesh_route_dispatch_direct_backends() {
+        let mut proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
+        proxy.upstream_id = Some("stable".to_string());
+        proxy.backend_tls_client_cert_path = Some("/certs/direct.pem".to_string());
+        proxy.backend_tls_client_key_path = Some("/certs/direct.key".to_string());
+        proxy.backend_tls_server_ca_cert_path = Some("/certs/direct-ca.pem".to_string());
+        proxy.resolved_tls = BackendTlsConfig {
+            client_cert_path: Some("/certs/stale-upstream.pem".to_string()),
+            client_key_path: Some("/certs/stale-upstream.key".to_string()),
+            server_ca_cert_path: Some("/certs/stale-upstream-ca.pem".to_string()),
+            verify_server_cert: false,
+        };
+
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "mrd-p".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "backend_host": "direct.test",
+                        "backend_port": 9443
+                    }
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+        let state = make_test_proxy_state(config);
+        let loaded = state.config.load_full();
+
+        let targets = state.collect_backend_capability_targets(&loaded);
+        let direct = targets
+            .iter()
+            .find(|target| target.host() == "direct.test" && target.port() == 9443)
+            .expect("direct backend override target should be probed");
+        assert_eq!(direct.proxy.upstream_id, None);
+        assert_eq!(
+            direct.proxy.resolved_tls.client_cert_path.as_deref(),
+            Some("/certs/direct.pem")
+        );
+        assert_eq!(
+            direct.proxy.resolved_tls.client_key_path.as_deref(),
+            Some("/certs/direct.key")
+        );
+        assert_eq!(
+            direct.proxy.resolved_tls.server_ca_cert_path.as_deref(),
+            Some("/certs/direct-ca.pem")
+        );
+        assert!(
+            direct.proxy.resolved_tls.verify_server_cert,
+            "direct backend probe should reset stale upstream verify policy"
+        );
     }
 
     #[test]

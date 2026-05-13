@@ -487,10 +487,17 @@ impl RequestContext {
         } else {
             None
         };
+        let direct_backend_tls_override = if direct_backend_override && proxy.upstream_id.is_some()
+        {
+            Some(BackendTlsConfig::from_proxy(&proxy))
+        } else {
+            None
+        };
         let resolved_tls_override = self
             .route_override_resolved_tls
             .clone()
-            .or(upstream_tls_override);
+            .or(upstream_tls_override)
+            .or(direct_backend_tls_override);
         let resolved_tls_changed = resolved_tls_override
             .as_ref()
             .is_some_and(|tls| *tls != proxy.resolved_tls);
