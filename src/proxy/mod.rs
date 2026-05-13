@@ -4049,7 +4049,7 @@ async fn handle_websocket_request_authenticated(
     let mut current_target = upstream_target;
     let mut ws_attempt = 0u32;
 
-    let backend_ws_stream = loop {
+    let backend_handshake = loop {
         match connect_websocket_backend(
             &current_backend_url,
             &proxy,
@@ -4062,7 +4062,7 @@ async fn handle_websocket_request_authenticated(
         )
         .await
         {
-            Ok(stream) => break stream,
+            Ok(handshake) => break handshake,
             Err(e) => {
                 // `connect_websocket_backend` covers more than TCP+TLS setup:
                 // `connect_async_tls_with_config` ALSO sends the WebSocket
@@ -4353,6 +4353,15 @@ async fn handle_websocket_request_authenticated(
                 ),
             )
     };
+
+    // Forward the backend's negotiated subprotocol (RFC 6455 §11.3.4, RFC
+    // 8441 §5.2). Clients that send `Sec-WebSocket-Protocol` expect the
+    // server to confirm the selected value; dropping it breaks
+    // subprotocol-based dispatch in application code.
+    if let Some(proto) = backend_handshake.negotiated_subprotocol.clone() {
+        ws_resp_builder = ws_resp_builder.header("sec-websocket-protocol", proto);
+    }
+    let backend_ws_stream = backend_handshake.stream;
 
     // Inject sticky session cookie on WebSocket upgrade responses
     if sticky_cookie_needed
@@ -4762,8 +4771,24 @@ fn build_websocket_tls_connector(
     ))))
 }
 
+/// Outcome of a successful backend WebSocket handshake. The stream carries
+/// frames; `negotiated_subprotocol` preserves the backend's chosen value
+/// (RFC 6455 §11.3.4, also applicable to RFC 8441 / RFC 9220 Extended CONNECT)
+/// so the frontend can forward it to the client. Without forwarding, clients
+/// that offered a subprotocol list see no negotiated value and fail
+/// application-level handshakes.
+///
+/// `Sec-WebSocket-Extensions` is intentionally NOT forwarded: the bridge
+/// doesn't speak `permessage-deflate` end-to-end, so signalling a negotiated
+/// extension would lead the client to decode raw frames as compressed.
+pub(crate) struct BackendWsHandshake {
+    pub stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
+}
+
 /// Connect to backend WebSocket server before sending 101 to client.
-/// Returns the connected backend stream, or an error if the backend is unreachable.
+/// Returns the connected backend stream + negotiated handshake metadata,
+/// or an error if the backend is unreachable.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn connect_websocket_backend(
     backend_url: &str,
@@ -4774,10 +4799,7 @@ pub(crate) async fn connect_websocket_backend(
     crls: &crate::tls::CrlList,
     max_websocket_frame_size_bytes: usize,
     websocket_write_buffer_size: usize,
-) -> Result<
-    WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    Box<dyn std::error::Error + Send + Sync>,
-> {
+) -> Result<BackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
     ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
@@ -4821,7 +4843,15 @@ pub(crate) async fn connect_websocket_backend(
     debug!("Connected to backend WebSocket server: {}", backend_url);
     debug!("Backend response status: {}", backend_response.status());
 
-    Ok(backend_ws_stream)
+    let negotiated_subprotocol = backend_response
+        .headers()
+        .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
+        .cloned();
+
+    Ok(BackendWsHandshake {
+        stream: backend_ws_stream,
+        negotiated_subprotocol,
+    })
 }
 
 /// Run bidirectional WebSocket proxying between upgraded client and connected backend.

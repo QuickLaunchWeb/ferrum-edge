@@ -257,6 +257,7 @@ pub(crate) async fn handle_h3_websocket(
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     state: ProxyState,
     request_guard: crate::overload::RequestGuard,
+    per_ip_guard: Option<crate::proxy::PerIpRequestGuard>,
     epoch: Arc<RequestEpoch>,
     proxy: Arc<Proxy>,
     ctx: RequestContext,
@@ -368,7 +369,7 @@ pub(crate) async fn handle_h3_websocket(
     // loop here. Circuit-breaker accounting still runs — see comments
     // around `record_failure` below — so backend isolation is enforced
     // even without retry-with-rotation.
-    let backend_ws_stream = match crate::proxy::connect_websocket_backend(
+    let backend_handshake = match crate::proxy::connect_websocket_backend(
         &backend_url,
         &proxy,
         &state.env_config,
@@ -380,7 +381,7 @@ pub(crate) async fn handle_h3_websocket(
     )
     .await
     {
-        Ok(s) => s,
+        Ok(handshake) => handshake,
         Err(e) => {
             // `connect_websocket_backend` covers more than TCP+TLS setup:
             // it ALSO sends the WebSocket upgrade request and reads the
@@ -473,6 +474,14 @@ pub(crate) async fn handle_h3_websocket(
     // transport as soon as the client sees the 200.
     let mut response_builder = Response::builder().status(StatusCode::OK);
 
+    // Forward the backend's negotiated subprotocol (RFC 6455 §11.3.4,
+    // applicable to RFC 9220 Extended CONNECT via RFC 8441 §5.2).
+    // Clients that offered a subprotocol expect the server's selected
+    // value; dropping it breaks subprotocol-based application dispatch.
+    if let Some(proto) = backend_handshake.negotiated_subprotocol.clone() {
+        response_builder = response_builder.header("sec-websocket-protocol", proto);
+    }
+
     // Sticky session cookie on the WS upgrade response, mirroring the
     // H1/H2 path.
     if sticky_cookie_needed
@@ -510,6 +519,20 @@ pub(crate) async fn handle_h3_websocket(
     }
 
     crate::proxy::record_request(&state, 200);
+
+    // Per-IP request accounting handoff: the upgrade is complete and the
+    // session is now a long-lived "connection" tracked by
+    // `ws_session_guard` (overload `active_connections`) and the WebSocket
+    // connection permit. Dropping the per-IP REQUEST guard here matches
+    // the H1/H2 path — there, `handle_websocket_request_authenticated`
+    // returns the upgrade response and the caller's `_per_ip_guard`
+    // drops as the function unwinds, BEFORE the spawned WS session
+    // continues. Keeping it for the full session lifetime would let one
+    // long-lived H3 WebSocket block normal H1/H2/H3 requests from the
+    // same IP for the entire session duration.
+    drop(per_ip_guard);
+
+    let backend_ws_stream = backend_handshake.stream;
 
     // Emit the successful-upgrade TransactionSummary now — same shape
     // the H1/H2 path emits at upgrade time.

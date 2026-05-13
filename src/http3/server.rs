@@ -1512,16 +1512,55 @@ async fn handle_h3_request(
     // from reaching this branch, but the dedicated handler also emits
     // a 501 itself as defense in depth.
     if http_flavor == HttpFlavor::WebSocket {
+        // CSWSH protection (RFC 6455 §10.2): reject WS upgrades from
+        // origins not on the allow-list BEFORE dispatching into the
+        // bridge. Mirrors the H1/H2 check in
+        // `src/proxy/mod.rs::handle_proxy_request_inner`; without this,
+        // any proxy relying on `allowed_ws_origins` can be bypassed via
+        // HTTP/3. `proxy_headers` keys were already lowercased by the
+        // H3 header-materialization path.
+        if !proxy.allowed_ws_origins.is_empty() {
+            let origin = proxy_headers
+                .get("origin")
+                .map(String::as_str)
+                .unwrap_or("");
+            if !proxy
+                .allowed_ws_origins
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(origin))
+            {
+                warn!(
+                    "H3 WebSocket upgrade rejected: Origin '{}' not in allowed_ws_origins for proxy {}",
+                    origin, proxy.id
+                );
+                record_request(&state, 403);
+                send_h3_error_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    StatusCode::FORBIDDEN,
+                    r#"{"error":"WebSocket Origin not allowed"}"#,
+                    crate::proxy::grpc_proxy::grpc_status::PERMISSION_DENIED,
+                    "WebSocket Origin not allowed",
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+
         let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
         // Transfer request-side accounting to the H3 WebSocket bridge. The
         // bridge starts its long-lived `ConnectionGuard` before dropping this
         // `RequestGuard`, so backend handshakes stay visible to overload
         // pressure and graceful drain while the established session is not
-        // double-counted as both a request and a connection.
+        // double-counted as both a request and a connection. The per-IP
+        // REQUEST guard is also transferred so the bridge can release the
+        // per-IP request slot at the 200 boundary, matching how the H1/H2
+        // path drops its `_per_ip_guard` when the upgrade response unwinds.
         return crate::http3::websocket::handle_h3_websocket(
             stream,
             state,
             request_guard,
+            _per_ip_guard,
             epoch,
             proxy,
             ctx,
