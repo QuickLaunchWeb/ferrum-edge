@@ -520,6 +520,9 @@ mod tests {
             namespace: namespace.into(),
             network: None,
             cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
         }
     }
 
@@ -2214,6 +2217,9 @@ mod tests {
                 namespace: "default".into(),
                 network: None,
                 cluster: None,
+                weight: None,
+                locality: None,
+                service_account: None,
             }],
             ..MeshSlice::default()
         };
@@ -2242,6 +2248,9 @@ mod tests {
                 namespace: "default".into(),
                 network: None,
                 cluster: None,
+                weight: None,
+                locality: None,
+                service_account: None,
             }],
             ..MeshSlice::default()
         };

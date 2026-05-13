@@ -161,6 +161,9 @@ fn create_test_mesh_config() -> GatewayConfig {
             namespace: "ferrum".to_string(),
             network: None,
             cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
         }],
         services: vec![MeshService {
             name: "api".to_string(),
