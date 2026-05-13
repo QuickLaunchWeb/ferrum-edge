@@ -1165,11 +1165,18 @@ fn virtual_service_routes(
             // overrides applied via `apply_route_overrides` so downstream
             // pool keys, capability-registry lookups, circuit-breaker keys,
             // and URL construction all derive from the effective destination.
+            //
+            // `listen_path` is passed so the plugin scopes match entries to
+            // this proxy. Without it, an `http.match[]` with `[{uri:/a},
+            // {uri:/b, headers:...}]` would let the `/b` header rule bleed
+            // into the `/a` proxy, and -- with `reject_unmatched: true` --
+            // a URI-only sibling entry would cause valid traffic to 404.
             if acc.options.vs_header_routing_experimental
                 && let Some(plugin) = mesh_route_dispatch_plugin_for_proxy(
                     &proxy_id,
                     &object.metadata.namespace,
                     http,
+                    listen_path.as_deref(),
                     backend_host.as_str(),
                     backend_port,
                     upstream_id.as_deref(),
@@ -1477,7 +1484,7 @@ fn parse_istio_duration_secs(raw: &str) -> Option<u64> {
     parse_istio_duration_ms(raw).map(|ms| if ms == 0 { 0 } else { ms.div_ceil(1000) })
 }
 
-fn path_match(uri: &Value) -> Option<String> {
+pub(super) fn path_match(uri: &Value) -> Option<String> {
     if let Some(prefix) = string_field(uri, "prefix") {
         return Some(prefix.to_string());
     }
@@ -5718,6 +5725,151 @@ mod tests {
             .expect("mesh_route_dispatch plugin should be emitted");
         let headers = &plugin.config["rules"][0]["match"]["headers"];
         assert_eq!(headers["x-canary"].as_str(), Some("v2"));
+    }
+
+    #[test]
+    fn virtual_service_mixed_uri_only_and_header_match_disables_reject_unmatched() {
+        // Codex P1 (#3237393205): a VirtualService whose `match[]` mixes a
+        // URI-only branch with a URI+header branch on the same URI must let
+        // plain `/api` requests fall through to the proxy's default backend.
+        // Istio `match[]` entries are ORed -- the URI-only entry is an
+        // unconditional catch-all for this listen_path. With
+        // `reject_unmatched: true` the silently dropped URI-only branch
+        // turned legitimate traffic into 404s.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/api"}},
+                            {
+                                "uri": {"prefix": "/api"},
+                                "headers": {"x-canary": {"exact": "v2"}}
+                            }
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin should still be emitted to surface predicates");
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules array");
+        assert_eq!(
+            rules.len(),
+            1,
+            "URI-only sibling does not become a rule; the header branch does"
+        );
+        assert_eq!(
+            rules[0]["match"]["headers"]["x-canary"].as_str(),
+            Some("v2")
+        );
+        assert_eq!(
+            plugin
+                .config
+                .get("reject_unmatched")
+                .and_then(Value::as_bool),
+            Some(false),
+            "URI-only catch-all sibling must disable reject_unmatched so plain `/api` traffic still reaches the default backend"
+        );
+    }
+
+    #[test]
+    fn virtual_service_match_rules_scoped_to_listen_path() {
+        // Codex P1 (#3232888791): match entries from a sibling URI branch
+        // must not bleed into a path-specific proxy. A `match[]` with
+        // `[{uri:/api}, {uri:/v2, headers:...}]` produces two proxies
+        // (`/api`, `/v2`); the header rule belongs only to the `/v2`
+        // proxy. Without scoping, the `/v2` header rule fires on `/api`
+        // requests too, violating VirtualService semantics.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/api"}},
+                            {
+                                "uri": {"prefix": "/v2"},
+                                "headers": {"x-canary": {"exact": "v2"}}
+                            }
+                        ],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+
+        let api_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some("/api"))
+            .expect("/api proxy");
+        let v2_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some("/v2"))
+            .expect("/v2 proxy");
+
+        // The /api branch is URI-only -- no rule applies to this proxy and
+        // every request matches the unconditional URI branch, so we emit
+        // no plugin at all (would-be plugin has zero rules).
+        let api_plugin = result.config.plugin_configs.iter().find(|p| {
+            p.plugin_name == "mesh_route_dispatch"
+                && p.proxy_id.as_deref() == Some(api_proxy.id.as_str())
+        });
+        assert!(
+            api_plugin.is_none(),
+            "/api proxy has only a URI-only branch -- no mesh_route_dispatch plugin should be emitted"
+        );
+
+        // The /v2 branch has a header predicate. Its proxy must get a
+        // plugin with the header rule AND `reject_unmatched: true` (no
+        // URI-only sibling in scope for this listen_path).
+        let v2_plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(v2_proxy.id.as_str())
+            })
+            .expect("/v2 proxy mesh_route_dispatch plugin");
+        let v2_rules = v2_plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        assert_eq!(v2_rules.len(), 1, "/v2 proxy sees only its own header rule");
+        assert_eq!(
+            v2_rules[0]["match"]["headers"]["x-canary"].as_str(),
+            Some("v2")
+        );
+        assert_eq!(
+            v2_plugin
+                .config
+                .get("reject_unmatched")
+                .and_then(Value::as_bool),
+            Some(true),
+            "/v2 has no URI-only sibling -- reject_unmatched stays on so traffic without x-canary 404s"
+        );
     }
 
     #[test]

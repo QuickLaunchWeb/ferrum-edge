@@ -643,10 +643,29 @@ pub(crate) fn fault_injection_plugin_for_proxy(
 /// Translate a VirtualService `http[]` entry's `match[]` blocks into a
 /// `mesh_route_dispatch` plugin instance for the route's proxy.
 ///
-/// Each `match[]` entry becomes one rule. URI predicates are already
-/// captured at the proxy level via `listen_path`, so this helper extracts
-/// only the non-URI predicates (`method`, `headers`, `queryParams`). If no
-/// match entry has non-URI predicates, returns `None` — no plugin emitted.
+/// Each in-scope `match[]` entry becomes one rule. URI predicates are
+/// already captured at the proxy level via `listen_path`, so this helper
+/// extracts only the non-URI predicates (`method`, `headers`,
+/// `queryParams`). If no in-scope match entry has non-URI predicates,
+/// returns `None` — no plugin emitted.
+///
+/// `listen_path` scopes the in-scope entries to this proxy: a `match[]`
+/// entry with a `uri` predicate only contributes to the proxy whose
+/// `listen_path` was derived from that same URI. URI-less entries (Istio
+/// "any URI with these predicates") apply to every proxy emitted from
+/// this `http[]` rule. Without this scoping, a `[{uri:/a}, {uri:/b,
+/// headers:...}]` `match[]` would bleed the `/b` header rule into the
+/// `/a` proxy, and the second P1 below would also fire.
+///
+/// `reject_unmatched` is forced to `false` when any in-scope entry is
+/// URI-only. Istio `match[]` entries are ORed: a URI-only entry is an
+/// unconditional catch-all for its listen_path, so requests that miss
+/// every other predicate must still be allowed to fall through to the
+/// proxy's default backend. With `reject_unmatched: true` and a URI-only
+/// sibling silently dropped, plain `/api` traffic on a `[{uri:/api},
+/// {uri:/api, headers:...}]` `match[]` would 404. When every in-scope
+/// entry carries non-URI predicates, `reject_unmatched: true` is kept so
+/// e.g. a GET-only route does not silently serve POST traffic.
 ///
 /// The rule's destination overrides to the route's own destination
 /// (`backend_host`/`backend_port` or `upstream_id`). The destination is
@@ -660,6 +679,7 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
     proxy_id: &str,
     namespace: &str,
     http: &Value,
+    listen_path: Option<&str>,
     backend_host: &str,
     backend_port: u16,
     upstream_id: Option<&str>,
@@ -670,7 +690,20 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
     }
 
     let mut rules = Vec::new();
+    let mut has_uri_only_match = false;
     for entry in matches {
+        // Scope to this proxy's listen_path. A match entry with a parseable
+        // URI applies only to the proxy whose listen_path was built from
+        // that URI; entries without a URI (or with an unsupported URI
+        // shape, which never produces a proxy) apply to every listen_path
+        // derived from this http[] rule and are not filtered out here.
+        let entry_path = entry.get("uri").and_then(istio::path_match);
+        if let (Some(entry_path), Some(listen_path)) = (entry_path.as_deref(), listen_path)
+            && entry_path != listen_path
+        {
+            continue;
+        }
+
         let mut match_criteria = serde_json::Map::new();
 
         if let Some(method_obj) = entry.get("method").and_then(Value::as_object)
@@ -704,6 +737,13 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
         }
 
         if match_criteria.is_empty() {
+            // In-scope entry with no extractable non-URI predicates: its
+            // URI already matched at proxy level, so this is an
+            // unconditional catch-all branch for `listen_path`. Mark it so
+            // `reject_unmatched` is disabled below; otherwise a co-located
+            // header/method rule would force 404 on traffic the URI-only
+            // branch is supposed to allow through.
+            has_uri_only_match = true;
             continue;
         }
 
@@ -738,7 +778,16 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
         // must not serve requests that miss those predicates via the proxy's
         // default backend. Without this, e.g., a GET-only route would
         // silently forward POST traffic to the same upstream.
-        config: serde_json::json!({"rules": rules, "reject_unmatched": true}),
+        //
+        // It flips to `false` when any in-scope entry is URI-only -- that
+        // entry is an unconditional ORed match for this listen_path, so
+        // unmatched requests must fall through to the default backend
+        // rather than 404. See the function docstring for the full
+        // rationale and the regression scenarios this guards against.
+        config: serde_json::json!({
+            "rules": rules,
+            "reject_unmatched": !has_uri_only_match,
+        }),
         scope: PluginScope::Proxy,
         proxy_id: Some(proxy_id.to_string()),
         enabled: true,
