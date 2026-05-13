@@ -328,10 +328,11 @@ impl MeshSlice {
             .filter(|dr| {
                 applicable_sidecar
                     .map(|sidecar| {
-                        let host_candidates = destination_rule_host_candidates(dr, &cluster_domain);
+                        let (resource_namespace, host_candidates) =
+                            destination_rule_host_scope(dr, &cluster_domain);
                         let host_refs: Vec<&str> =
                             host_candidates.iter().map(String::as_str).collect();
-                        sidecar_egress_includes_service(sidecar, dr.namespace.as_str(), &host_refs)
+                        sidecar_egress_includes_service(sidecar, &resource_namespace, &host_refs)
                     })
                     .unwrap_or(true)
             })
@@ -389,12 +390,12 @@ fn service_host_aliases(name: &str, namespace: &str, cluster_domain: &str) -> Ve
     candidates
 }
 
-fn destination_rule_host_candidates(
+fn destination_rule_host_scope(
     rule: &MeshDestinationRule,
     cluster_domain: &str,
-) -> Vec<String> {
+) -> (String, Vec<String>) {
     let host = rule.host.trim().trim_end_matches('.').to_ascii_lowercase();
-    let namespace = rule
+    let rule_namespace = rule
         .namespace
         .trim()
         .trim_end_matches('.')
@@ -404,46 +405,55 @@ fn destination_rule_host_candidates(
         .trim_end_matches('.')
         .to_ascii_lowercase();
 
-    destination_rule_service_name_from_host(&host, &namespace, &cluster_domain)
-        .map(|service_name| service_host_aliases(&service_name, &namespace, &cluster_domain))
-        .unwrap_or_else(|| vec![host])
+    destination_rule_service_ref_from_host(&host, &rule_namespace, &cluster_domain)
+        .map(|(service_name, service_namespace)| {
+            let candidates =
+                service_host_aliases(&service_name, &service_namespace, &cluster_domain);
+            (service_namespace, candidates)
+        })
+        .unwrap_or_else(|| (rule_namespace, vec![host]))
 }
 
-fn destination_rule_service_name_from_host(
+fn destination_rule_service_ref_from_host(
     host: &str,
-    namespace: &str,
+    rule_namespace: &str,
     cluster_domain: &str,
-) -> Option<String> {
-    if host.is_empty() || namespace.is_empty() || host.contains('*') {
+) -> Option<(String, String)> {
+    if host.is_empty() || rule_namespace.is_empty() || host.contains('*') {
         return None;
     }
     if !host.contains('.') {
-        return Some(host.to_string());
+        return Some((host.to_string(), rule_namespace.to_string()));
     }
 
-    if let Some(name) = host.strip_suffix(&format!(".{namespace}"))
+    if let Some(name) = host.strip_suffix(&format!(".{rule_namespace}"))
         && !name.is_empty()
         && !name.contains('.')
     {
-        return Some(name.to_string());
+        return Some((name.to_string(), rule_namespace.to_string()));
     }
 
-    if let Some(name) = host.strip_suffix(&format!(".{namespace}.svc"))
-        && !name.is_empty()
-        && !name.contains('.')
-    {
-        return Some(name.to_string());
+    if let Some((name, namespace)) = host.strip_suffix(".svc").and_then(split_service_host) {
+        return Some((name.to_string(), namespace.to_string()));
     }
 
     if !cluster_domain.is_empty()
-        && let Some(name) = host.strip_suffix(&format!(".{namespace}.svc.{cluster_domain}"))
-        && !name.is_empty()
-        && !name.contains('.')
+        && let Some((name, namespace)) = host
+            .strip_suffix(&format!(".svc.{cluster_domain}"))
+            .and_then(split_service_host)
     {
-        return Some(name.to_string());
+        return Some((name.to_string(), namespace.to_string()));
     }
 
     None
+}
+
+fn split_service_host(host: &str) -> Option<(&str, &str)> {
+    let (name, namespace) = host.split_once('.')?;
+    if name.is_empty() || namespace.is_empty() || name.contains('.') || namespace.contains('.') {
+        return None;
+    }
+    Some((name, namespace))
 }
 
 /// Resolve the most-specific applicable Sidecar for a workload.
@@ -2790,6 +2800,41 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_narrowing_matches_destination_rule_target_namespace() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["beta/*"]],
+            )],
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "beta-reviews-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "reviews.beta.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "gamma-checkout-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "checkout.gamma.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "beta-reviews-dr");
+    }
+
+    #[test]
     fn sidecar_resolution_prefers_workload_scoped_over_namespace_default() {
         // A workload that matches both a workload-scoped and a namespace-
         // default Sidecar should get the workload-scoped one.
@@ -3132,8 +3177,8 @@ mod tests {
     fn sidecar_narrowing_destination_rule_only_filtered_in_own_namespace() {
         // DestinationRule narrowing is paired with the namespace pre-filter:
         // only rules in the workload's namespace ever reach the slice, then
-        // the egress pattern filters within that. This locks in the current
-        // contract for future code reviews.
+        // the egress pattern filters by the rule host's target namespace. This
+        // locks in the current contract for future code reviews.
         let mesh = MeshConfig {
             sidecars: vec![make_sidecar(
                 "alpha-only",
