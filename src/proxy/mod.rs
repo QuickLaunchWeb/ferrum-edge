@@ -112,9 +112,24 @@ static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
 
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 
-fn mesh_route_dispatch_upstream_reference_warnings(config: &GatewayConfig) -> Vec<String> {
+/// Validate that every `mesh_route_dispatch` rule's
+/// `destination.upstream_id` points at a real upstream in the config.
+///
+/// Treated as a rejecting validator (same bucket as
+/// `validate_upstream_references` for `Proxy.upstream_id`): a typo in a
+/// rule's upstream_id is observationally equivalent to a typo on
+/// `Proxy.upstream_id` — `apply_route_overrides_with_upstreams` still
+/// bakes the missing id into the request proxy, `select_upstream_target`
+/// returns no target, and HTTP/H2/H3 dispatch falls back to the proxy's
+/// default `backend_host:backend_port`. That silent fallback can route
+/// matched traffic to the wrong backend instead of failing config
+/// validation, so the contract here matches normal Proxy upstream-id
+/// validation: refuse the config, log every dangling reference once.
+pub(crate) fn validate_mesh_route_dispatch_upstream_references(
+    config: &GatewayConfig,
+) -> Result<(), Vec<String>> {
     let upstream_ids: HashSet<&str> = config.upstreams.iter().map(|u| u.id.as_str()).collect();
-    let mut warnings = Vec::new();
+    let mut errors = Vec::new();
 
     for plugin in &config.plugin_configs {
         if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
@@ -130,7 +145,7 @@ fn mesh_route_dispatch_upstream_reference_warnings(config: &GatewayConfig) -> Ve
                 && !upstream_ids.contains(upstream_id)
             {
                 let proxy_id = plugin.proxy_id.as_deref().unwrap_or("<none>");
-                warnings.push(format!(
+                errors.push(format!(
                     "PluginConfig '{}' (mesh_route_dispatch) rule {} for proxy_id '{}' references non-existent upstream_id '{}'",
                     plugin.id, rule_idx, proxy_id, upstream_id
                 ));
@@ -138,7 +153,11 @@ fn mesh_route_dispatch_upstream_reference_warnings(config: &GatewayConfig) -> Ve
         }
     }
 
-    warnings
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 /// Capability probes run during startup and background refresh, so they should
@@ -1672,9 +1691,6 @@ impl ProxyState {
             &gateway_svid_bundle,
             &env_config_arc.namespace,
         );
-        for msg in mesh_route_dispatch_upstream_reference_warnings(&config) {
-            warn!("Config validation: {}", msg);
-        }
         let gateway_file_svid_bundle = clone_svid_bundle_slot(&gateway_svid_bundle);
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
         let hbone_pool = Arc::new(HboneConnectionPool::new(
@@ -2936,10 +2952,6 @@ impl ProxyState {
     ///     stale TLS path or a single misconfigured backend IP doesn't
     ///     freeze the entire control plane.
     ///   - `validate_hosts` (hostname syntax). Same rationale.
-    ///   - `mesh_route_dispatch` upstream-id rule references. Generated
-    ///     Kubernetes configs should always be internally consistent, but
-    ///     hand-authored plugin configs are plugin data; warn so operators see
-    ///     that matching requests will fail backend selection.
     ///
     /// - *Reject* — accumulate into the returned error vector and abort
     ///   the reload:
@@ -2953,6 +2965,15 @@ impl ProxyState {
     ///     500 every request through that proxy.
     ///   - `validate_plugin_references` — dangling plugin IDs / wrong
     ///     scope.
+    ///   - `validate_mesh_route_dispatch_upstream_references` — dangling
+    ///     `mesh_route_dispatch.destination.upstream_id` references are
+    ///     observationally identical to a dangling `Proxy.upstream_id`:
+    ///     `apply_route_overrides_with_upstreams` bakes the missing id
+    ///     into the request proxy, `select_upstream_target` returns no
+    ///     target, and dispatch silently falls back to the proxy's
+    ///     default backend host/port. Reject before swap so the typo
+    ///     surfaces as a config error instead of silent traffic
+    ///     misrouting.
     ///   - `validate_stream_proxy_port_conflicts` — rejects in non-DP
     ///     modes, warns in DP mode (the DP doesn't control its config and
     ///     one bad stream proxy port shouldn't block all other config
@@ -2986,9 +3007,6 @@ impl ProxyState {
                 warn!("Config validation: {}", msg);
             }
         }
-        for msg in mesh_route_dispatch_upstream_reference_warnings(config) {
-            warn!("Config validation: {}", msg);
-        }
 
         // Reject — collect all rejecting-validator failures into a single
         // error vector so callers can log every reason at once instead of
@@ -3007,6 +3025,9 @@ impl ProxyState {
             errors.extend(errs);
         }
         if let Err(errs) = config.validate_plugin_references() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = validate_mesh_route_dispatch_upstream_references(config) {
             errors.extend(errs);
         }
 
@@ -13844,7 +13865,14 @@ mod tests {
     }
 
     #[test]
-    fn mesh_route_dispatch_upstream_reference_warnings_report_missing_upstream() {
+    fn validate_mesh_route_dispatch_upstream_references_rejects_missing_upstream() {
+        // A typo'd upstream_id in a mesh_route_dispatch rule must fail
+        // validation, not just warn. The reviewer correctly flagged that
+        // the previous warn-only behavior let traffic silently fall back
+        // to the proxy's default backend_host/backend_port -- matched
+        // requests would observe wrong-backend routing while the gateway
+        // continued serving. The reject path now mirrors normal
+        // Proxy.upstream_id validation.
         let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
@@ -13871,10 +13899,81 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let warnings = mesh_route_dispatch_upstream_reference_warnings(&config);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("missing-upstream"), "{warnings:?}");
-        assert!(warnings[0].contains("mrd-p"), "{warnings:?}");
+        let result = validate_mesh_route_dispatch_upstream_references(&config);
+        let errs = result.expect_err("dangling upstream_id must be rejected");
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("missing-upstream"), "{errs:?}");
+        assert!(errs[0].contains("mrd-p"), "{errs:?}");
+    }
+
+    #[test]
+    fn validate_mesh_route_dispatch_upstream_references_ok_for_existing_upstream() {
+        // When the rule's upstream_id resolves to a real upstream, the
+        // validator returns Ok. Sanity check that we're not over-rejecting.
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
+        let now = chrono::Utc::now();
+        let upstream = upstream_with_targets("real-upstream", &[("backend.test", 8080)]);
+        let plugin = PluginConfig {
+            id: "mrd-p".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "real-upstream"}
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+
+        validate_mesh_route_dispatch_upstream_references(&config).expect("existing upstream ok");
+    }
+
+    #[test]
+    fn validate_mesh_route_dispatch_upstream_references_skips_disabled_plugins() {
+        // Disabled plugins don't execute on the hot path, so a typo in a
+        // disabled instance shouldn't block config reload. This mirrors
+        // the existing `enabled` check in the validator.
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "mrd-p".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "missing-upstream"}
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p".to_string()),
+            enabled: false,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+
+        validate_mesh_route_dispatch_upstream_references(&config)
+            .expect("disabled plugin must not block validation");
     }
 
     #[test]
@@ -14998,6 +15097,50 @@ mod tests {
         assert!(
             state.validate_full_config(&good_config).is_ok(),
             "minimal valid config must pass validate_full_config"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_full_config_rejects_dangling_mesh_route_dispatch_upstream_id() {
+        // External-review P2: mesh_route_dispatch.destination.upstream_id
+        // typos used to be warn-only and silently routed matched traffic
+        // to the proxy's default backend. The reject contract now matches
+        // normal Proxy.upstream_id references -- a typo refuses the swap
+        // before in-flight requests can observe wrong-backend dispatch.
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let proxy = make_validation_proxy("p1", "/api");
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "mrd-p1".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "does-not-exist"}
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p1".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut bad_config = make_validation_config(vec![proxy]);
+        bad_config.plugin_configs = vec![plugin];
+
+        let err = state
+            .validate_full_config(&bad_config)
+            .expect_err("dangling mesh_route_dispatch upstream_id must be rejected");
+        assert!(
+            err.iter().any(|e| e.contains("does-not-exist")),
+            "error must reference the missing upstream; got {err:?}"
+        );
+        assert!(
+            err.iter().any(|e| e.contains("mesh_route_dispatch")),
+            "error must identify the plugin family; got {err:?}"
         );
     }
 

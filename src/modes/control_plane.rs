@@ -758,6 +758,13 @@ pub async fn run(
                                 if let Err(errs) = new_config.validate_plugin_references() {
                                     validation_errors.extend(errs);
                                 }
+                                if let Err(errs) =
+                                    crate::proxy::validate_mesh_route_dispatch_upstream_references(
+                                        &new_config,
+                                    )
+                                {
+                                    validation_errors.extend(errs);
+                                }
                                 if !validation_errors.is_empty() {
                                     for msg in &validation_errors {
                                         error!("CP incremental config rejected: {}", msg);
