@@ -4899,7 +4899,7 @@ components:
             `proxy`↔`proxy_id`.
             Stream: `protocol`↔`protocol`, `proxy`↔`proxy_id`,
             `cause`↔`disconnect_cause`, `direction`↔`disconnect_direction`.
-            `static_fields`, `derived_fields`, `metadata`, and
+            `static_fields`, `derived_fields`, `metadata`, `order`, and
             `timestamp_format` are no-ops for statsd (line protocol, not JSON).
             See docs/log_schema.md.
         schema_ref:

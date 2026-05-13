@@ -595,10 +595,12 @@ fn detect_credential_scheme(value: &str) -> Option<&'static str> {
         if !payload.chars().any(char::is_whitespace) {
             return Some(label);
         }
-        // Pattern B: `key=value` opener (Digest, AWS4 SigV4 style),
-        // where `key` is a contiguous identifier-shaped run before `=`.
+        // Pattern B: `key=value` opener (Digest, AWS4 SigV4 style).
+        // HTTP auth-param allows bad whitespace around "=", so accept
+        // `key = value` too while still requiring the key itself to be
+        // identifier-shaped.
         if let Some(eq_idx) = payload.find('=') {
-            let key = &payload[..eq_idx];
+            let key = payload[..eq_idx].trim_matches(|c| matches!(c, ' ' | '\t'));
             if !key.is_empty()
                 && !key.chars().any(char::is_whitespace)
                 && key
@@ -1355,6 +1357,10 @@ mod tests {
         // credentials.
         assert_eq!(
             detect_credential_scheme("Digest username=\"foo\", realm=\"bar\""),
+            Some("Digest")
+        );
+        assert_eq!(
+            detect_credential_scheme("Digest username = \"foo\", realm = \"bar\""),
             Some("Digest")
         );
         assert_eq!(

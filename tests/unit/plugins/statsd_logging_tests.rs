@@ -303,6 +303,8 @@ async fn test_statsd_logging_accepts_unsupported_schema_keys_with_warning() {
             "schema": {
                 "summary_type": "http",
                 "static_fields": { "env": "prod" },
+                "derived_fields": [{ "name": "outcome", "kind": "outcome" }],
+                "order": ["*"],
                 "timestamp_format": "epoch_ms",
                 "metadata": { "mode": "omit" }
             }

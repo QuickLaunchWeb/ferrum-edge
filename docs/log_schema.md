@@ -199,7 +199,7 @@ is louder than letting the operator deploy a field that vanishes from
 logs.
 
 Workaround: rename the field to drop the substring (e.g.
-`secret_count` → `total_credentials` or `num_secrets_present`).
+`secret_count` → `total_credentials` or `credential_count`).
 
 Singular `token` keys go through a narrower per-segment classifier
 (`is_sensitive_token_metadata_key`) so usage metrics like
