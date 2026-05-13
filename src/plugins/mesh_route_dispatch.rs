@@ -108,12 +108,13 @@ pub struct MeshRouteDispatch {
 
 impl MeshRouteDispatch {
     pub fn new(config: &serde_json::Value) -> Result<Self, String> {
-        let parsed: MeshRouteDispatchConfig = serde_json::from_value(config.clone())
+        let mut parsed: MeshRouteDispatchConfig = serde_json::from_value(config.clone())
             .map_err(|e| format!("mesh_route_dispatch config: {e}"))?;
         if parsed.rules.is_empty() {
             return Err("mesh_route_dispatch.rules cannot be empty".to_string());
         }
-        for (idx, rule) in parsed.rules.iter().enumerate() {
+        for (idx, rule) in parsed.rules.iter_mut().enumerate() {
+            normalize_header_match_keys(idx, &mut rule.match_.headers)?;
             if rule.match_.is_empty() {
                 return Err(format!(
                     "mesh_route_dispatch.rules[{idx}].match requires at least one of \
@@ -145,6 +146,28 @@ impl MeshRouteDispatch {
     }
 }
 
+fn normalize_header_match_keys(
+    rule_idx: usize,
+    headers: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    if headers.is_empty() {
+        return Ok(());
+    }
+
+    let mut normalized = HashMap::with_capacity(headers.len());
+    for (name, expected) in std::mem::take(headers) {
+        let key = name.to_ascii_lowercase();
+        if normalized.insert(key.clone(), expected).is_some() {
+            return Err(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].match.headers contains duplicate \
+                 header `{key}` after ASCII case normalization"
+            ));
+        }
+    }
+    *headers = normalized;
+    Ok(())
+}
+
 #[async_trait]
 impl Plugin for MeshRouteDispatch {
     fn name(&self) -> &str {
@@ -171,18 +194,10 @@ impl Plugin for MeshRouteDispatch {
     ) -> PluginResult {
         for rule in &self.config.rules {
             if rule_matches(&rule.match_, ctx, headers) {
-                if let Some(id) = &rule.destination.upstream_id {
-                    ctx.route_override_upstream_id = Some(id.clone());
-                }
-                if let Some(host) = &rule.destination.backend_host {
-                    ctx.route_override_backend_host = Some(host.clone());
-                }
-                if let Some(port) = rule.destination.backend_port {
-                    ctx.route_override_backend_port = Some(port);
-                }
-                if let Some(tls) = &rule.destination.backend_tls {
-                    ctx.route_override_resolved_tls = Some(tls.clone());
-                }
+                ctx.route_override_upstream_id = rule.destination.upstream_id.clone();
+                ctx.route_override_backend_host = rule.destination.backend_host.clone();
+                ctx.route_override_backend_port = rule.destination.backend_port;
+                ctx.route_override_resolved_tls = rule.destination.backend_tls.clone();
                 return PluginResult::Continue;
             }
         }
@@ -211,10 +226,9 @@ fn rule_matches(
     }
     for (name, expected) in &m.headers {
         // `before_proxy` receives the in-flight header map; `ctx.headers`
-        // may have been moved out by the dispatcher. Read from the
-        // parameter; canonicalize the key by lowercasing once.
-        let key = name.to_ascii_lowercase();
-        match headers.get(key.as_str()) {
+        // may have been moved out by the dispatcher. Config header names are
+        // normalized at construction time, so this stays allocation-free.
+        match headers.get(name.as_str()) {
             Some(actual) if actual == expected => {}
             _ => return false,
         }
@@ -268,6 +282,35 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.contains("match requires at least one"), "got: {err}");
+    }
+
+    #[test]
+    fn normalizes_header_match_keys_at_load() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"headers": {"X-Canary": "v2"}},
+                "destination": {"upstream_id": "canary"}
+            }]
+        }))
+        .unwrap();
+
+        assert!(
+            plugin.rules()[0].match_.headers.contains_key("x-canary"),
+            "configured header keys should be normalized once, not per request"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_header_matches_after_normalization() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"headers": {"X-Canary": "v2", "x-canary": "v3"}},
+                "destination": {"upstream_id": "canary"}
+            }]
+        }))
+        .unwrap_err();
+
+        assert!(err.contains("duplicate header"), "got: {err}");
     }
 
     #[test]
@@ -361,7 +404,7 @@ mod tests {
     async fn header_match_routes_to_canary() {
         let plugin = MeshRouteDispatch::new(&json!({
             "rules": [{
-                "match": {"headers": {"x-canary": "v2"}},
+                "match": {"headers": {"X-Canary": "v2"}},
                 "destination": {"backend_host": "canary.svc", "backend_port": 9090}
             }]
         }))
@@ -445,6 +488,39 @@ mod tests {
         let mut headers = HashMap::new();
         let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("first"));
+    }
+
+    #[tokio::test]
+    async fn later_plugin_match_replaces_prior_route_overrides() {
+        let upstream_plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "first"}
+            }]
+        }))
+        .unwrap();
+        let direct_backend_plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"backend_host": "direct.svc", "backend_port": 8081}
+            }]
+        }))
+        .unwrap();
+
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::new();
+        let _ = upstream_plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("first"));
+
+        let _ = direct_backend_plugin
+            .before_proxy(&mut ctx, &mut headers)
+            .await;
+        assert!(ctx.route_override_upstream_id.is_none());
+        assert_eq!(
+            ctx.route_override_backend_host.as_deref(),
+            Some("direct.svc")
+        );
+        assert_eq!(ctx.route_override_backend_port, Some(8081));
     }
 
     #[tokio::test]
