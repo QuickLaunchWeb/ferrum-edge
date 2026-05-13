@@ -400,28 +400,39 @@ fn sidecar(object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
     };
 
     let mut egress = Vec::new();
-    for entry in object
-        .spec
-        .get("egress")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let hosts = string_array(entry, "hosts");
-        let port = match entry.get("port") {
-            Some(port_obj) => optional_port_field(
-                object,
-                port_obj.get("number"),
-                "Sidecar egress[].port.number",
-            )?,
-            None => None,
-        };
-        if hosts.is_empty() && port.is_none() {
-            // Empty entry — skip silently. An Istio Sidecar with no egress
-            // hosts and no port is a no-op and Istio itself ignores it.
-            continue;
+    match object.spec.get("egress") {
+        None => {
+            // Istio: omitted egress inherits/system-detects the outbound
+            // defaults. Encode that as allow-all so an ingress-only Sidecar
+            // does not accidentally narrow every resource out of the slice.
+            egress.push(MeshSidecarEgress {
+                hosts: vec!["*/*".to_string()],
+                port: None,
+            });
         }
-        egress.push(MeshSidecarEgress { hosts, port });
+        Some(raw_egress) => {
+            let entries = raw_egress
+                .as_array()
+                .ok_or_else(|| invalid_resource(object, "Sidecar egress must be an array"))?;
+            for entry in entries {
+                let hosts = string_array(entry, "hosts");
+                let port = match entry.get("port") {
+                    Some(port_obj) => optional_port_field(
+                        object,
+                        port_obj.get("number"),
+                        "Sidecar egress[].port.number",
+                    )?,
+                    None => None,
+                };
+                if hosts.is_empty() && port.is_none() {
+                    // Empty entry — skip silently. An Istio Sidecar with no
+                    // egress hosts and no port is a no-op and Istio itself
+                    // ignores it.
+                    continue;
+                }
+                egress.push(MeshSidecarEgress { hosts, port });
+            }
+        }
     }
 
     Ok(MeshSidecar {
@@ -5895,6 +5906,7 @@ mod tests {
             namespace: "default".to_string(),
             workload_spiffe_id: None,
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            cluster_domain: "cluster.local".to_string(),
             enforce_sidecar_egress: false,
         };
         let slice = MeshSlice::from_gateway_config(&gateway_config, request);
@@ -7018,6 +7030,29 @@ mod tests {
         let mesh = result.config.mesh.expect("mesh config");
         assert_eq!(mesh.sidecars.len(), 1);
         assert!(mesh.sidecars[0].workload_selector.is_none());
+        assert_eq!(mesh.sidecars[0].egress[0].port, None);
+    }
+
+    #[test]
+    fn sidecar_with_omitted_egress_inherits_outbound_defaults() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "workloadSelector": {"matchLabels": {"app": "frontend"}},
+                    "ingress": [
+                        {"port": {"number": 8080, "protocol": "HTTP", "name": "http"}}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.sidecars.len(), 1);
+        assert_eq!(mesh.sidecars[0].egress.len(), 1);
+        assert_eq!(mesh.sidecars[0].egress[0].hosts, vec!["*/*".to_string()]);
         assert_eq!(mesh.sidecars[0].egress[0].port, None);
     }
 

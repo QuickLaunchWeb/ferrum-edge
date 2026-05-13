@@ -553,7 +553,7 @@ When `FERRUM_MESH_TOPOLOGY=egress_gateway`, the mesh runtime materializes HTTP-f
 
 ## Sidecar Egress Scoping
 
-Istio `Sidecar` resources narrow which mesh resources a workload may reach via egress. Ferrum translates the egress portion of a `Sidecar` into a `MeshSidecar` record and applies it at slice build time. Ingress listener configuration on `Sidecar` is intentionally not modeled — egress scoping is the immediate compatibility gap.
+Istio `Sidecar` resources narrow which mesh service configuration a workload receives for egress. Ferrum translates the egress portion of a `Sidecar` into a `MeshSidecar` record and applies it at slice build time. Ingress listener configuration on `Sidecar` is intentionally not modeled — egress config scoping is the immediate compatibility gap.
 
 ### Behavior
 
@@ -578,11 +578,12 @@ Each `spec.egress[].hosts` entry follows Istio scope-host syntax:
 | `./host` | `host` in the Sidecar's own namespace |
 | `namespace/host` | Exact namespace + host match |
 | `namespace/*` | Anything in the specified namespace |
+| `~/*` | No namespace; trims all service config from the slice |
 | `host` (bare) | Treated as `./host` — current Sidecar's namespace |
 
-The `host` portion may itself be a single-label DNS wildcard (e.g. `*/*.example.com` admits `api.example.com` but not `example.com` nor `a.b.example.com`). This is the same single-label wildcard semantic Ferrum uses elsewhere (`config::types::wildcard_matches`, mesh DNS proxy); operators relying on deeper-than-one-label wildcards should list the additional surfaces explicitly.
+The `host` portion may itself be a single-label DNS wildcard (e.g. `*/*.example.com` admits `api.example.com` but not `example.com` nor `a.b.example.com`). This is the same single-label wildcard semantic Ferrum uses elsewhere (`config::types::wildcard_matches`, mesh DNS proxy); operators relying on deeper-than-one-label wildcards should list the additional surfaces explicitly. `MeshService` entries match their short name, `{name}.{namespace}`, `{name}.{namespace}.svc`, and `{name}.{namespace}.svc.{cluster_domain}` aliases. On the control plane this suffix follows `FERRUM_K8S_CLUSTER_DOMAIN`; in local mesh mode it follows `FERRUM_MESH_CLUSTER_DOMAIN`.
 
-A `Sidecar` declared with no `egress` entries denies all egress (Istio semantics). The optional `spec.egress[].port.number` is parsed and recorded but does not yet narrow by listener port — port matching for egress is a follow-up.
+When Kubernetes `spec.egress` is omitted, Istio inherits/system-detects outbound defaults; Ferrum translates that case as `*/*` so ingress-only Sidecars do not narrow egress config. An explicit native/file `egress: []` or `~/*` trims all service config from the slice. The optional `spec.egress[].port.number` is parsed and recorded but does not yet narrow by listener port — port matching for egress is a follow-up.
 
 When multiple `Sidecar` resources in the same namespace apply at the same scope tier (two namespace-defaults, or two workload-scoped Sidecars both matching the same workload), the resolver picks the ASCII-smallest `name` as the deterministic tiebreak so reconciles are stable across pods and restarts.
 

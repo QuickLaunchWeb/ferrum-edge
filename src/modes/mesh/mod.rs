@@ -428,6 +428,7 @@ impl MeshRuntimeConfig {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            cluster_domain: self.cluster_domain.clone(),
             enforce_sidecar_egress: self.sidecar_enforced,
         }
     }

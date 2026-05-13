@@ -849,7 +849,7 @@ pub enum SidecarHostPattern<'a> {
 impl MeshSidecarEgress {
     /// Parse one `egress.hosts` entry into a [`SidecarHostPattern`].
     pub fn parse_host_pattern(host: &str) -> SidecarHostPattern<'_> {
-        let trimmed = host.trim();
+        let trimmed = host.trim().trim_end_matches('.');
         match trimmed.split_once('/') {
             Some(("*", "*")) => SidecarHostPattern::AllowAll,
             Some(("*", host)) if !host.is_empty() => SidecarHostPattern::AnyNamespaceHost { host },
@@ -1181,6 +1181,8 @@ impl MeshConfig {
             &mut self.service_entries,
             &mut self.workloads,
             &mut self.mesh_policies,
+            &mut self.destination_rules,
+            &mut self.sidecars,
             self.multi_cluster.as_mut(),
         );
     }
@@ -1636,18 +1638,20 @@ fn validate_multi_cluster(
 /// the existing `normalize_fields()` pattern used elsewhere in
 /// [`crate::config::types`]. Idempotent.
 pub fn normalize_mesh_fields(service_entries: &mut [ServiceEntry], workloads: &mut [Workload]) {
-    normalize_mesh_fields_internal(service_entries, workloads, &mut [], None);
+    normalize_mesh_fields_internal(service_entries, workloads, &mut [], &mut [], &mut [], None);
 }
 
 fn normalize_mesh_fields_internal(
     service_entries: &mut [ServiceEntry],
     workloads: &mut [Workload],
     policies: &mut [MeshPolicy],
+    destination_rules: &mut [MeshDestinationRule],
+    sidecars: &mut [MeshSidecar],
     multi_cluster: Option<&mut MultiClusterConfig>,
 ) {
     for se in service_entries {
         for host in &mut se.hosts {
-            host.make_ascii_lowercase();
+            *host = normalize_mesh_hostname_like(host);
         }
         for ep in &mut se.endpoints {
             ep.address.make_ascii_lowercase();
@@ -1659,6 +1663,16 @@ fn normalize_mesh_fields_internal(
         }
     }
     normalize_mesh_policy_fields(policies);
+    for dr in destination_rules {
+        dr.host = normalize_mesh_hostname_like(&dr.host);
+    }
+    for sidecar in sidecars {
+        for egress in &mut sidecar.egress {
+            for host in &mut egress.hosts {
+                *host = normalize_mesh_hostname_like(host);
+            }
+        }
+    }
     if let Some(multi_cluster) = multi_cluster {
         for gateway in &mut multi_cluster.east_west_gateways {
             gateway.host.make_ascii_lowercase();
@@ -1667,6 +1681,10 @@ fn normalize_mesh_fields_internal(
             }
         }
     }
+}
+
+fn normalize_mesh_hostname_like(value: &str) -> String {
+    value.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 fn normalize_mesh_policy_fields(policies: &mut [MeshPolicy]) {

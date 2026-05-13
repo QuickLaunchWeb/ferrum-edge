@@ -80,6 +80,9 @@ pub struct XdsAdsServer {
     /// builder applies Istio `Sidecar` egress scope narrowing. Default
     /// `false` preserves existing CP behavior.
     sidecar_enforced: bool,
+    /// Cluster DNS suffix used when synthesizing MeshService FQDN aliases for
+    /// Sidecar egress matching.
+    cluster_domain: String,
 }
 
 #[derive(Default)]
@@ -208,7 +211,13 @@ impl XdsAdsServer {
             nonce_tracker: Arc::new(XdsNonceTracker::new()),
             active_streams: Arc::new(XdsStreamRegistry::default()),
             sidecar_enforced,
+            cluster_domain: crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
         }
+    }
+
+    pub fn with_cluster_domain(mut self, cluster_domain: String) -> Self {
+        self.cluster_domain = cluster_domain;
+        self
     }
 
     pub fn into_service(self) -> AggregatedDiscoveryServiceServer<Self> {
@@ -235,8 +244,12 @@ impl XdsAdsServer {
 
     fn rebuild_snapshot_from_config(&self, node_id: &str, config: &GatewayConfig) -> XdsSnapshot {
         let request = MeshSliceRequest::from_xds_node(node_id.to_string(), self.namespace.clone())
+            .with_cluster_domain(self.cluster_domain.clone())
             .with_enforce_sidecar_egress(self.sidecar_enforced);
-        let slice = MeshSlice::from_gateway_config(config, request);
+        let mut config = config.clone();
+        config.normalize_fields();
+        config.normalize_mesh_fields();
+        let slice = MeshSlice::from_gateway_config(&config, request);
         translate_mesh_slice_to_snapshot(&slice)
     }
 

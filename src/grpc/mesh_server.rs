@@ -79,6 +79,9 @@ pub struct MeshGrpcServer {
     /// per-subscriber slice request so DP-facing slices honor the operator's
     /// rollout decision. Default `false` preserves existing CP behavior.
     sidecar_enforced: bool,
+    /// Cluster DNS suffix used when synthesizing MeshService FQDN aliases for
+    /// Sidecar egress matching.
+    cluster_domain: String,
 }
 
 impl MeshGrpcServer {
@@ -145,9 +148,15 @@ impl MeshGrpcServer {
                 registry,
                 namespace,
                 sidecar_enforced,
+                cluster_domain: crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
             },
             tx_clone,
         )
+    }
+
+    pub fn with_cluster_domain(mut self, cluster_domain: String) -> Self {
+        self.cluster_domain = cluster_domain;
+        self
     }
 
     pub fn into_service(self) -> MeshConfigSyncServer<Self> {
@@ -221,6 +230,7 @@ impl MeshGrpcServer {
         let mut candidate = stream_config.clone();
         apply_incremental_to_config_snapshot(&mut candidate, delta);
         candidate.normalize_fields();
+        candidate.normalize_mesh_fields();
         let result =
             Self::build_mesh_config_update_if_changed(&candidate, slice_request, previous_slice)?;
         *stream_config = candidate;
@@ -285,13 +295,17 @@ impl MeshConfigSync for MeshGrpcServer {
             inner.workload_spiffe_id,
             inner.labels,
         )
+        .with_cluster_domain(self.cluster_domain.clone())
         .with_enforce_sidecar_egress(self.sidecar_enforced);
         // Register the receiver before loading the initial snapshot so a
         // concurrent CP broadcast is either captured by this stream or already
         // reflected in the loaded snapshot.
         let rx = self.mesh_update_tx.subscribe();
         let config = self.config.load_full();
-        let initial_slice = MeshSlice::from_gateway_config(config.as_ref(), slice_request.clone());
+        let mut initial_config = config.as_ref().clone();
+        initial_config.normalize_fields();
+        initial_config.normalize_mesh_fields();
+        let initial_slice = MeshSlice::from_gateway_config(&initial_config, slice_request.clone());
         let initial = Self::build_mesh_config_update_from_slice(initial_slice.clone())?;
 
         let now = Utc::now();
@@ -304,7 +318,7 @@ impl MeshConfigSync for MeshGrpcServer {
             last_update_at: now,
         });
 
-        let mut stream_config = config.as_ref().clone();
+        let mut stream_config = initial_config;
         let mut previous_slice = initial_slice;
         let config_for_recovery = self.config.clone();
         let stream_slice_request = slice_request.clone();
@@ -314,6 +328,7 @@ impl MeshConfigSync for MeshGrpcServer {
                 Ok(MeshConfigBroadcast::Full(config)) => {
                     let mut config = config.as_ref().clone();
                     config.normalize_fields();
+                    config.normalize_mesh_fields();
                     match Self::build_mesh_config_update_if_changed(
                         &config,
                         slice_request,
@@ -360,18 +375,21 @@ impl MeshConfigSync for MeshGrpcServer {
                         n
                     );
                     let current = config_for_recovery.load_full();
+                    let mut current_config = current.as_ref().clone();
+                    current_config.normalize_fields();
+                    current_config.normalize_mesh_fields();
                     match Self::build_mesh_config_update_if_changed(
-                        current.as_ref(),
+                        &current_config,
                         slice_request,
                         &previous_slice,
                     ) {
                         Ok((next_slice, Some(update))) => {
-                            stream_config = current.as_ref().clone();
+                            stream_config = current_config;
                             previous_slice = next_slice;
                             Some(Ok(update))
                         }
                         Ok((_, None)) => {
-                            stream_config = current.as_ref().clone();
+                            stream_config = current_config;
                             None
                         }
                         Err(e) => Some(Err(e)),
