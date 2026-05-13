@@ -3,9 +3,10 @@
 //! routing decision per request without mutating the matched `Proxy` in
 //! shared `ArcSwap` state.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use ferrum_edge::config::types::{BackendTlsConfig, Proxy};
+use ferrum_edge::config::types::{BackendTlsConfig, Proxy, Upstream, UpstreamPortOverride};
 use ferrum_edge::plugins::RequestContext;
 
 fn test_proxy() -> Arc<Proxy> {
@@ -25,6 +26,27 @@ fn upstream_proxy() -> Arc<Proxy> {
     }))
     .expect("minimal upstream proxy should deserialize");
     Arc::new(p)
+}
+
+fn upstream_with_port_overrides(id: &str, overrides: &[(u16, u64)]) -> Arc<Upstream> {
+    let mut upstream: Upstream = serde_json::from_value(serde_json::json!({
+        "id": id,
+        "targets": [{"host": "127.0.0.1", "port": 8080}],
+        "algorithm": "round_robin",
+    }))
+    .expect("minimal upstream should deserialize");
+    upstream.port_overrides = overrides
+        .iter()
+        .map(|(port, timeout)| {
+            (
+                *port,
+                UpstreamPortOverride {
+                    connect_timeout_ms: Some(*timeout),
+                },
+            )
+        })
+        .collect();
+    Arc::new(upstream)
 }
 
 fn ctx() -> RequestContext {
@@ -128,6 +150,53 @@ fn direct_backend_override_clears_existing_upstream_id() {
         result.resolved_tls.verify_server_cert,
         "direct backend override should reset inherited upstream verify policy"
     );
+}
+
+#[test]
+fn upstream_override_recomputes_dispatch_port_overrides() {
+    let mut proxy_template = (*upstream_proxy()).clone();
+    proxy_template.dispatch_port_overrides = Some(HashMap::from([(8080, 1_500)]));
+    let proxy = Arc::new(proxy_template);
+    let upstreams = HashMap::from([(
+        "canary".to_string(),
+        upstream_with_port_overrides("canary", &[(9090, 250)]),
+    )]);
+    let mut ctx = ctx();
+    ctx.route_override_upstream_id = Some("canary".to_string());
+
+    let result = ctx.apply_route_overrides_with_upstreams(Arc::clone(&proxy), &upstreams);
+
+    assert_eq!(result.upstream_id.as_deref(), Some("canary"));
+    assert_eq!(
+        result
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&9090)),
+        Some(&250),
+        "route override should project the destination upstream's port overrides"
+    );
+    assert!(
+        !result
+            .dispatch_port_overrides
+            .as_ref()
+            .is_some_and(|overrides| overrides.contains_key(&8080)),
+        "route override must not retain the original upstream's port overrides"
+    );
+}
+
+#[test]
+fn direct_backend_override_clears_dispatch_port_overrides() {
+    let mut proxy_template = (*upstream_proxy()).clone();
+    proxy_template.dispatch_port_overrides = Some(HashMap::from([(8080, 1_500)]));
+    let proxy = Arc::new(proxy_template);
+    let mut ctx = ctx();
+    ctx.route_override_backend_host = Some("direct.svc".to_string());
+    ctx.route_override_backend_port = Some(9090);
+
+    let result = ctx.apply_route_overrides(Arc::clone(&proxy));
+
+    assert_eq!(result.upstream_id, None);
+    assert_eq!(result.dispatch_port_overrides, None);
 }
 
 #[test]

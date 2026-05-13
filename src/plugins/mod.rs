@@ -519,11 +519,29 @@ impl RequestContext {
         let resolved_tls_changed = resolved_tls_override
             .as_ref()
             .is_some_and(|tls| *tls != proxy.resolved_tls);
+        let dispatch_port_overrides_override = if upstream_id_changed {
+            if direct_backend_override {
+                Some(None)
+            } else {
+                Some(
+                    self.route_override_upstream_id
+                        .as_deref()
+                        .and_then(|id| upstreams.and_then(|map| map.get(id)))
+                        .and_then(|upstream| dispatch_port_overrides_from_upstream(upstream)),
+                )
+            }
+        } else {
+            None
+        };
+        let dispatch_port_overrides_changed = dispatch_port_overrides_override
+            .as_ref()
+            .is_some_and(|overrides| *overrides != proxy.dispatch_port_overrides);
 
         if !upstream_id_changed
             && !backend_host_changed
             && !backend_port_changed
             && !resolved_tls_changed
+            && !dispatch_port_overrides_changed
         {
             return proxy;
         }
@@ -542,6 +560,9 @@ impl RequestContext {
         }
         if let Some(resolved_tls) = resolved_tls_override {
             overridden.resolved_tls = resolved_tls;
+        }
+        if let Some(dispatch_port_overrides) = dispatch_port_overrides_override {
+            overridden.dispatch_port_overrides = dispatch_port_overrides;
         }
         Arc::new(overridden)
     }
@@ -712,6 +733,19 @@ impl RequestContext {
         self.identified_consumer
             .as_ref()
             .and_then(|consumer| consumer.custom_id.as_deref())
+    }
+}
+
+fn dispatch_port_overrides_from_upstream(upstream: &Upstream) -> Option<HashMap<u16, u64>> {
+    let overrides: HashMap<u16, u64> = upstream
+        .port_overrides
+        .iter()
+        .filter_map(|(port, ovr)| ovr.connect_timeout_ms.map(|timeout| (*port, timeout)))
+        .collect();
+    if overrides.is_empty() {
+        None
+    } else {
+        Some(overrides)
     }
 }
 

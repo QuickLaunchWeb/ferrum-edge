@@ -1866,6 +1866,21 @@ async fn handle_batch_create(
                 )),
             }
         }
+
+        match crud::validate_mesh_route_dispatch_plugin_upstream_references(
+            db.as_ref(),
+            namespace,
+            plugin_config,
+            Some(&batch_upstream_ids),
+        )
+        .await
+        {
+            Ok(errs) => validation_errors.extend(errs),
+            Err(err) => validation_errors.push(format!(
+                "PluginConfig '{}' mesh_route_dispatch upstream reference check failed: {}",
+                plugin_config.id, err
+            )),
+        }
     }
 
     if !validation_errors.is_empty() {
@@ -2136,6 +2151,11 @@ async fn handle_restore(
         {
             Ok(errs) => validation_errors.extend(errs),
             Err(err) => validation_errors.push(err.to_string()),
+        }
+        if let Err(errs) =
+            crate::proxy::validate_mesh_route_dispatch_upstream_references(&temp_config)
+        {
+            validation_errors.extend(errs);
         }
         if !validation_errors.is_empty() {
             return Ok(json_response(

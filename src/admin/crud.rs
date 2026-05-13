@@ -12,6 +12,7 @@ use crate::config::db_backend::{DatabaseBackend, PaginatedResult};
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, Proxy, Upstream, validate_resource_id,
 };
+use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 
 pub(crate) type DbResult<T> = Result<T, anyhow::Error>;
 
@@ -365,6 +366,52 @@ pub(crate) fn hash_basic_auth_credentials(cred: &mut Value) -> Result<(), String
 
 pub(crate) fn validate_plugin_config_definition(pc: &PluginConfig) -> Result<(), String> {
     super::validate_plugin_config_definition(pc)
+}
+
+pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    plugin_config: &PluginConfig,
+    batch_upstream_ids: Option<&HashSet<&str>>,
+) -> DbResult<Vec<String>> {
+    if !plugin_config.enabled || plugin_config.plugin_name != "mesh_route_dispatch" {
+        return Ok(Vec::new());
+    }
+
+    let dispatch_config = match MeshRouteDispatchConfig::from_value(&plugin_config.config) {
+        Ok(config) => config,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut errors = Vec::new();
+    for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
+        let Some(upstream_id) = rule.destination.upstream_id.as_deref() else {
+            continue;
+        };
+        if batch_upstream_ids.is_some_and(|ids| ids.contains(upstream_id)) {
+            continue;
+        }
+
+        match db.check_upstream_exists(upstream_id, namespace).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let message = match db.get_upstream(upstream_id).await {
+                    Ok(Some(other)) => format!(
+                        "PluginConfig '{}' (mesh_route_dispatch) rule {} references upstream_id '{}' from namespace '{}' (plugin_config is in namespace '{}'); cross-namespace references are forbidden",
+                        plugin_config.id, rule_idx, upstream_id, other.namespace, namespace
+                    ),
+                    _ => format!(
+                        "PluginConfig '{}' (mesh_route_dispatch) rule {} references non-existent upstream_id '{}'",
+                        plugin_config.id, rule_idx, upstream_id
+                    ),
+                };
+                errors.push(message);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(errors)
 }
 
 pub(crate) async fn check_port_available(
@@ -761,6 +808,14 @@ impl AdminResource for PluginConfig {
                 "Invalid plugin config: {}",
                 error
             )]));
+        }
+
+        let upstream_errors =
+            validate_mesh_route_dispatch_plugin_upstream_references(db, namespace, resource, None)
+                .await
+                .map_err(AfterValidateError::Db)?;
+        if !upstream_errors.is_empty() {
+            return Err(AfterValidateError::BadRequest(upstream_errors));
         }
 
         Ok(())

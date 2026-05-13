@@ -135,9 +135,7 @@ pub(crate) fn validate_mesh_route_dispatch_upstream_references(
         if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
             continue;
         }
-        let Ok(dispatch_config) =
-            serde_json::from_value::<MeshRouteDispatchConfig>(plugin.config.clone())
-        else {
+        let Ok(dispatch_config) = MeshRouteDispatchConfig::from_value(&plugin.config) else {
             continue;
         };
         for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
@@ -2151,9 +2149,7 @@ impl ProxyState {
             if !base_proxy.dispatch_kind.is_http_family() {
                 continue;
             }
-            let Ok(dispatch_config) =
-                serde_json::from_value::<MeshRouteDispatchConfig>(plugin.config.clone())
-            else {
+            let Ok(dispatch_config) = MeshRouteDispatchConfig::from_value(&plugin.config) else {
                 warn!(
                     plugin_id = %plugin.id,
                     proxy_id = %proxy_id,

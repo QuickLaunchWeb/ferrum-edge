@@ -34,6 +34,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::config::types::BackendTlsConfig;
 use crate::plugins::{
@@ -41,7 +42,7 @@ use crate::plugins::{
 };
 
 /// Top-level config for the plugin.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeshRouteDispatchConfig {
     /// Ordered list of rules. First match wins; rules with no match criteria
     /// are rejected at config-load time to avoid silently-overriding catch-alls.
@@ -55,6 +56,13 @@ pub struct MeshRouteDispatchConfig {
     /// operators who configure the plugin directly as a soft override.
     #[serde(default)]
     pub reject_unmatched: bool,
+}
+
+impl MeshRouteDispatchConfig {
+    pub fn from_value(config: &Value) -> Result<Self, String> {
+        serde_json::from_value(config.clone())
+            .map_err(|e| format!("mesh_route_dispatch config: {e}"))
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -125,8 +133,7 @@ pub struct MeshRouteDispatch {
 
 impl MeshRouteDispatch {
     pub fn new(config: &serde_json::Value) -> Result<Self, String> {
-        let mut parsed: MeshRouteDispatchConfig = serde_json::from_value(config.clone())
-            .map_err(|e| format!("mesh_route_dispatch config: {e}"))?;
+        let mut parsed = MeshRouteDispatchConfig::from_value(config)?;
         if parsed.rules.is_empty() {
             return Err("mesh_route_dispatch.rules cannot be empty".to_string());
         }
@@ -154,6 +161,14 @@ impl MeshRouteDispatch {
             }
             let has_backend_host = rule.destination.backend_host.is_some();
             let has_backend_port = rule.destination.backend_port.is_some();
+            if rule.destination.upstream_id.is_some()
+                && (has_backend_host || has_backend_port || rule.destination.backend_tls.is_some())
+            {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{idx}].destination.upstream_id cannot be \
+                     combined with backend_host / backend_port / backend_tls"
+                ));
+            }
             if has_backend_host != has_backend_port {
                 return Err(format!(
                     "mesh_route_dispatch.rules[{idx}].destination.backend_host and \
@@ -164,8 +179,8 @@ impl MeshRouteDispatch {
         Ok(Self { config: parsed })
     }
 
-    /// Public for tests / introspection.
-    #[allow(dead_code)]
+    /// Public for tests.
+    #[cfg(test)]
     pub fn rules(&self) -> &[RouteRule] {
         &self.config.rules
     }
@@ -416,6 +431,37 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.contains("must be set together"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_upstream_id_combined_with_direct_backend() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {
+                    "upstream_id": "canary",
+                    "backend_host": "canary.svc",
+                    "backend_port": 9090
+                }
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("cannot be combined"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_upstream_id_combined_with_backend_tls() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {
+                    "upstream_id": "canary",
+                    "backend_tls": {"verify_server_cert": false}
+                }
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("cannot be combined"), "got: {err}");
     }
 
     #[tokio::test]

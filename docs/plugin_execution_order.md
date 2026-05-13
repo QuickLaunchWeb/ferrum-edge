@@ -234,6 +234,8 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 
 `mesh_route_dispatch` intentionally sits at priority 2995: authentication, `mesh_authz`, and rate limiting evaluate the original public proxy identity, then route overrides apply before request transformers, mirror/serverless/caching plugins, and backend dispatch. It cannot select a different `mesh_authz` policy scope. For WebSockets, the override selects only the upgrade handshake backend; the upgraded connection is pinned to that backend and frame hooks do not re-route individual frames.
 
+When a `mesh_route_dispatch` rule matches on query params, the plugin opts the whole proxy into decoded query-param materialization for HTTP/3 so its `query_params` predicates see the same percent-decoded values as HTTP/1.1 and HTTP/2. That means every plugin on that proxy observes decoded `ctx.query_params` while the query-rule instance is configured.
+
 ## Complete Execution Order
 
 Given all built-in plugins enabled, the execution order is:
