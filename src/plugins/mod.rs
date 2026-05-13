@@ -89,7 +89,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::config::types::{BackendScheme, Consumer, Proxy};
+use crate::config::types::{BackendScheme, BackendTlsConfig, Consumer, Proxy, Upstream};
 use crate::consumer_index::ConsumerIndex;
 
 /// Protocol categories that plugins can declare support for.
@@ -352,6 +352,13 @@ pub struct RequestContext {
     /// Plugin-set override for the proxy's `backend_port`. Same contract as
     /// `route_override_upstream_id`.
     pub route_override_backend_port: Option<u16>,
+    /// Plugin-set override for the proxy's resolved backend TLS identity.
+    ///
+    /// When `route_override_upstream_id` points at another upstream, dispatch
+    /// re-resolves this from the upstream snapshot automatically. Plugins that
+    /// override a direct backend host/port can set this field explicitly when
+    /// the destination uses different mTLS materials.
+    pub route_override_resolved_tls: Option<BackendTlsConfig>,
 }
 
 impl RequestContext {
@@ -383,16 +390,23 @@ impl RequestContext {
             route_override_upstream_id: None,
             route_override_backend_host: None,
             route_override_backend_port: None,
+            route_override_resolved_tls: None,
         }
     }
 
-    /// Effective upstream id for routing: plugin override > proxy.upstream_id.
+    /// Effective upstream id for routing: plugin upstream override >
+    /// direct-backend override (clears upstream) > proxy.upstream_id.
     /// Pool keys mentioning upstream identity must derive from this.
     #[inline]
     pub fn effective_upstream_id<'a>(&'a self, proxy: &'a Proxy) -> Option<&'a str> {
-        self.route_override_upstream_id
-            .as_deref()
-            .or(proxy.upstream_id.as_deref())
+        if let Some(upstream_id) = self.route_override_upstream_id.as_deref() {
+            return Some(upstream_id);
+        }
+        if self.route_override_backend_host.is_some() || self.route_override_backend_port.is_some()
+        {
+            return None;
+        }
+        proxy.upstream_id.as_deref()
     }
 
     /// Effective backend host for routing: plugin override > proxy.backend_host.
@@ -418,29 +432,91 @@ impl RequestContext {
         self.route_override_upstream_id.is_some()
             || self.route_override_backend_host.is_some()
             || self.route_override_backend_port.is_some()
+            || self.route_override_resolved_tls.is_some()
     }
 
     /// Build a `Proxy` Arc with any plugin-set route overrides applied. If no
-    /// overrides are set, returns a clone of the original `Arc` (no struct
-    /// alloc). When overrides are set, allocates one `Proxy` struct + `Arc`.
+    /// effective override is set, returns the original `Arc` (no struct alloc).
+    /// When overrides change the proxy, allocates one `Proxy` struct + `Arc`.
     ///
     /// Downstream dispatch reads `proxy.upstream_id` / `proxy.backend_host` /
-    /// `proxy.backend_port` directly; using the returned `Arc<Proxy>` makes
-    /// the override transparent to dispatch sites that already accept
-    /// `&Proxy` (pool keys, capability registry, URL construction, etc.).
+    /// `proxy.backend_port` / `proxy.resolved_tls` directly; using the
+    /// returned `Arc<Proxy>` makes the override transparent to dispatch sites
+    /// that already accept `&Proxy` (pool keys, capability registry, URL
+    /// construction, backend TLS, etc.).
     pub fn apply_route_overrides(&self, proxy: Arc<Proxy>) -> Arc<Proxy> {
-        if !self.has_route_overrides() {
+        self.apply_route_overrides_inner(proxy, None)
+    }
+
+    pub(crate) fn apply_route_overrides_with_upstreams(
+        &self,
+        proxy: Arc<Proxy>,
+        upstreams: &HashMap<String, Arc<Upstream>>,
+    ) -> Arc<Proxy> {
+        self.apply_route_overrides_inner(proxy, Some(upstreams))
+    }
+
+    fn apply_route_overrides_inner(
+        &self,
+        proxy: Arc<Proxy>,
+        upstreams: Option<&HashMap<String, Arc<Upstream>>>,
+    ) -> Arc<Proxy> {
+        let direct_backend_override = self.route_override_upstream_id.is_none()
+            && (self.route_override_backend_host.is_some()
+                || self.route_override_backend_port.is_some());
+        let upstream_id_changed = if direct_backend_override {
+            proxy.upstream_id.is_some()
+        } else {
+            self.route_override_upstream_id
+                .as_deref()
+                .is_some_and(|id| proxy.upstream_id.as_deref() != Some(id))
+        };
+        let backend_host_changed = self
+            .route_override_backend_host
+            .as_deref()
+            .is_some_and(|host| proxy.backend_host != host);
+        let backend_port_changed = self
+            .route_override_backend_port
+            .is_some_and(|port| proxy.backend_port != port);
+
+        let upstream_tls_override = if upstream_id_changed {
+            self.route_override_upstream_id
+                .as_deref()
+                .and_then(|id| upstreams.and_then(|map| map.get(id)))
+                .map(|upstream| BackendTlsConfig::from_upstream(upstream))
+        } else {
+            None
+        };
+        let resolved_tls_override = self
+            .route_override_resolved_tls
+            .clone()
+            .or(upstream_tls_override);
+        let resolved_tls_changed = resolved_tls_override
+            .as_ref()
+            .is_some_and(|tls| *tls != proxy.resolved_tls);
+
+        if !upstream_id_changed
+            && !backend_host_changed
+            && !backend_port_changed
+            && !resolved_tls_changed
+        {
             return proxy;
         }
+
         let mut overridden = (*proxy).clone();
         if let Some(id) = &self.route_override_upstream_id {
             overridden.upstream_id = Some(id.clone());
+        } else if direct_backend_override {
+            overridden.upstream_id = None;
         }
         if let Some(host) = &self.route_override_backend_host {
             overridden.backend_host = host.clone();
         }
         if let Some(port) = self.route_override_backend_port {
             overridden.backend_port = port;
+        }
+        if let Some(resolved_tls) = resolved_tls_override {
+            overridden.resolved_tls = resolved_tls;
         }
         Arc::new(overridden)
     }
@@ -1867,4 +1943,58 @@ pub fn available_plugins() -> Vec<&'static str> {
     ];
     plugins.extend(crate::custom_plugins::custom_plugin_names());
     plugins
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn upstream_override_reprojects_resolved_tls_from_snapshot() {
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "backend_host": "stable.svc",
+            "backend_port": 8080,
+            "upstream_id": "stable",
+        }))
+        .expect("minimal proxy should deserialize");
+        proxy.resolved_tls = BackendTlsConfig {
+            client_cert_path: Some("/certs/stable.pem".to_string()),
+            client_key_path: Some("/certs/stable.key".to_string()),
+            server_ca_cert_path: Some("/certs/stable-ca.pem".to_string()),
+            verify_server_cert: true,
+        };
+
+        let canary: Upstream = serde_json::from_value(json!({
+            "id": "canary",
+            "targets": [{"host": "canary.svc", "port": 9090}],
+            "backend_tls_client_cert_path": "/certs/canary.pem",
+            "backend_tls_client_key_path": "/certs/canary.key",
+            "backend_tls_server_ca_cert_path": "/certs/canary-ca.pem",
+            "backend_tls_verify_server_cert": false,
+        }))
+        .expect("minimal upstream should deserialize");
+        let mut upstreams = HashMap::new();
+        upstreams.insert("canary".to_string(), Arc::new(canary));
+
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        ctx.route_override_upstream_id = Some("canary".to_string());
+
+        let result = ctx.apply_route_overrides_with_upstreams(Arc::new(proxy), &upstreams);
+        assert_eq!(result.upstream_id.as_deref(), Some("canary"));
+        assert_eq!(
+            result.resolved_tls.client_cert_path.as_deref(),
+            Some("/certs/canary.pem")
+        );
+        assert_eq!(
+            result.resolved_tls.client_key_path.as_deref(),
+            Some("/certs/canary.key")
+        );
+        assert_eq!(
+            result.resolved_tls.server_ca_cert_path.as_deref(),
+            Some("/certs/canary-ca.pem")
+        );
+        assert!(!result.resolved_tls.verify_server_cert);
+    }
 }

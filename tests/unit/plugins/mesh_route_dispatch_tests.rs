@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use ferrum_edge::config::types::Proxy;
+use ferrum_edge::config::types::{BackendTlsConfig, Proxy};
 use ferrum_edge::plugins::RequestContext;
 
 fn test_proxy() -> Arc<Proxy> {
@@ -14,6 +14,16 @@ fn test_proxy() -> Arc<Proxy> {
         "backend_port": 8080,
     }))
     .expect("minimal proxy should deserialize");
+    Arc::new(p)
+}
+
+fn upstream_proxy() -> Arc<Proxy> {
+    let p: Proxy = serde_json::from_value(serde_json::json!({
+        "backend_host": "",
+        "backend_port": 0,
+        "upstream_id": "stable",
+    }))
+    .expect("minimal upstream proxy should deserialize");
     Arc::new(p)
 }
 
@@ -33,6 +43,20 @@ fn no_overrides_returns_same_arc() {
     assert!(
         Arc::ptr_eq(&proxy, &result),
         "no overrides should return the same Arc — no per-request allocation"
+    );
+}
+
+#[test]
+fn no_op_overrides_return_same_arc() {
+    let proxy = test_proxy();
+    let mut ctx = ctx();
+    ctx.route_override_backend_host = Some("stable.svc".to_string());
+    ctx.route_override_backend_port = Some(8080);
+
+    let result = ctx.apply_route_overrides(Arc::clone(&proxy));
+    assert!(
+        Arc::ptr_eq(&proxy, &result),
+        "overrides equal to the current proxy should stay allocation-free"
     );
 }
 
@@ -64,6 +88,49 @@ fn backend_host_and_port_override_apply_to_clone() {
     // Original Arc retains template values.
     assert_eq!(proxy.backend_host, "stable.svc");
     assert_eq!(proxy.backend_port, 8080);
+}
+
+#[test]
+fn direct_backend_override_clears_existing_upstream_id() {
+    let proxy = upstream_proxy();
+    let mut ctx = ctx();
+    ctx.route_override_backend_host = Some("canary.svc".to_string());
+    ctx.route_override_backend_port = Some(9090);
+
+    assert_eq!(ctx.effective_upstream_id(&proxy), None);
+    let result = ctx.apply_route_overrides(Arc::clone(&proxy));
+    assert_eq!(result.upstream_id, None);
+    assert_eq!(result.backend_host, "canary.svc");
+    assert_eq!(result.backend_port, 9090);
+}
+
+#[test]
+fn explicit_tls_override_applies_to_clone() {
+    let proxy = test_proxy();
+    let mut ctx = ctx();
+    ctx.route_override_backend_host = Some("canary.svc".to_string());
+    ctx.route_override_resolved_tls = Some(BackendTlsConfig {
+        client_cert_path: Some("/certs/canary.pem".to_string()),
+        client_key_path: Some("/certs/canary.key".to_string()),
+        server_ca_cert_path: Some("/certs/canary-ca.pem".to_string()),
+        verify_server_cert: false,
+    });
+
+    let result = ctx.apply_route_overrides(Arc::clone(&proxy));
+    assert_eq!(result.backend_host, "canary.svc");
+    assert_eq!(
+        result.resolved_tls.client_cert_path.as_deref(),
+        Some("/certs/canary.pem")
+    );
+    assert_eq!(
+        result.resolved_tls.client_key_path.as_deref(),
+        Some("/certs/canary.key")
+    );
+    assert_eq!(
+        result.resolved_tls.server_ca_cert_path.as_deref(),
+        Some("/certs/canary-ca.pem")
+    );
+    assert!(!result.resolved_tls.verify_server_cert);
 }
 
 #[test]

@@ -476,11 +476,15 @@ pub const MAX_COOKIE_DOMAIN_LENGTH: usize = 253;
 ///
 /// All runtime code (connection pools, health checks, proxy dispatch) reads
 /// from this resolved config rather than raw proxy/upstream fields.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendTlsConfig {
+    #[serde(default)]
     pub client_cert_path: Option<String>,
+    #[serde(default)]
     pub client_key_path: Option<String>,
+    #[serde(default)]
     pub server_ca_cert_path: Option<String>,
+    #[serde(default = "default_true")]
     pub verify_server_cert: bool,
 }
 
@@ -492,6 +496,26 @@ impl BackendTlsConfig {
             client_key_path: None,
             server_ca_cert_path: None,
             verify_server_cert: true,
+        }
+    }
+
+    /// Project an upstream's backend TLS fields into the resolved runtime form.
+    pub fn from_upstream(upstream: &Upstream) -> Self {
+        Self {
+            client_cert_path: upstream.backend_tls_client_cert_path.clone(),
+            client_key_path: upstream.backend_tls_client_key_path.clone(),
+            server_ca_cert_path: upstream.backend_tls_server_ca_cert_path.clone(),
+            verify_server_cert: upstream.backend_tls_verify_server_cert,
+        }
+    }
+
+    /// Project a direct-backend proxy's TLS fields into the resolved runtime form.
+    pub fn from_proxy(proxy: &Proxy) -> Self {
+        Self {
+            client_cert_path: proxy.backend_tls_client_cert_path.clone(),
+            client_key_path: proxy.backend_tls_client_key_path.clone(),
+            server_ca_cert_path: proxy.backend_tls_server_ca_cert_path.clone(),
+            verify_server_cert: proxy.backend_tls_verify_server_cert,
         }
     }
 }

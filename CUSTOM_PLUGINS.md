@@ -699,6 +699,11 @@ pub struct RequestContext {
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
     /// Cumulative nanoseconds spent by plugins making external HTTP calls.
     pub plugin_http_call_ns: Arc<AtomicU64>,
+    /// Optional routing overrides consumed after `before_proxy`.
+    pub route_override_upstream_id: Option<String>,
+    pub route_override_backend_host: Option<String>,
+    pub route_override_backend_port: Option<u16>,
+    pub route_override_resolved_tls: Option<BackendTlsConfig>,
 }
 ```
 

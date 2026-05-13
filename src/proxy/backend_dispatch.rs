@@ -150,18 +150,14 @@ pub(crate) struct UpstreamSelection {
 /// returns a no-op selection with `lb_hash_key: None` — the key is never
 /// read without an upstream.
 ///
-/// `route_override_upstream_id` lets plugins (e.g., `mesh_route_dispatch`)
-/// rewrite the routing decision per request without mutating the matched
-/// `Proxy`. When `Some`, it wins over `proxy.upstream_id`.
 pub(crate) fn select_upstream_target(
     proxy: &Proxy,
-    route_override_upstream_id: Option<&str>,
     state: &ProxyState,
     epoch: &RequestEpoch,
     client_ip: &str,
     proxy_headers: &HashMap<String, String>,
 ) -> UpstreamSelection {
-    let Some(upstream_id) = route_override_upstream_id.or(proxy.upstream_id.as_deref()) else {
+    let Some(upstream_id) = proxy.upstream_id.as_deref() else {
         return UpstreamSelection {
             lb_hash_key: None,
             target: None,
@@ -312,15 +308,13 @@ pub(crate) fn check_circuit_breaker(
 /// - Least-latency load balancer (backend TTFB)
 /// - Least-connections load balancer (connection end)
 ///
-/// `route_override_upstream_id` is the plugin-set override that wins over
-/// `proxy.upstream_id` — used so passive-health and least-latency reporting
-/// attribute to the upstream that was actually dispatched to, not the
-/// proxy's static configuration.
+/// Route-override plugins must pass the shadowed effective proxy so passive
+/// health and least-latency reporting attribute to the upstream that was
+/// actually dispatched to.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_backend_outcome(
     state: &ProxyState,
     proxy: &Proxy,
-    route_override_upstream_id: Option<&str>,
     lb_snapshot: &LoadBalancerCacheInner,
     selected_balancer: Option<&Arc<LoadBalancer>>,
     upstream_target: Option<&UpstreamTarget>,
@@ -343,10 +337,9 @@ pub(crate) fn record_backend_outcome(
     //   3. No active health checks configured for this upstream — when active probes
     //      exist, they provide consistent, controlled RTT measurements and take
     //      precedence over passive TTFB which includes variable application processing time
-    let effective_upstream_id = route_override_upstream_id.or(proxy.upstream_id.as_deref());
     if !connection_error
         && response_status < 500
-        && let (Some(upstream_id), Some(target)) = (effective_upstream_id, upstream_target)
+        && let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
     {
         let upstream = LoadBalancerCache::get_upstream_from(lb_snapshot, upstream_id);
         let has_active_hc = upstream
@@ -382,7 +375,7 @@ pub(crate) fn record_backend_outcome(
     }
 
     // Passive health check reporting (O(1) upstream lookup via index)
-    if let (Some(upstream_id), Some(target)) = (effective_upstream_id, upstream_target)
+    if let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
         && let Some(upstream) = LoadBalancerCache::get_upstream_from(lb_snapshot, upstream_id)
         && let Some(hc) = &upstream.health_checks
     {

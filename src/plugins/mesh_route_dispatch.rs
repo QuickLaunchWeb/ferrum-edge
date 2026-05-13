@@ -7,7 +7,7 @@
 //! conditions (method, headers, query params) become `mesh_route_dispatch`
 //! rules attached as a proxy-scoped plugin. At request time the plugin walks
 //! its rule list and — when a rule matches — sets one or more of
-//! `RequestContext.route_override_{upstream_id, backend_host, backend_port}`.
+//! `RequestContext.route_override_{upstream_id, backend_host, backend_port, resolved_tls}`.
 //! The dispatch path picks those up after the `before_proxy` phase via
 //! `RequestContext::apply_route_overrides`, which bakes the overrides into a
 //! fresh `Arc<Proxy>` so every downstream pool key, capability-registry
@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::config::types::BackendTlsConfig;
 use crate::plugins::{
     HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
 };
@@ -85,11 +86,18 @@ pub struct RouteDestination {
     /// Override the proxy's `backend_port`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_port: Option<u16>,
+    /// Override the proxy's resolved backend TLS materials when the rule
+    /// routes to a direct backend that uses different mTLS settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_tls: Option<BackendTlsConfig>,
 }
 
 impl RouteDestination {
     fn is_empty(&self) -> bool {
-        self.upstream_id.is_none() && self.backend_host.is_none() && self.backend_port.is_none()
+        self.upstream_id.is_none()
+            && self.backend_host.is_none()
+            && self.backend_port.is_none()
+            && self.backend_tls.is_none()
     }
 }
 
@@ -116,7 +124,7 @@ impl MeshRouteDispatch {
             if rule.destination.is_empty() {
                 return Err(format!(
                     "mesh_route_dispatch.rules[{idx}].destination requires at least one of \
-                     upstream_id / backend_host / backend_port"
+                     upstream_id / backend_host / backend_port / backend_tls"
                 ));
             }
             if let Some(port) = rule.destination.backend_port
@@ -171,6 +179,9 @@ impl Plugin for MeshRouteDispatch {
                 }
                 if let Some(port) = rule.destination.backend_port {
                     ctx.route_override_backend_port = Some(port);
+                }
+                if let Some(tls) = &rule.destination.backend_tls {
+                    ctx.route_override_resolved_tls = Some(tls.clone());
                 }
                 return PluginResult::Continue;
             }

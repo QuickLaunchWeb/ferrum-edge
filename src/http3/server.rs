@@ -1359,7 +1359,7 @@ async fn handle_h3_request(
     // and circuit-breaker target keys all derive from the effective
     // destination. Keep in sync with the H1/H2 dispatch path in
     // `src/proxy/mod.rs::handle_proxy_request_inner`.
-    let proxy = ctx.apply_route_overrides(proxy);
+    let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
 
     // Enforce request body size limit via Content-Length fast path. Apply
     // the gRPC-specific ceiling to gRPC requests so H3 matches H1/H2.
@@ -1410,7 +1410,6 @@ async fn handle_h3_request(
     // --- Upstream target selection and circuit breaker ---
     let selection = crate::proxy::backend_dispatch::select_upstream_target(
         &proxy,
-        ctx.route_override_upstream_id.as_deref(),
         &state,
         &epoch,
         &ctx.client_ip,
@@ -1721,7 +1720,6 @@ async fn handle_h3_request(
                 crate::proxy::backend_dispatch::record_backend_outcome(
                     &state,
                     &proxy,
-                    ctx.route_override_upstream_id.as_deref(),
                     &epoch.load_balancer,
                     upstream_balancer.as_ref(),
                     upstream_target.as_deref(),
@@ -1797,7 +1795,6 @@ async fn handle_h3_request(
             crate::proxy::backend_dispatch::record_backend_outcome(
                 &state,
                 &proxy,
-                ctx.route_override_upstream_id.as_deref(),
                 &epoch.load_balancer,
                 upstream_balancer.as_ref(),
                 upstream_target.as_deref(),
@@ -1991,7 +1988,6 @@ async fn handle_h3_request(
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
-            ctx.route_override_upstream_id.as_deref(),
             &epoch.load_balancer,
             upstream_balancer.as_ref(),
             upstream_target.as_deref(),
@@ -2261,7 +2257,6 @@ async fn handle_h3_request(
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
-            ctx.route_override_upstream_id.as_deref(),
             &epoch.load_balancer,
             upstream_balancer.as_ref(),
             upstream_target.as_deref(),
@@ -2517,7 +2512,6 @@ async fn handle_h3_request(
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
-            ctx.route_override_upstream_id.as_deref(),
             &epoch.load_balancer,
             upstream_balancer.as_ref(),
             final_target.as_deref(),

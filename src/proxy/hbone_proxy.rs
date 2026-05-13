@@ -255,17 +255,12 @@ pub(super) async fn handle_hbone_request(
     // destination (pool-poisoning invariant). Keep in sync with the H1/H2
     // dispatch path in `src/proxy/mod.rs::handle_proxy_request_inner` and
     // the HTTP/3 server in `src/http3/server.rs`.
-    let proxy_arc = ctx.apply_route_overrides(Arc::clone(proxy));
+    let proxy_arc = ctx
+        .apply_route_overrides_with_upstreams(Arc::clone(proxy), epoch.load_balancer.upstreams());
     let proxy: &Arc<Proxy> = &proxy_arc;
 
-    let selection = backend_dispatch::select_upstream_target(
-        proxy,
-        ctx.route_override_upstream_id.as_deref(),
-        state,
-        epoch,
-        &ctx.client_ip,
-        &ctx.headers,
-    );
+    let selection =
+        backend_dispatch::select_upstream_target(proxy, state, epoch, &ctx.client_ip, &ctx.headers);
     let upstream_target = selection.target;
     let upstream_balancer = selection.balancer;
 

@@ -627,7 +627,6 @@ where
             record_backend_outcome(
                 state,
                 proxy,
-                ctx.route_override_upstream_id.as_deref(),
                 &epoch.load_balancer,
                 upstream_balancer,
                 upstream_target,
@@ -836,7 +835,6 @@ where
                         record_backend_outcome(
                             state,
                             proxy,
-                            ctx.route_override_upstream_id.as_deref(),
                             &epoch.load_balancer,
                             upstream_balancer,
                             current_target.as_deref(),
@@ -1052,7 +1050,6 @@ where
                 record_backend_outcome(
                     state,
                     proxy,
-                    ctx.route_override_upstream_id.as_deref(),
                     &epoch.load_balancer,
                     upstream_balancer,
                     current_target.as_deref(),
@@ -1092,7 +1089,6 @@ where
                     record_backend_outcome(
                         state,
                         proxy,
-                        ctx.route_override_upstream_id.as_deref(),
                         &epoch.load_balancer,
                         upstream_balancer,
                         current_target.as_deref(),
@@ -1135,7 +1131,6 @@ where
         record_backend_outcome(
             state,
             proxy,
-            ctx.route_override_upstream_id.as_deref(),
             &epoch.load_balancer,
             upstream_balancer,
             current_target.as_deref(),
@@ -1171,7 +1166,6 @@ where
         record_backend_outcome(
             state,
             proxy,
-            ctx.route_override_upstream_id.as_deref(),
             &epoch.load_balancer,
             upstream_balancer,
             current_target.as_deref(),
@@ -1218,7 +1212,6 @@ where
                 record_backend_outcome(
                     state,
                     proxy,
-                    ctx.route_override_upstream_id.as_deref(),
                     &epoch.load_balancer,
                     upstream_balancer,
                     current_target.as_deref(),
@@ -1338,7 +1331,6 @@ where
         record_backend_outcome(
             state,
             proxy,
-            ctx.route_override_upstream_id.as_deref(),
             &epoch.load_balancer,
             upstream_balancer,
             current_target.as_deref(),
@@ -1379,7 +1371,6 @@ where
     record_backend_outcome(
         state,
         proxy,
-        ctx.route_override_upstream_id.as_deref(),
         &epoch.load_balancer,
         upstream_balancer,
         current_target.as_deref(),
@@ -1736,7 +1727,6 @@ where
                 record_backend_outcome(
                     state,
                     proxy,
-                    ctx.route_override_upstream_id.as_deref(),
                     &epoch.load_balancer,
                     upstream_balancer,
                     current_target.as_deref(),
@@ -1853,7 +1843,6 @@ where
             record_backend_outcome(
                 state,
                 proxy,
-                ctx.route_override_upstream_id.as_deref(),
                 &epoch.load_balancer,
                 upstream_balancer,
                 current_target.as_deref(),
@@ -1913,7 +1902,6 @@ where
                 record_backend_outcome(
                     state,
                     proxy,
-                    ctx.route_override_upstream_id.as_deref(),
                     &epoch.load_balancer,
                     upstream_balancer,
                     current_target.as_deref(),
@@ -1956,7 +1944,6 @@ where
             record_backend_outcome(
                 state,
                 proxy,
-                ctx.route_override_upstream_id.as_deref(),
                 &epoch.load_balancer,
                 upstream_balancer,
                 current_target.as_deref(),
@@ -2024,7 +2011,6 @@ where
             record_backend_outcome(
                 state,
                 proxy,
-                ctx.route_override_upstream_id.as_deref(),
                 &epoch.load_balancer,
                 upstream_balancer,
                 current_target.as_deref(),

@@ -71,8 +71,8 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::types::{
-    AuthMode, BackendScheme, DispatchKind, GatewayConfig, HttpFlavor, PluginConfig, PluginScope,
-    Proxy, ResponseBodyMode, UpstreamTarget,
+    AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HttpFlavor,
+    PluginConfig, PluginScope, Proxy, ResponseBodyMode, Upstream, UpstreamTarget,
 };
 use crate::config::{EnvConfig, PoolConfig};
 use crate::connection_pool::ConnectionPool;
@@ -85,7 +85,7 @@ use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
-    WebSocketFrameDirection,
+    WebSocketFrameDirection, mesh_route_dispatch::MeshRouteDispatchConfig,
 };
 use crate::proxy::headers as headers_mod;
 use crate::request_epoch::{RequestEpoch, RequestEpochStore, StagedRequestEpoch};
@@ -2024,10 +2024,15 @@ impl ProxyState {
         &self,
         config: &GatewayConfig,
     ) -> Vec<BackendCapabilityProbeTarget> {
-        let upstream_map: HashMap<&str, &crate::config::types::Upstream> = config
+        let upstream_map: HashMap<&str, &Upstream> = config
             .upstreams
             .iter()
             .map(|upstream| (upstream.id.as_str(), upstream))
+            .collect();
+        let proxy_map: HashMap<&str, &Proxy> = config
+            .proxies
+            .iter()
+            .map(|proxy| (proxy.id.as_str(), proxy))
             .collect();
         let mut seen = std::collections::HashSet::new();
         let mut targets = Vec::new();
@@ -2056,8 +2061,92 @@ impl ProxyState {
             }
         }
 
+        self.collect_mesh_route_dispatch_capability_targets(
+            config,
+            &proxy_map,
+            &upstream_map,
+            &mut seen,
+            &mut targets,
+        );
+
         self.backend_capabilities.retain_keys(&seen);
         targets
+    }
+
+    fn collect_mesh_route_dispatch_capability_targets(
+        &self,
+        config: &GatewayConfig,
+        proxy_map: &HashMap<&str, &Proxy>,
+        upstream_map: &HashMap<&str, &Upstream>,
+        seen: &mut std::collections::HashSet<String>,
+        targets: &mut Vec<BackendCapabilityProbeTarget>,
+    ) {
+        for plugin in &config.plugin_configs {
+            if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+                continue;
+            }
+            let Some(proxy_id) = plugin.proxy_id.as_deref() else {
+                continue;
+            };
+            let Some(base_proxy) = proxy_map.get(proxy_id) else {
+                continue;
+            };
+            if !base_proxy.dispatch_kind.is_http_family() {
+                continue;
+            }
+            let Ok(dispatch_config) =
+                serde_json::from_value::<MeshRouteDispatchConfig>(plugin.config.clone())
+            else {
+                warn!(
+                    plugin_id = %plugin.id,
+                    proxy_id = %proxy_id,
+                    "Skipping mesh_route_dispatch capability targets: config failed to parse"
+                );
+                continue;
+            };
+
+            for rule in dispatch_config.rules {
+                let destination = rule.destination;
+                let direct_backend_override = destination.upstream_id.is_none()
+                    && (destination.backend_host.is_some() || destination.backend_port.is_some());
+                let mut effective_proxy = (*base_proxy).clone();
+                if let Some(upstream_id) = destination.upstream_id {
+                    effective_proxy.upstream_id = Some(upstream_id.clone());
+                    let Some(upstream) = upstream_map.get(upstream_id.as_str()) else {
+                        continue;
+                    };
+                    effective_proxy.resolved_tls = BackendTlsConfig::from_upstream(upstream);
+                    for target in &upstream.targets {
+                        let probe_target = BackendCapabilityProbeTarget::from_proxy(
+                            &effective_proxy,
+                            Some(target),
+                        );
+                        if seen.insert(probe_target.key.clone()) {
+                            targets.push(probe_target);
+                        }
+                    }
+                    continue;
+                }
+
+                if let Some(host) = destination.backend_host {
+                    effective_proxy.backend_host = host;
+                }
+                if let Some(port) = destination.backend_port {
+                    effective_proxy.backend_port = port;
+                }
+                if direct_backend_override {
+                    effective_proxy.upstream_id = None;
+                }
+                if let Some(tls) = destination.backend_tls {
+                    effective_proxy.resolved_tls = tls;
+                }
+
+                let probe_target = BackendCapabilityProbeTarget::from_proxy(&effective_proxy, None);
+                if seen.insert(probe_target.key.clone()) {
+                    targets.push(probe_target);
+                }
+            }
+        }
     }
 
     fn build_backend_capability_probe_proxy(proxy: &Proxy) -> Proxy {
@@ -7199,12 +7288,11 @@ async fn handle_proxy_request_inner(
     // downstream pool keys, capability-registry lookups, URL construction,
     // and circuit-breaker target keys all derive from the effective
     // destination (pool-poisoning invariant).
-    let proxy = ctx.apply_route_overrides(proxy);
+    let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
 
     // Resolve upstream target and hash key from the request epoch.
     let selection = backend_dispatch::select_upstream_target(
         &proxy,
-        ctx.route_override_upstream_id.as_deref(),
         &state,
         &epoch,
         &ctx.client_ip,
@@ -8586,7 +8674,6 @@ async fn handle_proxy_request_inner(
     backend_dispatch::record_backend_outcome(
         &state,
         &proxy,
-        ctx.route_override_upstream_id.as_deref(),
         &epoch.load_balancer,
         upstream_balancer.as_ref(),
         upstream_target.as_deref(),
@@ -13586,6 +13673,63 @@ mod tests {
     /// explicit string.
     fn fake_pool_key(proxy_id: &str) -> String {
         format!("test-pool-key|{proxy_id}")
+    }
+
+    #[tokio::test]
+    async fn capability_targets_include_mesh_route_dispatch_override_upstreams() {
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
+        let mut upstream = upstream_with_targets("canary", &[("canary.test", 8443)]);
+        upstream.backend_tls_client_cert_path = Some("/certs/canary.pem".to_string());
+        upstream.backend_tls_client_key_path = Some("/certs/canary.key".to_string());
+        upstream.backend_tls_server_ca_cert_path = Some("/certs/canary-ca.pem".to_string());
+        upstream.backend_tls_verify_server_cert = false;
+
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "mrd-p".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "canary"}
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+        let state = make_test_proxy_state(config);
+        let loaded = state.config.load_full();
+
+        let targets = state.collect_backend_capability_targets(&loaded);
+        let canary = targets
+            .iter()
+            .find(|target| target.host() == "canary.test" && target.port() == 8443)
+            .expect("override upstream target should be probed");
+        assert_eq!(
+            canary.proxy.resolved_tls.client_cert_path.as_deref(),
+            Some("/certs/canary.pem")
+        );
+        assert_eq!(
+            canary.proxy.resolved_tls.client_key_path.as_deref(),
+            Some("/certs/canary.key")
+        );
+        assert_eq!(
+            canary.proxy.resolved_tls.server_ca_cert_path.as_deref(),
+            Some("/certs/canary-ca.pem")
+        );
+        assert!(!canary.proxy.resolved_tls.verify_server_cert);
     }
 
     #[test]
