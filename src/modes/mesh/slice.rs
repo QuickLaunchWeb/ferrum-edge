@@ -469,20 +469,23 @@ fn destination_rule_service_ref_from_host(
         return Some((host.to_string(), rule_namespace.to_string()));
     }
 
-    if let Some((name, namespace)) = split_service_host(host)
+    if let Some((name, namespace)) = split_canonical_service_host(host)
         && mesh_service_identities.contains(&(namespace.to_string(), name.to_string()))
     {
         return Some((name.to_string(), namespace.to_string()));
     }
 
-    if let Some((name, namespace)) = host.strip_suffix(".svc").and_then(split_service_host) {
+    if let Some((name, namespace)) = host
+        .strip_suffix(".svc")
+        .and_then(split_canonical_service_host)
+    {
         return Some((name.to_string(), namespace.to_string()));
     }
 
     if !cluster_domain.is_empty()
         && let Some((name, namespace)) = host
             .strip_suffix(&format!(".svc.{cluster_domain}"))
-            .and_then(split_service_host)
+            .and_then(split_canonical_service_host)
     {
         return Some((name.to_string(), namespace.to_string()));
     }
@@ -490,9 +493,11 @@ fn destination_rule_service_ref_from_host(
     None
 }
 
-fn split_service_host(host: &str) -> Option<(&str, &str)> {
-    let (name, namespace) = host.split_once('.')?;
-    if name.is_empty() || namespace.is_empty() || name.contains('.') || namespace.contains('.') {
+fn split_canonical_service_host(host: &str) -> Option<(&str, &str)> {
+    let mut labels = host.split('.');
+    let name = labels.next()?;
+    let namespace = labels.next()?;
+    if labels.next().is_some() || name.is_empty() || namespace.is_empty() {
         return None;
     }
     Some((name, namespace))
@@ -2965,6 +2970,32 @@ mod tests {
                 name: "external-dr".into(),
                 namespace: "alpha".into(),
                 host: "example.com".into(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "external-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_keeps_long_external_destination_rule_literal() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews.alpha.external.com"]],
+            )],
+            services: vec![make_service("alpha", "reviews")],
+            destination_rules: vec![MeshDestinationRule {
+                name: "external-dr".into(),
+                namespace: "alpha".into(),
+                host: "reviews.alpha.external.com".into(),
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
