@@ -212,7 +212,7 @@ impl MeshSlice {
 
         let namespace = request.namespace.clone();
         let cluster_domain = request.cluster_domain.clone();
-        let known_mesh_namespaces = mesh_known_namespaces(mesh, namespace.as_str());
+        let mesh_service_identities = mesh_service_identities(mesh);
         let workloads: Vec<Workload> = mesh
             .workloads
             .iter()
@@ -333,7 +333,7 @@ impl MeshSlice {
                         let (resource_namespace, host_candidates) = destination_rule_host_scope(
                             dr,
                             &cluster_domain,
-                            &known_mesh_namespaces,
+                            &mesh_service_identities,
                         );
                         let host_refs: Vec<&str> =
                             host_candidates.iter().map(String::as_str).collect();
@@ -373,32 +373,24 @@ impl MeshSlice {
     }
 }
 
-fn mesh_known_namespaces(mesh: &MeshConfig, request_namespace: &str) -> BTreeSet<String> {
-    let mut namespaces = BTreeSet::new();
-    insert_normalized_namespace(&mut namespaces, request_namespace);
-    for workload in &mesh.workloads {
-        insert_normalized_namespace(&mut namespaces, &workload.namespace);
-    }
+fn mesh_service_identities(mesh: &MeshConfig) -> BTreeSet<(String, String)> {
+    let mut identities = BTreeSet::new();
     for service in &mesh.services {
-        insert_normalized_namespace(&mut namespaces, &service.namespace);
+        let namespace = service
+            .namespace
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        let name = service
+            .name
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if !namespace.is_empty() && !name.is_empty() {
+            identities.insert((namespace, name));
+        }
     }
-    for entry in &mesh.service_entries {
-        insert_normalized_namespace(&mut namespaces, &entry.namespace);
-    }
-    for rule in &mesh.destination_rules {
-        insert_normalized_namespace(&mut namespaces, &rule.namespace);
-    }
-    for sidecar in &mesh.sidecars {
-        insert_normalized_namespace(&mut namespaces, &sidecar.namespace);
-    }
-    namespaces
-}
-
-fn insert_normalized_namespace(namespaces: &mut BTreeSet<String>, namespace: &str) {
-    let namespace = namespace.trim().trim_end_matches('.').to_ascii_lowercase();
-    if !namespace.is_empty() {
-        namespaces.insert(namespace);
-    }
+    identities
 }
 
 fn mesh_service_host_candidates(service: &MeshService, cluster_domain: &str) -> Vec<String> {
@@ -426,7 +418,7 @@ fn service_host_aliases(name: &str, namespace: &str, cluster_domain: &str) -> Ve
 fn destination_rule_host_scope(
     rule: &MeshDestinationRule,
     cluster_domain: &str,
-    known_mesh_namespaces: &BTreeSet<String>,
+    mesh_service_identities: &BTreeSet<(String, String)>,
 ) -> (String, Vec<String>) {
     let host = rule.host.trim().trim_end_matches('.').to_ascii_lowercase();
     let rule_namespace = rule
@@ -443,7 +435,7 @@ fn destination_rule_host_scope(
         &host,
         &rule_namespace,
         &cluster_domain,
-        known_mesh_namespaces,
+        mesh_service_identities,
     )
     .map(|(service_name, service_namespace)| {
         let candidates = service_host_aliases(&service_name, &service_namespace, &cluster_domain);
@@ -456,7 +448,7 @@ fn destination_rule_service_ref_from_host(
     host: &str,
     rule_namespace: &str,
     cluster_domain: &str,
-    known_mesh_namespaces: &BTreeSet<String>,
+    mesh_service_identities: &BTreeSet<(String, String)>,
 ) -> Option<(String, String)> {
     if host.is_empty() || rule_namespace.is_empty() || host.contains('*') {
         return None;
@@ -465,15 +457,8 @@ fn destination_rule_service_ref_from_host(
         return Some((host.to_string(), rule_namespace.to_string()));
     }
 
-    if let Some(name) = host.strip_suffix(&format!(".{rule_namespace}"))
-        && !name.is_empty()
-        && !name.contains('.')
-    {
-        return Some((name.to_string(), rule_namespace.to_string()));
-    }
-
     if let Some((name, namespace)) = split_service_host(host)
-        && known_mesh_namespaces.contains(namespace)
+        && mesh_service_identities.contains(&(namespace.to_string(), name.to_string()))
     {
         return Some((name.to_string(), namespace.to_string()));
     }
@@ -2924,6 +2909,7 @@ mod tests {
                 None,
                 vec![vec!["./example.com"]],
             )],
+            services: vec![make_service("com", "unrelated")],
             destination_rules: vec![MeshDestinationRule {
                 name: "external-dr".into(),
                 namespace: "alpha".into(),
