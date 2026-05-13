@@ -75,15 +75,103 @@ pub struct MeshGrpcServer {
     mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
     registry: Arc<MeshNodeRegistry>,
     namespace: String,
+    /// Mirror of `EnvConfig.mesh_sidecar_enforced`. Threaded through every
+    /// per-subscriber slice request so DP-facing slices honor the operator's
+    /// rollout decision. Default `false` preserves existing CP behavior.
+    sidecar_enforced: bool,
+    /// Cluster DNS suffix used when synthesizing MeshService FQDN aliases for
+    /// Sidecar egress matching.
+    cluster_domain: String,
+}
+
+pub struct MeshGrpcServerBuilder {
+    config: Arc<ArcSwap<GatewayConfig>>,
+    jwt_secret: String,
+    channel_capacity: usize,
+    registry: Arc<MeshNodeRegistry>,
+    expected_issuer: String,
+    namespace: String,
+    sidecar_enforced: bool,
+    cluster_domain: String,
+}
+
+impl MeshGrpcServerBuilder {
+    fn new(config: Arc<ArcSwap<GatewayConfig>>, jwt_secret: String) -> Self {
+        Self {
+            config,
+            jwt_secret,
+            channel_capacity: 128,
+            registry: Arc::new(MeshNodeRegistry::new()),
+            expected_issuer: DEFAULT_CP_DP_JWT_ISSUER.to_string(),
+            namespace: default_namespace(),
+            sidecar_enforced: false,
+            cluster_domain: crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
+        }
+    }
+
+    pub fn channel_capacity(mut self, channel_capacity: usize) -> Self {
+        self.channel_capacity = channel_capacity;
+        self
+    }
+
+    pub fn registry(mut self, registry: Arc<MeshNodeRegistry>) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    pub fn expected_issuer(mut self, expected_issuer: String) -> Self {
+        self.expected_issuer = expected_issuer;
+        self
+    }
+
+    pub fn namespace(mut self, namespace: String) -> Self {
+        self.namespace = namespace;
+        self
+    }
+
+    pub fn sidecar_enforced(mut self, sidecar_enforced: bool) -> Self {
+        self.sidecar_enforced = sidecar_enforced;
+        self
+    }
+
+    pub fn cluster_domain(mut self, cluster_domain: String) -> Self {
+        self.cluster_domain = cluster_domain;
+        self
+    }
+
+    pub fn build(self) -> (MeshGrpcServer, broadcast::Sender<MeshConfigBroadcast>) {
+        let (tx, _) = broadcast::channel(self.channel_capacity.max(1));
+        let tx_clone = tx.clone();
+        (
+            MeshGrpcServer {
+                config: self.config,
+                jwt_secret: self.jwt_secret,
+                expected_issuer: self.expected_issuer,
+                mesh_update_tx: tx,
+                registry: self.registry,
+                namespace: self.namespace,
+                sidecar_enforced: self.sidecar_enforced,
+                cluster_domain: self.cluster_domain,
+            },
+            tx_clone,
+        )
+    }
 }
 
 impl MeshGrpcServer {
+    pub fn builder(
+        config: Arc<ArcSwap<GatewayConfig>>,
+        jwt_secret: String,
+    ) -> MeshGrpcServerBuilder {
+        MeshGrpcServerBuilder::new(config, jwt_secret)
+    }
+
     #[allow(dead_code)]
     pub fn new(
         config: Arc<ArcSwap<GatewayConfig>>,
         jwt_secret: String,
     ) -> (Self, broadcast::Sender<MeshConfigBroadcast>) {
-        Self::with_channel_capacity(config, jwt_secret, 128)
+        Self::builder(config, jwt_secret).build()
     }
 
     #[allow(dead_code)]
@@ -92,16 +180,12 @@ impl MeshGrpcServer {
         jwt_secret: String,
         channel_capacity: usize,
     ) -> (Self, broadcast::Sender<MeshConfigBroadcast>) {
-        Self::with_channel_capacity_registry_issuer_and_namespace(
-            config,
-            jwt_secret,
-            channel_capacity,
-            Arc::new(MeshNodeRegistry::new()),
-            DEFAULT_CP_DP_JWT_ISSUER.to_string(),
-            default_namespace(),
-        )
+        Self::builder(config, jwt_secret)
+            .channel_capacity(channel_capacity)
+            .build()
     }
 
+    #[allow(dead_code)]
     pub fn with_channel_capacity_registry_issuer_and_namespace(
         config: Arc<ArcSwap<GatewayConfig>>,
         jwt_secret: String,
@@ -110,19 +194,18 @@ impl MeshGrpcServer {
         expected_issuer: String,
         namespace: String,
     ) -> (Self, broadcast::Sender<MeshConfigBroadcast>) {
-        let (tx, _) = broadcast::channel(channel_capacity.max(1));
-        let tx_clone = tx.clone();
-        (
-            Self {
-                config,
-                jwt_secret,
-                expected_issuer,
-                mesh_update_tx: tx,
-                registry,
-                namespace,
-            },
-            tx_clone,
-        )
+        Self::builder(config, jwt_secret)
+            .channel_capacity(channel_capacity)
+            .registry(registry)
+            .expected_issuer(expected_issuer)
+            .namespace(namespace)
+            .build()
+    }
+
+    #[allow(dead_code)]
+    pub fn with_cluster_domain(mut self, cluster_domain: String) -> Self {
+        self.cluster_domain = cluster_domain;
+        self
     }
 
     pub fn into_service(self) -> MeshConfigSyncServer<Self> {
@@ -196,6 +279,7 @@ impl MeshGrpcServer {
         let mut candidate = stream_config.clone();
         apply_incremental_to_config_snapshot(&mut candidate, delta);
         candidate.normalize_fields();
+        candidate.normalize_mesh_fields();
         let result =
             Self::build_mesh_config_update_if_changed(&candidate, slice_request, previous_slice)?;
         *stream_config = candidate;
@@ -259,13 +343,18 @@ impl MeshConfigSync for MeshGrpcServer {
             node_namespace.clone(),
             inner.workload_spiffe_id,
             inner.labels,
-        );
+        )
+        .with_cluster_domain(self.cluster_domain.clone())
+        .with_enforce_sidecar_egress(self.sidecar_enforced);
         // Register the receiver before loading the initial snapshot so a
         // concurrent CP broadcast is either captured by this stream or already
         // reflected in the loaded snapshot.
         let rx = self.mesh_update_tx.subscribe();
         let config = self.config.load_full();
-        let initial_slice = MeshSlice::from_gateway_config(config.as_ref(), slice_request.clone());
+        let mut initial_config = config.as_ref().clone();
+        initial_config.normalize_fields();
+        initial_config.normalize_mesh_fields();
+        let initial_slice = MeshSlice::from_gateway_config(&initial_config, slice_request.clone());
         let initial = Self::build_mesh_config_update_from_slice(initial_slice.clone())?;
 
         let now = Utc::now();
@@ -278,7 +367,7 @@ impl MeshConfigSync for MeshGrpcServer {
             last_update_at: now,
         });
 
-        let mut stream_config = config.as_ref().clone();
+        let mut stream_config = initial_config;
         let mut previous_slice = initial_slice;
         let config_for_recovery = self.config.clone();
         let stream_slice_request = slice_request.clone();
@@ -288,6 +377,7 @@ impl MeshConfigSync for MeshGrpcServer {
                 Ok(MeshConfigBroadcast::Full(config)) => {
                     let mut config = config.as_ref().clone();
                     config.normalize_fields();
+                    config.normalize_mesh_fields();
                     match Self::build_mesh_config_update_if_changed(
                         &config,
                         slice_request,
@@ -334,18 +424,21 @@ impl MeshConfigSync for MeshGrpcServer {
                         n
                     );
                     let current = config_for_recovery.load_full();
+                    let mut current_config = current.as_ref().clone();
+                    current_config.normalize_fields();
+                    current_config.normalize_mesh_fields();
                     match Self::build_mesh_config_update_if_changed(
-                        current.as_ref(),
+                        &current_config,
                         slice_request,
                         &previous_slice,
                     ) {
                         Ok((next_slice, Some(update))) => {
-                            stream_config = current.as_ref().clone();
+                            stream_config = current_config;
                             previous_slice = next_slice;
                             Some(Ok(update))
                         }
                         Ok((_, None)) => {
-                            stream_config = current.as_ref().clone();
+                            stream_config = current_config;
                             None
                         }
                         Err(e) => Some(Err(e)),
@@ -484,5 +577,74 @@ mod tests {
         assert_eq!(heartbeat.version, "v1");
         assert!(heartbeat.mesh_slice_json.is_empty());
         assert_eq!(heartbeat.ferrum_version, crate::FERRUM_VERSION);
+    }
+
+    #[test]
+    fn mesh_subscribe_sidecar_narrowing_survives_wire_serialization() {
+        // Verifies that when `sidecar_enforced=true`, the slice the CP emits
+        // on the wire is already narrowed: only the egress-admitted resources
+        // survive, and the `sidecars` array itself is empty on the DP side
+        // (DPs do not need the originals — the slice they receive is the
+        // authoritative view).
+        use crate::modes::mesh::config::{MeshSidecar, MeshSidecarEgress};
+
+        let mut mesh = MeshConfig {
+            services: vec![
+                MeshService {
+                    name: "reviews".to_string(),
+                    namespace: "alpha".to_string(),
+                    ports: vec![ServicePort {
+                        port: 8080,
+                        protocol: AppProtocol::Http,
+                        name: Some("http".to_string()),
+                    }],
+                    workloads: Vec::new(),
+                    protocol_overrides: std::collections::HashMap::new(),
+                },
+                MeshService {
+                    name: "checkout".to_string(),
+                    namespace: "alpha".to_string(),
+                    ports: vec![ServicePort {
+                        port: 8080,
+                        protocol: AppProtocol::Http,
+                        name: Some("http".to_string()),
+                    }],
+                    workloads: Vec::new(),
+                    protocol_overrides: std::collections::HashMap::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        mesh.sidecars = vec![MeshSidecar {
+            name: "default-sc".to_string(),
+            namespace: "alpha".to_string(),
+            workload_selector: None,
+            egress_inherits_defaults: false,
+            egress: vec![MeshSidecarEgress {
+                hosts: vec!["./reviews".to_string()],
+                port: None,
+            }],
+        }];
+        let config = GatewayConfig {
+            mesh: Some(Box::new(mesh)),
+            loaded_at: Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap(),
+            ..GatewayConfig::default()
+        };
+        let slice_request = MeshSliceRequest::from_native(
+            "node-a".to_string(),
+            "alpha".to_string(),
+            String::new(),
+            std::collections::HashMap::new(),
+        )
+        .with_enforce_sidecar_egress(true);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request);
+        // The CP narrowed the slice before serialization — only `reviews`
+        // should survive, and no Sidecar resource is carried on the wire.
+        let update = MeshGrpcServer::build_mesh_config_update_from_slice(slice.clone())
+            .expect("update builds");
+        let parsed: MeshSlice = serde_json::from_str(&update.mesh_slice_json)
+            .expect("mesh slice round-trips through JSON");
+        assert_eq!(parsed.services.len(), 1);
+        assert_eq!(parsed.services[0].name, "reviews");
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -7,11 +7,11 @@ use crate::modes::mesh::config::{
     AccessLogFilter, AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig,
     MeshConsistentHash, MeshDestinationRule, MeshEndpoint, MeshJwtRule, MeshLoadBalancer,
     MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshProxyConfig,
-    MeshRequestAuthentication, MeshRule, MeshSimpleLb, MeshSubset, MeshTelemetryConfig,
-    MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy, MeshTrafficPolicyTls,
-    MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch,
-    RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
-    TagOverrideOperation, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
+    MeshRequestAuthentication, MeshRule, MeshSidecar, MeshSidecarEgress, MeshSimpleLb, MeshSubset,
+    MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy,
+    MeshTrafficPolicyTls, MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction,
+    PolicyScope, PrincipalMatch, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation,
+    ServicePort, TagOverrideOperation, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
 };
 
 use super::{
@@ -69,10 +69,8 @@ pub(super) fn translate(
             Ok(true)
         }
         "Sidecar" => {
-            acc.warnings.push(format!(
-                "Sidecar {}/{} accepted; egress listener scoping is tracked for the Phase D reconciler and has no direct proxy output yet",
-                object.metadata.namespace, object.metadata.name
-            ));
+            let sidecar = sidecar(acc, object)?;
+            acc.mesh.sidecars.push(sidecar);
             Ok(true)
         }
         "Telemetry" => {
@@ -369,6 +367,119 @@ fn peer_authentication(
         selector,
         mtls_mode: effective_mtls_mode,
         port_overrides,
+    })
+}
+
+/// Translate an Istio `Sidecar` resource into a [`MeshSidecar`].
+///
+/// Parses:
+///   - `spec.workloadSelector.matchLabels` → [`MeshSidecar::workload_selector`]
+///     with the Sidecar's own namespace (a `Sidecar` only ever targets
+///     workloads in its own namespace, per Istio semantics).
+///   - `spec.egress[].hosts` → [`MeshSidecarEgress::hosts`] (verbatim — the
+///     slice builder parses each entry via `MeshSidecarEgress::parse_host_pattern`).
+///   - `spec.egress[].port.number` → [`MeshSidecarEgress::port`] (optional).
+///
+/// Ingress listener configuration (`spec.ingress[]`) and `outboundTrafficPolicy`
+/// are deliberately not translated yet — egress scoping is the immediate
+/// compatibility gap; the other surfaces stay in the documented "deferred"
+/// table until separate PRs land them.
+fn sidecar(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
+    if object.metadata.namespace == acc.options.istio_root_namespace {
+        acc.warnings.push(format!(
+            "Sidecar {}/{} is in the Istio root namespace '{}', but Ferrum Sidecar egress scoping is namespace-local today; it will not act as a mesh-wide default",
+            object.metadata.namespace, object.metadata.name, acc.options.istio_root_namespace
+        ));
+    }
+
+    let workload_selector = match object.spec.get("workloadSelector") {
+        Some(selector_value) => {
+            let labels = selector_from_istio(Some(selector_value));
+            if labels.is_empty() {
+                None
+            } else {
+                Some(WorkloadSelector {
+                    labels,
+                    namespace: Some(object.metadata.namespace.clone()),
+                })
+            }
+        }
+        None => None,
+    };
+
+    let mut egress = Vec::new();
+    let mut egress_inherits_defaults = false;
+    let mut port_scopes = BTreeSet::new();
+    match object.spec.get("egress") {
+        None => {
+            // Istio: omitted egress inherits the namespace default outbound
+            // scope. Keep it distinct from an explicit empty `egress: []`,
+            // which means block all.
+            egress_inherits_defaults = true;
+        }
+        Some(raw_egress) => {
+            let entries = raw_egress
+                .as_array()
+                .ok_or_else(|| invalid_resource(object, "Sidecar egress must be an array"))?;
+            for entry in entries {
+                let hosts_value = entry.get("hosts").ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        "Sidecar egress[].hosts must be a non-empty array of strings",
+                    )
+                })?;
+                let hosts_array = hosts_value.as_array().ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        "Sidecar egress[].hosts must be a non-empty array of strings",
+                    )
+                })?;
+                if hosts_array.is_empty() {
+                    return Err(invalid_resource(
+                        object,
+                        "Sidecar egress[].hosts must be a non-empty array of strings",
+                    ));
+                }
+                let hosts: Vec<String> = hosts_array
+                    .iter()
+                    .map(|host| {
+                        host.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                            invalid_resource(
+                                object,
+                                "Sidecar egress[].hosts must be a non-empty array of strings",
+                            )
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+                let port = match entry.get("port") {
+                    Some(port_obj) => optional_port_field(
+                        object,
+                        port_obj.get("number"),
+                        "Sidecar egress[].port.number",
+                    )?,
+                    None => None,
+                };
+                if let Some(port) = port {
+                    port_scopes.insert(port);
+                }
+                egress.push(MeshSidecarEgress { hosts, port });
+            }
+        }
+    }
+
+    if !port_scopes.is_empty() {
+        acc.warnings.push(format!(
+            "Sidecar {}/{} uses egress port scoping {:?}, but Ferrum currently narrows Sidecar egress by host only; the port field is parsed and preserved but not enforced",
+            object.metadata.namespace, object.metadata.name, port_scopes
+        ));
+    }
+
+    Ok(MeshSidecar {
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        workload_selector,
+        egress_inherits_defaults,
+        egress,
     })
 }
 
@@ -6034,6 +6145,8 @@ mod tests {
             namespace: "default".to_string(),
             workload_spiffe_id: None,
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            cluster_domain: "cluster.local".to_string(),
+            enforce_sidecar_egress: false,
         };
         let slice = MeshSlice::from_gateway_config(&gateway_config, request);
         // Both should match — namespace-default applies to any workload, and
@@ -7074,6 +7187,276 @@ mod tests {
         assert!(
             err.to_string().contains("port.number is required"),
             "expected port.number required error, got {err}"
+        );
+    }
+
+    // ── Sidecar translator ──────────────────────────────────────────────
+
+    #[test]
+    fn sidecar_with_workload_selector_and_egress_translates_correctly() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "workloadSelector": {
+                        "matchLabels": {"app": "frontend"}
+                    },
+                    "egress": [
+                        {
+                            "hosts": [
+                                "./reviews.default.svc.cluster.local",
+                                "*/external.example.com"
+                            ],
+                            "port": {"number": 8080}
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        // Sidecar must NOT produce the old Phase-D warning. Port scoping is
+        // parsed but not enforced yet, so that unsupported field gets a focused
+        // warning instead.
+        assert!(
+            !result.warnings.iter().any(|w| w.contains("Phase D")),
+            "Sidecar translation must not emit the deferred warning; warnings = {:?}",
+            result.warnings
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| { w.contains("egress port scoping") && w.contains("host only") }),
+            "Sidecar egress port should emit a host-only warning; warnings = {:?}",
+            result.warnings
+        );
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.sidecars.len(), 1);
+        let sc = &mesh.sidecars[0];
+        assert_eq!(sc.name, "sample");
+        assert_eq!(sc.namespace, "default");
+        let selector = sc
+            .workload_selector
+            .as_ref()
+            .expect("workload selector parsed");
+        assert_eq!(
+            selector.labels.get("app").map(String::as_str),
+            Some("frontend")
+        );
+        assert_eq!(selector.namespace.as_deref(), Some("default"));
+        assert!(!sc.egress_inherits_defaults);
+        assert_eq!(sc.egress.len(), 1);
+        assert_eq!(
+            sc.egress[0].hosts,
+            vec![
+                "./reviews.default.svc.cluster.local".to_string(),
+                "*/external.example.com".to_string(),
+            ]
+        );
+        assert_eq!(sc.egress[0].port, Some(8080));
+    }
+
+    #[test]
+    fn sidecar_without_workload_selector_is_namespace_default() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {"hosts": ["./reviews.default.svc.cluster.local"]}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.sidecars.len(), 1);
+        assert!(mesh.sidecars[0].workload_selector.is_none());
+        assert!(!mesh.sidecars[0].egress_inherits_defaults);
+        assert_eq!(mesh.sidecars[0].egress[0].port, None);
+    }
+
+    #[test]
+    fn sidecar_with_omitted_egress_inherits_outbound_defaults() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "workloadSelector": {"matchLabels": {"app": "frontend"}},
+                    "ingress": [
+                        {"port": {"number": 8080, "protocol": "HTTP", "name": "http"}}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.sidecars.len(), 1);
+        assert!(mesh.sidecars[0].egress_inherits_defaults);
+        assert!(mesh.sidecars[0].egress.is_empty());
+    }
+
+    #[test]
+    fn sidecar_translator_emits_no_warning_for_valid_resource() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {"hosts": ["*/*"]}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(
+            result.warnings.is_empty(),
+            "valid Sidecar must produce no warnings; got {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn sidecar_in_root_namespace_emits_scope_warning() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {"hosts": ["*/*"]}
+                    ]
+                }),
+            )],
+            options().with_istio_root_namespace("default".to_string()),
+        )
+        .expect("translation succeeds");
+
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| { w.contains("root namespace") && w.contains("namespace-local") }),
+            "root namespace Sidecar should emit scope warning; got {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn sidecar_with_empty_workload_selector_matchlabels_is_namespace_default() {
+        // workloadSelector present but matchLabels empty → treat as no
+        // selector. Mirrors Istio: a Sidecar with an empty selector applies
+        // to every workload in the namespace (i.e. namespace-default).
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "workloadSelector": {"matchLabels": {}},
+                    "egress": [
+                        {"hosts": ["*/*"]}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.sidecars.len(), 1);
+        assert!(
+            mesh.sidecars[0].workload_selector.is_none(),
+            "empty matchLabels should round-trip to no selector"
+        );
+    }
+
+    #[test]
+    fn sidecar_with_invalid_port_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {
+                            "hosts": ["./svc.default.svc.cluster.local"],
+                            "port": {"number": 0}
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("port 0 should be rejected");
+        assert!(
+            err.to_string().contains("Sidecar egress[].port.number"),
+            "error must reference the field; got {err}"
+        );
+    }
+
+    #[test]
+    fn sidecar_egress_missing_hosts_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {"port": {"number": 8080}}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("missing hosts should be rejected");
+        assert!(
+            err.to_string().contains("Sidecar egress[].hosts"),
+            "error must reference hosts; got {err}"
+        );
+    }
+
+    #[test]
+    fn sidecar_egress_empty_hosts_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {"hosts": []}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("empty hosts should be rejected");
+        assert!(
+            err.to_string().contains("Sidecar egress[].hosts"),
+            "error must reference hosts; got {err}"
+        );
+    }
+
+    #[test]
+    fn sidecar_egress_non_string_hosts_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {"hosts": ["./svc.default.svc.cluster.local", 42]}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("non-string hosts should be rejected");
+        assert!(
+            err.to_string().contains("Sidecar egress[].hosts"),
+            "error must reference hosts; got {err}"
         );
     }
 }

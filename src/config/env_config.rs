@@ -532,6 +532,14 @@ pub struct EnvConfig {
     /// this to keep mesh-internal identity claims (e.g. `source.`) from
     /// leaking to non-mesh upstream services.
     pub mesh_egress_strip_baggage_keys: Vec<String>,
+    /// When `true`, the slice builder applies Istio `Sidecar` egress scope
+    /// narrowing: services / service-entries / destination-rules outside the
+    /// applicable Sidecar's egress scope are filtered out before being sent
+    /// to data planes. Default `false` for safe rollout — operators opt in
+    /// after vetting their `Sidecar` resources. Parsing of `Sidecar` CRDs
+    /// happens unconditionally; this flag only gates the slice-narrowing
+    /// pass.
+    pub mesh_sidecar_enforced: bool,
 
     // Kubernetes CRD controller (Layer 8)
     /// Enable the Kubernetes CRD controller in CP mode. When true, the CP
@@ -1260,6 +1268,7 @@ impl Default for EnvConfig {
             mesh_config_protocol: "native".to_string(),
             mesh_trust_domain_aliases: Vec::new(),
             mesh_egress_strip_baggage_keys: Vec::new(),
+            mesh_sidecar_enforced: false,
             k8s_controller_enabled: false,
             k8s_watch_namespaces: Vec::new(),
             k8s_kubeconfig_path: None,
@@ -1546,6 +1555,7 @@ impl EnvConfig {
             mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
+            mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
             k8s_controller_enabled: bool = "FERRUM_K8S_CONTROLLER_ENABLED" => false;
             k8s_watch_namespaces: Vec<String> = "FERRUM_K8S_WATCH_NAMESPACES" => Vec::new();
             k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
@@ -1904,6 +1914,7 @@ impl EnvConfig {
             mesh_config_protocol,
             mesh_trust_domain_aliases,
             mesh_egress_strip_baggage_keys,
+            mesh_sidecar_enforced,
             k8s_controller_enabled,
             k8s_watch_namespaces,
             k8s_kubeconfig_path,
