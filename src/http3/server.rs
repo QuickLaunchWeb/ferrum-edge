@@ -560,12 +560,12 @@ async fn handle_h3_request(
     let start_time = std::time::Instant::now();
 
     // Detect the HTTP flavor (Plain / gRPC / WebSocket) once from the incoming
-    // H3 request — performed FIRST so every admission rejection below can be
+    // H3 request. This runs first so every admission rejection below can be
     // flavor-aware (trailers-only gRPC errors for gRPC requests, JSON for
     // everything else). WebSocket over H3 requires Extended CONNECT
-    // (RFC 9220) and is not currently supported by this listener; gRPC over
-    // H3 is legal but the backend-side decoupling below intentionally does
-    // not dispatch it via the H3 pool (the pool only speaks QUIC → QUIC
+    // (RFC 9220) and is handled by a dedicated bridge below; gRPC over H3 is
+    // legal but the backend-side decoupling below intentionally does not
+    // dispatch it via the H3 pool (the pool only speaks QUIC to QUIC
     // backends). Keeping the flavor around lets the dispatch guard emit a
     // precise 502 instead of forwarding non-Plain traffic to an H3 backend
     // that does not expect it.
@@ -769,10 +769,10 @@ async fn handle_h3_request(
 
     // Block non-WebSocket CONNECT requests. HTTP/3 Extended CONNECT for
     // WebSocket (RFC 9220) is classified above as `HttpFlavor::WebSocket`
-    // and falls through to the shared unsupported-WebSocket path, which
-    // returns the documented 501 response. Other CONNECT-style protocols
-    // (for example CONNECT-UDP) are not supported by this proxy and must be
-    // rejected to prevent tunnel establishment that bypasses proxy routing.
+    // and falls through to the dedicated bridge later in this handler. Other
+    // CONNECT-style protocols (for example CONNECT-UDP) are not supported by
+    // this proxy and must be rejected to prevent tunnel establishment that
+    // bypasses proxy routing.
     if method == "CONNECT" && http_flavor != HttpFlavor::WebSocket {
         warn!("Rejected non-WebSocket HTTP/3 CONNECT request");
         record_request(&state, 405);
@@ -1017,14 +1017,11 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    // Map runtime HTTP flavor to the plugin-cache protocol key so H3 gRPC
-    // requests load the gRPC plugin/auth/capability sets rather than the
-    // HTTP-only sets. WebSocket-over-H3 already returns 501 earlier, so we
-    // only need to distinguish gRPC from everything else here.
-    let request_protocol = match http_flavor {
-        HttpFlavor::Grpc => ProxyProtocol::Grpc,
-        _ => ProxyProtocol::Http,
-    };
+    // Map runtime HTTP flavor to the plugin-cache protocol key so H3 requests
+    // load the same plugin/auth/capability set as the H1/H2 dispatch path.
+    let request_protocol = h3_plugin_protocol_for_flavor(http_flavor);
+    let allows_request_body_buffering =
+        crate::proxy::http_flavor_allows_request_body_buffering(http_flavor);
 
     // Load plugin-cache values once for this request. Every plugin list,
     // capability bitset, and buffering flag below is derived from the same
@@ -1089,8 +1086,10 @@ async fn handle_h3_request(
     // Some auth plugins (for example `hmac_auth`) verify request body integrity
     // at authenticate time. Buffer the body before the auth phase runs so those
     // plugins can read `ctx.request_body_bytes`.
-    let h3_requires_body_before_authenticate = capabilities
-        .has(crate::plugin_cache::PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
+    // WebSocket Extended CONNECT is excluded: DATA frames after the H3 200 are
+    // WebSocket bytes, not a request body that can be drained before upgrade.
+    let h3_requires_body_before_authenticate = allows_request_body_buffering
+        && capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
         && plugins.iter().any(|plugin| {
             plugin.requires_request_body_before_authenticate()
                 && plugin.should_buffer_request_body(&ctx)
@@ -1190,7 +1189,8 @@ async fn handle_h3_request(
     }
 
     let maybe_needs_request_buffering = plugin_cache_view.requires_request_body_buffering();
-    let plugin_needs_request_buffering = maybe_needs_request_buffering
+    let plugin_needs_request_buffering = allows_request_body_buffering
+        && maybe_needs_request_buffering
         && plugins
             .iter()
             .any(|plugin| plugin.should_buffer_request_body(&ctx));
@@ -1445,22 +1445,14 @@ async fn handle_h3_request(
             }
         };
 
-    // Build backend URL — target-aware when upstream is configured.
-    // Host-only proxies (listen_path None) have no prefix to strip; use 0.
     let strip_len = proxy.listen_path.as_deref().map(str::len).unwrap_or(0);
-    let backend_url = if let Some(ref target) = upstream_target {
-        crate::proxy::build_backend_url_with_target(
-            &proxy,
-            &path,
-            &query_string,
-            &target.host,
-            target.port,
-            strip_len,
-            target.path.as_deref(),
-        )
-    } else {
-        crate::proxy::build_backend_url(&proxy, &path, &query_string, strip_len)
-    };
+    let backend_url = build_h3_backend_url_for_flavor(
+        &proxy,
+        http_flavor,
+        &path,
+        &query_string,
+        upstream_target.as_deref(),
+    );
     let backend_start = std::time::Instant::now();
     let sticky_cookie_needed = selection.sticky_cookie_needed;
 
@@ -1539,6 +1531,7 @@ async fn handle_h3_request(
             backend_url,
             proxy_headers,
             requires_ws_frame_hooks,
+            is_early_data,
         )
         .await;
     }
@@ -2774,6 +2767,54 @@ async fn handle_h3_request(
     Ok(())
 }
 
+fn h3_plugin_protocol_for_flavor(flavor: HttpFlavor) -> ProxyProtocol {
+    match flavor {
+        HttpFlavor::Plain => ProxyProtocol::Http,
+        HttpFlavor::Grpc => ProxyProtocol::Grpc,
+        HttpFlavor::WebSocket => ProxyProtocol::WebSocket,
+    }
+}
+
+fn build_h3_backend_url_for_flavor(
+    proxy: &Proxy,
+    flavor: HttpFlavor,
+    path: &str,
+    query_string: &str,
+    upstream_target: Option<&UpstreamTarget>,
+) -> String {
+    if flavor == HttpFlavor::WebSocket {
+        let (effective_host, effective_port, target_path) = if let Some(target) = upstream_target {
+            (target.host.as_str(), target.port, target.path.as_deref())
+        } else {
+            (proxy.backend_host.as_str(), proxy.backend_port, None)
+        };
+        return crate::proxy::build_websocket_backend_url_with_target(
+            proxy,
+            path,
+            query_string,
+            effective_host,
+            effective_port,
+            target_path,
+        );
+    }
+
+    // Host-only proxies (listen_path None) have no prefix to strip; use 0.
+    let strip_len = proxy.listen_path.as_deref().map(str::len).unwrap_or(0);
+    if let Some(target) = upstream_target {
+        crate::proxy::build_backend_url_with_target(
+            proxy,
+            path,
+            query_string,
+            &target.host,
+            target.port,
+            strip_len,
+            target.path.as_deref(),
+        )
+    } else {
+        crate::proxy::build_backend_url(proxy, path, query_string, strip_len)
+    }
+}
+
 /// Build the h3 backend header list from proxy request headers.
 ///
 /// Strips hop-by-hop headers per RFC 7230 §6.1, handles Host/preserve_host_header,
@@ -4000,6 +4041,81 @@ mod h3_streaming_outcome_tests {
             "backend-emitted 5xx without any error class is a status failure, \
              not a connection failure"
         );
+    }
+}
+
+#[cfg(test)]
+mod h3_plugin_protocol_tests {
+    use super::h3_plugin_protocol_for_flavor;
+    use crate::config::types::HttpFlavor;
+    use crate::plugins::ProxyProtocol;
+
+    #[test]
+    fn maps_websocket_flavor_to_websocket_plugin_protocol() {
+        assert_eq!(
+            h3_plugin_protocol_for_flavor(HttpFlavor::WebSocket),
+            ProxyProtocol::WebSocket
+        );
+    }
+
+    #[test]
+    fn maps_grpc_flavor_to_grpc_plugin_protocol() {
+        assert_eq!(
+            h3_plugin_protocol_for_flavor(HttpFlavor::Grpc),
+            ProxyProtocol::Grpc
+        );
+    }
+
+    #[test]
+    fn maps_plain_flavor_to_http_plugin_protocol() {
+        assert_eq!(
+            h3_plugin_protocol_for_flavor(HttpFlavor::Plain),
+            ProxyProtocol::Http
+        );
+    }
+}
+
+#[cfg(test)]
+mod h3_backend_url_tests {
+    use super::build_h3_backend_url_for_flavor;
+    use crate::config::types::{BackendScheme, DispatchKind, HttpFlavor, Proxy};
+
+    fn proxy_with_scheme(scheme: BackendScheme) -> Proxy {
+        let mut proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "backend_host": "backend.example",
+            "backend_port": 8443,
+        }))
+        .expect("minimal proxy should deserialize");
+        proxy.backend_scheme = Some(scheme);
+        proxy.dispatch_kind = match scheme {
+            BackendScheme::Http => DispatchKind::HttpPool,
+            BackendScheme::Https => DispatchKind::HttpsPool,
+            _ => proxy.dispatch_kind,
+        };
+        proxy
+    }
+
+    #[test]
+    fn websocket_backend_url_uses_wss_scheme_for_https_backends() {
+        let proxy = proxy_with_scheme(BackendScheme::Https);
+        let url =
+            build_h3_backend_url_for_flavor(&proxy, HttpFlavor::WebSocket, "/ws", "token=1", None);
+        assert_eq!(url, "wss://backend.example:8443/ws?token=1");
+    }
+
+    #[test]
+    fn websocket_backend_url_uses_ws_scheme_for_http_backends() {
+        let proxy = proxy_with_scheme(BackendScheme::Http);
+        let url =
+            build_h3_backend_url_for_flavor(&proxy, HttpFlavor::WebSocket, "/ws", "token=1", None);
+        assert_eq!(url, "ws://backend.example:8443/ws?token=1");
+    }
+
+    #[test]
+    fn plain_backend_url_keeps_http_family_scheme() {
+        let proxy = proxy_with_scheme(BackendScheme::Https);
+        let url = build_h3_backend_url_for_flavor(&proxy, HttpFlavor::Plain, "/api", "", None);
+        assert_eq!(url, "https://backend.example:8443/api");
     }
 }
 

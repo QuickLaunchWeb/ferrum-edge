@@ -1050,6 +1050,10 @@ pub(crate) fn request_may_have_body(method: &str, headers: &HashMap<String, Stri
         || headers.contains_key("transfer-encoding")
 }
 
+pub(crate) fn http_flavor_allows_request_body_buffering(flavor: HttpFlavor) -> bool {
+    !matches!(flavor, HttpFlavor::WebSocket)
+}
+
 async fn buffer_request_body_for_before_proxy(
     request: Request<Incoming>,
     method: &str,
@@ -4544,7 +4548,7 @@ fn collect_forwardable_headers(headers: &hyper::HeaderMap) -> Vec<(String, Strin
 ///
 /// Uses a single pre-sized `String` buffer to avoid intermediate allocations
 /// from multiple `format!()` calls (matches `build_backend_url_with_target`).
-fn build_websocket_backend_url_with_target(
+pub(crate) fn build_websocket_backend_url_with_target(
     proxy: &Proxy,
     incoming_path: &str,
     query_string: &str,
@@ -6838,6 +6842,7 @@ async fn handle_proxy_request_inner(
         HttpFlavor::Grpc => ProxyProtocol::Grpc,
         HttpFlavor::Plain => ProxyProtocol::Http,
     };
+    let allows_request_body_buffering = http_flavor_allows_request_body_buffering(flavor);
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
 
     // gRPC spec mandates POST method. Reject non-POST gRPC requests with a proper
@@ -6922,7 +6927,11 @@ async fn handle_proxy_request_inner(
     // plugins can read `ctx.request_body_bytes`.
     // HBONE CONNECT must keep hyper's upgrade handle in the streaming request
     // body. Pre-auth body buffering would consume it and make the relay fail.
+    // WebSocket Extended CONNECT is also excluded: DATA frames after the 200
+    // response are WebSocket bytes, not an HTTP request body to drain before
+    // authentication.
     let requires_body_before_authenticate = !is_hbone_connect
+        && allows_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
         && plugins.iter().any(|plugin| {
             plugin.requires_request_body_before_authenticate()
@@ -7076,7 +7085,8 @@ async fn handle_proxy_request_inner(
     let maybe_requires_request_body_buffering = plugin_cache_view.requires_request_body_buffering();
     // should_buffer_request_body is request-time (takes &RequestContext), so it
     // must still iterate. But the config-time capability checks use the bitset.
-    let requires_request_body_buffering = maybe_requires_request_body_buffering
+    let requires_request_body_buffering = allows_request_body_buffering
+        && maybe_requires_request_body_buffering
         && plugins
             .iter()
             .any(|plugin| plugin.should_buffer_request_body(&ctx));
@@ -12760,6 +12770,20 @@ mod tests {
             }
         }))
         .expect("test proxy should deserialize")
+    }
+
+    #[test]
+    fn websocket_flavor_does_not_allow_request_body_buffering() {
+        assert!(
+            !http_flavor_allows_request_body_buffering(HttpFlavor::WebSocket),
+            "WebSocket stream DATA is upgraded traffic, not a pre-upgrade request body"
+        );
+    }
+
+    #[test]
+    fn plain_and_grpc_flavors_allow_request_body_buffering() {
+        assert!(http_flavor_allows_request_body_buffering(HttpFlavor::Plain));
+        assert!(http_flavor_allows_request_body_buffering(HttpFlavor::Grpc));
     }
 
     #[test]

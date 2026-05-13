@@ -158,7 +158,10 @@ fn buf_into_bytes<B: Buf>(mut buf: B) -> Bytes {
 /// here because the H3 frontend has `proxy_headers: HashMap` while the
 /// H1/H2 path has `hyper::HeaderMap` and the same predicate doesn't
 /// directly reuse.
-fn collect_forwardable_h3_headers(headers: &HashMap<String, String>) -> Vec<(String, String)> {
+fn collect_forwardable_h3_headers(
+    headers: &HashMap<String, String>,
+    is_early_data: bool,
+) -> Vec<(String, String)> {
     /// hop-by-hop per RFC 9110 §7.6.1 + WS handshake.
     const SKIP_HEADERS: &[&str] = &[
         "connection",
@@ -174,6 +177,9 @@ fn collect_forwardable_h3_headers(headers: &HashMap<String, String>) -> Vec<(Str
         "proxy-authenticate",
         "proxy-authorization",
         "proxy-connection",
+        // RFC 8470 §5.2: clients do not set this. The gateway strips any
+        // inbound value and injects its authoritative value below.
+        "early-data",
         // H3 pseudo-headers that may still be present in the
         // header map produced upstream — never forward.
         ":method",
@@ -184,7 +190,7 @@ fn collect_forwardable_h3_headers(headers: &HashMap<String, String>) -> Vec<(Str
         ":status",
     ];
 
-    headers
+    let mut out: Vec<(String, String)> = headers
         .iter()
         .filter_map(|(name, value)| {
             let lower = name.to_ascii_lowercase();
@@ -193,7 +199,13 @@ fn collect_forwardable_h3_headers(headers: &HashMap<String, String>) -> Vec<(Str
             }
             Some((lower, value.clone()))
         })
-        .collect()
+        .collect();
+
+    if is_early_data {
+        out.push(("early-data".to_string(), "1".to_string()));
+    }
+
+    out
 }
 
 /// Write a small JSON error body on the H3 stream and finish.
@@ -258,6 +270,7 @@ pub(crate) async fn handle_h3_websocket(
     backend_url: String,
     proxy_headers: HashMap<String, String>,
     requires_ws_frame_hooks: bool,
+    is_early_data: bool,
 ) -> Result<(), anyhow::Error> {
     // Defense in depth: dispatcher already checked this. If the flag
     // got toggled mid-flight, return 501 rather than half-bridging.
@@ -319,7 +332,7 @@ pub(crate) async fn handle_h3_websocket(
     };
 
     // ── Build forwardable header list for the backend handshake ─────
-    let mut client_headers = collect_forwardable_h3_headers(&proxy_headers);
+    let mut client_headers = collect_forwardable_h3_headers(&proxy_headers, is_early_data);
     if let Some(username) = ctx.backend_consumer_username() {
         client_headers.push(("x-consumer-username".to_string(), username.to_string()));
     }
@@ -887,7 +900,7 @@ mod tests {
             ("host", "example.com"),
             ("x-custom", "passthrough"),
         ]);
-        let out = collect_forwardable_h3_headers(&headers);
+        let out = collect_forwardable_h3_headers(&headers, false);
         for stripped in [
             "connection",
             "upgrade",
@@ -922,7 +935,7 @@ mod tests {
             ("sec-websocket-protocol", "chat"),
             ("sec-websocket-extensions", "permessage-deflate"),
         ]);
-        let out = collect_forwardable_h3_headers(&headers);
+        let out = collect_forwardable_h3_headers(&headers, false);
         for stripped in [
             "sec-websocket-key",
             "sec-websocket-version",
@@ -959,7 +972,7 @@ mod tests {
             (":status", "200"),
             ("content-type", "text/plain"),
         ]);
-        let out = collect_forwardable_h3_headers(&headers);
+        let out = collect_forwardable_h3_headers(&headers, false);
         for stripped in [
             ":method",
             ":scheme",
@@ -983,9 +996,33 @@ mod tests {
         // the input map type doesn't enforce that — guard against an
         // upstream that supplies mixed-case keys.
         let headers = make_headers(&[("X-Trace-Id", "abc123"), ("Authorization", "Bearer token")]);
-        let out = collect_forwardable_h3_headers(&headers);
+        let out = collect_forwardable_h3_headers(&headers, false);
         assert_eq!(value_for(&out, "x-trace-id"), Some("abc123"));
         assert_eq!(value_for(&out, "authorization"), Some("Bearer token"));
+    }
+
+    #[test]
+    fn collect_strips_client_supplied_early_data_header() {
+        let headers = make_headers(&[("early-data", "1"), ("x-trace-id", "abc123")]);
+        let out = collect_forwardable_h3_headers(&headers, false);
+        assert!(
+            !has_key(&out, "early-data"),
+            "client-supplied Early-Data must be stripped when the QUIC request was not 0-RTT"
+        );
+        assert_eq!(value_for(&out, "x-trace-id"), Some("abc123"));
+    }
+
+    #[test]
+    fn collect_injects_gateway_early_data_header_for_zero_rtt() {
+        let headers = make_headers(&[("early-data", "0"), ("x-trace-id", "abc123")]);
+        let out = collect_forwardable_h3_headers(&headers, true);
+        let early_data_count = out.iter().filter(|(k, _)| k == "early-data").count();
+        assert_eq!(
+            early_data_count, 1,
+            "client-supplied Early-Data must be replaced by exactly one gateway value"
+        );
+        assert_eq!(value_for(&out, "early-data"), Some("1"));
+        assert_eq!(value_for(&out, "x-trace-id"), Some("abc123"));
     }
 
     #[test]

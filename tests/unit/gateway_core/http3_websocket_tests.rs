@@ -4,9 +4,8 @@
 //! These tests cover the request-classification surface that decides
 //! whether an incoming H3 request enters the WebSocket bridge in
 //! `crate::http3::websocket::handle_h3_websocket`. End-to-end
-//! frame-relay coverage lives in `tests/functional/h3_websocket_tests.rs`
-//! (gated `#[ignore]`, requires a built `ferrum-edge` binary and a
-//! WebSocket-over-H3 capable client).
+//! frame-relay coverage is tracked as follow-up work because the tree
+//! does not yet ship a reusable WebSocket-over-H3 capable client.
 
 use ferrum_edge::config::types::HttpFlavor;
 use ferrum_edge::proxy::backend_dispatch::detect_http_flavor;
