@@ -43,6 +43,14 @@ enum LogEntry {
     WebSocket(WsDisconnectLogEntry),
 }
 
+// TODO: extend the customizable log schema to WsDisconnectLogEntry.
+// Today `schema:` / `schema_ref:` on ws_logging only customize HTTP and
+// Stream summaries; WebSocket-disconnect entries fall through with their
+// native field set. Tracked under "Per-Plugin Notes" in
+// docs/log_schema.md. Implementing this means teaching `SchemaView`
+// (or a sibling view) about a third summary kind keyed off the fields
+// in this struct, then routing it through `WsBatchView` like the other
+// two arms.
 #[derive(Clone, serde::Serialize)]
 struct WsDisconnectLogEntry {
     event: &'static str,
