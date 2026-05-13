@@ -55,7 +55,8 @@ impl FromStr for Protocol {
 
 ### Fix
 
-Add `Protocol::WEB_SOCKET` as a third recognised value, mirroring the
+Add `Protocol::WEB_SOCKET` as a third recognised value and parse
+registered protocol tokens ASCII-case-insensitively, mirroring the
 existing `WEB_TRANSPORT` and `CONNECT_UDP` constants. No API breaking
 changes; downstream callers that match on `Protocol` already need a
 wildcard arm (the enum is opaque from outside the crate).

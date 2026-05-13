@@ -209,6 +209,18 @@ fn h3_protocol_websocket_parses_from_str() {
 }
 
 #[test]
+fn h3_protocol_websocket_parses_from_str_case_insensitive() {
+    for value in ["WebSocket", "WEBSOCKET", "webSocket"] {
+        let parsed: h3::ext::Protocol = match value.parse() {
+            Ok(p) => p,
+            Err(_) => panic!("h3 must accept '{value}' as a :protocol value"),
+        };
+        assert_eq!(parsed.as_str(), "websocket");
+        assert_eq!(parsed, h3::ext::Protocol::WEB_SOCKET);
+    }
+}
+
+#[test]
 fn h3_protocol_existing_values_unaffected() {
     // Patch 002 must not regress the other registered :protocol values.
     let wt: h3::ext::Protocol = match "webtransport".parse() {

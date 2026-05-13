@@ -100,8 +100,8 @@
 //! type the H1/H2 path uses for its long-lived sessions) so `SIGTERM`
 //! drain waits for in-flight H3 WebSocket sessions to close before
 //! exit, matching `FERRUM_SHUTDOWN_DRAIN_SECONDS` semantics. The
-//! caller's `RequestGuard` (held by `handle_h3_request`) also stays
-//! alive for the await; both counters block drain, which is intentional.
+//! caller drops its request-side guard before entering the relay so a
+//! long-lived upgraded socket is not also counted as an active request.
 //!
 //! ## 0-RTT
 //!

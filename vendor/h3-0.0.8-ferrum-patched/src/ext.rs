@@ -44,11 +44,14 @@ impl FromStr for Protocol {
     type Err = InvalidProtocol;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "webtransport" => Ok(Self(ProtocolInner::WebTransport)),
-            "connect-udp" => Ok(Self(ProtocolInner::ConnectUdp)),
-            "websocket" => Ok(Self(ProtocolInner::WebSocket)),
-            _ => Err(InvalidProtocol),
+        if s.eq_ignore_ascii_case("webtransport") {
+            Ok(Self(ProtocolInner::WebTransport))
+        } else if s.eq_ignore_ascii_case("connect-udp") {
+            Ok(Self(ProtocolInner::ConnectUdp))
+        } else if s.eq_ignore_ascii_case("websocket") {
+            Ok(Self(ProtocolInner::WebSocket))
+        } else {
+            Err(InvalidProtocol)
         }
     }
 }
@@ -73,6 +76,15 @@ mod tests {
         let p = parse("websocket");
         assert_eq!(p.as_str(), "websocket");
         assert_eq!(p, Protocol::WEB_SOCKET);
+    }
+
+    #[test]
+    fn websocket_from_str_is_ascii_case_insensitive() {
+        for value in ["WebSocket", "WEBSOCKET", "webSocket"] {
+            let p = parse(value);
+            assert_eq!(p.as_str(), "websocket");
+            assert_eq!(p, Protocol::WEB_SOCKET);
+        }
     }
 
     #[test]

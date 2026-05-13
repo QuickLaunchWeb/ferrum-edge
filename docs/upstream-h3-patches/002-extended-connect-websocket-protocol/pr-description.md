@@ -28,14 +28,16 @@ Result: applications cannot accept WebSocket-over-HTTP/3 with stock
 
 - Add `ProtocolInner::WebSocket` to the inner enum.
 - Add `Protocol::WEB_SOCKET` const.
-- Add the `"websocket"` arm in `FromStr`.
+- Add ASCII-case-insensitive `FromStr` matching for registered protocol tokens,
+  including `"websocket"`.
 - Add the `"websocket"` arm in `as_str`.
 
-Plus three unit tests covering:
+Plus four unit tests covering:
 
 1. `"websocket"` round-trips via `FromStr` → `as_str`.
-2. Unknown protocol values are still rejected.
-3. Existing protocols (`webtransport`, `connect-udp`) are unaffected.
+2. WebSocket protocol tokens parse ASCII-case-insensitively.
+3. Unknown protocol values are still rejected.
+4. Existing protocols (`webtransport`, `connect-udp`) are unaffected.
 
 No public API removals. Downstream callers matching on `Protocol` are
 already required to include a wildcard arm (the inner enum is private),

@@ -35,12 +35,12 @@ anything else, and `proto/headers.rs::try_value` turns that into a
 the application ever sees it. That makes RFC 9220 unreachable from
 application code on stock `h3` 0.0.8.
 
-This patch adds `Protocol::WEB_SOCKET` (the third standardized value),
-following the exact shape of the existing `WEB_TRANSPORT` /
-`CONNECT_UDP` constants — no API breaking changes, no new behavior for
-existing callers. Once the upstream issue + PR land and a registry
-release contains the variant, we retire the vendored crate per the
-"Retirement" section below.
+This patch adds `Protocol::WEB_SOCKET` (the third standardized value)
+and parses registered protocol tokens ASCII-case-insensitively, following
+the shape of the existing `WEB_TRANSPORT` / `CONNECT_UDP` constants
+without API breaking changes. Once the upstream issue + PR land and a
+registry release contains the variant, we retire the vendored crate per
+the "Retirement" section below.
 
 ## Files
 

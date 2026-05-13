@@ -29,12 +29,20 @@ diff --git a/h3/src/ext.rs b/h3/src/ext.rs
  }
 
  /// Error when parsing the protocol
-@@ -40,7 +47,32 @@ impl FromStr for Protocol {
-         match s {
-             "webtransport" => Ok(Self(ProtocolInner::WebTransport)),
-             "connect-udp" => Ok(Self(ProtocolInner::ConnectUdp)),
-+            "websocket" => Ok(Self(ProtocolInner::WebSocket)),
-             _ => Err(InvalidProtocol),
+@@ -43,7 +50,13 @@ impl FromStr for Protocol {
+     fn from_str(s: &str) -> Result<Self, Self::Err> {
+-        match s {
+-            "webtransport" => Ok(Self(ProtocolInner::WebTransport)),
+-            "connect-udp" => Ok(Self(ProtocolInner::ConnectUdp)),
+-            _ => Err(InvalidProtocol),
++        if s.eq_ignore_ascii_case("webtransport") {
++            Ok(Self(ProtocolInner::WebTransport))
++        } else if s.eq_ignore_ascii_case("connect-udp") {
++            Ok(Self(ProtocolInner::ConnectUdp))
++        } else if s.eq_ignore_ascii_case("websocket") {
++            Ok(Self(ProtocolInner::WebSocket))
++        } else {
++            Err(InvalidProtocol)
          }
      }
  }
@@ -48,6 +56,15 @@ diff --git a/h3/src/ext.rs b/h3/src/ext.rs
 +        let p: Protocol = "websocket".parse().expect("parse websocket");
 +        assert_eq!(p.as_str(), "websocket");
 +        assert_eq!(p, Protocol::WEB_SOCKET);
++    }
++
++    #[test]
++    fn websocket_from_str_is_ascii_case_insensitive() {
++        for value in ["WebSocket", "WEBSOCKET", "webSocket"] {
++            let p: Protocol = value.parse().expect("parse websocket case variant");
++            assert_eq!(p.as_str(), "websocket");
++            assert_eq!(p, Protocol::WEB_SOCKET);
++        }
 +    }
 +
 +    #[test]

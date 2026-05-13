@@ -591,7 +591,7 @@ async fn handle_h3_request(
     }
 
     // Track this request for overload monitoring and graceful drain.
-    let _request_guard = crate::overload::RequestGuard::new(&state.overload);
+    let request_guard = crate::overload::RequestGuard::new(&state.overload);
 
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
@@ -1513,6 +1513,13 @@ async fn handle_h3_request(
     // a 501 itself as defense in depth.
     if http_flavor == HttpFlavor::WebSocket {
         let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
+        // The HTTP request admission phase is complete once the H3 200
+        // upgrade response is about to be delegated to the long-lived
+        // WebSocket relay. From here the session is accounted as an active
+        // connection by `handle_h3_websocket`, matching H1/H2 WebSocket
+        // overload semantics and avoiding double-counting one socket as both
+        // an active request and an active connection for its full lifetime.
+        drop(request_guard);
         return crate::http3::websocket::handle_h3_websocket(
             stream,
             state,
