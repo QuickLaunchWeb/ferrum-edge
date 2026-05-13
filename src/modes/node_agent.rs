@@ -743,7 +743,7 @@ mod tests {
             cgroup_v2_available: false,
             bpf_fs_available: false,
         };
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
 
         let tx_clone = shutdown_tx.clone();
         tokio::spawn(async move {

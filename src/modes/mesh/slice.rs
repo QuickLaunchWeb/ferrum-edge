@@ -1,23 +1,49 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::{Mutex, OnceLock};
+use tracing::warn;
 
 use crate::config::types::GatewayConfig;
 use crate::modes::mesh::config::{
-    MeshDestinationRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshService,
-    MeshTelemetryResource, MtlsMode, MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication,
-    PolicyScope, ServiceEntry, TrustBundleSet, Workload, WorkloadLabels,
-    policy_scope_applies_to_workload, proxy_config_applies_to_workload, scope_applies_to_workload,
-    service_entry_applies_to_workload, workload_selector_matches,
+    MeshConfig, MeshDestinationRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication,
+    MeshService, MeshSidecar, MeshSidecarEgress, MeshTelemetryResource, MtlsMode,
+    MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication, PolicyScope, ServiceEntry,
+    SidecarHostPattern, TrustBundleSet, Workload, WorkloadLabels, policy_scope_applies_to_workload,
+    proxy_config_applies_to_workload, scope_applies_to_workload, service_entry_applies_to_workload,
+    workload_selector_matches,
 };
+use crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
 
 /// Node/workload selector used by both ADS and native `MeshSubscribe`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeshSliceRequest {
     pub node_id: String,
     pub namespace: String,
     pub workload_spiffe_id: Option<String>,
     pub labels: BTreeMap<String, String>,
+    /// Kubernetes cluster DNS domain used when synthesizing MeshService FQDN
+    /// aliases for Istio Sidecar host matching.
+    pub cluster_domain: String,
+    /// When `true`, the slice builder applies Istio Sidecar egress scope
+    /// narrowing to `service_entries`, `services`, and `destination_rules`.
+    /// Defaults to `false` so existing deployments see zero behavior change;
+    /// callers wire this from `FERRUM_MESH_SIDECAR_ENFORCED` (or set
+    /// directly in tests).
+    pub enforce_sidecar_egress: bool,
+}
+
+impl Default for MeshSliceRequest {
+    fn default() -> Self {
+        Self {
+            node_id: String::new(),
+            namespace: String::new(),
+            workload_spiffe_id: None,
+            labels: BTreeMap::new(),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            enforce_sidecar_egress: false,
+        }
+    }
 }
 
 impl MeshSliceRequest {
@@ -32,6 +58,8 @@ impl MeshSliceRequest {
             namespace,
             workload_spiffe_id: non_empty(workload_spiffe_id),
             labels: labels.into_iter().collect(),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            enforce_sidecar_egress: false,
         }
     }
 
@@ -46,7 +74,25 @@ impl MeshSliceRequest {
             namespace,
             workload_spiffe_id,
             labels: BTreeMap::new(),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            enforce_sidecar_egress: false,
         }
+    }
+
+    /// Returns `self` with `enforce_sidecar_egress` set to `enforce`. Builder
+    /// pattern keeps the existing constructor signatures stable while letting
+    /// callers thread the env-driven flag through without breaking call sites
+    /// that don't care about Sidecar scoping (xDS, tests, future protocols).
+    pub fn with_enforce_sidecar_egress(mut self, enforce: bool) -> Self {
+        self.enforce_sidecar_egress = enforce;
+        self
+    }
+
+    /// Returns `self` with the cluster DNS domain used for MeshService FQDN
+    /// aliases during Sidecar egress matching.
+    pub fn with_cluster_domain(mut self, cluster_domain: String) -> Self {
+        self.cluster_domain = cluster_domain;
+        self
     }
 }
 
@@ -244,6 +290,7 @@ impl MeshSlice {
         };
 
         let namespace = request.namespace.clone();
+        let cluster_domain = request.cluster_domain.clone();
         let workloads: Vec<Workload> = mesh
             .workloads
             .iter()
@@ -266,10 +313,54 @@ impl MeshSlice {
             request.labels.clone()
         };
 
+        // Resolve the effective applicable Sidecar egress scope for this
+        // workload. The returned scope is used downstream to narrow `services`,
+        // `service_entries`, and `destination_rules`. Returns `None` when no
+        // Sidecar applies or when the applicable Sidecar inherits system
+        // defaults with no namespace default to inherit from. The enforcement
+        // flag gates the entire narrowing pass so existing deployments see zero
+        // behavior change unless `FERRUM_MESH_SIDECAR_ENFORCED=true`.
+        let applicable_sidecar = if request.enforce_sidecar_egress {
+            warn_unsupported_sidecar_port_scoping(&mesh.sidecars);
+            resolve_applicable_sidecar_egress(
+                &mesh.sidecars,
+                effective_namespace,
+                &effective_labels,
+            )
+        } else {
+            None
+        };
+
+        // Sidecar-only indexes: skip the full scan over `mesh.services` and
+        // `mesh.service_entries` when no Sidecar applies (default-off feature,
+        // or an enforced workload that no Sidecar resource targets). The
+        // destination-rules filter is the only consumer and short-circuits
+        // before reading these when `applicable_sidecar` is `None`.
+        let (mesh_service_identities, service_entry_hosts) = if applicable_sidecar.is_some() {
+            (
+                mesh_service_identities(mesh),
+                visible_service_entry_hosts(mesh, effective_namespace, &effective_labels),
+            )
+        } else {
+            (BTreeSet::new(), BTreeSet::new())
+        };
+
         let services: Vec<MeshService> = mesh
             .services
             .iter()
-            .filter(|service| service.namespace == namespace)
+            .filter(|service| {
+                let Some(sidecar) = applicable_sidecar else {
+                    return service.namespace == namespace;
+                };
+                let host_candidates = mesh_service_host_candidates(service, &cluster_domain);
+                let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
+                sidecar_egress_includes_service(
+                    sidecar.namespace,
+                    sidecar.egress,
+                    service.namespace.as_str(),
+                    &host_refs,
+                )
+            })
             .cloned()
             .collect();
         let mesh_policies: Vec<MeshPolicy> = mesh
@@ -299,6 +390,19 @@ impl MeshSlice {
             .filter(|entry| {
                 service_entry_applies_to_workload(entry, effective_namespace, &effective_labels)
             })
+            .filter(|entry| {
+                applicable_sidecar
+                    .map(|sidecar| {
+                        let host_strs: Vec<&str> = entry.hosts.iter().map(String::as_str).collect();
+                        sidecar_egress_includes_service(
+                            sidecar.namespace,
+                            sidecar.egress,
+                            entry.namespace.as_str(),
+                            &host_strs,
+                        )
+                    })
+                    .unwrap_or(true)
+            })
             .cloned()
             .collect();
         let request_authentications: Vec<MeshRequestAuthentication> = mesh
@@ -318,7 +422,40 @@ impl MeshSlice {
         let destination_rules: Vec<MeshDestinationRule> = mesh
             .destination_rules
             .iter()
-            .filter(|dr| dr.namespace == namespace)
+            .filter(|dr| {
+                let Some(sidecar) = applicable_sidecar else {
+                    return dr.namespace == namespace;
+                };
+                let (resource_namespace, host_candidates) = destination_rule_host_scope(
+                    dr,
+                    &cluster_domain,
+                    &mesh_service_identities,
+                    &service_entry_hosts,
+                );
+                // Istio DestinationRule lookup namespaces are {client (the
+                // workload's own namespace), target service namespace, root
+                // namespace}. Root-namespace plumbing is deferred (see
+                // docs/mesh.md "Known Limitations"), so admit only DRs
+                // declared in the client or the target service namespace.
+                // Without this guard a DR in an unrelated namespace
+                // targeting `reviews.beta` could be imported into an
+                // `alpha` workload's slice merely because the Sidecar
+                // admits `beta/*`, letting a third-party namespace override
+                // client traffic policy.
+                let dr_namespace = dr.namespace.as_str();
+                if dr_namespace != effective_namespace
+                    && dr_namespace != resource_namespace.as_str()
+                {
+                    return false;
+                }
+                let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
+                sidecar_egress_includes_service(
+                    sidecar.namespace,
+                    sidecar.egress,
+                    &resource_namespace,
+                    &host_refs,
+                )
+            })
             .cloned()
             .collect();
         let proxy_configs: Vec<MeshProxyConfig> = mesh
@@ -380,6 +517,374 @@ fn insert_known_destination(
     for port in ports {
         entries.insert(format!("{host}:{port}"));
     }
+}
+
+fn mesh_service_identities(mesh: &MeshConfig) -> BTreeSet<(String, String)> {
+    let mut identities = BTreeSet::new();
+    for service in &mesh.services {
+        let namespace = service
+            .namespace
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        let name = service
+            .name
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if !namespace.is_empty() && !name.is_empty() {
+            identities.insert((namespace, name));
+        }
+    }
+    identities
+}
+
+static WARNED_UNSUPPORTED_SIDECAR_PORTS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+fn warn_unsupported_sidecar_port_scoping(sidecars: &[MeshSidecar]) {
+    let warned = WARNED_UNSUPPORTED_SIDECAR_PORTS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let Ok(mut warned) = warned.lock() else {
+        return;
+    };
+
+    for sidecar in sidecars {
+        let ports: BTreeSet<u16> = sidecar
+            .egress
+            .iter()
+            .filter_map(|egress| egress.port)
+            .collect();
+        if ports.is_empty() {
+            continue;
+        }
+
+        let key = format!("{}/{}:{ports:?}", sidecar.namespace, sidecar.name);
+        if warned.insert(key) {
+            warn!(
+                sidecar_namespace = %sidecar.namespace,
+                sidecar = %sidecar.name,
+                ports = ?ports,
+                "Sidecar egress port scoping is parsed but not enforced; slice narrowing is currently host-only"
+            );
+        }
+    }
+}
+
+fn visible_service_entry_hosts<L: WorkloadLabels + ?Sized>(
+    mesh: &MeshConfig,
+    workload_namespace: &str,
+    workload_labels: &L,
+) -> BTreeSet<String> {
+    let mut hosts = BTreeSet::new();
+    for entry in &mesh.service_entries {
+        if !service_entry_applies_to_workload(entry, workload_namespace, workload_labels) {
+            continue;
+        }
+        for host in &entry.hosts {
+            let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+            if !host.is_empty() {
+                hosts.insert(host);
+            }
+        }
+    }
+    hosts
+}
+
+fn mesh_service_host_candidates(service: &MeshService, cluster_domain: &str) -> Vec<String> {
+    service_host_aliases(&service.name, &service.namespace, cluster_domain)
+}
+
+fn service_host_aliases(name: &str, namespace: &str, cluster_domain: &str) -> Vec<String> {
+    let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    let namespace = namespace.trim().trim_end_matches('.').to_ascii_lowercase();
+    let cluster_domain = cluster_domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let mut candidates = vec![
+        name.clone(),
+        format!("{name}.{namespace}"),
+        format!("{name}.{namespace}.svc"),
+    ];
+    if !cluster_domain.is_empty() {
+        candidates.push(format!("{name}.{namespace}.svc.{cluster_domain}"));
+    }
+    candidates
+}
+
+fn destination_rule_host_scope(
+    rule: &MeshDestinationRule,
+    cluster_domain: &str,
+    mesh_service_identities: &BTreeSet<(String, String)>,
+    service_entry_hosts: &BTreeSet<String>,
+) -> (String, Vec<String>) {
+    let host = rule.host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let rule_namespace = rule
+        .namespace
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let cluster_domain = cluster_domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+
+    destination_rule_service_ref_from_host(
+        &host,
+        &rule_namespace,
+        &cluster_domain,
+        mesh_service_identities,
+        service_entry_hosts,
+    )
+    .map(|(service_name, service_namespace)| {
+        let candidates = service_host_aliases(&service_name, &service_namespace, &cluster_domain);
+        (service_namespace, candidates)
+    })
+    .unwrap_or_else(|| (rule_namespace, vec![host]))
+}
+
+fn destination_rule_service_ref_from_host(
+    host: &str,
+    rule_namespace: &str,
+    cluster_domain: &str,
+    mesh_service_identities: &BTreeSet<(String, String)>,
+    service_entry_hosts: &BTreeSet<String>,
+) -> Option<(String, String)> {
+    if host.is_empty() || rule_namespace.is_empty() || host.contains('*') {
+        return None;
+    }
+    if service_entry_hosts.contains(host) {
+        return None;
+    }
+    if !host.contains('.') {
+        return Some((host.to_string(), rule_namespace.to_string()));
+    }
+
+    if let Some((name, namespace)) = split_canonical_service_host(host)
+        && mesh_service_identity_exists(mesh_service_identities, namespace, name)
+    {
+        return Some((name.to_string(), namespace.to_string()));
+    }
+
+    if let Some((name, namespace)) = host
+        .strip_suffix(".svc")
+        .and_then(split_canonical_service_host)
+    {
+        return Some((name.to_string(), namespace.to_string()));
+    }
+
+    if !cluster_domain.is_empty()
+        && let Some((name, namespace)) = host
+            .strip_suffix(&format!(".svc.{cluster_domain}"))
+            .and_then(split_canonical_service_host)
+    {
+        return Some((name.to_string(), namespace.to_string()));
+    }
+
+    None
+}
+
+fn mesh_service_identity_exists(
+    mesh_service_identities: &BTreeSet<(String, String)>,
+    namespace: &str,
+    name: &str,
+) -> bool {
+    mesh_service_identities.contains(&(namespace.to_string(), name.to_string()))
+}
+
+fn split_canonical_service_host(host: &str) -> Option<(&str, &str)> {
+    let mut labels = host.split('.');
+    let name = labels.next()?;
+    let namespace = labels.next()?;
+    if labels.next().is_some() || name.is_empty() || namespace.is_empty() {
+        return None;
+    }
+    Some((name, namespace))
+}
+
+/// Resolve the most-specific applicable Sidecar for a workload.
+///
+/// Most specific wins: a Sidecar with a non-empty `workload_selector` whose
+/// labels match the workload outranks the namespace-default Sidecar (no
+/// `workload_selector`). Within the same tier the first matching entry wins
+/// — operators are expected to maintain at most one Sidecar per tier per
+/// namespace, mirroring Istio behavior.
+///
+/// Returns `None` if no Sidecar in `sidecars` applies to the workload.
+fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
+    sidecars: &'a [MeshSidecar],
+    workload_namespace: &str,
+    workload_labels: &L,
+) -> Option<ResolvedSidecarEgress<'a>> {
+    // Collect all matching sidecars per tier, then pick the ASCII-smallest
+    // `name` as a deterministic tiebreak. Translator emission order is not
+    // a stable input — two equally-applicable Sidecars in the same tier must
+    // resolve to the same result across pods and reconciles. This matches
+    // the precedent set by `MeshSlice::resolved_proxy_config`.
+    let mut workload_scoped: Option<&MeshSidecar> = None;
+    let mut namespace_default: Option<&MeshSidecar> = None;
+
+    for sidecar in sidecars {
+        if sidecar.namespace != workload_namespace {
+            continue;
+        }
+        match sidecar.workload_selector.as_ref() {
+            Some(selector) if !selector.labels.is_empty() => {
+                if workload_selector_matches(selector, workload_namespace, workload_labels)
+                    && workload_scoped
+                        .map(|current| sidecar.name.as_str() < current.name.as_str())
+                        .unwrap_or(true)
+                {
+                    workload_scoped = Some(sidecar);
+                }
+            }
+            _ => {
+                if namespace_default
+                    .map(|current| sidecar.name.as_str() < current.name.as_str())
+                    .unwrap_or(true)
+                {
+                    namespace_default = Some(sidecar);
+                }
+            }
+        }
+    }
+
+    let selected = workload_scoped.or(namespace_default)?;
+    if selected.egress_inherits_defaults {
+        if let Some(namespace_default) = namespace_default
+            && !std::ptr::eq(selected, namespace_default)
+            && !namespace_default.egress_inherits_defaults
+        {
+            return Some(ResolvedSidecarEgress {
+                namespace: namespace_default.namespace.as_str(),
+                egress: &namespace_default.egress,
+            });
+        }
+        return None;
+    }
+
+    Some(ResolvedSidecarEgress {
+        namespace: selected.namespace.as_str(),
+        egress: &selected.egress,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedSidecarEgress<'a> {
+    namespace: &'a str,
+    egress: &'a [MeshSidecarEgress],
+}
+
+/// Returns `true` when the Sidecar's egress scope admits a resource whose
+/// namespace is `resource_namespace` and whose host candidates are
+/// `host_candidates`.
+///
+/// For `MeshService` / `MeshDestinationRule` we pass a single-host slice
+/// (`name` / `host`). For `ServiceEntry` we pass all `hosts` and require at
+/// least one to match — matching Istio behavior where any host of a
+/// ServiceEntry being in scope brings the whole entry into scope.
+///
+/// An empty `egress` list is treated as "allow nothing" — Istio treats an
+/// explicit empty egress list this way. An empty `host_candidates` slice
+/// can only come from malformed/native config that carries no hosts, and
+/// returns `false`.
+fn sidecar_egress_includes_service(
+    sidecar_namespace: &str,
+    sidecar_egress: &[MeshSidecarEgress],
+    resource_namespace: &str,
+    host_candidates: &[&str],
+) -> bool {
+    if sidecar_egress.is_empty() {
+        // Istio: a Sidecar with no egress entries scopes traffic to nothing.
+        return false;
+    }
+    if host_candidates.is_empty() {
+        return false;
+    }
+    sidecar_egress.iter().any(|egress_entry| {
+        egress_entry.hosts.iter().any(|raw_pattern| {
+            sidecar_host_pattern_matches(
+                MeshSidecarEgress::parse_host_pattern(raw_pattern),
+                sidecar_namespace,
+                resource_namespace,
+                host_candidates,
+            )
+        })
+    })
+}
+
+/// Match a parsed [`SidecarHostPattern`] against a resource's namespace and
+/// host candidates. Hoisted out of `sidecar_egress_includes_service` so the
+/// match arms stay readable.
+fn sidecar_host_pattern_matches(
+    pattern: SidecarHostPattern<'_>,
+    sidecar_namespace: &str,
+    resource_namespace: &str,
+    host_candidates: &[&str],
+) -> bool {
+    match pattern {
+        SidecarHostPattern::AllowAll => true,
+        SidecarHostPattern::AnyNamespaceHost { host } => any_host_matches(host, host_candidates),
+        SidecarHostPattern::SameNamespaceHost { host } => {
+            resource_namespace == sidecar_namespace && any_host_matches(host, host_candidates)
+        }
+        SidecarHostPattern::SameNamespaceHostBare { host } => {
+            resource_namespace == sidecar_namespace && any_host_matches(host, host_candidates)
+        }
+        SidecarHostPattern::NamespaceWildcard { namespace } => resource_namespace == namespace,
+        SidecarHostPattern::NamespaceHost { namespace, host } => {
+            resource_namespace == namespace && any_host_matches(host, host_candidates)
+        }
+    }
+}
+
+/// Match a host pattern (the `<dnsName>` part of an Istio Sidecar scope) against
+/// every candidate. Returns `true` if any candidate matches.
+///
+/// Istio Sidecar `egress.hosts` supports a leading-label wildcard:
+///   - `reviews.alpha.svc.cluster.local` matches only that exact FQDN.
+///   - `*.foo.com` matches `bar.foo.com` (one label before the suffix) but not
+///     `foo.com` nor `a.b.foo.com`. This is the same single-label wildcard
+///     semantic used elsewhere in the gateway
+///     (see `crate::config::types::wildcard_matches` and the mesh DNS proxy).
+///
+/// Resource hosts may themselves be wildcards (e.g. a `ServiceEntry.hosts`
+/// entry of `*.googleapis.com`). When the pattern is `*` it admits any
+/// resource host. When both pattern and candidate are wildcard FQDNs, an exact
+/// string compare matches them (the operator declared the same wildcard
+/// surface). We deliberately do NOT try to compute wildcard-vs-wildcard
+/// overlap — Istio's reference implementation also does not.
+fn any_host_matches(pattern: &str, host_candidates: &[&str]) -> bool {
+    if pattern == "*" {
+        return !host_candidates.is_empty();
+    }
+    host_candidates
+        .iter()
+        .any(|candidate| host_matches_pattern(pattern, candidate))
+}
+
+/// Returns `true` when `candidate` matches `pattern` under Istio Sidecar
+/// scope-host semantics (single-label DNS wildcard, case-sensitive — operators
+/// are expected to canonicalise to lowercase upstream, identical to how
+/// `ServiceEntry.hosts` and `MeshDestinationRule.host` are already stored).
+fn host_matches_pattern(pattern: &str, candidate: &str) -> bool {
+    if pattern == candidate {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        // `*.foo.com` matches `bar.foo.com` (exactly one extra label) but not
+        // `foo.com` itself nor `a.b.foo.com`. Mirrors `wildcard_matches` in
+        // `src/config/types.rs` so route-side and mesh-side wildcard semantics
+        // stay aligned.
+        if candidate == suffix {
+            return false;
+        }
+        if let Some(prefix) = candidate.strip_suffix(suffix) {
+            return prefix.ends_with('.')
+                && prefix.len() > 1
+                && !prefix[..prefix.len() - 1].contains('.');
+        }
+    }
+    false
 }
 
 /// Scope tier used for PeerAuthentication precedence ranking.
@@ -495,11 +1000,12 @@ mod tests {
     use crate::config::types::GatewayConfig;
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
     use crate::modes::mesh::config::{
-        AppProtocol, MeshAccessLoggingConfig, MeshConfig, MeshPolicy, MeshProxyConfig,
-        MeshRequestAuthentication, MeshRule, MeshService, MeshTelemetryConfig,
-        MeshTelemetryResource, MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyAction,
-        PolicyScope, RemoteCluster, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle,
-        TrustBundleSet, Workload, WorkloadPort, WorkloadSelector,
+        AppProtocol, MeshAccessLoggingConfig, MeshConfig, MeshDestinationRule, MeshPolicy,
+        MeshProxyConfig, MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar,
+        MeshSidecarEgress, MeshTelemetryConfig, MeshTelemetryResource, MtlsMode,
+        MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope, RemoteCluster,
+        ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet, Workload,
+        WorkloadPort, WorkloadSelector,
     };
     use std::collections::HashMap;
 
@@ -660,6 +1166,8 @@ mod tests {
             namespace: namespace.into(),
             workload_spiffe_id: None,
             labels: BTreeMap::new(),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            enforce_sidecar_egress: false,
         }
     }
 
@@ -672,6 +1180,8 @@ mod tests {
             namespace: namespace.into(),
             workload_spiffe_id: None,
             labels,
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            enforce_sidecar_egress: false,
         }
     }
 
@@ -1389,6 +1899,8 @@ mod tests {
             namespace: "alpha".into(),
             workload_spiffe_id: Some(spiffe_id.to_string()),
             labels: BTreeMap::new(),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            enforce_sidecar_egress: false,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // The slice should inherit labels from the matched workload.
@@ -1425,6 +1937,8 @@ mod tests {
             namespace: "alpha".into(),
             workload_spiffe_id: Some(spiffe_id.to_string()),
             labels: BTreeMap::from([("custom".into(), "value".into())]),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            enforce_sidecar_egress: false,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // Explicit labels should be used, not the workload's labels.
@@ -1746,6 +2260,8 @@ mod tests {
                 namespace: "default".to_string(),
                 workload_spiffe_id: None,
                 labels: BTreeMap::new(),
+                cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+                enforce_sidecar_egress: false,
             },
         );
 
@@ -2350,5 +2866,1233 @@ mod tests {
         dedup.sort();
         dedup.dedup();
         assert_eq!(dedup.len(), entries.len());
+
+    // ── Sidecar egress scoping (FERRUM_MESH_SIDECAR_ENFORCED) ────────────
+
+    fn make_sidecar(
+        name: &str,
+        namespace: &str,
+        workload_selector: Option<WorkloadSelector>,
+        egress_hosts: Vec<Vec<&str>>,
+    ) -> MeshSidecar {
+        MeshSidecar {
+            name: name.into(),
+            namespace: namespace.into(),
+            workload_selector,
+            egress_inherits_defaults: false,
+            egress: egress_hosts
+                .into_iter()
+                .map(|hosts| MeshSidecarEgress {
+                    hosts: hosts.into_iter().map(String::from).collect(),
+                    port: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn make_inheriting_sidecar(
+        name: &str,
+        namespace: &str,
+        workload_selector: WorkloadSelector,
+    ) -> MeshSidecar {
+        MeshSidecar {
+            name: name.into(),
+            namespace: namespace.into(),
+            workload_selector: Some(workload_selector),
+            egress_inherits_defaults: true,
+            egress: Vec::new(),
+        }
+    }
+
+    fn make_se_with_host(
+        name: &str,
+        namespace: &str,
+        host: &str,
+        export_to: Vec<String>,
+    ) -> ServiceEntry {
+        ServiceEntry {
+            name: name.into(),
+            namespace: namespace.into(),
+            hosts: vec![host.into()],
+            endpoints: Vec::new(),
+            resolution: crate::modes::mesh::config::Resolution::None,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 443,
+                protocol: AppProtocol::Http2,
+                name: None,
+            }],
+            export_to,
+            workload_selector: None,
+        }
+    }
+
+    fn slice_request_enforced(namespace: &str) -> MeshSliceRequest {
+        MeshSliceRequest {
+            node_id: "node-1".into(),
+            namespace: namespace.into(),
+            workload_spiffe_id: None,
+            labels: BTreeMap::new(),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            enforce_sidecar_egress: true,
+        }
+    }
+
+    fn slice_request_enforced_with_labels(
+        namespace: &str,
+        labels: BTreeMap<String, String>,
+    ) -> MeshSliceRequest {
+        MeshSliceRequest {
+            node_id: "node-1".into(),
+            namespace: namespace.into(),
+            workload_spiffe_id: None,
+            labels,
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            enforce_sidecar_egress: true,
+        }
+    }
+
+    #[test]
+    fn sidecar_narrowing_filters_other_namespace_service_entries() {
+        // Sidecar restricts egress to same-namespace hosts; ServiceEntry in
+        // another namespace must be filtered out. Both entries export to `*`
+        // so visibility alone would let them both through — only sidecar
+        // narrowing should remove the "other" one.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews.alpha.svc.cluster.local"]],
+            )],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews-local",
+                    "alpha",
+                    "reviews.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "external-other",
+                    "beta",
+                    "external.beta.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.service_entries.len(), 1);
+        assert_eq!(slice.service_entries[0].name, "reviews-local");
+    }
+
+    #[test]
+    fn sidecar_narrowing_allow_all_pattern_is_noop() {
+        // `*/*` admits everything — slice should look identical to today.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar("default-sc", "alpha", None, vec![vec!["*/*"]])],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews-local",
+                    "alpha",
+                    "reviews.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "external-other",
+                    "beta",
+                    "external.beta.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.service_entries.len(), 2);
+    }
+
+    #[test]
+    fn sidecar_narrowing_workload_selector_only_matches_one_workload() {
+        // Sidecar targets `app=frontend`. A workload with `app=frontend`
+        // gets narrowed; a workload with `app=backend` falls through to no
+        // sidecar (no namespace-default sidecar), so it sees the full set.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "frontend-sc",
+                "alpha",
+                Some(WorkloadSelector {
+                    labels: HashMap::from([("app".into(), "frontend".into())]),
+                    namespace: None,
+                }),
+                vec![vec!["./reviews.alpha.svc.cluster.local"]],
+            )],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews",
+                    "alpha",
+                    "reviews.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "other",
+                    "alpha",
+                    "other.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+
+        // Frontend workload — narrowed.
+        let frontend_labels = BTreeMap::from([("app".into(), "frontend".into())]);
+        let frontend_slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_labels("alpha", frontend_labels),
+        );
+        assert_eq!(frontend_slice.service_entries.len(), 1);
+        assert_eq!(frontend_slice.service_entries[0].name, "reviews");
+
+        // Backend workload — no sidecar applies, no narrowing.
+        let backend_labels = BTreeMap::from([("app".into(), "backend".into())]);
+        let backend_slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_labels("alpha", backend_labels),
+        );
+        assert_eq!(backend_slice.service_entries.len(), 2);
+    }
+
+    #[test]
+    fn sidecar_narrowing_disabled_when_flag_unset() {
+        // Even with an aggressive Sidecar present, the default flag
+        // (enforce_sidecar_egress=false) skips narrowing entirely.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "deny-most",
+                "alpha",
+                None,
+                vec![vec!["./reviews.alpha.svc.cluster.local"]],
+            )],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews",
+                    "alpha",
+                    "reviews.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "external",
+                    "beta",
+                    "external.beta.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        // slice_request(..) is the existing helper with the flag false.
+        let slice = MeshSlice::from_gateway_config(&config, slice_request("alpha"));
+        assert_eq!(
+            slice.service_entries.len(),
+            2,
+            "narrowing must not fire when the flag is false"
+        );
+    }
+
+    #[test]
+    fn sidecar_narrowing_namespace_wildcard_admits_namespace() {
+        // `beta/*` admits anything in `beta`.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar("ns-sc", "alpha", None, vec![vec!["beta/*"]])],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews-beta",
+                    "beta",
+                    "reviews.beta.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "reviews-gamma",
+                    "gamma",
+                    "reviews.gamma.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.service_entries.len(), 1);
+        assert_eq!(slice.service_entries[0].name, "reviews-beta");
+    }
+
+    #[test]
+    fn sidecar_narrowing_any_namespace_host_pattern_matches_anywhere() {
+        // `*/reviews.alpha.svc.cluster.local` admits the host in ANY namespace.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "global-sc",
+                "alpha",
+                None,
+                vec![vec!["*/reviews.alpha.svc.cluster.local"]],
+            )],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews-alpha",
+                    "alpha",
+                    "reviews.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "reviews-cloned-in-beta",
+                    "beta",
+                    "reviews.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "unrelated",
+                    "beta",
+                    "unrelated.beta.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        // Both entries with that host across alpha + beta should match.
+        assert_eq!(slice.service_entries.len(), 2);
+    }
+
+    #[test]
+    fn sidecar_narrowing_filters_services_and_destination_rules() {
+        // MeshService and MeshDestinationRule are filtered too.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews"]],
+            )],
+            services: vec![
+                make_service("alpha", "reviews"),
+                make_service("alpha", "checkout"),
+            ],
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "reviews-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "reviews".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "checkout-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "checkout".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.services.len(), 1);
+        assert_eq!(slice.services[0].name, "reviews");
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "reviews-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_matches_mesh_service_fqdn_alias() {
+        // Operators commonly scope Kubernetes Services by FQDN in Sidecar
+        // hosts. MeshService stores only name + namespace, so the slice
+        // builder must synthesize DNS aliases before matching.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews.alpha.svc.cluster.local"]],
+            )],
+            services: vec![
+                make_service("alpha", "reviews"),
+                make_service("alpha", "checkout"),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.services.len(), 1);
+        assert_eq!(slice.services[0].name, "reviews");
+    }
+
+    #[test]
+    fn sidecar_narrowing_uses_cluster_domain_for_mesh_service_fqdn_alias() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews.alpha.svc.corp.local"]],
+            )],
+            services: vec![
+                make_service("alpha", "reviews"),
+                make_service("alpha", "checkout"),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let request = slice_request_enforced("alpha").with_cluster_domain("corp.local".to_string());
+        let slice = MeshSlice::from_gateway_config(&config, request);
+        assert_eq!(slice.services.len(), 1);
+        assert_eq!(slice.services[0].name, "reviews");
+    }
+
+    #[test]
+    fn sidecar_narrowing_matches_destination_rule_short_host_against_fqdn_scope() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews.alpha.svc.cluster.local"]],
+            )],
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "reviews-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "reviews".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "checkout-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "checkout".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "reviews-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_matches_destination_rule_fqdn_host_against_short_scope() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews"]],
+            )],
+            services: vec![
+                make_service("alpha", "reviews"),
+                make_service("alpha", "checkout"),
+            ],
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "reviews-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "reviews.alpha.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "checkout-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "checkout.alpha.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "reviews-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_matches_destination_rule_target_namespace() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["beta/*"]],
+            )],
+            services: vec![make_service("beta", "reviews")],
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "beta-reviews-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "reviews.beta.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "gamma-checkout-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "checkout.gamma.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "beta-reviews-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_infers_destination_rule_fqdn_namespace_without_service_registry() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["beta/*"]],
+            )],
+            destination_rules: vec![MeshDestinationRule {
+                name: "beta-reviews-dr".into(),
+                namespace: "alpha".into(),
+                host: "reviews.beta.svc.cluster.local".into(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "beta-reviews-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_matches_destination_rule_namespace_qualified_host() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["beta/*"]],
+            )],
+            services: vec![make_service("beta", "reviews")],
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "beta-reviews-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "reviews.beta".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "gamma-checkout-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "checkout.gamma".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "beta-reviews-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_keeps_external_two_label_destination_rule_literal() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./example.com"]],
+            )],
+            services: vec![make_service("com", "unrelated")],
+            destination_rules: vec![MeshDestinationRule {
+                name: "external-dr".into(),
+                namespace: "alpha".into(),
+                host: "example.com".into(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "external-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_keeps_long_external_destination_rule_literal() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews.alpha.external.com"]],
+            )],
+            services: vec![make_service("alpha", "reviews")],
+            destination_rules: vec![MeshDestinationRule {
+                name: "external-dr".into(),
+                namespace: "alpha".into(),
+                host: "reviews.alpha.external.com".into(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "external-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_keeps_external_dot_svc_destination_rule_literal() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./api.foo.svc"]],
+            )],
+            services: vec![make_service("alpha", "reviews")],
+            service_entries: vec![make_se_with_host(
+                "api-foo",
+                "alpha",
+                "api.foo.svc",
+                vec!["*".into()],
+            )],
+            destination_rules: vec![MeshDestinationRule {
+                name: "external-dr".into(),
+                namespace: "alpha".into(),
+                host: "api.foo.svc".into(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "external-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_ignores_invisible_service_entry_host_for_destination_rule_scope() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["beta/*"]],
+            )],
+            service_entries: vec![make_se_with_host(
+                "private-foo",
+                "beta",
+                "foo.beta.svc",
+                vec![".".into()],
+            )],
+            destination_rules: vec![MeshDestinationRule {
+                name: "beta-foo-dr".into(),
+                namespace: "alpha".into(),
+                host: "foo.beta.svc".into(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "beta-foo-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_rejects_destination_rule_from_unrelated_namespace() {
+        // Istio DestinationRule lookup namespaces are {client, target
+        // service, root}. A DR declared in `gamma` targeting
+        // `reviews.beta` must NOT be imported into an `alpha` workload's
+        // slice even if its Sidecar admits `beta/*` — `gamma` is none of
+        // the lookup namespaces.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["beta/*"]],
+            )],
+            services: vec![make_service("beta", "reviews")],
+            destination_rules: vec![MeshDestinationRule {
+                name: "cross-ns-dr".into(),
+                namespace: "gamma".into(),
+                host: "reviews.beta.svc.cluster.local".into(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert!(slice.destination_rules.is_empty());
+    }
+
+    #[test]
+    fn sidecar_narrowing_admits_destination_rule_from_target_service_namespace() {
+        // A DR declared in the target service's namespace (`beta`) must
+        // still be admitted alongside one declared in the client
+        // namespace (`alpha`); a DR declared in an unrelated namespace
+        // (`gamma`) targeting the same host must be filtered out.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["beta/*"]],
+            )],
+            services: vec![make_service("beta", "reviews")],
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "from-client-ns".into(),
+                    namespace: "alpha".into(),
+                    host: "reviews.beta.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "from-target-ns".into(),
+                    namespace: "beta".into(),
+                    host: "reviews.beta.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "from-unrelated-ns".into(),
+                    namespace: "gamma".into(),
+                    host: "reviews.beta.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        let names: BTreeSet<&str> = slice
+            .destination_rules
+            .iter()
+            .map(|dr| dr.name.as_str())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains("from-client-ns"));
+        assert!(names.contains("from-target-ns"));
+    }
+
+    #[test]
+    fn sidecar_resolution_prefers_workload_scoped_over_namespace_default() {
+        // A workload that matches both a workload-scoped and a namespace-
+        // default Sidecar should get the workload-scoped one.
+        let mesh = MeshConfig {
+            sidecars: vec![
+                // Namespace default — admits everything.
+                make_sidecar("ns-default", "alpha", None, vec![vec!["*/*"]]),
+                // Workload-scoped — admits only `reviews`.
+                make_sidecar(
+                    "frontend-only",
+                    "alpha",
+                    Some(WorkloadSelector {
+                        labels: HashMap::from([("app".into(), "frontend".into())]),
+                        namespace: None,
+                    }),
+                    vec![vec!["./reviews.alpha.svc.cluster.local"]],
+                ),
+            ],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews",
+                    "alpha",
+                    "reviews.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "other",
+                    "alpha",
+                    "other.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let labels = BTreeMap::from([("app".into(), "frontend".into())]);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_labels("alpha", labels),
+        );
+        assert_eq!(
+            slice.service_entries.len(),
+            1,
+            "workload-scoped sidecar should win over namespace-default"
+        );
+        assert_eq!(slice.service_entries[0].name, "reviews");
+    }
+
+    #[test]
+    fn sidecar_omitted_egress_inherits_namespace_default_scope() {
+        let mesh = MeshConfig {
+            sidecars: vec![
+                make_sidecar(
+                    "ns-default",
+                    "alpha",
+                    None,
+                    vec![vec!["./reviews.alpha.svc.cluster.local"]],
+                ),
+                make_inheriting_sidecar(
+                    "frontend-ingress-only",
+                    "alpha",
+                    WorkloadSelector {
+                        labels: HashMap::from([("app".into(), "frontend".into())]),
+                        namespace: Some("alpha".into()),
+                    },
+                ),
+            ],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews",
+                    "alpha",
+                    "reviews.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "checkout",
+                    "alpha",
+                    "checkout.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let labels = BTreeMap::from([("app".into(), "frontend".into())]);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_labels("alpha", labels),
+        );
+        assert_eq!(slice.service_entries.len(), 1);
+        assert_eq!(slice.service_entries[0].name, "reviews");
+    }
+
+    #[test]
+    fn sidecar_omitted_egress_without_namespace_default_is_noop() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_inheriting_sidecar(
+                "frontend-ingress-only",
+                "alpha",
+                WorkloadSelector {
+                    labels: HashMap::from([("app".into(), "frontend".into())]),
+                    namespace: Some("alpha".into()),
+                },
+            )],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews",
+                    "alpha",
+                    "reviews.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "checkout",
+                    "alpha",
+                    "checkout.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let labels = BTreeMap::from([("app".into(), "frontend".into())]);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_labels("alpha", labels),
+        );
+        assert_eq!(slice.service_entries.len(), 2);
+    }
+
+    #[test]
+    fn sidecar_with_empty_egress_blocks_everything() {
+        // Native/file MeshSidecar with an explicit empty egress list trims all
+        // egress config. Kubernetes omitted spec.egress sets
+        // `egress_inherits_defaults` instead.
+        let mesh = MeshConfig {
+            sidecars: vec![MeshSidecar {
+                name: "block-all".into(),
+                namespace: "alpha".into(),
+                workload_selector: None,
+                egress_inherits_defaults: false,
+                egress: Vec::new(),
+            }],
+            service_entries: vec![make_se_with_host(
+                "reviews",
+                "alpha",
+                "reviews.alpha.svc.cluster.local",
+                vec!["*".into()],
+            )],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert!(slice.service_entries.is_empty());
+    }
+
+    #[test]
+    fn sidecar_no_namespace_pattern_trims_service_config() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar("trim-all", "alpha", None, vec![vec!["~/*"]])],
+            services: vec![make_service("alpha", "reviews")],
+            service_entries: vec![make_se_with_host(
+                "reviews",
+                "alpha",
+                "reviews.alpha.svc.cluster.local",
+                vec!["*".into()],
+            )],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert!(slice.services.is_empty());
+        assert!(slice.service_entries.is_empty());
+    }
+
+    #[test]
+    fn sidecar_parse_host_pattern_round_trip() {
+        assert_eq!(
+            MeshSidecarEgress::parse_host_pattern("*/*"),
+            SidecarHostPattern::AllowAll
+        );
+        assert_eq!(
+            MeshSidecarEgress::parse_host_pattern("*/reviews"),
+            SidecarHostPattern::AnyNamespaceHost { host: "reviews" }
+        );
+        assert_eq!(
+            MeshSidecarEgress::parse_host_pattern("./reviews"),
+            SidecarHostPattern::SameNamespaceHost { host: "reviews" }
+        );
+        assert_eq!(
+            MeshSidecarEgress::parse_host_pattern("alpha/reviews"),
+            SidecarHostPattern::NamespaceHost {
+                namespace: "alpha",
+                host: "reviews",
+            }
+        );
+        assert_eq!(
+            MeshSidecarEgress::parse_host_pattern("alpha/*"),
+            SidecarHostPattern::NamespaceWildcard { namespace: "alpha" }
+        );
+        assert_eq!(
+            MeshSidecarEgress::parse_host_pattern("~/*"),
+            SidecarHostPattern::NamespaceWildcard { namespace: "~" }
+        );
+        assert_eq!(
+            MeshSidecarEgress::parse_host_pattern("bare-host"),
+            SidecarHostPattern::SameNamespaceHostBare { host: "bare-host" }
+        );
+    }
+
+    // ── Wildcard host matching (Istio `*.foo.com` semantics) ────────────
+
+    #[test]
+    fn sidecar_host_pattern_matches_single_label_dns_wildcard() {
+        // `*/*.foo.com` admits any single-label child of `foo.com` in any
+        // namespace. Mirrors the canonical Istio Sidecar wildcard semantic.
+        assert!(host_matches_pattern("*.foo.com", "bar.foo.com"));
+        assert!(host_matches_pattern("*.foo.com", "baz.foo.com"));
+        // Base domain itself does NOT match (consistent with
+        // wildcard_matches in src/config/types.rs).
+        assert!(!host_matches_pattern("*.foo.com", "foo.com"));
+        // Multi-level subdomains do NOT match (single-label wildcard).
+        assert!(!host_matches_pattern("*.foo.com", "a.b.foo.com"));
+        // Unrelated host.
+        assert!(!host_matches_pattern("*.foo.com", "foo.example.com"));
+        // Empty prefix (just `.foo.com`) does NOT match.
+        assert!(!host_matches_pattern("*.foo.com", ".foo.com"));
+    }
+
+    #[test]
+    fn sidecar_host_pattern_matches_exact_string() {
+        assert!(host_matches_pattern("reviews", "reviews"));
+        assert!(host_matches_pattern(
+            "reviews.alpha.svc.cluster.local",
+            "reviews.alpha.svc.cluster.local"
+        ));
+        assert!(!host_matches_pattern("reviews", "checkout"));
+    }
+
+    #[test]
+    fn sidecar_host_pattern_does_not_treat_bare_star_as_wildcard() {
+        // A bare `*` is normally trapped by the higher-level pattern parser
+        // (`*/*`, `namespace/*`); reaching the host predicate with `pattern
+        // == "*"` is only possible via the `any_host_matches` fast-path.
+        // `host_matches_pattern` itself stays strict — it must not silently
+        // glob.
+        assert!(!host_matches_pattern("*", "anything"));
+    }
+
+    #[test]
+    fn sidecar_narrowing_admits_dns_wildcard_against_service_entry_host() {
+        // `*/*.example.com` admits any single-label child of example.com.
+        // Verifies wildcard matching threads through the full slice builder.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "wildcard-sc",
+                "alpha",
+                None,
+                vec![vec!["*/*.example.com"]],
+            )],
+            service_entries: vec![
+                make_se_with_host("admit", "alpha", "api.example.com", vec!["*".into()]),
+                make_se_with_host("reject-base", "alpha", "example.com", vec!["*".into()]),
+                make_se_with_host(
+                    "reject-deep",
+                    "alpha",
+                    "deep.api.example.com",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "reject-other",
+                    "alpha",
+                    "api.unrelated.com",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(
+            slice.service_entries.len(),
+            1,
+            "only api.example.com admitted"
+        );
+        assert_eq!(slice.service_entries[0].name, "admit");
+    }
+
+    #[test]
+    fn sidecar_narrowing_dns_wildcard_in_namespace_scoped_pattern() {
+        // `./` + wildcard host: `./*.example.com` admits wildcard hosts ONLY
+        // in the sidecar's own namespace. Cross-namespace entries with the
+        // same wildcard surface must NOT match.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "ns-wildcard-sc",
+                "alpha",
+                None,
+                vec![vec!["./*.example.com"]],
+            )],
+            service_entries: vec![
+                make_se_with_host("alpha-hit", "alpha", "api.example.com", vec!["*".into()]),
+                make_se_with_host("beta-miss", "beta", "api.example.com", vec!["*".into()]),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.service_entries.len(), 1);
+        assert_eq!(slice.service_entries[0].name, "alpha-hit");
+    }
+
+    #[test]
+    fn sidecar_narrowing_dns_wildcard_combined_with_namespace_prefix() {
+        // `production/*.example.com` admits wildcard hosts ONLY in the
+        // explicitly named namespace, regardless of the sidecar's own
+        // namespace.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "explicit-ns-sc",
+                "alpha",
+                None,
+                vec![vec!["production/*.example.com"]],
+            )],
+            service_entries: vec![
+                make_se_with_host(
+                    "production-hit",
+                    "production",
+                    "api.example.com",
+                    vec!["*".into()],
+                ),
+                make_se_with_host("alpha-miss", "alpha", "api.example.com", vec!["*".into()]),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.service_entries.len(), 1);
+        assert_eq!(slice.service_entries[0].name, "production-hit");
+    }
+
+    #[test]
+    fn sidecar_narrowing_multi_host_service_entry_any_match_admits() {
+        // A ServiceEntry with multiple hosts: as long as ONE host matches the
+        // egress pattern, the whole entry is admitted. Documented at the
+        // sidecar_egress_includes_service rustdoc.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "wildcard-sc",
+                "alpha",
+                None,
+                vec![vec!["*/*.example.com"]],
+            )],
+            service_entries: vec![ServiceEntry {
+                name: "multi-host".into(),
+                namespace: "alpha".into(),
+                hosts: vec!["api.example.com".into(), "unrelated.other.com".into()],
+                endpoints: Vec::new(),
+                resolution: crate::modes::mesh::config::Resolution::None,
+                location: ServiceEntryLocation::MeshExternal,
+                ports: vec![ServicePort {
+                    port: 443,
+                    protocol: AppProtocol::Http2,
+                    name: None,
+                }],
+                export_to: vec!["*".into()],
+                workload_selector: None,
+            }],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.service_entries.len(), 1);
+    }
+
+    #[test]
+    fn sidecar_narrowing_multiple_egress_entries_evaluated_independently() {
+        // Each `egress[]` entry is its own OR clause. A second entry must
+        // admit a service that the first one rejects.
+        let mesh = MeshConfig {
+            sidecars: vec![MeshSidecar {
+                name: "two-clauses".into(),
+                namespace: "alpha".into(),
+                workload_selector: None,
+                egress_inherits_defaults: false,
+                egress: vec![
+                    MeshSidecarEgress {
+                        hosts: vec!["./reviews".into()],
+                        port: None,
+                    },
+                    MeshSidecarEgress {
+                        hosts: vec!["beta/checkout".into()],
+                        port: None,
+                    },
+                ],
+            }],
+            services: vec![
+                make_service("alpha", "reviews"),
+                make_service("alpha", "other-alpha"),
+            ],
+            destination_rules: vec![MeshDestinationRule {
+                name: "beta-checkout-dr".into(),
+                namespace: "beta".into(),
+                host: "checkout".into(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.services.len(), 1);
+        assert_eq!(slice.services[0].name, "reviews");
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "beta-checkout-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_admits_cross_namespace_services_and_destination_rules() {
+        // `beta/*` should admit beta services and DestinationRules when Sidecar
+        // enforcement is enabled. This mirrors ServiceEntry behavior and keeps
+        // Istio namespace-scoped egress patterns from becoming silently inert.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "beta-egress",
+                "alpha",
+                None,
+                vec![vec!["beta/*"]],
+            )],
+            services: vec![
+                make_service("alpha", "reviews"),
+                make_service("beta", "checkout"),
+                make_service("gamma", "payments"),
+            ],
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "alpha-reviews-dr".into(),
+                    namespace: "alpha".into(),
+                    host: "reviews".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "beta-checkout-dr".into(),
+                    namespace: "beta".into(),
+                    host: "checkout".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "gamma-payments-dr".into(),
+                    namespace: "gamma".into(),
+                    host: "payments".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.services.len(), 1);
+        assert_eq!(slice.services[0].namespace, "beta");
+        assert_eq!(slice.services[0].name, "checkout");
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "beta-checkout-dr");
     }
 }

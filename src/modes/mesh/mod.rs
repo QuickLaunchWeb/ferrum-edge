@@ -225,6 +225,12 @@ pub struct MeshRuntimeConfig {
     /// unknown destinations. Sourced from
     /// `FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS` (default 502).
     pub outbound_registry_reject_status: u16,
+    /// When `true`, the slice builder applies Istio `Sidecar` egress scope
+    /// narrowing. Sourced from `FERRUM_MESH_SIDECAR_ENFORCED` (default
+    /// `false`). When disabled, `Sidecar` resources are parsed and persisted
+    /// in `MeshConfig` but the slice projection ignores them — behavior is
+    /// identical to today, preserving safe-rollout semantics.
+    pub sidecar_enforced: bool,
 }
 
 impl MeshRuntimeConfig {
@@ -379,6 +385,7 @@ impl MeshRuntimeConfig {
             capture_mode,
             outbound_traffic_policy,
             outbound_registry_reject_status,
+            sidecar_enforced: env_config.mesh_sidecar_enforced,
         })
     }
 
@@ -455,6 +462,8 @@ impl MeshRuntimeConfig {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            cluster_domain: self.cluster_domain.clone(),
+            enforce_sidecar_egress: self.sidecar_enforced,
         }
     }
 }
@@ -524,6 +533,10 @@ fn gateway_config_from_mesh_slice(
             telemetry_resources: slice.telemetry_resources.clone(),
             destination_rules: slice.destination_rules.clone(),
             proxy_configs: slice.proxy_configs.clone(),
+            // Slice-narrowing is applied CP-side at `MeshSlice::from_gateway_config`.
+            // DPs receive the already-narrowed set of services / service-entries /
+            // destination-rules; `MeshSidecar` resources are not echoed back.
+            sidecars: Vec::new(),
             trust_bundles: slice.trust_bundles.clone(),
             multi_cluster: slice.multi_cluster.clone(),
             outbound_traffic_policy: slice.outbound_traffic_policy,
@@ -3334,6 +3347,7 @@ mod tests {
             capture_mode: crate::capture::CaptureMode::Explicit,
             outbound_traffic_policy: crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
             outbound_registry_reject_status: 502,
+            sidecar_enforced: false,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
         let mesh_state = MeshRuntimeState::new();
@@ -3425,6 +3439,7 @@ mod tests {
             capture_mode: crate::capture::CaptureMode::Explicit,
             outbound_traffic_policy: crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
             outbound_registry_reject_status: 502,
+            sidecar_enforced: false,
         }
     }
 

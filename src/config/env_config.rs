@@ -543,6 +543,14 @@ pub struct EnvConfig {
     /// when `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY=registry_only` rejects an
     /// unknown destination. Must be 4xx/5xx. Default: 502.
     pub mesh_outbound_registry_reject_status: u16,
+    /// When `true`, the slice builder applies Istio `Sidecar` egress scope
+    /// narrowing: services / service-entries / destination-rules outside the
+    /// applicable Sidecar's egress scope are filtered out before being sent
+    /// to data planes. Default `false` for safe rollout — operators opt in
+    /// after vetting their `Sidecar` resources. Parsing of `Sidecar` CRDs
+    /// happens unconditionally; this flag only gates the slice-narrowing
+    /// pass.
+    pub mesh_sidecar_enforced: bool,
 
     // Kubernetes CRD controller (Layer 8)
     /// Enable the Kubernetes CRD controller in CP mode. When true, the CP
@@ -1273,6 +1281,7 @@ impl Default for EnvConfig {
             mesh_egress_strip_baggage_keys: Vec::new(),
             mesh_outbound_traffic_policy: "allow_any".to_string(),
             mesh_outbound_registry_reject_status: 502,
+            mesh_sidecar_enforced: false,
             k8s_controller_enabled: false,
             k8s_watch_namespaces: Vec::new(),
             k8s_kubeconfig_path: None,
@@ -1561,6 +1570,7 @@ impl EnvConfig {
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
             mesh_outbound_traffic_policy: String = "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY" => "allow_any".to_string();
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
+            mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
             k8s_controller_enabled: bool = "FERRUM_K8S_CONTROLLER_ENABLED" => false;
             k8s_watch_namespaces: Vec<String> = "FERRUM_K8S_WATCH_NAMESPACES" => Vec::new();
             k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
@@ -1921,6 +1931,7 @@ impl EnvConfig {
             mesh_egress_strip_baggage_keys,
             mesh_outbound_traffic_policy,
             mesh_outbound_registry_reject_status,
+            mesh_sidecar_enforced,
             k8s_controller_enabled,
             k8s_watch_namespaces,
             k8s_kubeconfig_path,
