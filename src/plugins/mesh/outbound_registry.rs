@@ -3,10 +3,11 @@
 //! Implements Istio `MeshConfig.outboundTrafficPolicy.mode: REGISTRY_ONLY`.
 //! When the slice declares `RegistryOnly`, the gateway auto-injects this
 //! global plugin with a pre-built set of known destinations from the slice
-//! (services with their FQDN/namespace-qualified/bare-name forms, service
-//! entries with their declared hosts, and workload addresses) plus their
-//! declared ports. At request time the plugin reads the destination Host
-//! header and rejects unknown destinations with 502 (configurable).
+//! (services with their FQDN/namespace-qualified forms, local-namespace
+//! bare-name forms, service entries with their declared hosts, and workload
+//! addresses) plus their declared ports. At request time the plugin reads the
+//! destination Host header and rejects unknown destinations with 502
+//! (configurable).
 //!
 //! The plugin is **not** registered when policy is `AllowAny` (default),
 //! so non-mesh and permissive deployments pay zero per-request cost.

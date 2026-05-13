@@ -1717,7 +1717,7 @@ fn inject_mesh_global_plugins(
     ) {
         let registry = mesh_slice.build_known_destinations(&runtime.cluster_domain);
         let outbound_listen_ports = mesh_outbound_registry_listen_ports(runtime);
-        if outbound_listen_ports.is_empty() && !mesh_has_outbound_listener(runtime) {
+        if outbound_listen_ports.is_empty() {
             config
                 .plugin_configs
                 .retain(|p| p.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID);
@@ -1810,13 +1810,6 @@ fn inject_mesh_global_plugins(
         access_log_config,
         &runtime.namespace,
     );
-}
-
-fn mesh_has_outbound_listener(runtime: &MeshRuntimeConfig) -> bool {
-    runtime
-        .listener_plan()
-        .iter()
-        .any(|listener| listener.direction == MeshTrafficDirection::Outbound)
 }
 
 fn mesh_outbound_registry_listen_ports(runtime: &MeshRuntimeConfig) -> Vec<u16> {
@@ -4109,6 +4102,7 @@ mod tests {
     #[test]
     fn inject_mesh_global_plugins_runtime_registry_only_applies_when_slice_policy_absent() {
         let mut runtime = test_mesh_runtime_config();
+        runtime.outbound_listen_addr = "127.0.0.1:15001".parse().unwrap();
         runtime.outbound_traffic_policy =
             crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly;
         let mesh_slice = MeshSlice {
@@ -4132,6 +4126,29 @@ mod tests {
                 .plugin_configs
                 .iter()
                 .any(|plugin| plugin.id == MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_skips_outbound_registry_when_outbound_port_is_zero() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.outbound_listen_addr = "127.0.0.1:0".parse().unwrap();
+        runtime.outbound_traffic_policy =
+            crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly;
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            outbound_traffic_policy: None,
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
         );
     }
 

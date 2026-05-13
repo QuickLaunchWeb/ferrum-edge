@@ -119,7 +119,8 @@ impl MeshSlice {
     /// Build the set of known mesh destinations from this slice. Used by
     /// the auto-injected `mesh_outbound_registry` plugin when
     /// `outbound_traffic_policy == RegistryOnly`. Includes:
-    ///   - service `{name}`, `{name}.{namespace}`,
+    ///   - service `{name}` for services in this slice's namespace,
+    ///     `{name}.{namespace}`,
     ///     `{name}.{namespace}.svc`, and
     ///     `{name}.{namespace}.svc.{cluster_domain}` forms with their
     ///     declared ports
@@ -132,6 +133,7 @@ impl MeshSlice {
     pub fn build_known_destinations(&self, cluster_domain: &str) -> Vec<String> {
         let mut entries: HashSet<String> = HashSet::new();
         let cluster_domain = normalize_known_destination_host(cluster_domain).unwrap_or_default();
+        let local_namespace = normalize_known_destination_host(&self.namespace);
         for service in &self.services {
             let Some(service_name) = normalize_known_destination_host(&service.name) else {
                 continue;
@@ -146,7 +148,14 @@ impl MeshSlice {
             } else {
                 format!("{svc}.{cluster_domain}")
             };
-            for host in [&service_name, &namespaced, &svc, &fqdn] {
+            if local_namespace.as_deref() == Some(namespace.as_str()) {
+                insert_known_destination(
+                    &mut entries,
+                    &service_name,
+                    service.ports.iter().map(|p| p.port),
+                );
+            }
+            for host in [&namespaced, &svc, &fqdn] {
                 insert_known_destination(&mut entries, host, service.ports.iter().map(|p| p.port));
             }
         }
@@ -2112,6 +2121,7 @@ mod tests {
         use crate::modes::mesh::config::AppProtocol;
 
         let slice = MeshSlice {
+            namespace: "default".into(),
             services: vec![MeshService {
                 name: "reviews".into(),
                 namespace: "default".into(),
@@ -2137,10 +2147,48 @@ mod tests {
     }
 
     #[test]
+    fn build_known_destinations_scopes_bare_service_names_to_local_namespace() {
+        use crate::modes::mesh::config::{AppProtocol, ServicePort};
+
+        let http_port = ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".into()),
+        };
+        let slice = MeshSlice {
+            namespace: "default".into(),
+            services: vec![
+                MeshService {
+                    name: "reviews".into(),
+                    namespace: "default".into(),
+                    ports: vec![http_port.clone()],
+                    workloads: Vec::new(),
+                    protocol_overrides: HashMap::new(),
+                },
+                MeshService {
+                    name: "ratings".into(),
+                    namespace: "payments".into(),
+                    ports: vec![http_port],
+                    workloads: Vec::new(),
+                    protocol_overrides: HashMap::new(),
+                },
+            ],
+            ..MeshSlice::default()
+        };
+
+        let entries = slice.build_known_destinations("cluster.local");
+        assert!(entries.contains(&"reviews".to_string()));
+        assert!(!entries.contains(&"ratings".to_string()));
+        assert!(entries.contains(&"ratings.payments".to_string()));
+        assert!(entries.contains(&"ratings.payments.svc.cluster.local:8080".to_string()));
+    }
+
+    #[test]
     fn build_known_destinations_normalizes_cluster_domain_and_trailing_dots() {
         use crate::modes::mesh::config::{AppProtocol, ServicePort};
 
         let slice = MeshSlice {
+            namespace: "default".into(),
             services: vec![MeshService {
                 name: "Reviews".into(),
                 namespace: "Default".into(),
@@ -2265,6 +2313,7 @@ mod tests {
         use crate::modes::mesh::config::{AppProtocol, ServicePort};
 
         let slice = MeshSlice {
+            namespace: "default".into(),
             services: vec![
                 MeshService {
                     name: "zzz".into(),
