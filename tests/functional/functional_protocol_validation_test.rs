@@ -259,6 +259,16 @@ impl Harness {
             .spawn()
             .await
             .expect("start gateway");
+        // `wait_for_health` only verifies the admin port. The proxy listener
+        // is bound on a separate spawned task; on a loaded CI runner there is
+        // a brief window where `/health` is green but raw `TcpStream::connect`
+        // to the proxy port hits `ConnectionRefused`. This test file bypasses
+        // `reqwest` (raw HTTP framing + hyper H2 prior knowledge), so we wait
+        // for the proxy port explicitly before any test exercises it.
+        gateway
+            .wait_for_proxy_port(Duration::from_secs(10))
+            .await
+            .expect("proxy port did not become ready");
         Harness {
             proxy_port: gateway.proxy_port,
             _gateway: gateway,

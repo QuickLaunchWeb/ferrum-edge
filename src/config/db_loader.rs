@@ -5150,6 +5150,9 @@ fn row_to_proxy(
             .ok()
             .flatten(),
         resolved_tls: Default::default(),
+        // Populated by `GatewayConfig::resolve_dispatch_port_overrides()` after
+        // upstreams are loaded and any mesh DR overrides applied.
+        dispatch_port_overrides: None,
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })
@@ -5351,6 +5354,10 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         health_checks,
         service_discovery,
         subsets,
+        // Per-port overrides are populated in-memory by the mesh apply
+        // pipeline (`apply_destination_rules`); they are not persisted to SQL
+        // backends today, so SQL rows always start with an empty map.
+        port_overrides: std::collections::HashMap::new(),
         backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
         backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
         backend_tls_verify_server_cert,
