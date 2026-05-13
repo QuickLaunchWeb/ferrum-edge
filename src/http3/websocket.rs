@@ -402,6 +402,7 @@ pub(crate) async fn handle_h3_websocket(
                     &state,
                     &proxy,
                     &ctx,
+                    &proxy_headers,
                     &plugins,
                     plugin_execution_ns,
                     start_time,
@@ -506,6 +507,7 @@ pub(crate) async fn handle_h3_websocket(
         &state,
         &proxy,
         &ctx,
+        &proxy_headers,
         &plugins,
         plugin_execution_ns,
         start_time,
@@ -705,10 +707,21 @@ pub(crate) async fn handle_h3_websocket(
 /// Emit a `TransactionSummary` describing the successful WebSocket
 /// upgrade. Mirrors the H1/H2 path at `proxy/mod.rs` line ~4300 so log
 /// plugins see a consistent shape across frontends.
+///
+/// `proxy_headers` is the source of truth for the backend-bound header
+/// view. The H3 dispatcher in `handle_h3_request` populates it by either
+/// cloning `ctx.headers` (when identity headers need injection) or
+/// `std::mem::take`-ing it (the common case), so `ctx.headers` cannot be
+/// read from here for diagnostic fields like `user-agent` — it may be
+/// empty by the time we get called. Every other H3 path in
+/// `src/http3/server.rs` reads `user-agent` from `proxy_headers` for the
+/// same reason; keep this in sync.
+#[allow(clippy::too_many_arguments)]
 async fn emit_successful_upgrade_summary(
     state: &ProxyState,
     proxy: &Proxy,
     ctx: &RequestContext,
+    proxy_headers: &HashMap<String, String>,
     plugins: &[Arc<dyn Plugin>],
     plugin_execution_ns: u64,
     start_time: Instant,
@@ -756,7 +769,7 @@ async fn emit_successful_upgrade_summary(
         latency_plugin_execution_ms: plugin_execution_ms,
         latency_plugin_external_io_ms: plugin_external_io_ms,
         latency_gateway_overhead_ms: gateway_overhead_ms,
-        request_user_agent: ctx.headers.get("user-agent").cloned(),
+        request_user_agent: proxy_headers.get("user-agent").cloned(),
         metadata: ctx.metadata.clone(),
         ..TransactionSummary::default()
     };
@@ -768,11 +781,16 @@ async fn emit_successful_upgrade_summary(
 /// `rejection_phase` metadata field labels which gateway phase recorded
 /// the failure — useful for SRE dashboards keying on
 /// `metadata.rejection_phase = "websocket_backend_error"`.
+///
+/// `proxy_headers` is the source of truth for diagnostic header fields
+/// (`user-agent`). See `emit_successful_upgrade_summary` for the
+/// rationale on why this is not read from `ctx.headers`.
 #[allow(clippy::too_many_arguments)]
 async fn emit_failed_upgrade_summary(
     state: &ProxyState,
     proxy: &Proxy,
     ctx: &RequestContext,
+    proxy_headers: &HashMap<String, String>,
     plugins: &[Arc<dyn Plugin>],
     plugin_execution_ns: u64,
     start_time: Instant,
@@ -825,10 +843,172 @@ async fn emit_failed_upgrade_summary(
         latency_plugin_execution_ms: plugin_execution_ms,
         latency_plugin_external_io_ms: plugin_external_io_ms,
         latency_gateway_overhead_ms: gateway_overhead_ms,
-        request_user_agent: ctx.headers.get("user-agent").cloned(),
+        request_user_agent: proxy_headers.get("user-agent").cloned(),
         error_class: Some(error_class),
         metadata,
         ..TransactionSummary::default()
     };
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_headers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn has_key(out: &[(String, String)], key: &str) -> bool {
+        out.iter().any(|(k, _)| k == key)
+    }
+
+    fn value_for<'a>(out: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        out.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn collect_strips_hop_by_hop_headers() {
+        // RFC 9110 §7.6.1 hop-by-hop list — none of these should be
+        // forwarded to a backend even on an Extended CONNECT upgrade.
+        let headers = make_headers(&[
+            ("connection", "upgrade, close"),
+            ("upgrade", "websocket"),
+            ("keep-alive", "timeout=5"),
+            ("transfer-encoding", "chunked"),
+            ("te", "trailers"),
+            ("trailer", "Expires"),
+            ("proxy-authenticate", "Basic"),
+            ("proxy-authorization", "Bearer xyz"),
+            ("proxy-connection", "keep-alive"),
+            ("host", "example.com"),
+            ("x-custom", "passthrough"),
+        ]);
+        let out = collect_forwardable_h3_headers(&headers);
+        for stripped in [
+            "connection",
+            "upgrade",
+            "keep-alive",
+            "transfer-encoding",
+            "te",
+            "trailer",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "proxy-connection",
+            "host",
+        ] {
+            assert!(
+                !has_key(&out, stripped),
+                "hop-by-hop header `{}` must be stripped",
+                stripped,
+            );
+        }
+        assert_eq!(value_for(&out, "x-custom"), Some("passthrough"));
+    }
+
+    #[test]
+    fn collect_strips_websocket_handshake_artefacts() {
+        // RFC 6455 client → server handshake bits that have no meaning
+        // on the backend H1.1 Upgrade — the backend client (tungstenite)
+        // synthesises its own `Sec-WebSocket-Key` and the server's
+        // `Sec-WebSocket-Accept` is computed there too.
+        let headers = make_headers(&[
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+            ("sec-websocket-protocol", "chat"),
+            ("sec-websocket-extensions", "permessage-deflate"),
+        ]);
+        let out = collect_forwardable_h3_headers(&headers);
+        for stripped in [
+            "sec-websocket-key",
+            "sec-websocket-version",
+            "sec-websocket-accept",
+        ] {
+            assert!(
+                !has_key(&out, stripped),
+                "WS handshake header `{}` must be stripped",
+                stripped,
+            );
+        }
+        // Subprotocol / extensions ARE forwarded — backend WS picks them up
+        // and re-negotiates with the upstream WebSocket server. This mirrors
+        // the H1/H2 path's `collect_forwardable_headers` behavior.
+        assert_eq!(value_for(&out, "sec-websocket-protocol"), Some("chat"));
+        assert_eq!(
+            value_for(&out, "sec-websocket-extensions"),
+            Some("permessage-deflate"),
+        );
+    }
+
+    #[test]
+    fn collect_strips_h3_pseudo_headers() {
+        // The h3 server surfaces `:method`/`:scheme`/`:authority`/`:path`/
+        // `:protocol` on the request, and upstream code may also bake them
+        // into the raw header map. They are never valid as HTTP/1.1
+        // request-line / header fields.
+        let headers = make_headers(&[
+            (":method", "CONNECT"),
+            (":scheme", "https"),
+            (":authority", "example.com"),
+            (":path", "/ws"),
+            (":protocol", "websocket"),
+            (":status", "200"),
+            ("content-type", "text/plain"),
+        ]);
+        let out = collect_forwardable_h3_headers(&headers);
+        for stripped in [
+            ":method",
+            ":scheme",
+            ":authority",
+            ":path",
+            ":protocol",
+            ":status",
+        ] {
+            assert!(
+                !has_key(&out, stripped),
+                "H3 pseudo-header `{}` must be stripped",
+                stripped,
+            );
+        }
+        assert_eq!(value_for(&out, "content-type"), Some("text/plain"));
+    }
+
+    #[test]
+    fn collect_lowercases_header_names() {
+        // HTTP/3 already requires lowercase header names on the wire, but
+        // the input map type doesn't enforce that — guard against an
+        // upstream that supplies mixed-case keys.
+        let headers = make_headers(&[("X-Trace-Id", "abc123"), ("Authorization", "Bearer token")]);
+        let out = collect_forwardable_h3_headers(&headers);
+        assert_eq!(value_for(&out, "x-trace-id"), Some("abc123"));
+        assert_eq!(value_for(&out, "authorization"), Some("Bearer token"));
+    }
+
+    #[test]
+    fn user_agent_lookup_lives_on_proxy_headers_not_ctx() {
+        // Regression guard: the H3 dispatcher in `src/http3/server.rs`
+        // builds `proxy_headers` by either cloning `ctx.headers` (when
+        // identity injection is needed) or `std::mem::take`-ing it (the
+        // common case). In the take-path `ctx.headers` is empty by the
+        // time `handle_h3_websocket` runs, so the TransactionSummary
+        // helpers MUST read `request_user_agent` from `proxy_headers`,
+        // not from `ctx.headers`. This test pins the expected source of
+        // truth so a future refactor doesn't silently re-introduce the
+        // bug (which was caught in PR 784 review).
+        let proxy_headers = make_headers(&[("user-agent", "ferrum-test/1.0")]);
+        let ctx_headers_after_take: HashMap<String, String> = HashMap::new();
+        assert_eq!(
+            proxy_headers.get("user-agent").map(String::as_str),
+            Some("ferrum-test/1.0"),
+            "proxy_headers must carry user-agent (the post-take source)"
+        );
+        assert!(
+            !ctx_headers_after_take.contains_key("user-agent"),
+            "ctx.headers is moved-out and empty in the common dispatch path"
+        );
+    }
 }
