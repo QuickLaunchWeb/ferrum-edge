@@ -2866,6 +2866,7 @@ mod tests {
         dedup.sort();
         dedup.dedup();
         assert_eq!(dedup.len(), entries.len());
+    }
 
     // ── Sidecar egress scoping (FERRUM_MESH_SIDECAR_ENFORCED) ────────────
 
