@@ -355,6 +355,22 @@ impl MeshSlice {
                     &mesh_service_identities,
                     &service_entry_hosts,
                 );
+                // Istio DestinationRule lookup namespaces are {client (the
+                // workload's own namespace), target service namespace, root
+                // namespace}. Root-namespace plumbing is deferred (see
+                // docs/mesh.md "Known Limitations"), so admit only DRs
+                // declared in the client or the target service namespace.
+                // Without this guard a DR in an unrelated namespace
+                // targeting `reviews.beta` could be imported into an
+                // `alpha` workload's slice merely because the Sidecar
+                // admits `beta/*`, letting a third-party namespace override
+                // client traffic policy.
+                let dr_namespace = dr.namespace.as_str();
+                if dr_namespace != effective_namespace
+                    && dr_namespace != resource_namespace.as_str()
+                {
+                    return false;
+                }
                 let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
                 sidecar_egress_includes_service(
                     sidecar.namespace,
@@ -3174,6 +3190,90 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
         assert_eq!(slice.destination_rules.len(), 1);
         assert_eq!(slice.destination_rules[0].name, "beta-foo-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_rejects_destination_rule_from_unrelated_namespace() {
+        // Istio DestinationRule lookup namespaces are {client, target
+        // service, root}. A DR declared in `gamma` targeting
+        // `reviews.beta` must NOT be imported into an `alpha` workload's
+        // slice even if its Sidecar admits `beta/*` — `gamma` is none of
+        // the lookup namespaces.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["beta/*"]],
+            )],
+            services: vec![make_service("beta", "reviews")],
+            destination_rules: vec![MeshDestinationRule {
+                name: "cross-ns-dr".into(),
+                namespace: "gamma".into(),
+                host: "reviews.beta.svc.cluster.local".into(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert!(slice.destination_rules.is_empty());
+    }
+
+    #[test]
+    fn sidecar_narrowing_admits_destination_rule_from_target_service_namespace() {
+        // A DR declared in the target service's namespace (`beta`) must
+        // still be admitted alongside one declared in the client
+        // namespace (`alpha`); a DR declared in an unrelated namespace
+        // (`gamma`) targeting the same host must be filtered out.
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["beta/*"]],
+            )],
+            services: vec![make_service("beta", "reviews")],
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "from-client-ns".into(),
+                    namespace: "alpha".into(),
+                    host: "reviews.beta.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "from-target-ns".into(),
+                    namespace: "beta".into(),
+                    host: "reviews.beta.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "from-unrelated-ns".into(),
+                    namespace: "gamma".into(),
+                    host: "reviews.beta.svc.cluster.local".into(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        let names: BTreeSet<&str> = slice
+            .destination_rules
+            .iter()
+            .map(|dr| dr.name.as_str())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains("from-client-ns"));
+        assert!(names.contains("from-target-ns"));
     }
 
     #[test]
