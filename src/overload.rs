@@ -1379,7 +1379,19 @@ mod tests {
     async fn measure_event_loop_latency_detects_saturated_workers() {
         let handle = tokio::runtime::Handle::current();
         let num_workers = handle.metrics().num_workers();
-        const SLEEP_MS: u64 = 150;
+        // Sleep budget for the blockers. Each worker stalls inside
+        // `std::thread::sleep(SLEEP_MS)`, so the probe's queue wait is
+        // bounded above by SLEEP_MS minus the post-signal grace below.
+        const SLEEP_MS: u64 = 400;
+        // Bridge the unavoidable race between the blocker future's signal
+        // (`started.fetch_add` runs FIRST, then `std::thread::sleep`) and
+        // the worker actually entering its blocking sleep. On a contended
+        // CI host the OS scheduler can pause the worker between those two
+        // instructions long enough for the probe — submitted the instant
+        // `started == num_workers` — to land on a still-free worker and
+        // return in microseconds. This grace gives every blocker time to
+        // commit to its sleep call before the probe submits.
+        const POST_SIGNAL_GRACE_MS: u64 = 100;
 
         let started = Arc::new(AtomicUsize::new(0));
         let probe_started = Arc::clone(&started);
@@ -1387,6 +1399,7 @@ mod tests {
             while probe_started.load(Ordering::Acquire) < num_workers {
                 std::thread::yield_now();
             }
+            std::thread::sleep(Duration::from_millis(POST_SIGNAL_GRACE_MS));
             handle.block_on(measure_event_loop_latency())
         });
 
@@ -1410,7 +1423,8 @@ mod tests {
             .expect("latency probe thread should not panic");
 
         // Conservative lower bound: 25ms is well above µs-scale healthy
-        // readings, well below the SLEEP_MS budget, and tolerant of CI jitter.
+        // readings, well below the (SLEEP_MS - POST_SIGNAL_GRACE_MS) budget,
+        // and tolerant of CI jitter.
         assert!(
             latency >= Duration::from_millis(25),
             "expected probe to surface ≥25ms saturation, got {:?} \

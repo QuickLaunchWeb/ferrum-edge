@@ -287,7 +287,11 @@ fn route_backends(
                 },
             );
         backends.push(RouteBackend {
-            host: service_dns_name(backend_name, &backend_namespace),
+            host: service_dns_name(
+                backend_name,
+                &backend_namespace,
+                &acc.options.cluster_domain,
+            ),
             port: backend_port,
             weight,
         });
@@ -376,7 +380,11 @@ fn l4_route_proxies(
             hosts: string_array(&object.spec, "hostnames"),
             listen_path: None,
             strip_listen_path: false,
-            backend_host: service_dns_name(backend_name, &backend_namespace),
+            backend_host: service_dns_name(
+                backend_name,
+                &backend_namespace,
+                &acc.options.cluster_domain,
+            ),
             backend_port,
             upstream_id: None,
             backend_scheme: scheme,
@@ -1508,6 +1516,49 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("requires a matching ReferenceGrant")
+        );
+    }
+
+    #[test]
+    fn http_route_uses_custom_cluster_domain() {
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["app.example.com"],
+                "rules": [{
+                    "backendRefs": [{ "name": "stable", "port": 8080 }]
+                }]
+            }),
+        );
+
+        let opts = options().with_cluster_domain("corp.example".to_string());
+        let result =
+            translate_k8s_objects(&[route], opts).expect("custom cluster domain should work");
+
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "stable.default.svc.corp.example"
+        );
+    }
+
+    #[test]
+    fn tcp_route_uses_custom_cluster_domain() {
+        let route = object(
+            "TCPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "backendRefs": [{ "name": "db", "port": 5432 }]
+                }]
+            }),
+        );
+
+        let opts = options().with_cluster_domain("corp.example".to_string());
+        let result =
+            translate_k8s_objects(&[route], opts).expect("custom cluster domain should work");
+
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "db.default.svc.corp.example"
         );
     }
 }

@@ -50,6 +50,7 @@ pub struct K8sTranslationOptions {
     pub trust_domain: TrustDomain,
     pub prefer_istio_on_overlap: bool,
     pub istio_root_namespace: String,
+    pub cluster_domain: String,
     source_namespaces: Option<HashSet<String>>,
 }
 
@@ -61,6 +62,7 @@ impl K8sTranslationOptions {
             trust_domain,
             prefer_istio_on_overlap: true,
             istio_root_namespace: "istio-system".to_string(),
+            cluster_domain: "cluster.local".to_string(),
             source_namespaces: Some(source_namespaces),
         }
     }
@@ -68,6 +70,15 @@ impl K8sTranslationOptions {
     pub fn with_istio_root_namespace(mut self, namespace: String) -> Self {
         if !namespace.trim().is_empty() {
             self.istio_root_namespace = namespace;
+        }
+        self
+    }
+
+    pub fn with_cluster_domain(mut self, domain: String) -> Self {
+        // Empty/whitespace falls back to the existing default (`cluster.local`)
+        // rather than producing a translator that can never match a FQDN host.
+        if !domain.trim().is_empty() {
+            self.cluster_domain = domain;
         }
         self
     }
@@ -151,6 +162,13 @@ pub(crate) struct K8sAccumulator {
     reference_grants: HashSet<ReferenceGrantPermission>,
     proxy_sources: HashMap<String, SourceKind>,
     known_namespaces: HashSet<String>,
+    /// Port-name → port-number index for collected `Service` objects, nested
+    /// `namespace → service_name → port_name → port`. Built in the translator
+    /// pre-pass so VirtualService destinations carrying `port.name` (not
+    /// `port.number`) can be resolved against the workload's actual Service.
+    /// The nested shape lets `lookup_service_port` borrow `&str` arguments
+    /// directly — no per-lookup `.to_string()` allocations.
+    service_port_names: HashMap<String, HashMap<String, HashMap<String, u16>>>,
 }
 
 impl K8sAccumulator {
@@ -163,7 +181,24 @@ impl K8sAccumulator {
             reference_grants: HashSet::new(),
             proxy_sources: HashMap::new(),
             known_namespaces: HashSet::new(),
+            service_port_names: HashMap::new(),
         }
+    }
+
+    /// Resolve a Service port name to its `port` value. Returns `None` when
+    /// the service was never collected (cluster-external host, foreign
+    /// namespace, etc.) or when the named port isn't on that service.
+    pub(crate) fn lookup_service_port(
+        &self,
+        namespace: &str,
+        service: &str,
+        port_name: &str,
+    ) -> Option<u16> {
+        self.service_port_names
+            .get(namespace)
+            .and_then(|by_svc| by_svc.get(service))
+            .and_then(|ports| ports.get(port_name))
+            .copied()
     }
 
     fn observe_namespace(&mut self, namespace: &str) {
@@ -310,6 +345,8 @@ where
         acc.observe_namespace(&object.metadata.namespace);
         if object.kind == "ReferenceGrant" {
             gateway_api::collect_reference_grant(&mut acc, object)?;
+        } else if object.kind == "Service" {
+            collect_service(&mut acc, object)?;
         }
     }
 
@@ -328,6 +365,12 @@ where
             }));
         }
 
+        // Service objects are consumed by the pre-pass for port-name resolution;
+        // they do not produce Ferrum proxies/upstreams directly.
+        if object.kind == "Service" {
+            continue;
+        }
+
         if istio::translate(&mut acc, object)? || gateway_api::translate(&mut acc, object)? {
             continue;
         }
@@ -339,6 +382,38 @@ where
     }
 
     Ok(acc.finish())
+}
+
+/// Collect the `ports[].name → port` map from a core/v1 Service so later
+/// translation passes can resolve Istio `destination.port.name` references.
+/// Services with no named ports populate an empty entry — callers can still
+/// distinguish "service exists, port name unknown" from "service unknown".
+pub(crate) fn collect_service(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+) -> Result<(), K8sTranslateError> {
+    let ports = object
+        .spec
+        .get("ports")
+        .and_then(Value::as_array)
+        .map(|arr| arr.as_slice())
+        .unwrap_or(&[]);
+    let mut port_names: HashMap<String, u16> = HashMap::new();
+    for port_entry in ports {
+        let Some(name) = string_field(port_entry, "name") else {
+            continue;
+        };
+        let Some(raw) = port_entry.get("port").and_then(Value::as_u64) else {
+            continue;
+        };
+        let port = port_from_u64(object, raw, "Service.spec.ports[].port")?;
+        port_names.insert(name.to_string(), port);
+    }
+    acc.service_port_names
+        .entry(object.metadata.namespace.clone())
+        .or_default()
+        .insert(object.metadata.name.clone(), port_names);
+    Ok(())
 }
 
 pub(crate) fn invalid_resource(
@@ -447,6 +522,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
+        dispatch_port_overrides: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -694,6 +770,7 @@ pub(crate) fn upstream_for_route(
         health_checks: None,
         service_discovery: None,
         subsets: None,
+        port_overrides: HashMap::new(),
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
@@ -704,8 +781,8 @@ pub(crate) fn upstream_for_route(
     }
 }
 
-pub(crate) fn service_dns_name(name: &str, namespace: &str) -> String {
-    format!("{name}.{namespace}.svc.cluster.local")
+pub(crate) fn service_dns_name(name: &str, namespace: &str, cluster_domain: &str) -> String {
+    format!("{name}.{namespace}.svc.{cluster_domain}")
 }
 
 pub(crate) fn exact_path_listen_path(path: &str) -> String {

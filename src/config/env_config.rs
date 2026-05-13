@@ -561,6 +561,10 @@ pub struct EnvConfig {
     /// `translate_k8s_objects()` when building SPIFFE IDs from K8s
     /// ServiceAccount references. Default: "cluster.local".
     pub k8s_trust_domain: String,
+    /// Kubernetes cluster DNS domain for FQDN host matching in the K8s
+    /// translator. Hosts like `<svc>.<ns>.svc.<cluster_domain>` are accepted.
+    /// Default: "cluster.local".
+    pub k8s_cluster_domain: String,
 
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
@@ -1282,6 +1286,7 @@ impl Default for EnvConfig {
             k8s_watch_istio_crds: true,
             k8s_watch_gateway_api_crds: true,
             k8s_trust_domain: "cluster.local".to_string(),
+            k8s_cluster_domain: "cluster.local".to_string(),
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -1568,6 +1573,7 @@ impl EnvConfig {
             k8s_watch_istio_crds: bool = "FERRUM_K8S_WATCH_ISTIO_CRDS" => true;
             k8s_watch_gateway_api_crds: bool = "FERRUM_K8S_WATCH_GATEWAY_API_CRDS" => true;
             k8s_trust_domain: String = "FERRUM_K8S_TRUST_DOMAIN" => "cluster.local".to_string();
+            k8s_cluster_domain: String = "FERRUM_K8S_CLUSTER_DOMAIN" => "cluster.local".to_string();
             dp_grpc_tls_ca_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CA_CERT_PATH";
             dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
@@ -1926,6 +1932,7 @@ impl EnvConfig {
             k8s_watch_istio_crds,
             k8s_watch_gateway_api_crds,
             k8s_trust_domain,
+            k8s_cluster_domain,
             dp_grpc_tls_ca_cert_path,
             dp_grpc_tls_client_cert_path,
             dp_grpc_tls_client_key_path,

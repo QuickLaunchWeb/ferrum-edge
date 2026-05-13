@@ -270,7 +270,8 @@ subsets:
 | `trafficPolicy.connectionPool.http.*` | Ignored | Per-protocol connection pool not surfaced |
 | `trafficPolicy.connectionPool.tcp.maxConnections` / `tcpKeepalive` | Ignored | Pool sizing handled globally via `FERRUM_POOL_*` |
 | `trafficPolicy.tls` | Supported | Overrides the `PeerAuthentication`-derived backend posture per matching `Upstream` when set. Mode mapping: `DISABLE` → clears `Upstream.backend_tls_*`; `SIMPLE` → enables server-cert verify + `backend_tls_server_ca_cert_path = caCertificates` (client cert/key cleared); `MUTUAL` → enables server-cert verify + projects `caCertificates`/`clientCertificate`/`privateKey` onto `Upstream.backend_tls_server_ca_cert_path`/`_client_cert_path`/`_client_key_path`; `ISTIO_MUTUAL` → enables server-cert verify and leaves any existing client material untouched (Ferrum's `spiffe_identity`/`mtls_auth` plugins continue to supply the workload SVID — DR.tls does not yet project SPIFFE material onto `Upstream.backend_tls_*` directly). `insecureSkipVerify: true` forces `backend_tls_verify_server_cert = false`. `sni` and `subjectAltNames` are parsed and warned (no per-`Upstream` SNI/SAN override field today). When the field is unset, behavior is identical to today and `PeerAuthentication` continues to drive the default mTLS posture. |
-| `trafficPolicy.portLevelSettings` | Ignored | Per-port traffic policy not modeled |
+| `trafficPolicy.portLevelSettings[].port.number` + nested `connectionPool.tcp.connectTimeout` | Supported | Top-level policy applies first; per-port `connectTimeout` lands on `Upstream.port_overrides[port].connect_timeout_ms` at apply time, then `GatewayConfig::resolve_dispatch_port_overrides()` projects it onto `Proxy.dispatch_port_overrides` for O(1) hot-path lookup. All four dispatch families consult it: HTTP/H2/H3 via `resolve_effective_proxy_for_target` (`src/proxy/mod.rs`), gRPC via the same helper threaded through `proxy_grpc_request*` (`src/proxy/grpc_proxy.rs`), TCP via `effective_backend_connect_timeout_ms` in `TcpConnParams` (`src/proxy/tcp_proxy.rs`), and HBONE via `effective_connect_timeout_ms` in `connect_backend` (`src/proxy/hbone_proxy.rs`). Ports outside 1-65535 rejected; duplicate port entries rejected; phantom ports (DR entry references a port unused by any `Upstream.target`) skipped with a warning at apply time. The admin API rejects POST/PUT setting `Upstream.port_overrides` directly — express per-port policy as a DestinationRule (SQL/MongoDB schemas don't persist the field) |
+| `trafficPolicy.portLevelSettings[].loadBalancer` / `outlierDetection` | Parsed but not enforced (warns) | Gateway keeps a single `LoadBalancer` and `PassiveHealthCheck` per upstream — switching algorithm / hash ring / outlier thresholds per destination port is not yet wired up. Warnings surface BOTH from the K8s translator (so YAML pushes flag the gap at translate time) AND from `apply_destination_rules` (so native MeshSubscribe / xDS slices flag it at apply time on the data plane) |
 | `exportTo` | Ignored | DRs are scoped to their declared namespace at slice-filter time |
 
 Translator warnings surface in the `K8sTranslation.warnings` returned from `translate_k8s_objects`, so operators see them at apply time.
@@ -676,18 +677,24 @@ The injector checks annotations and labels to decide whether to inject:
 
 When `FERRUM_INJECTOR_REQUIRE_ANNOTATION=true` (default), pods must explicitly opt in via `ferrum.io/inject: "true"` or the `ferrum.io/mesh: "enabled"` label. When `false`, all pods are injected unless explicitly opted out.
 
-### Port Exclusions
+### Port and IP-Range Exclusions
 
-The injector supports outbound port exclusions via annotations on injected pods:
+The injector supports per-pod capture overrides via annotations. The Istio annotation namespace is honored byte-for-byte so workloads can migrate without rewriting metadata; Ferrum-native annotations are accepted as aliases for the port lists.
 
-| Annotation | Description |
-|---|---|
-| `traffic.sidecar.istio.io/excludeOutboundPorts` | Comma-separated ports excluded from outbound capture (Istio-compatible) |
-| `ferrum.io/exclude-outbound-ports` | Comma-separated ports excluded from outbound capture (Ferrum-native) |
+| Annotation | Direction | Semantics |
+|---|---|---|
+| `traffic.sidecar.istio.io/excludeOutboundPorts` | outbound | Comma-separated TCP destination ports excluded from outbound capture (Istio-compatible) |
+| `ferrum.io/excludeOutboundPorts` | outbound | Ferrum-native alias for the above |
+| `traffic.sidecar.istio.io/excludeInboundPorts` | inbound | Comma-separated TCP destination ports excluded from inbound capture (Istio-compatible). RETURN rules are emitted BEFORE the inbound REDIRECT so the exclusion is honored |
+| `ferrum.io/excludeInboundPorts` | inbound | Ferrum-native alias for the above |
+| `traffic.sidecar.istio.io/excludeOutboundIPRanges` | outbound | Comma-separated CIDRs appended to the env-derived outbound exclude list (matches Istio: per-pod additive) |
+| `traffic.sidecar.istio.io/includeOutboundIPRanges` | outbound | Comma-separated CIDRs that REPLACE the env-derived outbound include list when present (matches Istio: include-overrides-include) |
 
-Both annotations are merged; the injector folds them into the iptables capture plan so the init container's rules skip the listed ports. This is useful for databases, caches, or other services where sidecar proxying adds unnecessary latency.
+Port-list annotations merge with each other and with the injector-level `FERRUM_MESH_EXCLUDE_OUTBOUND_PORTS` / `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` defaults; results are deduplicated. CIDR annotations are validated at admission time -- invalid ports or CIDRs are rejected with a webhook error that names the offending annotation, so a typo cannot silently produce a broken iptables plan.
 
-Inbound port exclusions (`excludeInboundPorts`) and IP-range-based exclusions (`excludeOutboundIPRanges`, `includeOutboundIPRanges`) are deferred.
+**Pod-restart caveat:** annotations are evaluated at pod admission time only. Existing pods retain their previous capture rules until restart; bouncing affected workloads is required for previously-ignored annotations to take effect.
+
+**IPv6 CIDRs:** `includeOutboundIPRanges` / `excludeOutboundIPRanges` accept IPv6 CIDR literals (e.g. `fd00::/8`) at admission for forward compatibility, but `IptablesPlan::for_config` strips non-IPv4 CIDRs before emitting rules (with a `warn!` log naming each skipped CIDR). The init container only invokes the IPv4 `iptables` binary; feeding it a raw `-d fd00::/8` would fail the rule append and leave the capture chain half-populated. `ip6tables` fan-out is deferred. If an include list contains ONLY IPv6 CIDRs the outbound REDIRECT will not be emitted at all, so outbound capture is disabled for that pod — check init-container logs for the skip warning.
 
 ### SPIFFE ID Derivation
 
@@ -853,7 +860,8 @@ The node agent exposes atomic counters for operational monitoring:
 | `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES` | (empty) | Extra namespaces to exclude from capture (`kube-system`, `kube-public`, `kube-node-lease` always excluded) |
 | `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | `0.0.0.0/0` | CIDRs to capture for outbound traffic |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | (empty) | CIDRs to exclude from outbound capture (highest priority) |
-| `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | `15001,15006,15008,15020` | Destination ports to exclude from capture |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | `15001,15006,15008,15020` | Destination TCP ports excluded from outbound capture |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` | (empty) | Destination TCP ports excluded from inbound capture (mirrors Istio `excludeInboundPorts`; pod annotation `traffic.sidecar.istio.io/excludeInboundPorts` is additive) |
 
 ## VirtualService Translation
 
@@ -878,6 +886,42 @@ Per-route `fault` configuration is translated to proxy-scoped `fault_injection` 
 - `fault.abort.httpStatus` + `fault.abort.percentage` -> abort with status code at the configured rate.
 - `fault.delay.fixedDelay` + `fault.delay.percentage` -> inject latency at the configured rate.
 
+### Destination Port Resolution
+
+`route.destination.port` accepts either `number` (integer) or `name` (string). When a name is given, the translator resolves it against the `Service.spec.ports[].name` index built from collected core/v1 `Service` objects in the same translation batch (input order is irrelevant — Services are gathered in a pre-pass). `port.number` always wins when both are set. An unknown port name fails translation closed with the offending name in the error. Hosts are parsed as `<svc>`, `<svc>.<ns>`, `<svc>.<ns>.svc`, or `<svc>.<ns>.svc.cluster.local` (with or without a trailing dot); short hosts fall back to the VirtualService's own namespace, so port-name lookups for the same short host resolve differently depending on which namespace the VS lives in. Service ports without a `name` are silently skipped by the indexer (no panic). Numeric-port-only deployments need no changes.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: reviews
+  namespace: default
+spec:
+  ports:
+    - name: http
+      port: 8080
+    - name: grpc
+      port: 9090
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: reviews-vs
+  namespace: default
+spec:
+  hosts:
+    - reviews.default.svc.cluster.local
+  http:
+    - match:
+        - uri:
+            prefix: /api
+      route:
+        - destination:
+            host: reviews.default.svc.cluster.local
+            port:
+              name: http        # resolves to 8080 via the Service index above
+```
+
 ## Istio Compatibility Gaps
 
 The following Istio mesh surfaces are **not yet supported** and should be treated as deferred:
@@ -887,14 +931,11 @@ The following Istio mesh surfaces are **not yet supported** and should be treate
 | `Sidecar` (egress scoping) | Deferred | Use Ferrum proxy routing and upstream configuration |
 | `EnvoyFilter` | Not planned | Use Ferrum custom plugins |
 | `WasmPlugin` | Not planned | Use Ferrum custom plugins (`custom_plugins/`) |
-| `DestinationRule` port-level traffic policy | Deferred | Top-level traffic policy applies to all ports |
 | Outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`) | Deferred | Unknown outbound destinations are not blocked today |
 | `VirtualService` header/method-only matches | Skipped | Ferrum route proxies do not encode header/method predicates |
-| Inbound port exclusions (`excludeInboundPorts`) | Deferred | |
-| IP-range capture exclusions (`excludeOutboundIPRanges`, `includeOutboundIPRanges`) | Deferred | |
-| `Service.spec.ports[].name` resolution | Deferred | Use numeric ports in backendRefs and VirtualService destinations |
-| `WorkloadEntry` beyond address/labels/network/cluster | Partial | Basic fields supported; full VM lifecycle deferred |
-| `Telemetry` provider-specific config | Partial | Basic tracing/metrics/access-log envelopes supported |
+| Pod auto-discovery (K8s native service registry) | Deferred | Declare `WorkloadEntry` / `ServiceEntry` explicitly until a Pod watcher lands |
+| `WorkloadEntry` `weight` / `locality` / `serviceAccount` | Partial | Translated as workload metadata; locality-aware load balancing not yet wired (consumed by an upcoming PR). `serviceAccount` is kept separately from the SPIFFE path so introspection/audit doesn't need to parse it. |
+| `Telemetry.tracing[].providers[]` span emission | Partial | **Inline provider config only** — provider type inferred from the `name` field (`zipkin`/`datadog`/`lightstep`/`opentelemetry`) with required URL/endpoint fields on the entry itself; captured into the mesh slice and merged into `workload_metrics.tracing_provider`. Name-only references (`{name: "my-zipkin"}`) that rely on `meshConfig.extensionProviders` / `meshConfig.defaultProviders` lookup are **not yet supported** — they are gracefully skipped with a warning. Unrecognised provider names are also skipped (not hard-failed). Only the first `providers[]` entry is surfaced; multi-provider fan-out is deferred. Span emission to provider backends is not yet wired — sink-plugin follow-up. `Telemetry.tracing[].disableSpanReporting` and per-tag `CLIENT`/`SERVER` modes are deferred. |
 
 ## Environment Variables
 
@@ -959,7 +1000,8 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES` | (empty) | Extra namespaces to exclude (`kube-system`, `kube-public`, `kube-node-lease` always excluded) |
 | `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | `0.0.0.0/0` | CIDRs to capture for outbound traffic |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | (empty) | CIDRs to exclude from outbound capture (highest priority) |
-| `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | `15001,15006,15008,15020` | Destination ports to exclude from capture |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | `15001,15006,15008,15020` | Destination TCP ports excluded from outbound capture |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` | (empty) | Destination TCP ports excluded from inbound capture (mirrors Istio `excludeInboundPorts`; pod annotation `traffic.sidecar.istio.io/excludeInboundPorts` is additive) |
 
 ### Injector
 
