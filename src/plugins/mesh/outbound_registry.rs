@@ -337,6 +337,9 @@ impl Plugin for OutboundRegistry {
         if !self.should_enforce_for_request(ctx) {
             return PluginResult::Continue;
         }
+        // The shared HTTP/2, HTTP/3, and gRPC paths backfill `:authority`
+        // into `host` before plugin execution, so one lookup covers all
+        // HTTP-family frontends.
         let Some(host_header) = ctx.headers.get("host") else {
             return reject(self.reject_status, "host header required");
         };

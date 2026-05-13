@@ -539,6 +539,10 @@ pub struct EnvConfig {
     /// capture listener via the auto-injected `mesh_outbound_registry`
     /// plugin).
     pub mesh_outbound_traffic_policy: String,
+    /// HTTP status returned by the auto-injected mesh outbound registry plugin
+    /// when `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY=registry_only` rejects an
+    /// unknown destination. Must be 4xx/5xx. Default: 502.
+    pub mesh_outbound_registry_reject_status: u16,
 
     // Kubernetes CRD controller (Layer 8)
     /// Enable the Kubernetes CRD controller in CP mode. When true, the CP
@@ -1268,6 +1272,7 @@ impl Default for EnvConfig {
             mesh_trust_domain_aliases: Vec::new(),
             mesh_egress_strip_baggage_keys: Vec::new(),
             mesh_outbound_traffic_policy: "allow_any".to_string(),
+            mesh_outbound_registry_reject_status: 502,
             k8s_controller_enabled: false,
             k8s_watch_namespaces: Vec::new(),
             k8s_kubeconfig_path: None,
@@ -1555,6 +1560,7 @@ impl EnvConfig {
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
             mesh_outbound_traffic_policy: String = "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY" => "allow_any".to_string();
+            mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
             k8s_controller_enabled: bool = "FERRUM_K8S_CONTROLLER_ENABLED" => false;
             k8s_watch_namespaces: Vec<String> = "FERRUM_K8S_WATCH_NAMESPACES" => Vec::new();
             k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
@@ -1914,6 +1920,7 @@ impl EnvConfig {
             mesh_trust_domain_aliases,
             mesh_egress_strip_baggage_keys,
             mesh_outbound_traffic_policy,
+            mesh_outbound_registry_reject_status,
             k8s_controller_enabled,
             k8s_watch_namespaces,
             k8s_kubeconfig_path,

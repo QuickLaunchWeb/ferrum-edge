@@ -54,6 +54,7 @@ fn test_runtime() -> MeshRuntimeConfig {
         cluster_domain: "cluster.local".to_string(),
         capture_mode: CaptureMode::Explicit,
         outbound_traffic_policy: ferrum_edge::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
+        outbound_registry_reject_status: 502,
     }
 }
 
