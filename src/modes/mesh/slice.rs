@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Mutex, OnceLock};
+use tracing::warn;
 
 use crate::config::types::GatewayConfig;
 use crate::modes::mesh::config::{
@@ -245,6 +247,7 @@ impl MeshSlice {
         // flag gates the entire narrowing pass so existing deployments see zero
         // behavior change unless `FERRUM_MESH_SIDECAR_ENFORCED=true`.
         let applicable_sidecar = if request.enforce_sidecar_egress {
+            warn_unsupported_sidecar_port_scoping(&mesh.sidecars);
             resolve_applicable_sidecar_egress(
                 &mesh.sidecars,
                 effective_namespace,
@@ -257,22 +260,18 @@ impl MeshSlice {
         let services: Vec<MeshService> = mesh
             .services
             .iter()
-            .filter(|service| service.namespace == namespace)
             .filter(|service| {
-                applicable_sidecar
-                    .map(|sidecar| {
-                        let host_candidates =
-                            mesh_service_host_candidates(service, &cluster_domain);
-                        let host_refs: Vec<&str> =
-                            host_candidates.iter().map(String::as_str).collect();
-                        sidecar_egress_includes_service(
-                            sidecar.namespace,
-                            sidecar.egress,
-                            service.namespace.as_str(),
-                            &host_refs,
-                        )
-                    })
-                    .unwrap_or(true)
+                let Some(sidecar) = applicable_sidecar else {
+                    return service.namespace == namespace;
+                };
+                let host_candidates = mesh_service_host_candidates(service, &cluster_domain);
+                let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
+                sidecar_egress_includes_service(
+                    sidecar.namespace,
+                    sidecar.egress,
+                    service.namespace.as_str(),
+                    &host_refs,
+                )
             })
             .cloned()
             .collect();
@@ -335,26 +334,23 @@ impl MeshSlice {
         let destination_rules: Vec<MeshDestinationRule> = mesh
             .destination_rules
             .iter()
-            .filter(|dr| dr.namespace == namespace)
             .filter(|dr| {
-                applicable_sidecar
-                    .map(|sidecar| {
-                        let (resource_namespace, host_candidates) = destination_rule_host_scope(
-                            dr,
-                            &cluster_domain,
-                            &mesh_service_identities,
-                            &service_entry_hosts,
-                        );
-                        let host_refs: Vec<&str> =
-                            host_candidates.iter().map(String::as_str).collect();
-                        sidecar_egress_includes_service(
-                            sidecar.namespace,
-                            sidecar.egress,
-                            &resource_namespace,
-                            &host_refs,
-                        )
-                    })
-                    .unwrap_or(true)
+                let Some(sidecar) = applicable_sidecar else {
+                    return dr.namespace == namespace;
+                };
+                let (resource_namespace, host_candidates) = destination_rule_host_scope(
+                    dr,
+                    &cluster_domain,
+                    &mesh_service_identities,
+                    &service_entry_hosts,
+                );
+                let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
+                sidecar_egress_includes_service(
+                    sidecar.namespace,
+                    sidecar.egress,
+                    &resource_namespace,
+                    &host_refs,
+                )
             })
             .cloned()
             .collect();
@@ -406,6 +402,36 @@ fn mesh_service_identities(mesh: &MeshConfig) -> BTreeSet<(String, String)> {
         }
     }
     identities
+}
+
+static WARNED_UNSUPPORTED_SIDECAR_PORTS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+fn warn_unsupported_sidecar_port_scoping(sidecars: &[MeshSidecar]) {
+    let warned = WARNED_UNSUPPORTED_SIDECAR_PORTS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let Ok(mut warned) = warned.lock() else {
+        return;
+    };
+
+    for sidecar in sidecars {
+        let ports: BTreeSet<u16> = sidecar
+            .egress
+            .iter()
+            .filter_map(|egress| egress.port)
+            .collect();
+        if ports.is_empty() {
+            continue;
+        }
+
+        let key = format!("{}/{}:{ports:?}", sidecar.namespace, sidecar.name);
+        if warned.insert(key) {
+            warn!(
+                sidecar_namespace = %sidecar.namespace,
+                sidecar = %sidecar.name,
+                ports = ?ports,
+                "Sidecar egress port scoping is parsed but not enforced; slice narrowing is currently host-only"
+            );
+        }
+    }
 }
 
 fn visible_service_entry_hosts<L: WorkloadLabels + ?Sized>(
@@ -624,7 +650,8 @@ struct ResolvedSidecarEgress<'a> {
 ///
 /// An empty `egress` list is treated as "allow nothing" — Istio treats an
 /// explicit empty egress list this way. An empty `host_candidates` slice
-/// (defensive only — call sites always pass at least one) returns `false`.
+/// can only come from malformed/native config that carries no hosts, and
+/// returns `false`.
 fn sidecar_egress_includes_service(
     sidecar_namespace: &str,
     sidecar_egress: &[MeshSidecarEgress],
@@ -3552,27 +3579,27 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
         assert_eq!(slice.services.len(), 1);
         assert_eq!(slice.services[0].name, "reviews");
-        // destination_rules in `beta` are skipped because the slice builder
-        // filters `dr.namespace == request.namespace` BEFORE the egress
-        // predicate runs; the cross-namespace second clause therefore has
-        // no destination-rule effect here. Document the behavior so future
-        // refactors don't change it silently.
-        assert!(slice.destination_rules.is_empty());
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "beta-checkout-dr");
     }
 
     #[test]
-    fn sidecar_narrowing_destination_rule_only_filtered_in_own_namespace() {
-        // DestinationRule narrowing is paired with the namespace pre-filter:
-        // only rules in the workload's namespace ever reach the slice, then
-        // the egress pattern filters by the rule host's target namespace. This
-        // locks in the current contract for future code reviews.
+    fn sidecar_narrowing_admits_cross_namespace_services_and_destination_rules() {
+        // `beta/*` should admit beta services and DestinationRules when Sidecar
+        // enforcement is enabled. This mirrors ServiceEntry behavior and keeps
+        // Istio namespace-scoped egress patterns from becoming silently inert.
         let mesh = MeshConfig {
             sidecars: vec![make_sidecar(
-                "alpha-only",
+                "beta-egress",
                 "alpha",
                 None,
-                vec![vec!["./reviews"]],
+                vec![vec!["beta/*"]],
             )],
+            services: vec![
+                make_service("alpha", "reviews"),
+                make_service("beta", "checkout"),
+                make_service("gamma", "payments"),
+            ],
             destination_rules: vec![
                 MeshDestinationRule {
                     name: "alpha-reviews-dr".into(),
@@ -3583,17 +3610,17 @@ mod tests {
                     subsets: Vec::new(),
                 },
                 MeshDestinationRule {
-                    name: "alpha-other-dr".into(),
-                    namespace: "alpha".into(),
-                    host: "other".into(),
+                    name: "beta-checkout-dr".into(),
+                    namespace: "beta".into(),
+                    host: "checkout".into(),
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
                 },
                 MeshDestinationRule {
-                    name: "beta-reviews-dr".into(),
-                    namespace: "beta".into(),
-                    host: "reviews".into(),
+                    name: "gamma-payments-dr".into(),
+                    namespace: "gamma".into(),
+                    host: "payments".into(),
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
@@ -3603,7 +3630,10 @@ mod tests {
         };
         let config = config_with_mesh(mesh);
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.services.len(), 1);
+        assert_eq!(slice.services[0].namespace, "beta");
+        assert_eq!(slice.services[0].name, "checkout");
         assert_eq!(slice.destination_rules.len(), 1);
-        assert_eq!(slice.destination_rules[0].name, "alpha-reviews-dr");
+        assert_eq!(slice.destination_rules[0].name, "beta-checkout-dr");
     }
 }

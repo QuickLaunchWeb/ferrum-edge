@@ -84,13 +84,94 @@ pub struct MeshGrpcServer {
     cluster_domain: String,
 }
 
+pub struct MeshGrpcServerBuilder {
+    config: Arc<ArcSwap<GatewayConfig>>,
+    jwt_secret: String,
+    channel_capacity: usize,
+    registry: Arc<MeshNodeRegistry>,
+    expected_issuer: String,
+    namespace: String,
+    sidecar_enforced: bool,
+    cluster_domain: String,
+}
+
+impl MeshGrpcServerBuilder {
+    fn new(config: Arc<ArcSwap<GatewayConfig>>, jwt_secret: String) -> Self {
+        Self {
+            config,
+            jwt_secret,
+            channel_capacity: 128,
+            registry: Arc::new(MeshNodeRegistry::new()),
+            expected_issuer: DEFAULT_CP_DP_JWT_ISSUER.to_string(),
+            namespace: default_namespace(),
+            sidecar_enforced: false,
+            cluster_domain: crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
+        }
+    }
+
+    pub fn channel_capacity(mut self, channel_capacity: usize) -> Self {
+        self.channel_capacity = channel_capacity;
+        self
+    }
+
+    pub fn registry(mut self, registry: Arc<MeshNodeRegistry>) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    pub fn expected_issuer(mut self, expected_issuer: String) -> Self {
+        self.expected_issuer = expected_issuer;
+        self
+    }
+
+    pub fn namespace(mut self, namespace: String) -> Self {
+        self.namespace = namespace;
+        self
+    }
+
+    pub fn sidecar_enforced(mut self, sidecar_enforced: bool) -> Self {
+        self.sidecar_enforced = sidecar_enforced;
+        self
+    }
+
+    pub fn cluster_domain(mut self, cluster_domain: String) -> Self {
+        self.cluster_domain = cluster_domain;
+        self
+    }
+
+    pub fn build(self) -> (MeshGrpcServer, broadcast::Sender<MeshConfigBroadcast>) {
+        let (tx, _) = broadcast::channel(self.channel_capacity.max(1));
+        let tx_clone = tx.clone();
+        (
+            MeshGrpcServer {
+                config: self.config,
+                jwt_secret: self.jwt_secret,
+                expected_issuer: self.expected_issuer,
+                mesh_update_tx: tx,
+                registry: self.registry,
+                namespace: self.namespace,
+                sidecar_enforced: self.sidecar_enforced,
+                cluster_domain: self.cluster_domain,
+            },
+            tx_clone,
+        )
+    }
+}
+
 impl MeshGrpcServer {
+    pub fn builder(
+        config: Arc<ArcSwap<GatewayConfig>>,
+        jwt_secret: String,
+    ) -> MeshGrpcServerBuilder {
+        MeshGrpcServerBuilder::new(config, jwt_secret)
+    }
+
     #[allow(dead_code)]
     pub fn new(
         config: Arc<ArcSwap<GatewayConfig>>,
         jwt_secret: String,
     ) -> (Self, broadcast::Sender<MeshConfigBroadcast>) {
-        Self::with_channel_capacity(config, jwt_secret, 128)
+        Self::builder(config, jwt_secret).build()
     }
 
     #[allow(dead_code)]
@@ -99,16 +180,12 @@ impl MeshGrpcServer {
         jwt_secret: String,
         channel_capacity: usize,
     ) -> (Self, broadcast::Sender<MeshConfigBroadcast>) {
-        Self::with_channel_capacity_registry_issuer_and_namespace(
-            config,
-            jwt_secret,
-            channel_capacity,
-            Arc::new(MeshNodeRegistry::new()),
-            DEFAULT_CP_DP_JWT_ISSUER.to_string(),
-            default_namespace(),
-        )
+        Self::builder(config, jwt_secret)
+            .channel_capacity(channel_capacity)
+            .build()
     }
 
+    #[allow(dead_code)]
     pub fn with_channel_capacity_registry_issuer_and_namespace(
         config: Arc<ArcSwap<GatewayConfig>>,
         jwt_secret: String,
@@ -117,43 +194,15 @@ impl MeshGrpcServer {
         expected_issuer: String,
         namespace: String,
     ) -> (Self, broadcast::Sender<MeshConfigBroadcast>) {
-        Self::with_channel_capacity_registry_issuer_namespace_and_sidecar(
-            config,
-            jwt_secret,
-            channel_capacity,
-            registry,
-            expected_issuer,
-            namespace,
-            false,
-        )
+        Self::builder(config, jwt_secret)
+            .channel_capacity(channel_capacity)
+            .registry(registry)
+            .expected_issuer(expected_issuer)
+            .namespace(namespace)
+            .build()
     }
 
-    pub fn with_channel_capacity_registry_issuer_namespace_and_sidecar(
-        config: Arc<ArcSwap<GatewayConfig>>,
-        jwt_secret: String,
-        channel_capacity: usize,
-        registry: Arc<MeshNodeRegistry>,
-        expected_issuer: String,
-        namespace: String,
-        sidecar_enforced: bool,
-    ) -> (Self, broadcast::Sender<MeshConfigBroadcast>) {
-        let (tx, _) = broadcast::channel(channel_capacity.max(1));
-        let tx_clone = tx.clone();
-        (
-            Self {
-                config,
-                jwt_secret,
-                expected_issuer,
-                mesh_update_tx: tx,
-                registry,
-                namespace,
-                sidecar_enforced,
-                cluster_domain: crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
-            },
-            tx_clone,
-        )
-    }
-
+    #[allow(dead_code)]
     pub fn with_cluster_domain(mut self, cluster_domain: String) -> Self {
         self.cluster_domain = cluster_domain;
         self

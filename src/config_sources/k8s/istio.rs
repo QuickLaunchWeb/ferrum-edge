@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -69,7 +69,8 @@ pub(super) fn translate(
             Ok(true)
         }
         "Sidecar" => {
-            acc.mesh.sidecars.push(sidecar(object)?);
+            let sidecar = sidecar(acc, object)?;
+            acc.mesh.sidecars.push(sidecar);
             Ok(true)
         }
         "Telemetry" => {
@@ -383,7 +384,14 @@ fn peer_authentication(
 /// are deliberately not translated yet — egress scoping is the immediate
 /// compatibility gap; the other surfaces stay in the documented "deferred"
 /// table until separate PRs land them.
-fn sidecar(object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
+fn sidecar(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
+    if object.metadata.namespace == acc.options.istio_root_namespace {
+        acc.warnings.push(format!(
+            "Sidecar {}/{} is in the Istio root namespace '{}', but Ferrum Sidecar egress scoping is namespace-local today; it will not act as a mesh-wide default",
+            object.metadata.namespace, object.metadata.name, acc.options.istio_root_namespace
+        ));
+    }
+
     let workload_selector = match object.spec.get("workloadSelector") {
         Some(selector_value) => {
             let labels = selector_from_istio(Some(selector_value));
@@ -401,6 +409,7 @@ fn sidecar(object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
 
     let mut egress = Vec::new();
     let mut egress_inherits_defaults = false;
+    let mut port_scopes = BTreeSet::new();
     match object.spec.get("egress") {
         None => {
             // Istio: omitted egress inherits the namespace default outbound
@@ -450,9 +459,19 @@ fn sidecar(object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
                     )?,
                     None => None,
                 };
+                if let Some(port) = port {
+                    port_scopes.insert(port);
+                }
                 egress.push(MeshSidecarEgress { hosts, port });
             }
         }
+    }
+
+    if !port_scopes.is_empty() {
+        acc.warnings.push(format!(
+            "Sidecar {}/{} uses egress port scoping {:?}, but Ferrum currently narrows Sidecar egress by host only; the port field is parsed and preserved but not enforced",
+            object.metadata.namespace, object.metadata.name, port_scopes
+        ));
     }
 
     Ok(MeshSidecar {
@@ -7197,13 +7216,20 @@ mod tests {
         )
         .expect("translation succeeds");
 
-        // Sidecar must NOT produce the Phase-D warning.
+        // Sidecar must NOT produce the old Phase-D warning. Port scoping is
+        // parsed but not enforced yet, so that unsupported field gets a focused
+        // warning instead.
         assert!(
-            !result
+            !result.warnings.iter().any(|w| w.contains("Phase D")),
+            "Sidecar translation must not emit the deferred warning; warnings = {:?}",
+            result.warnings
+        );
+        assert!(
+            result
                 .warnings
                 .iter()
-                .any(|w| w.contains("Phase D") || w.contains("Sidecar")),
-            "Sidecar translation must not emit the deferred warning; warnings = {:?}",
+                .any(|w| { w.contains("egress port scoping") && w.contains("host only") }),
+            "Sidecar egress port should emit a host-only warning; warnings = {:?}",
             result.warnings
         );
 
@@ -7295,6 +7321,31 @@ mod tests {
         assert!(
             result.warnings.is_empty(),
             "valid Sidecar must produce no warnings; got {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn sidecar_in_root_namespace_emits_scope_warning() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "egress": [
+                        {"hosts": ["*/*"]}
+                    ]
+                }),
+            )],
+            options().with_istio_root_namespace("default".to_string()),
+        )
+        .expect("translation succeeds");
+
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| { w.contains("root namespace") && w.contains("namespace-local") }),
+            "root namespace Sidecar should emit scope warning; got {:?}",
             result.warnings
         );
     }

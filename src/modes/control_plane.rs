@@ -189,17 +189,14 @@ pub async fn run(
             env_config.namespace.clone(),
         );
     let (mesh_grpc_server, mesh_update_tx) =
-        MeshGrpcServer::with_channel_capacity_registry_issuer_namespace_and_sidecar(
-            config_arc.clone(),
-            grpc_secret.clone(),
-            env_config.cp_broadcast_channel_capacity,
-            mesh_registry.clone(),
-            env_config.cp_dp_grpc_jwt_issuer.clone(),
-            env_config.namespace.clone(),
-            env_config.mesh_sidecar_enforced,
-        );
-    let mesh_grpc_server =
-        mesh_grpc_server.with_cluster_domain(env_config.k8s_cluster_domain.clone());
+        MeshGrpcServer::builder(config_arc.clone(), grpc_secret.clone())
+            .channel_capacity(env_config.cp_broadcast_channel_capacity)
+            .registry(mesh_registry.clone())
+            .expected_issuer(env_config.cp_dp_grpc_jwt_issuer.clone())
+            .namespace(env_config.namespace.clone())
+            .sidecar_enforced(env_config.mesh_sidecar_enforced)
+            .cluster_domain(env_config.k8s_cluster_domain.clone())
+            .build();
     let xds_server = if env_config.xds_enabled {
         info!("FERRUM_XDS_ENABLED=true — mounting xDS ADS on the CP gRPC listener");
         Some(

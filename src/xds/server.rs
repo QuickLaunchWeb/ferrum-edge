@@ -1255,7 +1255,9 @@ fn should_send_delta_response(
 mod tests {
     use super::*;
     use crate::config::db_loader::IncrementalResult;
-    use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+    use crate::modes::mesh::config::{
+        AppProtocol, MeshConfig, MeshService, MeshSidecar, MeshSidecarEgress, ServicePort,
+    };
     use chrono::{TimeZone, Utc};
     use prost::Message;
 
@@ -1335,6 +1337,18 @@ mod tests {
             .collect()
     }
 
+    fn snapshot_cluster_names(snapshot: &XdsSnapshot) -> Vec<String> {
+        snapshot
+            .resources(super::super::translator::CDS_TYPE_URL)
+            .iter()
+            .map(|resource| {
+                super::super::proto::Cluster::decode(resource.value.as_slice())
+                    .expect("cluster resource should decode")
+                    .name
+            })
+            .collect()
+    }
+
     fn empty_delta(version_second: u32) -> IncrementalResult {
         IncrementalResult {
             added_or_modified_proxies: Vec::new(),
@@ -1390,6 +1404,22 @@ mod tests {
         )
     }
 
+    fn test_server_with_sidecar_enforcement(
+        config: GatewayConfig,
+        sidecar_enforced: bool,
+    ) -> XdsAdsServer {
+        let (tx, _) = broadcast::channel(1);
+        XdsAdsServer::with_sidecar_enforcement(
+            Arc::new(ArcSwap::from_pointee(config)),
+            tx,
+            "x".repeat(32),
+            "issuer".to_string(),
+            "default".to_string(),
+            32,
+            sidecar_enforced,
+        )
+    }
+
     fn cds_subscription() -> HashMap<String, XdsSubscription> {
         HashMap::from([(
             super::super::translator::CDS_TYPE_URL.to_string(),
@@ -1414,6 +1444,36 @@ mod tests {
         );
         assert!(resolve_stream_node_id(Some("node-a"), Some("node-a".to_string())).is_ok());
         assert!(resolve_stream_node_id(Some("node-a"), Some("node-b".to_string())).is_err());
+    }
+
+    #[test]
+    fn xds_sidecar_enforcement_filters_snapshot_services() {
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![mesh_service("api"), mesh_service("checkout")],
+                sidecars: vec![MeshSidecar {
+                    name: "default-scope".to_string(),
+                    namespace: "default".to_string(),
+                    workload_selector: None,
+                    egress_inherits_defaults: false,
+                    egress: vec![MeshSidecarEgress {
+                        hosts: vec!["./api".to_string()],
+                        port: None,
+                    }],
+                }],
+                ..MeshConfig::default()
+            })),
+            loaded_at: Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap(),
+            ..GatewayConfig::default()
+        };
+        let server = test_server_with_sidecar_enforcement(config.clone(), true);
+
+        let snapshot = server.snapshot_for_config("xds-node", &config);
+
+        assert_eq!(
+            snapshot_cluster_names(&snapshot),
+            vec!["cluster/default/api/8080".to_string()]
+        );
     }
 
     #[test]
