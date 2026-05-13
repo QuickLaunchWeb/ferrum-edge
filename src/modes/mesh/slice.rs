@@ -214,7 +214,6 @@ impl MeshSlice {
 
         let namespace = request.namespace.clone();
         let cluster_domain = request.cluster_domain.clone();
-        let mesh_service_identities = mesh_service_identities(mesh);
         let workloads: Vec<Workload> = mesh
             .workloads
             .iter()
@@ -236,8 +235,6 @@ impl MeshSlice {
         } else {
             request.labels.clone()
         };
-        let service_entry_hosts =
-            visible_service_entry_hosts(mesh, effective_namespace, &effective_labels);
 
         // Resolve the effective applicable Sidecar egress scope for this
         // workload. The returned scope is used downstream to narrow `services`,
@@ -255,6 +252,20 @@ impl MeshSlice {
             )
         } else {
             None
+        };
+
+        // Sidecar-only indexes: skip the full scan over `mesh.services` and
+        // `mesh.service_entries` when no Sidecar applies (default-off feature,
+        // or an enforced workload that no Sidecar resource targets). The
+        // destination-rules filter is the only consumer and short-circuits
+        // before reading these when `applicable_sidecar` is `None`.
+        let (mesh_service_identities, service_entry_hosts) = if applicable_sidecar.is_some() {
+            (
+                mesh_service_identities(mesh),
+                visible_service_entry_hosts(mesh, effective_namespace, &effective_labels),
+            )
+        } else {
+            (BTreeSet::new(), BTreeSet::new())
         };
 
         let services: Vec<MeshService> = mesh
