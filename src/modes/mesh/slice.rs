@@ -213,7 +213,6 @@ impl MeshSlice {
         let namespace = request.namespace.clone();
         let cluster_domain = request.cluster_domain.clone();
         let mesh_service_identities = mesh_service_identities(mesh);
-        let service_entry_hosts = service_entry_hosts(mesh);
         let workloads: Vec<Workload> = mesh
             .workloads
             .iter()
@@ -235,6 +234,8 @@ impl MeshSlice {
         } else {
             request.labels.clone()
         };
+        let service_entry_hosts =
+            visible_service_entry_hosts(mesh, effective_namespace, &effective_labels);
 
         // Resolve the effective applicable Sidecar egress scope for this
         // workload. The returned scope is used downstream to narrow `services`,
@@ -407,9 +408,16 @@ fn mesh_service_identities(mesh: &MeshConfig) -> BTreeSet<(String, String)> {
     identities
 }
 
-fn service_entry_hosts(mesh: &MeshConfig) -> BTreeSet<String> {
+fn visible_service_entry_hosts<L: WorkloadLabels + ?Sized>(
+    mesh: &MeshConfig,
+    workload_namespace: &str,
+    workload_labels: &L,
+) -> BTreeSet<String> {
     let mut hosts = BTreeSet::new();
     for entry in &mesh.service_entries {
+        if !service_entry_applies_to_workload(entry, workload_namespace, workload_labels) {
+            continue;
+        }
         for host in &entry.hosts {
             let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
             if !host.is_empty() {
@@ -3097,6 +3105,37 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
         assert_eq!(slice.destination_rules.len(), 1);
         assert_eq!(slice.destination_rules[0].name, "external-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_ignores_invisible_service_entry_host_for_destination_rule_scope() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["beta/*"]],
+            )],
+            service_entries: vec![make_se_with_host(
+                "private-foo",
+                "beta",
+                "foo.beta.svc",
+                vec![".".into()],
+            )],
+            destination_rules: vec![MeshDestinationRule {
+                name: "beta-foo-dr".into(),
+                namespace: "alpha".into(),
+                host: "foo.beta.svc".into(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "beta-foo-dr");
     }
 
     #[test]
