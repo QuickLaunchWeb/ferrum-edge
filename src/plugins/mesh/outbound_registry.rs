@@ -17,9 +17,9 @@
 //!   outbound traffic bypasses this plugin entirely. Operators relying on
 //!   REGISTRY_ONLY for stream-protocol egress need additional controls
 //!   (capture exclusions, ServiceEntry materialization).
-//! - `Host` header is split into `host` and optional `:port`. The matcher
-//!   checks both `host` and `host:port` against the registry so operators
-//!   can register either form.
+//! - `Host` header is split into `host` and optional `:port`. Requests with
+//!   no explicit port match bare registry hosts; requests with an explicit
+//!   port must match the same `host:port` registry entry.
 //! - Mesh-internal service-cluster-local hostnames are matched as-is; the
 //!   registry-build helper records the short, namespace-qualified, `.svc`,
 //!   and FQDN forms.
@@ -89,8 +89,8 @@ fn default_reject_status() -> u16 {
 #[derive(Debug)]
 pub struct OutboundRegistry {
     /// Bare-hostname entries from the operator-supplied registry, normalised
-    /// to ASCII-lowercase at construction. A request matches if its Host
-    /// header (port stripped) is present here, regardless of port.
+    /// to ASCII-lowercase at construction. A request matches these only when
+    /// its Host header does not carry an explicit port.
     hosts: HashSet<String>,
     /// `host:port` entries from the operator-supplied registry. A request
     /// matches only when its Host header carries the same `host:port` pair.
@@ -185,14 +185,9 @@ impl OutboundRegistry {
             if buf.is_empty() {
                 return false;
             }
-            if self.hosts.contains(buf.as_str()) {
-                return true;
-            }
-            if wildcard_suffix_matches_any(buf.as_str(), &self.wildcard_suffixes) {
-                return true;
-            }
             let Some(port) = port else {
-                return false;
+                return self.hosts.contains(buf.as_str())
+                    || wildcard_suffix_matches_any(buf.as_str(), &self.wildcard_suffixes);
             };
             if self
                 .wildcard_port_suffixes
@@ -419,7 +414,7 @@ mod tests {
     fn host_only_match() {
         let plugin = registry_plugin(&["reviews.default.svc.cluster.local"]);
         assert!(plugin.contains("reviews.default.svc.cluster.local", None));
-        assert!(plugin.contains("reviews.default.svc.cluster.local", Some(8080)));
+        assert!(!plugin.contains("reviews.default.svc.cluster.local", Some(8080)));
         assert!(!plugin.contains("ratings.default.svc.cluster.local", None));
     }
 
@@ -443,14 +438,14 @@ mod tests {
     fn trailing_dot_match() {
         let plugin = registry_plugin(&["Reviews.Default.Svc.Cluster.Local."]);
         assert!(plugin.contains("reviews.default.svc.cluster.local", None));
-        assert!(plugin.contains("reviews.default.svc.cluster.local.", Some(8080)));
+        assert!(!plugin.contains("reviews.default.svc.cluster.local.", Some(8080)));
     }
 
     #[test]
     fn wildcard_host_matches_one_label() {
         let plugin = registry_plugin(&["*.example.com"]);
         assert!(plugin.contains("api.example.com", None));
-        assert!(plugin.contains("API.EXAMPLE.COM.", Some(443)));
+        assert!(!plugin.contains("API.EXAMPLE.COM.", Some(443)));
         assert!(!plugin.contains("example.com", None));
         assert!(!plugin.contains("a.b.example.com", None));
     }
@@ -469,7 +464,7 @@ mod tests {
         let plugin = registry_plugin(&["2001:db8::1"]);
         assert!(plugin.contains("[2001:db8::1]", None));
         assert!(plugin.contains("[2001:0DB8::1]", None));
-        assert!(plugin.contains("[2001:db8::1]", Some(8080)));
+        assert!(!plugin.contains("[2001:db8::1]", Some(8080)));
         assert!(!is_host_port_entry("2001:db8::1"));
     }
 
@@ -563,7 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn passes_known_destination() {
-        let plugin = registry_plugin(&["reviews.svc"]);
+        let plugin = registry_plugin(&["reviews.svc:9090"]);
         let mut ctx = RequestContext::new(
             "127.0.0.1".to_string(),
             "GET".to_string(),
@@ -649,13 +644,13 @@ mod tests {
     fn lookup_avoids_alloc_on_already_lowercase_host() {
         // Smoke test the hot-path lookup with both buckets populated. The
         // important invariant is that bare-host registration matches any
-        // port (Istio REGISTRY_ONLY semantics) while host:port registration
-        // only matches the exact port.
+        // no-port Host header while host:port registration only matches the
+        // exact explicit port.
         let plugin = registry_plugin(&["reviews.svc", "tightly-bound:8080"]);
-        // Bare-host wildcards over port.
+        // Bare-host entries only match Host headers without an explicit port.
         assert!(plugin.contains("reviews.svc", None));
-        assert!(plugin.contains("reviews.svc", Some(80)));
-        assert!(plugin.contains("reviews.svc", Some(65535)));
+        assert!(!plugin.contains("reviews.svc", Some(80)));
+        assert!(!plugin.contains("reviews.svc", Some(65535)));
         // host:port is exact.
         assert!(plugin.contains("tightly-bound", Some(8080)));
         assert!(!plugin.contains("tightly-bound", Some(8081)));
