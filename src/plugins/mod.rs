@@ -633,8 +633,10 @@ impl RequestContext {
     }
 
     /// Materialize the raw query string into `self.query_params` without
-    /// percent-decoding. Used by HTTP/3 to preserve existing behavior where
-    /// query params are stored as raw strings.
+    /// percent-decoding.
+    ///
+    /// Most callers should prefer `materialize_query_params()` so plugins see
+    /// the same decoded values across HTTP protocol versions.
     pub fn materialize_query_params_raw(&mut self) {
         if let Some(raw) = self.raw_query_string.take() {
             for pair in raw.split('&') {

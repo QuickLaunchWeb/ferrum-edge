@@ -1073,9 +1073,10 @@ async fn handle_h3_request(
     }
     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
 
-    // Materialize query params before authentication (raw, no percent-decoding
-    // for HTTP/3 — preserves existing behavior).
-    ctx.materialize_query_params_raw();
+    // Materialize query params before authentication using the same
+    // percent-decoded representation as the H1/H2 path. Auth plugins and
+    // mesh_route_dispatch rules must not observe protocol-dependent values.
+    ctx.materialize_query_params();
 
     // Some auth plugins (for example `hmac_auth`) verify request body integrity
     // at authenticate time. Buffer the body before the auth phase runs so those

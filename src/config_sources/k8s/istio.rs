@@ -5578,6 +5578,42 @@ mod tests {
     }
 
     #[test]
+    fn virtual_service_method_match_preserves_exact_case() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "method": {"exact": "get"}
+                        }],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin should be emitted");
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules array");
+        let methods = rules[0]["match"]["methods"]
+            .as_array()
+            .expect("methods array");
+        assert_eq!(methods[0].as_str(), Some("get"));
+    }
+
+    #[test]
     fn virtual_service_uri_only_match_does_not_emit_plugin() {
         // URI-only matches still get the env-var path translated, but no
         // mesh_route_dispatch plugin is emitted because there are no

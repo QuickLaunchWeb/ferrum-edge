@@ -676,10 +676,7 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
         if let Some(method_obj) = entry.get("method").and_then(Value::as_object)
             && let Some(method) = method_obj.get("exact").and_then(Value::as_str)
         {
-            match_criteria.insert(
-                "methods".to_string(),
-                serde_json::json!([method.to_ascii_uppercase()]),
-            );
+            match_criteria.insert("methods".to_string(), serde_json::json!([method]));
         }
 
         if let Some(headers_obj) = entry.get("headers").and_then(Value::as_object) {

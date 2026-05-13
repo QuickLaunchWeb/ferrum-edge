@@ -205,7 +205,7 @@ fn rule_matches(
         && !m
             .methods
             .iter()
-            .any(|method| ctx.method.eq_ignore_ascii_case(method))
+            .any(|method| ctx.method.as_str() == method.as_str())
     {
         return false;
     }
@@ -334,6 +334,27 @@ mod tests {
         let mut headers = HashMap::new();
         let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn method_match_is_case_sensitive() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["get"]},
+                "destination": {"upstream_id": "lowercase"}
+            }]
+        }))
+        .unwrap();
+
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+
+        let mut ctx = ctx_with("get", "/api");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("lowercase"));
     }
 
     #[tokio::test]
