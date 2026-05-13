@@ -1105,10 +1105,9 @@ pub enum OutboundTrafficPolicy {
     /// point with a configurable 4xx/5xx status (default 502).
     ///
     /// HTTP-family only: the gate relies on the `Host` header, so raw TCP
-    /// and UDP outbound traffic bypass this policy. When the
-    /// `MeshSidecar`-egress feature lands the slice's known-destinations
-    /// set narrows automatically (slice projection runs first), so no
-    /// changes are needed here at that time.
+    /// and UDP outbound traffic bypass this policy. The registry is built
+    /// from the already-projected mesh slice, so future slice-filtering
+    /// refinements naturally narrow the allowed destination set.
     RegistryOnly,
 }
 
