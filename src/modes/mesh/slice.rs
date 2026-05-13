@@ -235,14 +235,19 @@ impl MeshSlice {
             request.labels.clone()
         };
 
-        // Resolve the most-specific applicable Sidecar for this workload. The
-        // returned reference is used downstream to narrow `services`,
+        // Resolve the effective applicable Sidecar egress scope for this
+        // workload. The returned scope is used downstream to narrow `services`,
         // `service_entries`, and `destination_rules`. Returns `None` when no
-        // Sidecar applies (behavior identical to today). The enforcement flag
-        // gates the entire narrowing pass so existing deployments see zero
+        // Sidecar applies or when the applicable Sidecar inherits system
+        // defaults with no namespace default to inherit from. The enforcement
+        // flag gates the entire narrowing pass so existing deployments see zero
         // behavior change unless `FERRUM_MESH_SIDECAR_ENFORCED=true`.
         let applicable_sidecar = if request.enforce_sidecar_egress {
-            resolve_applicable_sidecar(&mesh.sidecars, effective_namespace, &effective_labels)
+            resolve_applicable_sidecar_egress(
+                &mesh.sidecars,
+                effective_namespace,
+                &effective_labels,
+            )
         } else {
             None
         };
@@ -259,7 +264,8 @@ impl MeshSlice {
                         let host_refs: Vec<&str> =
                             host_candidates.iter().map(String::as_str).collect();
                         sidecar_egress_includes_service(
-                            sidecar,
+                            sidecar.namespace,
+                            sidecar.egress,
                             service.namespace.as_str(),
                             &host_refs,
                         )
@@ -300,7 +306,8 @@ impl MeshSlice {
                     .map(|sidecar| {
                         let host_strs: Vec<&str> = entry.hosts.iter().map(String::as_str).collect();
                         sidecar_egress_includes_service(
-                            sidecar,
+                            sidecar.namespace,
+                            sidecar.egress,
                             entry.namespace.as_str(),
                             &host_strs,
                         )
@@ -337,7 +344,12 @@ impl MeshSlice {
                         );
                         let host_refs: Vec<&str> =
                             host_candidates.iter().map(String::as_str).collect();
-                        sidecar_egress_includes_service(sidecar, &resource_namespace, &host_refs)
+                        sidecar_egress_includes_service(
+                            sidecar.namespace,
+                            sidecar.egress,
+                            &resource_namespace,
+                            &host_refs,
+                        )
                     })
                     .unwrap_or(true)
             })
@@ -495,11 +507,11 @@ fn split_service_host(host: &str) -> Option<(&str, &str)> {
 /// namespace, mirroring Istio behavior.
 ///
 /// Returns `None` if no Sidecar in `sidecars` applies to the workload.
-fn resolve_applicable_sidecar<'a, L: WorkloadLabels + ?Sized>(
+fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
     sidecars: &'a [MeshSidecar],
     workload_namespace: &str,
     workload_labels: &L,
-) -> Option<&'a MeshSidecar> {
+) -> Option<ResolvedSidecarEgress<'a>> {
     // Collect all matching sidecars per tier, then pick the ASCII-smallest
     // `name` as a deterministic tiebreak. Translator emission order is not
     // a stable input — two equally-applicable Sidecars in the same tier must
@@ -533,7 +545,30 @@ fn resolve_applicable_sidecar<'a, L: WorkloadLabels + ?Sized>(
         }
     }
 
-    workload_scoped.or(namespace_default)
+    let selected = workload_scoped.or(namespace_default)?;
+    if selected.egress_inherits_defaults {
+        if let Some(namespace_default) = namespace_default
+            && !std::ptr::eq(selected, namespace_default)
+            && !namespace_default.egress_inherits_defaults
+        {
+            return Some(ResolvedSidecarEgress {
+                namespace: namespace_default.namespace.as_str(),
+                egress: &namespace_default.egress,
+            });
+        }
+        return None;
+    }
+
+    Some(ResolvedSidecarEgress {
+        namespace: selected.namespace.as_str(),
+        egress: &selected.egress,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedSidecarEgress<'a> {
+    namespace: &'a str,
+    egress: &'a [MeshSidecarEgress],
 }
 
 /// Returns `true` when the Sidecar's egress scope admits a resource whose
@@ -549,22 +584,23 @@ fn resolve_applicable_sidecar<'a, L: WorkloadLabels + ?Sized>(
 /// explicit empty egress list this way. An empty `host_candidates` slice
 /// (defensive only — call sites always pass at least one) returns `false`.
 fn sidecar_egress_includes_service(
-    sidecar: &MeshSidecar,
+    sidecar_namespace: &str,
+    sidecar_egress: &[MeshSidecarEgress],
     resource_namespace: &str,
     host_candidates: &[&str],
 ) -> bool {
-    if sidecar.egress.is_empty() {
+    if sidecar_egress.is_empty() {
         // Istio: a Sidecar with no egress entries scopes traffic to nothing.
         return false;
     }
     if host_candidates.is_empty() {
         return false;
     }
-    sidecar.egress.iter().any(|egress_entry| {
+    sidecar_egress.iter().any(|egress_entry| {
         egress_entry.hosts.iter().any(|raw_pattern| {
             sidecar_host_pattern_matches(
                 MeshSidecarEgress::parse_host_pattern(raw_pattern),
-                &sidecar.namespace,
+                sidecar_namespace,
                 resource_namespace,
                 host_candidates,
             )
@@ -2399,6 +2435,7 @@ mod tests {
             name: name.into(),
             namespace: namespace.into(),
             workload_selector,
+            egress_inherits_defaults: false,
             egress: egress_hosts
                 .into_iter()
                 .map(|hosts| MeshSidecarEgress {
@@ -2406,6 +2443,20 @@ mod tests {
                     port: None,
                 })
                 .collect(),
+        }
+    }
+
+    fn make_inheriting_sidecar(
+        name: &str,
+        namespace: &str,
+        workload_selector: WorkloadSelector,
+    ) -> MeshSidecar {
+        MeshSidecar {
+            name: name.into(),
+            namespace: namespace.into(),
+            workload_selector: Some(workload_selector),
+            egress_inherits_defaults: true,
+            egress: Vec::new(),
         }
     }
 
@@ -2976,15 +3027,97 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_omitted_egress_inherits_namespace_default_scope() {
+        let mesh = MeshConfig {
+            sidecars: vec![
+                make_sidecar(
+                    "ns-default",
+                    "alpha",
+                    None,
+                    vec![vec!["./reviews.alpha.svc.cluster.local"]],
+                ),
+                make_inheriting_sidecar(
+                    "frontend-ingress-only",
+                    "alpha",
+                    WorkloadSelector {
+                        labels: HashMap::from([("app".into(), "frontend".into())]),
+                        namespace: Some("alpha".into()),
+                    },
+                ),
+            ],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews",
+                    "alpha",
+                    "reviews.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "checkout",
+                    "alpha",
+                    "checkout.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let labels = BTreeMap::from([("app".into(), "frontend".into())]);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_labels("alpha", labels),
+        );
+        assert_eq!(slice.service_entries.len(), 1);
+        assert_eq!(slice.service_entries[0].name, "reviews");
+    }
+
+    #[test]
+    fn sidecar_omitted_egress_without_namespace_default_is_noop() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_inheriting_sidecar(
+                "frontend-ingress-only",
+                "alpha",
+                WorkloadSelector {
+                    labels: HashMap::from([("app".into(), "frontend".into())]),
+                    namespace: Some("alpha".into()),
+                },
+            )],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews",
+                    "alpha",
+                    "reviews.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "checkout",
+                    "alpha",
+                    "checkout.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let labels = BTreeMap::from([("app".into(), "frontend".into())]);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_labels("alpha", labels),
+        );
+        assert_eq!(slice.service_entries.len(), 2);
+    }
+
+    #[test]
     fn sidecar_with_empty_egress_blocks_everything() {
         // Native/file MeshSidecar with an explicit empty egress list trims all
-        // egress config. The Kubernetes translator maps omitted spec.egress to
-        // `*/*` before it reaches this model.
+        // egress config. Kubernetes omitted spec.egress sets
+        // `egress_inherits_defaults` instead.
         let mesh = MeshConfig {
             sidecars: vec![MeshSidecar {
                 name: "block-all".into(),
                 namespace: "alpha".into(),
                 workload_selector: None,
+                egress_inherits_defaults: false,
                 egress: Vec::new(),
             }],
             service_entries: vec![make_se_with_host(
@@ -3228,6 +3361,7 @@ mod tests {
                 name: "two-clauses".into(),
                 namespace: "alpha".into(),
                 workload_selector: None,
+                egress_inherits_defaults: false,
                 egress: vec![
                     MeshSidecarEgress {
                         hosts: vec!["./reviews".into()],

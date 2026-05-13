@@ -570,6 +570,7 @@ mod tests {
             name: "default-sc".to_string(),
             namespace: "alpha".to_string(),
             workload_selector: None,
+            egress_inherits_defaults: false,
             egress: vec![MeshSidecarEgress {
                 hosts: vec!["./reviews".to_string()],
                 port: None,

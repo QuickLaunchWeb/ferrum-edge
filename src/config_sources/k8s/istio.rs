@@ -400,15 +400,13 @@ fn sidecar(object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
     };
 
     let mut egress = Vec::new();
+    let mut egress_inherits_defaults = false;
     match object.spec.get("egress") {
         None => {
-            // Istio: omitted egress inherits/system-detects the outbound
-            // defaults. Encode that as allow-all so an ingress-only Sidecar
-            // does not accidentally narrow every resource out of the slice.
-            egress.push(MeshSidecarEgress {
-                hosts: vec!["*/*".to_string()],
-                port: None,
-            });
+            // Istio: omitted egress inherits the namespace default outbound
+            // scope. Keep it distinct from an explicit empty `egress: []`,
+            // which means block all.
+            egress_inherits_defaults = true;
         }
         Some(raw_egress) => {
             let entries = raw_egress
@@ -439,6 +437,7 @@ fn sidecar(object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
         workload_selector,
+        egress_inherits_defaults,
         egress,
     })
 }
@@ -7200,6 +7199,7 @@ mod tests {
             Some("frontend")
         );
         assert_eq!(selector.namespace.as_deref(), Some("default"));
+        assert!(!sc.egress_inherits_defaults);
         assert_eq!(sc.egress.len(), 1);
         assert_eq!(
             sc.egress[0].hosts,
@@ -7229,6 +7229,7 @@ mod tests {
         let mesh = result.config.mesh.expect("mesh config");
         assert_eq!(mesh.sidecars.len(), 1);
         assert!(mesh.sidecars[0].workload_selector.is_none());
+        assert!(!mesh.sidecars[0].egress_inherits_defaults);
         assert_eq!(mesh.sidecars[0].egress[0].port, None);
     }
 
@@ -7250,9 +7251,8 @@ mod tests {
 
         let mesh = result.config.mesh.expect("mesh config");
         assert_eq!(mesh.sidecars.len(), 1);
-        assert_eq!(mesh.sidecars[0].egress.len(), 1);
-        assert_eq!(mesh.sidecars[0].egress[0].hosts, vec!["*/*".to_string()]);
-        assert_eq!(mesh.sidecars[0].egress[0].port, None);
+        assert!(mesh.sidecars[0].egress_inherits_defaults);
+        assert!(mesh.sidecars[0].egress.is_empty());
     }
 
     #[test]

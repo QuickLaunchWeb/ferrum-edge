@@ -817,6 +817,11 @@ pub struct MeshSidecar {
     /// Empty / `None` = namespace-default; non-empty = workload-scoped via labels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_selector: Option<WorkloadSelector>,
+    /// `true` when Kubernetes `spec.egress` was omitted and the Sidecar should
+    /// inherit the namespace default outbound scope instead of treating the
+    /// empty `egress` vector as an explicit block-all policy.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub egress_inherits_defaults: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<MeshSidecarEgress>,
 }
