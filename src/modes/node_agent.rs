@@ -506,6 +506,28 @@ async fn handle_fallback(
     probe: &KernelProbeResult,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
 ) -> Result<(), anyhow::Error> {
+    handle_fallback_with(config, probe, shutdown_tx, |cmds, phase| async move {
+        execute_iptables_commands(&cmds, phase).await
+    })
+    .await
+}
+
+/// Test seam for [`handle_fallback`]. The production path passes
+/// `execute_iptables_commands` (real `sh -c`); the unit test passes a no-op
+/// closure so it can assert the control flow (setup → wait → cleanup) without
+/// spawning ~11 subprocesses, which (a) is wall-clock expensive on a loaded
+/// CI box and (b) drags real-time scheduling into a test that should be
+/// purely deterministic.
+async fn handle_fallback_with<F, Fut>(
+    config: &NodeAgentConfig,
+    probe: &KernelProbeResult,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    mut execute: F,
+) -> Result<(), anyhow::Error>
+where
+    F: FnMut(Vec<String>, &'static str) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     match config.fallback_mode {
         FallbackMode::Iptables => {
             warn!(
@@ -517,7 +539,7 @@ async fn handle_fallback(
             );
 
             let plan = IptablesPlan::for_config(&config.capture_config);
-            execute_iptables_commands(&plan.commands, "setup").await;
+            execute(plan.commands, "setup").await;
 
             info!("Iptables fallback rules applied, awaiting shutdown signal");
 
@@ -525,7 +547,7 @@ async fn handle_fallback(
 
             info!("Shutdown signal received, cleaning up iptables rules");
             let cleanup = IptablesPlan::cleanup_commands();
-            execute_iptables_commands(&cleanup, "cleanup").await;
+            execute(cleanup, "cleanup").await;
 
             Ok(())
         }
@@ -715,19 +737,21 @@ mod tests {
         assert!(backend.cleaned_up);
     }
 
-    // Note: the iptables fallback executes `sh -c "iptables ..."` shell commands
-    // directly. On non-Linux (or Linux without `iptables` in PATH / without
-    // privilege) every command fails fast and the test verifies only that
-    // setup→shutdown→cleanup completes without panicking.
+    // Verifies handle_fallback's control flow (setup → wait → cleanup → Ok)
+    // without spawning real subprocesses. The earlier shape — invoking
+    // `handle_fallback` directly on non-Linux so each `sh -c iptables …`
+    // would fail fast — coupled a real-time sleep+signal race to ~11
+    // fork/exec calls. Under CI contention either the subprocess storm or
+    // the wall-clock race could push the test past its outer timeout.
     //
-    // Skipping on Linux avoids the failure mode where a developer or CI runner
-    // happens to have iptables installed AND root privileges (containers
-    // running as root, dev VMs) — in which case the test would mutate the
-    // host's real netfilter state. Cleanup runs on shutdown so normal
-    // termination self-recovers, but a panic mid-test would leave orphaned
-    // `FERRUM_MESH_*` chains in the `nat` table.
+    // This version uses `handle_fallback_with` to inject a no-op runner and
+    // pre-signals shutdown so `wait_for_shutdown`'s `borrow()` returns
+    // immediately. End-to-end: no I/O, no real-time dependency, no flake.
+    // The standalone `wait_for_shutdown_blocks_until_signal` test still
+    // exercises the blocking path, and `IptablesPlan` has its own coverage
+    // for command generation, so nothing of value is lost by mocking the
+    // executor here.
     #[tokio::test]
-    #[cfg(not(target_os = "linux"))]
     async fn handle_fallback_iptables_succeeds() {
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
@@ -743,23 +767,30 @@ mod tests {
             cgroup_v2_available: false,
             bpf_fs_available: false,
         };
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx
+            .send(true)
+            .expect("watch channel should be open");
 
-        let tx_clone = shutdown_tx.clone();
-        tokio::spawn(async move {
-            // Setup commands fail fast on non-Linux (no iptables binary), so the
-            // subscribe inside handle_fallback is reached well before this fires.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            tx_clone.send(true).ok();
-        });
+        let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let phases_for_runner = std::sync::Arc::clone(&phases);
 
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            handle_fallback(&config, &probe, &shutdown_tx),
+            std::time::Duration::from_secs(1),
+            handle_fallback_with(&config, &probe, &shutdown_tx, move |_, phase| {
+                let phases = std::sync::Arc::clone(&phases_for_runner);
+                async move {
+                    phases.lock().expect("phases mutex").push(phase);
+                }
+            }),
         )
         .await
         .expect("handle_fallback should complete within timeout");
         assert!(result.is_ok());
+        assert_eq!(
+            *phases.lock().expect("phases mutex"),
+            vec!["setup", "cleanup"]
+        );
     }
 
     #[test]
