@@ -538,7 +538,7 @@ pub struct EnvConfig {
     /// Default false (existing predicate-drop behavior). Operators turn this
     /// on to surface the predicates as a per-proxy plugin config — the
     /// override channel runs through `RequestContext.route_override_*` and
-    /// is applied to dispatch via `RequestContext::apply_route_overrides`.
+    /// is applied to dispatch after admission plugins have run.
     pub mesh_vs_header_routing_experimental: bool,
 
     // Kubernetes CRD controller (Layer 8)

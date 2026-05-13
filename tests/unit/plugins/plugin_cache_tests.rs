@@ -2494,6 +2494,60 @@ fn test_modifies_request_headers_flag_false_when_no_plugin_modifies() {
 }
 
 #[test]
+fn test_decoded_query_params_capability_preserved_with_priority_override() {
+    let mut plugin_config = make_plugin_config_with_json(
+        "ps1",
+        "mesh_route_dispatch",
+        json!({
+            "rules": [{
+                "match": {"query_params": {"variant": "beta"}},
+                "destination": {"upstream_id": "canary"}
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin_config.priority_override = Some(2990);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![plugin_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    assert!(
+        caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
+        "mesh_route_dispatch query-param rules must opt HTTP/3 into decoded query materialization"
+    );
+}
+
+#[test]
+fn test_decoded_query_params_capability_false_for_method_only_route_dispatch() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config_with_json(
+            "ps1",
+            "mesh_route_dispatch",
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "canary"}
+                }]
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    assert!(
+        !caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
+        "method/header-only route dispatch must preserve HTTP/3 raw query materialization"
+    );
+}
+
+#[test]
 fn test_requires_udp_datagram_hooks_flag_with_udp_rate_limiting() {
     // udp_rate_limiting returns true for requires_udp_datagram_hooks()
     let config = make_config(

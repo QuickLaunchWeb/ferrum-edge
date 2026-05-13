@@ -232,6 +232,8 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 
 `soap_ws_security` keeps AuthN-band priority 1500 for ordering, but validates SOAP bodies in `before_proxy` after request-body buffering is available.
 
+`mesh_route_dispatch` intentionally sits at priority 2995: authentication, `mesh_authz`, and rate limiting evaluate the original public proxy identity, then route overrides apply before request transformers, mirror/serverless/caching plugins, and backend dispatch. It cannot select a different `mesh_authz` policy scope. For WebSockets, the override selects only the upgrade handshake backend; the upgraded connection is pinned to that backend and frame hooks do not re-route individual frames.
+
 ## Complete Execution Order
 
 Given all built-in plugins enabled, the execution order is:
@@ -507,7 +509,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `ai_prompt_shield` | ✓ | ✓ | | | | Scans JSON request bodies for PII |
 | `ai_request_guard` | ✓ | ✓ | | | | Validates JSON request bodies |
 | `ai_federation` | ✓ | ✓ | | | | Routes to AI providers, normalizes responses |
-| `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; applies to all HTTP-family requests because Istio `VirtualService.http[]` covers HTTP/gRPC/WebSocket upgrades |
+| `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing |
 | `ai_token_metrics` | ✓ | ✓ | | | | Parses JSON response bodies for token usage |
 | `ai_rate_limiter` | ✓ | ✓ | | | | Parses JSON response bodies for token counts |
 | `ws_message_size_limiting` | | | ✓ | | | Enforces max frame size on WebSocket connections |

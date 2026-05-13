@@ -14,6 +14,15 @@
 //! lookup, circuit-breaker target key, and URL construction sees the
 //! effective destination.
 //!
+//! The plugin intentionally runs after authentication, authorization, and
+//! rate limiting. Those admission decisions use the public listener proxy
+//! identity; only downstream `before_proxy` plugins and backend dispatch see
+//! the effective override destination. WebSocket support applies to the
+//! HTTP upgrade handshake destination only — once upgraded, a WebSocket
+//! connection stays pinned to that backend and is not re-routed per frame.
+//! HBONE CONNECT traffic branches before `before_proxy`, so this plugin does
+//! not currently set route overrides for HBONE streams.
+//!
 //! ## Wire compatibility
 //!
 //! Old data planes that lack this plugin will receive a `create_plugin`
@@ -132,7 +141,7 @@ impl MeshRouteDispatch {
                 && port == 0
             {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}].destination.backend_port must be 1-65535"
+                    "mesh_route_dispatch.rules[{idx}].destination.backend_port must be non-zero"
                 ));
             }
             let has_backend_host = rule.destination.backend_host.is_some();
@@ -193,6 +202,13 @@ impl Plugin for MeshRouteDispatch {
         // Defaulting to HTTP-only would silently drop predicates for
         // gRPC and WS — the plugin would never run on those protocols.
         HTTP_FAMILY_PROTOCOLS
+    }
+
+    fn requires_decoded_query_params(&self) -> bool {
+        self.config
+            .rules
+            .iter()
+            .any(|rule| !rule.match_.query_params.is_empty())
     }
 
     async fn before_proxy(
@@ -354,7 +370,7 @@ mod tests {
             "rules": [{"match": {"methods": ["GET"]}, "destination": {"backend_port": 0}}]
         }))
         .unwrap_err();
-        assert!(err.contains("1-65535"), "got: {err}");
+        assert!(err.contains("non-zero"), "got: {err}");
     }
 
     #[test]
@@ -573,5 +589,29 @@ mod tests {
             ctx.route_override_upstream_id.as_deref(),
             Some("beta-upstream")
         );
+    }
+
+    #[test]
+    fn requires_decoded_query_params_for_query_rules_only() {
+        let method_only = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"}
+            }]
+        }))
+        .unwrap();
+        assert!(
+            !method_only.requires_decoded_query_params(),
+            "method/header-only routing must not change HTTP/3 query-param materialization"
+        );
+
+        let query_rule = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"query_params": {"variant": "beta"}},
+                "destination": {"upstream_id": "canary"}
+            }]
+        }))
+        .unwrap();
+        assert!(query_rule.requires_decoded_query_params());
     }
 }

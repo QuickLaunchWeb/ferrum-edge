@@ -5643,6 +5643,45 @@ mod tests {
     }
 
     #[test]
+    fn virtual_service_regex_uri_with_ignored_predicates_does_not_emit_plugin() {
+        // Unsupported non-URI match shapes (regex method/header/queryParam)
+        // are intentionally ignored by the current translator. A match entry
+        // with only URI plus ignored predicate types must not emit an empty
+        // mesh_route_dispatch rule.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"regex": "/v[0-9]+/api"},
+                            "method": {"regex": "GET|POST"},
+                            "headers": {"x-canary": {"regex": "v[0-9]+"}},
+                            "queryParams": {"variant": {"regex": "beta|stable"}}
+                        }],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+        assert!(
+            result
+                .config
+                .plugin_configs
+                .iter()
+                .all(|p| p.plugin_name != "mesh_route_dispatch"),
+            "URI plus ignored predicates should not emit mesh_route_dispatch"
+        );
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("~/v[0-9]+/api")
+        );
+    }
+
+    #[test]
     fn virtual_service_header_match_emits_plugin_with_headers() {
         let result = translate_k8s_objects(
             &[object(

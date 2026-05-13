@@ -1073,10 +1073,16 @@ async fn handle_h3_request(
     }
     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
 
-    // Materialize query params before authentication using the same
-    // percent-decoded representation as the H1/H2 path. Auth plugins and
-    // mesh_route_dispatch rules must not observe protocol-dependent values.
-    ctx.materialize_query_params();
+    // Materialize query params before authentication. HTTP/3 historically
+    // exposed raw, non-percent-decoded values to plugins; keep that default
+    // so enabling this PR does not silently change auth/cache keys. Plugins
+    // with query-param semantics that require H1/H2 parity opt in via the
+    // capability bit below.
+    if capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS) {
+        ctx.materialize_query_params();
+    } else {
+        ctx.materialize_query_params_raw();
+    }
 
     // Some auth plugins (for example `hmac_auth`) verify request body integrity
     // at authenticate time. Buffer the body before the auth phase runs so those

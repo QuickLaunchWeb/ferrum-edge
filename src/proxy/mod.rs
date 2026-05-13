@@ -55,7 +55,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, upgrade::OnUpgrade, upgrade::Upgraded};
 use hyper_util::rt::TokioIo;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -111,6 +111,35 @@ static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+
+fn mesh_route_dispatch_upstream_reference_warnings(config: &GatewayConfig) -> Vec<String> {
+    let upstream_ids: HashSet<&str> = config.upstreams.iter().map(|u| u.id.as_str()).collect();
+    let mut warnings = Vec::new();
+
+    for plugin in &config.plugin_configs {
+        if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+            continue;
+        }
+        let Ok(dispatch_config) =
+            serde_json::from_value::<MeshRouteDispatchConfig>(plugin.config.clone())
+        else {
+            continue;
+        };
+        for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
+            if let Some(upstream_id) = rule.destination.upstream_id.as_deref()
+                && !upstream_ids.contains(upstream_id)
+            {
+                let proxy_id = plugin.proxy_id.as_deref().unwrap_or("<none>");
+                warnings.push(format!(
+                    "PluginConfig '{}' (mesh_route_dispatch) rule {} for proxy_id '{}' references non-existent upstream_id '{}'",
+                    plugin.id, rule_idx, proxy_id, upstream_id
+                ));
+            }
+        }
+    }
+
+    warnings
+}
 
 /// Capability probes run during startup and background refresh, so they should
 /// not inherit long per-request connect timeouts that could hold readiness.
@@ -1643,6 +1672,9 @@ impl ProxyState {
             &gateway_svid_bundle,
             &env_config_arc.namespace,
         );
+        for msg in mesh_route_dispatch_upstream_reference_warnings(&config) {
+            warn!("Config validation: {}", msg);
+        }
         let gateway_file_svid_bundle = clone_svid_bundle_slot(&gateway_svid_bundle);
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
         let hbone_pool = Arc::new(HboneConnectionPool::new(
@@ -2904,6 +2936,10 @@ impl ProxyState {
     ///     stale TLS path or a single misconfigured backend IP doesn't
     ///     freeze the entire control plane.
     ///   - `validate_hosts` (hostname syntax). Same rationale.
+    ///   - `mesh_route_dispatch` upstream-id rule references. Generated
+    ///     Kubernetes configs should always be internally consistent, but
+    ///     hand-authored plugin configs are plugin data; warn so operators see
+    ///     that matching requests will fail backend selection.
     ///
     /// - *Reject* — accumulate into the returned error vector and abort
     ///   the reload:
@@ -2949,6 +2985,9 @@ impl ProxyState {
             for msg in &errors {
                 warn!("Config validation: {}", msg);
             }
+        }
+        for msg in mesh_route_dispatch_upstream_reference_warnings(config) {
+            warn!("Config validation: {}", msg);
         }
 
         // Reject — collect all rejecting-validator failures into a single
@@ -13802,6 +13841,40 @@ mod tests {
             direct.proxy.resolved_tls.verify_server_cert,
             "direct backend probe should reset stale upstream verify policy"
         );
+    }
+
+    #[test]
+    fn mesh_route_dispatch_upstream_reference_warnings_report_missing_upstream() {
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "mrd-p".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "missing-upstream"}
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+
+        let warnings = mesh_route_dispatch_upstream_reference_warnings(&config);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("missing-upstream"), "{warnings:?}");
+        assert!(warnings[0].contains("mrd-p"), "{warnings:?}");
     }
 
     #[test]

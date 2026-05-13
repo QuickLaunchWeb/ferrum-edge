@@ -263,11 +263,15 @@ pub struct RequestContext {
     /// Materialized headers HashMap. Empty until `materialize_headers()` is
     /// called. Plugin code and backend dispatch read from this field.
     pub headers: HashMap<String, String>,
-    /// Raw query string stored for lazy parsing. `None` when empty or after
-    /// `materialize_query_params()` has consumed it.
+    /// Raw query string stored for lazy parsing. `None` when empty or after a
+    /// query-param materializer has consumed it.
     raw_query_string: Option<String>,
-    /// Parsed + percent-decoded query parameters. Empty until
-    /// `materialize_query_params()` is called.
+    /// Parsed query parameters. Empty until `materialize_query_params()` or
+    /// `materialize_query_params_raw()` is called.
+    ///
+    /// HTTP/1.1 and HTTP/2 materialize percent-decoded query params for
+    /// historical compatibility. HTTP/3 materializes raw query params unless
+    /// an active plugin explicitly requires the decoded representation.
     pub query_params: HashMap<String, String>,
     pub matched_proxy: Option<Arc<Proxy>>,
     pub identified_consumer: Option<Arc<Consumer>>,
@@ -444,11 +448,25 @@ impl RequestContext {
     /// returned `Arc<Proxy>` makes the override transparent to dispatch sites
     /// that already accept `&Proxy` (pool keys, capability registry, URL
     /// construction, backend TLS, etc.).
+    ///
+    /// This convenience helper cannot re-resolve `resolved_tls` when
+    /// `route_override_upstream_id` points at a different upstream because it
+    /// has no upstream snapshot. Custom dispatch paths that allow upstream
+    /// overrides should call [`RequestContext::apply_route_overrides_with_upstreams`]
+    /// instead, or they can silently keep the original proxy's backend TLS
+    /// client certificate / CA / verify policy.
     pub fn apply_route_overrides(&self, proxy: Arc<Proxy>) -> Arc<Proxy> {
         self.apply_route_overrides_inner(proxy, None)
     }
 
-    pub(crate) fn apply_route_overrides_with_upstreams(
+    /// Build a `Proxy` Arc with plugin-set route overrides applied, re-resolving
+    /// backend TLS from the supplied upstream snapshot when
+    /// `route_override_upstream_id` changes the effective upstream.
+    ///
+    /// Use this variant for dispatch paths that might honor upstream-id
+    /// overrides. It preserves the pool-key / TLS-identity invariant that every
+    /// backend connection key and dial uses the effective routing target.
+    pub fn apply_route_overrides_with_upstreams(
         &self,
         proxy: Arc<Proxy>,
         upstreams: &HashMap<String, Arc<Upstream>>,
@@ -635,8 +653,9 @@ impl RequestContext {
     /// Materialize the raw query string into `self.query_params` without
     /// percent-decoding.
     ///
-    /// Most callers should prefer `materialize_query_params()` so plugins see
-    /// the same decoded values across HTTP protocol versions.
+    /// HTTP/3 uses this by default to preserve its legacy plugin-visible query
+    /// representation unless an active plugin explicitly opts into decoded
+    /// query params.
     pub fn materialize_query_params_raw(&mut self) {
         if let Some(raw) = self.raw_query_string.take() {
             for pair in raw.split('&') {
@@ -1194,8 +1213,8 @@ pub mod priority {
     pub const AI_FEDERATION: u16 = 2985;
     /// `mesh_route_dispatch`: rewrites `route_override_*` on `RequestContext`
     /// based on Istio VirtualService method/header/query-param predicates.
-    /// Runs at the top of the `before_proxy` band so subsequent plugins see
-    /// the resolved routing target via `RequestContext::apply_route_overrides`.
+    /// Runs after admission plugins and immediately before request-transform
+    /// plugins; backend dispatch applies the override after `before_proxy`.
     pub const MESH_ROUTE_DISPATCH: u16 = 2995;
     pub const REQUEST_TRANSFORMER: u16 = 3000;
     pub const SERVERLESS_FUNCTION: u16 = 3025;
@@ -1610,6 +1629,14 @@ pub trait Plugin: Send + Sync {
     /// Default no-op. Plugins wanting end-of-session observability should
     /// override this and set `requires_ws_disconnect_hooks()` to `true`.
     async fn on_ws_disconnect(&self, _ctx: &WsDisconnectContext) {}
+
+    /// Returns `true` when this plugin requires HTTP/3 query params to use the
+    /// percent-decoded representation. HTTP/3 historically exposed raw query
+    /// params to plugins, so this opt-in is intentionally narrow: enabling it
+    /// affects the shared `ctx.query_params` map for all plugins on the proxy.
+    fn requires_decoded_query_params(&self) -> bool {
+        false
+    }
 
     /// Called for each UDP datagram in both directions (client→backend and backend→client).
     ///
