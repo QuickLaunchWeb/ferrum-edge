@@ -733,7 +733,12 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
         id: format!("istio-vs-mrd-{proxy_id}"),
         plugin_name: "mesh_route_dispatch".to_string(),
         namespace: namespace.to_string(),
-        config: serde_json::json!({"rules": rules}),
+        // `reject_unmatched: true` enforces VirtualService match semantics:
+        // a route whose `match[]` specifies `method`/`headers`/`queryParams`
+        // must not serve requests that miss those predicates via the proxy's
+        // default backend. Without this, e.g., a GET-only route would
+        // silently forward POST traffic to the same upstream.
+        config: serde_json::json!({"rules": rules, "reject_unmatched": true}),
         scope: PluginScope::Proxy,
         proxy_id: Some(proxy_id.to_string()),
         enabled: true,

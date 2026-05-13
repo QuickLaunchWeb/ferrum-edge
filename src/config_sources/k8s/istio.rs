@@ -5575,6 +5575,16 @@ mod tests {
             .as_array()
             .expect("methods array");
         assert_eq!(methods[0].as_str(), Some("GET"));
+        // VirtualService match semantics: requests that miss the predicates
+        // must NOT fall through to the proxy's default backend.
+        assert_eq!(
+            plugin
+                .config
+                .get("reject_unmatched")
+                .and_then(Value::as_bool),
+            Some(true),
+            "VS-emitted mesh_route_dispatch must enforce match semantics via reject_unmatched"
+        );
     }
 
     #[test]

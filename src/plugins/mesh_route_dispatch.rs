@@ -47,6 +47,14 @@ pub struct MeshRouteDispatchConfig {
     /// are rejected at config-load time to avoid silently-overriding catch-alls.
     #[serde(default)]
     pub rules: Vec<RouteRule>,
+    /// When `true`, requests that match no rule are rejected with 404 instead
+    /// of falling through to the proxy's default backend. The Istio
+    /// VirtualService translator sets this so a route with `match.method=GET`
+    /// does not serve POST traffic via the proxy's default backend (which
+    /// would silently violate VS match semantics). Defaults to `false` for
+    /// operators who configure the plugin directly as a soft override.
+    #[serde(default)]
+    pub reject_unmatched: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -224,6 +232,19 @@ impl Plugin for MeshRouteDispatch {
                 ctx.route_override_resolved_tls = rule.destination.backend_tls.clone();
                 return PluginResult::Continue;
             }
+        }
+        if self.config.reject_unmatched {
+            // Istio VirtualService.http[].match semantics: a route gated by
+            // `method`/`headers`/`queryParams` must NOT serve requests that
+            // miss those predicates. Without this, the proxy's default
+            // backend would receive traffic the operator explicitly excluded
+            // (e.g., a GET-only canary route serving POST). 404 matches
+            // Envoy's behavior when no Istio route matches a request.
+            return PluginResult::Reject {
+                status_code: 404,
+                body: "no route matched mesh_route_dispatch predicates".to_string(),
+                headers: HashMap::new(),
+            };
         }
         PluginResult::Continue
     }
@@ -613,5 +634,72 @@ mod tests {
         }))
         .unwrap();
         assert!(query_rule.requires_decoded_query_params());
+    }
+
+    #[tokio::test]
+    async fn reject_unmatched_returns_404_when_no_rule_matches() {
+        // VirtualService semantics: a `match: method=GET` rule must NOT
+        // forward POST traffic to the proxy's default backend. With
+        // `reject_unmatched: true`, the plugin short-circuits with 404.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"}
+            }],
+            "reject_unmatched": true,
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("POST", "/api");
+        let mut headers = HashMap::new();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        match result {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 404);
+                assert!(body.contains("no route matched"), "got: {body}");
+            }
+            other => panic!("expected Reject 404, got {other:?}"),
+        }
+        assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn reject_unmatched_continues_when_rule_matches() {
+        // `reject_unmatched: true` must NOT reject matching requests —
+        // it only fires when every rule misses.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"}
+            }],
+            "reject_unmatched": true,
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::new();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("canary"));
+    }
+
+    #[tokio::test]
+    async fn reject_unmatched_default_false_preserves_fall_through() {
+        // Operators configuring the plugin directly (without VirtualService
+        // translation) keep today's soft-override behavior unless they
+        // explicitly opt in. This protects non-mesh consumers from a
+        // breaking semantic change.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("POST", "/api");
+        let mut headers = HashMap::new();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert!(ctx.route_override_upstream_id.is_none());
     }
 }
