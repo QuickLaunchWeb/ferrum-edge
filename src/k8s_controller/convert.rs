@@ -21,11 +21,21 @@ pub fn dynamic_object_to_k8s_object(
             .unwrap_or_default()
             .into_iter()
             .collect(),
+        deletion_timestamp: obj
+            .metadata
+            .deletion_timestamp
+            .as_ref()
+            .map(|ts| ts.0.to_string()),
     };
 
     let spec = obj
         .data
         .get("spec")
+        .cloned()
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    let status = obj
+        .data
+        .get("status")
         .cloned()
         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
@@ -34,6 +44,7 @@ pub fn dynamic_object_to_k8s_object(
         kind: kind.to_string(),
         metadata,
         spec,
+        status,
     }
 }
 

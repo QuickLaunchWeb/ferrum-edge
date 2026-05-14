@@ -31,8 +31,10 @@ fn istio_object(kind: &str, name: &str, spec: serde_json::Value) -> K8sObject {
             name: name.to_string(),
             namespace: "default".to_string(),
             labels: Default::default(),
+            deletion_timestamp: None,
         },
         spec,
+        status: serde_json::Value::Object(serde_json::Map::new()),
     }
 }
 

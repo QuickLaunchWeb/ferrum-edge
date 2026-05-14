@@ -2566,8 +2566,10 @@ mod tests {
                 name: "sample".to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec,
+            status: Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -7872,8 +7874,10 @@ mod tests {
                     name: "mesh-default".to_string(),
                     namespace: "istio-config".to_string(),
                     labels: HashMap::new(),
+                    deletion_timestamp: None,
                 },
                 spec: serde_json::json!({"tracing": {"sampling": 5.0}}),
+                status: Value::Object(serde_json::Map::new()),
             }],
             options_for_namespace("default")
                 .with_istio_root_namespace("istio-config".to_string())
@@ -7906,11 +7910,13 @@ mod tests {
                     name: "mesh-api".to_string(),
                     namespace: "istio-config".to_string(),
                     labels: HashMap::new(),
+                    deletion_timestamp: None,
                 },
                 spec: serde_json::json!({
                     "selector": {"matchLabels": {"app": "api"}},
                     "tracing": {"sampling": 50.0}
                 }),
+                status: Value::Object(serde_json::Map::new()),
             }],
             options_for_namespace("default")
                 .with_istio_root_namespace("istio-config".to_string())
@@ -8033,11 +8039,13 @@ mod tests {
                         name: "api-overrides".to_string(),
                         namespace: "default".to_string(),
                         labels: HashMap::new(),
+                        deletion_timestamp: None,
                     },
                     spec: serde_json::json!({
                         "selector": {"matchLabels": {"app": "api"}},
                         "tracing": {"sampling": 99.0}
                     }),
+                    status: Value::Object(serde_json::Map::new()),
                 },
             ],
             options(),
@@ -8479,8 +8487,10 @@ mod tests {
                 name: name.to_string(),
                 namespace: namespace.to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec: serde_json::json!({ "ports": ports_json }),
+            status: Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -8492,6 +8502,7 @@ mod tests {
                 name: name.to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec: serde_json::json!({
                 "hosts": ["api.example.com"],
@@ -8500,6 +8511,7 @@ mod tests {
                     "route": [{"destination": destination}]
                 }]
             }),
+            status: Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -8681,6 +8693,7 @@ mod tests {
                 name: "reviews".to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec: serde_json::json!({
                 "ports": [
@@ -8688,6 +8701,7 @@ mod tests {
                     {"name": "grpc", "port": 9090}            // named entry survives
                 ]
             }),
+            status: Value::Object(serde_json::Map::new()),
         };
         let vs_missing = virtual_service_with_destination(
             "vs-missing",
@@ -8727,8 +8741,10 @@ mod tests {
                 name: "reviews".to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec: serde_json::json!({}),
+            status: Value::Object(serde_json::Map::new()),
         };
         let result =
             translate_k8s_objects(&[svc], options()).expect("Service with no ports must not panic");

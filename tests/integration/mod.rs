@@ -22,6 +22,7 @@ mod log_schema_registry_tests;
 mod mesh_authz_negative_match_tests;
 mod mesh_destination_rule_tls_tests;
 mod mesh_hbone_tests;
+mod mesh_k8s_pod_discovery_tests;
 mod mesh_proxy_config_tests;
 mod scripted_backend_smoke_tests;
 mod tcp_fast_path_l4_plugins_tests;

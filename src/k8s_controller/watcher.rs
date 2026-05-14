@@ -19,6 +19,21 @@ pub struct CrdSpec {
     pub plural: &'static str,
 }
 
+pub struct CoreResourceSpec {
+    pub group: &'static str,
+    pub version: &'static str,
+    pub kind: &'static str,
+    pub plural: &'static str,
+    pub namespaced: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct WatcherSelection {
+    pub watch_istio: bool,
+    pub watch_gateway_api: bool,
+    pub watch_core: bool,
+}
+
 pub const ISTIO_CRDS: &[CrdSpec] = &[
     CrdSpec {
         group: "security.istio.io",
@@ -115,6 +130,39 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
     },
 ];
 
+pub const K8S_CORE_RESOURCES: &[CoreResourceSpec] = &[
+    CoreResourceSpec {
+        group: "",
+        version: "v1",
+        kind: "Pod",
+        plural: "pods",
+        namespaced: true,
+    },
+    CoreResourceSpec {
+        group: "",
+        version: "v1",
+        kind: "Service",
+        plural: "services",
+        namespaced: true,
+    },
+    CoreResourceSpec {
+        group: "discovery.k8s.io",
+        version: "v1",
+        kind: "EndpointSlice",
+        plural: "endpointslices",
+        namespaced: true,
+    },
+    // Node labels provide topology.kubernetes.io/{region,zone} for workload
+    // locality. Cluster-scoped watch only; namespace watch lists do not apply.
+    CoreResourceSpec {
+        group: "",
+        version: "v1",
+        kind: "Node",
+        plural: "nodes",
+        namespaced: false,
+    },
+];
+
 fn watch_scopes(namespaces: &[String]) -> Vec<Option<String>> {
     if namespaces.is_empty() {
         return vec![None];
@@ -133,8 +181,14 @@ fn build_apis_for_resource(
     client: &Client,
     ar: &ApiResource,
     namespaces: &[String],
+    namespaced: bool,
 ) -> Vec<(Api<DynamicObject>, ApiResource, String)> {
-    watch_scopes(namespaces)
+    let scopes = if namespaced {
+        watch_scopes(namespaces)
+    } else {
+        vec![None]
+    };
+    scopes
         .into_iter()
         .map(|scope| {
             let api = match scope.as_deref() {
@@ -160,6 +214,7 @@ pub async fn start_crd_watchers(
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     watch_istio: bool,
     watch_gateway_api: bool,
+    watch_core: bool,
     namespaces: Vec<String>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
@@ -216,7 +271,7 @@ pub async fn start_crd_watchers(
             continue;
         };
 
-        for (api, ar, scope) in build_apis_for_resource(&client, &ar, &namespaces) {
+        for (api, ar, scope) in build_apis_for_resource(&client, &ar, &namespaces, true) {
             if store_set
                 .lock()
                 .await
@@ -310,14 +365,126 @@ pub async fn start_crd_watchers(
         }
     }
 
+    if watch_core {
+        for resource in K8S_CORE_RESOURCES {
+            let api_version = if resource.group.is_empty() {
+                resource.version.to_string()
+            } else {
+                format!("{}/{}", resource.group, resource.version)
+            };
+            let ar = ApiResource {
+                group: resource.group.to_string(),
+                version: resource.version.to_string(),
+                api_version: api_version.clone(),
+                kind: resource.kind.to_string(),
+                plural: resource.plural.to_string(),
+            };
+            let kind = resource.kind.to_string();
+
+            for (api, ar, scope) in
+                build_apis_for_resource(&client, &ar, &namespaces, resource.namespaced)
+            {
+                if store_set
+                    .lock()
+                    .await
+                    .has_store_for_scope(&api_version, &kind, &scope)
+                {
+                    debug!(
+                        kind = %kind,
+                        api_version = %api_version,
+                        scope = %scope,
+                        "K8s core watcher already running, skipping duplicate start"
+                    );
+                    continue;
+                }
+
+                let writer = reflector::store::Writer::new(ar.clone());
+                let store = writer.as_reader();
+                let crd_store = Arc::new(CrdResourceStore::new_scoped(
+                    api_version.clone(),
+                    kind.clone(),
+                    scope.clone(),
+                    store,
+                ));
+
+                let change_notifier = {
+                    let mut set = store_set.lock().await;
+                    if !set.add_store(crd_store) {
+                        debug!(
+                            kind = %kind,
+                            api_version = %api_version,
+                            scope = %scope,
+                            "K8s core watcher already running, skipping duplicate start"
+                        );
+                        continue;
+                    }
+                    set.change_notifier()
+                };
+
+                let mut watcher_shutdown = shutdown.clone();
+                let cleanup_scope = scope.clone();
+                let task_kind = kind.clone();
+                let watcher_config = watcher::Config::default();
+
+                let handle = tokio::spawn(async move {
+                    let stream = reflector::reflector(writer, watcher(api, watcher_config));
+
+                    tokio::pin!(stream);
+
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = watcher_shutdown.changed() => {
+                                if *watcher_shutdown.borrow() {
+                                    debug!(kind = %task_kind, scope = %cleanup_scope, "Watcher shutting down");
+                                    return;
+                                }
+                            }
+                            item = stream.try_next() => {
+                                match item {
+                                    Ok(Some(_event)) => {
+                                        change_notifier.notify_change();
+                                    }
+                                    Ok(None) => {
+                                        info!(
+                                            kind = %task_kind,
+                                            scope = %cleanup_scope,
+                                            "Watch stream ended; retaining last reflector snapshot"
+                                        );
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            kind = %task_kind,
+                                            scope = %cleanup_scope,
+                                            error = %e,
+                                            "Watch error, kube-rs will retry with backoff"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+
+                handles.push(handle);
+                info!(
+                    kind = resource.kind,
+                    group = resource.group,
+                    scope = %scope,
+                    "Started K8s core watcher"
+                );
+            }
+        }
+    }
+
     handles
 }
 
 pub fn spawn_crd_reprobe_task(
     client: Client,
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
-    watch_istio: bool,
-    watch_gateway_api: bool,
+    selection: WatcherSelection,
     namespaces: Vec<String>,
     shutdown: tokio::sync::watch::Receiver<bool>,
     interval: Duration,
@@ -340,8 +507,9 @@ pub fn spawn_crd_reprobe_task(
                     let new_handles = start_crd_watchers(
                         client.clone(),
                         store_set.clone(),
-                        watch_istio,
-                        watch_gateway_api,
+                        selection.watch_istio,
+                        selection.watch_gateway_api,
+                        selection.watch_core,
                         namespaces.clone(),
                         shutdown.clone(),
                     ).await;
@@ -372,6 +540,25 @@ mod tests {
         assert_eq!(
             watch_scope_label(Some("prod")),
             "namespace:prod".to_string()
+        );
+    }
+
+    #[test]
+    fn k8s_core_resources_cover_pod_service_endpointslice_and_node() {
+        let kinds: HashSet<&str> = K8S_CORE_RESOURCES
+            .iter()
+            .map(|resource| resource.kind)
+            .collect();
+        assert!(kinds.contains("Pod"));
+        assert!(kinds.contains("Service"));
+        assert!(kinds.contains("EndpointSlice"));
+        assert!(kinds.contains("Node"));
+        assert!(
+            K8S_CORE_RESOURCES
+                .iter()
+                .find(|resource| resource.kind == "Node")
+                .is_some_and(|resource| !resource.namespaced),
+            "Node must be cluster-scoped so namespace watch lists do not create invalid Node APIs"
         );
     }
 }

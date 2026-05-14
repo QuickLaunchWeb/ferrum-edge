@@ -226,8 +226,11 @@ The Istio `AuthorizationPolicy` translator only consumes the four positive-match
 
 Service / namespace names embedded in destination hosts are matched case-sensitively against the collected Kubernetes object metadata (matching how the API server stores those names). The trailing cluster-domain suffix is matched case-insensitively per DNS semantics, so `<svc>.<ns>.svc.Cluster.Local` resolves the same as `<svc>.<ns>.svc.cluster.local`, but `Reviews.Default.svc.cluster.local` will not match a Service whose stored name is `reviews` in namespace `default`.
 
+`FERRUM_K8S_POD_DISCOVERY_ENABLED=true` enables the CP-side native Kubernetes registry bridge. The controller watches Pods, Services, EndpointSlices, and Nodes; translates ready Pods into mesh workloads; translates Services into mesh services using `spec.ports[]`; links Services to Pods through EndpointSlices; and copies Node topology labels into workload locality. Pending, terminating, failed, succeeded, or not-ready Pods are not surfaced. Explicit Istio `WorkloadEntry` / `ServiceEntry` resources override the auto-derived Pod/Service entries for the same service.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
+| `FERRUM_K8S_POD_DISCOVERY_ENABLED` | No | `false` | Enables opt-in native Kubernetes Pod/Service/EndpointSlice/Node discovery in the CP K8s controller |
 | `FERRUM_K8S_CLUSTER_DOMAIN` | No | `cluster.local` | Kubernetes cluster DNS domain used by the source translator for FQDN host matching. VirtualService destinations of the form `<svc>.<ns>.svc.<cluster_domain>` (and bare/short forms) resolve port names against the matching `Service` |
 | `FERRUM_INJECTOR_LISTEN_ADDR` | Injector mode | `0.0.0.0:9443` | Admission webhook bind address for `POST /mutate` |
 | `FERRUM_INJECTOR_SIDECAR_IMAGE` | No | `ferrum-edge:latest` | Image injected into workload pods as the Ferrum mesh sidecar |

@@ -4052,6 +4052,30 @@ fn test_pool_shard_amount_default_is_zero() {
 }
 
 #[test]
+fn test_k8s_pod_discovery_default_disabled() {
+    let config = EnvConfig::default();
+    assert!(
+        !config.k8s_pod_discovery_enabled,
+        "Pod auto-discovery is opt-in for the first rollout"
+    );
+}
+
+#[test]
+fn test_k8s_pod_discovery_parsed_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_K8S_POD_DISCOVERY_ENABLED", "true"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.k8s_pod_discovery_enabled);
+        },
+    );
+}
+
+#[test]
 fn test_pool_shard_amount_parsed_from_env() {
     with_env_vars(
         &[
