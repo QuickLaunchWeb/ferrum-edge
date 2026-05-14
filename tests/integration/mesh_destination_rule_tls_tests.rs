@@ -70,6 +70,7 @@ fn test_runtime() -> MeshRuntimeConfig {
         workload_spiffe_id: None,
         workload_svid_cert_path: None,
         workload_svid_key_path: None,
+        workload_svid_trust_bundle_path: None,
         xds_node_cluster: "default".to_string(),
         xds_stream_channel_capacity: 32,
         xds_primary_retry_secs: 300,
@@ -259,6 +260,9 @@ fn dr_istio_mutual_projects_workload_svid_onto_upstream() {
     let runtime = MeshRuntimeConfig {
         workload_svid_cert_path: Some("/var/run/secrets/ferrum/svid.pem".to_string()),
         workload_svid_key_path: Some("/var/run/secrets/ferrum/svid.key".to_string()),
+        workload_svid_trust_bundle_path: Some(
+            "/var/run/secrets/ferrum/trust-bundle.pem".to_string(),
+        ),
         ..test_runtime()
     };
 
@@ -277,6 +281,10 @@ fn dr_istio_mutual_projects_workload_svid_onto_upstream() {
         upstream.backend_tls_client_key_path.as_deref(),
         Some("/var/run/secrets/ferrum/svid.key")
     );
+    assert_eq!(
+        upstream.backend_tls_server_ca_cert_path.as_deref(),
+        Some("/var/run/secrets/ferrum/trust-bundle.pem")
+    );
     assert!(upstream.backend_tls_verify_server_cert);
 
     let proxy = prepared
@@ -291,6 +299,10 @@ fn dr_istio_mutual_projects_workload_svid_onto_upstream() {
     assert_eq!(
         proxy.resolved_tls.client_key_path.as_deref(),
         Some("/var/run/secrets/ferrum/svid.key")
+    );
+    assert_eq!(
+        proxy.resolved_tls.server_ca_cert_path.as_deref(),
+        Some("/var/run/secrets/ferrum/trust-bundle.pem")
     );
 }
 

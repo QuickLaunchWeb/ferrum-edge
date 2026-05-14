@@ -10,7 +10,7 @@ use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKey
 use rustls::{ClientConfig, RootCertStore};
 use thiserror::Error;
 
-use crate::config::types::Proxy;
+use crate::config::types::{BackendTlsConfig, Proxy};
 use crate::tls::{
     NoVerifier, TlsPolicy, backend_client_config_builder, build_server_verifier_with_crls,
 };
@@ -67,6 +67,38 @@ impl BackendTlsConfigCache {
             }
         }
     }
+}
+
+/// Append the backend TLS identity fields that partition runtime client caches.
+///
+/// Keep this in one place so HTTP, H2, H3, gRPC, and backend capability probes
+/// agree on which TLS dimensions can change a reusable backend connection.
+pub fn append_backend_tls_pool_key_fields(
+    buf: &mut String,
+    tls: &BackendTlsConfig,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
+    verify_server_cert: bool,
+) {
+    use std::fmt::Write;
+
+    buf.push_str(tls.server_ca_cert_path.as_deref().unwrap_or_default());
+    buf.push('|');
+    buf.push_str(client_cert_path.unwrap_or_default());
+    buf.push('|');
+    buf.push_str(client_key_path.unwrap_or_default());
+    buf.push('|');
+    buf.push_str(tls.sni.as_deref().unwrap_or_default());
+    buf.push('|');
+    let _ = write!(buf, "{}", tls.san_allow_list.len());
+    for san in &tls.san_allow_list {
+        buf.push(':');
+        let _ = write!(buf, "{}", san.len());
+        buf.push(':');
+        buf.push_str(san);
+    }
+    buf.push('|');
+    buf.push(if verify_server_cert { '1' } else { '0' });
 }
 
 /// Build the backend trust store using the CA chain resolution from CLAUDE.md:

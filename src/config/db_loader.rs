@@ -5500,8 +5500,10 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
                     e
                 )
             })?,
-            Ok(None) | Err(_) => Vec::new(),
+            Ok(None) => Vec::new(),
+            Err(e) => return Err(e.into()),
         };
+    let backend_tls_sni: Option<String> = row.try_get("backend_tls_sni")?;
 
     Ok(Upstream {
         id: row.try_get("id")?,
@@ -5524,10 +5526,7 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
         backend_tls_verify_server_cert,
         backend_tls_server_ca_cert_path: row.try_get("backend_tls_server_ca_cert_path").ok(),
-        backend_tls_sni: row
-            .try_get::<Option<String>, _>("backend_tls_sni")
-            .ok()
-            .flatten(),
+        backend_tls_sni,
         backend_tls_san_allow_list,
         // See row_to_proxy for the rationale: preserve here so admin reads
         // get the real owning spec id; runtime callers strip via

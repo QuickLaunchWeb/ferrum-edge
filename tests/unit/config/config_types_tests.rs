@@ -189,6 +189,29 @@ fn upstream_normalize_fields_lowercases_backend_tls_sni() {
     );
 }
 
+#[test]
+fn upstream_normalize_fields_lowercases_dns_sans_only() {
+    let mut upstream = make_upstream("tls-upstream");
+    upstream.backend_tls_san_allow_list = vec![
+        "Reviews.Mesh.Internal".to_string(),
+        "spiffe://Cluster.Local/ns/Default/sa/Reviews".to_string(),
+        "10.0.0.8".to_string(),
+        "2001:db8::1".to_string(),
+    ];
+
+    upstream.normalize_fields();
+
+    assert_eq!(
+        upstream.backend_tls_san_allow_list,
+        vec![
+            "reviews.mesh.internal".to_string(),
+            "spiffe://Cluster.Local/ns/Default/sa/Reviews".to_string(),
+            "10.0.0.8".to_string(),
+            "2001:db8::1".to_string(),
+        ]
+    );
+}
+
 /// Helper to create an empty gateway config.
 fn empty_config() -> GatewayConfig {
     GatewayConfig {

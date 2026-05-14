@@ -3,12 +3,12 @@ use ferrum_edge::config::types::{
     ActiveHealthCheck, AuthMode, BackendScheme, BackoffStrategy, CircuitBreakerConfig,
     ConsulConfig, Consumer, DispatchKind, GatewayConfig, HealthCheckConfig, KubernetesConfig,
     LoadBalancerAlgorithm, MAX_BACKEND_HOST_LENGTH, MAX_BACKEND_PATH_LENGTH,
-    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, MAX_CREDENTIAL_VALUE_LENGTH, MAX_CREDENTIALS_SIZE,
-    MAX_FILE_PATH_LENGTH, MAX_HOSTS_PER_PROXY, MAX_HTTP2_MAX_FRAME_SIZE,
-    MAX_HTTP3_CONNECTIONS_PER_BACKEND, MAX_LISTEN_PATH_LENGTH, MAX_NAME_LENGTH,
-    MAX_PLUGIN_CONFIG_SIZE, MAX_SD_STRING_LENGTH, MAX_TARGETS_PER_UPSTREAM, MAX_TIMEOUT_MS,
-    MAX_USERNAME_LENGTH, MIN_HTTP2_MAX_FRAME_SIZE, MIN_HTTP2_WINDOW_SIZE, MeshSdConfig,
-    PassiveHealthCheck, PluginConfig, PluginScope, Proxy, RetryConfig, SdProvider,
+    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
+    MAX_CREDENTIAL_VALUE_LENGTH, MAX_CREDENTIALS_SIZE, MAX_FILE_PATH_LENGTH, MAX_HOSTS_PER_PROXY,
+    MAX_HTTP2_MAX_FRAME_SIZE, MAX_HTTP3_CONNECTIONS_PER_BACKEND, MAX_LISTEN_PATH_LENGTH,
+    MAX_NAME_LENGTH, MAX_PLUGIN_CONFIG_SIZE, MAX_SD_STRING_LENGTH, MAX_TARGETS_PER_UPSTREAM,
+    MAX_TIMEOUT_MS, MAX_USERNAME_LENGTH, MIN_HTTP2_MAX_FRAME_SIZE, MIN_HTTP2_WINDOW_SIZE,
+    MeshSdConfig, PassiveHealthCheck, PluginConfig, PluginScope, Proxy, RetryConfig, SdProvider,
     ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
 use std::collections::HashMap;
@@ -568,6 +568,20 @@ fn test_upstream_backend_tls_san_allow_list_limit() {
     assert!(
         errs.iter()
             .any(|e| e.contains("backend_tls_san_allow_list") && e.contains("more than"))
+    );
+}
+
+#[test]
+fn test_upstream_backend_tls_san_allow_list_entry_length_limit() {
+    let mut upstream = make_upstream("test");
+    upstream.backend_tls_san_allow_list = vec![format!(
+        "{}.mesh.internal",
+        "a".repeat(MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH)
+    )];
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_san_allow_list[0]") && e.contains("must not exceed"))
     );
 }
 

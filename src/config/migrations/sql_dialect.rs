@@ -217,7 +217,7 @@ impl V001SqlBuilder {
                 backend_tls_verify_server_cert TINYINT NOT NULL DEFAULT 1,
                 backend_tls_server_ca_cert_path VARCHAR(2048),
                 backend_tls_sni VARCHAR(255),
-                backend_tls_san_allow_list TEXT,
+                backend_tls_san_allow_list MEDIUMTEXT,
                 api_spec_id VARCHAR(255),
                 created_at VARCHAR(64) NOT NULL,
                 updated_at VARCHAR(64) NOT NULL
@@ -639,6 +639,16 @@ mod tests {
         assert!(
             sql.contains("server_urls LONGTEXT NOT NULL"),
             "server_urls must not be capped at VARCHAR(8192); extractor caps can exceed that"
+        );
+    }
+
+    #[test]
+    fn test_mysql_upstreams_san_allow_list_column_holds_config_cap() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_upstreams_sql();
+        assert!(
+            sql.contains("backend_tls_san_allow_list MEDIUMTEXT"),
+            "SAN allow-list JSON can exceed MySQL TEXT when every allowed entry is near the per-entry cap"
         );
     }
 

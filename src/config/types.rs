@@ -3397,6 +3397,9 @@ impl Upstream {
         if let Some(sni) = &mut self.backend_tls_sni {
             *sni = sni.to_ascii_lowercase();
         }
+        for san in &mut self.backend_tls_san_allow_list {
+            normalize_backend_tls_san_allow_list_entry(san);
+        }
     }
 
     /// Resolve the effective backend connect timeout for a request destined to
@@ -3779,7 +3782,7 @@ impl Upstream {
     }
 }
 
-fn validate_backend_tls_sni(sni: &str) -> Result<(), String> {
+pub(crate) fn validate_backend_tls_sni(sni: &str) -> Result<(), String> {
     validate_string_field("backend_tls_sni", sni, MAX_HOST_LENGTH)?;
     if sni.trim().is_empty() {
         return Err("backend_tls_sni must not be empty".to_string());
@@ -3794,7 +3797,7 @@ fn validate_backend_tls_sni(sni: &str) -> Result<(), String> {
         .map_err(|e| format!("backend_tls_sni is invalid: {}", e))
 }
 
-fn validate_backend_tls_san_allow_list_entry(san: &str) -> Result<(), String> {
+pub(crate) fn validate_backend_tls_san_allow_list_entry(san: &str) -> Result<(), String> {
     validate_string_field("entry", san, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH)?;
     if san.trim().is_empty() {
         return Err("entry must not be empty".to_string());
@@ -3818,6 +3821,13 @@ fn validate_backend_tls_san_allow_list_entry(san: &str) -> Result<(), String> {
         return Err("entry must be an exact DNS name, SPIFFE URI, or IP address".to_string());
     }
     validate_host_entry(&san.to_ascii_lowercase()).map_err(|e| format!("entry is invalid: {}", e))
+}
+
+pub(crate) fn normalize_backend_tls_san_allow_list_entry(san: &mut String) {
+    if san.strip_prefix("spiffe://").is_some() || san.parse::<std::net::IpAddr>().is_ok() {
+        return;
+    }
+    *san = san.to_ascii_lowercase();
 }
 
 impl PluginConfig {

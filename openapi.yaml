@@ -3305,6 +3305,24 @@ components:
             Path to a PEM CA bundle used as the sole trust anchor when
             verifying backend server certificates for this upstream. When
             set, the system/webpki trust store is NOT used (CA exclusivity).
+        backend_tls_sni:
+          type: [string, "null"]
+          maxLength: 253
+          description: >-
+            Optional backend TLS Server Name Indication override. Mesh
+            DestinationRule `trafficPolicy.tls.sni` projects to this field.
+        backend_tls_san_allow_list:
+          type: array
+          maxItems: 256
+          items:
+            type: string
+            maxLength: 2048
+          default: []
+          description: >-
+            Optional allow-list of backend certificate Subject Alternative
+            Names. Entries may be exact DNS names, IP literals, or SPIFFE URI
+            SANs. Mesh DestinationRule `trafficPolicy.tls.subjectAltNames`
+            projects to this field.
         api_spec_id:
           type: [string, "null"]
           description: |
