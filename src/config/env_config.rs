@@ -781,6 +781,24 @@ pub struct EnvConfig {
     /// client produces faster than the backend drains; decrease on
     /// memory-constrained hosts. Legal range: [1, 1024].
     pub http3_request_body_channel_capacity: usize,
+    /// Whether the HTTP/3 listener advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`
+    /// and accepts WebSocket-over-HTTP/3 Extended CONNECT requests per
+    /// [RFC 9220](https://www.rfc-editor.org/rfc/rfc9220) (default: `true`).
+    ///
+    /// When `true`, the server signals to H3 clients that they may bootstrap a
+    /// WebSocket via `:method = CONNECT` + `:protocol = "websocket"`, and the
+    /// gateway bridges those streams to the backend WebSocket
+    /// (HTTP/1.1 Upgrade or H2 Extended CONNECT) just like the HTTP/1.1
+    /// and HTTP/2 frontends. WebSocket plugins (`on_ws_connect`,
+    /// `on_ws_frame`, `on_ws_disconnect`) run unchanged.
+    ///
+    /// When `false`, the server does not advertise the setting and the
+    /// listener returns 501 Not Implemented to any Extended CONNECT
+    /// WebSocket request that still arrives. Use this to opt out of the
+    /// RFC 9220 path while keeping plain HTTP/3 enabled — for instance,
+    /// to constrain the attack surface of a public H3 listener until you
+    /// have validated WebSocket-over-H3 in your environment.
+    pub http3_websocket_enabled: bool,
     /// Milliseconds the HTTP/3 listener spends draining already-buffered
     /// request-body bytes before issuing STOP_SENDING when a
     /// small/successful response is emitted while the client is likely
@@ -1358,6 +1376,7 @@ impl Default for EnvConfig {
             http3_coalesce_max_bytes: crate::http3::config::H3_COALESCE_MAX_DEFAULT,
             http3_flush_interval_micros: 200,
             http3_request_body_channel_capacity: 32,
+            http3_websocket_enabled: true,
             h3_request_body_drain_ms: 50,
             http3_initial_mtu: 1500,
             grpc_pool_ready_wait_ms: 1,
@@ -1660,6 +1679,7 @@ impl EnvConfig {
             http3_coalesce_max_bytes: usize = "FERRUM_HTTP3_COALESCE_MAX_BYTES" => crate::http3::config::H3_COALESCE_MAX_DEFAULT, clamp(crate::http3::config::H3_COALESCE_MIN_FLOOR, crate::http3::config::H3_COALESCE_MAX_CAP);
             http3_flush_interval_micros: u64 = "FERRUM_HTTP3_FLUSH_INTERVAL_MICROS" => 200u64, clamp(crate::http3::config::H3_FLUSH_INTERVAL_MIN_MICROS, crate::http3::config::H3_FLUSH_INTERVAL_MAX_MICROS);
             http3_request_body_channel_capacity: usize = "FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY" => 32usize, clamp(1usize, 1024usize);
+            http3_websocket_enabled: bool = "FERRUM_HTTP3_WEBSOCKET_ENABLED" => true;
             h3_request_body_drain_ms: u64 = "FERRUM_H3_REQUEST_BODY_DRAIN_MS" => 50u64, clamp(0u64, 1000u64);
             http3_initial_mtu: u16 = "FERRUM_HTTP3_INITIAL_MTU" => 1500u16;
             grpc_pool_ready_wait_ms: u64 = "FERRUM_GRPC_POOL_READY_WAIT_MS" => 1u64;
@@ -2002,6 +2022,7 @@ impl EnvConfig {
             http3_coalesce_max_bytes,
             http3_flush_interval_micros,
             http3_request_body_channel_capacity,
+            http3_websocket_enabled,
             h3_request_body_drain_ms,
             http3_initial_mtu,
             grpc_pool_ready_wait_ms,

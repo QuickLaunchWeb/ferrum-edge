@@ -374,10 +374,11 @@ Admin listener TLS and mTLS variables are listed in [Admin API](#admin-api).
 | `FERRUM_HTTP3_COALESCE_MAX_BYTES` | No | `32768` | Response coalesce buffer capacity and `min_bytes` clamp |
 | `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | No | `200` | Response coalesce time-based flush interval (µs) |
 | `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` | No | `32` | Bounded mpsc capacity for the H3→non-H3 cross-protocol request-body bridge. Bounds in-flight request memory to approximately `capacity × average_h3_chunk_size` during streaming uploads. Range: 1–1024. |
+| `FERRUM_HTTP3_WEBSOCKET_ENABLED` | No | `true` | Advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL` and accept RFC 9220 Extended CONNECT (`:method=CONNECT`, `:protocol=websocket`) on the H3 listener. When `false`, the H3 server does not advertise the setting and the bridge returns 501. The WebSocket plugin pipeline (`on_ws_frame`, `on_ws_disconnect`, `ws_rate_limit`, `ws_message_size_limiting`, `ws_frame_logging`) and admission control (`FERRUM_WEBSOCKET_MAX_CONNECTIONS`) work on H3 sessions whether or not `FERRUM_WEBSOCKET_TUNNEL_MODE` is set — H3 always frame-parses since there is no raw TCP underneath QUIC. See [docs/http3.md](http3.md#websocket-over-http3-rfc-9220-extended-connect). |
 | `FERRUM_HTTP3_INITIAL_MTU` | No | `1500` | Initial QUIC path MTU (clamped 1200–65527) |
 | `FERRUM_H3_REQUEST_BODY_DRAIN_MS` | No | `50` | Courtesy drain window before STOP_SENDING on small/successful H3 responses |
 
-See [docs/http3.md](http3.md) for the full HTTP/3 dispatch model, cross-protocol bridge behavior, and WebSocket-over-H3 rationale.
+See [docs/http3.md](http3.md) for the full HTTP/3 dispatch model, cross-protocol bridge behavior, and WebSocket-over-H3 bridging.
 
 ### Stream Proxy (TCP/UDP/DTLS)
 

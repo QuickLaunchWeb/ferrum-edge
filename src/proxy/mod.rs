@@ -53,7 +53,7 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode, upgrade::OnUpgrade, upgrade::Upgraded};
+use hyper::{Request, Response, StatusCode, upgrade::OnUpgrade};
 use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -1050,6 +1050,10 @@ pub(crate) fn request_may_have_body(method: &str, headers: &HashMap<String, Stri
         || headers.contains_key("transfer-encoding")
 }
 
+pub(crate) fn http_flavor_allows_request_body_buffering(flavor: HttpFlavor) -> bool {
+    !matches!(flavor, HttpFlavor::WebSocket)
+}
+
 async fn buffer_request_body_for_before_proxy(
     request: Request<Incoming>,
     method: &str,
@@ -1162,13 +1166,16 @@ impl Drop for PerIpRequestGuard {
 /// WebSocket proxying runs in a spawned task after the HTTP handler returns.
 /// Keeping the accounting in a guard makes the end event fire on normal close,
 /// upgrade failure, task cancellation, or panic unwind.
-struct LoadBalancerConnectionGuard {
+pub(crate) struct LoadBalancerConnectionGuard {
     target: Option<Arc<UpstreamTarget>>,
     balancer: Option<Arc<LoadBalancer>>,
 }
 
 impl LoadBalancerConnectionGuard {
-    fn new(target: Option<Arc<UpstreamTarget>>, balancer: Option<Arc<LoadBalancer>>) -> Self {
+    pub(crate) fn new(
+        target: Option<Arc<UpstreamTarget>>,
+        balancer: Option<Arc<LoadBalancer>>,
+    ) -> Self {
         if let (Some(target), Some(balancer)) = (target.as_ref(), balancer.as_ref()) {
             balancer.record_connection_start(target);
         }
@@ -4054,7 +4061,7 @@ async fn handle_websocket_request_authenticated(
     let mut current_target = upstream_target;
     let mut ws_attempt = 0u32;
 
-    let backend_ws_stream = loop {
+    let backend_handshake = loop {
         match connect_websocket_backend(
             &current_backend_url,
             &proxy,
@@ -4067,7 +4074,7 @@ async fn handle_websocket_request_authenticated(
         )
         .await
         {
-            Ok(stream) => break stream,
+            Ok(handshake) => break handshake,
             Err(e) => {
                 // `connect_websocket_backend` covers more than TCP+TLS setup:
                 // `connect_async_tls_with_config` ALSO sends the WebSocket
@@ -4359,6 +4366,15 @@ async fn handle_websocket_request_authenticated(
             )
     };
 
+    // Forward the backend's negotiated subprotocol (RFC 6455 §11.3.4, RFC
+    // 8441 §5.2). Clients that send `Sec-WebSocket-Protocol` expect the
+    // server to confirm the selected value; dropping it breaks
+    // subprotocol-based dispatch in application code.
+    if let Some(proto) = backend_handshake.negotiated_subprotocol.clone() {
+        ws_resp_builder = ws_resp_builder.header("sec-websocket-protocol", proto);
+    }
+    let backend_ws_stream = backend_handshake.stream;
+
     // Inject sticky session cookie on WebSocket upgrade responses
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
@@ -4464,8 +4480,15 @@ async fn handle_websocket_request_authenticated(
         let _ws_session_guard = ws_session_guard;
         match on_upgrade.await {
             Ok(upgraded) => {
+                // H1/H2 frontends adapt hyper's `Upgraded` (which is
+                // `AsyncRead + AsyncWrite` in hyper-1 land) into the
+                // tokio AsyncRead/AsyncWrite vocabulary via `TokioIo`.
+                // The H3 frontend (`src/http3/websocket.rs`) bypasses
+                // this wrap and passes its own duplex adapter directly
+                // to `run_websocket_proxy`, which is now generic over
+                // the client transport type.
                 if let Err(e) = run_websocket_proxy(
-                    upgraded,
+                    TokioIo::new(upgraded),
                     backend_ws_stream,
                     &proxy_id,
                     ws_conn_id,
@@ -4476,6 +4499,11 @@ async fn handle_websocket_request_authenticated(
                     max_ws_frame,
                     ws_write_buf,
                     ws_tunnel,
+                    // H1/H2: RFC 6455 / RFC 8441 mandate masked
+                    // client-to-server frames. The H3 caller in
+                    // `src/http3/websocket.rs` passes `true` for
+                    // RFC 9220 §5 compliance.
+                    false,
                     &adaptive_buf,
                 )
                 .await
@@ -4541,7 +4569,7 @@ fn collect_forwardable_headers(headers: &hyper::HeaderMap) -> Vec<(String, Strin
 ///
 /// Uses a single pre-sized `String` buffer to avoid intermediate allocations
 /// from multiple `format!()` calls (matches `build_backend_url_with_target`).
-fn build_websocket_backend_url_with_target(
+pub(crate) fn build_websocket_backend_url_with_target(
     proxy: &Proxy,
     incoming_path: &str,
     query_string: &str,
@@ -4755,8 +4783,24 @@ fn build_websocket_tls_connector(
     ))))
 }
 
+/// Outcome of a successful backend WebSocket handshake. The stream carries
+/// frames; `negotiated_subprotocol` preserves the backend's chosen value
+/// (RFC 6455 §11.3.4, also applicable to RFC 8441 / RFC 9220 Extended CONNECT)
+/// so the frontend can forward it to the client. Without forwarding, clients
+/// that offered a subprotocol list see no negotiated value and fail
+/// application-level handshakes.
+///
+/// `Sec-WebSocket-Extensions` is intentionally NOT forwarded: the bridge
+/// doesn't speak `permessage-deflate` end-to-end, so signalling a negotiated
+/// extension would lead the client to decode raw frames as compressed.
+pub(crate) struct BackendWsHandshake {
+    pub stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
+}
+
 /// Connect to backend WebSocket server before sending 101 to client.
-/// Returns the connected backend stream, or an error if the backend is unreachable.
+/// Returns the connected backend stream + negotiated handshake metadata,
+/// or an error if the backend is unreachable.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn connect_websocket_backend(
     backend_url: &str,
@@ -4767,10 +4811,7 @@ pub(crate) async fn connect_websocket_backend(
     crls: &crate::tls::CrlList,
     max_websocket_frame_size_bytes: usize,
     websocket_write_buffer_size: usize,
-) -> Result<
-    WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    Box<dyn std::error::Error + Send + Sync>,
-> {
+) -> Result<BackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
     ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
@@ -4814,7 +4855,15 @@ pub(crate) async fn connect_websocket_backend(
     debug!("Connected to backend WebSocket server: {}", backend_url);
     debug!("Backend response status: {}", backend_response.status());
 
-    Ok(backend_ws_stream)
+    let negotiated_subprotocol = backend_response
+        .headers()
+        .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
+        .cloned();
+
+    Ok(BackendWsHandshake {
+        stream: backend_ws_stream,
+        negotiated_subprotocol,
+    })
 }
 
 /// Run bidirectional WebSocket proxying between upgraded client and connected backend.
@@ -4937,9 +4986,33 @@ fn guard_ws_control_transform(
     }
 }
 
+/// Generic over the client transport type `C`. The H1/H2 frontend passes
+/// `TokioIo::new(upgraded)` (hyper's `Upgraded` adapted to tokio AsyncRead+AsyncWrite);
+/// the H3 frontend (RFC 9220 Extended CONNECT) passes a `tokio::io::DuplexStream`
+/// half that is bridged to the QUIC stream by a pair of pump tasks in
+/// `src/http3/websocket.rs`. The function is generic so both frontends share
+/// the same frame relay, plugin pipeline, and disconnect bookkeeping —
+/// only the bytes-on-the-wire transport differs.
+///
+/// `websocket_tunnel_mode` is a no-op for transports that aren't underpinned by
+/// a single TCP socket (the early-return below still works generically — both
+/// frontends pass `AsyncRead + AsyncWrite + Unpin + Send`, so
+/// `copy_bidirectional_with_sizes` accepts both — but the tunnel-mode
+/// caveats about server-push frame loss only apply to the H1 path that
+/// drops down to raw TCP). H3 callers pass `websocket_tunnel_mode = false`.
+///
+/// `accept_unmasked_client_frames` controls whether the WebSocket framer
+/// accepts client-to-server frames without the RFC 6455 mask bit set.
+/// HTTP/1.1 and HTTP/2 callers pass `false` (RFC 6455 / RFC 8441 mandate
+/// masked client frames). HTTP/3 callers pass `true` — RFC 9220 §5
+/// REVERSES the masking requirement: client-to-server frames MUST NOT
+/// be masked when the WebSocket runs over HTTP/3. tungstenite does not
+/// have a "reject masked frames" mode, so this knob accepts both shapes
+/// on the H3 path; strict RFC 9220 §5 enforcement (close 1002 on a
+/// masked H3 frame) is a future-work follow-up.
 #[allow(clippy::too_many_arguments)]
-async fn run_websocket_proxy(
-    upgraded: Upgraded,
+pub(crate) async fn run_websocket_proxy<C>(
+    client_io: C,
     backend_ws_stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     proxy_id: &str,
     connection_id: u64,
@@ -4950,8 +5023,27 @@ async fn run_websocket_proxy(
     max_websocket_frame_size_bytes: usize,
     websocket_write_buffer_size: usize,
     websocket_tunnel_mode: bool,
+    accept_unmasked_client_frames: bool,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    // Invariant: the tunnel-mode raw-copy fast path is only reachable from H1
+    // frontends. RFC 6455 (H1.1) and RFC 8441 (H2 Extended CONNECT) mandate
+    // masked client frames, so H1/H2 always pass `accept_unmasked_client_frames
+    // = false`. RFC 9220 (H3 Extended CONNECT) reverses the rule and the H3
+    // caller passes `true` — but H3 cannot tunnel raw bytes (there is no TCP
+    // underneath QUIC) so the caller also passes `websocket_tunnel_mode =
+    // false`. If both are ever `true` simultaneously, a refactor has wired a
+    // non-TCP transport into the tunnel branch and `copy_bidirectional` would
+    // silently elide frame parsing on traffic that needs it.
+    debug_assert!(
+        !(websocket_tunnel_mode && accept_unmasked_client_frames),
+        "run_websocket_proxy: tunnel mode is incompatible with unmasked client \
+         frames (H3 caller must pass websocket_tunnel_mode=false)"
+    );
+
     // When tunnel mode is enabled and no plugins need frame-level hooks, bypass
     // WebSocket frame parsing entirely and do raw TCP bidirectional copy. This
     // avoids per-frame header parsing, masking validation, and opcode dispatch —
@@ -4981,7 +5073,7 @@ async fn run_websocket_proxy(
         // sends immediately after upgrade should use frame-parsing mode (set
         // a frame-level plugin or disable `FERRUM_WEBSOCKET_TUNNEL_MODE`).
         let mut backend = backend_ws_stream.into_inner();
-        let mut client_io = TokioIo::new(upgraded);
+        let mut client_io = client_io;
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
         let result = tokio::io::copy_bidirectional_with_sizes(
             &mut client_io,
@@ -5025,9 +5117,13 @@ async fn run_websocket_proxy(
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
     ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
     ws_config.write_buffer_size = websocket_write_buffer_size;
+    // RFC 9220 §5: frames over HTTP/3 are NOT masked. H1/H2 callers
+    // pass `false` (RFC 6455 / RFC 8441 mandate masked client frames);
+    // H3 callers pass `true`.
+    ws_config.accept_unmasked_frames = accept_unmasked_client_frames;
 
     let ws_stream = WebSocketStream::from_raw_socket(
-        TokioIo::new(upgraded),
+        client_io,
         tokio_tungstenite::tungstenite::protocol::Role::Server,
         Some(ws_config),
     )
@@ -6832,6 +6928,7 @@ async fn handle_proxy_request_inner(
         HttpFlavor::Grpc => ProxyProtocol::Grpc,
         HttpFlavor::Plain => ProxyProtocol::Http,
     };
+    let allows_request_body_buffering = http_flavor_allows_request_body_buffering(flavor);
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
 
     // gRPC spec mandates POST method. Reject non-POST gRPC requests with a proper
@@ -6916,7 +7013,11 @@ async fn handle_proxy_request_inner(
     // plugins can read `ctx.request_body_bytes`.
     // HBONE CONNECT must keep hyper's upgrade handle in the streaming request
     // body. Pre-auth body buffering would consume it and make the relay fail.
+    // WebSocket Extended CONNECT is also excluded: DATA frames after the 200
+    // response are WebSocket bytes, not an HTTP request body to drain before
+    // authentication.
     let requires_body_before_authenticate = !is_hbone_connect
+        && allows_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
         && plugins.iter().any(|plugin| {
             plugin.requires_request_body_before_authenticate()
@@ -7070,7 +7171,8 @@ async fn handle_proxy_request_inner(
     let maybe_requires_request_body_buffering = plugin_cache_view.requires_request_body_buffering();
     // should_buffer_request_body is request-time (takes &RequestContext), so it
     // must still iterate. But the config-time capability checks use the bitset.
-    let requires_request_body_buffering = maybe_requires_request_body_buffering
+    let requires_request_body_buffering = allows_request_body_buffering
+        && maybe_requires_request_body_buffering
         && plugins
             .iter()
             .any(|plugin| plugin.should_buffer_request_body(&ctx));
@@ -10541,11 +10643,11 @@ pub(crate) fn build_sticky_cookie_header(
     cookie
 }
 
-fn strip_query_params(url: &str) -> &str {
+pub(crate) fn strip_query_params(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
 }
 
-fn record_status(state: &ProxyState, status: u16) {
+pub(crate) fn record_status(state: &ProxyState, status: u16) {
     // Fast path: get() uses a read lock (shared), which is much cheaper than
     // entry() which always takes a write lock. Since status codes are a small
     // fixed set, the entry almost always exists after the first request.
@@ -10563,7 +10665,7 @@ fn record_status(state: &ProxyState, status: u16) {
     // else: silently drop — rare status code and map is at capacity
 }
 
-fn record_request(state: &ProxyState, status: u16) {
+pub(crate) fn record_request(state: &ProxyState, status: u16) {
     state.request_count.fetch_add(1, Ordering::Relaxed);
     record_status(state, status);
 }
@@ -12754,6 +12856,20 @@ mod tests {
             }
         }))
         .expect("test proxy should deserialize")
+    }
+
+    #[test]
+    fn websocket_flavor_does_not_allow_request_body_buffering() {
+        assert!(
+            !http_flavor_allows_request_body_buffering(HttpFlavor::WebSocket),
+            "WebSocket stream DATA is upgraded traffic, not a pre-upgrade request body"
+        );
+    }
+
+    #[test]
+    fn plain_and_grpc_flavors_allow_request_body_buffering() {
+        assert!(http_flavor_allows_request_body_buffering(HttpFlavor::Plain));
+        assert!(http_flavor_allows_request_body_buffering(HttpFlavor::Grpc));
     }
 
     #[test]

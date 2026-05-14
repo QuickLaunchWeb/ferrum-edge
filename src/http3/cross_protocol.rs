@@ -74,10 +74,16 @@
 //!   for streaming gRPC responses we pull them out of hyper's trailer
 //!   frame during the DATA-loop exit.
 //!
-//! - **WebSocket over HTTP/3** — returned as 501. RFC 9220 defines
-//!   Extended CONNECT over H3 for WebSocket, but neither common clients
-//!   nor most backends implement it; sending the upgrade over H1/H2 is
-//!   the supported path.
+//! - **WebSocket over HTTP/3** — handled separately by
+//!   `crate::http3::websocket::handle_h3_websocket` (RFC 9220 Extended
+//!   CONNECT). The dispatcher in `src/http3/server.rs::handle_h3_request`
+//!   intercepts `HttpFlavor::WebSocket` BEFORE the cross-protocol path
+//!   so the dedicated handler can take ownership of the QUIC stream
+//!   (split into independent send/recv halves for full-duplex frame
+//!   relay). The `HttpFlavor::WebSocket` arm in `run()` below remains
+//!   as defense in depth: if a refactor accidentally routes WebSocket
+//!   here, it returns 501 rather than misbehaving silently. Controlled
+//!   by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default true).
 //!
 //! ## Outcome reporting
 //!
@@ -430,14 +436,22 @@ where
             .await
         }
         HttpFlavor::WebSocket => {
+            // Defense in depth. The H3 dispatcher in
+            // `src/http3/server.rs::handle_h3_request` intercepts
+            // WebSocket flavor BEFORE cross_protocol::run and routes
+            // it to `crate::http3::websocket::handle_h3_websocket`,
+            // which implements RFC 9220 Extended CONNECT bridging.
+            // Reaching this arm means a refactor accidentally fell
+            // through; emit 501 rather than silently misbehave.
             warn!(
                 proxy_id = %proxy.id,
-                "WebSocket over HTTP/3 (RFC 9220 Extended CONNECT) is not supported; returning 501"
+                "Unexpected WebSocket flavor reached cross_protocol::run; \
+                 should have been routed to handle_h3_websocket. Returning 501."
             );
             write_error(
                 stream,
                 StatusCode::NOT_IMPLEMENTED,
-                r#"{"error":"WebSocket over HTTP/3 is not supported. Send the upgrade over HTTP/1.1 or HTTP/2."}"#,
+                r#"{"error":"WebSocket over HTTP/3 routing error"}"#,
                 backend_start,
                 0,
             )
