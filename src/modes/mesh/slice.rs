@@ -169,7 +169,9 @@ impl MeshSlice {
     ///     `{name}.{namespace}`,
     ///     `{name}.{namespace}.svc`, and
     ///     `{name}.{namespace}.svc.{cluster_domain}` forms with their
-    ///     declared ports
+    ///     declared ports. Resources without declared ports also get a
+    ///     `host:*` marker so REGISTRY_ONLY treats the known destination as
+    ///     valid when HTTP callers include an explicit Host port.
     ///   - `service_entries.hosts` with their declared ports
     ///   - `workloads.addresses`
     ///
@@ -514,8 +516,13 @@ fn insert_known_destination(
     ports: impl Iterator<Item = u16>,
 ) {
     entries.insert(host.to_string());
+    let mut inserted_port = false;
     for port in ports {
+        inserted_port = true;
         entries.insert(format!("{host}:{port}"));
+    }
+    if !inserted_port {
+        entries.insert(format!("{host}:*"));
     }
 }
 
@@ -2660,6 +2667,28 @@ mod tests {
         assert!(entries.contains(&"reviews.default.svc.cluster.local:8080".to_string()));
         assert!(entries.contains(&"reviews.default.svc:8080".to_string()));
         assert!(entries.contains(&"reviews.default:8080".to_string()));
+    }
+
+    #[test]
+    fn build_known_destinations_emits_any_port_marker_when_ports_absent() {
+        let slice = MeshSlice {
+            namespace: "default".into(),
+            services: vec![MeshService {
+                name: "ratings".into(),
+                namespace: "default".into(),
+                ports: Vec::new(),
+                workloads: Vec::new(),
+                protocol_overrides: HashMap::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        let entries = slice.build_known_destinations("cluster.local");
+        assert!(entries.contains(&"ratings".to_string()));
+        assert!(entries.contains(&"ratings:*".to_string()));
+        assert!(entries.contains(&"ratings.default:*".to_string()));
+        assert!(entries.contains(&"ratings.default.svc:*".to_string()));
+        assert!(entries.contains(&"ratings.default.svc.cluster.local:*".to_string()));
     }
 
     #[test]

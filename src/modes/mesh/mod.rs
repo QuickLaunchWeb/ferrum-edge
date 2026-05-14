@@ -4221,11 +4221,25 @@ mod tests {
         let prepared =
             gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
 
+        let plugin = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+            .expect("outbound registry plugin injected");
+        let registry = plugin
+            .config
+            .get("registry")
+            .and_then(serde_json::Value::as_array)
+            .expect("registry config array");
         assert!(
-            prepared
-                .plugin_configs
+            registry
                 .iter()
-                .any(|plugin| plugin.id == MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+                .any(|entry| entry.as_str() == Some("ratings.default"))
+        );
+        assert!(
+            registry
+                .iter()
+                .any(|entry| entry.as_str() == Some("ratings.default:*"))
         );
     }
 

@@ -979,7 +979,7 @@ The following Istio mesh surfaces are either deferred or have Ferrum-specific su
 |---|---|---|
 | `EnvoyFilter` | Not planned | Use Ferrum custom plugins |
 | `WasmPlugin` | Not planned | Use Ferrum custom plugins (`custom_plugins/`) |
-| Outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`) | Supported | `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY=registry_only` (or native/CRD slice-supplied `outbound_traffic_policy`) auto-injects the `mesh_outbound_registry` plugin on topologies with an outbound capture listener; unknown destinations are rejected at the outbound gate with `FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS` (default 502), inbound sidecar/ambient traffic is not gated by this outbound policy, wildcard ServiceEntry hosts match one DNS label, and empty registries fail closed |
+| Outbound traffic policy (`REGISTRY_ONLY` / `ALLOW_ANY`) | Supported | `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY=registry_only` (or native/CRD slice-supplied `outbound_traffic_policy`) auto-injects the `mesh_outbound_registry` plugin on topologies with an outbound capture listener; unknown destinations are rejected at the outbound gate with `FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS` (default 502), inbound sidecar/ambient traffic is not gated by this outbound policy, wildcard ServiceEntry hosts match one DNS label, resources with no declared ports admit any explicit Host port for that known destination, and empty registries fail closed |
 | `VirtualService` header/method-only matches | Skipped | Ferrum route proxies do not encode header/method predicates |
 | Pod auto-discovery (K8s native service registry) | Deferred | Declare `WorkloadEntry` / `ServiceEntry` explicitly until a Pod watcher lands |
 | `WorkloadEntry` `weight` / `locality` / `serviceAccount` | Partial | Translated as workload metadata; locality-aware load balancing not yet wired (consumed by an upcoming PR). `serviceAccount` is kept separately from the SPIFFE path so introspection/audit doesn't need to parse it. |
@@ -1021,6 +1021,8 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_DNS_TTL_SECONDS` | `60` | TTL for mesh-resolved DNS responses |
 | `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` | `1024` | Concurrent query semaphore limit |
 | `FERRUM_MESH_CLUSTER_DOMAIN` | `cluster.local` | Kubernetes cluster domain for FQDN synthesis |
+| `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY` | `allow_any` | Mesh-wide outbound policy: `allow_any` or `registry_only` |
+| `FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS` | `502` | HTTP 4xx/5xx status returned when `registry_only` rejects an unknown HTTP-family destination |
 
 ### Identity / CA
 
