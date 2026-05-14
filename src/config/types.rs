@@ -494,6 +494,8 @@ pub struct BackendTlsConfig {
     pub sni: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub san_allow_list: Vec<String>,
+    #[serde(skip)]
+    pub san_allow_list_key_digest: Option<String>,
 }
 
 impl BackendTlsConfig {
@@ -506,11 +508,13 @@ impl BackendTlsConfig {
             verify_server_cert: true,
             sni: None,
             san_allow_list: Vec::new(),
+            san_allow_list_key_digest: None,
         }
     }
 
     /// Project an upstream's backend TLS fields into the resolved runtime form.
     pub fn from_upstream(upstream: &Upstream) -> Self {
+        let digest = Self::compute_san_digest(&upstream.backend_tls_san_allow_list);
         Self {
             client_cert_path: upstream.backend_tls_client_cert_path.clone(),
             client_key_path: upstream.backend_tls_client_key_path.clone(),
@@ -518,6 +522,7 @@ impl BackendTlsConfig {
             verify_server_cert: upstream.backend_tls_verify_server_cert,
             sni: upstream.backend_tls_sni.clone(),
             san_allow_list: upstream.backend_tls_san_allow_list.clone(),
+            san_allow_list_key_digest: digest,
         }
     }
 
@@ -530,7 +535,25 @@ impl BackendTlsConfig {
             verify_server_cert: proxy.backend_tls_verify_server_cert,
             sni: None,
             san_allow_list: Vec::new(),
+            san_allow_list_key_digest: None,
         }
+    }
+
+    pub fn recompute_san_digest(&mut self) {
+        self.san_allow_list_key_digest = Self::compute_san_digest(&self.san_allow_list);
+    }
+
+    fn compute_san_digest(sans: &[String]) -> Option<String> {
+        if sans.is_empty() {
+            return None;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        sans.len().hash(&mut hasher);
+        for san in sans {
+            san.hash(&mut hasher);
+        }
+        Some(format!("{:016x}", hasher.finish()))
     }
 }
 
@@ -1698,19 +1721,7 @@ impl GatewayConfig {
         let upstream_tls: HashMap<&str, BackendTlsConfig> = self
             .upstreams
             .iter()
-            .map(|u| {
-                (
-                    u.id.as_str(),
-                    BackendTlsConfig {
-                        client_cert_path: u.backend_tls_client_cert_path.clone(),
-                        client_key_path: u.backend_tls_client_key_path.clone(),
-                        server_ca_cert_path: u.backend_tls_server_ca_cert_path.clone(),
-                        verify_server_cert: u.backend_tls_verify_server_cert,
-                        sni: u.backend_tls_sni.clone(),
-                        san_allow_list: u.backend_tls_san_allow_list.clone(),
-                    },
-                )
-            })
+            .map(|u| (u.id.as_str(), BackendTlsConfig::from_upstream(u)))
             .collect();
 
         for proxy in &mut self.proxies {
@@ -1720,14 +1731,7 @@ impl GatewayConfig {
                     .cloned()
                     .unwrap_or_else(BackendTlsConfig::default_verify)
             } else {
-                BackendTlsConfig {
-                    client_cert_path: proxy.backend_tls_client_cert_path.clone(),
-                    client_key_path: proxy.backend_tls_client_key_path.clone(),
-                    server_ca_cert_path: proxy.backend_tls_server_ca_cert_path.clone(),
-                    verify_server_cert: proxy.backend_tls_verify_server_cert,
-                    sni: None,
-                    san_allow_list: Vec::new(),
-                }
+                BackendTlsConfig::from_proxy(proxy)
             };
         }
     }

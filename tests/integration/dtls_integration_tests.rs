@@ -67,14 +67,7 @@ fn build_dtls_proxy(backend_host: &str, backend_port: u16, ca_path: Option<Strin
     }))
     .expect("build DTLS proxy");
     // resolved_tls is #[serde(skip)], so populate it from proxy fields for direct-backend proxies
-    proxy.resolved_tls = ferrum_edge::config::types::BackendTlsConfig {
-        client_cert_path: proxy.backend_tls_client_cert_path.clone(),
-        client_key_path: proxy.backend_tls_client_key_path.clone(),
-        server_ca_cert_path: proxy.backend_tls_server_ca_cert_path.clone(),
-        verify_server_cert: proxy.backend_tls_verify_server_cert,
-        sni: None,
-        san_allow_list: Vec::new(),
-    };
+    proxy.resolved_tls = ferrum_edge::config::types::BackendTlsConfig::from_proxy(&proxy);
     proxy
 }
 

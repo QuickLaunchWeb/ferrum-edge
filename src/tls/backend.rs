@@ -80,8 +80,6 @@ pub fn append_backend_tls_pool_key_fields(
     client_key_path: Option<&str>,
     verify_server_cert: bool,
 ) {
-    use std::fmt::Write;
-
     buf.push_str(tls.server_ca_cert_path.as_deref().unwrap_or_default());
     buf.push('|');
     buf.push_str(client_cert_path.unwrap_or_default());
@@ -90,13 +88,7 @@ pub fn append_backend_tls_pool_key_fields(
     buf.push('|');
     buf.push_str(tls.sni.as_deref().unwrap_or_default());
     buf.push('|');
-    let _ = write!(buf, "{}", tls.san_allow_list.len());
-    for san in &tls.san_allow_list {
-        buf.push(':');
-        let _ = write!(buf, "{}", san.len());
-        buf.push(':');
-        buf.push_str(san);
-    }
+    buf.push_str(tls.san_allow_list_key_digest.as_deref().unwrap_or_default());
     buf.push('|');
     buf.push(if verify_server_cert { '1' } else { '0' });
 }

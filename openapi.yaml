@@ -3311,6 +3311,8 @@ components:
           description: >-
             Optional backend TLS Server Name Indication override. Mesh
             DestinationRule `trafficPolicy.tls.sni` projects to this field.
+            Stored/projected only — backend handshake SNI consumption is not
+            yet enforced (tracked by GAP-1B).
         backend_tls_san_allow_list:
           type: array
           maxItems: 256
@@ -3322,7 +3324,8 @@ components:
             Optional allow-list of backend certificate Subject Alternative
             Names. Entries may be exact DNS names, IP literals, or SPIFFE URI
             SANs. Mesh DestinationRule `trafficPolicy.tls.subjectAltNames`
-            projects to this field.
+            projects to this field. Stored/projected only — SAN allow-list
+            verification is not yet enforced (tracked by GAP-1C).
         api_spec_id:
           type: [string, "null"]
           description: |

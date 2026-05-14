@@ -2057,6 +2057,7 @@ mod tests {
             verify_server_cert: true,
             sni: None,
             san_allow_list: Vec::new(),
+            san_allow_list_key_digest: None,
         };
 
         let canary: Upstream = serde_json::from_value(json!({

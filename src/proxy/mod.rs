@@ -14025,6 +14025,7 @@ mod tests {
             verify_server_cert: false,
             sni: None,
             san_allow_list: Vec::new(),
+            san_allow_list_key_digest: None,
         };
 
         let now = chrono::Utc::now();

@@ -134,9 +134,9 @@ async fn connection_pool_key_direct_backend_format() {
     );
     // BackendScheme::Http = 0
     assert!(key.contains("|0|"), "key should contain protocol 0: {key}");
-    // No DNS override, no CA, no mTLS, no SNI, empty SAN list marker, verify=true (1)
+    // No DNS override, no CA, no mTLS, no SNI, no SAN digest, verify=true (1)
     assert!(
-        key.ends_with("||||0|1"),
+        key.ends_with("|||||1"),
         "key should end with empty dns/ca/mtls and verify=1: {key}"
     );
 }
@@ -202,6 +202,7 @@ async fn connection_pool_key_with_backend_tls_sni_and_sans() {
     let mut p1 = minimal_proxy();
     p1.resolved_tls.sni = Some("reviews.mesh.internal".to_string());
     p1.resolved_tls.san_allow_list = vec!["reviews.mesh.internal".to_string()];
+    p1.resolved_tls.recompute_san_digest();
     let mut p2 = p1.clone();
     p2.resolved_tls.sni = Some("ratings.mesh.internal".to_string());
 
@@ -213,6 +214,7 @@ async fn connection_pool_key_with_backend_tls_sni_and_sans() {
 
     p2.resolved_tls.sni = p1.resolved_tls.sni.clone();
     p2.resolved_tls.san_allow_list = vec!["ratings.mesh.internal".to_string()];
+    p2.resolved_tls.recompute_san_digest();
     assert_ne!(
         pool.pool_key_for_warmup(&p1),
         pool.pool_key_for_warmup(&p2),
@@ -405,7 +407,7 @@ fn h2_pool_key_basic_format() {
     let key = Http2ConnectionPool::pool_key_for_warmup(&proxy);
     // Format: host|port|dns|ca|mtls_cert|mtls_key|sni|sans|verify
     assert_eq!(
-        key, "backend.example.com|8080||||||0|1",
+        key, "backend.example.com|8080|||||||1",
         "basic H2 key format mismatch"
     );
 }
@@ -450,6 +452,7 @@ fn h2_pool_key_with_backend_tls_sni_and_sans() {
     let mut p1 = minimal_proxy();
     p1.resolved_tls.sni = Some("reviews.mesh.internal".to_string());
     p1.resolved_tls.san_allow_list = vec!["reviews.mesh.internal".to_string()];
+    p1.resolved_tls.recompute_san_digest();
     let mut p2 = p1.clone();
     p2.resolved_tls.sni = Some("ratings.mesh.internal".to_string());
 
@@ -461,6 +464,7 @@ fn h2_pool_key_with_backend_tls_sni_and_sans() {
 
     p2.resolved_tls.sni = p1.resolved_tls.sni.clone();
     p2.resolved_tls.san_allow_list = vec!["ratings.mesh.internal".to_string()];
+    p2.resolved_tls.recompute_san_digest();
     assert_ne!(
         Http2ConnectionPool::pool_key_for_warmup(&p1),
         Http2ConnectionPool::pool_key_for_warmup(&p2),
@@ -698,7 +702,7 @@ fn h3_pool_key_basic_format() {
     // Format: host|port|index|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify
     // (all TLS fields empty by default, verify=true → trailing "1")
     assert_eq!(
-        key, "backend.example.com|8080|0||||||0|1",
+        key, "backend.example.com|8080|0|||||||1",
         "basic H3 key format mismatch"
     );
 }
@@ -786,6 +790,7 @@ fn h3_pool_key_with_backend_tls_sni_and_sans() {
     let mut p1 = minimal_proxy();
     p1.resolved_tls.sni = Some("reviews.mesh.internal".to_string());
     p1.resolved_tls.san_allow_list = vec!["reviews.mesh.internal".to_string()];
+    p1.resolved_tls.recompute_san_digest();
     let mut p2 = p1.clone();
     p2.resolved_tls.sni = Some("ratings.mesh.internal".to_string());
 
@@ -797,6 +802,7 @@ fn h3_pool_key_with_backend_tls_sni_and_sans() {
 
     p2.resolved_tls.sni = p1.resolved_tls.sni.clone();
     p2.resolved_tls.san_allow_list = vec!["ratings.mesh.internal".to_string()];
+    p2.resolved_tls.recompute_san_digest();
     assert_ne!(
         Http3ConnectionPool::pool_key(&p1, 0),
         Http3ConnectionPool::pool_key(&p2, 0),
@@ -979,7 +985,7 @@ fn h3_pool_key_full_tls_config() {
     // Shape: host|port|index|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify
     // dns_override is empty here, so we get an empty field between index and CA.
     assert_eq!(
-        key, "backend.example.com|8080|2||/ca/bundle.pem|/client/cert.pem|/client/key.pem||0|0",
+        key, "backend.example.com|8080|2||/ca/bundle.pem|/client/cert.pem|/client/key.pem|||0",
         "full TLS config H3 key format mismatch"
     );
 }
@@ -1158,8 +1164,8 @@ async fn all_three_pools_use_pipe_delimiter() {
             "{name} key should use | delimiter: {key}"
         );
         assert!(
-            key.contains("|0|"),
-            "{name} key should include the empty SAN-list marker: {key}"
+            key.contains("||"),
+            "{name} key should include empty SAN-digest field: {key}"
         );
     }
 }
@@ -1215,6 +1221,7 @@ fn backend_capability_key_includes_backend_tls_sni_and_sans() {
     p1.dispatch_kind = DispatchKind::from(BackendScheme::Https);
     p1.resolved_tls.sni = Some("reviews.mesh.internal".to_string());
     p1.resolved_tls.san_allow_list = vec!["reviews.mesh.internal".to_string()];
+    p1.resolved_tls.recompute_san_digest();
 
     let mut p2 = p1.clone();
     p2.resolved_tls.sni = Some("ratings.mesh.internal".to_string());
@@ -1226,6 +1233,7 @@ fn backend_capability_key_includes_backend_tls_sni_and_sans() {
 
     p2.resolved_tls.sni = p1.resolved_tls.sni.clone();
     p2.resolved_tls.san_allow_list = vec!["ratings.mesh.internal".to_string()];
+    p2.resolved_tls.recompute_san_digest();
     assert_ne!(
         capability_key(&p1),
         capability_key(&p2),

@@ -142,6 +142,7 @@ fn direct_backend_override_clears_existing_upstream_id() {
         verify_server_cert: false,
         sni: None,
         san_allow_list: Vec::new(),
+        san_allow_list_key_digest: None,
     };
     let proxy = Arc::new(proxy_template);
     let mut ctx = ctx();
@@ -230,6 +231,7 @@ fn explicit_tls_override_applies_to_clone() {
         verify_server_cert: false,
         sni: None,
         san_allow_list: Vec::new(),
+        san_allow_list_key_digest: None,
     });
 
     let result = ctx.apply_route_overrides(Arc::clone(&proxy));
