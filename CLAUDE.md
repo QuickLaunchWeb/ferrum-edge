@@ -4,6 +4,15 @@
 
 High-performance Rust edge proxy (HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC, raw TCP/UDP) with 58+ plugins, four operating modes, LB + health checks. Rust (edition 2024) on tokio + hyper 1.0. Single binary `ferrum-edge` (CLI subcommands + env config). License: PolyForm Noncommercial 1.0.0 (dual-licensed commercial).
 
+## Read Before Touching
+
+- Mesh behavior → [docs/mesh.md](docs/mesh.md) + `src/modes/mesh/` + mesh plugin injection notes below
+- HTTP/3 / WebSocket / QUIC → [docs/http3.md](docs/http3.md) + `src/http3/` + Backend Capability Registry below
+- API spec extraction → [docs/api_specs.md](docs/api_specs.md) + `src/admin/api_specs/`
+- Config/env changes → [docs/configuration.md](docs/configuration.md) + `ferrum.conf` + `src/config/env_config.rs`
+- Plugin ordering or hooks → [docs/plugin_execution_order.md](docs/plugin_execution_order.md) + `src/plugins/mod.rs`
+- Upstream protocol dependencies → Dependency Version Sync below + `tests/performance/multi_protocol/`
+
 ## Commands
 
 ### CLI
@@ -18,7 +27,9 @@ ferrum-edge health [-p PORT] [--host H] [--tls] [--tls-no-verify]
 
 `run`/`validate` flags: `-s/--settings <PATH>`, `-c/--spec <PATH>`, `-m/--mode <MODE>`, `-v/--verbose`. **Precedence**: CLI > env > conf file > smart defaults > hardcoded. Smart defaults search `./ferrum.conf`, `./config/ferrum.conf`, `/etc/ferrum/ferrum.conf` and `./resources.{yaml,json}`, `./config/resources.{yaml,json}`, `/etc/ferrum/config.{yaml,json}`. CLI flags translate to env vars via `apply_run_overrides()` **before** `CONF_FILE_CACHE` reads — see `main.rs`.
 
-### Build / Test / Lint
+### Command Reference
+
+Use these as building blocks; the local testing policy below decides which subset to run.
 
 ```bash
 cargo build                               # Debug
@@ -37,9 +48,10 @@ cargo fmt --all && cargo fmt --all -- --check
 
 CI runs the full matrix on every PR (format, clippy, all test crates, perf regression, 5 build targets). Locally, test only what you changed and let CI catch the rest — don't run the whole suite after every iteration.
 
-**Always before pushing:**
-1. `cargo fmt --all -- --check` — fmt is the #1 CI failure
-2. `cargo clippy --all-targets -- -D warnings` — same lints CI runs
+**Before pushing, choose by change type:**
+- Rust changes → `cargo fmt --all -- --check` + `cargo clippy --all-targets -- -D warnings` + the targeted tests below
+- Docs/comment-only → `git diff --check` plus any relevant doc formatter/linter if one exists
+- Config/schema/spec/template changes → validate the changed surface (`ferrum-edge validate`, OpenAPI/schema checks, or targeted config/admin tests) and run Rust fmt/clippy only if Rust files changed
 
 **Targeted by change scope:**
 - Private fn in `src/` → `cargo test --lib <module>::tests`
@@ -182,7 +194,10 @@ Host-only HTTP proxy matches all paths under its hosts; `strip_listen_path: true
 
 **`backend_scheme` + runtime flavor**: HTTP-family proxies accept `http`/`https` and `backend_scheme` is optional (defaults to `https`). Stream-family (`tcp`/`tcps`/`udp`/`dtls`) requires an explicit scheme. gRPC and WebSocket are NOT schemes — they are runtime flavors classified per-request via `backend_dispatch::detect_http_flavor()` (one header lookup, zero allocation). A single `https` proxy serves Plain/gRPC/WebSocket traffic uniformly. HTTPS backends are classified out of band into the usable plain-HTTP buckets (`h1`, `h2_tls`, `h3`) plus the gRPC transport buckets (`h2_tls`, `h2c`).
 
-**HTTP/3 is decoupled from the backend.** An H3 client can hit any `https` backend; the gateway dispatches Plain/gRPC via reqwest / H2 pool just like H1/H2 clients do and only uses the native H3 backend pool when the startup capability registry has already proved the concrete backend target supports H3. WebSocket over H3 (RFC 9220 Extended CONNECT) is supported as a frontend protocol and bridges to HTTP/1.1-Upgrade backends — the H3 frontend never speaks WebSocket directly to a backend because browsers / Node `ws` / common WebSocket backends still bootstrap over H1.1 / H2. Gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default `true`); the H3 server advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL` when enabled, and the bridge in `src/http3/websocket.rs` runs the same plugin pipeline, frame relay, and `on_ws_frame` / `on_ws_disconnect` hooks as the H1/H2 path. See [docs/http3.md](docs/http3.md) for the cross-protocol bridge, buffering policy, and rationale.
+**HTTP/3 frontend invariant**:
+- Invariant: an H3 client can hit any `https` backend; native H3 backend dispatch is used only when the capability registry proves the concrete target supports H3.
+- Touch points: `src/http3/`, `src/proxy/backend_capabilities.rs`, [docs/http3.md](docs/http3.md).
+- Regression guard: H3 WebSocket (RFC 9220 Extended CONNECT) bridges to the same backend WebSocket transport and frame-plugin pipeline as H1/H2; the H3 frontend never speaks WebSocket directly to a backend. Gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED`.
 
 ### Protocol-Level Request Validation
 
@@ -192,7 +207,11 @@ CONNECT: H2 Extended CONNECT (RFC 8441) and H3 Extended CONNECT (RFC 9220), both
 
 Frontend TLS/DTLS handshakes are bounded by `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` (default 10s, 0 disables) before HTTP header timers can start. Backend TLS/H2/gRPC/H3 handshakes are bounded by the per-proxy `backend_connect_timeout_ms` budget; this is an end-to-end connect budget, not only the TCP SYN phase. Frontend DTLS demux state is capped before allocating per-peer channels/tasks and released on handshake timeout; `/overload.stream_listeners.dtls_demux_sessions` exposes an eventually consistent pre-handshake diagnostic count for triage.
 
-**Frontend TLS-before-backend invariant**: Every TLS/DTLS-terminating client-facing protocol completes frontend crypto/admission before backend dispatch: HTTPS/H2/gRPC/WSS complete TLS before request routing; normal H3 completes QUIC/TLS before request routing; TCP+TLS completes TLS and `on_stream_connect` before backend connect; UDP+DTLS completes DTLS and `on_stream_connect` before backend session creation. Frontend handshake failures and plugin rejects are frontend setup failures: do not dial backend and do not trip backend circuit breakers. The only deliberate exception is operator-enabled HTTP/3 0-RTT early data (`FERRUM_TLS_EARLY_DATA_METHODS`), which is disabled by default, method-gated, and forwarded with `Early-Data: 1` for backend replay policy.
+**Frontend TLS-before-backend invariant**:
+- Invariant: every TLS/DTLS-terminating client-facing protocol completes frontend crypto/admission before backend dispatch.
+- Touch points: HTTPS/H2/gRPC/WSS route only after TLS; normal H3 after QUIC/TLS; TCP+TLS after `on_stream_connect`; UDP+DTLS after `on_stream_connect`.
+- Regression guard: frontend handshake failures and plugin rejects do not dial backend and do not trip backend circuit breakers.
+- Exception: operator-enabled HTTP/3 0-RTT (`FERRUM_TLS_EARLY_DATA_METHODS`) is disabled by default, method-gated, and forwarded with `Early-Data: 1`.
 
 ### TLS/DTLS Passthrough
 
@@ -401,47 +420,35 @@ One nuance: hyper coalesces concurrent cold-pool connects, so simultaneous reque
 
 ### Backend Capability Registry (`src/proxy/backend_capabilities.rs`)
 
-Out-of-band protocol classifier that decides whether a plain HTTPS request uses native H3, the direct H2 pool, or reqwest. Keyed by deduplicated backend target identity matching `Http3ConnectionPool::pool_key`.
+**Invariant**: plain HTTPS backend dispatch chooses native H3, direct H2, or reqwest from a per-target capability record keyed the same way as `Http3ConnectionPool::pool_key`. `Unknown` / `Unsupported` route via reqwest, so an empty registry degrades gracefully.
 
-**Lifecycle**: populated by `warmup_connection_pools()` when `FERRUM_POOL_WARMUP_ENABLED=true`; otherwise `start_backend_capability_refresh_task(run_initial_refresh=true, ...)` runs the first probe pass. Periodic refresh every `FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS` (default 24h). Config reload calls `spawn_backend_capability_refresh`; `RefreshCoalescer` guarantees at most one in-flight task + one queued re-run. Probe parallelism: cross-target `for_each_concurrent(pool_warmup_concurrency)`; intra-target HTTPS uses `tokio::join!` for parallel H2 + H3 probes. Probe timeouts clamp to 5s.
+**Touch points**: populated by `warmup_connection_pools()` when `FERRUM_POOL_WARMUP_ENABLED=true`; otherwise `start_backend_capability_refresh_task(run_initial_refresh=true, ...)` runs the first probe pass. Config reload calls `spawn_backend_capability_refresh`; `RefreshCoalescer` guarantees at most one in-flight task + one queued re-run. Hot lookup uses a thread-local key buffer.
 
-**Hot-path lookup**: `BackendCapabilityRegistry::get(proxy, target)` uses a thread-local key buffer (zero per-request allocation). `Unknown` / `Unsupported` both route via reqwest, so an empty registry degrades gracefully.
-
-**Stale-cache invalidation**: `mark_h3_unsupported` / `mark_h2_tls_unsupported` Arc-swap the cached record to downgrade. H3 downgrade gated by `is_h3_transport_error_class` (includes ConnectionRefused/Timeout/Reset/Closed/TlsError/ProtocolError/DnsLookupError/PortExhaustion/ConnectionPoolError/ReadWriteTimeout; excludes ClientDisconnect/payload-size/`GracefulRemoteClose`). H2/TLS downgrade fires on `Http2PoolError::BackendSelectedHttp1`. Next periodic refresh re-probes and restores on recovery.
-
-**H3 graceful-close suppression**: `H3_NO_ERROR` ApplicationClose / GOAWAY at `recv_response` is detected by `is_h3_graceful_close` and surfaced as `ErrorClass::GracefulRemoteClose` (excluded from transport-error class). RFC 9114 §8.1 spec-legal teardown — treating it as a capability failure would disable H3 forever on backends that close after every response. Upstream h3-crate fix vendored at `vendor/h3-0.0.8-ferrum-patched`; lifecycle in [docs/upstream-h3-patches/](docs/upstream-h3-patches/).
-
-**Per-target dispatch contract** (`proxy_to_backend_inner`): capture `current_dispatch_h3 = supports_native_http3_backend(...)` once per attempt:
-- **Same target across attempts** → keep the snapshot. Cross-protocol replay against the same backend risks duplicating non-idempotent requests (the failed transport may have flushed headers/body before the error surfaced).
-- **LB rotation to a different target** → recompute for the new target. Mixed-capability upstreams are real (target A speaks H3, B speaks H1); without recompute, the retry forces H3 against an H1-only backend → 502 forever.
-
-This matches industry practice (Envoy/NGINX/Cloudflare/GFE): cross-protocol fallback at connection establishment or per-target classification, never mid-attempt against the same backend.
+**Regression guards**:
+- Stale-cache invalidation uses `mark_h3_unsupported` / `mark_h2_tls_unsupported`; H3 downgrade is gated by `is_h3_transport_error_class` and excludes `ClientDisconnect`, payload-size errors, and `GracefulRemoteClose`.
+- `H3_NO_ERROR` ApplicationClose / GOAWAY at `recv_response` is `ErrorClass::GracefulRemoteClose`, not a capability failure. Upstream h3-crate fix is vendored at `vendor/h3-0.0.8-ferrum-patched`; lifecycle in [docs/upstream-h3-patches/](docs/upstream-h3-patches/).
+- `proxy_to_backend_inner` captures `current_dispatch_h3 = supports_native_http3_backend(...)` once per attempt. Keep the snapshot for the same target; recompute after LB rotation to a different target so mixed-capability upstreams work.
 
 **Admin introspection** (JWT-auth): `GET /backend-capabilities` snapshot, `POST /backend-capabilities/refresh` forces classification pass. Payloads carry only classifications + probe timestamps — safe to leave permanently enabled. See [docs/admin_api.md](docs/admin_api.md#backend-capability-registry).
 
 ### Connection-Error Classification Boundary
 
-`BackendResponse::connection_error: bool` means exactly: **"the request body never reached the backend's application layer."** When `true`, the retry loop fires `retry_on_connect_failure` regardless of HTTP method (idempotent by construction). When `false`, retries must respect `retry_on_methods` / `retryable_status_codes`.
+**Invariant**: `BackendResponse::connection_error: bool` means exactly "the request body never reached the backend's application layer." When `true`, `retry_on_connect_failure` can replay regardless of HTTP method; when `false`, retries must respect `retry_on_methods` / `retryable_status_codes`.
 
-Every protocol classifier funnels `ErrorClass` through `retry::request_reached_wire(error_class) -> bool`, which returns `false` only for pre-wire classes: `ConnectionRefused`, `ConnectionTimeout`, `DnsLookupError`, `TlsError`, `PortExhaustion`, `ConnectionPoolError`. Per-classifier `connection_error: bool` fields are intentionally absent — earlier code derived the boolean at every dispatch site with inconsistent implementations.
+**Touch points**: every protocol classifier funnels `ErrorClass` through `retry::request_reached_wire(error_class) -> bool`, which returns `false` only for pre-wire classes: `ConnectionRefused`, `ConnectionTimeout`, `DnsLookupError`, `TlsError`, `PortExhaustion`, `ConnectionPoolError`. Per-classifier `connection_error: bool` fields are intentionally absent.
 
-**H3 pool body-on-wire signal — authoritative when present.** [`Http3ConnectionPool`](src/http3/client.rs) returns a typed `H3PoolError`. `H3PoolError::request_on_wire()` is `true` once `send_request().await` has succeeded on any internal attempt. Gateway H3 sites use the pool signal **exclusively** for `connection_error`:
+**H3 regression guard**: [`Http3ConnectionPool`](src/http3/client.rs) returns typed `H3PoolError`; `H3PoolError::request_on_wire()` is authoritative once `send_request().await` has succeeded on any internal attempt. Gateway H3 sites use the pool signal **exclusively** for `connection_error`:
 
 ```rust
 let is_conn_error = !e.request_on_wire();
 let (error_kind, error_class) = classify_h3_error(e.as_ref()); // labels + downgrade gating only
 ```
 
-Do NOT AND with `!request_reached_wire(error_class)` for H3 — the class is a string heuristic that can disagree with the typed signal (a connect-phase QUIC reset would be classified `ConnectionReset` = post-wire). The pool's `request_on_wire` is ground truth.
+Do NOT AND with `!request_reached_wire(error_class)` for H3 — the class is a label and can disagree with the typed signal. The fresh-connect setup path MUST preserve the sticky flag with `H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire)`.
 
-The fresh-connect setup path MUST propagate the sticky flag — every `?` exit goes through `|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire)`. `promote_on_wire_if` is asymmetric: `true` flips false → true; `false` must NOT demote.
+**Connect-phase RST guard**: a SYN that gets RST'd is equivalent to ECONNREFUSED. `classify_reqwest_error` collapses connect-phase `"refused"` / `"reset"` into `ConnectionRefused`; `classify_http2_pool_error::classify_io_error` treats the H2 pool as connect-only; H3 relies on `request_on_wire`.
 
-**Connect-phase RST rule.** A SYN that gets RST'd is equivalent to ECONNREFUSED — classifiers must NOT emit `ConnectionReset` from connect-phase paths (`request_reached_wire(ConnectionReset) == true`). Enforcement:
-- `classify_reqwest_error` (`src/retry.rs`): `is_connect()` branch collapses `"refused"` and `"reset"` into `ConnectionRefused`.
-- `classify_http2_pool_error::classify_io_error`: H2 pool is connect-only, so `ConnectionReset` → `ConnectionRefused`.
-- H3 pool: `request_on_wire` signal makes class irrelevant for `connection_error`.
-
-**`mark_h3_unsupported` predicate intentionally diverges.** Capability downgrade uses `is_h3_transport_error_class` (broader than `request_reached_wire` — includes mid-stream resets/closes/protocol errors because they still fail the H3 transport).
+**Capability-downgrade note**: `mark_h3_unsupported` intentionally uses `is_h3_transport_error_class`, which is broader than `request_reached_wire` because mid-stream resets/closes/protocol errors still fail the H3 transport.
 
 ### Health Check Architecture (two-layer)
 
@@ -530,7 +537,7 @@ PostgreSQL/MySQL/SQLite (sqlx), MongoDB. SQLite uses `PRAGMA journal_mode=WAL`/`
 
 ### PR Checklist
 
-Local before pushing: `cargo fmt --all -- --check` + `cargo clippy --all-targets -- -D warnings` + tests targeted to your change (see "Local testing" above). CI runs the full matrix on PR. New features: normal/edge/error tests. No `.unwrap()`/`.expect()` in prod. PR description with summary + changes + test plan. Docs updated when behavior changes (FEATURES.md, README.md, docs/, openapi.yaml); new `FERRUM_*` vars in `ferrum.conf` with commented defaults.
+Use "Local testing" above for validation and record what ran in the PR. New features need normal/edge/error coverage. No `.unwrap()`/`.expect()` in prod, no dead code, and no silent behavior changes. PR description must include summary + changes + test plan. Docs updated when behavior changes (`FEATURES.md`, `README.md`, `docs/`, `openapi.yaml`); new `FERRUM_*` vars need `docs/configuration.md` + `ferrum.conf` commented defaults.
 
 ### Commit Style / Branch Naming
 
