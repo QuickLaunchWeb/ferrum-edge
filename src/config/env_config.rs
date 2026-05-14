@@ -1121,7 +1121,7 @@ pub struct EnvConfig {
     pub runtime_metrics_window_1m_seconds: u64,
     /// Runtime metrics status-rate window. Default: 300.
     pub runtime_metrics_window_5m_seconds: u64,
-    /// Count tracing warn/error/etc. events by bounded category. Default: true.
+    /// Count Ferrum tracing warn/error/etc. events by bounded category. Default: true.
     pub runtime_metrics_log_counter_enabled: bool,
     /// Admin `/metrics/runtime` JSON response cache TTL. Default: 1000.
     pub runtime_metrics_cache_ttl_ms: u64,

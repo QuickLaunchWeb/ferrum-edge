@@ -26,6 +26,9 @@ where
     S: Subscriber,
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        if !should_count_target(event.metadata().target()) {
+            return;
+        }
         let level = level_to_runtime(*event.metadata().level());
         let category = classify_target(event.metadata().target());
         self.metrics.record_log(level, category);
@@ -70,6 +73,10 @@ pub fn classify_target(target: &str) -> &'static str {
     }
 }
 
+pub fn should_count_target(target: &str) -> bool {
+    target.starts_with("ferrum_edge") || target.starts_with("custom_plugins")
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -87,5 +94,12 @@ mod tests {
             "pool"
         );
         assert_eq!(super::classify_target("something_else"), "other");
+    }
+
+    #[test]
+    fn target_counting_is_project_scoped() {
+        assert!(super::should_count_target("ferrum_edge::proxy"));
+        assert!(super::should_count_target("custom_plugins::my_plugin"));
+        assert!(!super::should_count_target("hyper::proto"));
     }
 }

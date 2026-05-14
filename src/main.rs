@@ -61,6 +61,8 @@ use config::{EnvConfig, OperatingMode};
 use tracing::{Level, Metadata, debug, error, info, warn};
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -216,13 +218,19 @@ fn init_logging() -> (WorkerGuard, WorkerGuard) {
             .with_writer(SeverityWriter {
                 stdout: stdout_writer.clone(),
                 stderr: stderr_writer.clone(),
-            });
+            })
+            .with_filter(env_filter);
+        let log_counter_filter = filter_fn(|metadata| {
+            crate::runtime_metrics_tracing_layer::should_count_target(metadata.target())
+        });
         tracing_subscriber::registry()
-            .with(env_filter)
             .with(fmt_layer)
-            .with(crate::runtime_metrics_tracing_layer::CountingLayer::new(
-                crate::runtime_metrics::global(),
-            ))
+            .with(
+                crate::runtime_metrics_tracing_layer::CountingLayer::new(
+                    crate::runtime_metrics::global(),
+                )
+                .with_filter(log_counter_filter),
+            )
             .try_init()
             .is_ok()
     } else {
@@ -237,11 +245,9 @@ fn init_logging() -> (WorkerGuard, WorkerGuard) {
             .with_writer(SeverityWriter {
                 stdout: stdout_writer,
                 stderr: stderr_writer,
-            });
-        let _ = tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer)
-            .try_init();
+            })
+            .with_filter(env_filter);
+        let _ = tracing_subscriber::registry().with(fmt_layer).try_init();
     }
 
     (stdout_guard, stderr_guard)

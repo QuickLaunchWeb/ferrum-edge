@@ -328,7 +328,7 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/metrics/runtime
 
 Returns one process-global JSON snapshot for host and gateway triage: process CPU and memory, file descriptors, ephemeral-port pressure, HTTP status windows, error classes, DNS outcomes, backend pool churn, TCP reset counts, bounded log counters, and overload state.
 
-The response is cached briefly (`FERRUM_METRICS_RUNTIME_CACHE_MS`, default `1000`) to avoid amplifying sampler work under polling. Log counters mirror tracing events allowed by `FERRUM_LOG_LEVEL` / `RUST_LOG`, and the 1m/5m HTTP status windows can be disabled with `FERRUM_METRICS_STATUS_TRACKING_ENABLED=false` for maximum hot-path throughput.
+The response is cached briefly (`FERRUM_METRICS_RUNTIME_CACHE_MS`, default `1000`) to avoid amplifying sampler work under polling. Log counters count Ferrum project tracing events independently of the output `FERRUM_LOG_LEVEL` / `RUST_LOG` filter, and the 1m/5m HTTP status windows can be disabled with `FERRUM_METRICS_STATUS_TRACKING_ENABLED=false` for maximum hot-path throughput.
 
 ## Charges
 
