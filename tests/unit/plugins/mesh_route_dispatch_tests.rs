@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ferrum_edge::config::types::{BackendTlsConfig, Proxy, Upstream, UpstreamPortOverride};
+use ferrum_edge::config::types::{
+    BackendTlsConfig, Proxy, ResolvedPortOverride, Upstream, UpstreamPortOverride,
+};
 use ferrum_edge::plugins::RequestContext;
 
 fn test_proxy() -> Arc<Proxy> {
@@ -42,6 +44,7 @@ fn upstream_with_port_overrides(id: &str, overrides: &[(u16, u64)]) -> Arc<Upstr
                 *port,
                 UpstreamPortOverride {
                     connect_timeout_ms: Some(*timeout),
+                    ..Default::default()
                 },
             )
         })
@@ -172,7 +175,13 @@ fn direct_backend_override_clears_existing_upstream_id() {
 #[test]
 fn upstream_override_recomputes_dispatch_port_overrides() {
     let mut proxy_template = (*upstream_proxy()).clone();
-    proxy_template.dispatch_port_overrides = Some(HashMap::from([(8080, 1_500)]));
+    proxy_template.dispatch_port_overrides = Some(HashMap::from([(
+        8080,
+        ResolvedPortOverride {
+            connect_timeout_ms: Some(1_500),
+            ..Default::default()
+        },
+    )]));
     let proxy = Arc::new(proxy_template);
     let upstreams = HashMap::from([(
         "canary".to_string(),
@@ -188,8 +197,9 @@ fn upstream_override_recomputes_dispatch_port_overrides() {
         result
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|overrides| overrides.get(&9090)),
-        Some(&250),
+            .and_then(|overrides| overrides.get(&9090))
+            .and_then(|override_config| override_config.connect_timeout_ms),
+        Some(250),
         "route override should project the destination upstream's port overrides"
     );
     assert!(
@@ -204,7 +214,13 @@ fn upstream_override_recomputes_dispatch_port_overrides() {
 #[test]
 fn direct_backend_override_clears_dispatch_port_overrides() {
     let mut proxy_template = (*upstream_proxy()).clone();
-    proxy_template.dispatch_port_overrides = Some(HashMap::from([(8080, 1_500)]));
+    proxy_template.dispatch_port_overrides = Some(HashMap::from([(
+        8080,
+        ResolvedPortOverride {
+            connect_timeout_ms: Some(1_500),
+            ..Default::default()
+        },
+    )]));
     let proxy = Arc::new(proxy_template);
     let mut ctx = ctx();
     ctx.route_override_backend_host = Some("direct.svc".to_string());

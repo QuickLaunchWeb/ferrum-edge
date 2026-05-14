@@ -2509,6 +2509,10 @@ async fn handle_h3_request(
                     (&proxy.upstream_id, &current_target)
                     && let Some(ref hash_key) = lb_hash_key
                     && let Some(next) = {
+                        let has_port_override = proxy
+                            .dispatch_port_overrides
+                            .as_ref()
+                            .is_some_and(|overrides| overrides.contains_key(&prev_target.port));
                         let health_ctx = crate::load_balancer::HealthContext {
                             active_unhealthy: &state.health_checker.active_unhealthy_targets,
                             proxy_passive: state
@@ -2516,17 +2520,47 @@ async fn handle_h3_request(
                                 .passive_health
                                 .get(&proxy.id)
                                 .map(|r| r.value().clone()),
-                            max_ejection_percent: LoadBalancerCache::max_ejection_percent_from(
-                                &epoch.load_balancer,
-                                upstream_id,
-                            ),
+                            max_ejection_percent: if has_port_override {
+                                LoadBalancerCache::max_ejection_percent_for_port_from(
+                                    &epoch.load_balancer,
+                                    upstream_id,
+                                    &proxy,
+                                    prev_target.port,
+                                )
+                            } else {
+                                LoadBalancerCache::max_ejection_percent_from(
+                                    &epoch.load_balancer,
+                                    upstream_id,
+                                )
+                            },
                         };
                         if let Some(subset_name) = proxy.upstream_subset.as_deref() {
-                            LoadBalancerCache::select_next_target_subset_from(
+                            if has_port_override {
+                                LoadBalancerCache::select_next_target_for_port_subset_from(
+                                    &epoch.load_balancer,
+                                    upstream_id,
+                                    hash_key,
+                                    prev_target.port,
+                                    subset_name,
+                                    prev_target,
+                                    Some(&health_ctx),
+                                )
+                            } else {
+                                LoadBalancerCache::select_next_target_subset_from(
+                                    &epoch.load_balancer,
+                                    upstream_id,
+                                    hash_key,
+                                    subset_name,
+                                    prev_target,
+                                    Some(&health_ctx),
+                                )
+                            }
+                        } else if has_port_override {
+                            LoadBalancerCache::select_next_target_for_port_from(
                                 &epoch.load_balancer,
                                 upstream_id,
                                 hash_key,
-                                subset_name,
+                                prev_target.port,
                                 prev_target,
                                 Some(&health_ctx),
                             )
@@ -3040,8 +3074,19 @@ pub(crate) fn inject_sticky_cookie(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
     {
-        let strategy =
-            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id);
+        let has_port_override = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .is_some_and(|overrides| overrides.contains_key(&target.port));
+        let strategy = if has_port_override {
+            LoadBalancerCache::get_hash_on_strategy_for_port_from(
+                &epoch.load_balancer,
+                upstream_id,
+                target.port,
+            )
+        } else {
+            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id)
+        };
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();

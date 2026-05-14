@@ -4321,6 +4321,10 @@ async fn handle_websocket_request_authenticated(
                         (&proxy.upstream_id, &current_target)
                         && let Some(ref hash_key) = lb_hash_key
                         && let Some(next) = {
+                            let has_port_override = proxy
+                                .dispatch_port_overrides
+                                .as_ref()
+                                .is_some_and(|overrides| overrides.contains_key(&prev_target.port));
                             let health_ctx = crate::load_balancer::HealthContext {
                                 active_unhealthy: &state.health_checker.active_unhealthy_targets,
                                 proxy_passive: state
@@ -4328,17 +4332,47 @@ async fn handle_websocket_request_authenticated(
                                     .passive_health
                                     .get(&proxy.id)
                                     .map(|r| r.value().clone()),
-                                max_ejection_percent: LoadBalancerCache::max_ejection_percent_from(
-                                    &epoch.load_balancer,
-                                    upstream_id,
-                                ),
+                                max_ejection_percent: if has_port_override {
+                                    LoadBalancerCache::max_ejection_percent_for_port_from(
+                                        &epoch.load_balancer,
+                                        upstream_id,
+                                        &proxy,
+                                        prev_target.port,
+                                    )
+                                } else {
+                                    LoadBalancerCache::max_ejection_percent_from(
+                                        &epoch.load_balancer,
+                                        upstream_id,
+                                    )
+                                },
                             };
                             if let Some(subset_name) = proxy.upstream_subset.as_deref() {
-                                LoadBalancerCache::select_next_target_subset_from(
+                                if has_port_override {
+                                    LoadBalancerCache::select_next_target_for_port_subset_from(
+                                        &epoch.load_balancer,
+                                        upstream_id,
+                                        hash_key,
+                                        prev_target.port,
+                                        subset_name,
+                                        prev_target,
+                                        Some(&health_ctx),
+                                    )
+                                } else {
+                                    LoadBalancerCache::select_next_target_subset_from(
+                                        &epoch.load_balancer,
+                                        upstream_id,
+                                        hash_key,
+                                        subset_name,
+                                        prev_target,
+                                        Some(&health_ctx),
+                                    )
+                                }
+                            } else if has_port_override {
+                                LoadBalancerCache::select_next_target_for_port_from(
                                     &epoch.load_balancer,
                                     upstream_id,
                                     hash_key,
-                                    subset_name,
+                                    prev_target.port,
                                     prev_target,
                                     Some(&health_ctx),
                                 )
@@ -4545,8 +4579,19 @@ async fn handle_websocket_request_authenticated(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
-        let strategy =
-            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id);
+        let has_port_override = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .is_some_and(|overrides| overrides.contains_key(&target.port));
+        let strategy = if has_port_override {
+            LoadBalancerCache::get_hash_on_strategy_for_port_from(
+                &epoch.load_balancer,
+                upstream_id,
+                target.port,
+            )
+        } else {
+            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id)
+        };
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
@@ -7919,6 +7964,10 @@ async fn handle_proxy_request_inner(
                     (&proxy.upstream_id, &grpc_current_target)
                     && let Some(ref hash_key) = lb_hash_key
                     && let Some(next) = {
+                        let has_port_override = proxy
+                            .dispatch_port_overrides
+                            .as_ref()
+                            .is_some_and(|overrides| overrides.contains_key(&prev_target.port));
                         let health_ctx = crate::load_balancer::HealthContext {
                             active_unhealthy: &state.health_checker.active_unhealthy_targets,
                             proxy_passive: state
@@ -7926,17 +7975,47 @@ async fn handle_proxy_request_inner(
                                 .passive_health
                                 .get(&proxy.id)
                                 .map(|r| r.value().clone()),
-                            max_ejection_percent: LoadBalancerCache::max_ejection_percent_from(
-                                &epoch.load_balancer,
-                                upstream_id,
-                            ),
+                            max_ejection_percent: if has_port_override {
+                                LoadBalancerCache::max_ejection_percent_for_port_from(
+                                    &epoch.load_balancer,
+                                    upstream_id,
+                                    &proxy,
+                                    prev_target.port,
+                                )
+                            } else {
+                                LoadBalancerCache::max_ejection_percent_from(
+                                    &epoch.load_balancer,
+                                    upstream_id,
+                                )
+                            },
                         };
                         if let Some(subset_name) = proxy.upstream_subset.as_deref() {
-                            LoadBalancerCache::select_next_target_subset_from(
+                            if has_port_override {
+                                LoadBalancerCache::select_next_target_for_port_subset_from(
+                                    &epoch.load_balancer,
+                                    upstream_id,
+                                    hash_key,
+                                    prev_target.port,
+                                    subset_name,
+                                    prev_target,
+                                    Some(&health_ctx),
+                                )
+                            } else {
+                                LoadBalancerCache::select_next_target_subset_from(
+                                    &epoch.load_balancer,
+                                    upstream_id,
+                                    hash_key,
+                                    subset_name,
+                                    prev_target,
+                                    Some(&health_ctx),
+                                )
+                            }
+                        } else if has_port_override {
+                            LoadBalancerCache::select_next_target_for_port_from(
                                 &epoch.load_balancer,
                                 upstream_id,
                                 hash_key,
-                                subset_name,
+                                prev_target.port,
                                 prev_target,
                                 Some(&health_ctx),
                             )
@@ -8463,10 +8542,22 @@ async fn handle_proxy_request_inner(
                     && let (Some(upstream_id), Some(target)) =
                         (&proxy.upstream_id, &upstream_target)
                 {
-                    let strategy = LoadBalancerCache::get_hash_on_strategy_from(
-                        &epoch.load_balancer,
-                        upstream_id,
-                    );
+                    let has_port_override = proxy
+                        .dispatch_port_overrides
+                        .as_ref()
+                        .is_some_and(|overrides| overrides.contains_key(&target.port));
+                    let strategy = if has_port_override {
+                        LoadBalancerCache::get_hash_on_strategy_for_port_from(
+                            &epoch.load_balancer,
+                            upstream_id,
+                            target.port,
+                        )
+                    } else {
+                        LoadBalancerCache::get_hash_on_strategy_from(
+                            &epoch.load_balancer,
+                            upstream_id,
+                        )
+                    };
                     if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
                         let upstream =
                             LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
@@ -8748,6 +8839,10 @@ async fn handle_proxy_request_inner(
             if let (Some(upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
                 && let Some(ref hash_key) = lb_hash_key
                 && let Some(next) = {
+                    let has_port_override = proxy
+                        .dispatch_port_overrides
+                        .as_ref()
+                        .is_some_and(|overrides| overrides.contains_key(&prev_target.port));
                     let health_ctx = crate::load_balancer::HealthContext {
                         active_unhealthy: &state.health_checker.active_unhealthy_targets,
                         proxy_passive: state
@@ -8755,17 +8850,47 @@ async fn handle_proxy_request_inner(
                             .passive_health
                             .get(&proxy.id)
                             .map(|r| r.value().clone()),
-                        max_ejection_percent: LoadBalancerCache::max_ejection_percent_from(
-                            &epoch.load_balancer,
-                            upstream_id,
-                        ),
+                        max_ejection_percent: if has_port_override {
+                            LoadBalancerCache::max_ejection_percent_for_port_from(
+                                &epoch.load_balancer,
+                                upstream_id,
+                                &proxy,
+                                prev_target.port,
+                            )
+                        } else {
+                            LoadBalancerCache::max_ejection_percent_from(
+                                &epoch.load_balancer,
+                                upstream_id,
+                            )
+                        },
                     };
                     if let Some(subset_name) = proxy.upstream_subset.as_deref() {
-                        LoadBalancerCache::select_next_target_subset_from(
+                        if has_port_override {
+                            LoadBalancerCache::select_next_target_for_port_subset_from(
+                                &epoch.load_balancer,
+                                upstream_id,
+                                hash_key,
+                                prev_target.port,
+                                subset_name,
+                                prev_target,
+                                Some(&health_ctx),
+                            )
+                        } else {
+                            LoadBalancerCache::select_next_target_subset_from(
+                                &epoch.load_balancer,
+                                upstream_id,
+                                hash_key,
+                                subset_name,
+                                prev_target,
+                                Some(&health_ctx),
+                            )
+                        }
+                    } else if has_port_override {
+                        LoadBalancerCache::select_next_target_for_port_from(
                             &epoch.load_balancer,
                             upstream_id,
                             hash_key,
-                            subset_name,
+                            prev_target.port,
                             prev_target,
                             Some(&health_ctx),
                         )
@@ -9160,8 +9285,19 @@ async fn handle_proxy_request_inner(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
     {
-        let strategy =
-            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id);
+        let has_port_override = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .is_some_and(|overrides| overrides.contains_key(&target.port));
+        let strategy = if has_port_override {
+            LoadBalancerCache::get_hash_on_strategy_for_port_from(
+                &epoch.load_balancer,
+                upstream_id,
+                target.port,
+            )
+        } else {
+            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id)
+        };
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
@@ -9596,7 +9732,10 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     let Some(target) = upstream_target else {
         return std::borrow::Cow::Borrowed(proxy);
     };
-    let Some(&override_ms) = overrides.get(&target.port) else {
+    let Some(override_config) = overrides.get(&target.port) else {
+        return std::borrow::Cow::Borrowed(proxy);
+    };
+    let Some(override_ms) = override_config.connect_timeout_ms else {
         return std::borrow::Cow::Borrowed(proxy);
     };
     if override_ms == proxy.backend_connect_timeout_ms {
@@ -15520,7 +15659,20 @@ mod tests {
         proxy.dispatch_port_overrides = if overrides.is_empty() {
             None
         } else {
-            Some(overrides.iter().copied().collect())
+            Some(
+                overrides
+                    .iter()
+                    .map(|(port, timeout)| {
+                        (
+                            *port,
+                            crate::config::types::ResolvedPortOverride {
+                                connect_timeout_ms: Some(*timeout),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect(),
+            )
         };
         proxy
     }
@@ -15676,6 +15828,7 @@ mod tests {
             8080,
             UpstreamPortOverride {
                 connect_timeout_ms: Some(750),
+                ..Default::default()
             },
         );
 
@@ -15692,7 +15845,10 @@ mod tests {
             .dispatch_port_overrides
             .as_ref()
             .expect("upstream has overrides → proxy must get the map");
-        assert_eq!(projected.get(&8080).copied(), Some(750));
+        assert_eq!(
+            projected.get(&8080).and_then(|ovr| ovr.connect_timeout_ms),
+            Some(750)
+        );
 
         // Upstreams without overrides should NOT install an empty map on the
         // proxy — that would defeat the fast-path None check.

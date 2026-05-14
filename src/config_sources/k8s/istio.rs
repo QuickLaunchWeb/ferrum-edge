@@ -704,15 +704,6 @@ fn destination_rule(
 /// [`MeshTrafficPolicy`] map keyed by port number. Each entry is a regular
 /// traffic-policy block scoped to one port; the cold-path apply pass layers
 /// the resolved policy onto the matching upstream's `port_overrides`.
-///
-/// Today only `connectionPool.tcp.connectTimeout` is actually enforced
-/// per-port — see `Upstream::effective_connect_timeout_ms` and the dispatch
-/// call to `resolve_effective_proxy_for_target`. Per-port `loadBalancer`
-/// and `outlierDetection` fields ARE parsed (so the slice round-trips), but
-/// the gateway keeps a single `LoadBalancer` and `PassiveHealthCheck` per
-/// upstream — switching algorithm/hash-ring or thresholds per destination
-/// port would require per-port balancer instances and is out of scope here.
-/// We emit translator warnings so operators see the gap at apply time.
 fn translate_port_level_settings(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -748,23 +739,6 @@ fn translate_port_level_settings(
             ));
         }
         let port = port_u64 as u16;
-
-        // Warn for parsed-but-not-enforced per-port fields so operators see
-        // the gap at apply time instead of silently expecting per-port LB
-        // / outlier behaviour. `connectTimeout` IS enforced and stays
-        // silent.
-        if entry.get("loadBalancer").is_some() {
-            acc.warnings.push(format!(
-                "DestinationRule {}/{}: trafficPolicy.portLevelSettings[].loadBalancer is parsed but not enforced per-port today (gateway keeps a single load balancer per upstream); only connectTimeout is applied at request time",
-                object.metadata.namespace, object.metadata.name
-            ));
-        }
-        if entry.get("outlierDetection").is_some() {
-            acc.warnings.push(format!(
-                "DestinationRule {}/{}: trafficPolicy.portLevelSettings[].outlierDetection is parsed but not enforced per-port today (gateway keeps a single passive health check per upstream); only connectTimeout is applied at request time",
-                object.metadata.namespace, object.metadata.name
-            ));
-        }
 
         let policy = translate_traffic_policy(acc, object, entry)?;
 

@@ -4,7 +4,8 @@
 //! least connections, least latency, consistent hashing, and random.
 
 use crate::config::types::{
-    GatewayConfig, LoadBalancerAlgorithm, SubsetDefinition, Upstream, UpstreamTarget,
+    GatewayConfig, LoadBalancerAlgorithm, Proxy, SubsetDefinition, Upstream, UpstreamPortOverride,
+    UpstreamTarget,
 };
 use crate::health_check::ProxyHealthState;
 use arc_swap::ArcSwap;
@@ -144,6 +145,17 @@ impl HealthBitset {
         }
         remaining.trailing_zeros() as usize
     }
+}
+
+fn bitset_for_indices(indices: &[usize]) -> HealthBitset {
+    let mut bitset = HealthBitset::empty();
+    for &idx in indices {
+        debug_assert!(idx < MAX_BITSET_TARGETS);
+        if idx < MAX_BITSET_TARGETS {
+            bitset.set(idx);
+        }
+    }
+    bitset
 }
 
 use std::sync::Arc;
@@ -366,12 +378,13 @@ impl LoadBalancerCache {
         for upstream in &config.upstreams {
             map.insert(
                 upstream.id.clone(),
-                Arc::new(LoadBalancer::with_subsets(
+                Arc::new(LoadBalancer::with_subsets_and_port_overrides(
                     &upstream.id,
                     upstream.algorithm,
                     &upstream.targets,
                     upstream.hash_on.clone(),
                     upstream.subsets.as_deref(),
+                    Some(&upstream.port_overrides),
                 )),
             );
         }
@@ -421,12 +434,13 @@ impl LoadBalancerCache {
         for upstream in added.iter().chain(modified.iter()) {
             new_balancers.insert(
                 upstream.id.clone(),
-                Arc::new(LoadBalancer::with_subsets(
+                Arc::new(LoadBalancer::with_subsets_and_port_overrides(
                     &upstream.id,
                     upstream.algorithm,
                     &upstream.targets,
                     upstream.hash_on.clone(),
                     upstream.subsets.as_deref(),
+                    Some(&upstream.port_overrides),
                 )),
             );
         }
@@ -496,14 +510,20 @@ impl LoadBalancerCache {
             .get(upstream_id)
             .and_then(|upstream| upstream.subsets.as_deref())
             .map(|subsets| subsets.to_vec());
+        let existing_port_overrides = current
+            .upstreams
+            .get(upstream_id)
+            .map(|upstream| upstream.port_overrides.clone())
+            .unwrap_or_default();
         new_balancers.insert(
             upstream_id.to_string(),
-            Arc::new(LoadBalancer::with_subsets(
+            Arc::new(LoadBalancer::with_subsets_and_port_overrides(
                 upstream_id,
                 algorithm,
                 &new_targets,
                 hash_on,
                 existing_subsets.as_deref(),
+                Some(&existing_port_overrides),
             )),
         );
 
@@ -573,6 +593,20 @@ impl LoadBalancerCache {
             .unwrap_or(HashOnStrategy::Ip)
     }
 
+    /// Get the pre-parsed hash-on strategy for a per-port override.
+    #[inline]
+    pub fn get_hash_on_strategy_for_port_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+        port: u16,
+    ) -> HashOnStrategy {
+        snapshot
+            .balancers
+            .get(upstream_id)
+            .map(|b| b.hash_on_strategy_for_port(port))
+            .unwrap_or(HashOnStrategy::Ip)
+    }
+
     #[inline]
     pub fn get_upstream_from(
         snapshot: &LoadBalancerCacheInner,
@@ -593,6 +627,19 @@ impl LoadBalancerCache {
         balancer.select(ctx_key, health)
     }
 
+    /// Select a target from a port-specific load balancer state.
+    #[inline]
+    pub fn select_target_for_port_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+        ctx_key: &str,
+        port: u16,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<TargetSelection> {
+        let balancer = snapshot.balancers.get(upstream_id)?;
+        balancer.select_for_port(ctx_key, port, health)
+    }
+
     /// Select a target from a named subset within an upstream.
     /// Unknown, empty, or fully unhealthy subsets return `None`.
     #[inline]
@@ -605,6 +652,20 @@ impl LoadBalancerCache {
     ) -> Option<TargetSelection> {
         let balancer = snapshot.balancers.get(upstream_id)?;
         balancer.select_from_subset(ctx_key, subset_name, health)
+    }
+
+    /// Select a target from a named subset using port-specific state.
+    #[inline]
+    pub fn select_target_for_port_subset_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+        ctx_key: &str,
+        port: u16,
+        subset_name: &str,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<TargetSelection> {
+        let balancer = snapshot.balancers.get(upstream_id)?;
+        balancer.select_for_port_from_subset(ctx_key, port, subset_name, health)
     }
 
     /// Select next target, excluding a previously tried target (for retries).
@@ -631,6 +692,18 @@ impl LoadBalancerCache {
         balancer.select_excluding(ctx_key, exclude, health)
     }
 
+    pub fn select_next_target_for_port_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+        ctx_key: &str,
+        port: u16,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let balancer = snapshot.balancers.get(upstream_id)?;
+        balancer.select_excluding_for_port(ctx_key, port, exclude, health)
+    }
+
     pub fn select_next_target_subset_from(
         snapshot: &LoadBalancerCacheInner,
         upstream_id: &str,
@@ -641,6 +714,19 @@ impl LoadBalancerCache {
     ) -> Option<Arc<UpstreamTarget>> {
         let balancer = snapshot.balancers.get(upstream_id)?;
         balancer.select_excluding_from_subset(ctx_key, subset_name, exclude, health)
+    }
+
+    pub fn select_next_target_for_port_subset_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+        ctx_key: &str,
+        port: u16,
+        subset_name: &str,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let balancer = snapshot.balancers.get(upstream_id)?;
+        balancer.select_excluding_for_port_from_subset(ctx_key, port, subset_name, exclude, health)
     }
 
     #[inline]
@@ -654,6 +740,22 @@ impl LoadBalancerCache {
             .and_then(|u| u.health_checks.as_ref())
             .and_then(|hc| hc.passive.as_ref())
             .and_then(|p| p.max_ejection_percent)
+    }
+
+    #[inline]
+    pub fn max_ejection_percent_for_port_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+        proxy: &Proxy,
+        port: u16,
+    ) -> Option<u8> {
+        proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&port))
+            .and_then(|override_config| override_config.passive_health_check.as_ref())
+            .and_then(|passive| passive.max_ejection_percent)
+            .or_else(|| Self::max_ejection_percent_from(snapshot, upstream_id))
     }
 
     /// Snapshot of active connection counts per upstream for metrics.
@@ -793,6 +895,19 @@ pub struct LoadBalancer {
     /// Per-subset consistent-hash rings. These avoid walking the full upstream
     /// ring when a small subset uses consistent hashing.
     subset_hash_rings: HashMap<String, Vec<(u64, usize)>>,
+    /// Per-destination-port load-balancing state projected from
+    /// DestinationRule `trafficPolicy.portLevelSettings[]`.
+    port_overrides: HashMap<u16, PortLbState>,
+}
+
+struct PortLbState {
+    target_indices: Vec<usize>,
+    algorithm: LoadBalancerAlgorithm,
+    rr_counter: AtomicU64,
+    wrr_state: std::sync::Mutex<Vec<i64>>,
+    wrr_needs_stale_check: AtomicBool,
+    hash_ring: Vec<(u64, usize)>,
+    hash_on_strategy: HashOnStrategy,
 }
 
 impl LoadBalancer {
@@ -814,6 +929,26 @@ impl LoadBalancer {
         targets: &[UpstreamTarget],
         hash_on: Option<String>,
         subsets: Option<&[SubsetDefinition]>,
+    ) -> Self {
+        Self::with_subsets_and_port_overrides(
+            upstream_id,
+            algorithm,
+            targets,
+            hash_on,
+            subsets,
+            None,
+        )
+    }
+
+    /// Create a new load balancer with optional subset definitions and
+    /// per-port override state.
+    fn with_subsets_and_port_overrides(
+        upstream_id: &str,
+        algorithm: LoadBalancerAlgorithm,
+        targets: &[UpstreamTarget],
+        hash_on: Option<String>,
+        subsets: Option<&[SubsetDefinition]>,
+        port_overrides: Option<&HashMap<u16, UpstreamPortOverride>>,
     ) -> Self {
         let wrr_weights: Vec<i64> = vec![0; targets.len()];
         // Pre-compute host:port keys for internal use (active connections, latency, hash ring)
@@ -909,6 +1044,39 @@ impl LoadBalancer {
             }
         }
 
+        let mut port_states = HashMap::new();
+        if let Some(overrides) = port_overrides {
+            for (port, override_config) in overrides {
+                let target_indices: Vec<usize> = targets
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, target)| (target.port == *port).then_some(idx))
+                    .collect();
+                if target_indices.is_empty() {
+                    continue;
+                }
+                let effective_algorithm = override_config.algorithm.unwrap_or(algorithm);
+                let effective_hash_on = override_config.hash_on.as_deref().or(hash_on.as_deref());
+                let hash_ring = if effective_algorithm == LoadBalancerAlgorithm::ConsistentHashing {
+                    build_hash_ring_for_indices(&host_port_keys, target_indices.iter().copied())
+                } else {
+                    Vec::new()
+                };
+                port_states.insert(
+                    *port,
+                    PortLbState {
+                        target_indices,
+                        algorithm: effective_algorithm,
+                        rr_counter: AtomicU64::new(0),
+                        wrr_state: std::sync::Mutex::new(vec![0; targets.len()]),
+                        wrr_needs_stale_check: AtomicBool::new(false),
+                        hash_ring,
+                        hash_on_strategy: HashOnStrategy::parse(effective_hash_on),
+                    },
+                );
+            }
+        }
+
         Self {
             targets: targets.iter().cloned().map(Arc::new).collect(),
             target_keys,
@@ -928,6 +1096,7 @@ impl LoadBalancer {
             subset_wrr_state,
             subset_wrr_needs_stale_check,
             subset_hash_rings,
+            port_overrides: port_states,
         }
     }
 
@@ -1038,6 +1207,9 @@ impl LoadBalancer {
         self.wrr_needs_stale_check.store(true, Ordering::Release);
         for flag in self.subset_wrr_needs_stale_check.values() {
             flag.store(true, Ordering::Release);
+        }
+        for state in self.port_overrides.values() {
+            state.wrr_needs_stale_check.store(true, Ordering::Release);
         }
 
         // Find minimum EWMA among all targets (excluding unset)
@@ -1258,11 +1430,212 @@ impl LoadBalancer {
             return None;
         }
 
-        self.select_with_bitset_using(ctx_key, &subset_healthy, algorithm, wrr_state, hash_ring)
-            .map(|target| TargetSelection {
-                target,
-                is_fallback: false,
-            })
+        self.select_with_bitset_using(
+            ctx_key,
+            &subset_healthy,
+            algorithm,
+            &self.rr_counter,
+            wrr_state,
+            hash_ring,
+        )
+        .map(|target| TargetSelection {
+            target,
+            is_fallback: false,
+        })
+    }
+
+    /// Select a target using a per-port override when one exists for `port`.
+    /// Missing port state falls back to the upstream-level selector.
+    pub fn select_for_port(
+        &self,
+        ctx_key: &str,
+        port: u16,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<TargetSelection> {
+        let Some(port_state) = self.port_overrides.get(&port) else {
+            return self.select(ctx_key, health);
+        };
+        let n = self.targets.len();
+        if n == 0 || port_state.target_indices.is_empty() {
+            return None;
+        }
+
+        if n > MAX_BITSET_TARGETS {
+            return self.select_port_vec_fallback(ctx_key, port_state, health);
+        }
+
+        let healthy = self.compute_health_bitset(health);
+        let mut port_healthy = HealthBitset::empty();
+        for &idx in &port_state.target_indices {
+            if healthy.contains(idx) {
+                port_healthy.set(idx);
+            }
+        }
+
+        if port_healthy.is_empty() {
+            let all_port_targets = bitset_for_indices(&port_state.target_indices);
+            return self
+                .select_with_bitset_using(
+                    ctx_key,
+                    &all_port_targets,
+                    port_state.algorithm,
+                    &port_state.rr_counter,
+                    &port_state.wrr_state,
+                    &port_state.hash_ring,
+                )
+                .map(|target| TargetSelection {
+                    target,
+                    is_fallback: true,
+                });
+        }
+
+        self.select_with_bitset_using(
+            ctx_key,
+            &port_healthy,
+            port_state.algorithm,
+            &port_state.rr_counter,
+            &port_state.wrr_state,
+            &port_state.hash_ring,
+        )
+        .map(|target| TargetSelection {
+            target,
+            is_fallback: false,
+        })
+    }
+
+    /// Select a target from a named subset using a per-port override when one
+    /// exists for `port`. Unknown, empty, or fully unhealthy subset/port
+    /// intersections return `None`, matching `select_from_subset`.
+    pub fn select_for_port_from_subset(
+        &self,
+        ctx_key: &str,
+        port: u16,
+        subset_name: &str,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<TargetSelection> {
+        let Some(port_state) = self.port_overrides.get(&port) else {
+            return self.select_from_subset(ctx_key, subset_name, health);
+        };
+        let n = self.targets.len();
+        if n == 0 || port_state.target_indices.is_empty() {
+            return None;
+        }
+        let subset_target_indices = match self.subset_indices.get(subset_name) {
+            Some(indices) if !indices.is_empty() => indices,
+            Some(_) => return None,
+            None => return None,
+        };
+
+        if n > MAX_BITSET_TARGETS {
+            return self.select_port_subset_vec_fallback(
+                ctx_key,
+                port_state,
+                subset_target_indices,
+                health,
+            );
+        }
+
+        let healthy = self.compute_health_bitset(health);
+        let subset_mask = bitset_for_indices(subset_target_indices);
+        let mut port_subset_healthy = HealthBitset::empty();
+        for &idx in &port_state.target_indices {
+            if healthy.contains(idx) && subset_mask.contains(idx) {
+                port_subset_healthy.set(idx);
+            }
+        }
+
+        if port_subset_healthy.is_empty() {
+            return None;
+        }
+
+        self.select_with_bitset_using(
+            ctx_key,
+            &port_subset_healthy,
+            port_state.algorithm,
+            &port_state.rr_counter,
+            &port_state.wrr_state,
+            &port_state.hash_ring,
+        )
+        .map(|target| TargetSelection {
+            target,
+            is_fallback: false,
+        })
+    }
+
+    fn select_port_vec_fallback(
+        &self,
+        ctx_key: &str,
+        port_state: &PortLbState,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<TargetSelection> {
+        let all_healthy = self.healthy_targets_vec(health);
+        let mut healthy_mask = vec![false; self.targets.len()];
+        for (idx, _) in all_healthy {
+            healthy_mask[idx] = true;
+        }
+        let mut candidates: Vec<(usize, &Arc<UpstreamTarget>)> = port_state
+            .target_indices
+            .iter()
+            .filter(|&&idx| healthy_mask[idx])
+            .map(|&idx| (idx, &self.targets[idx]))
+            .collect();
+        let is_fallback = candidates.is_empty();
+        if is_fallback {
+            candidates = port_state
+                .target_indices
+                .iter()
+                .map(|&idx| (idx, &self.targets[idx]))
+                .collect();
+        }
+
+        self.select_from_candidates_vec_using(
+            ctx_key,
+            &candidates,
+            port_state.algorithm,
+            &port_state.rr_counter,
+            &port_state.wrr_state,
+            &port_state.hash_ring,
+        )
+        .map(|target| TargetSelection {
+            target,
+            is_fallback,
+        })
+    }
+
+    fn select_port_subset_vec_fallback(
+        &self,
+        ctx_key: &str,
+        port_state: &PortLbState,
+        subset_indices: &[usize],
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<TargetSelection> {
+        let all_healthy = self.healthy_targets_vec(health);
+        let mut healthy_mask = vec![false; self.targets.len()];
+        for (idx, _) in all_healthy {
+            healthy_mask[idx] = true;
+        }
+        let candidates: Vec<(usize, &Arc<UpstreamTarget>)> = port_state
+            .target_indices
+            .iter()
+            .filter(|&&idx| healthy_mask[idx] && subset_indices.contains(&idx))
+            .map(|&idx| (idx, &self.targets[idx]))
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+
+        self.select_from_candidates_vec_using(
+            ctx_key,
+            &candidates,
+            port_state.algorithm,
+            &port_state.rr_counter,
+            &port_state.wrr_state,
+            &port_state.hash_ring,
+        )
+        .map(|target| TargetSelection {
+            target,
+            is_fallback: false,
+        })
     }
 
     /// Vec-based subset selection fallback for >128 targets.
@@ -1293,6 +1666,7 @@ impl LoadBalancer {
             ctx_key,
             &subset_healthy,
             self.subset_algorithm(subset_name),
+            &self.rr_counter,
             self.subset_wrr_state(subset_name),
             self.subset_hash_ring(subset_name),
         )
@@ -1340,6 +1714,12 @@ impl LoadBalancer {
                     None
                 }
             })
+            .or_else(|| {
+                self.port_overrides.values().find_map(|port_state| {
+                    std::ptr::eq(wrr_state, &port_state.wrr_state)
+                        .then_some(&port_state.wrr_needs_stale_check)
+                })
+            })
             .unwrap_or(&self.wrr_needs_stale_check)
     }
 
@@ -1349,6 +1729,14 @@ impl LoadBalancer {
             .get(subset_name)
             .map(Vec::as_slice)
             .unwrap_or(&self.hash_ring)
+    }
+
+    #[inline]
+    fn hash_on_strategy_for_port(&self, port: u16) -> HashOnStrategy {
+        self.port_overrides
+            .get(&port)
+            .map(|state| state.hash_on_strategy.clone())
+            .unwrap_or_else(|| self.hash_on_strategy.clone())
     }
 
     /// Dispatch to the algorithm-specific selector using a pre-computed bitset.
@@ -1362,6 +1750,7 @@ impl LoadBalancer {
             ctx_key,
             healthy,
             self.algorithm,
+            &self.rr_counter,
             &self.wrr_state,
             &self.hash_ring,
         )
@@ -1372,6 +1761,7 @@ impl LoadBalancer {
         ctx_key: &str,
         healthy: &HealthBitset,
         algorithm: LoadBalancerAlgorithm,
+        rr_counter: &AtomicU64,
         wrr_state: &std::sync::Mutex<Vec<i64>>,
         hash_ring: &[(u64, usize)],
     ) -> Option<Arc<UpstreamTarget>> {
@@ -1381,7 +1771,7 @@ impl LoadBalancer {
         let all = healthy.is_all(self.targets.len());
         match algorithm {
             LoadBalancerAlgorithm::RoundRobin => {
-                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+                let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
                 let target_idx = if all {
                     idx % self.targets.len()
                 } else {
@@ -1390,7 +1780,7 @@ impl LoadBalancer {
                 Some(Arc::clone(&self.targets[target_idx]))
             }
             LoadBalancerAlgorithm::Random => {
-                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed);
+                let idx = rr_counter.fetch_add(1, Ordering::Relaxed);
                 let hash = golden_ratio_hash(idx) as usize;
                 let target_idx = if all {
                     hash % self.targets.len()
@@ -1443,6 +1833,7 @@ impl LoadBalancer {
             ctx_key,
             candidates,
             self.algorithm,
+            &self.rr_counter,
             &self.wrr_state,
             &self.hash_ring,
         )
@@ -1453,6 +1844,7 @@ impl LoadBalancer {
         ctx_key: &str,
         candidates: &[(usize, &Arc<UpstreamTarget>)],
         algorithm: LoadBalancerAlgorithm,
+        rr_counter: &AtomicU64,
         wrr_state: &std::sync::Mutex<Vec<i64>>,
         hash_ring: &[(u64, usize)],
     ) -> Option<Arc<UpstreamTarget>> {
@@ -1461,11 +1853,11 @@ impl LoadBalancer {
         }
         match algorithm {
             LoadBalancerAlgorithm::RoundRobin => {
-                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+                let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
                 Some(Arc::clone(candidates[idx % candidates.len()].1))
             }
             LoadBalancerAlgorithm::Random => {
-                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed);
+                let idx = rr_counter.fetch_add(1, Ordering::Relaxed);
                 let hash = golden_ratio_hash(idx) as usize;
                 Some(Arc::clone(candidates[hash % candidates.len()].1))
             }
@@ -1525,6 +1917,75 @@ impl LoadBalancer {
         self.select_with_bitset(ctx_key, &healthy)
     }
 
+    pub fn select_excluding_for_port(
+        &self,
+        ctx_key: &str,
+        port: u16,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let Some(port_state) = self.port_overrides.get(&port) else {
+            return self.select_excluding(ctx_key, exclude, health);
+        };
+        let n = self.targets.len();
+        if n == 0 || port_state.target_indices.is_empty() {
+            return None;
+        }
+
+        let exclude_idx = self
+            .targets
+            .iter()
+            .position(|t| t.host == exclude.host && t.port == exclude.port);
+
+        if n > MAX_BITSET_TARGETS {
+            return self.select_excluding_port_vec_fallback(
+                ctx_key,
+                port_state,
+                exclude_idx,
+                health,
+            );
+        }
+
+        let mut healthy = self.compute_health_bitset(health);
+        if let Some(ei) = exclude_idx {
+            healthy.clear(ei);
+        }
+
+        let mut port_healthy = HealthBitset::empty();
+        for &idx in &port_state.target_indices {
+            if healthy.contains(idx) {
+                port_healthy.set(idx);
+            }
+        }
+
+        if port_healthy.is_empty() {
+            let mut fallback = bitset_for_indices(&port_state.target_indices);
+            if let Some(ei) = exclude_idx {
+                fallback.clear(ei);
+            }
+            if fallback.is_empty() {
+                return None;
+            }
+            return self.select_with_bitset_using(
+                ctx_key,
+                &fallback,
+                port_state.algorithm,
+                &port_state.rr_counter,
+                &port_state.wrr_state,
+                &port_state.hash_ring,
+            );
+        }
+
+        self.select_with_bitset_using(
+            ctx_key,
+            &port_healthy,
+            port_state.algorithm,
+            &port_state.rr_counter,
+            &port_state.wrr_state,
+            &port_state.hash_ring,
+        )
+    }
+
     pub fn select_excluding_from_subset(
         &self,
         ctx_key: &str,
@@ -1578,8 +2039,72 @@ impl LoadBalancer {
             ctx_key,
             &subset_healthy,
             self.subset_algorithm(subset_name),
+            &self.rr_counter,
             self.subset_wrr_state(subset_name),
             self.subset_hash_ring(subset_name),
+        )
+    }
+
+    pub fn select_excluding_for_port_from_subset(
+        &self,
+        ctx_key: &str,
+        port: u16,
+        subset_name: &str,
+        exclude: &UpstreamTarget,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let Some(port_state) = self.port_overrides.get(&port) else {
+            return self.select_excluding_from_subset(ctx_key, subset_name, exclude, health);
+        };
+        let n = self.targets.len();
+        if n == 0 || port_state.target_indices.is_empty() {
+            return None;
+        }
+        let subset_target_indices = match self.subset_indices.get(subset_name) {
+            Some(indices) if !indices.is_empty() => indices,
+            Some(_) => return None,
+            None => return None,
+        };
+
+        let exclude_idx = self
+            .targets
+            .iter()
+            .position(|t| t.host == exclude.host && t.port == exclude.port);
+
+        if n > MAX_BITSET_TARGETS {
+            return self.select_excluding_port_subset_vec_fallback(
+                ctx_key,
+                port_state,
+                subset_target_indices,
+                exclude_idx,
+                health,
+            );
+        }
+
+        let mut healthy = self.compute_health_bitset(health);
+        if let Some(ei) = exclude_idx {
+            healthy.clear(ei);
+        }
+
+        let subset_mask = bitset_for_indices(subset_target_indices);
+        let mut port_subset_healthy = HealthBitset::empty();
+        for &idx in &port_state.target_indices {
+            if healthy.contains(idx) && subset_mask.contains(idx) {
+                port_subset_healthy.set(idx);
+            }
+        }
+
+        if port_subset_healthy.is_empty() {
+            return None;
+        }
+
+        self.select_with_bitset_using(
+            ctx_key,
+            &port_subset_healthy,
+            port_state.algorithm,
+            &port_state.rr_counter,
+            &port_state.wrr_state,
+            &port_state.hash_ring,
         )
     }
 
@@ -1613,6 +2138,88 @@ impl LoadBalancer {
         self.select_from_candidates_vec(ctx_key, &healthy)
     }
 
+    fn select_excluding_port_vec_fallback(
+        &self,
+        ctx_key: &str,
+        port_state: &PortLbState,
+        exclude_idx: Option<usize>,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let all_healthy = self.healthy_targets_vec(health);
+        let mut healthy_mask = vec![false; self.targets.len()];
+        for (idx, _) in all_healthy {
+            healthy_mask[idx] = true;
+        }
+
+        let mut candidates: Vec<(usize, &Arc<UpstreamTarget>)> = port_state
+            .target_indices
+            .iter()
+            .copied()
+            .filter(|&idx| healthy_mask[idx] && exclude_idx.is_none_or(|ei| ei != idx))
+            .map(|idx| (idx, &self.targets[idx]))
+            .collect();
+        if candidates.is_empty() {
+            candidates = port_state
+                .target_indices
+                .iter()
+                .copied()
+                .filter(|&idx| exclude_idx.is_none_or(|ei| ei != idx))
+                .map(|idx| (idx, &self.targets[idx]))
+                .collect();
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+
+        self.select_from_candidates_vec_using(
+            ctx_key,
+            &candidates,
+            port_state.algorithm,
+            &port_state.rr_counter,
+            &port_state.wrr_state,
+            &port_state.hash_ring,
+        )
+    }
+
+    fn select_excluding_port_subset_vec_fallback(
+        &self,
+        ctx_key: &str,
+        port_state: &PortLbState,
+        subset_indices: &[usize],
+        exclude_idx: Option<usize>,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let all_healthy = self.healthy_targets_vec(health);
+        let mut healthy_mask = vec![false; self.targets.len()];
+        for (idx, _) in all_healthy {
+            healthy_mask[idx] = true;
+        }
+
+        let candidates: Vec<(usize, &Arc<UpstreamTarget>)> = port_state
+            .target_indices
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                healthy_mask[idx]
+                    && subset_indices.contains(&idx)
+                    && exclude_idx.is_none_or(|ei| ei != idx)
+            })
+            .map(|idx| (idx, &self.targets[idx]))
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+
+        self.select_from_candidates_vec_using(
+            ctx_key,
+            &candidates,
+            port_state.algorithm,
+            &port_state.rr_counter,
+            &port_state.wrr_state,
+            &port_state.hash_ring,
+        )
+    }
+
     fn select_excluding_subset_vec_fallback(
         &self,
         ctx_key: &str,
@@ -1643,6 +2250,7 @@ impl LoadBalancer {
             ctx_key,
             &subset_healthy,
             self.subset_algorithm(subset_name),
+            &self.rr_counter,
             self.subset_wrr_state(subset_name),
             self.subset_hash_ring(subset_name),
         )

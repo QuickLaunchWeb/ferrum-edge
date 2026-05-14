@@ -13,7 +13,7 @@ use std::time::Duration;
 use hyper::Request;
 use tracing::{debug, warn};
 
-use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
+use crate::config::types::{HttpFlavor, PassiveHealthCheck, Proxy, Upstream, UpstreamTarget};
 use crate::load_balancer::{
     HashOnStrategy, HealthContext, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
 };
@@ -181,11 +181,25 @@ pub(crate) fn select_upstream_target(
 
     // Resolve the ejection cap from the upstream's passive health config.
     let upstream_arc = LoadBalancerCache::get_upstream_from(balancers, upstream_id);
-    let max_ejection_percent = upstream_arc
+    let dispatch_port = proxy.backend_port;
+    let has_port_override = proxy
+        .dispatch_port_overrides
         .as_ref()
-        .and_then(|u| u.health_checks.as_ref())
-        .and_then(|hc| hc.passive.as_ref())
-        .and_then(|p| p.max_ejection_percent);
+        .is_some_and(|overrides| overrides.contains_key(&dispatch_port));
+    let max_ejection_percent = if has_port_override {
+        LoadBalancerCache::max_ejection_percent_for_port_from(
+            balancers,
+            upstream_id,
+            proxy,
+            dispatch_port,
+        )
+    } else {
+        upstream_arc
+            .as_ref()
+            .and_then(|u| u.health_checks.as_ref())
+            .and_then(|hc| hc.passive.as_ref())
+            .and_then(|p| p.max_ejection_percent)
+    };
 
     let health_ctx = HealthContext {
         active_unhealthy: &state.health_checker.active_unhealthy_targets,
@@ -193,18 +207,41 @@ pub(crate) fn select_upstream_target(
         max_ejection_percent,
     };
 
-    let strategy = LoadBalancerCache::get_hash_on_strategy_from(balancers, upstream_id);
+    let strategy = if has_port_override {
+        LoadBalancerCache::get_hash_on_strategy_for_port_from(balancers, upstream_id, dispatch_port)
+    } else {
+        LoadBalancerCache::get_hash_on_strategy_from(balancers, upstream_id)
+    };
     let (hash_key, needs_set) = resolve_hash_key(&strategy, client_ip, proxy_headers);
 
     let selected_balancer = balancers.get_balancer(upstream_id);
 
     // Use subset routing when the proxy specifies an upstream_subset.
     let selection_result = if let Some(ref subset_name) = proxy.upstream_subset {
-        LoadBalancerCache::select_target_subset_from(
+        if has_port_override {
+            LoadBalancerCache::select_target_for_port_subset_from(
+                balancers,
+                upstream_id,
+                &hash_key,
+                dispatch_port,
+                subset_name,
+                Some(&health_ctx),
+            )
+        } else {
+            LoadBalancerCache::select_target_subset_from(
+                balancers,
+                upstream_id,
+                &hash_key,
+                subset_name,
+                Some(&health_ctx),
+            )
+        }
+    } else if has_port_override {
+        LoadBalancerCache::select_target_for_port_from(
             balancers,
             upstream_id,
             &hash_key,
-            subset_name,
+            dispatch_port,
             Some(&health_ctx),
         )
     } else {
@@ -396,16 +433,34 @@ pub(crate) fn record_backend_outcome(
     // Passive health check reporting (O(1) upstream lookup via index)
     if let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
         && let Some(upstream) = LoadBalancerCache::get_upstream_from(lb_snapshot, upstream_id)
-        && let Some(hc) = &upstream.health_checks
     {
+        let passive = passive_health_for_target(proxy, &upstream, target);
         state.health_checker.report_response(
             &proxy.id,
             target,
             response_status,
             connection_error,
-            hc.passive.as_ref(),
+            passive,
         );
     }
+}
+
+pub(crate) fn passive_health_for_target<'a>(
+    proxy: &'a Proxy,
+    upstream: &'a Upstream,
+    target: &UpstreamTarget,
+) -> Option<&'a PassiveHealthCheck> {
+    proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&target.port))
+        .and_then(|override_config| override_config.passive_health_check.as_ref())
+        .or_else(|| {
+            upstream
+                .health_checks
+                .as_ref()
+                .and_then(|hc| hc.passive.as_ref())
+        })
 }
 
 /// Resolve the hash key for consistent-hashing or sticky-session load balancing.

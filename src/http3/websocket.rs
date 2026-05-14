@@ -462,6 +462,10 @@ pub(crate) async fn handle_h3_websocket(
                     if let (Some(upstream_id), Some(prev_target), Some(hash_key)) =
                         (&proxy.upstream_id, &current_target, lb_hash_key.as_deref())
                         && let Some(next) = {
+                            let has_port_override = proxy
+                                .dispatch_port_overrides
+                                .as_ref()
+                                .is_some_and(|overrides| overrides.contains_key(&prev_target.port));
                             let health_ctx = crate::load_balancer::HealthContext {
                                 active_unhealthy: &state.health_checker.active_unhealthy_targets,
                                 proxy_passive: state
@@ -469,18 +473,47 @@ pub(crate) async fn handle_h3_websocket(
                                     .passive_health
                                     .get(&proxy.id)
                                     .map(|r| r.value().clone()),
-                                max_ejection_percent:
+                                max_ejection_percent: if has_port_override {
+                                    crate::load_balancer::LoadBalancerCache::max_ejection_percent_for_port_from(
+                                        &epoch.load_balancer,
+                                        upstream_id,
+                                        &proxy,
+                                        prev_target.port,
+                                    )
+                                } else {
                                     crate::load_balancer::LoadBalancerCache::max_ejection_percent_from(
                                         &epoch.load_balancer,
                                         upstream_id,
-                                    ),
+                                    )
+                                },
                             };
                             if let Some(subset_name) = proxy.upstream_subset.as_deref() {
-                                crate::load_balancer::LoadBalancerCache::select_next_target_subset_from(
+                                if has_port_override {
+                                    crate::load_balancer::LoadBalancerCache::select_next_target_for_port_subset_from(
+                                        &epoch.load_balancer,
+                                        upstream_id,
+                                        hash_key,
+                                        prev_target.port,
+                                        subset_name,
+                                        prev_target,
+                                        Some(&health_ctx),
+                                    )
+                                } else {
+                                    crate::load_balancer::LoadBalancerCache::select_next_target_subset_from(
+                                        &epoch.load_balancer,
+                                        upstream_id,
+                                        hash_key,
+                                        subset_name,
+                                        prev_target,
+                                        Some(&health_ctx),
+                                    )
+                                }
+                            } else if has_port_override {
+                                crate::load_balancer::LoadBalancerCache::select_next_target_for_port_from(
                                     &epoch.load_balancer,
                                     upstream_id,
                                     hash_key,
-                                    subset_name,
+                                    prev_target.port,
                                     prev_target,
                                     Some(&health_ctx),
                                 )
@@ -607,10 +640,22 @@ pub(crate) async fn handle_h3_websocket(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
-        let strategy = crate::load_balancer::LoadBalancerCache::get_hash_on_strategy_from(
-            &epoch.load_balancer,
-            upstream_id,
-        );
+        let has_port_override = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .is_some_and(|overrides| overrides.contains_key(&target.port));
+        let strategy = if has_port_override {
+            crate::load_balancer::LoadBalancerCache::get_hash_on_strategy_for_port_from(
+                &epoch.load_balancer,
+                upstream_id,
+                target.port,
+            )
+        } else {
+            crate::load_balancer::LoadBalancerCache::get_hash_on_strategy_from(
+                &epoch.load_balancer,
+                upstream_id,
+            )
+        };
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = crate::load_balancer::LoadBalancerCache::get_upstream_from(
                 &epoch.load_balancer,

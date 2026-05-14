@@ -34,9 +34,9 @@ use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
 use crate::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshDestinationRule, MeshJwtRule, MeshLoadBalancer,
-    MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig, MeshTrafficPolicy,
-    MeshTrafficPolicyTls, MtlsMode, PolicyScope, Resolution, ServiceEntry, ServiceEntryLocation,
-    service_entry_exported_to_namespace,
+    MeshOutlierDetection, MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig,
+    MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyScope, Resolution, ServiceEntry,
+    ServiceEntryLocation, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
@@ -1021,29 +1021,6 @@ fn apply_destination_rules(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
                     continue;
                 }
 
-                // The K8s translator emits warnings for
-                // `portLevelSettings[].loadBalancer` / `outlierDetection` at
-                // translate time (src/config_sources/k8s/istio.rs), but
-                // native MeshSubscribe / xDS slices bypass that path. Surface
-                // the same gap here so operators see the unenforced fields
-                // regardless of how the slice arrives at the data plane.
-                if port_policy.load_balancer.is_some() {
-                    warn!(
-                        rule = %dr.name,
-                        upstream = %upstream.id,
-                        port = port,
-                        "DestinationRule portLevelSettings.loadBalancer is parsed but not enforced per-port today (gateway keeps a single load balancer per upstream); only connectTimeout is applied"
-                    );
-                }
-                if port_policy.outlier_detection.is_some() {
-                    warn!(
-                        rule = %dr.name,
-                        upstream = %upstream.id,
-                        port = port,
-                        "DestinationRule portLevelSettings.outlierDetection is parsed but not enforced per-port today (gateway keeps a single passive health check per upstream); only connectTimeout is applied"
-                    );
-                }
-
                 let override_slot = upstream.port_overrides.entry(*port).or_default();
                 apply_traffic_policy_to_port_override(override_slot, port_policy);
             }
@@ -1095,23 +1072,23 @@ fn apply_destination_rules(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
 }
 
 /// Project a `MeshTrafficPolicy` onto a per-port `UpstreamPortOverride` slot.
-///
-/// Only `connect_timeout_ms` is wired into the dispatch hot path today
-/// (`Upstream::effective_connect_timeout_ms`). Per-port LB algorithm and
-/// hash-key are intentionally NOT applied — the gateway keeps a single
-/// `LoadBalancer` per upstream and switching algorithm/ring per destination
-/// port would require per-port balancer instances (different counters /
-/// hash rings). The translator emits a warning when operators set these on
-/// `portLevelSettings[].loadBalancer` so they know the gap.
-///
-/// Per-port `outlierDetection` is also not split out — it produces a single
-/// `PassiveHealthCheck` on the upstream via the top-level policy.
 fn apply_traffic_policy_to_port_override(
     slot: &mut UpstreamPortOverride,
     policy: &MeshTrafficPolicy,
 ) {
     if let Some(timeout_ms) = policy.connect_timeout_ms {
         slot.connect_timeout_ms = Some(timeout_ms);
+    }
+    if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
+        slot.algorithm = Some(algorithm);
+    }
+    if let Some(hash_on) = mesh_hash_on_to_ferrum(&policy.load_balancer) {
+        slot.hash_on = Some(hash_on);
+    }
+    if let Some(ref od) = policy.outlier_detection {
+        let mut passive = slot.passive_health_check.clone().unwrap_or_default();
+        apply_outlier_detection_to_passive(&mut passive, od);
+        slot.passive_health_check = Some(passive);
     }
 }
 
@@ -1158,19 +1135,11 @@ fn destination_rule_host_matches(rule_host: &str, namespace: &str, candidate: &s
 /// TLS settings override the PeerAuthentication defaults via
 /// `apply_traffic_policy_tls_to_upstream`.
 fn apply_traffic_policy_to_upstream(upstream: &mut Upstream, policy: &MeshTrafficPolicy) {
-    if let Some(lb) = &policy.load_balancer {
-        if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
-            upstream.algorithm = algorithm;
-        }
-        if let MeshLoadBalancer::ConsistentHash(ch) = lb {
-            if let Some(header) = &ch.http_header_name {
-                upstream.hash_on = Some(format!("header:{header}"));
-            } else if let Some(cookie) = &ch.http_cookie_name {
-                upstream.hash_on = Some(format!("cookie:{cookie}"));
-            } else if ch.use_source_ip {
-                upstream.hash_on = Some("ip".to_string());
-            }
-        }
+    if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
+        upstream.algorithm = algorithm;
+    }
+    if let Some(hash_on) = mesh_hash_on_to_ferrum(&policy.load_balancer) {
+        upstream.hash_on = Some(hash_on);
     }
 
     // Outlier detection -> passive health check.
@@ -1181,18 +1150,7 @@ fn apply_traffic_policy_to_upstream(upstream: &mut Upstream, policy: &MeshTraffi
             .passive
             .get_or_insert_with(PassiveHealthCheck::default);
 
-        if let Some(consecutive) = od.consecutive_errors {
-            passive.unhealthy_threshold = consecutive;
-        }
-        if let Some(interval) = od.interval_seconds {
-            passive.unhealthy_window_seconds = interval;
-        }
-        if let Some(ejection) = od.base_ejection_seconds {
-            passive.healthy_after_seconds = ejection;
-        }
-        if let Some(max_pct) = od.max_ejection_percent {
-            passive.max_ejection_percent = Some(max_pct);
-        }
+        apply_outlier_detection_to_passive(passive, od);
     }
 
     // Backend TLS posture override from DestinationRule.trafficPolicy.tls.
@@ -1314,6 +1272,36 @@ fn mesh_lb_to_ferrum(lb: &Option<MeshLoadBalancer>) -> Option<LoadBalancerAlgori
         },
         Some(MeshLoadBalancer::ConsistentHash(_)) => Some(LoadBalancerAlgorithm::ConsistentHashing),
         None => None,
+    }
+}
+
+fn mesh_hash_on_to_ferrum(lb: &Option<MeshLoadBalancer>) -> Option<String> {
+    let Some(MeshLoadBalancer::ConsistentHash(ch)) = lb else {
+        return None;
+    };
+    if let Some(header) = &ch.http_header_name {
+        Some(format!("header:{header}"))
+    } else if let Some(cookie) = &ch.http_cookie_name {
+        Some(format!("cookie:{cookie}"))
+    } else if ch.use_source_ip {
+        Some("ip".to_string())
+    } else {
+        None
+    }
+}
+
+fn apply_outlier_detection_to_passive(passive: &mut PassiveHealthCheck, od: &MeshOutlierDetection) {
+    if let Some(consecutive) = od.consecutive_errors {
+        passive.unhealthy_threshold = consecutive;
+    }
+    if let Some(interval) = od.interval_seconds {
+        passive.unhealthy_window_seconds = interval;
+    }
+    if let Some(ejection) = od.base_ejection_seconds {
+        passive.healthy_after_seconds = ejection;
+    }
+    if let Some(max_pct) = od.max_ejection_percent {
+        passive.max_ejection_percent = Some(max_pct);
     }
 }
 
@@ -3889,16 +3877,14 @@ mod tests {
         );
         assert_eq!(config.proxies[0].backend_connect_timeout_ms, 1111);
 
-        // Per-port 8080 connect-timeout override lands on port_overrides[8080]
-        // without disturbing the upstream-level fields or the proxy-default
-        // connect timeout. The LB algorithm in `portLevelSettings[].loadBalancer`
-        // is intentionally NOT mirrored here today — see
-        // `apply_traffic_policy_to_port_override` rationale.
+        // Per-port policy lands on port_overrides[8080] without disturbing
+        // the upstream-level fields or the proxy-default connect timeout.
         let port_8080 = config.upstreams[0]
             .port_overrides
             .get(&8080)
             .expect("port 8080 override");
         assert_eq!(port_8080.connect_timeout_ms, Some(2222));
+        assert_eq!(port_8080.algorithm, Some(LoadBalancerAlgorithm::Random));
 
         // Proof that the override is actually consulted at dispatch time via
         // the helper the hot path uses — port 8080 wins, other ports fall
@@ -3970,12 +3956,21 @@ mod tests {
             .get(&8080)
             .expect("port 8080 override");
         assert_eq!(p8080.connect_timeout_ms, Some(750));
+        assert_eq!(
+            p8080.algorithm,
+            Some(LoadBalancerAlgorithm::LeastConnections)
+        );
 
         let p9090 = config.upstreams[0]
             .port_overrides
             .get(&9090)
             .expect("port 9090 override");
         assert_eq!(p9090.connect_timeout_ms, Some(3000));
+        assert_eq!(
+            p9090.algorithm,
+            Some(LoadBalancerAlgorithm::ConsistentHashing)
+        );
+        assert_eq!(p9090.hash_on.as_deref(), Some("header:x-user"));
 
         // Effective-timeout helper is what the dispatch hot path consults.
         // Each port's own override wins; an unrelated port falls back to the

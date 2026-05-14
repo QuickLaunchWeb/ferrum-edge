@@ -228,6 +228,10 @@ fn select_next_cross_protocol_retry_target(
         return None;
     };
 
+    let has_port_override = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .is_some_and(|overrides| overrides.contains_key(&prev_target.port));
     let health_ctx = crate::load_balancer::HealthContext {
         active_unhealthy: &state.health_checker.active_unhealthy_targets,
         proxy_passive: state
@@ -235,18 +239,48 @@ fn select_next_cross_protocol_retry_target(
             .passive_health
             .get(&proxy.id)
             .map(|r| r.value().clone()),
-        max_ejection_percent: crate::load_balancer::LoadBalancerCache::max_ejection_percent_from(
-            &epoch.load_balancer,
-            upstream_id,
-        ),
+        max_ejection_percent: if has_port_override {
+            crate::load_balancer::LoadBalancerCache::max_ejection_percent_for_port_from(
+                &epoch.load_balancer,
+                upstream_id,
+                proxy,
+                prev_target.port,
+            )
+        } else {
+            crate::load_balancer::LoadBalancerCache::max_ejection_percent_from(
+                &epoch.load_balancer,
+                upstream_id,
+            )
+        },
     };
 
     let next = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
-        crate::load_balancer::LoadBalancerCache::select_next_target_subset_from(
+        if has_port_override {
+            crate::load_balancer::LoadBalancerCache::select_next_target_for_port_subset_from(
+                &epoch.load_balancer,
+                upstream_id,
+                hash_key,
+                prev_target.port,
+                subset_name,
+                prev_target,
+                Some(&health_ctx),
+            )
+        } else {
+            crate::load_balancer::LoadBalancerCache::select_next_target_subset_from(
+                &epoch.load_balancer,
+                upstream_id,
+                hash_key,
+                subset_name,
+                prev_target,
+                Some(&health_ctx),
+            )
+        }
+    } else if has_port_override {
+        crate::load_balancer::LoadBalancerCache::select_next_target_for_port_from(
             &epoch.load_balancer,
             upstream_id,
             hash_key,
-            subset_name,
+            prev_target.port,
             prev_target,
             Some(&health_ctx),
         )
