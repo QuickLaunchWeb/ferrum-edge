@@ -1,4 +1,4 @@
-//! Plugin system — 58 built-in plugins with a trait-based architecture.
+//! Plugin system — 60 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -987,7 +987,7 @@ pub struct StreamTransactionSummary {
 ///
 /// | Band      | Range       | Purpose                                   | Plugins |
 /// |-----------|-------------|-------------------------------------------|---------|
-/// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
+/// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975), ai_federation (2985) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
@@ -997,8 +997,14 @@ pub struct StreamTransactionSummary {
 pub mod priority {
     pub const OTEL_TRACING: u16 = 25;
     pub const CORRELATION_ID: u16 = 50;
-    pub const REQUEST_TERMINATION: u16 = 125;
     pub const CORS: u16 = 100;
+    pub const REQUEST_TERMINATION: u16 = 125;
+    /// `mesh_outbound_registry`: rejects outbound requests whose
+    /// destination is not in the mesh registry. Auto-injected only when
+    /// `MeshConfig.outbound_traffic_policy == RegistryOnly`. Runs in the
+    /// `on_request_received` band so the rejection is visible to all
+    /// downstream observability without engaging the auth pipeline.
+    pub const MESH_OUTBOUND_REGISTRY: u16 = 130;
     pub const IP_RESTRICTION: u16 = 150;
     pub const GEO_RESTRICTION: u16 = 175;
     pub const BOT_DETECTION: u16 = 200;
@@ -1550,6 +1556,9 @@ pub fn create_plugin_with_http_client(
             tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
         ))),
         "mesh_authz" => Ok(Some(Arc::new(mesh::authz::MeshAuthz::new(config)?))),
+        "mesh_outbound_registry" => Ok(Some(Arc::new(
+            mesh::outbound_registry::OutboundRegistry::new(config)?,
+        ))),
         "ip_restriction" => Ok(Some(Arc::new(ip_restriction::IpRestriction::new(config)?))),
         "geo_restriction" => Ok(Some(Arc::new(geo_restriction::GeoRestriction::new(
             config,
@@ -1704,6 +1713,7 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "jwks_auth"
             | "mtls_auth"
             | "mesh_authz"
+            | "mesh_outbound_registry"
             | "access_control"
             | "tcp_connection_throttle"
             | "ip_restriction"
@@ -1728,6 +1738,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "mtls_auth",
         "spiffe_identity",
         "mesh_authz",
+        "mesh_outbound_registry",
         "compression",
         "cors",
         "access_control",

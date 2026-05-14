@@ -107,10 +107,17 @@ fn mesh_config_normalize_lowercases_policy_hosts() {
 fn mesh_plugins_are_registered() {
     let available = available_plugins();
     assert!(available.contains(&"mesh_authz"));
+    assert!(available.contains(&"mesh_outbound_registry"));
     assert!(available.contains(&"workload_metrics"));
     assert!(available.contains(&"access_log"));
     assert!(is_security_plugin("mesh_authz"));
+    assert!(is_security_plugin("mesh_outbound_registry"));
     assert!(create_plugin("mesh_authz", &json!({})).unwrap().is_some());
+    assert!(
+        create_plugin("mesh_outbound_registry", &json!({"registry": []}))
+            .unwrap()
+            .is_some()
+    );
     assert!(
         create_plugin("workload_metrics", &json!({}))
             .unwrap()

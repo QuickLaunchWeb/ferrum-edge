@@ -847,6 +847,10 @@ fn reverse_translate(
         proxy_configs: Vec::new(),
         trust_bundles: None,
         multi_cluster: None,
+        // MeshConfig outboundTrafficPolicy is not represented in the minimal
+        // ADS resources consumed here. xDS deployments use the runtime env
+        // fallback until MeshConfig translation is wired.
+        outbound_traffic_policy: None,
     })
 }
 
