@@ -7530,21 +7530,19 @@ async fn handle_proxy_request_inner(
     // the right content-type. The gRPC pool uses h2c (plaintext HTTP/2) for
     // `BackendScheme::Http` and TLS+ALPN=h2 for `BackendScheme::Https`.
     if is_grpc_request && proxy.dispatch_kind.is_http_family() {
-        let (grpc_effective_host, grpc_effective_port) = if let Some(ref target) = upstream_target {
-            (target.host.as_str(), target.port)
-        } else {
-            (proxy.backend_host.as_str(), proxy.backend_port)
-        };
         // Honor DestinationRule per-port `connect_timeout_ms` overrides on
         // the gRPC path — the gRPC transport reads
-        // `proxy.backend_connect_timeout_ms` directly (grpc_proxy.rs), so we
-        // must pass the resolved Cow<Proxy> through dispatch. Borrowed when
-        // no override applies; cloned only when an override differs.
-        let grpc_effective_proxy =
-            resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref());
-        let grpc_dispatch_proxy: &Proxy = grpc_effective_proxy.as_ref();
+        // `proxy.backend_{host,port,connect_timeout_ms}` directly
+        // (grpc_proxy.rs), so we must pass the resolved Cow<Proxy> through
+        // dispatch. Borrowed when no override applies; cloned only when the
+        // selected target or per-port timeout differs.
+        let grpc_connection_proxy =
+            resolve_backend_connection_proxy_for_target(&proxy, upstream_target.as_deref());
+        let grpc_dispatch_proxy: &Proxy = grpc_connection_proxy.as_ref();
+        let grpc_effective_host = grpc_dispatch_proxy.backend_host.as_str();
+        let grpc_effective_port = grpc_dispatch_proxy.backend_port;
         let mut grpc_backend_url = build_backend_url_with_target(
-            &proxy,
+            grpc_dispatch_proxy,
             &path,
             &query_string,
             grpc_effective_host,
@@ -7878,8 +7876,10 @@ async fn handle_proxy_request_inner(
                 // current target so per-port `connect_timeout_ms` overrides
                 // apply to the retried backend. Same per-target-rotation
                 // contract as `proxy_to_backend_inner`.
-                let grpc_retry_effective_proxy =
-                    resolve_effective_proxy_for_target(&proxy, grpc_current_target.as_deref());
+                let grpc_retry_effective_proxy = resolve_backend_connection_proxy_for_target(
+                    &proxy,
+                    grpc_current_target.as_deref(),
+                );
                 grpc_result = grpc_proxy::proxy_grpc_request_from_bytes(
                     grpc_method.clone(),
                     grpc_req_headers.clone(),
@@ -9491,6 +9491,31 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     std::borrow::Cow::Owned(owned)
 }
 
+/// Resolve the effective `Proxy` for backend pools that build their key and
+/// dial target from `proxy.backend_host` / `proxy.backend_port`.
+///
+/// Generic reqwest and H3 dispatch pass the selected upstream target as an
+/// explicit argument to their transport. The gRPC and direct-H2 pools do not:
+/// their pool keys and connection establishment read the `Proxy` fields
+/// directly. After an upstream override or normal load-balanced selection,
+/// those pool-backed paths must bake the concrete target host/port into the
+/// proxy clone or they can reuse/dial a connection for the route template's
+/// original backend.
+pub(crate) fn resolve_backend_connection_proxy_for_target<'a>(
+    proxy: &'a Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> std::borrow::Cow<'a, Proxy> {
+    let mut effective = resolve_effective_proxy_for_target(proxy, upstream_target);
+    if let Some(target) = upstream_target
+        && (effective.backend_host != target.host || effective.backend_port != target.port)
+    {
+        let owned = effective.to_mut();
+        owned.backend_host = target.host.clone();
+        owned.backend_port = target.port;
+    }
+    effective
+}
+
 /// Retry a backend request, replaying the original request body if available.
 /// The body bytes were collected and retained on the first attempt so they
 /// can be replayed on connection-failure retries without data loss.
@@ -9991,13 +10016,9 @@ async fn proxy_to_backend(
         let pool_config = state.connection_pool.global_pool_config().for_proxy(proxy);
         // Mirror the warmup path: the direct H2 pool must key and dial on the
         // load-balanced target, not the proxy's template backend_host/port.
-        let direct_h2_target_proxy = upstream_target.map(|target| {
-            let mut target_proxy = proxy.clone();
-            target_proxy.backend_host = target.host.clone();
-            target_proxy.backend_port = target.port;
-            target_proxy
-        });
-        let direct_h2_proxy = direct_h2_target_proxy.as_ref().unwrap_or(proxy);
+        let direct_h2_effective_proxy =
+            resolve_backend_connection_proxy_for_target(proxy, upstream_target);
+        let direct_h2_proxy = direct_h2_effective_proxy.as_ref();
         if can_use_direct_http2_pool(
             pool_config.enable_http2,
             retain_request_body,
@@ -15323,8 +15344,12 @@ mod tests {
     }
 
     fn target_for_test(port: u16) -> UpstreamTarget {
+        target_with_host_for_test("backend.local", port)
+    }
+
+    fn target_with_host_for_test(host: &str, port: u16) -> UpstreamTarget {
         UpstreamTarget {
-            host: "backend.local".to_string(),
+            host: host.to_string(),
             port,
             weight: 1,
             tags: HashMap::new(),
@@ -15393,6 +15418,50 @@ mod tests {
             "missing upstream_target must take the borrowed branch"
         );
         assert_eq!(effective.backend_connect_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn resolve_backend_connection_proxy_rebases_selected_target_host_port() {
+        let proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        let target = target_with_host_for_test("canary.local", 9090);
+        let effective = resolve_backend_connection_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Owned(_)),
+            "pool-backed dispatch must clone when the selected target differs"
+        );
+        assert_eq!(effective.backend_host, "canary.local");
+        assert_eq!(effective.backend_port, 9090);
+        assert_eq!(effective.backend_connect_timeout_ms, 5000);
+        assert_eq!(proxy.backend_host, "backend.local");
+        assert_eq!(proxy.backend_port, 8080);
+    }
+
+    #[test]
+    fn resolve_backend_connection_proxy_preserves_port_override_when_rebasing_target() {
+        let proxy = proxy_with_port_overrides_for_test(5000, &[(9090, 750)]);
+        let target = target_with_host_for_test("canary.local", 9090);
+        let effective = resolve_backend_connection_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Owned(_)),
+            "target rebase plus port override must use the owned branch"
+        );
+        assert_eq!(effective.backend_host, "canary.local");
+        assert_eq!(effective.backend_port, 9090);
+        assert_eq!(effective.backend_connect_timeout_ms, 750);
+        assert_eq!(proxy.backend_connect_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn resolve_backend_connection_proxy_borrows_when_target_matches() {
+        let proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        let target = target_for_test(8080);
+        let effective = resolve_backend_connection_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Borrowed(_)),
+            "matching target with no policy override must stay zero-alloc"
+        );
+        assert_eq!(effective.backend_host, "backend.local");
+        assert_eq!(effective.backend_port, 8080);
     }
 
     #[test]

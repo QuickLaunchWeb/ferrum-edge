@@ -445,9 +445,14 @@ impl RequestContext {
     ///
     /// Downstream dispatch reads `proxy.upstream_id` / `proxy.backend_host` /
     /// `proxy.backend_port` / `proxy.resolved_tls` directly; using the
-    /// returned `Arc<Proxy>` makes the override transparent to dispatch sites
-    /// that already accept `&Proxy` (pool keys, capability registry, URL
-    /// construction, backend TLS, etc.).
+    /// returned `Arc<Proxy>` makes direct-backend overrides transparent to
+    /// dispatch sites that already accept `&Proxy` (pool keys, capability
+    /// registry, URL construction, backend TLS, etc.).
+    ///
+    /// Upstream-id overrides still need a later load-balancer target
+    /// selection before `backend_host` / `backend_port` can be rebased. Any
+    /// backend pool that keys or dials from those proxy fields must bake the
+    /// selected target into its per-dispatch proxy after LB selection.
     ///
     /// This convenience helper cannot re-resolve `resolved_tls` when
     /// `route_override_upstream_id` points at a different upstream because it
@@ -464,8 +469,10 @@ impl RequestContext {
     /// `route_override_upstream_id` changes the effective upstream.
     ///
     /// Use this variant for dispatch paths that might honor upstream-id
-    /// overrides. It preserves the pool-key / TLS-identity invariant that every
-    /// backend connection key and dial uses the effective routing target.
+    /// overrides. It preserves the upstream-id / TLS / per-port-policy
+    /// portion of the effective routing target. Pool-backed transports that
+    /// read `proxy.backend_host` / `proxy.backend_port` directly must still
+    /// rebase those fields after load-balancer target selection.
     pub fn apply_route_overrides_with_upstreams(
         &self,
         proxy: Arc<Proxy>,
