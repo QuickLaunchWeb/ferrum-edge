@@ -139,6 +139,8 @@ impl MigrationRunner {
 
     /// Build the ordered list of all known migrations.
     fn all_migrations(&self) -> Vec<Box<dyn MigrationEntry>> {
+        // During build-out, schema additions are folded into V001 rather than
+        // carried as upgrade migrations.
         vec![Box::new(MigrationEntryV001(
             v001_initial_schema::V001InitialSchema,
         ))]
