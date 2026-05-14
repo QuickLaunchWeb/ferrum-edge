@@ -33,6 +33,7 @@ pub mod lazy_timeout;
 pub mod load_balancer;
 pub mod metrics;
 pub mod modes;
+pub mod notifications;
 pub mod overload;
 pub mod plugin_cache;
 pub mod plugins;

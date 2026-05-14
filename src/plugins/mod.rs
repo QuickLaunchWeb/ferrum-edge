@@ -51,6 +51,7 @@ pub mod mesh_route_dispatch;
 pub mod mtls_auth;
 pub mod otel_tracing;
 pub mod prometheus_metrics;
+pub mod proxy_alerts;
 pub mod rate_limiting;
 pub mod request_deduplication;
 pub mod request_mirror;
@@ -1288,6 +1289,7 @@ pub mod priority {
     pub const LOKI_LOGGING: u16 = 9155;
     pub const UDP_LOGGING: u16 = 9160;
     pub const TRANSACTION_DEBUGGER: u16 = 9200;
+    pub const PROXY_ALERTS: u16 = 9250;
     pub const PROMETHEUS_METRICS: u16 = 9300;
     pub const API_CHARGEBACK: u16 = 9350;
     pub const WORKLOAD_METRICS: u16 = 9360;
@@ -1864,6 +1866,10 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.namespace(),
         )?))),
+        "proxy_alerts" => Ok(Some(Arc::new(proxy_alerts::ProxyAlerts::new(
+            config,
+            http_client.clone(),
+        )?))),
         "api_chargeback" => Ok(Some(Arc::new(api_chargeback::ApiChargeback::new(
             config,
             http_client.namespace(),
@@ -2006,6 +2012,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "response_mock",
         "serverless_function",
         "prometheus_metrics",
+        "proxy_alerts",
         "otel_tracing",
         "ai_token_metrics",
         "ai_request_guard",

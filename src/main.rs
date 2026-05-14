@@ -35,6 +35,7 @@ mod lazy_timeout;
 mod load_balancer;
 mod metrics;
 mod modes;
+mod notifications;
 mod overload;
 mod plugin_cache;
 mod plugins;
