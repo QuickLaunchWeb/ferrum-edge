@@ -137,7 +137,7 @@ Full docs: [docs/mesh.md](docs/mesh.md). Engineering invariants only below.
 
 **Config consumption** (`config_consumer/`): `FERRUM_MESH_CONFIG_PROTOCOL=native` uses `MeshConfigSync.MeshSubscribe` gRPC; `xds` uses a standard ADS client (CDS/EDS/LDS/RDS/SDS, 25ms debounce). Both: jittered exponential backoff (1s→30s, ±25%), multi-CP failover via `FERRUM_DP_CP_GRPC_URLS`, JWT auth in metadata.
 
-**PolicyScope precedence** (all scope-aware resources): `WorkloadSelector` > `Namespace` > `MeshWide`; ASCII-smallest `name` tiebreaks within a tier. Applies to `MeshPolicy`, `PeerAuthentication`, `MeshRequestAuthentication`, `MeshTelemetryResource`, `MeshProxyConfig`. The same `policy_scope_applies_to_workload` helper feeds `MeshSlice::from_gateway_config` AND the `mesh_authz` plugin — do NOT fork.
+**PolicyScope filtering**: scope-aware mesh resources are filtered against workload namespace + labels via shared helpers (`policy_scope_applies_to_workload` / `scope_applies_to_workload`); do NOT fork those predicates. Single-winner precedence (`WorkloadSelector` > `Namespace` > `MeshWide`) applies only where the runtime resolves one effective setting, such as `PeerAuthentication` and `MeshProxyConfig`. `MeshPolicy` and `MeshRequestAuthentication` are additive after filtering, and `MeshTelemetryResource` merges per section.
 
 **Mesh plugin injection** (`mod.rs::inject_mesh_global_plugins()`): auto-injects reserved-ID global plugins at slice-apply time: `__mesh_spiffe_identity` (940), `__mesh_authz` (2075), `__mesh_workload_metrics`, `__mesh_request_auth` (only when JWT rules present), `__mesh_access_log`. Operator-managed globals of the same type override mesh-injected ones.
 
