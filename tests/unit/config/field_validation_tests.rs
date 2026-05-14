@@ -586,6 +586,28 @@ fn test_upstream_backend_tls_san_allow_list_entry_length_limit() {
 }
 
 #[test]
+fn test_upstream_backend_tls_san_allow_list_rejects_spiffe_without_path() {
+    let mut upstream = make_upstream("test");
+    upstream.backend_tls_san_allow_list = vec!["spiffe://cluster.local".into()];
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_san_allow_list[0]") && e.contains("non-empty path"))
+    );
+
+    upstream.backend_tls_san_allow_list = vec!["spiffe://cluster.local/".into()];
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_san_allow_list[0]") && e.contains("non-empty path"))
+    );
+
+    upstream.backend_tls_san_allow_list =
+        vec!["spiffe://cluster.local/ns/default/sa/reviews".into()];
+    assert!(upstream.validate_fields().is_ok());
+}
+
+#[test]
 fn test_upstream_requires_targets_or_service_discovery() {
     let mut upstream = make_upstream("test");
     upstream.targets.clear();

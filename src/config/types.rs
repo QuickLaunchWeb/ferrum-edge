@@ -3809,8 +3809,11 @@ pub(crate) fn validate_backend_tls_san_allow_list_entry(san: &str) -> Result<(),
         return Ok(());
     }
     if let Some(rest) = san.strip_prefix("spiffe://") {
-        if rest.is_empty() || rest.contains(char::is_whitespace) {
-            return Err("entry is invalid: SPIFFE URI must include a non-empty path".to_string());
+        let has_path = rest
+            .find('/')
+            .is_some_and(|slash| slash > 0 && slash + 1 < rest.len());
+        if !has_path || rest.contains(char::is_whitespace) {
+            return Err("entry is invalid: SPIFFE URI must include a non-empty path after the trust domain (e.g. spiffe://domain/ns/default/sa/name)".to_string());
         }
         return Ok(());
     }
