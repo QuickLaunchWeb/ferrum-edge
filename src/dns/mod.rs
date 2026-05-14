@@ -332,7 +332,7 @@ impl DnsCache {
 
             // Fresh entry — return immediately
             if entry.expires_at > now && !entry.addresses.is_empty() && !entry.is_error {
-                crate::runtime_metrics::global().record_dns_hit();
+                crate::runtime_metrics::global_ref().record_dns_hit();
                 return Ok(entry.addresses[0]);
             }
 
@@ -376,13 +376,13 @@ impl DnsCache {
                         hostname
                     );
                 }
-                crate::runtime_metrics::global().record_dns_stale();
+                crate::runtime_metrics::global_ref().record_dns_stale();
                 return Ok(entry.addresses[0]);
             }
 
             // Cached error that hasn't expired — return error immediately
             if entry.is_error && entry.expires_at > now {
-                crate::runtime_metrics::global().record_dns_error();
+                crate::runtime_metrics::global_ref().record_dns_error();
                 anyhow::bail!("DNS resolution failed for {} (cached error)", hostname);
             }
         }
@@ -400,7 +400,7 @@ impl DnsCache {
                     "DNS resolved {} -> {:?} (native_ttl={:?}, effective_ttl={:?})",
                     hostname, addrs[0], native_ttl, ttl
                 );
-                crate::runtime_metrics::global().record_dns_miss();
+                crate::runtime_metrics::global_ref().record_dns_miss();
                 Ok(addrs[0])
             }
             Ok(_) | Err(_) if hostname == "localhost" => {
@@ -412,17 +412,17 @@ impl DnsCache {
                 let addrs =
                     self.cache_success_entry(hostname, vec![addr], None, ttl, per_proxy_ttl)?;
                 debug!("DNS resolved localhost -> {} (built-in fallback)", addr);
-                crate::runtime_metrics::global().record_dns_miss();
+                crate::runtime_metrics::global_ref().record_dns_miss();
                 Ok(addrs[0])
             }
             Ok(_) => {
                 self.cache_error(hostname, per_proxy_ttl);
-                crate::runtime_metrics::global().record_dns_error();
+                crate::runtime_metrics::global_ref().record_dns_error();
                 anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
             }
             Err(e) => {
                 self.cache_error(hostname, per_proxy_ttl);
-                crate::runtime_metrics::global().record_dns_error();
+                crate::runtime_metrics::global_ref().record_dns_error();
                 Err(e)
             }
         }
@@ -458,6 +458,7 @@ impl DnsCache {
             prior_per_proxy_ttl = entry.original_per_proxy_ttl;
 
             if entry.expires_at > now && !entry.addresses.is_empty() && !entry.is_error {
+                crate::runtime_metrics::global_ref().record_dns_hit();
                 return Ok(entry.addresses.clone());
             }
 
@@ -481,10 +482,12 @@ impl DnsCache {
                         }
                     }
                 }
+                crate::runtime_metrics::global_ref().record_dns_stale();
                 return Ok(entry.addresses.clone());
             }
 
             if entry.is_error && entry.expires_at > now {
+                crate::runtime_metrics::global_ref().record_dns_error();
                 anyhow::bail!("DNS resolution failed for {} (cached error)", hostname);
             }
         }
@@ -495,19 +498,27 @@ impl DnsCache {
         match self.timed_resolve(hostname).await {
             Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
                 let ttl = self.effective_ttl(native_ttl, per_proxy_ttl);
-                self.cache_success_entry(hostname, addrs, record_type, ttl, per_proxy_ttl)
+                let addrs =
+                    self.cache_success_entry(hostname, addrs, record_type, ttl, per_proxy_ttl)?;
+                crate::runtime_metrics::global_ref().record_dns_miss();
+                Ok(addrs)
             }
             Ok(_) | Err(_) if hostname == "localhost" => {
                 let addr = self.localhost_addr();
                 let ttl = self.effective_ttl(Duration::from_secs(3600), per_proxy_ttl);
-                self.cache_success_entry(hostname, vec![addr], None, ttl, per_proxy_ttl)
+                let addrs =
+                    self.cache_success_entry(hostname, vec![addr], None, ttl, per_proxy_ttl)?;
+                crate::runtime_metrics::global_ref().record_dns_miss();
+                Ok(addrs)
             }
             Ok(_) => {
                 self.cache_error(hostname, per_proxy_ttl);
+                crate::runtime_metrics::global_ref().record_dns_error();
                 anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
             }
             Err(e) => {
                 self.cache_error(hostname, per_proxy_ttl);
+                crate::runtime_metrics::global_ref().record_dns_error();
                 Err(e)
             }
         }

@@ -84,6 +84,7 @@ pub async fn run(
     crate::runtime_metrics::global().configure(
         env_config.status_counts_max_entries,
         env_config.runtime_metrics_pool_tracking_enabled,
+        env_config.runtime_metrics_cache_ttl_ms,
     );
     // Wire stream listeners (TCP/UDP/DTLS) to the global SIGTERM channel so
     // their accept loops exit promptly during graceful drain. Without this,
@@ -124,7 +125,7 @@ pub async fn run(
         shutdown_tx.subscribe(),
     );
     let runtime_system_handle = crate::system_metrics::start_sampler(
-        proxy_state.clone(),
+        Some(proxy_state.clone()),
         env_config.runtime_metrics_system_sample_interval_ms,
         shutdown_tx.subscribe(),
     );

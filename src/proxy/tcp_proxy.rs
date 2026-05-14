@@ -1007,11 +1007,12 @@ async fn run_tcp_accept_loop(
                         sni_hostname: stream_ctx.sni_hostname.clone(),
                         metadata: stream_ctx.take_metadata(),
                     };
-                    crate::runtime_metrics::global().record_stream_transaction(&summary);
+                    crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
                     if summary.error_class == Some(crate::retry::ErrorClass::ConnectionReset)
                         && let Some(direction) = summary.disconnect_direction
                     {
-                        crate::runtime_metrics::global().record_tcp_rst(&summary.proxy_id, direction);
+                        crate::runtime_metrics::global_ref()
+                            .record_tcp_rst(&summary.proxy_id, direction);
                     }
 
                     // Run on_stream_disconnect plugins (logging, metrics, etc.)

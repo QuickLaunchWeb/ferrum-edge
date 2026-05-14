@@ -399,17 +399,17 @@ impl HboneConnectionPool {
         .await
         {
             Ok(Ok(sender)) => {
-                crate::runtime_metrics::global()
+                crate::runtime_metrics::global_ref()
                     .record_pool_handshake(crate::runtime_metrics::PoolKind::Hbone);
                 sender
             }
             Ok(Err(err)) => {
-                crate::runtime_metrics::global()
+                crate::runtime_metrics::global_ref()
                     .record_pool_failure(crate::runtime_metrics::PoolKind::Hbone);
                 return Err(err);
             }
             Err(_) => {
-                crate::runtime_metrics::global()
+                crate::runtime_metrics::global_ref()
                     .record_pool_failure(crate::runtime_metrics::PoolKind::Hbone);
                 return Err(HbonePoolError::ConnectStream {
                     authority,
@@ -924,7 +924,7 @@ fn prune_pool_entries(entries: &mut Vec<HbonePoolEntry>) -> usize {
 }
 
 fn record_hbone_evictions(count: usize) {
-    let metrics = crate::runtime_metrics::global();
+    let metrics = crate::runtime_metrics::global_ref();
     for _ in 0..count {
         metrics.record_pool_eviction(crate::runtime_metrics::PoolKind::Hbone);
     }

@@ -2223,6 +2223,7 @@ async fn serve_mesh_runtime(
     crate::runtime_metrics::global().configure(
         env_config.status_counts_max_entries,
         env_config.runtime_metrics_pool_tracking_enabled,
+        env_config.runtime_metrics_cache_ttl_ms,
     );
     proxy_state
         .stream_listener_manager
@@ -2262,7 +2263,7 @@ async fn serve_mesh_runtime(
         shutdown_tx.subscribe(),
     );
     let runtime_system_handle = crate::system_metrics::start_sampler(
-        proxy_state.clone(),
+        Some(proxy_state.clone()),
         env_config.runtime_metrics_system_sample_interval_ms,
         shutdown_tx.subscribe(),
     );

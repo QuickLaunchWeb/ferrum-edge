@@ -20,9 +20,13 @@ use crate::system_metrics::SystemSnapshot;
 pub static RUNTIME_METRICS: OnceLock<Arc<RuntimeMetrics>> = OnceLock::new();
 
 pub fn global() -> Arc<RuntimeMetrics> {
+    Arc::clone(RUNTIME_METRICS.get_or_init(|| Arc::new(RuntimeMetrics::new())))
+}
+
+pub fn global_ref() -> &'static RuntimeMetrics {
     RUNTIME_METRICS
         .get_or_init(|| Arc::new(RuntimeMetrics::new()))
-        .clone()
+        .as_ref()
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -150,6 +154,7 @@ pub struct RuntimeMetrics {
 
     max_error_entries: AtomicUsize,
     pool_tracking_enabled: AtomicBool,
+    cache_ttl_ms: AtomicU64,
     client_disconnects: CachePadded<AtomicU64>,
     status_current_1m: DashMap<u16, CachePadded<AtomicU64>>,
     status_current_5m: DashMap<u16, CachePadded<AtomicU64>>,
@@ -190,6 +195,7 @@ impl RuntimeMetrics {
             started_at: Instant::now(),
             max_error_entries: AtomicUsize::new(200),
             pool_tracking_enabled: AtomicBool::new(true),
+            cache_ttl_ms: AtomicU64::new(1000),
             client_disconnects: CachePadded::new(AtomicU64::new(0)),
             status_current_1m: DashMap::new(),
             status_current_5m: DashMap::new(),
@@ -200,11 +206,21 @@ impl RuntimeMetrics {
         }
     }
 
-    pub fn configure(&self, max_error_entries: usize, pool_tracking_enabled: bool) {
+    pub fn configure(
+        &self,
+        max_error_entries: usize,
+        pool_tracking_enabled: bool,
+        cache_ttl_ms: u64,
+    ) {
         self.max_error_entries
             .store(max_error_entries.max(1), Ordering::Relaxed);
         self.pool_tracking_enabled
             .store(pool_tracking_enabled, Ordering::Relaxed);
+        self.cache_ttl_ms.store(cache_ttl_ms, Ordering::Relaxed);
+    }
+
+    pub fn cache_ttl_ms(&self) -> u64 {
+        self.cache_ttl_ms.load(Ordering::Relaxed)
     }
 
     pub fn record_http_status(&self, status: u16) {
@@ -798,6 +814,7 @@ fn is_grpc_summary(summary: &TransactionSummary) -> bool {
         .get("request_protocol")
         .or_else(|| summary.metadata.get("mesh.request_protocol"))
         .is_some_and(|value| value == "grpc" || value == "grpc-web")
+        || summary.metadata.contains_key("grpc_status")
 }
 
 fn direction_label(direction: Direction) -> &'static str {
@@ -872,5 +889,30 @@ mod tests {
         assert_eq!(dns.lookups_total, 2);
         assert_eq!(dns.hit_ratio, 0.5);
         assert_eq!(dns.error_ratio, 0.5);
+    }
+
+    #[test]
+    fn grpc_status_metadata_classifies_error_as_grpc() {
+        let metrics = RuntimeMetrics::new();
+        let mut summary = TransactionSummary {
+            proxy_id: Some("grpc-a".to_string()),
+            response_status_code: 200,
+            error_class: Some(ErrorClass::ReadWriteTimeout),
+            ..TransactionSummary::default()
+        };
+        summary
+            .metadata
+            .insert("grpc_status".to_string(), "14".to_string());
+
+        metrics.record_transaction(&summary);
+        let snapshot = build_errors_snapshot(&metrics);
+
+        assert_eq!(
+            snapshot
+                .by_class
+                .get("read_write_timeout")
+                .map(|counts| (counts.http, counts.grpc)),
+            Some((0, 1))
+        );
     }
 }

@@ -277,7 +277,7 @@ async fn emit_udp_stream_disconnect(
     context: UdpDisconnectContext<'_>,
 ) {
     let summary = build_udp_stream_summary(context);
-    crate::runtime_metrics::global().record_stream_transaction(&summary);
+    crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
     if plugins.is_empty() {
         return;
     }
@@ -1611,7 +1611,7 @@ async fn start_dtls_frontend_listener(
                         disconnect_cause,
                         metadata: &handler_metadata,
                     });
-                    crate::runtime_metrics::global().record_stream_transaction(&summary);
+                    crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
 
                     // Fire on_stream_disconnect plugins
                     if !handler_plugins.is_empty() {

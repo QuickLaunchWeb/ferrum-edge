@@ -201,7 +201,7 @@ impl<M: PoolManager> GenericPool<M> {
     pub fn invalidate(&self, key: &str) {
         if let Some((_, entry)) = self.entries.remove(key) {
             if let Some(kind) = self.manager.runtime_metrics_kind() {
-                crate::runtime_metrics::global().record_pool_eviction(kind);
+                crate::runtime_metrics::global_ref().record_pool_eviction(kind);
             }
             self.manager.destroy(entry.conn);
         }
@@ -359,13 +359,13 @@ impl<M: PoolManager> GenericPool<M> {
         let created = match create(key.clone()).await {
             Ok(created) => {
                 if let Some(kind) = self.manager.runtime_metrics_kind() {
-                    crate::runtime_metrics::global().record_pool_handshake(kind);
+                    crate::runtime_metrics::global_ref().record_pool_handshake(kind);
                 }
                 created
             }
             Err(err) => {
                 if let Some(kind) = self.manager.runtime_metrics_kind() {
-                    crate::runtime_metrics::global().record_pool_failure(kind);
+                    crate::runtime_metrics::global_ref().record_pool_failure(kind);
                 }
                 return Err(err);
             }
@@ -379,7 +379,7 @@ impl<M: PoolManager> GenericPool<M> {
                     entry.last_used_epoch_ms.store(now, Ordering::Relaxed);
                     let existing = entry.conn.clone();
                     if let Some(kind) = self.manager.runtime_metrics_kind() {
-                        crate::runtime_metrics::global().record_pool_eviction(kind);
+                        crate::runtime_metrics::global_ref().record_pool_eviction(kind);
                     }
                     self.manager.destroy(created);
                     Ok(existing)
@@ -387,7 +387,7 @@ impl<M: PoolManager> GenericPool<M> {
                     let old = std::mem::replace(&mut entry.conn, created.clone());
                     entry.last_used_epoch_ms.store(now, Ordering::Relaxed);
                     if let Some(kind) = self.manager.runtime_metrics_kind() {
-                        crate::runtime_metrics::global().record_pool_eviction(kind);
+                        crate::runtime_metrics::global_ref().record_pool_eviction(kind);
                     }
                     self.manager.destroy(old);
                     Ok(created)
@@ -450,7 +450,7 @@ impl<M: PoolManager> GenericPool<M> {
                 for key in keys_to_remove {
                     if let Some((_, entry)) = entries.remove(&key) {
                         if let Some(kind) = manager.runtime_metrics_kind() {
-                            crate::runtime_metrics::global().record_pool_eviction(kind);
+                            crate::runtime_metrics::global_ref().record_pool_eviction(kind);
                         }
                         manager.destroy(entry.conn);
                     }

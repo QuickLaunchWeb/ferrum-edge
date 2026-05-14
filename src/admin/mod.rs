@@ -1402,7 +1402,7 @@ async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Byte
         .proxy_state
         .as_ref()
         .map(|ps| ps.env_config.runtime_metrics_cache_ttl_ms)
-        .unwrap_or(1000);
+        .unwrap_or_else(|| crate::runtime_metrics::global_ref().cache_ttl_ms());
     let cache = runtime_metrics_cache();
     let cached = cache.load();
     if let Some((cached_at, ref bytes)) = **cached

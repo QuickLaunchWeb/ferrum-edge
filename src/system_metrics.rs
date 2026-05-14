@@ -125,7 +125,7 @@ fn cpu_count() -> u32 {
 }
 
 pub fn start_sampler(
-    proxy_state: crate::proxy::ProxyState,
+    proxy_state: Option<crate::proxy::ProxyState>,
     sample_interval_ms: u64,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -135,7 +135,7 @@ pub fn start_sampler(
         let interval = Duration::from_millis(sample_interval_ms.max(100));
 
         loop {
-            let snapshot = sampler.sample(Some(&proxy_state));
+            let snapshot = sampler.sample(proxy_state.as_ref());
             metrics.system.store(std::sync::Arc::new(snapshot));
 
             tokio::select! {
@@ -212,15 +212,17 @@ impl SystemSampler {
 }
 
 fn fd_snapshot(proxy_state: Option<&crate::proxy::ProxyState>) -> FdSnapshot {
-    let Some(ps) = proxy_state else {
-        return FdSnapshot {
-            current: 0,
-            max: 0,
-            ratio: 0.0,
-        };
+    let (current, max) = if let Some(ps) = proxy_state {
+        (
+            ps.overload.fd_current.load(Ordering::Relaxed),
+            ps.overload.fd_max.load(Ordering::Relaxed),
+        )
+    } else {
+        (
+            crate::overload::count_open_fds(),
+            crate::overload::get_fd_limit(),
+        )
     };
-    let current = ps.overload.fd_current.load(Ordering::Relaxed);
-    let max = ps.overload.fd_max.load(Ordering::Relaxed);
     FdSnapshot {
         current,
         max,
@@ -581,5 +583,16 @@ mod tests {
             super::parse_ephemeral_port_range("32768\t60999"),
             (Some(32768), Some(60999), Some(28232))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sampler_without_proxy_state_reports_process_metrics() {
+        let mut sampler = super::SystemSampler::new();
+        let snapshot = sampler.sample(None);
+
+        assert!(snapshot.memory.rss_bytes > 0);
+        assert!(snapshot.file_descriptors.current > 0);
+        assert!(snapshot.file_descriptors.max > 0);
     }
 }
