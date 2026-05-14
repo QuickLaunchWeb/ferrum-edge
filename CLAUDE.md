@@ -33,19 +33,30 @@ cargo fmt --all && cargo fmt --all -- --check
 
 **Prerequisite**: `protoc`. `build.rs` runs `tonic_build` on `proto/ferrum.proto`.
 
-### Before Every Commit — MANDATORY
+### Local testing — targeted, not exhaustive
 
-**Steps 1-3 are non-negotiable. CI rejects unformatted code immediately — #1 cause of CI failures.**
+CI runs the full matrix on every PR (format, clippy, all test crates, perf regression, 5 build targets). Locally, test only what you changed and let CI catch the rest — don't run the whole suite after every iteration.
 
-0. `rustup update stable` — CI uses `dtolnay/rust-toolchain@stable`; new clippy lints will fail CI if you're behind
-1. `cargo fmt --all` then `cargo fmt --all -- --check` (fmt can miss files that --check catches)
-2. `cargo clippy --all-targets -- -D warnings`
-3. `cargo test --test unit_tests && cargo test --lib && cargo test --test integration_tests`
-4. If proxy behavior changed: `cargo build --bin ferrum-edge && cargo test --test functional_tests -- --ignored`
+**Always before pushing:**
+1. `cargo fmt --all -- --check` — fmt is the #1 CI failure
+2. `cargo clippy --all-targets -- -D warnings` — same lints CI runs
+
+**Targeted by change scope:**
+- Private fn in `src/` → `cargo test --lib <module>::tests`
+- Public API → `cargo test --test unit_tests <filter>`
+- Cross-module behavior → `cargo test --test integration_tests <filter>`
+- Proxy hot-path change → `cargo build --bin ferrum-edge && cargo test --test functional_tests <filter> -- --ignored`
+
+**Run the full suite locally only when:**
+- Touching shared infrastructure (config types, plugin trait, pool, router, hot path)
+- Refactoring across modules
+- Pre-release / pre-merge if CI is congested
+
+Otherwise: push and let CI's parallel matrix do the wide pass. CI is the gate, not the local machine.
 
 ### CI (GitHub Actions)
 
-PRs: format check → tests (parallel) → lint → perf regression → build 5 targets (Linux x86_64/ARM64, macOS x86_64/ARM64, Windows x86_64). All must pass to merge. Push to main: build → overwrite `latest` release → multi-arch Docker to Docker Hub + GHCR. Tag `v*`: versioned release + Docker tags (`v0.9.0`/`0.9.0`/`0.9`). Required secrets: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`. GHCR uses `GITHUB_TOKEN`. Repo **Settings > Actions > Workflow permissions** must be Read+Write.
+PRs: format → tests (parallel) → lint → perf regression → build 5 targets (Linux x86_64/ARM64, macOS x86_64/ARM64, Windows x86_64). All must pass to merge. Push to main: overwrite `latest` release + multi-arch Docker (Docker Hub + GHCR). Tag `v*`: versioned release + Docker tags. Required secrets: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`. Repo Settings > Actions > Workflow permissions must be Read+Write.
 
 ## Architecture
 
@@ -118,35 +129,31 @@ At startup, before config load. Env var suffixes resolve the base name: `_VAULT`
 
 ### Mesh Mode Architecture (`src/modes/mesh/`)
 
-Full docs: [docs/mesh.md](docs/mesh.md). Key engineering invariants below.
+Full docs: [docs/mesh.md](docs/mesh.md). Engineering invariants only below.
 
-**Topologies** (`MeshTopology`): `Sidecar` (inbound 15006 mTLS + outbound 15001 plaintext capture), `Ambient` (HBONE 15008 + outbound 15001), `EastWestGateway` (SNI-routed passthrough on 15443), `EgressGateway` (mTLS inbound 15090 → external ServiceEntry backends). Topology drives which listeners spawn; all share the same proxy/plugin chain.
+**Topologies** (`MeshTopology`): `Sidecar` (inbound 15006 mTLS + outbound 15001 capture), `Ambient` (HBONE 15008 + outbound 15001), `EastWestGateway` (SNI-routed passthrough on 15443), `EgressGateway` (mTLS inbound 15090 → external ServiceEntry backends). Topology drives which listeners spawn; all share the same proxy/plugin chain.
 
-**Runtime state** (`MeshRuntimeState` in `runtime.rs`): `ArcSwap<Option<MeshSlice>>` — lock-free hot-swap, same pattern as `GatewayConfig`. `wait_for_first_slice()` blocks startup until the first valid slice arrives. `subscribe()` returns a `watch::Receiver` for config-update notifications.
+**Runtime state**: `ArcSwap<Option<MeshSlice>>` in `runtime.rs` — lock-free hot-swap, same pattern as `GatewayConfig`. `wait_for_first_slice()` blocks startup until the first valid slice arrives.
 
-**Config consumption** (`config_consumer/`): `FERRUM_MESH_CONFIG_PROTOCOL=native` uses `MeshConfigSync.MeshSubscribe` gRPC (server pushes full `MeshSlice` JSON). `xds` uses a standard ADS client consuming CDS/EDS/LDS/RDS/SDS with 25ms debounce. Both protocols: jittered exponential backoff (1s→30s, ±25%), multi-CP failover via `FERRUM_DP_CP_GRPC_URLS`, JWT auth in metadata.
+**Config consumption** (`config_consumer/`): `FERRUM_MESH_CONFIG_PROTOCOL=native` uses `MeshConfigSync.MeshSubscribe` gRPC; `xds` uses a standard ADS client (CDS/EDS/LDS/RDS/SDS, 25ms debounce). Both: jittered exponential backoff (1s→30s, ±25%), multi-CP failover via `FERRUM_DP_CP_GRPC_URLS`, JWT auth in metadata.
 
-**MeshSlice** (`slice.rs`): per-node filtered view of mesh config. `from_gateway_config()` filters workloads/policies/peer_auth/service_entries/request_auth/telemetry/proxy_configs by namespace + PolicyScope + export_to visibility. `MeshSlice::resolved_proxy_config()` picks the most-specific applicable `MeshProxyConfig` by PolicyScope tier (`WorkloadSelector` > `Namespace` > `MeshWide`; ASCII-smallest `name` tiebreaks within a tier). `content_eq()` suppresses no-op updates (ignores transport version stamp). The CP computes slices per subscriber; the `start_mesh_slice_apply_task` background task applies valid slices atomically and skips invalid ones.
+**PolicyScope precedence** (all scope-aware resources): `WorkloadSelector` > `Namespace` > `MeshWide`; ASCII-smallest `name` tiebreaks within a tier. Applies to `MeshPolicy`, `PeerAuthentication`, `MeshRequestAuthentication`, `MeshTelemetryResource`, `MeshProxyConfig`. The same `policy_scope_applies_to_workload` helper feeds `MeshSlice::from_gateway_config` AND the `mesh_authz` plugin — do NOT fork.
 
-**Mesh data model** (`config.rs`): `Workload` (SPIFFE identity unit), `MeshService` (logical service grouping workloads), `MeshPolicy` (authorization with PolicyScope + rules), `PeerAuthentication` (per-port mTLS mode), `ServiceEntry` (external service hosts/endpoints/resolution/location/export_to), `MeshRequestAuthentication` (JWT validation rules with scope — permissive: declares valid JWTs, not required ones), `MeshTelemetryResource` (per-scope tracing/metrics/access-logging config), `MeshDestinationRule` (host-targeted `MeshTrafficPolicy` + `port_level_settings: HashMap<u16, MeshTrafficPolicy>` for per-destination-port overrides from Istio `trafficPolicy.portLevelSettings[]` + named subsets — only `connectionPool.tcp.connectTimeout` is enforced today: it lands on `Upstream.port_overrides[port].connect_timeout_ms` at apply time, then projects to `Proxy.dispatch_port_overrides` in `GatewayConfig::resolve_dispatch_port_overrides()` so every dispatch family (HTTP/H2/H3 via `resolve_effective_proxy_for_target`, gRPC, TCP, HBONE) consults it with a single field read; per-port `loadBalancer`/`outlierDetection` are parsed but not enforced (one balancer + one passive-health-check per upstream today) and surface warnings on BOTH the K8s translator path and at slice-apply time so native MeshSubscribe/xDS pushes are caught too; phantom ports (DR entries whose port isn't on any target) are skipped with a warning to keep `port_overrides` clean; admin-API POST/PUT setting `Upstream.port_overrides` is rejected — SQL/MongoDB schemas don't persist it, so the canonical surface is a DestinationRule), `MeshTrafficPolicyTls` (optional `DestinationRule.trafficPolicy.tls` block: when `Some(...)`, projects `mode`/`caCertificates`/`clientCertificate`/`privateKey`/`insecureSkipVerify` onto the matching `Upstream.backend_tls_*` fields at cold-path apply time and overrides the `PeerAuthentication`-derived default; `None` preserves today's PeerAuthentication-driven mTLS posture), `TrustBundleSet` (local + federated X.509/JWT authorities), `MultiClusterConfig` (remote clusters + east-west gateways), `MeshProxyConfig` (Istio `ProxyConfig` — PolicyScope-scoped (root-namespace → MeshWide), `tracing_sampling` merges into `workload_metrics.sampling_percentage`, invalid `spec.concurrency` rejected as InvalidResource). Validation: `validate_mesh_config()` returns flat `Vec<String>` errors.
+**Mesh plugin injection** (`mod.rs::inject_mesh_global_plugins()`): auto-injects reserved-ID global plugins at slice-apply time: `__mesh_spiffe_identity` (940), `__mesh_authz` (2075), `__mesh_workload_metrics`, `__mesh_request_auth` (only when JWT rules present), `__mesh_access_log`. Operator-managed globals of the same type override mesh-injected ones.
 
-**HBONE protocol** (`hbone.rs`): HTTP/2 CONNECT over mTLS on port 15008. `is_hbone_connect()` detects via method + optional `x-ferrum-mesh-protocol`/`x-istio-protocol` headers. `HboneIdentity::from_headers()` extracts `source.principal`/`destination.principal` from W3C Baggage with percent-decoding. Fallback key aliases: `source.principal`, `source_principal`, `source.identity`, `source_identity`, `src.identity`, `src_identity`. Trust-domain gating: baggage `source.principal` honored only when its trust domain matches peer cert's or appears in `FERRUM_MESH_TRUST_DOMAIN_ALIASES`; mismatches fall back to peer cert identity with audit metadata.
+**HBONE trust-domain gating** (`hbone.rs`): HTTP/2 CONNECT over mTLS on port 15008. Baggage `source.principal` honored only when its trust domain matches the peer cert's or appears in `FERRUM_MESH_TRUST_DOMAIN_ALIASES`; mismatches fall back to peer cert identity with audit metadata. Fallback key aliases enumerated in `HboneIdentity::from_headers()`.
 
-**DNS proxy** (`dns_proxy.rs`): `MeshDnsProxy` with `DnsResolutionTable` rebuilt atomically from `MeshSlice` on every update (via `ArcSwap`). Resolves ServiceEntry hosts → endpoint IPs and MeshService names → workload addresses (both FQDN `{name}.{ns}.svc.{cluster_domain}` and short `{name}.{ns}`). Wildcard hosts (`*.example.com`) via bucketed suffix matching. Non-mesh queries forwarded to upstream. UDP + TCP, A/AAAA, EDNS(0), concurrent query semaphore. Enabled via `FERRUM_MESH_DNS_PROXY_ENABLED`.
+**PeerAuthentication inbound mTLS**: resolved once at startup from the initial slice. Live policy changes do NOT re-build the inbound `ServerConfig` — **restart required**, consistent with the static-TLS-material rotation model. `Disable` is rejected for Ambient and EgressGateway. See [docs/mesh.md](docs/mesh.md#peerauthentication).
 
-**Mesh plugin injection** (`mod.rs::inject_mesh_global_plugins()`): auto-injects reserved-ID global plugins at slice-apply time: `__mesh_spiffe_identity` (spiffe_identity, priority 940), `__mesh_authz` (mesh_authz, 2075), `__mesh_workload_metrics` (workload_metrics), `__mesh_request_auth` (jwks_auth, only when MeshRequestAuthentication has JWT rules), `__mesh_access_log` (access_log with Telemetry API filter). Operator-managed globals of the same type override mesh-injected ones.
+**Authorization evaluation** (`policy.rs`): DENY rules first (first match wins). Any ALLOW rule + no match → implicit deny (Istio semantics). `RequestMatch` supports Istio-style conjunctive negative-match fields (`not_methods`/`not_paths`/`not_hosts`/`not_ports`) — a rule with `methods=[GET]` AND `not_paths=[/admin]` forms a single AND-block; do NOT split into separate DENY policies.
 
-**Mesh materialization**: `materialize_east_west_gateway_proxies()` creates SNI-routed passthrough TCP proxies from `MultiClusterConfig.east_west_gateways` (east-west topology only). `materialize_egress_gateway_proxies()` creates HTTP-family proxies from `ServiceEntry` resources with `location: mesh_external` (egress topology only; internal entries and non-HTTP protocols are skipped).
+**Istio empty-rule semantics**: K8s translation must preserve `AuthorizationPolicy` action semantics. `ALLOW` with no `rules` is allow-nothing (emit a never-matching rule); `DENY`/`AUDIT` with no `rules` are no-ops. Do not collapse all empty-rule policies to the same representation.
 
-**PeerAuthentication inbound mTLS** (`resolve_inbound_mtls_mode`, `validate_inbound_mtls_mode_for_topology`): the inbound TLS-terminating listener's mTLS mode is resolved once at startup from the initial mesh slice with Istio-style precedence (`WorkloadSelector` > `Namespace` > `MeshWide`) plus port-level overrides. Port for override lookup follows `listener_plan()`: Sidecar → `inbound_listen_addr` (15006), Ambient → `hbone_listen_addr` (15008), EgressGateway → `egress_listen_addr` (15090). `Disable` is rejected for Ambient (HBONE is mTLS-only) and EgressGateway (must verify sidecar client certs); accepted for Sidecar and structurally no-op for EastWestGateway (SNI passthrough). Live policy changes pushed via CP/xDS do NOT re-build the inbound `ServerConfig` — restart required, consistent with the static-TLS-material rotation model. See [docs/mesh.md](docs/mesh.md#peerauthentication).
+**DestinationRule port-level settings**: only `connectionPool.tcp.connectTimeout` is enforced today. Per-port `loadBalancer`/`outlierDetection` are parsed but warning-only (one balancer + one passive-health-check per upstream). Phantom ports (DR entries whose port isn't on any target) are skipped with a warning. Admin-API POST/PUT setting `Upstream.port_overrides` is rejected — canonical surface is a DestinationRule.
 
-**Telemetry API merge** (`merge_applicable_telemetry()`): merges `MeshTelemetryResource` entries by scope specificity (`WorkloadSelector` > `Namespace` > `MeshWide`). Each section (tracing, metrics, access_logging) is merged independently — most-specific-scope wins per section.
+**Mesh materialization**: `materialize_east_west_gateway_proxies()` creates SNI-passthrough TCP proxies (east-west topology only). `materialize_egress_gateway_proxies()` creates HTTP-family proxies from ServiceEntries with `location: mesh_external` (egress topology only).
 
-**Authorization evaluation** (`policy.rs`): `evaluate_mesh_authorization()` → `MeshAuthzDecision::{Allow, Deny, Audit}`. DENY rules checked first (first match wins). If any ALLOW rule exists but none matched → implicit deny (Istio semantics). Principal matching (SPIFFE glob, namespace glob, trust domain), request matching (methods, paths, hosts, ports with glob patterns, headers case-insensitive), condition matching (attribute values OR, not_values NOT). Header rules are normalized at config-load time so hot path avoids allocation. `RequestMatch` also supports Istio-style conjunctive negative-match fields `not_methods`/`not_paths`/`not_hosts`/`not_ports`: a rule with `methods=[GET]` AND `not_paths=[/admin]` rejects the request when EITHER the method is not GET OR the path matches `/admin` (positive AND negative predicates form a single AND-block — do NOT split into separate DENY policies).
-
-**MeshGrpcServer** (`src/grpc/mesh_server.rs`): implements `MeshConfigSync.MeshSubscribe` on the CP. JWT auth per subscribe, namespace validation, version compatibility check. Broadcasts config updates via tokio `broadcast` (capacity `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`); lagging subscribers auto-get full snapshots. `MeshNodeRegistry` (`mesh_registry.rs`) tracks connected nodes in DashMap, auto-removed on stream drop via `TrackedMeshStream`.
-
-**Injector mode** (`src/modes/injector.rs`): Kubernetes admission webhook (`POST /mutate`). `InjectorConfig::from_env_config()` parses env vars. JSON patches: sidecar container (ferrum-edge run, mesh env vars, runAsUser=PROXY_UID), optional init container for iptables capture (NET_ADMIN). SPIFFE ID derived: `spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}`. JWT secret via `SecretKeyRef` (valueFrom.secretKeyRef, never plaintext). Annotations: `ferrum.io/inject=true` or `ferrum.io/mesh=enabled` opt in; `sidecar.istio.io/inject=false` or `ferrum.io/inject=false` opt out.
+**Injector mode** (`src/modes/injector.rs`): K8s admission webhook (`POST /mutate`). Sidecar `runAsUser=PROXY_UID`, optional iptables init container (NET_ADMIN). SPIFFE ID: `spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}`. JWT secret via `SecretKeyRef` (never plaintext). Opt-in: `ferrum.io/inject=true` or `ferrum.io/mesh=enabled`. Opt-out: `sidecar.istio.io/inject=false` or `ferrum.io/inject=false`.
 
 ### Domain Model (`src/config/types.rs`)
 
@@ -262,33 +269,25 @@ Four rate plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_
 
 ### API Spec Management (admin-only metadata)
 
-Operators submit OpenAPI 2.0 / 3.0.x / 3.1.x / 3.2.x docs (JSON or YAML, autodetected) augmented with `x-ferrum-proxy` (required), `x-ferrum-upstream` (optional), `x-ferrum-plugins` (optional) extensions at the doc root. The handler extracts native Ferrum resources, runs the SAME validation pipeline as direct admin POSTs, persists transactionally, and stores the original doc gzip-compressed for retrieval. Endpoints: `POST/PUT/GET/DELETE /api-specs[/{id}]`, `GET /api-specs/by-proxy/{proxy_id}`, `GET /api-specs`. See [docs/api_specs.md](docs/api_specs.md).
+Full docs: [docs/api_specs.md](docs/api_specs.md). Operators submit OpenAPI 2.0/3.0.x/3.1.x/3.2.x docs (JSON/YAML) with `x-ferrum-proxy` (required), `x-ferrum-upstream`, `x-ferrum-plugins` extensions. Handler extracts native Ferrum resources, validates, persists transactionally, stores original gzip-compressed. Endpoints: `POST/PUT/GET/DELETE /api-specs[/{id}]`, `GET /api-specs/by-proxy/{proxy_id}`, `GET /api-specs`. Mode behavior: db/cp = read+write; dp/file = both endpoints reject.
 
 **Hot-path invariant — `api_specs` is admin-only metadata, NEVER loaded by gateway runtime.** Required guards:
-- Not a `GatewayConfig` field — adding `Vec<ApiSpec>` would put 25 MiB+ blobs through `ArcSwap` and the polling loop
-- Not in `src/config/db_loader.rs` `load_*` / poll path — only the per-bundle admin trait methods touch the table
-- Not in `src/grpc/cp_server.rs` `broadcast_update` — DPs never see specs (CP-only storage)
+- Not a `GatewayConfig` field — would put 25 MiB+ blobs through `ArcSwap` and polling loop
+- Not in `src/config/db_loader.rs` `load_*` / poll path
+- Not in `src/grpc/cp_server.rs` `broadcast_update` — DPs never see specs
 - Not added to any periodic refresh, snapshot, or runtime cache
 
-Specs are admin-API on-demand only. Adding them to any runtime path is a regression. Integration test in `tests/integration/admin_db_api_specs_tests.rs` covers the trait contract; preserve hot-path isolation when modifying.
+Specs are admin-API on-demand only. Adding them to any runtime path is a regression. Integration test: `tests/integration/admin_db_api_specs_tests.rs`.
 
-**Validation reuse — do NOT fork the admit path.** Spec-extracted resources go through identical validators to direct admin POSTs: `Proxy::normalize_fields() + validate_fields()`, `validate_host_entry()`, `plugins::validate_plugin_config()`, `db.check_listen_path_unique() / check_proxy_name_unique() / check_upstream_name_unique()`. See `extract_and_validate()` in `src/admin/api_specs/handlers.rs`. Forking creates silent admit-rules drift between routes.
+**Validation reuse — do NOT fork the admit path.** Spec-extracted resources go through identical validators to direct admin POSTs (`Proxy::normalize_fields()`, `validate_fields()`, `plugins::validate_plugin_config()`, uniqueness checks). See `extract_and_validate()` in `src/admin/api_specs/handlers.rs`.
 
-**Ownership model**: nullable `api_spec_id: Option<String>` column on `proxies`, `upstreams`, `plugin_configs` (added inline to v1 schema in `src/config/migrations/sql_dialect.rs`). PUT `/api-specs/{id}` deletes spec-owned resources (`WHERE api_spec_id = {id}`) and re-inserts; hand-added resources (api_spec_id NULL) survive. DELETE `/api-specs/{id}` deletes the spec-owned proxy → existing FK cascade wipes attached plugins + the api_spec row; spec-owned upstream is cleaned manually (no FK on the back-link by design — would require complex cross-table create ordering on MySQL).
+**Ownership model**: nullable `api_spec_id` column on `proxies`/`upstreams`/`plugin_configs`. PUT `/api-specs/{id}` deletes spec-owned resources (`WHERE api_spec_id = {id}`) and re-inserts; hand-added resources (api_spec_id NULL) survive. DELETE cascades via FK on proxy; spec-owned upstream cleaned manually (no FK on back-link by design).
 
-**Forbidden in specs** (rejected at extract time, `src/admin/api_specs/extractor.rs`): `x-ferrum-consumers` (use `POST /consumers` instead), plugin `scope != proxy` (only proxy-scoped allowed), plugin `proxy_id != spec proxy.id`, embedded credential keys (`credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`, `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`) anywhere in plugin config (recursive walk on the `config` value, NOT the plugin name — a `jwt` plugin with normal config is fine).
+**Forbidden in specs** (rejected in `src/admin/api_specs/extractor.rs`): `x-ferrum-consumers` (use `POST /consumers`), plugin `scope != proxy`, plugin `proxy_id != spec proxy.id`, embedded credential keys (recursive walk on `config` value, NOT the plugin name — a `jwt` plugin with normal config is fine).
 
-**Storage**: gzip-compressed bytes (BYTEA / LONGBLOB / BLOB on SQL, BinData on Mongo) + sha256 hex `content_hash` (ETag for `If-None-Match` 304s) + `uncompressed_size`. Body cap on submit: `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25). MongoDB BSON 16 MB cap is enforced pre-flight at write time — operators with >~14 MiB compressed specs should use a SQL backend.
+**Idempotent PUT**: `replace_api_spec_bundle` compares `resource_hash` (sha256 of resource fields, excluding `api_spec_id`/`created_at`/`updated_at`). On match, only the `api_specs` row updates; `updated_at` on `proxies`/`upstreams`/`plugin_configs` does NOT advance — polling cycle does not trigger router/plugin cache rebuild, pool warmup, capability refresh, or DP broadcast. When changing the hash function, update `replace_api_spec_bundle` in `db_loader.rs` and `mongo_store.rs` together.
 
-**Atomicity**: SQL backends use `sqlx::Transaction` for submit/replace. MongoDB uses `with_transaction` when `FERRUM_MONGO_REPLICA_SET` is configured; otherwise best-effort with compensating deletes (partial-failure window on infrastructure faults). Production MongoDB deployments should use a replica set.
-
-**Mode behavior**: db/cp = read+write; dp/file = both endpoints reject (no DB). Same gating as other write endpoints via `AdminState::check_write_allowed()`.
-
-**Idempotent PUT (no-churn for doc-only edits)**: `replace_api_spec_bundle` compares `old.resource_hash` (sha256 of the bundle's resource fields, excluding `api_spec_id` / `created_at` / `updated_at`) to the new bundle's hash. On match, only the `api_specs` row updates; `proxies` / `upstreams` / `plugin_configs` are untouched and their `updated_at` does NOT advance — so the polling cycle does not trigger router-cache rebuild, plugin-cache rebuild, pool warmup, capability-registry refresh, or DP gRPC broadcast. Hash helper: `hash_resource_bundle()` in [src/admin/api_specs/extractor.rs](src/admin/api_specs/extractor.rs). When changing the hash function, update the `resource_hash` column comparison in `replace_api_spec_bundle` impls in `db_loader.rs` and `mongo_store.rs` together — otherwise existing rows look like they always need a re-write.
-
-**Listable metadata** (Tier 1 — extracted at submit time, queryable as columns): `description` (truncated 4 KiB at UTF-8 boundary), `contact_name`, `contact_email`, `license_name`, `license_identifier` (`info.license.identifier` in 3.1+, falls back to `info.license.url`), `tags` (top-level `tags[].name`, deduped + sorted), `server_urls` (`servers[].url` in 3.x; `{scheme}://{host}{basePath}` in 2.0), `operation_count` (HTTP methods summed across all `paths.*`). All extracted from the same `serde_yaml::Value` walk used for Ferrum extensions — zero extra parse cost. The `ApiSpecSummary` returned by `GET /api-specs` and `GET /api-specs/by-proxy/{proxy_id}` includes these fields but EXCLUDES `resource_hash` (internal use only).
-
-**List filters** on `GET /api-specs` (Tier 2): `?proxy_id` (exact), `?spec_version` (prefix match — `3.1` matches `3.1.0`/`3.1.1`), `?title_contains` (case-insensitive substring), `?updated_since` (ISO-8601 — `updated_at >= ?`), `?has_tag` (exact tag membership), `?sort_by` (whitelist: `updated_at` (default) / `title` / `operation_count` / `created_at`), `?order` (`asc` / `desc` — default `desc`). Unknown `sort_by` / `order` values return 400. Default sort is `updated_at desc` (most recent first — matches UI expectation). The `has_tag` SQL backend uses LIKE pattern matching against the JSON-stored tag array; tag names containing `"` or `%` could cause false matches (documented limitation in [src/config/db_loader.rs](src/config/db_loader.rs); MongoDB uses native array membership and is unaffected).
+**Storage caps**: body submit cap is `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25). MongoDB additionally bounded by BSON 16 MB doc limit — operators with >~14 MiB compressed specs should use a SQL backend. MongoDB multi-doc atomicity requires `FERRUM_MONGO_REPLICA_SET`.
 
 ## Test Structure
 
@@ -339,7 +338,7 @@ Use struct harness with `try_new()` retry wrapper (killing gateway on `wait_for_
 
 **Cert expiration** (`check_cert_expiry()` in `src/tls/mod.rs`): all surfaces check `notBefore`/`notAfter`. Expired = hard failure. Warning within `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` (default 30).
 
-**CRL** (`FERRUM_TLS_CRL_FILE_PATH`): PEM (multiple blocks OK), loaded once, `Arc`-shared. Policy: `allow_unknown_revocation_status` + `only_check_end_entity_revocation`. Applied to frontend mTLS (H1/H2 via `load_tls_config_with_client_auth`, H3 via `build_client_cert_verifier`, DTLS via `build_frontend_dtls_config`), all 6 rustls backend paths, and the rustls-based logging sinks (`tcp_logging` TLS, `ws_logging` wss, `udp_logging` DTLS — plumbed via `PluginHttpClient::tls_crls()`). NOT applied to DP→CP gRPC (tonic-managed) or reqwest-based plugin paths (reqwest does not expose CRL configuration). Restart to reload. No hot reload for any TLS surface.
+**CRL** (`FERRUM_TLS_CRL_FILE_PATH`): PEM, loaded once, `Arc`-shared. Applied to frontend mTLS (H1/H2/H3/DTLS), all 6 rustls backend paths, and rustls-based logging sinks (`tcp_logging` TLS, `ws_logging` wss, `udp_logging` DTLS). NOT applied to DP→CP gRPC (tonic-managed) or reqwest-based plugin paths (reqwest exposes no CRL config). Restart to reload — no hot reload for any TLS surface.
 
 **Pool-per-cert-path**: reqwest paths (HTTP/1.1, H2 via reqwest, H3 frontend→backend) → distinct `reqwest::Client`. rustls paths (gRPC pool, H2 direct) → per-connection.
 
@@ -394,7 +393,7 @@ Shared shell in `src/pool/mod.rs`; per-pool key formats below. Key must include 
 
 Rules: never add policy fields (timeouts, pool sizes, keepalives); empty/default strings are free; keep `|` delimiter.
 
-**Pool DashMap shard sizing**: every pool's `entries` and `pending_creations` map (plus `rr_counters` on the H2/gRPC pools, `cache`/`refreshing` on the DNS cache, `per_ip_request_counts` on `ProxyState`, `prefix_cache`/`regex_cache` on `RouterCache`) is constructed via `DashMap::with_shard_amount(N)` instead of `DashMap::new()`. The shard count is resolved through `crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount)` — `0` (default) auto-derives `next_power_of_two(max(64, num_cpus * 16))`, any positive `FERRUM_POOL_SHARD_AMOUNT` override is rounded up to the next power of two (DashMap's API requires power-of-two shard counts). The default DashMap shard count of `4 * num_cpus` starves on writes at high cardinality (1K+ unique pool keys, distinct client IPs) — bumping to ≥ `num_cpus * 16` gives concurrent inserts/removals enough independent locks to actually parallelise. Memory cost: each shard is ~96 B + an empty inner map; 1024 shards × 6 maps ≈ 600 KB worst case. Negligible. New `DashMap::new()` callers on the request hot path should mirror this pattern; low-cardinality maps (`health_check`, `circuit_breaker`, plugin-internal) are intentionally left at the default to avoid wasting shards on bounded data.
+**Pool DashMap shard sizing**: every pool's hot-path `DashMap` (entries, pending_creations, rr_counters, DNS cache, `per_ip_request_counts`, router prefix/regex cache) is built via `DashMap::with_shard_amount()` resolved through `crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount)` — default auto-derives `next_power_of_two(max(64, num_cpus * 16))`. DashMap's default of `4 * num_cpus` starves writes at high cardinality. New hot-path `DashMap::new()` callers must mirror this; low-cardinality maps (`health_check`, `circuit_breaker`, plugin-internal) stay at the default.
 
 **Policy cross-proxy sharing**: Because pool keys exclude policy fields, proxies resolving to the same entry share the underlying `reqwest::Client`. Both `backend_connect_timeout_ms` and `backend_read_timeout_ms` are applied per-request on the dispatch side (`RequestBuilder::connect_timeout()` and `RequestBuilder::timeout()`), so two proxies with different timeouts on the same pool entry get independent per-request timeouts — no cross-proxy leakage, no need for a `dns_override` work-around. The `connect_timeout` per-request override comes from a vendored copy of reqwest 0.13.3 with PR seanmonstar/reqwest#3017 applied; see `vendor/reqwest-0.13.3-ferrum-patched/` and `docs/upstream-reqwest-patches/001-per-request-connect-timeout/` for the lifecycle and retirement plan.
 
@@ -402,82 +401,47 @@ One nuance: hyper coalesces concurrent cold-pool connects, so simultaneous reque
 
 ### Backend Capability Registry (`src/proxy/backend_capabilities.rs`)
 
-Out-of-band protocol classifier that decides whether a plain HTTPS request uses native H3, the direct H2 pool, or reqwest — keyed by deduplicated backend target identity (scheme + host + port + `dns_override` + CA + mTLS cert + mTLS key + verify). The key format matches `Http3ConnectionPool::pool_key` so the classification and QUIC reuse stay aligned.
+Out-of-band protocol classifier that decides whether a plain HTTPS request uses native H3, the direct H2 pool, or reqwest. Keyed by deduplicated backend target identity matching `Http3ConnectionPool::pool_key`.
 
-**Lifecycle**:
-- `warmup_connection_pools()` (file/db with `FERRUM_POOL_WARMUP_ENABLED=true`) awaits a full probe pass before traffic.
-- `start_backend_capability_refresh_task(run_initial_refresh, shutdown)`: spawns the periodic probe every `FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS` (default 86400 = 24h). Callers pass `true` when warmup was skipped (warmup-off or DP with non-empty initial config) so the registry populates before the first periodic tick — otherwise HTTPS dispatch falls back to reqwest until the 24h mark. DP passes `false` because its startup config is empty; first CP config push triggers `spawn_backend_capability_refresh` via `apply_incremental`/`update_config`.
-- Config reload (`apply_incremental` / `update_config`) calls `spawn_backend_capability_refresh` — the `RefreshCoalescer` guarantees at most one in-flight task plus one queued re-run via a `try_finish` handoff that re-checks `pending` after releasing the runner role, so late config changes are never orphaned.
+**Lifecycle**: populated by `warmup_connection_pools()` when `FERRUM_POOL_WARMUP_ENABLED=true`; otherwise `start_backend_capability_refresh_task(run_initial_refresh=true, ...)` runs the first probe pass. Periodic refresh every `FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS` (default 24h). Config reload calls `spawn_backend_capability_refresh`; `RefreshCoalescer` guarantees at most one in-flight task + one queued re-run. Probe parallelism: cross-target `for_each_concurrent(pool_warmup_concurrency)`; intra-target HTTPS uses `tokio::join!` for parallel H2 + H3 probes. Probe timeouts clamp to 5s.
 
-**Probe parallelism**:
-- Cross-target: `for_each_concurrent(pool_warmup_concurrency)` (default 500), matching the DNS warmup pattern.
-- Intra-target (HTTPS only): `tokio::join!` runs the H2 probe (`probe_h2_tls` borrows `&mut record`) and the H3 probe (`probe_h3` returns `H3ProbeOutcome` to avoid aliasing the mutable record borrow) in parallel, halving worst-case per-target wall-clock.
-- Probe timeouts clamp to `BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP` (5 s) so slow QUIC discovery never holds startup readiness.
+**Hot-path lookup**: `BackendCapabilityRegistry::get(proxy, target)` uses a thread-local key buffer (zero per-request allocation). `Unknown` / `Unsupported` both route via reqwest, so an empty registry degrades gracefully.
 
-**Hot-path lookup**:
-- `BackendCapabilityRegistry::get(proxy, target)` builds the key in a thread-local `RefCell<String>` buffer — zero per-request allocation on repeat calls (mirrors `HTTP2_POOL_KEY_BUF`).
-- `supports_native_http3_backend(state, proxy, target)` and `supports_direct_http2_backend` are two boolean checks on the returned record. `Unknown` / `Unsupported` both route via reqwest, so an empty registry degrades gracefully.
+**Stale-cache invalidation**: `mark_h3_unsupported` / `mark_h2_tls_unsupported` Arc-swap the cached record to downgrade. H3 downgrade gated by `is_h3_transport_error_class` (includes ConnectionRefused/Timeout/Reset/Closed/TlsError/ProtocolError/DnsLookupError/PortExhaustion/ConnectionPoolError/ReadWriteTimeout; excludes ClientDisconnect/payload-size/`GracefulRemoteClose`). H2/TLS downgrade fires on `Http2PoolError::BackendSelectedHttp1`. Next periodic refresh re-probes and restores on recovery.
 
-**Stale-cache invalidation**: `mark_h3_unsupported(proxy, target)` and `mark_h2_tls_unsupported(proxy, target)` Arc-swap the cached record to downgrade the relevant bucket with an operator-visible `last_probe_error`.
+**H3 graceful-close suppression**: `H3_NO_ERROR` ApplicationClose / GOAWAY at `recv_response` is detected by `is_h3_graceful_close` and surfaced as `ErrorClass::GracefulRemoteClose` (excluded from transport-error class). RFC 9114 §8.1 spec-legal teardown — treating it as a capability failure would disable H3 forever on backends that close after every response. Upstream h3-crate fix vendored at `vendor/h3-0.0.8-ferrum-patched`; lifecycle in [docs/upstream-h3-patches/](docs/upstream-h3-patches/).
 
-- H3 downgrade gated by `is_h3_transport_error_class` (ConnectionRefused/Timeout/Reset/Closed/TlsError/ProtocolError/DnsLookupError/PortExhaustion/ConnectionPoolError/ReadWriteTimeout — NOT ClientDisconnect, payload-size errors, or `GracefulRemoteClose`) via `is_h3_transport_failure`, which inspects `error_class` ONLY. `classify_h3_error` flags GOAWAY / stream reset / non-connect read timeouts with `connection_error=false`; they are still transport failures and must downgrade. Hit sites: `proxy_to_backend`, `proxy_to_backend_http3_retry` (H1/H2 frontend → H3 backend), plus `http3/server.rs` streaming-body / streaming-response / buffered paths (H3 frontend → H3 backend).
-- **`classify_h3_error` is a typed wrapper** over `http3::client::classify_http3_error` — both H3 error-classification entry points walk `std::error::Error::source()` for typed `quinn::ConnectionError` / `quinn::ConnectError` / `io::Error` first, falling back to anchored substring matches on `h3::Error` Display strings. There is no separate `&str`-only classifier in `proxy/mod.rs`. The proxy wrapper's only job beyond the typed walker is mapping `ErrorClass` → `(error_kind: &'static str, is_connection_error: bool)`, where `is_connection_error` reflects the retry-on-connect contract (true for genuine connection-establishment failures; false for protocol-level / read-timeout errors that won't be cured by reconnecting). Buffered H3 response reads (`drain_h3_response_body`) return `Result<Vec<u8>, h3::error::StreamError>` — the typed `StreamError` is preserved end-to-end so the classifier can see typed variants directly without round-tripping through Display.
-- **Graceful remote close suppression**: `H3_NO_ERROR` `ApplicationClose` and GOAWAY/`RemoteClosing` at the `recv_response` boundary are detected by `is_h3_graceful_close` (in `src/http3/client.rs`, shared with `drain_h3_response_body`) and surfaced via the dedicated `H3PoolError::graceful_close` constructor. `classify_h3_error` (server.rs) and `classify_h3_pool_error` (proxy/mod.rs) honor `is_graceful_close()` and return `ErrorClass::GracefulRemoteClose` instead of the underlying `ConnectionClosed`/`ProtocolError` class. Because that variant is excluded from `is_h3_transport_error_class`, all `mark_h3_unsupported` sites (server.rs streaming-body / streaming-response / buffered, plus proxy/mod.rs `current_dispatch_h3 && is_h3_transport_failure(&result)` and the inner H3 dispatch branch) automatically suppress the downgrade. The in-flight request still 502s — no headers are available to forward — but the next request stays on H3. RFC 9114 §8.1 defines `H3_NO_ERROR` as the peer's spec-legal teardown signal; treating it as a capability failure would mean a backend that closes after every response (e.g. a fast responder racing FIN with `CONNECTION_CLOSE` on Linux + io_uring's UDP coalescing) gets H3 disabled forever. The recv_data path is recovered into a successful response by `drain_h3_response_body` when the body is complete; only the `recv_response` (no headers parsed) and incomplete-body cases need the graceful-close constructor.
-- **Upstream h3 fix tracked separately**: The 502 at `recv_response` is the symptom of an h3-crate bug — `FrameStream::try_recv` discards already-buffered bytes when `poll_read` reports a connection error, instead of letting the decoder drain them first. A drafted upstream patch (issue + PR + unified diff against h3 0.0.8) lives in [docs/upstream-h3-patches/001-recv-frame-drain-on-quic-close/](docs/upstream-h3-patches/001-recv-frame-drain-on-quic-close/). The lifecycle README in that directory has the hand-off steps for filing upstream and the retirement plan for when it merges. **Applied via vendored crate at `vendor/h3-0.0.8-ferrum-patched`; retire when upstream merges per the lifecycle README.** The gateway-side suppression above is correct on its own merits regardless of whether the upstream fix is applied; vendoring just additionally eliminates the 502 itself.
-- H2/TLS downgrade fires on `Http2PoolError::BackendSelectedHttp1` in the direct-H2 dispatch branch — the old per-pool-key ALPN learning cache was removed when the capability registry took over, so without this downgrade every subsequent request would repeat the failed H2 handshake + ALPN fallback until the 24 h refresh. The gRPC `h2_tls` bucket is downgraded in lockstep because the same ALPN observation applies. `plain_http.h1` is set to `Supported` to record that the backend still speaks HTTPS — just over HTTP/1.1.
+**Per-target dispatch contract** (`proxy_to_backend_inner`): capture `current_dispatch_h3 = supports_native_http3_backend(...)` once per attempt:
+- **Same target across attempts** → keep the snapshot. Cross-protocol replay against the same backend risks duplicating non-idempotent requests (the failed transport may have flushed headers/body before the error surfaced).
+- **LB rotation to a different target** → recompute for the new target. Mixed-capability upstreams are real (target A speaks H3, B speaks H1); without recompute, the retry forces H3 against an H1-only backend → 502 forever.
 
-The next periodic refresh re-probes and restores `Supported` if the backend recovers.
+This matches industry practice (Envoy/NGINX/Cloudflare/GFE): cross-protocol fallback at connection establishment or per-target classification, never mid-attempt against the same backend.
 
-**Per-target dispatch contract**: The retry loop in `proxy_to_backend_inner` captures `current_dispatch_h3 = supports_native_http3_backend(...)` for the target being attempted and threads it into the dispatch call (as `dispatch_h3` to `proxy_to_backend`, or as the H3-vs-reqwest branch selector for retries) — re-reading the registry inside `proxy_to_backend` would race the async DNS resolve against a concurrent `mark_h3_unsupported` / refresh and split a single attempt's dispatch decision in half. Two scopes:
-
-- **Same target across attempts** → keep the snapshot. Cross-protocol replay against the same backend would bypass `proxy.retry.retry_on_methods` (the failed transport attempt may have flushed headers/body before the error surfaced) and risk duplicating non-idempotent requests on the same backend instance. Same-protocol H3 retries do replay the retained body (the outer retry loop's job, gated by `retry_on_methods`); the prohibition is on protocol switching, not on replay itself.
-- **Load-balancer rotation to a different target** → recompute `current_dispatch_h3` for the new target. Different target → different backend → no same-target partial-write replay risk, so the new target's actual capability classification (mixed-capability upstreams are real: target A speaks H3, target B speaks H1) wins. Without recompute, an H3-supported initial target locks `dispatch_h3 = true` for every retry and forces `proxy_to_backend_http3_retry` against an H1-only B → 502 forever. Per-target lookup is O(1) (`DashMap` + thread-local key buffer); `Unknown` and `Unsupported` both gracefully fall to reqwest.
-
-Capability downgrade still fires on every transport-class H3 failure but only affects the next attempt's dispatch decision (or the next request, if no rotation happens). This matches industry practice (Envoy, NGINX, HAProxy, Cloudflare, GFE): cross-protocol fallback happens at connection establishment (happy-eyeballs) or via the next-attempt's per-target classification, never silently mid-attempt against the same backend.
-
-**Probe outcomes for expected-unsupported cases** (h2c on plaintext HTTP, H3 on most HTTPS backends): classified as `Unsupported` with a `debug!` log — not appended to `last_probe_error`. Only genuine connection/TLS-config failures on HTTPS backends populate the error string so operators don't chase phantom errors every refresh cycle.
-
-**Admin introspection** (JWT-authenticated, always exposed): `GET /backend-capabilities` returns the full registry snapshot (`BackendCapabilityRegistry::snapshot()`); `POST /backend-capabilities/refresh` forces a synchronous classification pass. Operators use these for routing-decision debugging, protocol-rollout monitoring, and post-incident recovery (force-refresh after a live downgrade). Payloads carry only classifications + probe timestamps — no credentials or request bodies — so they're safe to leave permanently enabled. See [docs/admin_api.md](docs/admin_api.md#backend-capability-registry) + `openapi.yaml` for the full schema; Phase-3 scripted-backend tests assert on these endpoints.
+**Admin introspection** (JWT-auth): `GET /backend-capabilities` snapshot, `POST /backend-capabilities/refresh` forces classification pass. Payloads carry only classifications + probe timestamps — safe to leave permanently enabled. See [docs/admin_api.md](docs/admin_api.md#backend-capability-registry).
 
 ### Connection-Error Classification Boundary
 
-`BackendResponse::connection_error: bool` has exactly one meaning: **"the request body never reached the backend's application layer."** When `true`, the gateway-level retry loop fires `retry_on_connect_failure` regardless of HTTP method, because replaying a request that never went on the wire is idempotent by construction. When `false`, retries must respect `retry_on_methods` / `retryable_status_codes`.
+`BackendResponse::connection_error: bool` means exactly: **"the request body never reached the backend's application layer."** When `true`, the retry loop fires `retry_on_connect_failure` regardless of HTTP method (idempotent by construction). When `false`, retries must respect `retry_on_methods` / `retryable_status_codes`.
 
-Every protocol classifier (reqwest, direct H2 pool, gRPC pool, native H3 pool, H3 cross-protocol bridge, recv-side body classifier) funnels its `ErrorClass` through one helper:
+Every protocol classifier funnels `ErrorClass` through `retry::request_reached_wire(error_class) -> bool`, which returns `false` only for pre-wire classes: `ConnectionRefused`, `ConnectionTimeout`, `DnsLookupError`, `TlsError`, `PortExhaustion`, `ConnectionPoolError`. Per-classifier `connection_error: bool` fields are intentionally absent — earlier code derived the boolean at every dispatch site with inconsistent implementations.
 
-```rust
-retry::request_reached_wire(error_class) -> bool
-// connection_error = !request_reached_wire(error_class)
-```
-
-`request_reached_wire` returns `false` only for pre-wire transport classes: `ConnectionRefused`, `ConnectionTimeout`, `DnsLookupError`, `TlsError`, `PortExhaustion`, `ConnectionPoolError`. Everything else (`ConnectionReset`, `ConnectionClosed`, `ProtocolError`, `ReadWriteTimeout`, `RequestBodyTooLarge`, `ResponseBodyTooLarge`, `ClientDisconnect`, `RequestError`) is post-wire.
-
-**Per-classifier `connection_error: bool` fields are intentionally absent.** Earlier code derived the boolean separately at every dispatch site (`e.is_connect() || e.is_timeout()` for reqwest; an `is_conn_error` tuple element for H3) and the implementations disagreed. Concretely the H3 string-heuristic classifier matched `"reset"` BEFORE specific h3 / QUIC tokens, so a stream-level `RESET_STREAM` (an application-layer abort) classified as `ConnectionReset` with `connection_error=true` and an `ApplicationClose` (genuinely transport-class) classified as `ProtocolError` with `connection_error=false`. The H3 classifier in `proxy/mod.rs::classify_h3_error` is now a thin wrapper over `http3::client::classify_http3_error` so both paths agree byte-for-byte; the bare `"stream"` substring (which used to false-match `"upstream"` in load-balancer messages) is gone.
-
-**`retry::error_class_log_kind(class)`** centralizes the short label every dispatcher emits as the `error_kind` field on `tracing::error!` log lines. Operators grep one stable token per failure mode across all protocol logs.
-
-**H3 pool body-on-wire signal — authoritative when present.** [`Http3ConnectionPool`](src/http3/client.rs) returns a typed [`H3PoolError`](src/http3/client.rs) instead of `anyhow::Error`. `H3PoolError::request_on_wire()` is `true` once `send_request().await` has succeeded on ANY internal attempt (cached → fallback → fresh-connect chain). The pool's retry chain calls `e.promote_on_wire_if(any_request_on_wire)` on every fresh-connect setup `?` exit so the sticky flag survives a subsequent connect-class failure.
-
-Gateway H3 sites use the pool signal **exclusively** to drive `connection_error`:
+**H3 pool body-on-wire signal — authoritative when present.** [`Http3ConnectionPool`](src/http3/client.rs) returns a typed `H3PoolError`. `H3PoolError::request_on_wire()` is `true` once `send_request().await` has succeeded on any internal attempt. Gateway H3 sites use the pool signal **exclusively** for `connection_error`:
 
 ```rust
 let is_conn_error = !e.request_on_wire();
 let (error_kind, error_class) = classify_h3_error(e.as_ref()); // labels + downgrade gating only
 ```
 
-Critically: do NOT AND with `!retry::request_reached_wire(error_class)` for H3. The class is a string heuristic that can disagree with the pool's typed signal — e.g. a connect-phase QUIC reset is genuinely pre-wire but the fallback string match emits `ConnectionReset` (which `request_reached_wire` treats as post-wire). ANDing would silently skip `retry_on_connect_failure` on those flaky-network paths. The pool's `request_on_wire` is ground truth; the class is a label.
+Do NOT AND with `!request_reached_wire(error_class)` for H3 — the class is a string heuristic that can disagree with the typed signal (a connect-phase QUIC reset would be classified `ConnectionReset` = post-wire). The pool's `request_on_wire` is ground truth.
 
-The fresh-connect setup path (`tls_config_fn()`, `create_or_get_proxy_sender()`) MUST also propagate the sticky flag — every `?` exit goes through `|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire)` so a post-wire cached attempt followed by a fresh-connect TLS failure doesn't surface as `request_on_wire=false`. `promote_on_wire_if` is asymmetric by design: `condition=true` flips false → true; `condition=false` is a no-op (it must NOT demote a flag set by an earlier `H3PoolError::post_wire(...)` constructor). Two inline tests in `h3_pool_error_tests` regression-protect this closure shape.
+The fresh-connect setup path MUST propagate the sticky flag — every `?` exit goes through `|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire)`. `promote_on_wire_if` is asymmetric: `true` flips false → true; `false` must NOT demote.
 
-**Connect-phase RST classification rule.** A SYN that gets RST'd is functionally equivalent to ECONNREFUSED — the request never reached the wire. Per-protocol classifiers must NOT emit `ConnectionReset` from connect-phase paths because `request_reached_wire(ConnectionReset) == true` (post-wire, mid-stream reset). Concrete enforcement points:
+**Connect-phase RST rule.** A SYN that gets RST'd is equivalent to ECONNREFUSED — classifiers must NOT emit `ConnectionReset` from connect-phase paths (`request_reached_wire(ConnectionReset) == true`). Enforcement:
+- `classify_reqwest_error` (`src/retry.rs`): `is_connect()` branch collapses `"refused"` and `"reset"` into `ConnectionRefused`.
+- `classify_http2_pool_error::classify_io_error`: H2 pool is connect-only, so `ConnectionReset` → `ConnectionRefused`.
+- H3 pool: `request_on_wire` signal makes class irrelevant for `connection_error`.
 
-- **`classify_reqwest_error`** (`src/retry.rs`): the `is_connect()` branch collapses both `"refused"` and `"reset"` substrings into `ErrorClass::ConnectionRefused`. Outside `is_connect()`, `"reset"` correctly stays `ConnectionReset` (mid-stream).
-- **`classify_http2_pool_error::classify_io_error`** (`src/proxy/http2_pool.rs`): the H2 pool is a pure connection-establishment layer, so `phase_is_connect=true` is hardcoded — `io::ErrorKind::ConnectionReset` maps to `ConnectionRefused` and `io::ErrorKind::TimedOut` maps to `ConnectionTimeout`.
-- **H3 pool**: the `request_on_wire` signal makes the class irrelevant for `connection_error`; the class is used only for log labels + capability-downgrade gating.
-
-**Out of scope (P9 follow-up).** The H3 pool still does internal `body.clone()` retries across cached/fallback indices; an attempt that committed the body and then died mid-stream causes a non-idempotent replay on the next internal index, regardless of `retry_on_methods`. The body-on-wire signal makes the OUTER gateway retry safe; tightening the INNER pool replay to honor `retry_on_methods` is a separate correctness fix.
-
-**`mark_h3_unsupported` is unrelated.** Capability downgrade uses `is_h3_transport_error_class(error_class)` — broader than `request_reached_wire` (it includes `ConnectionReset` / `ConnectionClosed` / `ProtocolError` / `ReadWriteTimeout` because a backend that resets H3 streams or times out reads is still failing the H3 transport, even if the request reached the wire). The two predicates intentionally diverge.
+**`mark_h3_unsupported` predicate intentionally diverges.** Capability downgrade uses `is_h3_transport_error_class` (broader than `request_reached_wire` — includes mid-stream resets/closes/protocol errors because they still fail the H3 transport).
 
 ### Health Check Architecture (two-layer)
 
@@ -566,7 +530,7 @@ PostgreSQL/MySQL/SQLite (sqlx), MongoDB. SQLite uses `PRAGMA journal_mode=WAL`/`
 
 ### PR Checklist
 
-`cargo fmt` clean; `cargo clippy --all-targets -- -D warnings`; unit + integration tests pass; new features have normal/edge/error tests; no `.unwrap()`/`.expect()` in prod; no dead code (`-D dead-code`); PR description with summary + changes + test plan; docs updated (FEATURES.md, README.md, docs/, openapi.yaml); new `FERRUM_*` env vars in `ferrum.conf` with commented defaults.
+Local before pushing: `cargo fmt --all -- --check` + `cargo clippy --all-targets -- -D warnings` + tests targeted to your change (see "Local testing" above). CI runs the full matrix on PR. New features: normal/edge/error tests. No `.unwrap()`/`.expect()` in prod. PR description with summary + changes + test plan. Docs updated when behavior changes (FEATURES.md, README.md, docs/, openapi.yaml); new `FERRUM_*` vars in `ferrum.conf` with commented defaults.
 
 ### Commit Style / Branch Naming
 
@@ -574,50 +538,27 @@ Imperative mood, concise (e.g., `Fix rate limiter to handle zero-window edge cas
 
 ## Key Environment Variables
 
-Full docs reference: `docs/configuration.md`. Runtime parsing/defaults: `src/config/env_config.rs`. Editable template: `ferrum.conf`. Most-common essentials below.
+**Canonical reference**: [docs/configuration.md](docs/configuration.md). **Runtime parsing**: `src/config/env_config.rs`. **Editable template**: `ferrum.conf`. Only the load-bearing ones are listed here — for the full list (90+ vars), use the docs.
 
-- `FERRUM_MODE` (required): `database`/`file`/`cp`/`dp`/`mesh`/`injector`/`migrate`
-- `FERRUM_NAMESPACE` (`ferrum`): which namespace this instance loads
-- `FERRUM_LOG_LEVEL` (`error`)
-- `FERRUM_LOG_REDACT_METADATA_KEYS` (empty) — comma-separated extra substrings (case-insensitive) to redact from `TransactionSummary.metadata` / `StreamTransactionSummary.metadata` in addition to the built-in `authorization`/`cookie`/`set-cookie`/`x-api-key`/`x-auth-token`/`x-csrf-token`/`bearer`/`password`/`secret`/`token` defaults. Applies to every logging plugin (stdout/http/tcp/kafka/loki/udp/ws/statsd) via the central serde adapter.
-- `FERRUM_PROXY_HTTP_PORT`/`HTTPS_PORT` (8000/8443); `FERRUM_ADMIN_HTTP_PORT`/`HTTPS_PORT` (9000/9443) — `0` disables plaintext
-- `FERRUM_ADMIN_JWT_SECRET` (required db/cp, ≥32 chars)
-- `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (25; body cap for `POST/PUT /api-specs`. Mongo backends are additionally bounded by the BSON 16 MB doc limit, enforced at write time)
-- `FERRUM_FRONTEND_TLS_CERT_PATH`/`KEY_PATH`
-- `FERRUM_TLS_CA_BUNDLE_PATH` (global backend CA, exclusive); `FERRUM_TLS_NO_VERIFY` (**testing only**); `FERRUM_TLS_CRL_FILE_PATH`
-- `FERRUM_FILE_CONFIG_PATH` (required file mode)
-- `FERRUM_DB_TYPE`/`DB_URL` (required db); `FERRUM_DB_FAILOVER_URLS`, `FERRUM_DB_READ_REPLICA_URL`; `FERRUM_DB_TLS_MODE` + DB TLS cert paths; `FERRUM_DB_POOL_MAX_CONNECTIONS` (32, bump for large CP)
-- `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS` (`false`; opt-in auto-apply of pending custom-plugin SQL migrations at startup in `database`/`cp`. Default off — gateway warns but does not auto-mutate schema; operators run `FERRUM_MODE=migrate` explicitly. Enable for embedded SQLite deployments)
-- `FERRUM_CP_GRPC_LISTEN_ADDR` (`0.0.0.0:50051`; port `0` disables)
-- `FERRUM_CP_DP_GRPC_JWT_SECRET` (required cp/dp, ≥32 chars)
-- `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` (128; per-channel — DP `ConfigSync.Subscribe` and mesh `MeshConfigSync.MeshSubscribe` are independent broadcast channels; lagging subscribers on either auto-snapshot)
-- `FERRUM_XDS_ENABLED` (`false`); `FERRUM_XDS_STREAM_CHANNEL_CAPACITY` (32; per-ADS-stream response queue)
-- `FERRUM_DP_CP_GRPC_URLS` (required dp); `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` (300)
-- `FERRUM_MESH_CONFIG_PROTOCOL` (`native`; `xds` for standard ADS); `FERRUM_MESH_TOPOLOGY` (`sidecar`; `ambient`/`east_west_gateway`/`egress_gateway`); `FERRUM_MESH_NODE_ID` (`$HOSTNAME` or `ferrum-mesh-node`)
-- `FERRUM_MESH_INBOUND_LISTEN_ADDR` (`0.0.0.0:15006`); `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` (`127.0.0.1:15001`); `FERRUM_MESH_HBONE_LISTEN_ADDR` (`0.0.0.0:15008`); `FERRUM_MESH_EGRESS_LISTEN_ADDR` (`0.0.0.0:15090`); `FERRUM_MESH_EAST_WEST_LISTEN_PORT` (`15443`)
-- `FERRUM_MESH_WORKLOAD_SPIFFE_ID` (optional SPIFFE hint); `FERRUM_MESH_WORKLOAD_LABELS` (`k1=v1,k2=v2` for PolicyScope matching); `FERRUM_MESH_TRUST_DOMAIN_ALIASES` (comma-separated extra trust domains for HBONE baggage)
-- `FERRUM_MESH_DNS_PROXY_ENABLED` (`false`); `FERRUM_MESH_DNS_LISTEN_ADDR` (`127.0.0.1:15053`); `FERRUM_MESH_DNS_UPSTREAM_ADDR` (`127.0.0.53:53`); `FERRUM_MESH_DNS_TTL_SECONDS` (`60`); `FERRUM_MESH_CLUSTER_DOMAIN` (`cluster.local`)
-- `FERRUM_MESH_CAPTURE_MODE` (`explicit`; `iptables` for injector init-container capture, `ebpf` for node-agent eBPF capture requiring kernel 5.7+ — injector does not inject privileged init container for eBPF to avoid Pod Security admission rejection); `FERRUM_MESH_PROXY_UID` (1337 in injected sidecars); `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS` (comma-separated key prefixes stripped at egress dispatch)
-- `FERRUM_INJECTOR_LISTEN_ADDR` (`0.0.0.0:9443`); `FERRUM_INJECTOR_SIDECAR_IMAGE` (`ferrum-edge:latest`); `FERRUM_INJECTOR_REQUIRE_ANNOTATION` (`true`); `FERRUM_INJECTOR_TRUST_DOMAIN` (`cluster.local`); `FERRUM_INJECTOR_TLS_CERT_PATH`/`KEY_PATH` for Kubernetes webhook HTTPS
-- `FERRUM_MAX_CONNECTIONS` (100000)/`MAX_REQUESTS` (0 = unlimited)
-- `FERRUM_SHUTDOWN_DRAIN_SECONDS` (30; `0` immediate)
-- `FERRUM_WORKER_THREADS` (CPU cores); `FERRUM_BLOCKING_THREADS` (512; **bump to ≥1024 with io_uring splice at scale**)
-- `FERRUM_ACCEPT_THREADS` (0 = CPU cores; SO_REUSEPORT, Unix-only)
-- `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`/`HALF_CLOSE_MAX_WAIT_SECONDS` (300/300; TCP fast path also requires per-proxy backend read/write timeouts `0`)
-- `FERRUM_UDP_MAX_SESSIONS` (10000); `FERRUM_UDP_RECVMMSG_BATCH_SIZE` (64)
-- `FERRUM_WEBSOCKET_MAX_CONNECTIONS` (20000; 0 = disabled)
-- `FERRUM_WEBSOCKET_TUNNEL_MODE` (`false`) — raw TCP copy; **frame-loss risk for server-push** (stock tickers, Socket.IO) where backend writes in same TCP segment as 101
-- `FERRUM_MAX_CREDENTIALS_PER_TYPE` (2); `FERRUM_BASIC_AUTH_HMAC_SECRET` (**change in production**)
-- `FERRUM_TRUSTED_PROXIES` (XFF CIDRs); `FERRUM_BACKEND_ALLOW_IPS` (`both`/`private`/`public`)
-- `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (0 = auto `max(10K, proxies × 3)`)
-- `FERRUM_POOL_WARMUP_ENABLED` (`true`); `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` (8 MiB), `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` (32 MiB) — gRPC tuning
-- `FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS` (86400 = 24h) — background re-classification interval for the backend capability registry (H1/H2/H3 + h2c). Tune down during backend protocol rollouts so H3-upgrade / rollback detection latency shrinks; startup + H3 failure downgrade are the main triggers the rest of the time.
-- `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES` (65536; eager buffer when CL ≤ this; `0` always stream)
-- `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` (32; bounded mpsc for H3→non-H3 cross-protocol request-body bridge; ~512 KiB pipeline depth per upload)
-- `FERRUM_HTTP3_WEBSOCKET_ENABLED` (`true`; advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL` and accept RFC 9220 Extended CONNECT WebSocket requests. When false the H3 listener does not advertise the setting and the bridge returns 501. WebSocket plugins (`on_ws_frame`, `on_ws_disconnect`, `ws_rate_limit`, `ws_message_size_limiting`, `ws_frame_logging`) run on H3 sessions whether or not `FERRUM_WEBSOCKET_TUNNEL_MODE` is set; H3 always frame-parses since there is no raw TCP underneath QUIC.)
-- `FERRUM_KTLS_ENABLED`/`IO_URING_SPLICE_ENABLED`/`UDP_GSO_ENABLED`/`UDP_PKTINFO_ENABLED`/`UDP_GRO_ENABLED`/`TCP_FASTOPEN_ENABLED` (all `auto` on Linux)
-- `FERRUM_DNS_MIN_TTL_SECONDS` (5); `FERRUM_DNS_TTL_OVERRIDE_SECONDS` (0)
-- `FERRUM_ADD_VIA_HEADER`/`VIA_PSEUDONYM` (`true`/`ferrum-edge`)
+**Required by mode:**
+- `FERRUM_MODE` (`database`/`file`/`cp`/`dp`/`mesh`/`injector`/`migrate`)
+- `FERRUM_NAMESPACE` (`ferrum`) — which namespace this instance loads
+- `FERRUM_FILE_CONFIG_PATH` (required `file`)
+- `FERRUM_DB_TYPE` + `FERRUM_DB_URL` (required `database`/`cp`)
+- `FERRUM_ADMIN_JWT_SECRET` (required `db`/`cp`, ≥32 chars)
+- `FERRUM_CP_DP_GRPC_JWT_SECRET` (required `cp`/`dp`, ≥32 chars)
+- `FERRUM_DP_CP_GRPC_URLS` (required `dp`)
+
+**Surfaces that change gateway behavior in non-obvious ways:**
+- `FERRUM_PROXY_HTTP_PORT`/`HTTPS_PORT`, `FERRUM_ADMIN_HTTP_PORT`/`HTTPS_PORT`, port inside `FERRUM_CP_GRPC_LISTEN_ADDR` — port `0` disables plaintext (TLS-only listener)
+- `FERRUM_TLS_CA_BUNDLE_PATH` (global backend CA, **exclusive** — disables webpki when set); `FERRUM_TLS_NO_VERIFY` (testing only); `FERRUM_TLS_CRL_FILE_PATH`
+- `FERRUM_POOL_WARMUP_ENABLED` (`true`) — disabling skews backend-hit assertions and delays capability registry population
+- `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS` (`false`) — opt-in auto-apply at startup; default warns but doesn't auto-mutate schema
+- `FERRUM_WEBSOCKET_TUNNEL_MODE` (`false`) — raw TCP copy; **frame-loss risk for server-push** (stock tickers, Socket.IO)
+- `FERRUM_BLOCKING_THREADS` (512) — **bump to ≥1024 with io_uring splice at scale**
+- `FERRUM_LOG_REDACT_METADATA_KEYS` (empty) — extra substrings to redact from transaction logs beyond built-ins (`authorization`/`cookie`/`set-cookie`/`x-api-key`/`x-auth-token`/`x-csrf-token`/`bearer`/`password`/`secret`/`token`)
+
+**Mesh-specific** (only relevant in `mesh`/`injector` modes): see [docs/mesh.md](docs/mesh.md). Topology/listeners/SPIFFE/DNS proxy vars all live in `ferrum.conf` under `FERRUM_MESH_*`.
 
 ## Proto / gRPC (CP/DP)
 
