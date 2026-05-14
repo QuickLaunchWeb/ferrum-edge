@@ -340,6 +340,9 @@ impl HealthChecker {
                         client_key_path: upstream.backend_tls_client_key_path.clone(),
                         server_ca_cert_path: upstream.backend_tls_server_ca_cert_path.clone(),
                         verify_server_cert: upstream.backend_tls_verify_server_cert,
+                        // Kept in the resolved TLS cache for parity with proxy
+                        // dispatch; reqwest health probes consume SNI/SAN
+                        // enforcement with the GAP-1B/GAP-1C backend TLS work.
                         sni: upstream.backend_tls_sni.clone(),
                         san_allow_list: upstream.backend_tls_san_allow_list.clone(),
                     };

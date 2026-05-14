@@ -3963,8 +3963,11 @@ mod inner {
                 backend_tls_client_key_path: None,
                 backend_tls_verify_server_cert: true,
                 backend_tls_server_ca_cert_path: None,
-                backend_tls_sni: None,
-                backend_tls_san_allow_list: Vec::new(),
+                backend_tls_sni: Some("reviews.mesh.internal".to_string()),
+                backend_tls_san_allow_list: vec![
+                    "reviews.mesh.internal".to_string(),
+                    "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
+                ],
                 api_spec_id: None,
                 created_at: now,
                 updated_at: now,
@@ -3980,6 +3983,17 @@ mod inner {
             assert_eq!(restored.targets[0].host, "target1.example.com");
             assert_eq!(restored.targets[0].port, 8080);
             assert_eq!(restored.targets[0].weight, 100);
+            assert_eq!(
+                restored.backend_tls_sni.as_deref(),
+                Some("reviews.mesh.internal")
+            );
+            assert_eq!(
+                restored.backend_tls_san_allow_list,
+                vec![
+                    "reviews.mesh.internal".to_string(),
+                    "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
+                ]
+            );
         }
 
         #[test]

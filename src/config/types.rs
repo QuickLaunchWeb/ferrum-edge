@@ -43,6 +43,10 @@ pub const MAX_TARGETS_PER_UPSTREAM: usize = 1000;
 pub const MAX_TAGS_PER_TARGET: usize = 50;
 /// Maximum number of subset definitions per upstream.
 pub const MAX_SUBSETS_PER_UPSTREAM: usize = 100;
+/// Maximum number of backend TLS SAN allow-list entries per upstream.
+pub const MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES: usize = 256;
+/// Maximum length for one backend TLS SAN allow-list entry.
+pub const MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH: usize = 2048;
 /// Maximum length for a subset name.
 pub const MAX_SUBSET_NAME_LENGTH: usize = 255;
 /// Maximum length for a tag key or value.
@@ -2969,7 +2973,6 @@ impl Proxy {
         {
             errors.push(e);
         }
-
         // TLS cert/key pairing: both must be set or neither
         match (
             &self.backend_tls_client_cert_path,
@@ -3391,6 +3394,9 @@ impl Upstream {
         for target in &mut self.targets {
             target.host = target.host.to_ascii_lowercase();
         }
+        if let Some(sni) = &mut self.backend_tls_sni {
+            *sni = sni.to_ascii_lowercase();
+        }
     }
 
     /// Resolve the effective backend connect timeout for a request destined to
@@ -3667,6 +3673,23 @@ impl Upstream {
         {
             errors.push(e);
         }
+        if let Some(ref sni) = self.backend_tls_sni
+            && let Err(e) = validate_backend_tls_sni(sni)
+        {
+            errors.push(e);
+        }
+        if self.backend_tls_san_allow_list.len() > MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES {
+            errors.push(format!(
+                "backend_tls_san_allow_list must not have more than {} entries (got {})",
+                MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
+                self.backend_tls_san_allow_list.len()
+            ));
+        }
+        for (i, san) in self.backend_tls_san_allow_list.iter().enumerate() {
+            if let Err(e) = validate_backend_tls_san_allow_list_entry(san) {
+                errors.push(format!("backend_tls_san_allow_list[{}].{}", i, e));
+            }
+        }
 
         // TLS cert/key pairing: both must be set or neither
         match (
@@ -3754,6 +3777,47 @@ impl Upstream {
             Err(errors)
         }
     }
+}
+
+fn validate_backend_tls_sni(sni: &str) -> Result<(), String> {
+    validate_string_field("backend_tls_sni", sni, MAX_HOST_LENGTH)?;
+    if sni.trim().is_empty() {
+        return Err("backend_tls_sni must not be empty".to_string());
+    }
+    if sni.trim() != sni {
+        return Err("backend_tls_sni must not have leading or trailing whitespace".to_string());
+    }
+    if sni.contains('*') {
+        return Err("backend_tls_sni must be an exact hostname, not a wildcard".to_string());
+    }
+    validate_host_entry(&sni.to_ascii_lowercase())
+        .map_err(|e| format!("backend_tls_sni is invalid: {}", e))
+}
+
+fn validate_backend_tls_san_allow_list_entry(san: &str) -> Result<(), String> {
+    validate_string_field("entry", san, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH)?;
+    if san.trim().is_empty() {
+        return Err("entry must not be empty".to_string());
+    }
+    if san.trim() != san {
+        return Err("entry must not have leading or trailing whitespace".to_string());
+    }
+    if san.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    if let Some(rest) = san.strip_prefix("spiffe://") {
+        if rest.is_empty() || rest.contains(char::is_whitespace) {
+            return Err("entry is invalid: SPIFFE URI must include a non-empty path".to_string());
+        }
+        return Ok(());
+    }
+    if san.contains("://") {
+        return Err("entry is invalid: URI SAN allow-list entries must be SPIFFE URIs".to_string());
+    }
+    if san.contains('*') {
+        return Err("entry must be an exact DNS name, SPIFFE URI, or IP address".to_string());
+    }
+    validate_host_entry(&san.to_ascii_lowercase()).map_err(|e| format!("entry is invalid: {}", e))
 }
 
 impl PluginConfig {

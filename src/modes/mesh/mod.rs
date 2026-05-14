@@ -1271,8 +1271,21 @@ fn apply_traffic_policy_tls_to_upstream(
             upstream.backend_tls_server_ca_cert_path = tls.ca_certificates.clone();
         }
         MtlsMode::IstioMutual => {
-            upstream.backend_tls_client_cert_path = runtime.workload_svid_cert_path.clone();
-            upstream.backend_tls_client_key_path = runtime.workload_svid_key_path.clone();
+            match (
+                runtime.workload_svid_cert_path.clone(),
+                runtime.workload_svid_key_path.clone(),
+            ) {
+                (Some(cert_path), Some(key_path)) => {
+                    upstream.backend_tls_client_cert_path = Some(cert_path);
+                    upstream.backend_tls_client_key_path = Some(key_path);
+                }
+                _ => {
+                    warn!(
+                        upstream = %upstream.id,
+                        "DestinationRule ISTIO_MUTUAL requested but workload SVID cert/key paths are not both configured; preserving existing backend client certificate settings"
+                    );
+                }
+            }
         }
         // PeerAuthentication-side modes are rejected at translate time;
         // an in-memory slice that still carries one is a programming
@@ -3803,6 +3816,49 @@ mod tests {
         assert_eq!(
             upstream.backend_tls_client_key_path.as_deref(),
             Some("/var/run/secrets/ferrum/svid.key")
+        );
+    }
+
+    #[test]
+    fn dr_tls_istio_mutual_without_svid_preserves_existing_client_material() {
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        upstream.backend_tls_client_cert_path = Some("/existing/client.pem".to_string());
+        upstream.backend_tls_client_key_path = Some("/existing/client.key".to_string());
+        upstream.backend_tls_verify_server_cert = false;
+        let runtime = MeshRuntimeConfig {
+            workload_svid_cert_path: None,
+            workload_svid_key_path: None,
+            ..test_mesh_runtime_config()
+        };
+
+        let policy = MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::IstioMutual,
+                sni: Some("reviews.mesh.internal".to_string()),
+                subject_alt_names: vec!["reviews.mesh.internal".to_string()],
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        };
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime);
+
+        assert!(upstream.backend_tls_verify_server_cert);
+        assert_eq!(
+            upstream.backend_tls_client_cert_path.as_deref(),
+            Some("/existing/client.pem")
+        );
+        assert_eq!(
+            upstream.backend_tls_client_key_path.as_deref(),
+            Some("/existing/client.key")
+        );
+        assert_eq!(
+            upstream.backend_tls_sni.as_deref(),
+            Some("reviews.mesh.internal")
+        );
+        assert_eq!(
+            upstream.backend_tls_san_allow_list,
+            vec!["reviews.mesh.internal".to_string()]
         );
     }
 

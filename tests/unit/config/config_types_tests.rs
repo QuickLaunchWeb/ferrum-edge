@@ -176,6 +176,19 @@ fn resolve_upstream_tls_projects_sni_and_sans_to_proxy_cache() {
     );
 }
 
+#[test]
+fn upstream_normalize_fields_lowercases_backend_tls_sni() {
+    let mut upstream = make_upstream("tls-upstream");
+    upstream.backend_tls_sni = Some("Reviews.Mesh.Internal".to_string());
+
+    upstream.normalize_fields();
+
+    assert_eq!(
+        upstream.backend_tls_sni.as_deref(),
+        Some("reviews.mesh.internal")
+    );
+}
+
 /// Helper to create an empty gateway config.
 fn empty_config() -> GatewayConfig {
     GatewayConfig {
