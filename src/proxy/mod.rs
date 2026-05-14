@@ -4440,6 +4440,9 @@ async fn handle_websocket_request_authenticated(
                         };
                         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                     }
+                } else {
+                    crate::runtime_metrics::global_ref()
+                        .record_http_error(Some(&proxy.id), ws_error_class);
                 }
 
                 let ws_body = if is_ws_dns_error {
@@ -8087,17 +8090,21 @@ async fn handle_proxy_request_inner(
                 // body wrapper (non-exceeded streaming path).
                 let deferred_grpc_logger: Option<
                     Arc<crate::proxy::deferred_log::DeferredTransactionLogger>,
-                > = if !plugins.is_empty() {
-                    let grpc_resolved_ip = state
-                        .dns_cache
-                        .resolve(
-                            &proxy.backend_host,
-                            proxy.dns_override.as_deref(),
-                            proxy.dns_cache_ttl_seconds,
-                        )
-                        .await
-                        .ok()
-                        .map(|ip| ip.to_string());
+                > = if !plugins.is_empty() || streamed || final_error_class.is_some() {
+                    let grpc_resolved_ip = if !plugins.is_empty() {
+                        state
+                            .dns_cache
+                            .resolve(
+                                &proxy.backend_host,
+                                proxy.dns_override.as_deref(),
+                                proxy.dns_cache_ttl_seconds,
+                            )
+                            .await
+                            .ok()
+                            .map(|ip| ip.to_string())
+                    } else {
+                        None
+                    };
 
                     // Read counters populated earlier in the gRPC body
                     // handling (request bytes) and by the streaming deferred
@@ -8596,6 +8603,11 @@ async fn handle_proxy_request_inner(
                         };
                         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                     }
+                } else {
+                    crate::runtime_metrics::global_ref().record_grpc_error(
+                        ctx.matched_proxy.as_ref().map(|p| p.id.as_str()),
+                        grpc_error_class,
+                    );
                 }
 
                 record_request(&state, 200); // gRPC errors use HTTP 200
@@ -9067,7 +9079,9 @@ async fn handle_proxy_request_inner(
     let gateway_processing_ms = total_ms - effective_backend_ms;
     let gateway_overhead_ms = (total_ms - effective_backend_ms - plugin_execution_ms).max(0.0);
 
-    // Log phase — skip TransactionSummary construction when no plugins need it.
+    // Log/runtime-metrics phase. Keep the no-plugin, non-streaming success
+    // path lightweight, but still construct a summary when runtime metrics need
+    // error/client-disconnect classification without logging plugins.
     //
     // For streaming responses (Streaming / StreamingH2 / StreamingH3), defer
     // the log until the response body reaches a terminal state. At this point
@@ -9083,8 +9097,14 @@ async fn handle_proxy_request_inner(
     // can replace the originally-streaming body with a Buffered one. We branch on
     // the *current* `response_body` rather than the captured `is_streaming_response`
     // (which tracks the original backend behavior for observability).
+    let body_will_stream = matches!(
+        &response_body,
+        ResponseBody::Streaming(_) | ResponseBody::StreamingH2(_) | ResponseBody::StreamingH3(_)
+    );
+    let needs_transaction_summary =
+        !plugins.is_empty() || body_will_stream || backend_error_class.is_some();
     let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
-        if !plugins.is_empty() {
+        if needs_transaction_summary {
             // Request bytes: read the shared counter populated by the body
             // handlers in `proxy_to_backend` / `proxy_to_backend_http2` /
             // `proxy_to_backend_http3`. By this point the request has
@@ -9130,12 +9150,6 @@ async fn handle_proxy_request_inner(
                 ..TransactionSummary::default()
             };
 
-            let body_will_stream = matches!(
-                &response_body,
-                ResponseBody::Streaming(_)
-                    | ResponseBody::StreamingH2(_)
-                    | ResponseBody::StreamingH3(_)
-            );
             if body_will_stream {
                 // Thread `start_time` so `latency_total_ms` / derived gateway
                 // fields are re-derived at body-completion time — closes the

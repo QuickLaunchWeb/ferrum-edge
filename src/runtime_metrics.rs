@@ -15,6 +15,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::plugins::{Direction, StreamTransactionSummary, TransactionSummary};
+use crate::retry::ErrorClass;
 use crate::system_metrics::SystemSnapshot;
 
 pub static RUNTIME_METRICS: OnceLock<Arc<RuntimeMetrics>> = OnceLock::new();
@@ -233,15 +234,10 @@ impl RuntimeMetrics {
         }
 
         if let Some(class) = summary.error_class {
-            let proxy_id = Arc::<str>::from(summary.proxy_id.as_deref().unwrap_or("unknown"));
-            let key = ErrorKey {
-                proxy_id,
-                class: class.as_str(),
-            };
             if is_grpc_summary(summary) {
-                self.increment_error_map(&self.grpc_errors_by_class, key);
+                self.record_grpc_error_inner(summary.proxy_id.as_deref(), class, false);
             } else {
-                self.increment_error_map(&self.http_errors_by_class, key);
+                self.record_http_error_inner(summary.proxy_id.as_deref(), class, false);
             }
         }
 
@@ -252,6 +248,40 @@ impl RuntimeMetrics {
             };
             self.increment_error_map(&self.body_errors_by_class, key);
         }
+    }
+
+    pub fn record_http_error(&self, proxy_id: Option<&str>, class: ErrorClass) {
+        self.record_http_error_inner(proxy_id, class, true);
+    }
+
+    pub fn record_grpc_error(&self, proxy_id: Option<&str>, class: ErrorClass) {
+        self.record_grpc_error_inner(proxy_id, class, true);
+    }
+
+    fn record_http_error_inner(
+        &self,
+        proxy_id: Option<&str>,
+        class: ErrorClass,
+        count_client_disconnect_class: bool,
+    ) {
+        if count_client_disconnect_class && class == ErrorClass::ClientDisconnect {
+            self.client_disconnects.fetch_add(1, Ordering::Relaxed);
+        }
+        let key = error_key(proxy_id, class);
+        self.increment_error_map(&self.http_errors_by_class, key);
+    }
+
+    fn record_grpc_error_inner(
+        &self,
+        proxy_id: Option<&str>,
+        class: ErrorClass,
+        count_client_disconnect_class: bool,
+    ) {
+        if count_client_disconnect_class && class == ErrorClass::ClientDisconnect {
+            self.client_disconnects.fetch_add(1, Ordering::Relaxed);
+        }
+        let key = error_key(proxy_id, class);
+        self.increment_error_map(&self.grpc_errors_by_class, key);
     }
 
     pub fn record_stream_transaction(&self, summary: &StreamTransactionSummary) {
@@ -392,6 +422,13 @@ fn increment_status_map(map: &DashMap<u16, CachePadded<AtomicU64>>, status: u16)
         map.entry(status)
             .or_insert_with(|| CachePadded::new(AtomicU64::new(0)))
             .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn error_key(proxy_id: Option<&str>, class: ErrorClass) -> ErrorKey {
+    ErrorKey {
+        proxy_id: Arc::<str>::from(proxy_id.unwrap_or("unknown")),
+        class: class.as_str(),
     }
 }
 
@@ -913,6 +950,31 @@ mod tests {
                 .get("read_write_timeout")
                 .map(|counts| (counts.http, counts.grpc)),
             Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn direct_http_error_recording_covers_no_plugin_path() {
+        let metrics = RuntimeMetrics::new();
+
+        metrics.record_http_error(Some("proxy-a"), ErrorClass::ClientDisconnect);
+
+        assert_eq!(metrics.client_disconnects.load(Ordering::Relaxed), 1);
+        let snapshot = build_errors_snapshot(&metrics);
+        assert_eq!(
+            snapshot
+                .by_proxy
+                .get("proxy-a")
+                .and_then(|classes| classes.get("client_disconnect"))
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot
+                .by_class
+                .get("client_disconnect")
+                .map(|counts| counts.http),
+            Some(1)
         );
     }
 }
