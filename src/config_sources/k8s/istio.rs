@@ -1204,6 +1204,8 @@ fn virtual_service_routes(
     let mut proxies = Vec::new();
     let mut upstreams = Vec::new();
     let mut plugins = Vec::new();
+    let mut deferred_uri_less_proxies = Vec::new();
+    let mut deferred_uri_less_plugins = Vec::new();
     let mut prior_uri_less_route_rules: Vec<Value> = Vec::new();
 
     for (index, http) in object
@@ -1249,6 +1251,8 @@ fn virtual_service_routes(
 
         let match_count = match_paths.len();
         for (match_index, listen_path) in match_paths.into_iter().enumerate() {
+            let is_uri_less_catch_all = listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH);
+            let mut route_plugins = Vec::new();
             let suffix = if match_count == 1 {
                 index.to_string()
             } else {
@@ -1269,7 +1273,7 @@ fn virtual_service_routes(
                     fault_value,
                 )
             {
-                plugins.push(plugin);
+                route_plugins.push(plugin);
             }
 
             // `mesh_route_dispatch`: per-route header/method/queryParam
@@ -1301,10 +1305,10 @@ fn virtual_service_routes(
                     &prior_uri_less_route_rules,
                 )
             {
-                plugins.push(plugin);
+                route_plugins.push(plugin);
             }
 
-            proxies.push(proxy_for_route(RouteProxySpec {
+            let proxy = proxy_for_route(RouteProxySpec {
                 id: proxy_id,
                 namespace: object.metadata.namespace.clone(),
                 hosts: hosts.clone(),
@@ -1317,7 +1321,21 @@ fn virtual_service_routes(
                 listen_port: None,
                 retry: retry.clone(),
                 backend_read_timeout_ms: timeout_ms,
-            }));
+            });
+
+            // URI-less VirtualService matches are represented by a synthetic
+            // regex catch-all. Keep those proxies after all concrete
+            // URI-derived routes for this VirtualService so an earlier
+            // header-only route can decorate a later regex route without its
+            // own `~.*` proxy winning the regex first-match slot and returning
+            // 404 before the later route has a chance to run.
+            if is_uri_less_catch_all {
+                deferred_uri_less_plugins.extend(route_plugins);
+                deferred_uri_less_proxies.push(proxy);
+            } else {
+                plugins.extend(route_plugins);
+                proxies.push(proxy);
+            }
         }
 
         if acc.options.vs_header_routing_experimental {
@@ -1331,6 +1349,9 @@ fn virtual_service_routes(
             ));
         }
     }
+
+    plugins.extend(deferred_uri_less_plugins);
+    proxies.extend(deferred_uri_less_proxies);
 
     Ok((proxies, upstreams, plugins))
 }
@@ -1368,7 +1389,9 @@ fn match_paths(http: &Value, vs_header_routing_experimental: bool) -> Vec<Option
     // so any URI-bearing siblings stay on their own proxy and do not
     // bleed onto the catch-all. The synthetic path is regex (`~.*`) rather
     // than prefix `/` so Ferrum's prefix-before-regex router does not let
-    // a URI-less sibling shadow real regex URI routes.
+    // a URI-less sibling shadow real prefix URI routes. The translator
+    // defers these catch-all proxies until after all URI-derived proxies so
+    // they also do not shadow later regex URI routes.
     if vs_header_routing_experimental
         && !seen_paths.contains(&Some(URI_LESS_MATCH_LISTEN_PATH.to_string()))
         && matches
@@ -6276,6 +6299,99 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(false),
             "misses must fall through to the selected default proxy backend"
+        );
+    }
+
+    #[test]
+    fn virtual_service_header_only_match_does_not_shadow_later_regex_route() {
+        // Codex P1 (#3238865239): regex routes are first-match in config
+        // order. An earlier URI-less rule materialized as `~.*` must be
+        // deferred after later regex URI routes; otherwise it wins routing
+        // and 404s predicate misses before the later regex route can run.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [
+                        {
+                            "match": [
+                                {"headers": {"x-canary": {"exact": "v2"}}}
+                            ],
+                            "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                        },
+                        {
+                            "match": [
+                                {"uri": {"regex": "/v[0-9]+/api"}}
+                            ],
+                            "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                        }
+                    ]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+
+        let stable_index = result
+            .config
+            .proxies
+            .iter()
+            .position(|p| {
+                p.listen_path.as_deref() == Some("~/v[0-9]+/api")
+                    && p.backend_host == "stable.default.svc.cluster.local"
+            })
+            .expect("later regex URI proxy");
+        let catch_all_index = result
+            .config
+            .proxies
+            .iter()
+            .position(|p| p.listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH))
+            .expect("deferred URI-less catch-all proxy");
+        assert!(
+            stable_index < catch_all_index,
+            "later regex URI proxy must be indexed before the synthetic catch-all"
+        );
+
+        let stable_proxy = &result.config.proxies[stable_index];
+        let matched = crate::router_cache::RouterCache::new(&result.config, 0)
+            .find_proxy(Some("api.example.com"), "/v1/api")
+            .expect("regex URI proxy should match");
+        assert_eq!(
+            matched.proxy.id, stable_proxy.id,
+            "the hot router should select the later regex route, not the `~.*` catch-all"
+        );
+
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(stable_proxy.id.as_str())
+            })
+            .expect("prior URI-less rule decorates later regex proxy");
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules array");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0]["match"]["headers"]["x-canary"].as_str(),
+            Some("v2")
+        );
+        assert_eq!(
+            rules[0]["destination"]["backend_host"].as_str(),
+            Some("canary.default.svc.cluster.local")
+        );
+        assert_eq!(
+            plugin
+                .config
+                .get("reject_unmatched")
+                .and_then(Value::as_bool),
+            Some(false),
+            "predicate misses must fall through to the selected regex route backend"
         );
     }
 
