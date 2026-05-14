@@ -5,18 +5,23 @@
 //! 2. Starts the gateway in file mode with a ws:// proxy config
 //! 3. Connects a WebSocket client through the gateway
 //! 4. Verifies end-to-end echo round-trips for text and binary messages
-//! 5. Tests both plaintext (ws://) and TLS (wss://) connections
+//! 5. Tests plaintext (ws://), TLS (wss://), and HTTP/3 Extended CONNECT
+//!    WebSocket connections
 //!
 //! This test is marked with #[ignore] as it requires the binary to be built
 //! and should be run with: cargo test --test functional_tests functional_websocket -- --ignored --nocapture
 
 use futures_util::{SinkExt, StreamExt};
+use http::StatusCode;
 use std::io::Write;
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::protocol::Message;
+
+use crate::scaffolding::{Http3Client, WebSocketOptions};
 
 // ============================================================================
 // Helpers
@@ -38,6 +43,14 @@ async fn free_port() -> u16 {
 // from inside a pattern guard.
 #[allow(clippy::collapsible_match)]
 async fn start_ws_echo_server(port: u16) {
+    start_ws_echo_server_with_subprotocol(port, None).await;
+}
+
+#[allow(clippy::collapsible_match, clippy::result_large_err)]
+async fn start_ws_echo_server_with_subprotocol(
+    port: u16,
+    selected_subprotocol: Option<&'static str>,
+) {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind WS echo server");
@@ -45,7 +58,24 @@ async fn start_ws_echo_server(port: u16) {
     loop {
         if let Ok((stream, _addr)) = listener.accept().await {
             tokio::spawn(async move {
-                let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+                let callback = move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                                     mut resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    if let Some(selected) = selected_subprotocol {
+                        let offered = req
+                            .headers()
+                            .get("sec-websocket-protocol")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        if offered.split(',').any(|v| v.trim() == selected) {
+                            resp.headers_mut().insert(
+                                "sec-websocket-protocol",
+                                selected.parse().expect("valid subprotocol header"),
+                            );
+                        }
+                    }
+                    Ok(resp)
+                };
+                let ws_stream = match tokio_tungstenite::accept_hdr_async(stream, callback).await {
                     Ok(s) => s,
                     Err(_) => return,
                 };
@@ -80,6 +110,28 @@ async fn start_ws_echo_server(port: u16) {
     }
 }
 
+async fn start_http_text_server(port: u16, body: &'static str) {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .expect("Failed to bind HTTP text server");
+
+    loop {
+        if let Ok((mut stream, _addr)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    }
+}
+
 /// Build the gateway binary (debug profile).
 fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
     let output = std::process::Command::new("cargo")
@@ -109,23 +161,46 @@ fn start_gateway(
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+    start_gateway_with_extra_env(
+        config_path,
+        http_port,
+        https_port,
+        tls_cert_path,
+        tls_key_path,
+        &[],
+    )
+}
+
+fn start_gateway_with_extra_env(
+    config_path: &str,
+    http_port: u16,
+    https_port: Option<u16>,
+    tls_cert_path: Option<&str>,
+    tls_key_path: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let mut cmd = std::process::Command::new(gateway_binary_path());
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
     if let Some(port) = https_port {
-        cmd.env("FERRUM_PROXY_HTTPS_PORT", port.to_string());
+        cmd.env("FERRUM_PROXY_HTTPS_PORT", port.to_string())
+            .env("FERRUM_ENABLE_HTTP3", "true");
     }
     if let Some(cert) = tls_cert_path {
         cmd.env("FERRUM_FRONTEND_TLS_CERT_PATH", cert);
     }
     if let Some(key) = tls_key_path {
         cmd.env("FERRUM_FRONTEND_TLS_KEY_PATH", key);
+    }
+    for (name, value) in extra_env {
+        cmd.env(name, value);
     }
 
     Ok(cmd.spawn()?)
@@ -148,6 +223,83 @@ consumers: []
 plugin_configs: []
 "#,
         backend_port
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
+/// Build a WebSocket proxy backed by an upstream whose first target is
+/// intentionally dead and second target is live. H3 WebSocket retries should
+/// rotate from target 1 to target 2 on the same CONNECT request.
+fn write_ws_retry_upstream_config(
+    config_path: &std::path::Path,
+    dead_port: u16,
+    backend_port: u16,
+) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "h3-ws-retry-proxy"
+    listen_path: "/ws-echo"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {dead_port}
+    strip_listen_path: true
+    upstream_id: "h3-ws-upstream"
+    backend_connect_timeout_ms: 200
+    retry:
+      max_retries: 1
+      retry_on_connect_failure: true
+      backoff: !fixed
+        delay_ms: 10
+
+upstreams:
+  - id: "h3-ws-upstream"
+    name: "H3 WS Upstream"
+    algorithm: round_robin
+    targets:
+      - host: "127.0.0.1"
+        port: {dead_port}
+        weight: 1
+      - host: "127.0.0.1"
+        port: {backend_port}
+        weight: 1
+
+consumers: []
+plugin_configs: []
+"#
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
+fn write_ws_and_http_config(config_path: &std::path::Path, ws_backend_port: u16, http_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "ws-echo-proxy"
+    listen_path: "/ws-echo"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {ws_backend_port}
+    strip_listen_path: true
+
+  - id: "plain-proxy"
+    listen_path: "/plain"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {http_port}
+    strip_listen_path: true
+
+consumers: []
+plugin_configs: []
+"#
     );
 
     let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
@@ -288,17 +440,27 @@ async fn start_gateway_tls_with_retry(
     tls_cert_path: &str,
     tls_key_path: &str,
 ) -> (std::process::Child, u16, u16) {
+    start_gateway_tls_with_retry_extra_env(config_path, tls_cert_path, tls_key_path, &[]).await
+}
+
+async fn start_gateway_tls_with_retry_extra_env(
+    config_path: &str,
+    tls_cert_path: &str,
+    tls_key_path: &str,
+    extra_env: &[(&str, &str)],
+) -> (std::process::Child, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_http_port = free_port().await;
         let gateway_https_port = free_port().await;
-        match start_gateway(
+        match start_gateway_with_extra_env(
             config_path,
             gateway_http_port,
             Some(gateway_https_port),
             Some(tls_cert_path),
             Some(tls_key_path),
+            extra_env,
         ) {
             Ok(mut child) => match wait_for_gateway(gateway_https_port).await {
                 Ok(()) => return (child, gateway_http_port, gateway_https_port),
@@ -509,4 +671,270 @@ async fn test_websocket_multiple_messages() {
     let _ = gateway.wait();
     echo_handle.abort();
     println!("test_websocket_multiple_messages PASSED");
+}
+
+/// Test HTTP/3 WebSocket (RFC 9220 Extended CONNECT) proxying through the
+/// gateway, including unmasked compliant frames, binary frames, and today's
+/// documented permissive handling of masked client frames.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_rfc9220_echo_and_masked_frame() {
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{}/ws-echo", gateway_https_port);
+    let mut ws = client
+        .websocket(&url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket connect");
+    assert_eq!(ws.status, StatusCode::OK);
+    assert!(
+        ws.headers.get("sec-websocket-protocol").is_none(),
+        "backend negotiated no subprotocol, so H3 200 must not invent one"
+    );
+
+    ws.send_text("hello h3").await.expect("send text");
+    assert_eq!(ws.recv_text().await.expect("text echo"), "Echo: hello h3");
+
+    ws.send_binary(&[1, 2, 3, 4, 5]).await.expect("send binary");
+    assert_eq!(
+        ws.recv_text().await.expect("binary echo"),
+        "Echo binary: 5 bytes"
+    );
+
+    ws.send_masked_text("masked but accepted")
+        .await
+        .expect("send masked text");
+    assert_eq!(
+        ws.recv_text().await.expect("masked text echo"),
+        "Echo: masked but accepted"
+    );
+
+    ws.send_close().await.expect("close");
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// The H3 bridge forwards the client's offered subprotocols to the backend
+/// H1 Upgrade handshake and mirrors the backend's selected protocol on the
+/// RFC 9220 200 response.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_subprotocol_forwarding_and_none() {
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server_with_subprotocol(
+        backend_port,
+        Some("chat.v2"),
+    ));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{}/ws-echo", gateway_https_port);
+    let mut with_subprotocol = client
+        .websocket(
+            &url,
+            WebSocketOptions::default().subprotocols(["chat.v1", "chat.v2"]),
+        )
+        .await
+        .expect("H3 WebSocket connect with subprotocols");
+    assert_eq!(with_subprotocol.status, StatusCode::OK);
+    assert_eq!(
+        with_subprotocol
+            .headers
+            .get("sec-websocket-protocol")
+            .and_then(|v| v.to_str().ok()),
+        Some("chat.v2")
+    );
+    with_subprotocol
+        .send_text("subprotocol")
+        .await
+        .expect("send text");
+    assert_eq!(
+        with_subprotocol.recv_text().await.expect("echo"),
+        "Echo: subprotocol"
+    );
+    with_subprotocol.send_close().await.expect("close");
+
+    let mut without_subprotocol = client
+        .websocket(&url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket connect without subprotocol");
+    assert_eq!(without_subprotocol.status, StatusCode::OK);
+    assert!(
+        without_subprotocol
+            .headers
+            .get("sec-websocket-protocol")
+            .is_none(),
+        "backend should not select a subprotocol when the client offered none"
+    );
+    without_subprotocol
+        .send_text("plain")
+        .await
+        .expect("send text");
+    assert_eq!(
+        without_subprotocol.recv_text().await.expect("echo"),
+        "Echo: plain"
+    );
+    without_subprotocol.send_close().await.expect("close");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// H3 WebSocket backend setup failures should follow the same retry-on-connect
+/// policy and target rotation as H1/H2 WebSockets.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_retry_rotates_to_next_upstream_target() {
+    let dead_port = free_port().await;
+    let backend_port = free_port().await;
+
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_retry_upstream_config(&config_path, dead_port, backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{}/ws-echo", gateway_https_port);
+    let mut ws = client
+        .websocket(&url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket connect should retry from dead target to live target");
+    assert_eq!(ws.status, StatusCode::OK);
+
+    ws.send_text("retry rotation").await.expect("send text");
+    assert_eq!(ws.recv_text().await.expect("echo"), "Echo: retry rotation");
+    ws.send_close().await.expect("close");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// A failed H3 WebSocket backend setup should be surfaced as the same 502 JSON
+/// response as the H1/H2 upgrade path instead of hanging the CONNECT stream.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_failed_backend_upgrade_returns_502() {
+    let dead_port = free_port().await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, dead_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{}/ws-echo", gateway_https_port);
+    let mut ws = client
+        .websocket(&url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket failed-upgrade response");
+    assert_eq!(ws.status, StatusCode::BAD_GATEWAY);
+    assert!(
+        ws.recv_body_text()
+            .await
+            .expect("failed-upgrade body")
+            .contains("Backend WebSocket connection failed")
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+}
+
+/// The H3 bridge releases the per-IP request guard after the 200 upgrade
+/// response. Keeping it for the full WebSocket session would make one
+/// long-lived socket block ordinary requests from the same client IP.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_releases_per_ip_request_slot_after_200() {
+    let ws_backend_port = free_port().await;
+    let http_backend_port = free_port().await;
+
+    let echo_handle = tokio::spawn(start_ws_echo_server(ws_backend_port));
+    let http_handle = tokio::spawn(start_http_text_server(http_backend_port, "plain-ok"));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_and_http_config(&config_path, ws_backend_port, http_backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry_extra_env(
+            config_path.to_str().unwrap(),
+            cert_path,
+            key_path,
+            &[("FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP", "1")],
+        )
+        .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let ws_url = format!("https://localhost:{}/ws-echo", gateway_https_port);
+    let mut ws = client
+        .websocket(&ws_url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket connect");
+    assert_eq!(ws.status, StatusCode::OK);
+
+    let plain_url = format!("https://localhost:{}/plain", gateway_https_port);
+    let plain = client.get(&plain_url).await.expect("plain H3 request");
+    assert_eq!(
+        plain.status,
+        StatusCode::OK,
+        "per-IP request slot should be released after the H3 WS 200 response"
+    );
+    assert_eq!(plain.body_text(), "plain-ok");
+
+    ws.send_text("still open").await.expect("send text");
+    assert_eq!(ws.recv_text().await.expect("echo"), "Echo: still open");
+    ws.send_close().await.expect("close");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+    http_handle.abort();
 }

@@ -65,8 +65,8 @@ pub use backends::{
 };
 pub use certs::TestCa;
 pub use clients::{
-    ClientResponse, DtlsClient, GrpcClient, GrpcResponse, Http1Client, Http2Client, Http3Client,
-    Http3Response, UdpClient,
+    ClientResponse, DtlsClient, GrpcClient, GrpcResponse, H3WebSocketFrame, Http1Client,
+    Http2Client, Http3Client, Http3Response, Http3WebSocket, UdpClient, WebSocketOptions,
 };
 pub use harness::{GatewayHarness, GatewayHarnessBuilder, HarnessMode};
 pub use matrix::{BackendKind, FrontendKind, MatrixBackend, MatrixResponse};

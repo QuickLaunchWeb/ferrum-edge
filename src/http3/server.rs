@@ -854,7 +854,7 @@ async fn handle_h3_request(
     }
 
     // Per-IP concurrent request limiting (same as HTTP/1.1 and HTTP/2 paths).
-    let _per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
+    let per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
         let count = counts
             .entry(ctx.client_ip.clone())
             .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
@@ -1553,14 +1553,14 @@ async fn handle_h3_request(
         // `RequestGuard`, so backend handshakes stay visible to overload
         // pressure and graceful drain while the established session is not
         // double-counted as both a request and a connection. The per-IP
-        // REQUEST guard is also transferred so the bridge can release the
+        // request guard is also transferred so the bridge can release the
         // per-IP request slot at the 200 boundary, matching how the H1/H2
         // path drops its `_per_ip_guard` when the upgrade response unwinds.
         return crate::http3::websocket::handle_h3_websocket(
             stream,
             state,
             request_guard,
-            _per_ip_guard,
+            per_ip_guard,
             epoch,
             proxy,
             ctx,

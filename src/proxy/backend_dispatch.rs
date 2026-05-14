@@ -85,10 +85,14 @@ fn is_extended_connect_websocket<B>(req: &Request<B>) -> bool {
             req.version(),
             hyper::Version::HTTP_2 | hyper::Version::HTTP_3
         )
-        && req
+        && (req
             .extensions()
             .get::<hyper::ext::Protocol>()
             .is_some_and(|p| p.as_ref().eq_ignore_ascii_case(b"websocket"))
+            || req
+                .extensions()
+                .get::<h3::ext::Protocol>()
+                .is_some_and(|p| p.as_str().eq_ignore_ascii_case("websocket")))
 }
 
 /// HTTP/1.1 WebSocket upgrade check. Accepts only well-formed RFC 6455

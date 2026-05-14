@@ -220,6 +220,10 @@ pair of pump tasks (see `src/http3/websocket.rs`). The duplex half on
 the WebSocket-framer side is wrapped in
 `tokio_tungstenite::WebSocketStream` and handed to the generic
 `run_websocket_proxy` function — the same function the H1/H2 path uses.
+Per established H3 WebSocket session the bridge reserves a 64 KiB
+duplex buffer plus a 16 KiB send-pump scratch buffer; protocol frame
+size remains governed separately by
+`FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`.
 This means every WebSocket plugin works on H3 sessions unchanged:
 
 - `on_ws_frame` (frame-level inspection / transformation; `ws_rate_limit`, `ws_message_size_limiting`, `ws_frame_logging`)
@@ -247,8 +251,9 @@ The gateway's H3 path:
   mode, only an "accept" mode that is permissive in both directions.
   Practically, a compliant H3 client sends unmasked frames and works;
   a non-compliant H3 client sending masked frames is still bridged
-  correctly (data is delivered intact). Strict rejection is a future
-  follow-up — see `src/http3/websocket.rs` module docs.
+  correctly (data is delivered intact). Strict rejection remains tracked
+  by the `TODO(h3-ws-rfc9220-masked-close)` marker in
+  `src/http3/websocket.rs`.
 
 ### Tunnel mode
 
@@ -330,13 +335,14 @@ Unit tests in `tests/unit/gateway_core/http3_websocket_tests.rs` cover:
 - Env-config parsing of `FERRUM_HTTP3_WEBSOCKET_ENABLED` (defaults to
   true, parses `true` / `false` correctly).
 
-End-to-end functional coverage (a real Extended-CONNECT-capable H3
-client sending and receiving WebSocket frames over QUIC) is not yet
-in-tree because no off-the-shelf H3 client ships RFC 9220 today —
-curl 8.x, h2load, and tungstenite all only support WebSocket over
-HTTP/1.1 / HTTP/2. The bridge has been verified against a custom
-h3-quinn-based test client; a follow-up will land that harness in
-`tests/functional/`.
+End-to-end functional coverage lives in
+`tests/functional/functional_websocket_test.rs`. The tree ships a small
+h3-quinn-based RFC 9220 client because common off-the-shelf clients
+(curl 8.x, h2load, tungstenite) still focus on WebSocket over HTTP/1.1
+/ HTTP/2. The functional shard covers H3 text/binary frame relay,
+masked-frame permissiveness, subprotocol forwarding and the no-subprotocol
+case, backend retry target rotation, failed backend upgrade responses,
+and per-IP request-slot release after the 200 CONNECT response.
 
 ## QUIC connection migration
 

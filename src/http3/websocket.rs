@@ -54,12 +54,15 @@
 //!
 //! ## Buffer sizing
 //!
-//! The duplex bridge uses a 64 KiB internal buffer (`H3_WS_DUPLEX_BUFFER_BYTES`).
-//! Large enough that small WebSocket frames don't cause excessive context
-//! switching on the pump tasks; small enough that a slow consumer on
-//! either side can't accumulate megabytes of in-flight bytes. Frame size
-//! is independently bounded by `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`
-//! enforced by the WebSocket framer, not the bridge buffer.
+//! The duplex bridge uses a 64 KiB internal buffer
+//! (`H3_WS_DUPLEX_BUFFER_BYTES`) plus a 16 KiB scratch buffer on the
+//! send pump (`H3_WS_SEND_PUMP_READ_BUFFER_BYTES`). The duplex is large
+//! enough that small WebSocket frames don't cause excessive context
+//! switching on the pump tasks; the scratch buffer is intentionally
+//! smaller because bytes are copied into `Bytes` immediately before
+//! `send_data()`. Frame size is independently bounded by
+//! `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` enforced by the WebSocket
+//! framer, not the bridge buffers.
 //!
 //! ## Tunnel mode
 //!
@@ -135,6 +138,51 @@ use crate::retry;
 /// Internal buffer size for the H3 ↔ WebSocket-framer duplex bridge.
 /// See module-level docs for rationale.
 const H3_WS_DUPLEX_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Scratch read buffer for the send pump. This is deliberately smaller
+/// than the duplex capacity because each read is immediately copied into
+/// an h3 DATA `Bytes`; keeping it at 16 KiB caps per-session bridge memory
+/// while still batching small frames.
+const H3_WS_SEND_PUMP_READ_BUFFER_BYTES: usize = 16 * 1024;
+
+struct AbortOnDropJoinHandle {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl AbortOnDropJoinHandle {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn abort(&self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+
+    async fn abort_and_wait(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    async fn wait(mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for AbortOnDropJoinHandle {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
 
 /// Listen-port label for the `WsSessionMeta` that backs on_ws_disconnect.
 /// H3 always lands on the HTTPS port (port 0 disables H3 entirely; the
@@ -585,12 +633,12 @@ pub(crate) async fn handle_h3_websocket(
             return Err(anyhow::anyhow!("failed to build H3 WebSocket 200: {}", e));
         }
     };
+    crate::proxy::record_request(&state, 200);
+
     if let Err(e) = stream.send_response(response).await {
         error!(proxy_id = %proxy.id, "H3 WS: failed to send 200 response: {}", e);
         return Err(anyhow::anyhow!("H3 WebSocket send_response: {}", e));
     }
-
-    crate::proxy::record_request(&state, 200);
 
     // Per-IP request accounting handoff: the upgrade is complete and the
     // session is now a long-lived "connection" tracked by
@@ -628,7 +676,7 @@ pub(crate) async fn handle_h3_websocket(
     let proxy_id_for_pumps = proxy.id.clone();
 
     // h3_recv → pump_write : client-frame bytes flow to the WS parser
-    let recv_pump = tokio::spawn(async move {
+    let recv_pump = AbortOnDropJoinHandle::new(tokio::spawn(async move {
         loop {
             match h3_recv.recv_data().await {
                 Ok(Some(chunk)) => {
@@ -664,13 +712,13 @@ pub(crate) async fn handle_h3_websocket(
         }
         // Dropping pump_write signals EOF to the WS framer reading
         // from the other duplex half.
-    });
+    }));
 
     let proxy_id_for_send_pump = proxy.id.clone();
 
     // pump_read → h3_send : WS framer's encoded bytes flow back over QUIC
-    let send_pump = tokio::spawn(async move {
-        let mut buf = vec![0u8; H3_WS_DUPLEX_BUFFER_BYTES];
+    let send_pump = AbortOnDropJoinHandle::new(tokio::spawn(async move {
+        let mut buf = vec![0u8; H3_WS_SEND_PUMP_READ_BUFFER_BYTES];
         loop {
             let n = match pump_read.read(&mut buf).await {
                 Ok(0) => break, // EOF — WS framer dropped its sink half
@@ -701,7 +749,7 @@ pub(crate) async fn handle_h3_websocket(
                 e
             );
         }
-    });
+    }));
 
     // ── Collect WebSocket frame and disconnect plugin lists ─────────
     let ws_frame_plugins: Vec<Arc<dyn Plugin>> = if requires_ws_frame_hooks {
@@ -755,8 +803,10 @@ pub(crate) async fn handle_h3_websocket(
         ws_write_buf,
         false, // H3 always frame-parses; tunnel mode is H1-only
         // RFC 9220 §5: WebSocket frames over HTTP/3 are NOT masked.
-        // Strict enforcement (closing with 1002 on a masked frame)
-        // is a future-work follow-up; for now we accept both shapes.
+        // TODO(h3-ws-rfc9220-masked-close): strict enforcement (closing
+        // with 1002 on a masked frame) is still a documented compliance
+        // gap because tungstenite only exposes a permissive
+        // accept-unmasked mode. See docs/http3.md#frame-masking--rfc-9220-5-vs-rfc-6455.
         true,
         &adaptive_buf,
     )
@@ -792,8 +842,8 @@ pub(crate) async fn handle_h3_websocket(
     // half of the QUIC stream + the duplex write half; both will be
     // dropped cleanly.
     recv_pump.abort();
-    let _ = recv_pump.await;
-    let _ = send_pump.await;
+    recv_pump.abort_and_wait().await;
+    send_pump.wait().await;
 
     // Drop guards explicitly so their `Drop` impl runs before the
     // info!() below — keeps the "session ended" log adjacent to the
@@ -1139,5 +1189,42 @@ mod tests {
             !ctx_headers_after_take.contains_key("user-agent"),
             "ctx.headers is moved-out and empty in the common dispatch path"
         );
+    }
+
+    #[test]
+    fn h3_ws_send_pump_buffer_is_smaller_than_duplex_capacity() {
+        assert_eq!(H3_WS_DUPLEX_BUFFER_BYTES, 64 * 1024);
+        assert_eq!(H3_WS_SEND_PUMP_READ_BUFFER_BYTES, 16 * 1024);
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_join_handle_aborts_detached_task() {
+        struct DropMarker(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_in_task = dropped.clone();
+        let handle = tokio::spawn(async move {
+            let _marker = DropMarker(dropped_in_task);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let guard = AbortOnDropJoinHandle::new(handle);
+        started_rx.await.expect("task started");
+        drop(guard);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            if dropped.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("dropping AbortOnDropJoinHandle should abort and drop the task future");
     }
 }
