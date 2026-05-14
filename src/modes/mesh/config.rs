@@ -1152,8 +1152,16 @@ pub struct MeshSubset {
 /// core `GatewayConfig` struct stays lean for non-mesh deployments.
 /// Stored as `Option<Box<MeshConfig>>` on `GatewayConfig` — `None` when
 /// the operator has no mesh resources, zero cost in that case.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshConfig {
+    /// Istio root namespace used for mesh-wide policy resources and
+    /// cluster-wide Sidecar defaults. Native mesh YAML can override it;
+    /// Kubernetes translation fills it from `K8sTranslationOptions`.
+    #[serde(
+        default = "default_istio_root_namespace",
+        skip_serializing_if = "is_default_istio_root_namespace"
+    )]
+    pub istio_root_namespace: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workloads: Vec<Workload>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1191,6 +1199,35 @@ pub struct MeshConfig {
     pub outbound_traffic_policy: Option<OutboundTrafficPolicy>,
 }
 
+pub fn default_istio_root_namespace() -> String {
+    "istio-system".to_string()
+}
+
+fn is_default_istio_root_namespace(value: &str) -> bool {
+    value == "istio-system"
+}
+
+impl Default for MeshConfig {
+    fn default() -> Self {
+        Self {
+            istio_root_namespace: default_istio_root_namespace(),
+            workloads: Vec::new(),
+            services: Vec::new(),
+            mesh_policies: Vec::new(),
+            peer_authentications: Vec::new(),
+            service_entries: Vec::new(),
+            request_authentications: Vec::new(),
+            telemetry_resources: Vec::new(),
+            destination_rules: Vec::new(),
+            proxy_configs: Vec::new(),
+            sidecars: Vec::new(),
+            trust_bundles: None,
+            multi_cluster: None,
+            outbound_traffic_policy: None,
+        }
+    }
+}
+
 /// Istio mesh-wide outbound traffic policy. Mirrors
 /// `MeshConfig.outboundTrafficPolicy.mode` in the upstream API.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1226,6 +1263,12 @@ impl MeshConfig {
     }
 
     pub fn normalize(&mut self) {
+        let trimmed_root_namespace = self.istio_root_namespace.trim();
+        if trimmed_root_namespace.is_empty() {
+            self.istio_root_namespace = default_istio_root_namespace();
+        } else if trimmed_root_namespace.len() != self.istio_root_namespace.len() {
+            self.istio_root_namespace = trimmed_root_namespace.to_string();
+        }
         normalize_mesh_fields_internal(
             &mut self.service_entries,
             &mut self.workloads,

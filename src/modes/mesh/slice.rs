@@ -319,15 +319,17 @@ impl MeshSlice {
         // workload. The returned scope is used downstream to narrow `services`,
         // `service_entries`, and `destination_rules`. Returns `None` when no
         // Sidecar applies or when the applicable Sidecar inherits system
-        // defaults with no namespace default to inherit from. The enforcement
-        // flag gates the entire narrowing pass so existing deployments see zero
-        // behavior change unless `FERRUM_MESH_SIDECAR_ENFORCED=true`.
+        // defaults with no namespace or root-namespace default to inherit
+        // from. The enforcement flag gates the entire narrowing pass so
+        // existing deployments see zero behavior change unless
+        // `FERRUM_MESH_SIDECAR_ENFORCED=true`.
         let applicable_sidecar = if request.enforce_sidecar_egress {
             warn_unsupported_sidecar_port_scoping(&mesh.sidecars);
             resolve_applicable_sidecar_egress(
                 &mesh.sidecars,
                 effective_namespace,
                 &effective_labels,
+                mesh.istio_root_namespace.as_str(),
             )
         } else {
             None
@@ -710,17 +712,18 @@ fn split_canonical_service_host(host: &str) -> Option<(&str, &str)> {
 
 /// Resolve the most-specific applicable Sidecar for a workload.
 ///
-/// Most specific wins: a Sidecar with a non-empty `workload_selector` whose
-/// labels match the workload outranks the namespace-default Sidecar (no
-/// `workload_selector`). Within the same tier the first matching entry wins
-/// — operators are expected to maintain at most one Sidecar per tier per
-/// namespace, mirroring Istio behavior.
+/// Most specific wins: a Sidecar with a non-empty `workload_selector` in the
+/// workload namespace whose labels match the workload outranks the workload
+/// namespace-default Sidecar (no `workload_selector`), which outranks the
+/// Istio root-namespace default Sidecar. Within the same tier the
+/// ASCII-smallest name wins so reconciles stay deterministic.
 ///
 /// Returns `None` if no Sidecar in `sidecars` applies to the workload.
 fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
     sidecars: &'a [MeshSidecar],
     workload_namespace: &str,
     workload_labels: &L,
+    istio_root_namespace: &str,
 ) -> Option<ResolvedSidecarEgress<'a>> {
     // Collect all matching sidecars per tier, then pick the ASCII-smallest
     // `name` as a deterministic tiebreak. Translator emission order is not
@@ -729,33 +732,47 @@ fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
     // the precedent set by `MeshSlice::resolved_proxy_config`.
     let mut workload_scoped: Option<&MeshSidecar> = None;
     let mut namespace_default: Option<&MeshSidecar> = None;
+    let mut root_namespace_default: Option<&MeshSidecar> = None;
+    let root_namespace = istio_root_namespace.trim();
 
     for sidecar in sidecars {
-        if sidecar.namespace != workload_namespace {
-            continue;
-        }
-        match sidecar.workload_selector.as_ref() {
-            Some(selector) if !selector.labels.is_empty() => {
-                if workload_selector_matches(selector, workload_namespace, workload_labels)
-                    && workload_scoped
+        if sidecar.namespace == workload_namespace {
+            match sidecar.workload_selector.as_ref() {
+                Some(selector) if !selector.labels.is_empty() => {
+                    if workload_selector_matches(selector, workload_namespace, workload_labels)
+                        && workload_scoped
+                            .map(|current| sidecar.name.as_str() < current.name.as_str())
+                            .unwrap_or(true)
+                    {
+                        workload_scoped = Some(sidecar);
+                    }
+                }
+                _ => {
+                    if namespace_default
                         .map(|current| sidecar.name.as_str() < current.name.as_str())
                         .unwrap_or(true)
-                {
-                    workload_scoped = Some(sidecar);
+                    {
+                        namespace_default = Some(sidecar);
+                    }
                 }
             }
-            _ => {
-                if namespace_default
-                    .map(|current| sidecar.name.as_str() < current.name.as_str())
-                    .unwrap_or(true)
-                {
-                    namespace_default = Some(sidecar);
-                }
-            }
+        } else if !root_namespace.is_empty()
+            && sidecar.namespace == root_namespace
+            && sidecar
+                .workload_selector
+                .as_ref()
+                .is_none_or(|selector| selector.labels.is_empty())
+            && root_namespace_default
+                .map(|current| sidecar.name.as_str() < current.name.as_str())
+                .unwrap_or(true)
+        {
+            root_namespace_default = Some(sidecar);
         }
     }
 
-    let selected = workload_scoped.or(namespace_default)?;
+    let selected = workload_scoped
+        .or(namespace_default)
+        .or(root_namespace_default)?;
     if selected.egress_inherits_defaults {
         if let Some(namespace_default) = namespace_default
             && !std::ptr::eq(selected, namespace_default)
@@ -764,6 +781,15 @@ fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
             return Some(ResolvedSidecarEgress {
                 namespace: namespace_default.namespace.as_str(),
                 egress: &namespace_default.egress,
+            });
+        }
+        if let Some(root_namespace_default) = root_namespace_default
+            && !std::ptr::eq(selected, root_namespace_default)
+            && !root_namespace_default.egress_inherits_defaults
+        {
+            return Some(ResolvedSidecarEgress {
+                namespace: root_namespace_default.namespace.as_str(),
+                egress: &root_namespace_default.egress,
             });
         }
         return None;
@@ -3782,6 +3808,167 @@ mod tests {
             slice_request_enforced_with_labels("alpha", labels),
         );
         assert_eq!(slice.service_entries.len(), 2);
+    }
+
+    #[test]
+    fn sidecar_root_namespace_default_applies_when_namespace_has_no_sidecar() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "mesh-default",
+                "istio-system",
+                None,
+                vec![vec!["beta/*"]],
+            )],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews-beta",
+                    "beta",
+                    "reviews.beta.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "payments-gamma",
+                    "gamma",
+                    "payments.gamma.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.service_entries.len(), 1);
+        assert_eq!(slice.service_entries[0].name, "reviews-beta");
+    }
+
+    #[test]
+    fn sidecar_namespace_default_wins_over_root_namespace_default() {
+        let mesh = MeshConfig {
+            sidecars: vec![
+                make_sidecar("mesh-default", "istio-system", None, vec![vec!["beta/*"]]),
+                make_sidecar("namespace-default", "alpha", None, vec![vec!["gamma/*"]]),
+            ],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews-beta",
+                    "beta",
+                    "reviews.beta.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "payments-gamma",
+                    "gamma",
+                    "payments.gamma.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.service_entries.len(), 1);
+        assert_eq!(slice.service_entries[0].name, "payments-gamma");
+    }
+
+    #[test]
+    fn sidecar_workload_scoped_inherits_root_default_when_namespace_default_absent() {
+        let mesh = MeshConfig {
+            sidecars: vec![
+                make_sidecar("mesh-default", "istio-system", None, vec![vec!["beta/*"]]),
+                make_inheriting_sidecar(
+                    "frontend-ingress-only",
+                    "alpha",
+                    WorkloadSelector {
+                        labels: HashMap::from([("app".into(), "frontend".into())]),
+                        namespace: Some("alpha".into()),
+                    },
+                ),
+            ],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews-beta",
+                    "beta",
+                    "reviews.beta.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "payments-gamma",
+                    "gamma",
+                    "payments.gamma.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let labels = BTreeMap::from([("app".into(), "frontend".into())]);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_labels("alpha", labels),
+        );
+        assert_eq!(slice.service_entries.len(), 1);
+        assert_eq!(slice.service_entries[0].name, "reviews-beta");
+    }
+
+    #[test]
+    fn sidecar_root_namespace_default_tiebreak_uses_ascii_smallest_name() {
+        let mesh = MeshConfig {
+            sidecars: vec![
+                make_sidecar("b-default", "istio-system", None, vec![vec!["beta/*"]]),
+                make_sidecar("a-default", "istio-system", None, vec![vec!["gamma/*"]]),
+            ],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews-beta",
+                    "beta",
+                    "reviews.beta.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "payments-gamma",
+                    "gamma",
+                    "payments.gamma.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.service_entries.len(), 1);
+        assert_eq!(slice.service_entries[0].name, "payments-gamma");
+    }
+
+    #[test]
+    fn sidecar_root_namespace_default_uses_mesh_config_root_namespace() {
+        let mesh = MeshConfig {
+            istio_root_namespace: "istio-config".into(),
+            sidecars: vec![make_sidecar(
+                "mesh-default",
+                "istio-config",
+                None,
+                vec![vec!["beta/*"]],
+            )],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews-beta",
+                    "beta",
+                    "reviews.beta.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "payments-gamma",
+                    "gamma",
+                    "payments.gamma.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.service_entries.len(), 1);
+        assert_eq!(slice.service_entries[0].name, "reviews-beta");
     }
 
     #[test]

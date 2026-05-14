@@ -391,13 +391,6 @@ fn peer_authentication(
 /// compatibility gap; the other surfaces stay in the documented "deferred"
 /// table until separate PRs land them.
 fn sidecar(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
-    if object.metadata.namespace == acc.options.istio_root_namespace {
-        acc.warnings.push(format!(
-            "Sidecar {}/{} is in the Istio root namespace '{}', but Ferrum Sidecar egress scoping is namespace-local today; it will not act as a mesh-wide default",
-            object.metadata.namespace, object.metadata.name, acc.options.istio_root_namespace
-        ));
-    }
-
     let workload_selector = match object.spec.get("workloadSelector") {
         Some(selector_value) => {
             let labels = selector_from_istio(Some(selector_value));
@@ -9232,7 +9225,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_in_root_namespace_emits_scope_warning() {
+    fn sidecar_in_root_namespace_translates_without_scope_warning() {
         let result = translate_k8s_objects(
             &[object(
                 "Sidecar",
@@ -9247,13 +9240,14 @@ mod tests {
         .expect("translation succeeds");
 
         assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| { w.contains("root namespace") && w.contains("namespace-local") }),
-            "root namespace Sidecar should emit scope warning; got {:?}",
+            result.warnings.is_empty(),
+            "root namespace Sidecar is now a supported cluster-wide default; warnings = {:?}",
             result.warnings
         );
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.istio_root_namespace, "default");
+        assert_eq!(mesh.sidecars.len(), 1);
+        assert_eq!(mesh.sidecars[0].namespace, "default");
     }
 
     #[test]

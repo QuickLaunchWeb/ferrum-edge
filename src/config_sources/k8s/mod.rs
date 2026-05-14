@@ -185,10 +185,14 @@ pub(crate) struct K8sAccumulator {
 
 impl K8sAccumulator {
     fn new(options: K8sTranslationOptions) -> Self {
+        let mesh = MeshConfig {
+            istio_root_namespace: options.istio_root_namespace.clone(),
+            ..MeshConfig::default()
+        };
         Self {
             options,
             config: GatewayConfig::default(),
-            mesh: MeshConfig::default(),
+            mesh,
             warnings: Vec::new(),
             reference_grants: HashSet::new(),
             proxy_sources: HashMap::new(),
@@ -309,7 +313,11 @@ impl K8sAccumulator {
         self.mesh.proxy_configs.sort_by(|left, right| {
             (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
         });
-        if self.mesh != MeshConfig::default() {
+        let empty_mesh = MeshConfig {
+            istio_root_namespace: self.mesh.istio_root_namespace.clone(),
+            ..MeshConfig::default()
+        };
+        if self.mesh != empty_mesh {
             self.config.mesh = Some(Box::new(self.mesh));
         }
         let mut known_namespaces: Vec<String> = self.known_namespaces.into_iter().collect();

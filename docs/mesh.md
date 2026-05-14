@@ -565,7 +565,8 @@ Most specific wins:
 
 1. **Workload-scoped** Sidecar (`spec.workloadSelector.matchLabels` matches the workload's labels)
 2. **Namespace-default** Sidecar (no `workloadSelector`)
-3. **No Sidecar applies** → no narrowing (existing behavior)
+3. **Root-namespace default** Sidecar (no `workloadSelector`, in `FERRUM_K8S_ISTIO_ROOT_NAMESPACE`, default `istio-system`)
+4. **No Sidecar applies** → no narrowing (existing behavior)
 
 ### Host Pattern Syntax
 
@@ -583,13 +584,12 @@ Each `spec.egress[].hosts` entry follows Istio scope-host syntax:
 
 The `host` portion may itself be a single-label DNS wildcard (e.g. `*/*.example.com` admits `api.example.com` but not `example.com` nor `a.b.example.com`). This is the same single-label wildcard semantic Ferrum uses elsewhere (`config::types::wildcard_matches`, mesh DNS proxy); operators relying on deeper-than-one-label wildcards should list the additional surfaces explicitly. `MeshService` entries match their short name, `{name}.{namespace}`, `{name}.{namespace}.svc`, and `{name}.{namespace}.svc.{cluster_domain}` aliases. On the control plane this suffix follows `FERRUM_K8S_CLUSTER_DOMAIN`; in local mesh mode it follows `FERRUM_MESH_CLUSTER_DOMAIN`.
 
-When Kubernetes `spec.egress` is omitted, Istio inherits the namespace-default outbound scope; Ferrum preserves that distinction so an ingress-only workload Sidecar does not override a namespace default. If no namespace default Sidecar exists, omitted egress is treated as no narrowing. An explicit native/file `egress: []` or `~/*` trims all service config from the slice. The optional `spec.egress[].port.number` is parsed and recorded but does not yet narrow by listener port — port matching for egress is a follow-up.
+When Kubernetes `spec.egress` is omitted, Istio inherits the namespace-default outbound scope; Ferrum preserves that distinction so an ingress-only workload Sidecar does not override a namespace default. If no namespace default exists, Ferrum falls back to the root-namespace default Sidecar when one is present; otherwise omitted egress is treated as no narrowing. An explicit native/file `egress: []` or `~/*` trims all service config from the slice. The optional `spec.egress[].port.number` is parsed and recorded but does not yet narrow by listener port — port matching for egress is a follow-up.
 
-When multiple `Sidecar` resources in the same namespace apply at the same scope tier (two namespace-defaults, or two workload-scoped Sidecars both matching the same workload), the resolver picks the ASCII-smallest `name` as the deterministic tiebreak so reconciles are stable across pods and restarts.
+When multiple `Sidecar` resources apply at the same scope tier (two namespace-defaults, two root-namespace defaults, or two workload-scoped Sidecars both matching the same workload), the resolver picks the ASCII-smallest `name` as the deterministic tiebreak so reconciles are stable across pods and restarts.
 
 ### Known Limitations
 
-- `Sidecar` resources placed in the Istio root namespace (`istio-system` by default) are not yet treated as cluster-wide defaults. They apply only to workloads in their own namespace. Operators relying on a mesh-wide default `Sidecar` should declare a namespace-default `Sidecar` in each workload namespace until the root-namespace plumbing lands.
 - Slice narrowing today filters `services`, `service_entries`, and `destination_rules`. **Workload identity entries are not filtered** by Sidecar scope — every workload in the workload's own namespace continues to appear in the slice even when the applicable Sidecar only allows egress to a subset of services. This avoids breaking introspection and mTLS peer-identity lookups; workload-identity narrowing is tracked as a follow-up.
 
 ### Migration Notes
