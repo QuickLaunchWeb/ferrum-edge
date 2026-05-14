@@ -30,6 +30,7 @@ struct ListenerHandle {
     frontend_tls: bool,
     passthrough: bool,
     started: Arc<AtomicBool>,
+    tcp_metrics: Option<Arc<TcpProxyMetrics>>,
     udp_metrics: Option<Arc<UdpProxyMetrics>>,
 }
 
@@ -52,6 +53,11 @@ struct DtlsDemuxMetricEntry {
     sessions: Arc<AtomicU64>,
 }
 
+enum StreamBackendMetricEntry {
+    Tcp(Arc<TcpProxyMetrics>),
+    Udp(Arc<UdpProxyMetrics>),
+}
+
 /// Manages the set of active TCP/UDP stream listeners.
 ///
 /// All state is behind a tokio `Mutex` to serialize reconciliation calls.
@@ -59,6 +65,7 @@ struct DtlsDemuxMetricEntry {
 pub struct StreamListenerManager {
     listeners: tokio::sync::Mutex<std::collections::HashMap<String, ListenerHandle>>,
     dtls_metrics: arc_swap::ArcSwap<Vec<DtlsDemuxMetricEntry>>,
+    stream_backend_metrics: arc_swap::ArcSwap<Vec<StreamBackendMetricEntry>>,
     bind_addr: IpAddr,
     config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     dns_cache: DnsCache,
@@ -230,6 +237,7 @@ impl StreamListenerManager {
         Self {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             dtls_metrics: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
+            stream_backend_metrics: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
             bind_addr,
             config,
             dns_cache,
@@ -518,7 +526,7 @@ impl StreamListenerManager {
             // listener observes both per-listener removal AND global SIGTERM.
             let global_shutdown = self.global_shutdown_rx.load().as_ref().clone();
 
-            let (join_handle, udp_metrics) = if scheme.is_udp() {
+            let (join_handle, tcp_metrics, udp_metrics) = if scheme.is_udp() {
                 let started_for_listener = started.clone();
                 // UDP or DTLS listener
                 // Passthrough proxies forward raw encrypted datagrams — no DTLS termination.
@@ -606,7 +614,7 @@ impl StreamListenerManager {
                         );
                     }
                 });
-                (join_handle, listener_udp_metrics)
+                (join_handle, None, listener_udp_metrics)
             } else {
                 let started_for_listener = started.clone();
                 // TCP or TcpTls listener
@@ -617,6 +625,7 @@ impl StreamListenerManager {
                     None
                 };
                 let metrics = Arc::new(TcpProxyMetrics::default());
+                let listener_tcp_metrics = Some(metrics.clone());
                 let tcp_idle_timeout = self.tcp_idle_timeout_seconds;
                 let tcp_half_close_max_wait = self.tcp_half_close_max_wait_seconds;
                 let frontend_tls_handshake_timeout = self.frontend_tls_handshake_timeout_seconds;
@@ -674,7 +683,7 @@ impl StreamListenerManager {
                         );
                     }
                 });
-                (join_handle, None)
+                (join_handle, listener_tcp_metrics, None)
             };
 
             info!(
@@ -695,6 +704,7 @@ impl StreamListenerManager {
                     frontend_tls: *frontend_tls,
                     passthrough: *passthrough,
                     started,
+                    tcp_metrics,
                     udp_metrics,
                 },
             );
@@ -713,6 +723,23 @@ impl StreamListenerManager {
             .collect();
         dtls_entries.sort_by(|a, b| a.listener_key.cmp(&b.listener_key));
         self.dtls_metrics.store(Arc::new(dtls_entries));
+
+        let stream_backend_entries: Vec<StreamBackendMetricEntry> = listeners
+            .values()
+            .filter_map(|h| match h.scheme {
+                BackendScheme::Tcp | BackendScheme::Tcps => h
+                    .tcp_metrics
+                    .as_ref()
+                    .map(|m| StreamBackendMetricEntry::Tcp(m.clone())),
+                BackendScheme::Udp | BackendScheme::Dtls => h
+                    .udp_metrics
+                    .as_ref()
+                    .map(|m| StreamBackendMetricEntry::Udp(m.clone())),
+                BackendScheme::Http | BackendScheme::Https => None,
+            })
+            .collect();
+        self.stream_backend_metrics
+            .store(Arc::new(stream_backend_entries));
 
         bind_failures
     }
@@ -739,6 +766,12 @@ impl StreamListenerManager {
             dtls_demux_sessions_total,
             dtls_demux_sessions,
         }
+    }
+
+    /// Estimate active stream backend sockets without including frontend HTTP/WebSocket sessions.
+    pub fn active_backend_session_estimate(&self) -> u64 {
+        let entries = self.stream_backend_metrics.load();
+        active_backend_session_estimate_from_entries(&entries)
     }
 
     /// Wait until all currently configured stream listeners have successfully
@@ -828,5 +861,40 @@ impl StreamListenerManager {
             info!(proxy_id = %proxy_id, port = handle.listen_port, "Shutting down stream listener");
             let _ = handle.shutdown_tx.send(true);
         }
+    }
+}
+
+fn active_backend_session_estimate_from_entries(entries: &[StreamBackendMetricEntry]) -> u64 {
+    entries.iter().fold(0u64, |total, entry| {
+        let active = match entry {
+            StreamBackendMetricEntry::Tcp(metrics) => {
+                metrics.active_connections.load(Ordering::Relaxed)
+            }
+            StreamBackendMetricEntry::Udp(metrics) => {
+                metrics.active_sessions.load(Ordering::Relaxed)
+            }
+        };
+        total.saturating_add(active)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn active_backend_session_estimate_sums_tcp_and_udp_stream_sessions() {
+        let tcp_metrics = Arc::new(TcpProxyMetrics::default());
+        let udp_metrics = Arc::new(UdpProxyMetrics::default());
+        tcp_metrics.active_connections.store(2, Ordering::Relaxed);
+        udp_metrics.active_sessions.store(3, Ordering::Relaxed);
+        let entries = vec![
+            StreamBackendMetricEntry::Tcp(tcp_metrics),
+            StreamBackendMetricEntry::Udp(udp_metrics),
+        ];
+
+        assert_eq!(active_backend_session_estimate_from_entries(&entries), 5);
     }
 }

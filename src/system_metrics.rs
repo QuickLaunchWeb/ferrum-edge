@@ -249,15 +249,17 @@ fn ephemeral_snapshot(
         };
     };
 
-    let http_pool_entries = ps.connection_pool.get_stats().total_pools as u64;
-    // Only backend/outbound pools consume ephemeral client ports. Frontend
-    // active connections are listener-side sessions and would inflate this
-    // estimate during inbound-heavy traffic.
+    let http_pool_entries = ps.connection_pool.pool_size() as u64;
+    let stream_backend_sessions = ps.stream_listener_manager.active_backend_session_estimate();
+    // Only backend/outbound pools and stream backend sessions consume ephemeral
+    // client ports. Frontend active connections are listener-side sessions and
+    // would inflate this estimate during inbound-heavy traffic.
     let active_outbound_estimate = http_pool_entries
         .saturating_add(ps.grpc_pool.pool_size() as u64)
         .saturating_add(ps.http2_pool.pool_size() as u64)
         .saturating_add(ps.h3_pool.pool_size() as u64)
-        .saturating_add(ps.hbone_pool.pool_size() as u64);
+        .saturating_add(ps.hbone_pool.pool_size() as u64)
+        .saturating_add(stream_backend_sessions);
 
     EphemeralPortSnapshot {
         range_low,

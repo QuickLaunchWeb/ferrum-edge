@@ -269,6 +269,11 @@ impl ConnectionPool {
         }
     }
 
+    /// Return only the number of pooled client entries without cloning pool keys.
+    pub fn pool_size(&self) -> usize {
+        self.pool.pool_size()
+    }
+
     /// Get TLS configuration for HTTP/3 backend connections.
     pub fn get_tls_config_for_backend(
         &self,
