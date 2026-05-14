@@ -250,11 +250,10 @@ fn ephemeral_snapshot(
     };
 
     let http_pool_entries = ps.connection_pool.get_stats().total_pools as u64;
-    let active_outbound_estimate = ps
-        .overload
-        .active_connections
-        .load(Ordering::Relaxed)
-        .saturating_add(http_pool_entries)
+    // Only backend/outbound pools consume ephemeral client ports. Frontend
+    // active connections are listener-side sessions and would inflate this
+    // estimate during inbound-heavy traffic.
+    let active_outbound_estimate = http_pool_entries
         .saturating_add(ps.grpc_pool.pool_size() as u64)
         .saturating_add(ps.http2_pool.pool_size() as u64)
         .saturating_add(ps.h3_pool.pool_size() as u64)
@@ -561,6 +560,8 @@ fn jemalloc_resident_bytes() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     #[cfg(target_os = "linux")]
     #[test]
     fn parse_cgroup_limit_handles_max_and_large_v1_values() {
@@ -594,5 +595,25 @@ mod tests {
         assert!(snapshot.memory.rss_bytes > 0);
         assert!(snapshot.file_descriptors.current > 0);
         assert!(snapshot.file_descriptors.max > 0);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_snapshot_excludes_frontend_active_connections() {
+        let config = crate::config::types::GatewayConfig::default();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::EnvConfig::default();
+        let (proxy_state, _handles) =
+            crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+                .expect("proxy state");
+
+        proxy_state
+            .overload
+            .active_connections
+            .store(500, Ordering::Relaxed);
+
+        let snapshot =
+            super::ephemeral_snapshot(Some(&proxy_state), (Some(32768), Some(60999), Some(28232)));
+
+        assert_eq!(snapshot.active_outbound_estimate, 0);
     }
 }
