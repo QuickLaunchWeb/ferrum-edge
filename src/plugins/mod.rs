@@ -1067,6 +1067,9 @@ impl TransactionSummary {
 /// spawned mirror task maximum time to complete. The mirror entry uses the
 /// same `TransactionSummary` schema with `mirror: true` so existing log
 /// pipelines work without changes.
+///
+/// Some proxy paths call this with an empty plugin slice so runtime transaction
+/// metrics still see no-plugin error and streaming-disconnect outcomes.
 pub async fn log_with_mirror(
     plugins: &[Arc<dyn Plugin>],
     summary: &TransactionSummary,

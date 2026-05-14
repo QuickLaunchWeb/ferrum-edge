@@ -204,7 +204,9 @@ paths:
 
         The response is cached briefly (default 1000 ms, configurable with
         `FERRUM_METRICS_RUNTIME_CACHE_MS`) because system metrics are sampled in
-        the background.
+        the background. Log counters mirror tracing events allowed by
+        `FERRUM_LOG_LEVEL` / `RUST_LOG`; the extra 1m/5m HTTP status windows
+        can be disabled with `FERRUM_METRICS_STATUS_TRACKING_ENABLED=false`.
       tags: [Metrics]
       responses:
         "200":
@@ -3974,7 +3976,28 @@ components:
         client_disconnects: { type: integer, format: uint64 }
         status_codes:
           type: object
-          additionalProperties: true
+          properties:
+            totals:
+              type: object
+              additionalProperties: { type: integer, format: uint64 }
+            rate_1s:
+              type: object
+              additionalProperties: { type: integer, format: uint64 }
+            rate_1m:
+              type: object
+              additionalProperties: { type: integer, format: uint64 }
+            rate_5m:
+              type: object
+              additionalProperties: { type: integer, format: uint64 }
+            percent_total:
+              type: object
+              additionalProperties: { type: number, format: double }
+            percent_1m:
+              type: object
+              additionalProperties: { type: number, format: double }
+            percent_5m:
+              type: object
+              additionalProperties: { type: number, format: double }
 
     RuntimeErrorsSnapshot:
       type: object
@@ -4018,7 +4041,13 @@ components:
         pool_failures_total: { type: object, additionalProperties: { type: integer, format: uint64 } }
         tcp_rst_observed:
           type: object
-          additionalProperties: true
+          properties:
+            by_proxy:
+              type: object
+              additionalProperties:
+                type: object
+                additionalProperties: { type: integer, format: uint64 }
+            total: { type: integer, format: uint64 }
 
     RuntimeLogsSnapshot:
       type: object

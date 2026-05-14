@@ -924,10 +924,8 @@ fn prune_pool_entries(entries: &mut Vec<HbonePoolEntry>) -> usize {
 }
 
 fn record_hbone_evictions(count: usize) {
-    let metrics = crate::runtime_metrics::global_ref();
-    for _ in 0..count {
-        metrics.record_pool_eviction(crate::runtime_metrics::PoolKind::Hbone);
-    }
+    crate::runtime_metrics::global_ref()
+        .record_pool_evictions(crate::runtime_metrics::PoolKind::Hbone, count as u64);
 }
 
 fn entry_idle_expired(last_used_at: Instant, idle_timeout_seconds: u64, now: Instant) -> bool {

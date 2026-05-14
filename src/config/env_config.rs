@@ -1127,6 +1127,8 @@ pub struct EnvConfig {
     pub runtime_metrics_cache_ttl_ms: u64,
     /// Count backend pool creation/failure/eviction churn. Default: true.
     pub runtime_metrics_pool_tracking_enabled: bool,
+    /// Count extra `/metrics/runtime` HTTP status windows. Default: true.
+    pub runtime_metrics_status_tracking_enabled: bool,
     /// TCP listen backlog size for proxy listeners. Default: 2048.
     /// Higher values absorb connection bursts without SYN drops.
     pub tcp_listen_backlog: u32,
@@ -1458,6 +1460,7 @@ impl Default for EnvConfig {
             runtime_metrics_log_counter_enabled: true,
             runtime_metrics_cache_ttl_ms: 1000,
             runtime_metrics_pool_tracking_enabled: true,
+            runtime_metrics_status_tracking_enabled: true,
             tcp_listen_backlog: 2048,
             accept_threads: 0,
             server_http2_max_concurrent_streams: 1000,
@@ -1774,6 +1777,7 @@ impl EnvConfig {
             runtime_metrics_log_counter_enabled: bool = "FERRUM_METRICS_LOG_COUNTER_ENABLED" => true;
             runtime_metrics_cache_ttl_ms: u64 = "FERRUM_METRICS_RUNTIME_CACHE_MS" => 1000u64;
             runtime_metrics_pool_tracking_enabled: bool = "FERRUM_METRICS_POOL_TRACKING_ENABLED" => true;
+            runtime_metrics_status_tracking_enabled: bool = "FERRUM_METRICS_STATUS_TRACKING_ENABLED" => true;
             tcp_listen_backlog: u32 = "FERRUM_TCP_LISTEN_BACKLOG" => 2048u32, max(128u32);
             server_http2_max_concurrent_streams: u32 = "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS" => 1000u32, max(1u32);
             server_http2_max_pending_accept_reset_streams: usize = "FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS" => 64usize, max(1usize);
@@ -2124,6 +2128,7 @@ impl EnvConfig {
             runtime_metrics_log_counter_enabled,
             runtime_metrics_cache_ttl_ms,
             runtime_metrics_pool_tracking_enabled,
+            runtime_metrics_status_tracking_enabled,
             tcp_listen_backlog,
             accept_threads,
             server_http2_max_concurrent_streams,

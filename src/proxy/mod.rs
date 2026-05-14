@@ -7099,6 +7099,11 @@ async fn handle_proxy_request_inner(
     };
     let allows_request_body_buffering = http_flavor_allows_request_body_buffering(flavor);
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
+    if is_grpc_request {
+        ctx.metadata
+            .entry("request_protocol".to_string())
+            .or_insert_with(|| "grpc".to_string());
+    }
 
     // gRPC spec mandates POST method. Reject non-POST gRPC requests with a proper
     // gRPC trailers-only error rather than forwarding an invalid request to the backend.

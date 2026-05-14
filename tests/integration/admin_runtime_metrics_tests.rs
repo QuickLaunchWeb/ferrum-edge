@@ -128,7 +128,7 @@ fn seed_runtime_counters() {
     });
     metrics.record_dns_hit();
     metrics.record_dns_miss();
-    metrics.record_pool_handshake(PoolKind::Http1);
+    metrics.record_pool_handshake(PoolKind::HttpReqwest);
     metrics.record_log(LogLevel::Warn, "proxy");
 }
 
@@ -236,7 +236,7 @@ async fn runtime_metrics_endpoint_returns_seeded_json_shape() {
         "seeded DNS counters missing: {body}"
     );
     assert!(
-        body["connections"]["pool_handshakes_total"]["http1"]
+        body["connections"]["pool_handshakes_total"]["http_reqwest"]
             .as_u64()
             .unwrap_or(0)
             >= 1,

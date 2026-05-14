@@ -982,43 +982,53 @@ async fn run_tcp_accept_loop(
                         }
                     };
 
-                    let disconnected_wall_at = chrono::Utc::now();
-                    let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
-                    let summary = StreamTransactionSummary {
-                        namespace: proxy_namespace,
-                        proxy_id: final_proxy_id,
-                        proxy_name,
-                        client_ip,
-                        consumer_username,
-                        auth_method: stream_ctx.auth_method,
-                        backend_target: result.backend.backend_target,
-                        backend_resolved_ip: result.backend.backend_resolved_ip,
-                        protocol: backend_scheme.to_string(),
-                        listen_port: port,
-                        duration_ms,
-                        bytes_sent: bytes_in,
-                        bytes_received: bytes_out,
-                        connection_error: conn_error,
-                        error_class,
-                        disconnect_direction,
-                        disconnect_cause,
-                        timestamp_connected: connected_wall_at.to_rfc3339(),
-                        timestamp_disconnected: disconnected_wall_at.to_rfc3339(),
-                        sni_hostname: stream_ctx.sni_hostname.clone(),
-                        metadata: stream_ctx.take_metadata(),
-                    };
-                    crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
-                    if summary.error_class == Some(crate::retry::ErrorClass::ConnectionReset)
-                        && let Some(direction) = summary.disconnect_direction
-                    {
-                        crate::runtime_metrics::global_ref()
-                            .record_tcp_rst(&summary.proxy_id, direction);
-                    }
+                    if !plugins.is_empty() || error_class.is_some() {
+                        let disconnected_wall_at = chrono::Utc::now();
+                        let consumer_username = if !plugins.is_empty() {
+                            stream_ctx.effective_identity().map(str::to_owned)
+                        } else {
+                            None
+                        };
+                        let summary = StreamTransactionSummary {
+                            namespace: proxy_namespace,
+                            proxy_id: final_proxy_id,
+                            proxy_name,
+                            client_ip,
+                            consumer_username,
+                            auth_method: stream_ctx.auth_method,
+                            backend_target: result.backend.backend_target,
+                            backend_resolved_ip: result.backend.backend_resolved_ip,
+                            protocol: backend_scheme.to_string(),
+                            listen_port: port,
+                            duration_ms,
+                            bytes_sent: bytes_in,
+                            bytes_received: bytes_out,
+                            connection_error: conn_error,
+                            error_class,
+                            disconnect_direction,
+                            disconnect_cause,
+                            timestamp_connected: connected_wall_at.to_rfc3339(),
+                            timestamp_disconnected: disconnected_wall_at.to_rfc3339(),
+                            sni_hostname: stream_ctx.sni_hostname.clone(),
+                            metadata: if !plugins.is_empty() {
+                                stream_ctx.take_metadata()
+                            } else {
+                                Default::default()
+                            },
+                        };
+                        crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
+                        if summary.error_class == Some(crate::retry::ErrorClass::ConnectionReset)
+                            && let Some(direction) = summary.disconnect_direction
+                        {
+                            crate::runtime_metrics::global_ref()
+                                .record_tcp_rst(&summary.proxy_id, direction);
+                        }
 
-                    // Run on_stream_disconnect plugins (logging, metrics, etc.)
-                    if !plugins.is_empty() {
-                        for plugin in plugins.iter() {
-                            plugin.on_stream_disconnect(&summary).await;
+                        // Run on_stream_disconnect plugins (logging, metrics, etc.)
+                        if !plugins.is_empty() {
+                            for plugin in plugins.iter() {
+                                plugin.on_stream_disconnect(&summary).await;
+                            }
                         }
                     }
 

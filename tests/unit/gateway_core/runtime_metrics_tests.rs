@@ -18,7 +18,7 @@ fn runtime_metrics_counters_increment() {
     metrics.record_dns_hit();
     metrics.record_dns_miss();
     metrics.record_dns_error();
-    metrics.record_pool_handshake(PoolKind::Http1);
+    metrics.record_pool_handshake(PoolKind::HttpReqwest);
     metrics.record_pool_failure(PoolKind::Http3);
     metrics.record_pool_eviction(PoolKind::Grpc);
     metrics.record_log(LogLevel::Warn, "proxy");

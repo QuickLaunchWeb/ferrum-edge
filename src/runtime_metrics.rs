@@ -30,17 +30,11 @@ pub fn global_ref() -> &'static RuntimeMetrics {
         .as_ref()
 }
 
-#[derive(Debug, Hash, Eq, PartialEq, Clone)]
-pub struct ErrorKey {
-    pub proxy_id: Arc<str>,
-    pub class: &'static str,
-}
+pub type ErrorCounterMap = DashMap<&'static str, DashMap<Arc<str>, CachePadded<AtomicU64>>>;
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
 pub enum PoolKind {
-    Http1,
-    #[allow(dead_code)] // reqwest may negotiate H2 internally; kept as stable output vocabulary.
-    Http2Reqwest,
+    HttpReqwest,
     Http2Direct,
     Http3,
     Grpc,
@@ -50,8 +44,7 @@ pub enum PoolKind {
 impl PoolKind {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Http1 => "http1",
-            Self::Http2Reqwest => "http2_reqwest",
+            Self::HttpReqwest => "http_reqwest",
             Self::Http2Direct => "http2_direct",
             Self::Http3 => "http3",
             Self::Grpc => "grpc",
@@ -126,10 +119,10 @@ const ERROR_CLASSES: [&str; 15] = [
 ];
 
 pub struct RuntimeMetrics {
-    pub http_errors_by_class: DashMap<ErrorKey, CachePadded<AtomicU64>>,
-    pub grpc_errors_by_class: DashMap<ErrorKey, CachePadded<AtomicU64>>,
-    pub body_errors_by_class: DashMap<ErrorKey, CachePadded<AtomicU64>>,
-    pub stream_errors_by_class: DashMap<ErrorKey, CachePadded<AtomicU64>>,
+    pub http_errors_by_class: ErrorCounterMap,
+    pub grpc_errors_by_class: ErrorCounterMap,
+    pub body_errors_by_class: ErrorCounterMap,
+    pub stream_errors_by_class: ErrorCounterMap,
 
     pub dns_lookups_total: CachePadded<AtomicU64>,
     pub dns_cache_hits: CachePadded<AtomicU64>,
@@ -155,6 +148,7 @@ pub struct RuntimeMetrics {
 
     max_error_entries: AtomicUsize,
     pool_tracking_enabled: AtomicBool,
+    status_tracking_enabled: AtomicBool,
     cache_ttl_ms: AtomicU64,
     client_disconnects: CachePadded<AtomicU64>,
     reqwest_active_backend_requests: CachePadded<AtomicU64>,
@@ -197,6 +191,7 @@ impl RuntimeMetrics {
             started_at: Instant::now(),
             max_error_entries: AtomicUsize::new(200),
             pool_tracking_enabled: AtomicBool::new(true),
+            status_tracking_enabled: AtomicBool::new(true),
             cache_ttl_ms: AtomicU64::new(1000),
             client_disconnects: CachePadded::new(AtomicU64::new(0)),
             reqwest_active_backend_requests: CachePadded::new(AtomicU64::new(0)),
@@ -213,12 +208,15 @@ impl RuntimeMetrics {
         &self,
         max_error_entries: usize,
         pool_tracking_enabled: bool,
+        status_tracking_enabled: bool,
         cache_ttl_ms: u64,
     ) {
         self.max_error_entries
             .store(max_error_entries.max(1), Ordering::Relaxed);
         self.pool_tracking_enabled
             .store(pool_tracking_enabled, Ordering::Relaxed);
+        self.status_tracking_enabled
+            .store(status_tracking_enabled, Ordering::Relaxed);
         self.cache_ttl_ms.store(cache_ttl_ms, Ordering::Relaxed);
     }
 
@@ -227,6 +225,9 @@ impl RuntimeMetrics {
     }
 
     pub fn record_http_status(&self, status: u16) {
+        if !self.status_tracking_enabled.load(Ordering::Relaxed) {
+            return;
+        }
         self.increment_status_current(status);
     }
 
@@ -254,11 +255,11 @@ impl RuntimeMetrics {
         }
 
         if let Some(class) = summary.body_error_class {
-            let key = ErrorKey {
-                proxy_id: Arc::<str>::from(summary.proxy_id.as_deref().unwrap_or("unknown")),
-                class: class.as_str(),
-            };
-            self.increment_error_map(&self.body_errors_by_class, key);
+            self.increment_error_map(
+                &self.body_errors_by_class,
+                summary.proxy_id.as_deref().unwrap_or("unknown"),
+                class.as_str(),
+            );
         }
     }
 
@@ -279,8 +280,11 @@ impl RuntimeMetrics {
         if count_client_disconnect_class && class == ErrorClass::ClientDisconnect {
             self.client_disconnects.fetch_add(1, Ordering::Relaxed);
         }
-        let key = error_key(proxy_id, class);
-        self.increment_error_map(&self.http_errors_by_class, key);
+        self.increment_error_map(
+            &self.http_errors_by_class,
+            proxy_id.unwrap_or("unknown"),
+            class.as_str(),
+        );
     }
 
     fn record_grpc_error_inner(
@@ -292,17 +296,20 @@ impl RuntimeMetrics {
         if count_client_disconnect_class && class == ErrorClass::ClientDisconnect {
             self.client_disconnects.fetch_add(1, Ordering::Relaxed);
         }
-        let key = error_key(proxy_id, class);
-        self.increment_error_map(&self.grpc_errors_by_class, key);
+        self.increment_error_map(
+            &self.grpc_errors_by_class,
+            proxy_id.unwrap_or("unknown"),
+            class.as_str(),
+        );
     }
 
     pub fn record_stream_transaction(&self, summary: &StreamTransactionSummary) {
         if let Some(class) = summary.error_class {
-            let key = ErrorKey {
-                proxy_id: Arc::<str>::from(summary.proxy_id.as_str()),
-                class: class.as_str(),
-            };
-            self.increment_error_map(&self.stream_errors_by_class, key);
+            self.increment_error_map(
+                &self.stream_errors_by_class,
+                summary.proxy_id.as_str(),
+                class.as_str(),
+            );
         }
     }
 
@@ -339,8 +346,15 @@ impl RuntimeMetrics {
     }
 
     pub fn record_pool_eviction(&self, kind: PoolKind) {
+        self.record_pool_evictions(kind, 1);
+    }
+
+    pub fn record_pool_evictions(&self, kind: PoolKind, count: u64) {
+        if count == 0 {
+            return;
+        }
         if self.pool_tracking_enabled.load(Ordering::Relaxed) {
-            self.increment_pool_map(&self.pool_evictions_total, kind);
+            self.increment_pool_map_by(&self.pool_evictions_total, kind, count);
         }
     }
 
@@ -374,20 +388,38 @@ impl RuntimeMetrics {
         increment_status_map(&self.status_current_5m, status);
     }
 
-    fn increment_error_map(&self, map: &DashMap<ErrorKey, CachePadded<AtomicU64>>, key: ErrorKey) {
-        if let Some(counter) = map.get(&key) {
+    fn increment_error_map(&self, map: &ErrorCounterMap, proxy_id: &str, class: &'static str) {
+        if let Some(class_counters) = map.get(class)
+            && let Some(counter) = class_counters.get(proxy_id)
+        {
             counter.fetch_add(1, Ordering::Relaxed);
-        } else if map.len() < self.max_error_entries.load(Ordering::Relaxed) {
-            map.entry(key)
-                .or_insert_with(|| CachePadded::new(AtomicU64::new(0)))
-                .fetch_add(1, Ordering::Relaxed);
+            return;
         }
+
+        if error_map_len(map) >= self.max_error_entries.load(Ordering::Relaxed) {
+            return;
+        }
+
+        map.entry(class)
+            .or_default()
+            .entry(Arc::<str>::from(proxy_id))
+            .or_insert_with(|| CachePadded::new(AtomicU64::new(0)))
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn increment_pool_map(&self, map: &DashMap<PoolKind, CachePadded<AtomicU64>>, kind: PoolKind) {
+        self.increment_pool_map_by(map, kind, 1);
+    }
+
+    fn increment_pool_map_by(
+        &self,
+        map: &DashMap<PoolKind, CachePadded<AtomicU64>>,
+        kind: PoolKind,
+        count: u64,
+    ) {
         map.entry(kind)
             .or_insert_with(|| CachePadded::new(AtomicU64::new(0)))
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     fn rotate_status_window(&self, window: StatusWindow) {
@@ -449,11 +481,8 @@ fn increment_status_map(map: &DashMap<u16, CachePadded<AtomicU64>>, status: u16)
     }
 }
 
-fn error_key(proxy_id: Option<&str>, class: ErrorClass) -> ErrorKey {
-    ErrorKey {
-        proxy_id: Arc::<str>::from(proxy_id.unwrap_or("unknown")),
-        class: class.as_str(),
-    }
+fn error_map_len(map: &ErrorCounterMap) -> usize {
+    map.iter().map(|entry| entry.value().len()).sum()
 }
 
 enum StatusWindow {
@@ -714,23 +743,25 @@ fn build_errors_snapshot(metrics: &RuntimeMetrics) -> ErrorsSnapshot {
 }
 
 fn fold_error_map(
-    map: &DashMap<ErrorKey, CachePadded<AtomicU64>>,
+    map: &ErrorCounterMap,
     slot: impl Fn(&mut ErrorClassCounts) -> &mut u64,
     by_class: &mut BTreeMap<&'static str, ErrorClassCounts>,
     by_proxy: &mut BTreeMap<String, BTreeMap<&'static str, u64>>,
 ) {
-    for entry in map.iter() {
-        let count = entry.value().load(Ordering::Relaxed);
-        let class = entry.key().class;
-        let counts = by_class.entry(class).or_default();
-        let field = slot(counts);
-        *field = field.saturating_add(count);
-        by_proxy
-            .entry(entry.key().proxy_id.to_string())
-            .or_default()
-            .entry(class)
-            .and_modify(|value| *value = value.saturating_add(count))
-            .or_insert(count);
+    for class_entry in map.iter() {
+        let class = *class_entry.key();
+        for proxy_entry in class_entry.value().iter() {
+            let count = proxy_entry.value().load(Ordering::Relaxed);
+            let counts = by_class.entry(class).or_default();
+            let field = slot(counts);
+            *field = field.saturating_add(count);
+            by_proxy
+                .entry(proxy_entry.key().to_string())
+                .or_default()
+                .entry(class)
+                .and_modify(|value| *value = value.saturating_add(count))
+                .or_insert(count);
+        }
     }
 }
 
@@ -1000,6 +1031,18 @@ mod tests {
                 .map(|counts| (counts.http, counts.grpc)),
             Some((0, 1))
         );
+    }
+
+    #[test]
+    fn status_tracking_can_be_disabled() {
+        let metrics = RuntimeMetrics::new();
+        metrics.configure(200, true, false, 1000);
+
+        metrics.record_http_status(200);
+        metrics.rotate_status_window(StatusWindow::OneMinute(60));
+
+        assert_eq!(metrics.requests_window_1m.load(Ordering::Relaxed), 0);
+        assert!(metrics.status_window_1m.is_empty());
     }
 
     #[test]

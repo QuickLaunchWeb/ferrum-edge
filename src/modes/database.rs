@@ -324,6 +324,7 @@ pub async fn run(
     crate::runtime_metrics::global().configure(
         env_config.status_counts_max_entries,
         env_config.runtime_metrics_pool_tracking_enabled,
+        env_config.runtime_metrics_status_tracking_enabled,
         env_config.runtime_metrics_cache_ttl_ms,
     );
 

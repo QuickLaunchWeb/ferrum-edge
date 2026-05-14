@@ -190,7 +190,7 @@ impl PoolManager for ReqwestPoolManager {
     }
 
     fn runtime_metrics_kind(&self) -> Option<crate::runtime_metrics::PoolKind> {
-        Some(crate::runtime_metrics::PoolKind::Http1)
+        Some(crate::runtime_metrics::PoolKind::HttpReqwest)
     }
 }
 

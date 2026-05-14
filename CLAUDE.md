@@ -88,6 +88,8 @@ PRs: format → tests (parallel) → lint → perf regression → build 5 target
 
 **`/health` DB check cached 15s via lock-free `ArcSwap`** (`AdminState.CachedDbHealthResult`). Endpoints unauthenticated; without caching an attacker could flood `SELECT 1` and exhaust `FERRUM_DB_POOL_MAX_CONNECTIONS` (default 32). Do not remove. Response includes `database.pool` stats when connected.
 
+**`/metrics/runtime` JSON response cached via lock-free `ArcSwap`** (`runtime_metrics_cache()`). Endpoint is JWT-authenticated; without caching, aggressive polling would amplify system sampling and serialization work. Do not remove.
+
 **`GET /cluster`** (JWT-auth): CP returns connected DPs (from `DpNodeRegistry`, auto-removed on stream drop via `TrackedStream`); DP returns CP connection state (from `DpCpConnectionState`, primary vs fallback, `last_config_received_at`).
 
 ### Core Design Principles
