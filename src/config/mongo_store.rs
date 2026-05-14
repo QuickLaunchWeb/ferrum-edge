@@ -32,6 +32,7 @@ mod inner {
     use crate::config::types::{
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, Proxy, Upstream,
     };
+    use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
     use arc_swap::ArcSwap;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
@@ -46,6 +47,33 @@ mod inner {
     use tracing::{debug, info, warn};
     // regex::escape is used for safe MongoDB $regex pattern construction in list filters.
     use regex::escape as regex_escape;
+
+    fn mesh_route_dispatch_references_upstream_id(
+        plugin: &PluginConfig,
+        upstream_id: &str,
+    ) -> bool {
+        if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+            return false;
+        }
+        MeshRouteDispatchConfig::from_value(&plugin.config)
+            .is_ok_and(|config| config.references_upstream_id(upstream_id))
+    }
+
+    fn mesh_route_dispatch_referenced_upstream(
+        plugin: &PluginConfig,
+        upstream_ids: &HashSet<String>,
+    ) -> Option<String> {
+        if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+            return None;
+        }
+        let config = MeshRouteDispatchConfig::from_value(&plugin.config).ok()?;
+        config
+            .rules
+            .iter()
+            .filter_map(|rule| rule.destination.upstream_id.as_deref())
+            .find(|upstream_id| upstream_ids.contains(*upstream_id))
+            .map(ToOwned::to_owned)
+    }
 
     /// Connection settings captured at startup so `reconnect()` and
     /// `try_failover_reconnect()` can rebuild the underlying `Client` against
@@ -630,6 +658,38 @@ mod inner {
             Ok(())
         }
 
+        async fn find_mesh_route_dispatch_upstream_ref_opt_session(
+            &self,
+            session: Option<&mut ClientSession>,
+            upstream_id: &str,
+        ) -> Result<Option<PluginConfig>, anyhow::Error> {
+            if let Some(s) = session {
+                let mut cursor = self
+                    .plugin_configs()
+                    .find(doc! { "plugin_name": "mesh_route_dispatch", "enabled": true })
+                    .session(&mut *s)
+                    .await?;
+                while cursor.advance(&mut *s).await? {
+                    let plugin = doc_to_plugin_config(cursor.deserialize_current()?)?;
+                    if mesh_route_dispatch_references_upstream_id(&plugin, upstream_id) {
+                        return Ok(Some(plugin));
+                    }
+                }
+            } else {
+                let mut cursor = self
+                    .plugin_configs()
+                    .find(doc! { "plugin_name": "mesh_route_dispatch", "enabled": true })
+                    .await?;
+                while cursor.advance().await? {
+                    let plugin = doc_to_plugin_config(cursor.deserialize_current()?)?;
+                    if mesh_route_dispatch_references_upstream_id(&plugin, upstream_id) {
+                        return Ok(Some(plugin));
+                    }
+                }
+            }
+            Ok(None)
+        }
+
         async fn current_api_spec_resource_hash(
             &self,
             bundle: &crate::admin::api_specs::ExtractedBundle,
@@ -736,8 +796,8 @@ mod inner {
             spec_id: &str,
             spec_proxy_id: &str,
         ) -> Result<(), anyhow::Error> {
-            let mut upstream_ids = Vec::new();
-            let external = if let Some(s) = session {
+            if let Some(s) = session {
+                let mut upstream_ids = Vec::new();
                 let mut upstream_cursor = self
                     .upstreams()
                     .find(doc! { "api_spec_id": spec_id, "namespace": namespace })
@@ -757,15 +817,52 @@ mod inner {
                 }
 
                 let filter = doc! {
-                    "upstream_id": { "$in": upstream_ids },
+                    "upstream_id": { "$in": &upstream_ids },
                     "_id": { "$ne": spec_proxy_id },
                 };
-                self.proxies()
+                let external = self
+                    .proxies()
                     .find_one(filter)
                     .projection(doc! { "_id": 1, "upstream_id": 1 })
                     .session(&mut *s)
-                    .await?
+                    .await?;
+                if let Some(doc) = external {
+                    let proxy_id = doc.get_str("_id").unwrap_or("<unknown>");
+                    let upstream_id = doc.get_str("upstream_id").unwrap_or("<unknown>");
+                    anyhow::bail!(
+                        "proxy '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                         detach it before replacing or deleting the API spec",
+                        proxy_id,
+                        upstream_id,
+                        spec_id
+                    );
+                }
+
+                let spec_upstream_ids: HashSet<String> = upstream_ids.iter().cloned().collect();
+                let mut plugin_cursor = self
+                    .plugin_configs()
+                    .find(doc! { "plugin_name": "mesh_route_dispatch", "enabled": true })
+                    .session(&mut *s)
+                    .await?;
+                while plugin_cursor.advance(&mut *s).await? {
+                    let plugin = doc_to_plugin_config(plugin_cursor.deserialize_current()?)?;
+                    if plugin.api_spec_id.as_deref() == Some(spec_id) {
+                        continue;
+                    }
+                    if let Some(upstream_id) =
+                        mesh_route_dispatch_referenced_upstream(&plugin, &spec_upstream_ids)
+                    {
+                        anyhow::bail!(
+                            "mesh_route_dispatch plugin_config '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                             detach it before replacing or deleting the API spec",
+                            plugin.id,
+                            upstream_id,
+                            spec_id
+                        );
+                    }
+                }
             } else {
+                let mut upstream_ids = Vec::new();
                 let mut upstream_cursor = self
                     .upstreams()
                     .find(doc! { "api_spec_id": spec_id, "namespace": namespace })
@@ -783,24 +880,48 @@ mod inner {
                 }
 
                 let filter = doc! {
-                    "upstream_id": { "$in": upstream_ids },
+                    "upstream_id": { "$in": &upstream_ids },
                     "_id": { "$ne": spec_proxy_id },
                 };
-                self.proxies()
+                let external = self
+                    .proxies()
                     .find_one(filter)
                     .projection(doc! { "_id": 1, "upstream_id": 1 })
-                    .await?
-            };
-            if let Some(doc) = external {
-                let proxy_id = doc.get_str("_id").unwrap_or("<unknown>");
-                let upstream_id = doc.get_str("upstream_id").unwrap_or("<unknown>");
-                anyhow::bail!(
-                    "proxy '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
-                     detach it before replacing or deleting the API spec",
-                    proxy_id,
-                    upstream_id,
-                    spec_id
-                );
+                    .await?;
+                if let Some(doc) = external {
+                    let proxy_id = doc.get_str("_id").unwrap_or("<unknown>");
+                    let upstream_id = doc.get_str("upstream_id").unwrap_or("<unknown>");
+                    anyhow::bail!(
+                        "proxy '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                         detach it before replacing or deleting the API spec",
+                        proxy_id,
+                        upstream_id,
+                        spec_id
+                    );
+                }
+
+                let spec_upstream_ids: HashSet<String> = upstream_ids.iter().cloned().collect();
+                let mut plugin_cursor = self
+                    .plugin_configs()
+                    .find(doc! { "plugin_name": "mesh_route_dispatch", "enabled": true })
+                    .await?;
+                while plugin_cursor.advance().await? {
+                    let plugin = doc_to_plugin_config(plugin_cursor.deserialize_current()?)?;
+                    if plugin.api_spec_id.as_deref() == Some(spec_id) {
+                        continue;
+                    }
+                    if let Some(upstream_id) =
+                        mesh_route_dispatch_referenced_upstream(&plugin, &spec_upstream_ids)
+                    {
+                        anyhow::bail!(
+                            "mesh_route_dispatch plugin_config '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                             detach it before replacing or deleting the API spec",
+                            plugin.id,
+                            upstream_id,
+                            spec_id
+                        );
+                    }
+                }
             }
 
             Ok(())
@@ -1455,7 +1576,17 @@ mod inner {
                                         .session(&mut *s)
                                         .await?
                                         > 0;
-                                    if !still_referenced {
+                                    let dispatch_ref = if !still_referenced {
+                                        this.find_mesh_route_dispatch_upstream_ref_opt_session(
+                                            Some(&mut *s),
+                                            uid,
+                                        )
+                                        .await
+                                        .map_err(|e| mongodb::error::Error::custom(e.to_string()))?
+                                    } else {
+                                        None
+                                    };
+                                    if !still_referenced && dispatch_ref.is_none() {
                                         let _ = this
                                             .upstreams()
                                             .delete_one(mongodb::bson::doc! { "_id": uid.as_str() })
@@ -1523,7 +1654,13 @@ mod inner {
                         .count_documents(doc! { "upstream_id": uid })
                         .await?
                         > 0;
-                    if !still_referenced {
+                    let dispatch_ref = if !still_referenced {
+                        self.find_mesh_route_dispatch_upstream_ref_opt_session(None, uid)
+                            .await?
+                    } else {
+                        None
+                    };
+                    if !still_referenced && dispatch_ref.is_none() {
                         info!("Cascade-deleting orphaned upstream {}", uid);
                         let _ = self.upstreams().delete_one(doc! { "_id": uid }).await;
                     }
@@ -1784,6 +1921,26 @@ mod inner {
 
         async fn delete_upstream(&self, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
+            let proxy_refs = self
+                .proxies()
+                .count_documents(doc! { "upstream_id": id })
+                .await?;
+            if proxy_refs > 0 {
+                anyhow::bail!(
+                    "Upstream {} is referenced by one or more proxies and cannot be deleted",
+                    id
+                );
+            }
+            if let Some(plugin) = self
+                .find_mesh_route_dispatch_upstream_ref_opt_session(None, id)
+                .await?
+            {
+                anyhow::bail!(
+                    "Upstream {} is referenced by mesh_route_dispatch plugin_config '{}' and cannot be deleted",
+                    id,
+                    plugin.id
+                );
+            }
             let result = self.upstreams().delete_one(doc! { "_id": id }).await?;
             self.check_slow_query("delete_upstream", start);
             Ok(result.deleted_count > 0)
@@ -1806,7 +1963,13 @@ mod inner {
                 .proxies()
                 .count_documents(doc! { "upstream_id": upstream_id })
                 .await?;
-            if count == 0 {
+            let dispatch_ref = if count == 0 {
+                self.find_mesh_route_dispatch_upstream_ref_opt_session(None, upstream_id)
+                    .await?
+            } else {
+                None
+            };
+            if count == 0 && dispatch_ref.is_none() {
                 self.upstreams()
                     .delete_one(doc! { "_id": upstream_id })
                     .await?;

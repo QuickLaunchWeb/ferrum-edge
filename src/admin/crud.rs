@@ -555,9 +555,9 @@ impl AdminResource for Upstream {
     }
 
     fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
-        if error
-            .to_string()
-            .contains("referenced by one or more proxies")
+        let error_text = error.to_string();
+        if error_text.contains("referenced by one or more proxies")
+            || error_text.contains("referenced by mesh_route_dispatch plugin_config")
         {
             return super::json_response(
                 StatusCode::CONFLICT,

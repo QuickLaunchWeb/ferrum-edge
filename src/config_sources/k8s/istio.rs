@@ -16,14 +16,15 @@ use crate::modes::mesh::config::{
 
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions,
-    MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind, exact_path_listen_path,
-    fault_injection_plugin_for_proxy, invalid_resource, mesh_route_dispatch_can_emit_rule,
-    mesh_route_dispatch_has_unsupported_predicate, mesh_route_dispatch_plugin_for_proxy,
-    mesh_route_dispatch_uri_less_rules, optional_port_field, parse_istio_duration_ms,
-    port_from_u64, proxy_for_route, resource_id, selector_from_istio, string_array, string_field,
-    string_map, upstream_for_route,
+    MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
+    attach_route_plugins_to_proxy, exact_path_listen_path, fault_injection_plugin_for_proxy,
+    invalid_resource, mesh_route_dispatch_can_emit_rule,
+    mesh_route_dispatch_has_unsupported_predicate, mesh_route_dispatch_plugin_from_rules,
+    mesh_route_dispatch_rules_for_proxy, optional_port_field, parse_istio_duration_ms,
+    port_from_u64, proxy_for_route, request_termination_plugin_for_proxy, resource_id,
+    selector_from_istio, string_array, string_field, string_map, upstream_for_route,
 };
-use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT, PluginConfig, RetryConfig};
+use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT, PluginConfig, Proxy, RetryConfig};
 
 const URI_LESS_MATCH_LISTEN_PATH: &str = "~.*";
 
@@ -1196,6 +1197,102 @@ type VsRouteResult = (
     Vec<PluginConfig>,
 );
 
+struct PendingRouteDispatch {
+    proxy: Proxy,
+    route_plugins: Vec<PluginConfig>,
+    rules: Vec<Value>,
+    is_uri_less_catch_all: bool,
+    force_terminate: bool,
+}
+
+fn stash_pending_route_dispatch(
+    pending: &mut Vec<(Option<String>, PendingRouteDispatch)>,
+    listen_path: Option<String>,
+    proxy: Proxy,
+    route_plugins: Vec<PluginConfig>,
+    rules: Vec<Value>,
+    is_uri_less_catch_all: bool,
+    force_terminate: bool,
+) {
+    if let Some((_, bucket)) = pending.iter_mut().find(|(key, _)| *key == listen_path) {
+        bucket.proxy = proxy;
+        bucket.route_plugins = route_plugins;
+        bucket.rules.extend(rules);
+        bucket.is_uri_less_catch_all = is_uri_less_catch_all;
+        bucket.force_terminate |= force_terminate;
+    } else {
+        pending.push((
+            listen_path,
+            PendingRouteDispatch {
+                proxy,
+                route_plugins,
+                rules,
+                is_uri_less_catch_all,
+                force_terminate,
+            },
+        ));
+    }
+}
+
+fn take_pending_route_dispatch(
+    pending: &mut Vec<(Option<String>, PendingRouteDispatch)>,
+    listen_path: &Option<String>,
+) -> Option<PendingRouteDispatch> {
+    let index = pending.iter().position(|(key, _)| key == listen_path)?;
+    Some(pending.remove(index).1)
+}
+
+fn route_has_local_policy(
+    route_plugins: &[PluginConfig],
+    retry: &Option<RetryConfig>,
+    timeout_ms: Option<u64>,
+) -> bool {
+    !route_plugins.is_empty() || retry.is_some() || timeout_ms.is_some()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_route_candidate(
+    proxies: &mut Vec<Proxy>,
+    plugins: &mut Vec<PluginConfig>,
+    deferred_uri_less_proxies: &mut Vec<Proxy>,
+    deferred_uri_less_plugins: &mut Vec<PluginConfig>,
+    namespace: &str,
+    mut proxy: Proxy,
+    mut route_plugins: Vec<PluginConfig>,
+    dispatch_rules: Vec<Value>,
+    reject_unmatched: bool,
+    is_uri_less_catch_all: bool,
+    force_terminate: bool,
+) {
+    let terminate_unconditionally = force_terminate && dispatch_rules.is_empty();
+    if terminate_unconditionally {
+        route_plugins.push(request_termination_plugin_for_proxy(
+            &proxy.id,
+            namespace,
+            "unsupported Istio VirtualService match predicate",
+        ));
+    }
+
+    let reject_unmatched = reject_unmatched || force_terminate;
+    if let Some(plugin) = mesh_route_dispatch_plugin_from_rules(
+        &proxy.id,
+        namespace,
+        dispatch_rules,
+        reject_unmatched,
+    ) {
+        route_plugins.push(plugin);
+    }
+
+    attach_route_plugins_to_proxy(&mut proxy, &route_plugins);
+    if is_uri_less_catch_all {
+        deferred_uri_less_plugins.extend(route_plugins);
+        deferred_uri_less_proxies.push(proxy);
+    } else {
+        plugins.extend(route_plugins);
+        proxies.push(proxy);
+    }
+}
+
 fn virtual_service_routes(
     object: &K8sObject,
     acc: &mut K8sAccumulator,
@@ -1206,18 +1303,20 @@ fn virtual_service_routes(
     let mut plugins = Vec::new();
     let mut deferred_uri_less_proxies = Vec::new();
     let mut deferred_uri_less_plugins = Vec::new();
-    let mut prior_uri_less_route_rules: Vec<Value> = Vec::new();
-
-    for (index, http) in object
+    let mut pending_uri_less_route: Option<PendingRouteDispatch> = None;
+    let mut pending_scoped_routes: Vec<(Option<String>, PendingRouteDispatch)> = Vec::new();
+    let http_routes: Vec<&Value> = object
         .spec
         .get("http")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .enumerate()
-    {
-        let match_paths = match_paths(http, acc.options.vs_header_routing_experimental);
-        if match_paths.is_empty() {
+        .collect();
+
+    for (index, http) in http_routes.iter().copied().enumerate() {
+        let route_candidates =
+            route_candidate_paths(http, acc.options.vs_header_routing_experimental);
+        if route_candidates.is_empty() {
             continue;
         }
 
@@ -1249,8 +1348,10 @@ fn virtual_service_routes(
         let retry = route_retry_config(http);
         let timeout_ms = route_timeout_ms(http);
 
-        let match_count = match_paths.len();
-        for (match_index, listen_path) in match_paths.into_iter().enumerate() {
+        let match_count = route_candidates.len();
+        for (match_index, (listen_path, force_terminate_current)) in
+            route_candidates.into_iter().enumerate()
+        {
             let is_uri_less_catch_all = listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH);
             let mut route_plugins = Vec::new();
             let suffix = if match_count == 1 {
@@ -1276,43 +1377,27 @@ fn virtual_service_routes(
                 route_plugins.push(plugin);
             }
 
-            // `mesh_route_dispatch`: per-route header/method/queryParam
-            // matching. Gated behind `vs_header_routing_experimental`
-            // (`FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL`) so existing
-            // deployments see zero behavior change on upgrade. The plugin
-            // surfaces the predicates via `route_override_*` on the request
-            // context; the dispatcher shadows the matched `Proxy` with the
-            // overrides applied via `apply_route_overrides` so downstream
-            // pool keys, capability-registry lookups, circuit-breaker keys,
-            // and URL construction all derive from the effective destination.
-            //
-            // `listen_path` is passed so the plugin scopes match entries to
-            // this proxy. Without it, an `http.match[]` with `[{uri:/a},
-            // {uri:/b, headers:...}]` would let the `/b` header rule bleed
-            // into the `/a` proxy, and -- with `reject_unmatched: true` --
-            // a URI-only sibling entry would cause valid traffic to 404.
-            if acc.options.vs_header_routing_experimental
-                && let Some(plugin) = mesh_route_dispatch_plugin_for_proxy(
-                    &proxy_id,
-                    &object.metadata.namespace,
-                    http,
-                    listen_path.as_deref(),
-                    MeshRouteDispatchDestination {
-                        backend_host: backend_host.as_str(),
-                        backend_port,
-                        upstream_id: upstream_id.as_deref(),
-                    },
-                    &prior_uri_less_route_rules,
-                )
-            {
-                route_plugins.push(plugin);
-            }
+            let (current_route_rules, has_uri_only_match) =
+                if acc.options.vs_header_routing_experimental {
+                    mesh_route_dispatch_rules_for_proxy(
+                        http,
+                        listen_path.as_deref(),
+                        MeshRouteDispatchDestination {
+                            backend_host: backend_host.as_str(),
+                            backend_port,
+                            upstream_id: upstream_id.as_deref(),
+                        },
+                        false,
+                    )
+                } else {
+                    (Vec::new(), false)
+                };
 
             let proxy = proxy_for_route(RouteProxySpec {
                 id: proxy_id,
                 namespace: object.metadata.namespace.clone(),
                 hosts: hosts.clone(),
-                listen_path,
+                listen_path: listen_path.clone(),
                 strip_listen_path: false,
                 backend_host: backend_host.clone(),
                 backend_port,
@@ -1323,37 +1408,177 @@ fn virtual_service_routes(
                 backend_read_timeout_ms: timeout_ms,
             });
 
-            // URI-less VirtualService matches are represented by a synthetic
-            // regex catch-all. Keep those proxies after all concrete
-            // URI-derived routes for this VirtualService so an earlier
-            // header-only route can decorate a later regex route without its
-            // own `~.*` proxy winning the regex first-match slot and returning
-            // 404 before the later route has a chance to run.
-            if is_uri_less_catch_all {
-                deferred_uri_less_plugins.extend(route_plugins);
-                deferred_uri_less_proxies.push(proxy);
-            } else {
-                plugins.extend(route_plugins);
-                proxies.push(proxy);
+            // `mesh_route_dispatch` candidates whose every in-scope match entry
+            // is guarded by method/header/queryParam predicates cannot stand as
+            // independent proxies when a later route has the same listen_path:
+            // a predicate miss must fall through to the later route, but Ferrum's
+            // hot router selects exactly one proxy. Stash those guarded rules and
+            // prepend them to the later materialized proxy. URI-less guarded
+            // rules are stashed globally and decorate every later concrete route;
+            // a synthetic `~.*` catch-all is emitted at the end for paths no later
+            // route handles.
+            let current_route_has_rules = !current_route_rules.is_empty();
+            let guarded_route = force_terminate_current
+                || (acc.options.vs_header_routing_experimental
+                    && current_route_has_rules
+                    && !has_uri_only_match);
+            let has_later_same_path = guarded_route
+                && !is_uri_less_catch_all
+                && http_routes.iter().skip(index + 1).any(|later| {
+                    route_candidate_paths(later, acc.options.vs_header_routing_experimental)
+                        .iter()
+                        .any(|(later_path, _)| later_path == &listen_path)
+                });
+            let has_later_any_path = is_uri_less_catch_all
+                && http_routes.iter().skip(index + 1).any(|later| {
+                    !route_candidate_paths(later, acc.options.vs_header_routing_experimental)
+                        .is_empty()
+                });
+            let consumes_pending_uri_less = pending_uri_less_route.is_some();
+            let consumes_pending_scoped = pending_scoped_routes
+                .iter()
+                .any(|(key, _)| key == &listen_path);
+            let collapse_required = has_later_same_path
+                || consumes_pending_scoped
+                || (is_uri_less_catch_all
+                    && (has_later_any_path || pending_uri_less_route.is_some()));
+            if route_has_local_policy(&route_plugins, &retry, timeout_ms)
+                && (consumes_pending_uri_less
+                    || consumes_pending_scoped
+                    || (guarded_route && collapse_required))
+            {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "VirtualService HTTP route {index} uses route-local fault/retries/timeout policy on a route that must be merged with another route; Ferrum cannot apply that policy per mesh_route_dispatch rule"
+                    ),
+                ));
             }
-        }
 
-        if acc.options.vs_header_routing_experimental {
-            prior_uri_less_route_rules.extend(mesh_route_dispatch_uri_less_rules(
-                http,
-                MeshRouteDispatchDestination {
-                    backend_host: backend_host.as_str(),
-                    backend_port,
-                    upstream_id: upstream_id.as_deref(),
-                },
-            ));
+            if guarded_route && (is_uri_less_catch_all || has_later_same_path) {
+                if is_uri_less_catch_all {
+                    if let Some(bucket) = pending_uri_less_route.as_mut() {
+                        bucket.proxy = proxy;
+                        bucket.route_plugins = route_plugins;
+                        bucket.rules.extend(current_route_rules);
+                        bucket.is_uri_less_catch_all = true;
+                        bucket.force_terminate |= force_terminate_current;
+                    } else {
+                        pending_uri_less_route = Some(PendingRouteDispatch {
+                            proxy,
+                            route_plugins,
+                            rules: current_route_rules,
+                            is_uri_less_catch_all: true,
+                            force_terminate: force_terminate_current,
+                        });
+                    }
+                } else {
+                    stash_pending_route_dispatch(
+                        &mut pending_scoped_routes,
+                        listen_path.clone(),
+                        proxy,
+                        route_plugins,
+                        current_route_rules,
+                        false,
+                        force_terminate_current,
+                    );
+                }
+                continue;
+            }
+
+            let mut dispatch_rules = Vec::new();
+            let mut force_terminate = force_terminate_current;
+            if let Some(bucket) = pending_uri_less_route.as_ref() {
+                dispatch_rules.extend(bucket.rules.iter().cloned());
+                force_terminate |= bucket.force_terminate;
+            }
+            if let Some(bucket) =
+                take_pending_route_dispatch(&mut pending_scoped_routes, &listen_path)
+            {
+                dispatch_rules.extend(bucket.rules);
+                force_terminate |= bucket.force_terminate;
+            }
+
+            dispatch_rules.extend(current_route_rules);
+            let reject_unmatched = guarded_route && !force_terminate;
+
+            materialize_route_candidate(
+                &mut proxies,
+                &mut plugins,
+                &mut deferred_uri_less_proxies,
+                &mut deferred_uri_less_plugins,
+                &object.metadata.namespace,
+                proxy,
+                route_plugins,
+                dispatch_rules,
+                reject_unmatched,
+                is_uri_less_catch_all,
+                force_terminate,
+            );
         }
+    }
+
+    for (_, bucket) in pending_scoped_routes {
+        materialize_route_candidate(
+            &mut proxies,
+            &mut plugins,
+            &mut deferred_uri_less_proxies,
+            &mut deferred_uri_less_plugins,
+            &object.metadata.namespace,
+            bucket.proxy,
+            bucket.route_plugins,
+            bucket.rules,
+            true,
+            bucket.is_uri_less_catch_all,
+            bucket.force_terminate,
+        );
+    }
+    if let Some(bucket) = pending_uri_less_route {
+        materialize_route_candidate(
+            &mut proxies,
+            &mut plugins,
+            &mut deferred_uri_less_proxies,
+            &mut deferred_uri_less_plugins,
+            &object.metadata.namespace,
+            bucket.proxy,
+            bucket.route_plugins,
+            bucket.rules,
+            true,
+            true,
+            bucket.force_terminate,
+        );
     }
 
     plugins.extend(deferred_uri_less_plugins);
     proxies.extend(deferred_uri_less_proxies);
 
     Ok((proxies, upstreams, plugins))
+}
+
+fn route_candidate_paths(
+    http: &Value,
+    vs_header_routing_experimental: bool,
+) -> Vec<(Option<String>, bool)> {
+    let supported_paths = match_paths(http, vs_header_routing_experimental);
+    let mut seen_paths: HashSet<Option<String>> = HashSet::with_capacity(supported_paths.len());
+    let mut candidates = Vec::with_capacity(supported_paths.len());
+    for path in supported_paths {
+        seen_paths.insert(path.clone());
+        candidates.push((path, false));
+    }
+
+    for path in unsupported_match_paths(http, vs_header_routing_experimental) {
+        if seen_paths.insert(path.clone()) {
+            candidates.push((path, true));
+        } else if let Some((_, force_terminate)) = candidates
+            .iter_mut()
+            .find(|(candidate_path, _)| candidate_path == &path)
+        {
+            *force_terminate = true;
+        }
+    }
+
+    candidates
 }
 
 fn match_paths(http: &Value, vs_header_routing_experimental: bool) -> Vec<Option<String>> {
@@ -1399,6 +1624,47 @@ fn match_paths(http: &Value, vs_header_routing_experimental: bool) -> Vec<Option
             .any(|m| m.get("uri").is_none() && mesh_route_dispatch_can_emit_rule(m))
     {
         paths.push(Some(URI_LESS_MATCH_LISTEN_PATH.to_string()));
+    }
+
+    paths
+}
+
+fn unsupported_match_paths(
+    http: &Value,
+    vs_header_routing_experimental: bool,
+) -> Vec<Option<String>> {
+    if !vs_header_routing_experimental {
+        return Vec::new();
+    }
+
+    let Some(matches) = http.get("match").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    if matches.is_empty() {
+        return Vec::new();
+    }
+
+    let mut seen_paths: HashSet<Option<String>> = HashSet::new();
+    let mut paths = Vec::new();
+    for entry in matches
+        .iter()
+        .filter(|entry| mesh_route_dispatch_has_unsupported_predicate(entry))
+    {
+        let ignore_uri_case_is_unsupported = entry
+            .get("ignoreUriCase")
+            .is_some_and(|value| value.as_bool() != Some(false));
+        let listen_path = if ignore_uri_case_is_unsupported {
+            Some(URI_LESS_MATCH_LISTEN_PATH.to_string())
+        } else {
+            entry
+                .get("uri")
+                .and_then(path_match)
+                .map(Some)
+                .unwrap_or_else(|| Some(URI_LESS_MATCH_LISTEN_PATH.to_string()))
+        };
+        if seen_paths.insert(listen_path.clone()) {
+            paths.push(listen_path);
+        }
     }
 
     paths
@@ -2283,6 +2549,13 @@ mod tests {
             namespace.to_string(),
             TrustDomain::new("cluster.local").expect("test trust domain"),
         )
+    }
+
+    fn proxy_has_plugin(proxy: &Proxy, plugin: &PluginConfig) -> bool {
+        proxy
+            .plugins
+            .iter()
+            .any(|assoc| assoc.plugin_config_id == plugin.id)
     }
 
     fn object(kind: &str, spec: Value) -> K8sObject {
@@ -5689,6 +5962,10 @@ mod tests {
             plugin.proxy_id.as_deref(),
             Some(result.config.proxies[0].id.as_str())
         );
+        assert!(
+            proxy_has_plugin(&result.config.proxies[0], plugin),
+            "generated fault_injection config must be associated with the proxy or PluginCache will not instantiate it"
+        );
     }
 
     // -- mesh_route_dispatch ----------------------------------------------
@@ -5752,6 +6029,16 @@ mod tests {
             plugin.scope,
             crate::config::types::PluginScope::Proxy
         ));
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| plugin.proxy_id.as_deref() == Some(p.id.as_str()))
+            .expect("plugin proxy exists");
+        assert!(
+            proxy_has_plugin(proxy, plugin),
+            "generated mesh_route_dispatch config must be associated with its proxy"
+        );
         let rules = plugin
             .config
             .get("rules")
@@ -5840,7 +6127,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_service_regex_uri_with_ignored_predicates_does_not_materialize_route() {
+    fn virtual_service_regex_uri_with_ignored_predicates_fails_closed() {
         // Unsupported non-URI match shapes (regex method/header/queryParam)
         // cannot be enforced by mesh_route_dispatch. A match entry with URI
         // plus only unsupported predicate types must not materialize a naked
@@ -5873,10 +6160,22 @@ mod tests {
                 .all(|p| p.plugin_name != "mesh_route_dispatch"),
             "URI plus ignored predicates should not emit mesh_route_dispatch"
         );
-        assert!(
-            result.config.proxies.is_empty(),
-            "URI plus unsupported predicates must not materialize an unguarded proxy"
-        );
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some("~/v[0-9]+/api"))
+            .expect("URI plus unsupported predicates materializes a terminating proxy");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+            })
+            .expect("unsupported predicates attach a termination plugin");
+        assert!(proxy_has_plugin(proxy, plugin));
     }
 
     #[test]
@@ -6303,6 +6602,476 @@ mod tests {
     }
 
     #[test]
+    fn virtual_service_unsupported_uri_less_predicate_decorates_later_default_with_termination() {
+        // Unsupported URI-less predicates cannot be represented by
+        // mesh_route_dispatch. If they were skipped, the later default route
+        // would serve requests that Istio gated. Collapse a terminating plugin
+        // onto the selected default proxy instead.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [
+                        {
+                            "match": [
+                                {"headers": {"x-tier": {"regex": "gold|platinum"}}}
+                            ],
+                            "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                        },
+                        {
+                            "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                        }
+                    ]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+
+        let stable_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| {
+                p.listen_path.as_deref() == Some("/")
+                    && p.backend_host == "stable.default.svc.cluster.local"
+            })
+            .expect("later default proxy");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == Some(stable_proxy.id.as_str())
+            })
+            .expect("unsupported URI-less predicate terminates the selected proxy");
+        assert!(proxy_has_plugin(stable_proxy, plugin));
+        assert!(
+            !result
+                .config
+                .plugin_configs
+                .iter()
+                .any(|p| p.plugin_name == "mesh_route_dispatch"),
+            "unsupported predicate must not emit a partial dispatch rule"
+        );
+    }
+
+    #[test]
+    fn virtual_service_ignore_uri_case_match_fails_closed() {
+        // `ignoreUriCase` changes path matching itself, which Ferrum's
+        // router cannot emulate with a normal prefix route. Treat it as an
+        // unsupported predicate and fail closed rather than accidentally
+        // making only one casing reachable.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [
+                        {
+                            "match": [{
+                                "uri": {"prefix": "/Api"},
+                                "ignoreUriCase": true
+                            }],
+                            "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                        },
+                        {
+                            "match": [{"uri": {"prefix": "/api"}}],
+                            "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                        }
+                    ]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+
+        let stable_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| {
+                p.listen_path.as_deref() == Some("/api")
+                    && p.backend_host == "stable.default.svc.cluster.local"
+            })
+            .expect("later case-sensitive URI proxy");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == Some(stable_proxy.id.as_str())
+            })
+            .expect("ignoreUriCase branch attaches termination to later proxy");
+        assert!(proxy_has_plugin(stable_proxy, plugin));
+    }
+
+    #[test]
+    fn virtual_service_ignore_uri_case_false_uses_regular_uri_match() {
+        // Explicit `ignoreUriCase: false` is equivalent to Istio's default
+        // case-sensitive path matching and must not be treated as unsupported.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"prefix": "/Api"},
+                            "ignoreUriCase": false
+                        }],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some("/Api"))
+            .expect("regular case-sensitive URI proxy");
+        assert_eq!(proxy.backend_host, "canary.default.svc.cluster.local");
+        assert!(
+            !result
+                .config
+                .plugin_configs
+                .iter()
+                .any(|p| p.plugin_name == "request_termination"),
+            "ignoreUriCase=false must not emit fail-closed termination"
+        );
+    }
+
+    #[test]
+    fn virtual_service_ignore_uri_case_false_with_other_unsupported_predicate_stays_uri_scoped() {
+        // If some other predicate is unsupported, an explicit
+        // `ignoreUriCase: false` should not broaden the fail-closed proxy to
+        // the synthetic URI-less catch-all.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{
+                            "uri": {"prefix": "/Api"},
+                            "ignoreUriCase": false,
+                            "method": {"regex": "GET|POST"}
+                        }],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    }]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some("/Api"))
+            .expect("fail-closed proxy stays scoped to the URI match");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+            })
+            .expect("unsupported method regex terminates the URI-scoped proxy");
+        assert!(proxy_has_plugin(proxy, plugin));
+        assert!(
+            !result
+                .config
+                .proxies
+                .iter()
+                .any(|p| p.listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH)),
+            "ignoreUriCase=false must not force URI-less fail-closed broadening"
+        );
+    }
+
+    #[test]
+    fn virtual_service_same_path_guarded_route_decorates_later_default() {
+        // Ordered Istio http[] routes with the same URI must behave like
+        // route-list fall-through: a canary header branch can divert matches,
+        // while misses continue to the later stable route. Two Ferrum proxies
+        // with the same host+listen_path cannot express that, so the earlier
+        // guarded branch is collapsed into a dispatch rule on the later proxy.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [
+                        {
+                            "match": [{
+                                "uri": {"prefix": "/api"},
+                                "headers": {"x-canary": {"exact": "v2"}}
+                            }],
+                            "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                        },
+                        {
+                            "match": [{"uri": {"prefix": "/api"}}],
+                            "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                        }
+                    ]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+
+        let api_proxies: Vec<&Proxy> = result
+            .config
+            .proxies
+            .iter()
+            .filter(|p| p.listen_path.as_deref() == Some("/api"))
+            .collect();
+        assert_eq!(
+            api_proxies.len(),
+            1,
+            "same-path ordered routes must collapse to one proxy"
+        );
+        let stable_proxy = api_proxies[0];
+        assert_eq!(
+            stable_proxy.backend_host,
+            "stable.default.svc.cluster.local"
+        );
+
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(stable_proxy.id.as_str())
+            })
+            .expect("canary branch decorates the stable proxy");
+        assert!(proxy_has_plugin(stable_proxy, plugin));
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules array");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0]["match"]["headers"]["x-canary"].as_str(),
+            Some("v2")
+        );
+        assert_eq!(
+            rules[0]["destination"]["backend_host"].as_str(),
+            Some("canary.default.svc.cluster.local")
+        );
+        assert_eq!(rules[0]["destination"]["backend_port"].as_u64(), Some(9090));
+        assert_eq!(
+            plugin
+                .config
+                .get("reject_unmatched")
+                .and_then(Value::as_bool),
+            Some(false),
+            "predicate misses must fall through to the later stable backend"
+        );
+    }
+
+    #[test]
+    fn virtual_service_same_path_mixed_supported_and_unsupported_match_fails_closed_on_miss() {
+        // If one match entry on a route is representable and a sibling on the
+        // same listen_path is not, preserve the supported dispatch rule but
+        // keep reject_unmatched enabled after collapse. Otherwise traffic that
+        // might have matched the unsupported predicate would leak to the later
+        // default route.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [
+                        {
+                            "match": [
+                                {"uri": {"prefix": "/api"}, "method": {"exact": "GET"}},
+                                {"uri": {"prefix": "/api"}, "method": {"regex": "PO.*"}}
+                            ],
+                            "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                        },
+                        {
+                            "match": [{"uri": {"prefix": "/api"}}],
+                            "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                        }
+                    ]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+
+        let api_proxies: Vec<&Proxy> = result
+            .config
+            .proxies
+            .iter()
+            .filter(|p| p.listen_path.as_deref() == Some("/api"))
+            .collect();
+        assert_eq!(api_proxies.len(), 1);
+        let stable_proxy = api_proxies[0];
+        assert_eq!(
+            stable_proxy.backend_host,
+            "stable.default.svc.cluster.local"
+        );
+
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(stable_proxy.id.as_str())
+            })
+            .expect("supported rule decorates the stable proxy");
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules array");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["match"]["methods"][0].as_str(), Some("GET"));
+        assert_eq!(
+            plugin
+                .config
+                .get("reject_unmatched")
+                .and_then(Value::as_bool),
+            Some(true),
+            "unsupported sibling must make predicate misses fail closed"
+        );
+        assert!(
+            !result.config.plugin_configs.iter().any(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == Some(stable_proxy.id.as_str())
+            }),
+            "a supported dispatch rule can fail closed with reject_unmatched instead of terminating every request"
+        );
+    }
+
+    #[test]
+    fn virtual_service_same_path_guarded_route_with_local_policy_is_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [
+                        {
+                            "match": [{
+                                "uri": {"prefix": "/api"},
+                                "headers": {"x-canary": {"exact": "v2"}}
+                            }],
+                            "timeout": "250ms",
+                            "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                        },
+                        {
+                            "match": [{"uri": {"prefix": "/api"}}],
+                            "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                        }
+                    ]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect_err("route-local timeout cannot be collapsed into a destination-only rule");
+        assert!(err.to_string().contains("route-local"), "got: {err}");
+        assert!(
+            err.to_string().contains("mesh_route_dispatch"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_multiple_uri_less_routes_collapse_in_order() {
+        // Multiple URI-less guarded routes all materialize as `~.*`; emitting
+        // one proxy per route would make the first reject misses before the
+        // second can match. Collapse them into one ordered rule list.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [
+                        {
+                            "match": [{"headers": {"x-canary": {"exact": "v2"}}}],
+                            "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                        },
+                        {
+                            "match": [{"headers": {"x-region": {"exact": "east"}}}],
+                            "route": [{"destination": {"host": "east.default.svc.cluster.local", "port": {"number": 8081}}}]
+                        }
+                    ]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+
+        let catch_all_proxies: Vec<&Proxy> = result
+            .config
+            .proxies
+            .iter()
+            .filter(|p| p.listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH))
+            .collect();
+        assert_eq!(
+            catch_all_proxies.len(),
+            1,
+            "URI-less guarded route list must collapse to one catch-all proxy"
+        );
+        let proxy = catch_all_proxies[0];
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+            })
+            .expect("collapsed catch-all has dispatch plugin");
+        assert!(proxy_has_plugin(proxy, plugin));
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules array");
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0]["match"]["headers"]["x-canary"].as_str(),
+            Some("v2")
+        );
+        assert_eq!(
+            rules[0]["destination"]["backend_host"].as_str(),
+            Some("canary.default.svc.cluster.local")
+        );
+        assert_eq!(
+            rules[1]["match"]["headers"]["x-region"].as_str(),
+            Some("east")
+        );
+        assert_eq!(
+            rules[1]["destination"]["backend_host"].as_str(),
+            Some("east.default.svc.cluster.local")
+        );
+        assert_eq!(
+            plugin
+                .config
+                .get("reject_unmatched")
+                .and_then(Value::as_bool),
+            Some(true),
+            "with no later default route, misses must still fail closed"
+        );
+    }
+
+    #[test]
     fn virtual_service_header_only_match_does_not_shadow_later_regex_route() {
         // Codex P1 (#3238865239): regex routes are first-match in config
         // order. An earlier URI-less rule materialized as `~.*` must be
@@ -6435,13 +7204,12 @@ mod tests {
     }
 
     #[test]
-    fn virtual_service_header_only_match_with_unsupported_predicates_skipped() {
+    fn virtual_service_header_only_match_with_unsupported_predicates_fails_closed() {
         // A header-only entry whose only header predicate is `regex`
         // cannot be enforced by mesh_route_dispatch. Materializing a
-        // catch-all with no rule would route ALL traffic to the route's
-        // backend, silently widening past the operator's intent. Skip
-        // materialization entirely; today's drop behaviour is the
-        // fail-closed default.
+        // catch-all to the route's backend would silently widen past the
+        // operator's intent. Emit a terminating catch-all instead, so a
+        // later broader route cannot accidentally serve the guarded traffic.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -6461,18 +7229,35 @@ mod tests {
         assert!(
             !result
                 .config
-                .proxies
+                .plugin_configs
                 .iter()
-                .any(|p| p.listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH)),
-            "header-only match with only unsupported predicates does not materialize a catch-all"
+                .any(|p| p.plugin_name == "mesh_route_dispatch"),
+            "unsupported predicates must not emit a partial dispatch plugin"
         );
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH))
+            .expect("terminating catch-all proxy materialized");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+            })
+            .expect("termination plugin attached");
+        assert!(proxy_has_plugin(proxy, plugin));
     }
 
     #[test]
-    fn virtual_service_header_only_match_with_partial_unsupported_predicates_skipped() {
+    fn virtual_service_header_only_match_with_partial_unsupported_predicates_fails_closed() {
         // A URI-less entry with one exact predicate and one unsupported
         // predicate is unsafe to materialize: mesh_route_dispatch would skip
-        // the partial rule, leaving an unguarded catch-all proxy behind.
+        // the partial rule, leaving an unguarded catch-all proxy behind. The
+        // translator emits a terminating catch-all instead.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -6494,12 +7279,28 @@ mod tests {
             options().with_vs_header_routing_experimental(true),
         )
         .expect("translation succeeds");
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH))
+            .expect("terminating catch-all proxy materialized");
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "request_termination"
+                    && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+            })
+            .expect("termination plugin attached");
+        assert!(proxy_has_plugin(proxy, plugin));
         assert!(
-            result.config.proxies.is_empty(),
-            "partial URI-less predicates must not materialize an unguarded catch-all"
-        );
-        assert!(
-            result.config.plugin_configs.is_empty(),
+            !result
+                .config
+                .plugin_configs
+                .iter()
+                .any(|p| p.plugin_name == "mesh_route_dispatch"),
             "partial URI-less predicates must not emit a dispatch plugin"
         );
     }

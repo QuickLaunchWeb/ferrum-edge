@@ -388,8 +388,9 @@ pub fn target_key(host: &str, port: u16) -> String {
     format!("{host}:{port}")
 }
 
-/// Cache of circuit breakers, keyed per-proxy for direct backends or
-/// per-target (`proxy_id::host:port`) for upstream load-balanced targets.
+/// Cache of circuit breakers, keyed per proxy unless dispatch supplies an
+/// effective target (`proxy_id::host:port`) for upstream targets or direct
+/// backend overrides.
 pub struct CircuitBreakerCache {
     breakers: DashMap<String, Arc<CircuitBreaker>>,
     max_entries: usize,
@@ -416,8 +417,9 @@ impl CircuitBreakerCache {
 
     /// Get or create a circuit breaker for a proxy (or proxy+target).
     ///
-    /// `target_key` should be `Some("host:port")` when the proxy uses an upstream,
-    /// or `None` for direct backend proxies.
+    /// `target_key` should be `Some("host:port")` when the request resolved to
+    /// a concrete upstream target or direct backend override, and `None` when a
+    /// direct backend proxy should use one breaker for the proxy.
     /// If the config has changed, replaces the breaker with a fresh one.
     pub fn get_or_create(
         &self,

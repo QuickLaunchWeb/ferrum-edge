@@ -1391,6 +1391,7 @@ async fn handle_h3_request(
     // destination. Keep in sync with the H1/H2 dispatch path in
     // `src/proxy/mod.rs::handle_proxy_request_inner`.
     let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
 
     // Enforce request body size limit via Content-Length fast path. Apply
     // the gRPC-specific ceiling to gRPC requests so H3 matches H1/H2.

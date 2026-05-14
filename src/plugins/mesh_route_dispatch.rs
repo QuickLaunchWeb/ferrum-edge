@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::types::BackendTlsConfig;
+use crate::config::types::{BackendTlsConfig, MAX_BACKEND_HOST_LENGTH};
 use crate::plugins::{
     HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
 };
@@ -62,6 +62,110 @@ impl MeshRouteDispatchConfig {
     pub fn from_value(config: &Value) -> Result<Self, String> {
         serde_json::from_value(config.clone())
             .map_err(|e| format!("mesh_route_dispatch config: {e}"))
+    }
+
+    pub fn from_value_normalized(config: &Value) -> Result<Self, String> {
+        let mut parsed = Self::from_value(config)?;
+        parsed.normalize_and_validate()?;
+        Ok(parsed)
+    }
+
+    pub fn references_upstream_id(&self, upstream_id: &str) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| rule.destination.upstream_id.as_deref() == Some(upstream_id))
+    }
+
+    fn normalize_and_validate(&mut self) -> Result<(), String> {
+        if self.rules.is_empty() {
+            return Err("mesh_route_dispatch.rules cannot be empty".to_string());
+        }
+        for (idx, rule) in self.rules.iter_mut().enumerate() {
+            normalize_header_match_keys(idx, &mut rule.match_.headers)?;
+            if rule.match_.is_empty() {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{idx}].match requires at least one of \
+                     methods / headers / query_params (an empty match would silently \
+                     never fire, contradicting first-match-wins semantics)"
+                ));
+            }
+            if rule.destination.is_empty() {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{idx}].destination requires at least one of \
+                     upstream_id / backend_host / backend_port / backend_tls"
+                ));
+            }
+            if let Some(port) = rule.destination.backend_port
+                && port == 0
+            {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{idx}].destination.backend_port must be non-zero"
+                ));
+            }
+            if let Some(host) = rule.destination.backend_host.as_mut() {
+                let trimmed = host.trim();
+                if trimmed.is_empty() {
+                    return Err(format!(
+                        "mesh_route_dispatch.rules[{idx}].destination.backend_host must not be empty"
+                    ));
+                }
+                if trimmed.len() > MAX_BACKEND_HOST_LENGTH {
+                    return Err(format!(
+                        "mesh_route_dispatch.rules[{idx}].destination.backend_host must not exceed {MAX_BACKEND_HOST_LENGTH} characters"
+                    ));
+                }
+                if trimmed.contains("://") {
+                    return Err(format!(
+                        "mesh_route_dispatch.rules[{idx}].destination.backend_host must not contain a scheme"
+                    ));
+                }
+                if trimmed.chars().any(char::is_whitespace) {
+                    return Err(format!(
+                        "mesh_route_dispatch.rules[{idx}].destination.backend_host must not contain whitespace"
+                    ));
+                }
+                *host = trimmed.to_ascii_lowercase();
+            }
+            let has_backend_host = rule.destination.backend_host.is_some();
+            let has_backend_port = rule.destination.backend_port.is_some();
+            if rule.destination.upstream_id.is_some()
+                && (has_backend_host || has_backend_port || rule.destination.backend_tls.is_some())
+            {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{idx}].destination.upstream_id cannot be \
+                     combined with backend_host / backend_port / backend_tls"
+                ));
+            }
+            if has_backend_host != has_backend_port {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{idx}].destination.backend_host and \
+                     backend_port must be set together for direct-backend overrides"
+                ));
+            }
+            if rule.destination.backend_tls.is_some() && !(has_backend_host && has_backend_port) {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{idx}].destination.backend_tls requires \
+                     backend_host and backend_port so TLS overrides only apply to a direct backend"
+                ));
+            }
+            if let Some(tls) = rule.destination.backend_tls.as_ref() {
+                let has_client_cert = tls
+                    .client_cert_path
+                    .as_deref()
+                    .is_some_and(|path| !path.is_empty());
+                let has_client_key = tls
+                    .client_key_path
+                    .as_deref()
+                    .is_some_and(|path| !path.is_empty());
+                if has_client_cert != has_client_key {
+                    return Err(format!(
+                        "mesh_route_dispatch.rules[{idx}].destination.backend_tls.client_cert_path \
+                         and client_key_path must be set together"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -133,56 +237,7 @@ pub struct MeshRouteDispatch {
 
 impl MeshRouteDispatch {
     pub fn new(config: &serde_json::Value) -> Result<Self, String> {
-        let mut parsed = MeshRouteDispatchConfig::from_value(config)?;
-        if parsed.rules.is_empty() {
-            return Err("mesh_route_dispatch.rules cannot be empty".to_string());
-        }
-        for (idx, rule) in parsed.rules.iter_mut().enumerate() {
-            normalize_header_match_keys(idx, &mut rule.match_.headers)?;
-            if rule.match_.is_empty() {
-                return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}].match requires at least one of \
-                     methods / headers / query_params (an empty match would silently \
-                     never fire, contradicting first-match-wins semantics)"
-                ));
-            }
-            if rule.destination.is_empty() {
-                return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}].destination requires at least one of \
-                     upstream_id / backend_host / backend_port / backend_tls"
-                ));
-            }
-            if let Some(port) = rule.destination.backend_port
-                && port == 0
-            {
-                return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}].destination.backend_port must be non-zero"
-                ));
-            }
-            if let Some(host) = rule.destination.backend_host.as_deref()
-                && host.is_empty()
-            {
-                return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}].destination.backend_host must not be empty"
-                ));
-            }
-            let has_backend_host = rule.destination.backend_host.is_some();
-            let has_backend_port = rule.destination.backend_port.is_some();
-            if rule.destination.upstream_id.is_some()
-                && (has_backend_host || has_backend_port || rule.destination.backend_tls.is_some())
-            {
-                return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}].destination.upstream_id cannot be \
-                     combined with backend_host / backend_port / backend_tls"
-                ));
-            }
-            if has_backend_host != has_backend_port {
-                return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}].destination.backend_host and \
-                     backend_port must be set together for direct-backend overrides"
-                ));
-            }
-        }
+        let parsed = MeshRouteDispatchConfig::from_value_normalized(config)?;
         Ok(Self { config: parsed })
     }
 
@@ -429,6 +484,22 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_direct_backend_host_at_load() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"backend_host": "  Canary.SVC.Cluster.Local  ", "backend_port": 443}
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            plugin.rules()[0].destination.backend_host.as_deref(),
+            Some("canary.svc.cluster.local")
+        );
+    }
+
+    #[test]
     fn rejects_backend_host_without_backend_port() {
         let err = MeshRouteDispatch::new(&json!({
             "rules": [{
@@ -466,6 +537,39 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.contains("cannot be combined"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_backend_tls_client_cert_without_key() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {
+                    "backend_host": "canary.svc",
+                    "backend_port": 443,
+                    "backend_tls": {"client_cert_path": "/certs/client.pem"}
+                }
+            }]
+        }))
+        .unwrap_err();
+
+        assert!(err.contains("must be set together"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_backend_tls_without_direct_backend() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {
+                    "backend_tls": {"verify_server_cert": false}
+                }
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("requires"), "got: {err}");
+        assert!(err.contains("backend_host"), "got: {err}");
+        assert!(err.contains("backend_port"), "got: {err}");
     }
 
     #[test]

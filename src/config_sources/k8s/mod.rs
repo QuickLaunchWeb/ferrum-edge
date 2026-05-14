@@ -571,6 +571,40 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
     }
 }
 
+pub(crate) fn attach_route_plugins_to_proxy(proxy: &mut Proxy, plugins: &[PluginConfig]) {
+    proxy
+        .plugins
+        .extend(plugins.iter().map(|plugin| PluginAssociation {
+            plugin_config_id: plugin.id.clone(),
+        }));
+}
+
+/// Build a `request_termination` plugin config for a translated route that
+/// cannot safely be represented by Ferrum's current routing dimensions.
+pub(crate) fn request_termination_plugin_for_proxy(
+    proxy_id: &str,
+    namespace: &str,
+    message: &str,
+) -> PluginConfig {
+    let now = Utc::now();
+    PluginConfig {
+        id: format!("istio-vs-rt-{proxy_id}"),
+        plugin_name: "request_termination".to_string(),
+        namespace: namespace.to_string(),
+        config: serde_json::json!({
+            "status_code": 404,
+            "message": message,
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some(proxy_id.to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 /// Build a `fault_injection` plugin config scoped to a specific proxy.
 pub(crate) fn fault_injection_plugin_for_proxy(
     proxy_id: &str,
@@ -677,11 +711,14 @@ pub(crate) struct MeshRouteDispatchDestination<'a> {
 /// (`method.regex` / `.prefix`, `headers.X.regex` / `.prefix`,
 /// `queryParams.X.regex`, or fully-unsupported keys like `authority`,
 /// `scheme`, `port`, `sourceLabels`, `gateways`, `withoutHeaders`,
-/// `sourceNamespace`) are skipped entirely — they do NOT collapse onto
-/// the URI-only catch-all branch. If they did, a mixed `match[]` with
-/// one supported exact rule plus one unsupported regex sibling would
-/// disable `reject_unmatched` and silently forward exactly the requests
-/// the operator gated.
+/// `sourceNamespace`, `ignoreUriCase`) are skipped by the dispatch-rule
+/// extractor — they do NOT collapse onto the URI-only catch-all branch. The
+/// VirtualService translator emits a separate proxy-scoped
+/// `request_termination` artifact for unsupported-only route candidates so
+/// later broader routes do not silently serve gated traffic. If unsupported
+/// entries collapsed here, a mixed `match[]` with one supported exact rule
+/// plus one unsupported regex sibling would disable `reject_unmatched` and
+/// silently forward exactly the requests the operator gated.
 ///
 /// The rule's destination overrides to the route's own destination
 /// (`backend_host`/`backend_port` or `upstream_id`). The destination is
@@ -691,6 +728,7 @@ pub(crate) struct MeshRouteDispatchDestination<'a> {
 ///   2. Future enhancements (multi-destination canary routing collapsing
 ///      multiple `http[]` entries into one proxy + multi-rule plugin) reuse
 ///      the same plugin contract.
+#[allow(dead_code)]
 pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
     proxy_id: &str,
     namespace: &str,
@@ -717,6 +755,7 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
     mesh_route_dispatch_plugin_from_rules(proxy_id, namespace, rules, reject_unmatched)
 }
 
+#[allow(dead_code)]
 pub(crate) fn mesh_route_dispatch_uri_less_rules(
     http: &Value,
     destination: MeshRouteDispatchDestination<'_>,
@@ -724,7 +763,7 @@ pub(crate) fn mesh_route_dispatch_uri_less_rules(
     mesh_route_dispatch_rules_for_proxy(http, None, destination, true).0
 }
 
-fn mesh_route_dispatch_rules_for_proxy(
+pub(crate) fn mesh_route_dispatch_rules_for_proxy(
     http: &Value,
     listen_path: Option<&str>,
     route_destination: MeshRouteDispatchDestination<'_>,
@@ -837,7 +876,7 @@ fn mesh_route_dispatch_rules_for_proxy(
     (rules, has_uri_only_match)
 }
 
-fn mesh_route_dispatch_plugin_from_rules(
+pub(crate) fn mesh_route_dispatch_plugin_from_rules(
     proxy_id: &str,
     namespace: &str,
     rules: Vec<Value>,
@@ -904,6 +943,14 @@ pub(crate) fn mesh_route_dispatch_has_supported_non_uri_predicate(entry: &Value)
 }
 
 pub(crate) fn mesh_route_dispatch_has_unsupported_predicate(entry: &Value) -> bool {
+    if let Some(ignore_uri_case) = entry.get("ignoreUriCase") {
+        match ignore_uri_case.as_bool() {
+            Some(true) => return true,
+            Some(false) => {}
+            None => return true,
+        }
+    }
+
     if entry.get("method").is_some()
         && entry
             .get("method")

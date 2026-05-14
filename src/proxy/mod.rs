@@ -2156,7 +2156,9 @@ impl ProxyState {
             if !base_proxy.dispatch_kind.is_http_family() {
                 continue;
             }
-            let Ok(dispatch_config) = MeshRouteDispatchConfig::from_value(&plugin.config) else {
+            let Ok(dispatch_config) =
+                MeshRouteDispatchConfig::from_value_normalized(&plugin.config)
+            else {
                 warn!(
                     plugin_id = %plugin.id,
                     proxy_id = %proxy_id,
@@ -7516,6 +7518,7 @@ async fn handle_proxy_request_inner(
     // and circuit-breaker target keys all derive from the effective
     // destination (pool-poisoning invariant).
     let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
 
     // Resolve upstream target and hash key from the request epoch.
     let selection = backend_dispatch::select_upstream_target(
@@ -14059,6 +14062,55 @@ mod tests {
         assert!(
             direct.proxy.resolved_tls.verify_server_cert,
             "direct backend probe should reset stale upstream verify policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_targets_normalize_mesh_route_dispatch_direct_backend_hosts() {
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "mrd-p".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "backend_host": " Direct.TEST ",
+                        "backend_port": 9443
+                    }
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+        let state = make_test_proxy_state(config);
+        let loaded = state.config.load_full();
+
+        let targets = state.collect_backend_capability_targets(&loaded);
+
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.host() == "direct.test" && target.port() == 9443),
+            "capability probes must use the same normalized direct backend host as the runtime plugin"
+        );
+        assert!(
+            !targets
+                .iter()
+                .any(|target| target.host() == " Direct.TEST "),
+            "raw mesh_route_dispatch backend_host must not become a separate capability key"
         );
     }
 

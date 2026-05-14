@@ -51,6 +51,9 @@ enum ValidationStep<'a> {
     UpstreamReferences {
         action: ValidationAction<'a>,
     },
+    MeshRouteDispatchReferences {
+        action: ValidationAction<'a>,
+    },
     PluginReferences {
         action: ValidationAction<'a>,
     },
@@ -176,6 +179,15 @@ impl<'a> ValidationPipeline<'a> {
         self
     }
 
+    pub(crate) fn validate_mesh_route_dispatch_references(
+        mut self,
+        action: ValidationAction<'a>,
+    ) -> Self {
+        self.steps
+            .push(ValidationStep::MeshRouteDispatchReferences { action });
+        self
+    }
+
     pub(crate) fn validate_plugin_references(mut self, action: ValidationAction<'a>) -> Self {
         self.steps.push(ValidationStep::PluginReferences { action });
         self
@@ -281,6 +293,13 @@ impl<'a> ValidationPipeline<'a> {
                 }
                 ValidationStep::UpstreamReferences { action } => {
                     if let Err(errors) = config.validate_upstream_references() {
+                        handle_validation_errors(action, errors, &mut collected_errors)?;
+                    }
+                }
+                ValidationStep::MeshRouteDispatchReferences { action } => {
+                    if let Err(errors) =
+                        crate::proxy::validate_mesh_route_dispatch_upstream_references(config)
+                    {
                         handle_validation_errors(action, errors, &mut collected_errors)?;
                     }
                 }

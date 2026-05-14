@@ -4337,6 +4337,31 @@ impl GatewayConfig {
                     }
                 }
             }
+            for plugin in &self.plugin_configs {
+                if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+                    continue;
+                }
+                let Ok(dispatch_config) =
+                    crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value_normalized(
+                        &plugin.config,
+                    )
+                else {
+                    continue;
+                };
+                for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
+                    let Some(host) = rule.destination.backend_host.as_deref() else {
+                        continue;
+                    };
+                    if let Ok(ip) = host.parse::<std::net::IpAddr>()
+                        && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
+                    {
+                        errors.push(format!(
+                            "PluginConfig '{}' mesh_route_dispatch.rules[{}].destination.backend_host IP {} denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
+                            plugin.id, rule_idx, ip, backend_allow_ips
+                        ));
+                    }
+                }
+            }
         }
 
         if errors.is_empty() {
@@ -4398,6 +4423,68 @@ impl GatewayConfig {
                 && let Err(e) = validate_mmdb_file("geo_restriction.db_path", db_path)
             {
                 errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+            }
+            if pc.plugin_name == "mesh_route_dispatch"
+                && let Some(rules) = pc.config.get("rules").and_then(serde_json::Value::as_array)
+            {
+                for (rule_idx, rule) in rules.iter().enumerate() {
+                    let Some(backend_tls) = rule
+                        .get("destination")
+                        .and_then(|destination| destination.get("backend_tls"))
+                        .and_then(serde_json::Value::as_object)
+                    else {
+                        continue;
+                    };
+                    let client_cert = backend_tls
+                        .get("client_cert_path")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|path| !path.is_empty());
+                    let client_key = backend_tls
+                        .get("client_key_path")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|path| !path.is_empty());
+                    match (client_cert, client_key) {
+                        (Some(_), None) => errors.push(format!(
+                            "PluginConfig '{}': mesh_route_dispatch.rules[{}].destination.backend_tls.client_cert_path is set but client_key_path is missing",
+                            pc.id, rule_idx
+                        )),
+                        (None, Some(_)) => errors.push(format!(
+                            "PluginConfig '{}': mesh_route_dispatch.rules[{}].destination.backend_tls.client_key_path is set but client_cert_path is missing",
+                            pc.id, rule_idx
+                        )),
+                        _ => {}
+                    }
+                    if let Some(path) = client_cert
+                        && validated_paths.insert(path.to_string())
+                        && let Err(e) = validate_pem_cert_file(
+                            "mesh_route_dispatch.backend_tls.client_cert_path",
+                            path,
+                        )
+                    {
+                        errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                    }
+                    if let Some(path) = client_key
+                        && validated_paths.insert(path.to_string())
+                        && let Err(e) = validate_pem_key_file(
+                            "mesh_route_dispatch.backend_tls.client_key_path",
+                            path,
+                        )
+                    {
+                        errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                    }
+                    if let Some(path) = backend_tls
+                        .get("server_ca_cert_path")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|path| !path.is_empty())
+                        && validated_paths.insert(path.to_string())
+                        && let Err(e) = validate_pem_cert_file(
+                            "mesh_route_dispatch.backend_tls.server_ca_cert_path",
+                            path,
+                        )
+                    {
+                        errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                    }
+                }
             }
         }
         errors

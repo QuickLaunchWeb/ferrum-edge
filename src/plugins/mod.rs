@@ -556,8 +556,12 @@ impl RequestContext {
         let mut overridden = (*proxy).clone();
         if let Some(id) = &self.route_override_upstream_id {
             overridden.upstream_id = Some(id.clone());
+            if upstream_id_changed {
+                overridden.upstream_subset = None;
+            }
         } else if direct_backend_override {
             overridden.upstream_id = None;
+            overridden.upstream_subset = None;
         }
         if let Some(host) = &self.route_override_backend_host {
             overridden.backend_host = host.clone();

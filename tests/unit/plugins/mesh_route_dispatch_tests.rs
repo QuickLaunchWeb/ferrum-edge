@@ -99,6 +99,23 @@ fn upstream_override_swaps_arc_and_sets_upstream_id() {
 }
 
 #[test]
+fn upstream_override_clears_inherited_subset() {
+    let mut proxy_template = (*upstream_proxy()).clone();
+    proxy_template.upstream_subset = Some("stable-v1".to_string());
+    let proxy = Arc::new(proxy_template);
+    let mut ctx = ctx();
+    ctx.route_override_upstream_id = Some("canary".to_string());
+
+    let result = ctx.apply_route_overrides(Arc::clone(&proxy));
+
+    assert_eq!(result.upstream_id.as_deref(), Some("canary"));
+    assert_eq!(
+        result.upstream_subset, None,
+        "a subset selected on the original upstream must not leak onto a different override upstream"
+    );
+}
+
+#[test]
 fn backend_host_and_port_override_apply_to_clone() {
     let proxy = test_proxy();
     let mut ctx = ctx();

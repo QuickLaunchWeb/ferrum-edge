@@ -286,8 +286,7 @@ pub(crate) fn check_circuit_breaker(
     state: &ProxyState,
     upstream_target: Option<&UpstreamTarget>,
 ) -> Result<(Option<String>, bool), ()> {
-    let cb_target_key =
-        upstream_target.map(|t| crate::circuit_breaker::target_key(&t.host, t.port));
+    let cb_target_key = circuit_breaker_target_key(proxy, upstream_target);
 
     if let Some(cb_config) = &proxy.circuit_breaker {
         match state.circuit_breaker_cache.can_execute(
@@ -304,6 +303,22 @@ pub(crate) fn check_circuit_breaker(
     }
 
     Ok((cb_target_key, false))
+}
+
+fn circuit_breaker_target_key(
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> Option<String> {
+    upstream_target
+        .map(|t| crate::circuit_breaker::target_key(&t.host, t.port))
+        .or_else(|| {
+            (proxy.upstream_id.is_none()
+                && !proxy.backend_host.is_empty()
+                && proxy.backend_port != 0)
+                .then(|| {
+                    crate::circuit_breaker::target_key(&proxy.backend_host, proxy.backend_port)
+                })
+        })
 }
 
 /// Record the outcome of a backend request across all observability systems:
@@ -465,5 +480,20 @@ mod tests {
                 .expect("target remains");
 
         assert!(Arc::ptr_eq(&original, &concrete));
+    }
+
+    #[test]
+    fn circuit_breaker_target_key_uses_direct_backend_override() {
+        let proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "backend_host": "canary.svc",
+            "backend_port": 9090,
+        }))
+        .expect("minimal proxy should deserialize");
+
+        assert_eq!(
+            circuit_breaker_target_key(&proxy, None).as_deref(),
+            Some("canary.svc:9090"),
+            "direct backend overrides must partition circuit breaker state by effective host:port"
+        );
     }
 }

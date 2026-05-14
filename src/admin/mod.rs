@@ -2145,17 +2145,14 @@ async fn handle_restore(
             .validate_regex_listen_paths(ValidationAction::Collect)
             .validate_unique_listen_paths(ValidationAction::Collect)
             .validate_stream_proxies(ValidationAction::Collect)
+            .validate_plugin_configs(ValidationAction::Collect)
             .validate_upstream_references(ValidationAction::Collect)
+            .validate_mesh_route_dispatch_references(ValidationAction::Collect)
             .validate_plugin_references(ValidationAction::Collect)
             .run()
         {
             Ok(errs) => validation_errors.extend(errs),
             Err(err) => validation_errors.push(err.to_string()),
-        }
-        if let Err(errs) =
-            crate::proxy::validate_mesh_route_dispatch_upstream_references(&temp_config)
-        {
-            validation_errors.extend(errs);
         }
         if !validation_errors.is_empty() {
             return Ok(json_response(

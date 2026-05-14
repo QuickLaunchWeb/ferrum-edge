@@ -255,6 +255,7 @@ pub(super) async fn handle_hbone_request(
     let proxy_arc = ctx
         .apply_route_overrides_with_upstreams(Arc::clone(proxy), epoch.load_balancer.upstreams());
     let proxy: &Arc<Proxy> = &proxy_arc;
+    ctx.matched_proxy = Some(Arc::clone(proxy));
 
     let selection =
         backend_dispatch::select_upstream_target(proxy, state, epoch, &ctx.client_ip, &ctx.headers);
