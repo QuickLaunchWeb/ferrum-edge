@@ -21,6 +21,7 @@ use super::rules::{
     ErrorClassRule, ErrorRateRule, LatencyMetric, LatencyPercentileRule, RecoveryConfig, Rule,
     RuleCommon, StatusCodeCountRule, StreamDisconnectCauseRule,
 };
+use super::windows::MAX_FINITE_LATENCY_BOUND_MS;
 
 const MIN_WINDOW_SECONDS: u32 = 5;
 const MAX_WINDOW_SECONDS: u32 = 3600;
@@ -57,23 +58,35 @@ pub struct QuietHourWindow {
 
 impl QuietHourWindow {
     pub fn matches(&self, dt: DateTime<Utc>) -> bool {
-        if !self.weekdays.is_empty() {
-            let weekday = dt.weekday().num_days_from_sunday();
-            if !self.weekdays.contains(&weekday) {
-                return false;
-            }
-        }
         let now_minute = dt.hour() * 60 + dt.minute();
         if self.from_minute == self.to_minute {
             // Zero-length window matches nothing.
             return false;
         }
-        if self.from_minute < self.to_minute {
-            now_minute >= self.from_minute && now_minute < self.to_minute
+        let window_start_weekday = if self.from_minute < self.to_minute {
+            if !(now_minute >= self.from_minute && now_minute < self.to_minute) {
+                return false;
+            }
+            dt.weekday().num_days_from_sunday()
+        } else if now_minute >= self.from_minute {
+            dt.weekday().num_days_from_sunday()
+        } else if now_minute < self.to_minute {
+            // Wrapped overnight window: after-midnight minutes still belong
+            // to the previous day's scheduled window.
+            previous_weekday(dt.weekday().num_days_from_sunday())
         } else {
-            // Wrap past midnight.
-            now_minute >= self.from_minute || now_minute < self.to_minute
-        }
+            return false;
+        };
+
+        self.weekdays.is_empty() || self.weekdays.contains(&window_start_weekday)
+    }
+}
+
+fn previous_weekday(day_from_sunday: u32) -> u32 {
+    if day_from_sunday == 0 {
+        6
+    } else {
+        day_from_sunday - 1
     }
 }
 
@@ -128,6 +141,16 @@ impl ProxyAlertsConfig {
         let mut seen_rule_names: HashSet<String> = HashSet::new();
         let mut rules: Vec<Rule> = Vec::with_capacity(rules_array.len());
         for (idx, raw_rule) in rules_array.iter().enumerate() {
+            // Per-rule `enabled: false` skips the rule before validation so
+            // operators can keep incomplete draft rules in config without
+            // breaking the active alert set.
+            if !raw_rule
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+            {
+                continue;
+            }
             let rule_id = idx as u32;
             let rule = parse_rule(
                 rule_id,
@@ -147,15 +170,7 @@ impl ProxyAlertsConfig {
                     "proxy_alerts: duplicate rule name '{name}' (rule names must be unique)"
                 ));
             }
-            // Per-rule `enabled: false` skips the rule entirely so operators
-            // can mute a rule without removing config.
-            if raw_rule
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true)
-            {
-                rules.push(rule);
-            }
+            rules.push(rule);
         }
 
         if rules.is_empty() {
@@ -257,9 +272,9 @@ fn parse_error_rate(
                 common.name
             )
         })?;
-    if !(0.0..=100.0).contains(&threshold_percent) {
+    if !(0.0 < threshold_percent && threshold_percent <= 100.0) {
         return Err(format!(
-            "proxy_alerts: rule '{}': 'threshold_percent' must be in [0.0, 100.0] (got {threshold_percent})",
+            "proxy_alerts: rule '{}': 'threshold_percent' must be in (0.0, 100.0] (got {threshold_percent})",
             common.name
         ));
     }
@@ -345,6 +360,12 @@ fn parse_latency_percentile(
         return Err(format!(
             "proxy_alerts: rule '{}': 'threshold_ms' must be > 0 (got {threshold_ms})",
             common.name
+        ));
+    }
+    if threshold_ms > MAX_FINITE_LATENCY_BOUND_MS as f64 {
+        return Err(format!(
+            "proxy_alerts: rule '{}': 'threshold_ms' must be <= {} (largest finite histogram bucket; got {threshold_ms})",
+            common.name, MAX_FINITE_LATENCY_BOUND_MS
         ));
     }
     let min_request_count = raw
@@ -496,11 +517,7 @@ fn read_threshold_count(raw: &Value, rule_name: &str) -> Result<u64, String> {
 }
 
 fn read_window_seconds(raw: &Value, rule_name: &str, default: u32) -> Result<u32, String> {
-    let v = raw
-        .get("window_seconds")
-        .and_then(Value::as_u64)
-        .map(|n| n as u32)
-        .unwrap_or(default);
+    let v = read_rule_u32(raw, "window_seconds", rule_name)?.unwrap_or(default);
     if !(MIN_WINDOW_SECONDS..=MAX_WINDOW_SECONDS).contains(&v) {
         return Err(format!(
             "proxy_alerts: rule '{rule_name}': 'window_seconds' must be in [{MIN_WINDOW_SECONDS}, {MAX_WINDOW_SECONDS}] (got {v})"
@@ -510,11 +527,7 @@ fn read_window_seconds(raw: &Value, rule_name: &str, default: u32) -> Result<u32
 }
 
 fn read_cooldown_ms(raw: &Value, rule_name: &str, default: u32) -> Result<u64, String> {
-    let v = raw
-        .get("cooldown_seconds")
-        .and_then(Value::as_u64)
-        .map(|n| n as u32)
-        .unwrap_or(default);
+    let v = read_rule_u32(raw, "cooldown_seconds", rule_name)?.unwrap_or(default);
     if !(MIN_COOLDOWN_SECONDS..=MAX_COOLDOWN_SECONDS).contains(&v) {
         return Err(format!(
             "proxy_alerts: rule '{rule_name}': 'cooldown_seconds' must be in [{MIN_COOLDOWN_SECONDS}, {MAX_COOLDOWN_SECONDS}] (got {v})"
@@ -534,14 +547,11 @@ fn read_recovery(
     if rec.is_null() {
         return Ok(None);
     }
-    let obj = rec
-        .as_object()
+    rec.as_object()
         .ok_or_else(|| format!("proxy_alerts: rule '{rule_name}': 'recovery' must be an object"))?;
-    let resolved_window_seconds = obj
-        .get("resolved_window_seconds")
-        .and_then(Value::as_u64)
-        .map(|n| n as u32)
-        .unwrap_or(default_resolved_window_seconds);
+    let resolved_window_seconds =
+        read_object_u32(rec, "resolved_window_seconds", rule_name, "recovery")?
+            .unwrap_or(default_resolved_window_seconds);
     if !(MIN_RESOLVED_WINDOW_SECONDS..=MAX_RESOLVED_WINDOW_SECONDS)
         .contains(&resolved_window_seconds)
     {
@@ -552,6 +562,37 @@ fn read_recovery(
     Ok(Some(RecoveryConfig {
         resolved_window_ms: u64::from(resolved_window_seconds) * 1000,
     }))
+}
+
+fn read_rule_u32(raw: &Value, key: &str, rule_name: &str) -> Result<Option<u32>, String> {
+    let Some(v) = raw.get(key) else {
+        return Ok(None);
+    };
+    let n = v.as_u64().ok_or_else(|| {
+        format!("proxy_alerts: rule '{rule_name}': '{key}' must be an unsigned integer")
+    })?;
+    u32::try_from(n)
+        .map(Some)
+        .map_err(|_| format!("proxy_alerts: rule '{rule_name}': '{key}' is too large for u32"))
+}
+
+fn read_object_u32(
+    raw: &Value,
+    key: &str,
+    rule_name: &str,
+    object_name: &str,
+) -> Result<Option<u32>, String> {
+    let Some(v) = raw.get(key) else {
+        return Ok(None);
+    };
+    let n = v.as_u64().ok_or_else(|| {
+        format!(
+            "proxy_alerts: rule '{rule_name}': '{object_name}.{key}' must be an unsigned integer"
+        )
+    })?;
+    u32::try_from(n).map(Some).map_err(|_| {
+        format!("proxy_alerts: rule '{rule_name}': '{object_name}.{key}' is too large for u32")
+    })
 }
 
 fn read_severity(raw: &Value, rule_name: &str) -> Result<Severity, String> {
@@ -672,6 +713,13 @@ fn parse_hh_mm(s: &str) -> Result<u32, String> {
     let (h, m) = s
         .split_once(':')
         .ok_or_else(|| format!("expected HH:MM, got '{s}'"))?;
+    if h.len() != 2
+        || m.len() != 2
+        || !h.bytes().all(|b| b.is_ascii_digit())
+        || !m.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(format!("expected HH:MM, got '{s}'"));
+    }
     let hour: u32 = h.parse().map_err(|_| format!("invalid hour in '{s}'"))?;
     let minute: u32 = m.parse().map_err(|_| format!("invalid minute in '{s}'"))?;
     if hour > 23 {
@@ -685,10 +733,12 @@ fn parse_hh_mm(s: &str) -> Result<u32, String> {
 
 fn read_u32_default(config: &Value, key: &str, default: u32) -> Result<u32, String> {
     match config.get(key) {
-        Some(v) => v
-            .as_u64()
-            .map(|n| n as u32)
-            .ok_or_else(|| format!("proxy_alerts: '{key}' must be an unsigned integer")),
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .ok_or_else(|| format!("proxy_alerts: '{key}' must be an unsigned integer"))?;
+            u32::try_from(n).map_err(|_| format!("proxy_alerts: '{key}' is too large for u32"))
+        }
         None => Ok(default),
     }
 }

@@ -1161,6 +1161,7 @@ paths:
                 - response_mock
                 - response_caching
                 - prometheus_metrics
+                - proxy_alerts
                 - otel_tracing
                 - ai_token_metrics
                 - ai_request_guard
@@ -4984,6 +4985,444 @@ components:
           type: integer
           default: 500
           description: Minimum age (ms) of the render cache before record() will invalidate it. Under extreme load this prevents an allocation per request
+
+    ProxyAlertsConfig:
+      type: object
+      description: |
+        Plugin: proxy_alerts — in-gateway anomaly notifications for proxy
+        traffic. Observes HTTP/gRPC transaction summaries, TCP/UDP stream
+        disconnect summaries, and WebSocket disconnect summaries, then sends
+        Trigger/Resolve notifications to Slack, Microsoft Teams, Discord, or
+        generic HTTP webhooks. See docs/proxy_alerts.md.
+      required: [channels, rules]
+      properties:
+        enabled:
+          type: boolean
+          default: true
+          description: Master runtime switch for this plugin instance.
+        default_cooldown_seconds:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 86400
+          default: 300
+          description: Per-rule fallback cooldown. Cooldown is tracked per `(rule, proxy, channel)`.
+        default_min_request_count:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 50
+          description: Per-rule fallback for error-rate and latency-percentile rules.
+        default_window_seconds:
+          type: integer
+          format: uint32
+          minimum: 5
+          maximum: 3600
+          default: 60
+          description: Per-rule fallback sliding-window length.
+        default_resolved_window_seconds:
+          type: integer
+          format: uint32
+          minimum: 5
+          maximum: 86400
+          default: 300
+          description: Per-rule fallback recovery quiet period after a breach clears.
+        max_concurrent_dispatches:
+          type: integer
+          format: uint32
+          minimum: 1
+          default: 8
+          description: Maximum concurrent outbound notification requests. Excess alerts are dropped, not queued.
+        quiet_hours_utc:
+          type: array
+          default: []
+          description: UTC time windows where Trigger alerts are suppressed. Resolve alerts still dispatch.
+          items:
+            $ref: "#/components/schemas/ProxyAlertsQuietHourWindow"
+        channels:
+          type: object
+          minProperties: 1
+          propertyNames:
+            pattern: "^[A-Za-z0-9_-]+$"
+          additionalProperties:
+            $ref: "#/components/schemas/ProxyAlertsChannel"
+          description: Map of channel name to channel definition. Rule `channels` entries reference these names.
+        rules:
+          type: array
+          minItems: 1
+          description: Alert rules evaluated per matched proxy.
+          items:
+            $ref: "#/components/schemas/ProxyAlertsRule"
+      example:
+        enabled: true
+        default_cooldown_seconds: 300
+        default_min_request_count: 50
+        default_window_seconds: 60
+        default_resolved_window_seconds: 300
+        max_concurrent_dispatches: 8
+        quiet_hours_utc:
+          - from: "23:00"
+            to: "06:00"
+            weekdays: [0, 6]
+        channels:
+          ops_slack:
+            type: slack
+            webhook_url_env: FERRUM_ALERTS_SLACK_WEBHOOK
+            channel_override: "#alerts-prod"
+          pagerduty_v2:
+            type: webhook
+            url_env: FERRUM_PAGERDUTY_EVENTS_URL
+            method: POST
+            headers:
+              Content-Type: application/json
+            body_template: '{"routing_key":"$ROUTING_KEY","event_action":"${event_action}","payload":{"summary":"${rule_name}: ${reason}","source":"${proxy_name}","severity":"${severity}"}}'
+        rules:
+          - name: proxy_5xx_spike
+            enabled: true
+            type: error_rate
+            status_codes: [500, 501, 502, 503, 504]
+            threshold_percent: 5.0
+            min_request_count: 100
+            window_seconds: 60
+            channels: [ops_slack, pagerduty_v2]
+            cooldown_seconds: 300
+            recovery:
+              resolved_window_seconds: 300
+            severity: high
+
+    ProxyAlertsQuietHourWindow:
+      type: object
+      required: [from, to]
+      properties:
+        from:
+          type: string
+          pattern: "^([01][0-9]|2[0-3]):[0-5][0-9]$"
+          description: UTC start time in strict HH:MM form.
+        to:
+          type: string
+          pattern: "^([01][0-9]|2[0-3]):[0-5][0-9]$"
+          description: UTC end time in strict HH:MM form. Values earlier than `from` wrap past midnight.
+        weekdays:
+          type: array
+          default: []
+          description: Days the window applies to (`0 = Sunday` ... `6 = Saturday`). Omit or use `[]` for every day.
+          items:
+            type: integer
+            minimum: 0
+            maximum: 6
+
+    ProxyAlertsChannel:
+      oneOf:
+        - $ref: "#/components/schemas/ProxyAlertsSlackChannel"
+        - $ref: "#/components/schemas/ProxyAlertsTeamsChannel"
+        - $ref: "#/components/schemas/ProxyAlertsDiscordChannel"
+        - $ref: "#/components/schemas/ProxyAlertsWebhookChannel"
+
+    ProxyAlertsSlackChannel:
+      type: object
+      required: [type]
+      anyOf:
+        - required: [webhook_url]
+        - required: [webhook_url_env]
+      properties:
+        type:
+          type: string
+          enum: [slack]
+        webhook_url:
+          type: string
+          format: uri
+          description: Slack incoming webhook URL. Prefer `webhook_url_env` for secrets.
+        webhook_url_env:
+          type: string
+          description: Environment variable containing the Slack incoming webhook URL.
+        channel_override:
+          type: string
+          description: Optional Slack channel override, e.g. `#alerts-prod`.
+        username:
+          type: string
+          description: Optional bot username override.
+        icon_emoji:
+          type: string
+          description: Optional bot icon emoji, e.g. `:rotating_light:`.
+
+    ProxyAlertsTeamsChannel:
+      type: object
+      required: [type]
+      anyOf:
+        - required: [webhook_url]
+        - required: [webhook_url_env]
+      properties:
+        type:
+          type: string
+          enum: [teams]
+        webhook_url:
+          type: string
+          format: uri
+          description: Microsoft Teams incoming webhook URL. Prefer `webhook_url_env` for secrets.
+        webhook_url_env:
+          type: string
+          description: Environment variable containing the Teams incoming webhook URL.
+
+    ProxyAlertsDiscordChannel:
+      type: object
+      required: [type]
+      anyOf:
+        - required: [webhook_url]
+        - required: [webhook_url_env]
+      properties:
+        type:
+          type: string
+          enum: [discord]
+        webhook_url:
+          type: string
+          format: uri
+          description: Discord-compatible webhook URL. Prefer `webhook_url_env` for secrets.
+        webhook_url_env:
+          type: string
+          description: Environment variable containing the Discord webhook URL.
+        username:
+          type: string
+          description: Optional webhook username override.
+
+    ProxyAlertsWebhookChannel:
+      type: object
+      required: [type, body_template]
+      anyOf:
+        - required: [url]
+        - required: [url_env]
+      properties:
+        type:
+          type: string
+          enum: [webhook]
+        url:
+          type: string
+          format: uri
+          description: HTTP(S) endpoint URL. Prefer `url_env` for secrets.
+        url_env:
+          type: string
+          description: Environment variable containing the HTTP(S) endpoint URL.
+        method:
+          type: string
+          enum: [POST, PUT, PATCH]
+          default: POST
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          default:
+            Content-Type: application/json
+          description: Headers sent with the webhook request. JSON content types JSON-escape template substitutions.
+        body_template:
+          type: string
+          description: Template body. Supports generic notification variables plus proxy_alerts variables such as `${rule_name}`, `${proxy_name}`, `${observed}`, `${threshold}`, `${sample_count}`, `${window_seconds}`, and `${reason}`.
+
+    ProxyAlertsRule:
+      oneOf:
+        - $ref: "#/components/schemas/ProxyAlertsErrorRateRule"
+        - $ref: "#/components/schemas/ProxyAlertsStatusCodeCountRule"
+        - $ref: "#/components/schemas/ProxyAlertsLatencyPercentileRule"
+        - $ref: "#/components/schemas/ProxyAlertsErrorClassRule"
+        - $ref: "#/components/schemas/ProxyAlertsStreamDisconnectCauseRule"
+
+    ProxyAlertsRuleCommon:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: Unique rule name within this plugin config.
+        enabled:
+          type: boolean
+          default: true
+          description: Disabled rules are skipped before validation.
+        window_seconds:
+          type: integer
+          format: uint32
+          minimum: 5
+          maximum: 3600
+          description: Sliding-window length for this rule.
+        channels:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            pattern: "^[A-Za-z0-9_-]+$"
+          description: Channel names from the top-level `channels` map.
+        cooldown_seconds:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 86400
+          description: Per-rule cooldown override.
+        recovery:
+          oneOf:
+            - $ref: "#/components/schemas/ProxyAlertsRecovery"
+            - type: "null"
+          description: Optional resolved notification settings.
+        severity:
+          $ref: "#/components/schemas/ProxyAlertsSeverity"
+
+    ProxyAlertsRecovery:
+      type: object
+      properties:
+        resolved_window_seconds:
+          type: integer
+          format: uint32
+          minimum: 5
+          maximum: 86400
+          default: 300
+          description: How long the rule must stay below threshold before a Resolve notification is sent.
+
+    ProxyAlertsSeverity:
+      type: string
+      enum: [info, low, medium, high, critical]
+      default: medium
+
+    ProxyAlertsErrorRateRule:
+      allOf:
+        - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
+        - type: object
+          required: [name, type, status_codes, threshold_percent, channels]
+          properties:
+            type:
+              type: string
+              enum: [error_rate]
+            status_codes:
+              $ref: "#/components/schemas/ProxyAlertsStatusCodeList"
+            threshold_percent:
+              type: number
+              format: double
+              exclusiveMinimum: 0
+              maximum: 100
+              description: Alert when the matching status-code percentage is at least this value.
+            min_request_count:
+              type: integer
+              format: uint64
+              minimum: 1
+              description: Minimum total requests in the window before the percentage can alert.
+
+    ProxyAlertsStatusCodeCountRule:
+      allOf:
+        - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
+        - type: object
+          required: [name, type, status_codes, threshold_count, channels]
+          properties:
+            type:
+              type: string
+              enum: [status_code_count]
+            status_codes:
+              $ref: "#/components/schemas/ProxyAlertsStatusCodeList"
+            threshold_count:
+              type: integer
+              format: uint64
+              minimum: 1
+              description: Alert when at least this many matching responses occur in the window.
+
+    ProxyAlertsLatencyPercentileRule:
+      allOf:
+        - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
+        - type: object
+          required: [name, type, metric, percentile, threshold_ms, channels]
+          properties:
+            type:
+              type: string
+              enum: [latency_percentile]
+            metric:
+              type: string
+              enum: [backend_total_ms, backend_ttfb_ms, total_ms, stream_duration_ms]
+              description: Latency metric to observe. `stream_duration_ms` applies to TCP/UDP/WebSocket sessions; the others apply to HTTP-family summaries.
+            percentile:
+              type: integer
+              minimum: 1
+              maximum: 99
+            threshold_ms:
+              type: number
+              format: double
+              exclusiveMinimum: 0
+              maximum: 300000
+              description: Alert when the bucket upper-bound estimate for the percentile is strictly greater than this threshold.
+            min_request_count:
+              type: integer
+              format: uint64
+              minimum: 1
+              description: Minimum observations in the window before the percentile can alert.
+
+    ProxyAlertsErrorClassRule:
+      allOf:
+        - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
+        - type: object
+          required: [name, type, classes, threshold_count, channels]
+          properties:
+            type:
+              type: string
+              enum: [error_class]
+            classes:
+              type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/ErrorClass"
+              description: Error classes counted by this rule. HTTP rules also check `body_error_class`.
+            threshold_count:
+              type: integer
+              format: uint64
+              minimum: 1
+              description: Alert when at least this many matching errors occur in the window.
+
+    ProxyAlertsStreamDisconnectCauseRule:
+      allOf:
+        - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
+        - type: object
+          required: [name, type, causes, threshold_count, channels]
+          properties:
+            type:
+              type: string
+              enum: [stream_disconnect_cause]
+            causes:
+              type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/DisconnectCause"
+              description: Stream disconnect causes counted by this rule.
+            threshold_count:
+              type: integer
+              format: uint64
+              minimum: 1
+              description: Alert when at least this many matching disconnects occur in the window.
+
+    ProxyAlertsStatusCodeList:
+      type: array
+      minItems: 1
+      items:
+        type: integer
+        minimum: 100
+        maximum: 599
+
+    ErrorClass:
+      type: string
+      enum:
+        - connection_timeout
+        - connection_refused
+        - connection_reset
+        - connection_closed
+        - dns_lookup_error
+        - tls_error
+        - read_write_timeout
+        - client_disconnect
+        - protocol_error
+        - response_body_too_large
+        - request_body_too_large
+        - connection_pool_error
+        - port_exhaustion
+        - graceful_remote_close
+        - request_error
+
+    DisconnectCause:
+      type: string
+      enum:
+        - idle_timeout
+        - recv_error
+        - backend_error
+        - graceful_shutdown
 
     OtelTracingConfig:
       type: object

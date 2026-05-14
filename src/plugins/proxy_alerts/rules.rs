@@ -9,10 +9,12 @@
 use std::sync::Arc;
 
 use crate::notifications::Severity;
-use crate::plugins::{DisconnectCause, StreamTransactionSummary, TransactionSummary};
+use crate::plugins::{
+    DisconnectCause, StreamTransactionSummary, TransactionSummary, WsDisconnectContext,
+};
 use crate::retry::ErrorClass;
 
-use super::windows::{RuleWindowSpec, WindowKind, WindowStore};
+use super::windows::{MAX_FINITE_LATENCY_BOUND_MS, RuleWindowSpec, WindowKind, WindowStore};
 
 #[allow(clippy::enum_variant_names)] // All variants are millisecond metrics by intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,12 +145,21 @@ impl Rule {
             Self::StreamDisconnectCause(_) => "stream_disconnect_cause",
         }
     }
+
+    pub fn observes_ws_disconnect(&self) -> bool {
+        match self {
+            Self::LatencyPercentile(r) => r.metric == LatencyMetric::StreamDurationMs,
+            Self::ErrorClass(_) | Self::StreamDisconnectCause(_) => true,
+            Self::ErrorRate(_) | Self::StatusCodeCount(_) => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum SampleInput<'a> {
     Http(&'a TransactionSummary),
     Stream(&'a StreamTransactionSummary),
+    WebSocket(&'a WsDisconnectContext),
 }
 
 impl<'a> SampleInput<'a> {
@@ -156,6 +167,7 @@ impl<'a> SampleInput<'a> {
         match self {
             Self::Http(s) => s.proxy_id.as_deref(),
             Self::Stream(s) => Some(s.proxy_id.as_str()),
+            Self::WebSocket(s) => Some(s.proxy_id.as_str()),
         }
     }
 
@@ -163,6 +175,7 @@ impl<'a> SampleInput<'a> {
         match self {
             Self::Http(s) => s.proxy_name.as_deref(),
             Self::Stream(s) => s.proxy_name.as_deref(),
+            Self::WebSocket(s) => s.proxy_name.as_deref(),
         }
     }
 
@@ -170,6 +183,7 @@ impl<'a> SampleInput<'a> {
         match self {
             Self::Http(s) => s.namespace.as_str(),
             Self::Stream(s) => s.namespace.as_str(),
+            Self::WebSocket(s) => s.namespace.as_str(),
         }
     }
 }
@@ -290,16 +304,18 @@ fn observe_latency_percentile(
         (LatencyMetric::BackendTtfbMs, SampleInput::Http(s)) => s.latency_backend_ttfb_ms,
         (LatencyMetric::TotalMs, SampleInput::Http(s)) => s.latency_total_ms,
         (LatencyMetric::StreamDurationMs, SampleInput::Stream(s)) => s.duration_ms,
+        (LatencyMetric::StreamDurationMs, SampleInput::WebSocket(s)) => s.duration_ms,
         _ => return None,
     };
     if latency < 0.0 || !latency.is_finite() {
         // Sentinel value (-1.0) or NaN — skip recording but still return
-        // a no-breach observation so the recovery state machine can
-        // progress on subsequent valid samples.
+        // a snapshot-based observation. Sentinel samples must not clear an
+        // already-breached latency window.
         let (estimate, total) =
             store.snapshot_percentile(rule.common.id, proxy_id, rule.percentile, now_ms);
+        let breach = latency_estimate_breaches(estimate, total, rule);
         return Some(RuleObservation {
-            breach: false,
+            breach,
             observed: estimate
                 .map(format_latency)
                 .unwrap_or_else(|| "n/a".to_string()),
@@ -316,8 +332,7 @@ fn observe_latency_percentile(
     store.record_latency(rule.common.id, proxy_id, latency, now_ms);
     let (estimate, total) =
         store.snapshot_percentile(rule.common.id, proxy_id, rule.percentile, now_ms);
-    let breach = total >= rule.min_request_count
-        && estimate.map(|v| v >= rule.threshold_ms).unwrap_or(false);
+    let breach = latency_estimate_breaches(estimate, total, rule);
     Some(RuleObservation {
         breach,
         observed: estimate
@@ -335,6 +350,21 @@ fn observe_latency_percentile(
     })
 }
 
+fn latency_estimate_breaches(
+    estimate_upper_bound_ms: Option<f64>,
+    total: u64,
+    rule: &LatencyPercentileRule,
+) -> bool {
+    total >= rule.min_request_count
+        && estimate_upper_bound_ms
+            // Percentiles are fixed-bucket estimates. Use a strict comparison
+            // against the bucket upper bound so thresholds that fall inside a
+            // bucket can still fire, while a threshold exactly on a bucket
+            // boundary does not fire for samples from the previous bucket.
+            .map(|estimate| estimate > rule.threshold_ms)
+            .unwrap_or(false)
+}
+
 fn observe_error_class(
     rule: &ErrorClassRule,
     sample: SampleInput<'_>,
@@ -342,13 +372,14 @@ fn observe_error_class(
     store: &WindowStore,
     now_ms: u64,
 ) -> Option<RuleObservation> {
-    let class = match sample {
-        SampleInput::Http(s) => s.error_class.or(s.body_error_class),
-        SampleInput::Stream(s) => s.error_class,
-    };
-    let matched = match class {
-        Some(c) => rule.classes.contains(&c),
-        None => false,
+    let matched = match sample {
+        SampleInput::Http(s) => {
+            s.error_class.is_some_and(|c| rule.classes.contains(&c))
+                || s.body_error_class
+                    .is_some_and(|c| rule.classes.contains(&c))
+        }
+        SampleInput::Stream(s) => s.error_class.is_some_and(|c| rule.classes.contains(&c)),
+        SampleInput::WebSocket(s) => s.error_class.is_some_and(|c| rule.classes.contains(&c)),
     };
     store.record_count(rule.common.id, proxy_id, matched, now_ms);
     let (matched_total, _) = store.snapshot_count(rule.common.id, proxy_id, now_ms);
@@ -373,10 +404,11 @@ fn observe_stream_disconnect(
     store: &WindowStore,
     now_ms: u64,
 ) -> Option<RuleObservation> {
-    let SampleInput::Stream(s) = sample else {
-        return None;
+    let cause = match sample {
+        SampleInput::Stream(s) => s.disconnect_cause,
+        SampleInput::WebSocket(s) => Some(websocket_disconnect_cause(s)),
+        SampleInput::Http(_) => return None,
     };
-    let cause = s.disconnect_cause;
     let matched = match cause {
         Some(c) => rule.causes.contains(&c),
         None => false,
@@ -401,6 +433,19 @@ fn observe_stream_disconnect(
     })
 }
 
+fn websocket_disconnect_cause(ctx: &WsDisconnectContext) -> DisconnectCause {
+    let Some(class) = ctx.error_class else {
+        return DisconnectCause::GracefulShutdown;
+    };
+    match ctx.direction {
+        Some(direction) => {
+            crate::proxy::tcp_proxy::disconnect_cause_for_failure(direction, &class, ctx.io_side)
+        }
+        None if class == ErrorClass::ReadWriteTimeout => DisconnectCause::IdleTimeout,
+        None => DisconnectCause::RecvError,
+    }
+}
+
 fn disconnect_cause_str(c: DisconnectCause) -> &'static str {
     match c {
         DisconnectCause::IdleTimeout => "idle_timeout",
@@ -412,7 +457,7 @@ fn disconnect_cause_str(c: DisconnectCause) -> &'static str {
 
 fn format_latency(v: f64) -> String {
     if v.is_infinite() {
-        ">30000ms".to_string()
+        format!(">{MAX_FINITE_LATENCY_BOUND_MS}ms")
     } else {
         format!("{:.0}ms", v)
     }

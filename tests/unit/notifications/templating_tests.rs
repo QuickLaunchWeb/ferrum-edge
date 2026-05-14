@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use ferrum_edge::notifications::templating::{
-    render_template, unknown_variables, validate_template,
+    render_template, render_template_json_string_escaped, unknown_variables, validate_template,
 };
 
 fn vars(items: &[(&str, &str)]) -> HashMap<String, String> {
@@ -52,6 +52,33 @@ fn passes_through_dollar_followed_by_non_special() {
     // include literal dollar signs in payloads.
     let out = render_template("price $5.00 with ${name}", &vars(&[("name", "x")])).unwrap();
     assert_eq!(out, "price $5.00 with x");
+}
+
+#[test]
+fn preserves_non_ascii_text_around_variables() {
+    let out = render_template("résumé ${name} Δ $$", &vars(&[("name", "東京")])).unwrap();
+    assert_eq!(out, "résumé 東京 Δ $");
+}
+
+#[test]
+fn json_string_rendering_escapes_substituted_values() {
+    let out = render_template_json_string_escaped(
+        "{\"summary\":\"${reason}\",\"plain\":\"${name}\"}",
+        &vars(&[
+            ("reason", "classified as [\"tls_error\"] \\ backend\nretry"),
+            ("name", "東京"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        "{\"summary\":\"classified as [\\\"tls_error\\\"] \\\\ backend\\nretry\",\"plain\":\"東京\"}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        parsed["summary"],
+        "classified as [\"tls_error\"] \\ backend\nretry"
+    );
 }
 
 #[test]

@@ -161,7 +161,8 @@ pub(crate) const STREAM_SPLICE_IDLE_TIMEOUT_PREFIX: &str = "TCP idle timeout";
 /// | `ClientToBackend` | Write | Backend  |
 /// | `BackendToClient` | Read  | Backend  |
 /// | `BackendToClient` | Write | Client   |
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[doc(hidden)]
 pub enum StreamIoSide {
     /// Failure reading from the source socket of this half.

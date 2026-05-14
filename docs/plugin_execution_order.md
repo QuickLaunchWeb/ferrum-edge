@@ -303,7 +303,7 @@ Given all built-in plugins enabled, the execution order is:
 | 59 | `udp_logging` | 9160 | log, on_stream_disconnect |
 | 60 | `ws_logging` | 9175 | log, on_stream_disconnect |
 | 61 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 62 | `proxy_alerts` | 9250 | log, on_stream_disconnect |
+| 62 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
 | 63 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
 | 64 | `api_chargeback` | 9350 | log |
 | 65 | `workload_metrics` | 9360 | before_proxy, on_stream_connect |

@@ -13,8 +13,8 @@
 //!
 //! 1. The hook fires for every plugin in the slice.
 //! 2. Frame counters are reported as 0 (tunnel mode doesn't parse frames).
-//! 3. Failure info is preserved into `WsDisconnectContext.direction` and
-//!    `.error_class`.
+//! 3. Failure info is preserved into `WsDisconnectContext.direction`,
+//!    `.io_side`, and `.error_class`.
 //! 4. Empty plugin slices skip the hook entirely (zero overhead when no
 //!    plugin opts in).
 
@@ -24,7 +24,9 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use ferrum_edge::_test_support::{fire_ws_tunnel_disconnect_hooks, make_ws_session_meta};
+use ferrum_edge::_test_support::{
+    StreamIoSide, fire_ws_tunnel_disconnect_hooks, make_ws_session_meta,
+};
 use ferrum_edge::plugins::{Direction, Plugin, WsDisconnectContext};
 use ferrum_edge::retry::ErrorClass;
 
@@ -40,6 +42,7 @@ struct CapturedDisconnect {
     frames_c2b: u64,
     frames_b2c: u64,
     direction: Option<Direction>,
+    io_side: Option<StreamIoSide>,
     error_class: Option<ErrorClass>,
 }
 
@@ -76,6 +79,7 @@ impl Plugin for CapturingDisconnectPlugin {
             frames_c2b: ctx.frames_client_to_backend,
             frames_b2c: ctx.frames_backend_to_client,
             direction: ctx.direction,
+            io_side: ctx.io_side,
             error_class: ctx.error_class,
         });
     }
@@ -158,12 +162,17 @@ async fn test_tunnel_disconnect_propagates_direction_and_error_class() {
         &plugins,
         "proxy-abc",
         &meta,
-        Some((Direction::BackendToClient, ErrorClass::ConnectionReset)),
+        Some((
+            Direction::BackendToClient,
+            ErrorClass::ConnectionReset,
+            Some(StreamIoSide::Write),
+        )),
     )
     .await;
 
     let captured = captured.lock().unwrap();
     assert_eq!(captured[0].direction, Some(Direction::BackendToClient));
+    assert_eq!(captured[0].io_side, Some(StreamIoSide::Write));
     assert_eq!(captured[0].error_class, Some(ErrorClass::ConnectionReset),);
 }
 
@@ -181,7 +190,7 @@ async fn test_tunnel_disconnect_skips_when_no_plugins_opted_in() {
         &plugins,
         "proxy-abc",
         &meta,
-        Some((Direction::Unknown, ErrorClass::RequestError)),
+        Some((Direction::Unknown, ErrorClass::RequestError, None)),
     )
     .await;
 }

@@ -14,8 +14,10 @@ use url::Url;
 use crate::plugins::utils::http_client::PluginHttpClient;
 
 use super::super::notification::Notification;
-use super::super::templating::{render_template, validate_template};
-use super::resolve_optional_string;
+use super::super::templating::{
+    render_template, render_template_json_string_escaped, validate_template,
+};
+use super::{redacted_endpoint_url, resolve_optional_string};
 
 /// Template variable names the webhook channel projects from a generic
 /// [`Notification`]. Callers (the proxy_alerts plugin in particular) supply
@@ -152,7 +154,7 @@ impl WebhookChannel {
     /// Callers with extra context should use [`Self::render_body_with_vars`].
     pub fn render_body(&self, n: &Notification) -> Result<String, String> {
         let vars = base_vars(n);
-        render_template(&self.body_template, &vars)
+        self.render_body_from_vars(&vars)
     }
 
     pub fn render_body_with_vars(
@@ -164,7 +166,7 @@ impl WebhookChannel {
         for (k, v) in extras {
             vars.insert(k.clone(), v.clone());
         }
-        render_template(&self.body_template, &vars)
+        self.render_body_from_vars(&vars)
     }
 
     /// Dispatch with extra template variables supplied by the caller.
@@ -184,8 +186,9 @@ impl WebhookChannel {
             req = req.header(k.clone(), v.clone());
         }
         req = req.body(body);
+        let redacted_url = redacted_endpoint_url(&self.url);
         let resp = http
-            .execute(req, "proxy_alerts_webhook")
+            .execute_redacted(req, "proxy_alerts_webhook", &redacted_url)
             .await
             .map_err(|e| format!("webhook dispatch failed: {e}"))?;
         if !resp.status().is_success() {
@@ -205,6 +208,31 @@ impl WebhookChannel {
         let extras: HashMap<String, String> = HashMap::new();
         self.dispatch_with_vars(notification, &extras, http).await
     }
+
+    fn render_body_from_vars(&self, vars: &HashMap<String, String>) -> Result<String, String> {
+        if self.body_template_uses_json_escaping() {
+            render_template_json_string_escaped(&self.body_template, vars)
+        } else {
+            render_template(&self.body_template, vars)
+        }
+    }
+
+    fn body_template_uses_json_escaping(&self) -> bool {
+        self.headers.iter().any(|(name, value)| {
+            name.as_str().eq_ignore_ascii_case("content-type") && header_value_is_json(value)
+        })
+    }
+}
+
+fn header_value_is_json(value: &HeaderValue) -> bool {
+    let Ok(raw) = value.to_str() else {
+        return false;
+    };
+    let media_type = raw.split(';').next().unwrap_or("").trim();
+    if media_type.eq_ignore_ascii_case("application/json") {
+        return true;
+    }
+    media_type.to_ascii_lowercase().ends_with("+json")
 }
 
 fn base_vars(n: &Notification) -> HashMap<String, String> {

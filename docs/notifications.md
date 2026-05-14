@@ -20,6 +20,7 @@ Reusable, plugin-agnostic notification infrastructure. Lives at `src/notificatio
 - Channel name matches `[A-Za-z0-9_-]+`.
 - `webhook_url` (Slack/Teams/Discord) and `url` (generic webhook) MUST be `http://` or `https://` with a host.
 - For each URL field there is a sibling `*_env` form (`webhook_url_env: "MY_ENV"`) that resolves via `std::env::var()` at construction. Combine with the gateway's secret resolver (`_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP` env-var suffixes) to keep credentials out of config files.
+- Dispatch slow-call/error logs redact endpoint paths, query strings, and userinfo because incoming webhook credentials commonly live inside the URL.
 
 ### Slack (Incoming Webhook)
 
@@ -73,7 +74,7 @@ Posts an `embeds` payload. `Notification.fields` become `embeds[0].fields` (`{na
 }
 ```
 
-Renders `body_template` after `${var}` substitution and POSTs the result. The default `Content-Type: application/json` is added if the operator does not supply their own.
+Renders `body_template` after `${var}` substitution and POSTs the result. The default `Content-Type: application/json` is added if the operator does not supply their own. For JSON content types (`application/json` or `*+json`), substituted values are escaped as JSON string content so quotes, backslashes, and control characters inside alert fields cannot break the body; place variables inside JSON strings unless the value is intentionally numeric/boolean text. Non-JSON content types keep raw substitution.
 
 #### Template variables provided by the notifications layer
 

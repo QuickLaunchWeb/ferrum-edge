@@ -11,6 +11,7 @@ use ferrum_edge::notifications::channels::{
     DiscordChannel, NotificationChannel, SlackChannel, TeamsChannel, WebhookChannel, parse_channels,
 };
 use ferrum_edge::notifications::{EventAction, Notification, NotificationField, Severity};
+use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use serde_json::{Value, json};
 
 fn fixed_notification() -> Notification {
@@ -240,6 +241,68 @@ fn webhook_renders_template_with_caller_extras() {
 }
 
 #[test]
+fn webhook_json_template_escapes_variable_values() {
+    let chan = parse_one(
+        "pd",
+        json!({
+            "type": "webhook",
+            "url": "https://events.pagerduty.com/v2/enqueue",
+            "body_template": "{\"summary\":\"${rule_name}: ${reason}\"}",
+        }),
+    );
+    let NotificationChannel::Webhook(webhook) = chan else {
+        panic!("expected webhook");
+    };
+    let mut extras: HashMap<String, String> = HashMap::new();
+    extras.insert("rule_name".to_string(), "proxy_5xx".to_string());
+    extras.insert(
+        "reason".to_string(),
+        "classified as [\"tls_error\"] \\ backend\nretry".to_string(),
+    );
+    let body = webhook
+        .render_body_with_vars(&fixed_notification(), &extras)
+        .unwrap();
+    assert!(
+        body.contains("\\\"tls_error\\\""),
+        "JSON string value should be escaped: {body}"
+    );
+    assert!(
+        body.contains("\\\\ backend\\nretry"),
+        "backslashes and newlines should be escaped: {body}"
+    );
+    let parsed: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        parsed["summary"],
+        "proxy_5xx: classified as [\"tls_error\"] \\ backend\nretry"
+    );
+}
+
+#[test]
+fn webhook_text_template_keeps_raw_variable_values() {
+    let chan = parse_one(
+        "raw",
+        json!({
+            "type": "webhook",
+            "url": "https://example.com/alerts",
+            "headers": { "content-type": "text/plain" },
+            "body_template": "reason=${reason}",
+        }),
+    );
+    let NotificationChannel::Webhook(webhook) = chan else {
+        panic!("expected webhook");
+    };
+    let mut extras: HashMap<String, String> = HashMap::new();
+    extras.insert(
+        "reason".to_string(),
+        "classified as [\"tls_error\"] \\ backend".to_string(),
+    );
+    let body = webhook
+        .render_body_with_vars(&fixed_notification(), &extras)
+        .unwrap();
+    assert_eq!(body, "reason=classified as [\"tls_error\"] \\ backend");
+}
+
+#[test]
 fn webhook_rejects_unbalanced_template_at_construction() {
     let err = WebhookChannel::new(
         "pd",
@@ -305,6 +368,26 @@ fn webhook_operator_content_type_overrides_default() {
         .find(|(k, _)| k.as_str().eq_ignore_ascii_case("content-type"))
         .unwrap();
     assert_eq!(ct.1.to_str().unwrap(), "text/plain");
+}
+
+#[tokio::test]
+async fn webhook_dispatch_error_redacts_secret_url() {
+    let webhook = WebhookChannel::new(
+        "pd",
+        &json!({
+            "type": "webhook",
+            "url": "http://127.0.0.1:1/hooks/TOKEN123?routing_key=abc123",
+            "body_template": "x",
+        }),
+    )
+    .unwrap();
+    let err = webhook
+        .dispatch(&fixed_notification(), &PluginHttpClient::default())
+        .await
+        .unwrap_err();
+    assert!(err.contains("redacted"), "got: {err}");
+    assert!(!err.contains("TOKEN123"), "got: {err}");
+    assert!(!err.contains("abc123"), "got: {err}");
 }
 
 // -------------------------------------------------- env-var resolution helper

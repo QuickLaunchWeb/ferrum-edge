@@ -12,7 +12,7 @@ use url::Url;
 use crate::plugins::utils::http_client::PluginHttpClient;
 
 use super::super::notification::Notification;
-use super::resolve_optional_string;
+use super::{redacted_endpoint_url, resolve_optional_string};
 
 #[derive(Debug, Clone)]
 pub struct SlackChannel {
@@ -86,9 +86,10 @@ impl SlackChannel {
         http: &PluginHttpClient,
     ) -> Result<(), String> {
         let payload = self.build_payload(notification);
+        let redacted_url = redacted_endpoint_url(&self.webhook_url);
         let req = http.get().post(self.webhook_url.as_ref()).json(&payload);
         let resp = http
-            .execute(req, "proxy_alerts_slack")
+            .execute_redacted(req, "proxy_alerts_slack", &redacted_url)
             .await
             .map_err(|e| format!("slack dispatch failed: {e}"))?;
         if !resp.status().is_success() {

@@ -1,13 +1,14 @@
 //! Cooldown gate + recovery state machine for proxy_alerts.
 //!
 //! - [`CooldownGate`] suppresses repeated dispatches per `(rule_id,
-//!   channel_id)`. Atomic CAS on a single `AtomicU64` per pair.
+//!   proxy_id, channel_id)`. Atomic CAS on a single `AtomicU64` per key.
 //! - [`RecoveryGate`] tracks per-`(rule_id, proxy_id)` lifecycle so a rule
 //!   that breaches and then recovers can dispatch a single resolve event.
 //!
 //! Both surfaces are infallible by design — they only return whether to
 //! proceed; the caller's `tokio::spawn` does the actual dispatch.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
@@ -16,7 +17,8 @@ use crate::util::sharding::pool_shard_amount;
 
 #[derive(Debug)]
 pub struct CooldownGate {
-    last_sent: DashMap<(u32, u32), AtomicU64>,
+    last_sent: DashMap<(u32, u32), Arc<DashMap<String, AtomicU64>>>,
+    inner_shard_amount: usize,
 }
 
 impl Default for CooldownGate {
@@ -27,8 +29,10 @@ impl Default for CooldownGate {
 
 impl CooldownGate {
     pub fn new() -> Self {
+        let shard_amount = pool_shard_amount(0);
         Self {
-            last_sent: DashMap::with_shard_amount(pool_shard_amount(0)),
+            last_sent: DashMap::with_shard_amount(shard_amount),
+            inner_shard_amount: shard_amount,
         }
     }
 
@@ -38,13 +42,25 @@ impl CooldownGate {
     pub fn try_acquire(
         &self,
         rule_id: u32,
+        proxy_id: &str,
         channel_id: u32,
         cooldown_ms: u64,
         now_ms: u64,
     ) -> bool {
-        let entry = self
-            .last_sent
-            .entry((rule_id, channel_id))
+        let per_proxy = if let Some(existing) = self.last_sent.get(&(rule_id, channel_id)) {
+            Arc::clone(existing.value())
+        } else {
+            Arc::clone(
+                self.last_sent
+                    .entry((rule_id, channel_id))
+                    .or_insert_with(|| {
+                        Arc::new(DashMap::with_shard_amount(self.inner_shard_amount))
+                    })
+                    .value(),
+            )
+        };
+        let entry = per_proxy
+            .entry(proxy_id.to_string())
             .or_insert_with(|| AtomicU64::new(0));
         let atomic = entry.value();
         let mut prev = atomic.load(Ordering::Acquire);
@@ -129,6 +145,28 @@ impl RecoveryGate {
         Self::transition(entry.value_mut(), breach, recovery_ms, now_ms)
     }
 
+    /// Evaluate the next lifecycle outcome without mutating state.
+    ///
+    /// Used by the dispatch path so Trigger/Resolve transitions can be
+    /// committed only after at least one notification channel accepts the
+    /// event. Non-notifying outcomes still use [`Self::observe`] directly.
+    pub fn evaluate(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        breach: bool,
+        recovery_ms: u64,
+        now_ms: u64,
+    ) -> LifecycleOutcome {
+        let state = self
+            .state
+            .get(&(rule_id, proxy_id.to_string()))
+            .map(|entry| *entry.value())
+            .unwrap_or(RuleState::Healthy);
+        let mut state = state;
+        Self::transition(&mut state, breach, recovery_ms, now_ms)
+    }
+
     fn transition(
         state: &mut RuleState,
         breach: bool,
@@ -144,6 +182,10 @@ impl RecoveryGate {
             }
             (RuleState::Healthy, false) => LifecycleOutcome::Quiet,
             (RuleState::Active { .. }, true) => LifecycleOutcome::StillActive,
+            (RuleState::Active { .. }, false) if recovery_ms == 0 => {
+                *state = RuleState::Healthy;
+                LifecycleOutcome::Quiet
+            }
             (RuleState::Active { .. }, false) => {
                 *state = RuleState::Recovering {
                     left_threshold_at_ms: now_ms,
@@ -159,9 +201,18 @@ impl RecoveryGate {
                 if recovery_ms > 0 && now_ms.saturating_sub(left_threshold_at_ms) >= recovery_ms {
                     *state = RuleState::Healthy;
                     LifecycleOutcome::Resolve
+                } else if recovery_ms == 0 {
+                    *state = RuleState::Healthy;
+                    LifecycleOutcome::Quiet
                 } else {
                     LifecycleOutcome::Quiet
                 }
+            }
+            (RuleState::Recovering { .. }, true) if recovery_ms == 0 => {
+                *state = RuleState::Active {
+                    fired_at_ms: now_ms,
+                };
+                LifecycleOutcome::Trigger
             }
             (RuleState::Recovering { .. }, true) => {
                 *state = RuleState::Active {

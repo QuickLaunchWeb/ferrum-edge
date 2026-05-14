@@ -202,8 +202,10 @@ pub enum WebSocketFrameDirection {
 /// Mirrors the information made available on `StreamTransactionSummary`
 /// for TCP/UDP streams so logging/metrics plugins have parity across all
 /// three protocols. `direction` identifies which half of the frame relay
-/// terminated first — `None` indicates a clean close initiated by both
-/// peers or an upgrade that never established frame flow.
+/// terminated first and `io_side` identifies whether that half failed while
+/// reading from its source or writing to its destination. `None` for both
+/// indicates a clean close initiated by either peer or an upgrade that never
+/// established frame flow.
 ///
 /// Populated once per accepted WebSocket upgrade, including H2 Extended
 /// CONNECT (RFC 8441) sessions. The frame relay code should construct
@@ -229,6 +231,10 @@ pub struct WsDisconnectContext {
     /// Which direction observed the first terminating error. `None` for
     /// clean close initiated by either peer.
     pub direction: Option<Direction>,
+    /// Which I/O side inside the failing direction observed the error. This
+    /// disambiguates `BackendToClient` reads from the backend versus writes to
+    /// a disconnected client.
+    pub io_side: Option<crate::proxy::tcp_proxy::StreamIoSide>,
     /// Classification of the terminating error, if any.
     pub error_class: Option<crate::retry::ErrorClass>,
     /// Consumer identity associated with the upgrade (copied from

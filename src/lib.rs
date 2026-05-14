@@ -434,7 +434,11 @@ pub mod _test_support {
         ws_disconnect_plugins: &[Arc<dyn Plugin>],
         proxy_id: &str,
         session_meta: &crate::proxy::WsSessionMeta,
-        failure: Option<(crate::plugins::Direction, crate::retry::ErrorClass)>,
+        failure: Option<(
+            crate::plugins::Direction,
+            crate::retry::ErrorClass,
+            Option<StreamIoSide>,
+        )>,
     ) {
         crate::proxy::fire_ws_tunnel_disconnect_hooks(
             ws_disconnect_plugins,

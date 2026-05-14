@@ -5069,7 +5069,11 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
     ws_disconnect_plugins: &[Arc<dyn Plugin>],
     proxy_id: &str,
     session_meta: &WsSessionMeta,
-    failure: Option<(crate::plugins::Direction, retry::ErrorClass)>,
+    failure: Option<(
+        crate::plugins::Direction,
+        retry::ErrorClass,
+        Option<tcp_proxy::StreamIoSide>,
+    )>,
 ) {
     if ws_disconnect_plugins.is_empty() {
         return;
@@ -5087,8 +5091,9 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
         duration_ms: disconnect_duration_ms,
         frames_client_to_backend: 0,
         frames_backend_to_client: 0,
-        direction: failure.as_ref().map(|(d, _)| *d),
-        error_class: failure.map(|(_, c)| c),
+        direction: failure.as_ref().map(|(d, _, _)| *d),
+        io_side: failure.as_ref().and_then(|(_, _, side)| *side),
+        error_class: failure.map(|(_, c, _)| c),
         consumer_username: session_meta.consumer_username.clone(),
         auth_method: session_meta.auth_method,
         metadata: session_meta.metadata.clone(),
@@ -5263,6 +5268,7 @@ where
                 Some((
                     crate::plugins::Direction::Unknown,
                     crate::retry::classify_boxed_error(anyhow_err.as_ref()),
+                    None,
                 ))
             }
         };
@@ -5320,8 +5326,13 @@ where
     // are dropped. Both directions still publish their clean-close outcome
     // through the counter, so "no error + clean close" is distinguishable
     // from "error observed on one half".
-    let first_failure: Arc<std::sync::OnceLock<(crate::plugins::Direction, retry::ErrorClass)>> =
-        Arc::new(std::sync::OnceLock::new());
+    let first_failure: Arc<
+        std::sync::OnceLock<(
+            crate::plugins::Direction,
+            retry::ErrorClass,
+            Option<tcp_proxy::StreamIoSide>,
+        )>,
+    > = Arc::new(std::sync::OnceLock::new());
     let first_failure_ctb = first_failure.clone();
     let first_failure_btc = first_failure.clone();
 
@@ -5427,6 +5438,7 @@ where
                                         let _ = first_failure_ctb.set((
                                             crate::plugins::Direction::ClientToBackend,
                                             retry::classify_boxed_error(&e),
+                                            Some(tcp_proxy::StreamIoSide::Write),
                                         ));
                                         break;
                                     }
@@ -5463,6 +5475,7 @@ where
                             let _ = first_failure_ctb.set((
                                 crate::plugins::Direction::ClientToBackend,
                                 retry::classify_boxed_error(&e),
+                                Some(tcp_proxy::StreamIoSide::Read),
                             ));
                             break;
                         }
@@ -5570,6 +5583,7 @@ where
                                         let _ = first_failure_btc.set((
                                             crate::plugins::Direction::BackendToClient,
                                             retry::classify_boxed_error(&e),
+                                            Some(tcp_proxy::StreamIoSide::Write),
                                         ));
                                         break;
                                     }
@@ -5604,6 +5618,7 @@ where
                             let _ = first_failure_btc.set((
                                 crate::plugins::Direction::BackendToClient,
                                 retry::classify_boxed_error(&e),
+                                Some(tcp_proxy::StreamIoSide::Read),
                             ));
                             break;
                         }
@@ -5650,12 +5665,14 @@ where
             let _ = first_failure.set((
                 crate::plugins::Direction::BackendToClient,
                 retry::ErrorClass::ReadWriteTimeout,
+                None,
             ));
         }
     } else if tokio::time::timeout(WS_DRAIN_GRACE, c2b).await.is_err() {
         let _ = first_failure.set((
             crate::plugins::Direction::ClientToBackend,
             retry::ErrorClass::ReadWriteTimeout,
+            None,
         ));
     }
 
@@ -5678,8 +5695,9 @@ where
             duration_ms: disconnect_duration_ms,
             frames_client_to_backend: frames_c2b.load(Ordering::Relaxed),
             frames_backend_to_client: frames_b2c.load(Ordering::Relaxed),
-            direction: failure.as_ref().map(|(d, _)| *d),
-            error_class: failure.map(|(_, c)| c),
+            direction: failure.as_ref().map(|(d, _, _)| *d),
+            io_side: failure.as_ref().and_then(|(_, _, side)| *side),
+            error_class: failure.map(|(_, c, _)| c),
             consumer_username: session_meta.consumer_username,
             auth_method: session_meta.auth_method,
             metadata: session_meta.metadata,

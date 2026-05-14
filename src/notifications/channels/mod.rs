@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value;
+use url::Url;
 
 use crate::plugins::utils::http_client::PluginHttpClient;
 
@@ -192,4 +193,18 @@ pub(super) fn resolve_optional_string(
         return Ok(Some(resolved));
     }
     Ok(None)
+}
+
+/// Redact a webhook endpoint for logs/errors. Incoming webhook credentials
+/// commonly live in the URL path or query string, so keep only scheme/host/port.
+pub(super) fn redacted_endpoint_url(raw: &str) -> String {
+    let Ok(mut url) = Url::parse(raw) else {
+        return "redacted-url".to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.set_path("/redacted");
+    url.to_string()
 }

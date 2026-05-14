@@ -11,16 +11,16 @@
 //! whose tag points at an older epoch, the slot is reset (counters cleared)
 //! before being incremented.
 //!
-//! All operations are lock-free atomic. `record()` does at most:
-//! - 1 atomic swap on the slot tag
-//! - 2 atomic stores when the slot rolls over (rare)
+//! All operations use atomics only. `record()` does at most:
+//! - 1 atomic load on the slot tag in the common case
+//! - 1 CAS + counter resets when the slot rolls over (rare)
 //! - 1–2 atomic fetch_adds on the slot's counters
 //!
 //! `snapshot()` does N_BUCKETS atomic loads. No allocation on either path.
 //!
-//! Two minor races are intentional:
-//! - A `record()` racing with a slot rollover may lose its single sample.
-//! - A `snapshot()` may see a partial bucket mid-update.
+//! One minor race is intentional:
+//! - A `snapshot()` may see a partial bucket mid-update or skip a bucket while
+//!   its rollover reset is in progress.
 //!
 //! Both are acceptable for alerting where threshold breaches sustain across
 //! many buckets and individual samples are not load-bearing.
@@ -35,14 +35,17 @@ use dashmap::DashMap;
 use crate::util::sharding::pool_shard_amount;
 
 const N_BUCKETS: usize = 10;
+const RESETTING_EPOCH: u64 = u64::MAX;
 
 /// Upper bounds (exclusive) of latency histogram buckets, in milliseconds.
 /// Bucket `i` covers `[upper[i-1], upper[i])` for `i > 0` and `[0, upper[0])`
 /// for `i = 0`. The final bucket (index `LATENCY_BUCKET_COUNT - 1`) covers
 /// `[upper[last], +∞)`.
-const LATENCY_UPPER_BOUNDS_MS: [u64; 12] = [
-    5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000, 30_000,
+const LATENCY_UPPER_BOUNDS_MS: [u64; 15] = [
+    5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000, 30_000, 60_000, 120_000, 300_000,
 ];
+pub const MAX_FINITE_LATENCY_BOUND_MS: u64 =
+    LATENCY_UPPER_BOUNDS_MS[LATENCY_UPPER_BOUNDS_MS.len() - 1];
 const LATENCY_BUCKET_COUNT: usize = LATENCY_UPPER_BOUNDS_MS.len() + 1;
 
 #[derive(Debug)]
@@ -82,11 +85,7 @@ impl BucketedCounter {
         let tag = now_ms / self.bucket_ms;
         let slot = (tag % self.buckets.len() as u64) as usize;
         let bucket = &self.buckets[slot];
-        let prev = bucket.epoch_index.swap(tag, Ordering::AcqRel);
-        if prev != tag {
-            bucket.matched.store(0, Ordering::Relaxed);
-            bucket.total.store(0, Ordering::Relaxed);
-        }
+        prepare_counter_bucket(bucket, tag);
         if matched {
             bucket.matched.fetch_add(1, Ordering::Relaxed);
         }
@@ -102,7 +101,7 @@ impl BucketedCounter {
         let mut total = 0u64;
         for bucket in self.buckets.iter() {
             let tag = bucket.epoch_index.load(Ordering::Acquire);
-            if cur_tag.saturating_sub(tag) < max_age {
+            if tag != RESETTING_EPOCH && cur_tag.saturating_sub(tag) < max_age {
                 matched = matched.saturating_add(bucket.matched.load(Ordering::Relaxed));
                 total = total.saturating_add(bucket.total.load(Ordering::Relaxed));
             }
@@ -113,10 +112,9 @@ impl BucketedCounter {
     pub fn last_record_ms(&self) -> u64 {
         self.buckets
             .iter()
-            .map(|b| b.epoch_index.load(Ordering::Acquire))
+            .map(|b| epoch_to_record_ms(b.epoch_index.load(Ordering::Acquire), self.bucket_ms))
             .max()
             .unwrap_or(0)
-            .saturating_mul(self.bucket_ms)
     }
 }
 
@@ -155,12 +153,7 @@ impl BucketedLatencyHistogram {
         let tag = now_ms / self.bucket_ms;
         let slot = (tag % self.buckets.len() as u64) as usize;
         let bucket = &self.buckets[slot];
-        let prev = bucket.epoch_index.swap(tag, Ordering::AcqRel);
-        if prev != tag {
-            for c in bucket.counts.iter() {
-                c.store(0, Ordering::Relaxed);
-            }
-        }
+        prepare_latency_bucket(bucket, tag);
         let idx = bucket_index_for(latency_ms);
         bucket.counts[idx].fetch_add(1, Ordering::Relaxed);
     }
@@ -174,7 +167,7 @@ impl BucketedLatencyHistogram {
         let mut total = 0u64;
         for bucket in self.buckets.iter() {
             let tag = bucket.epoch_index.load(Ordering::Acquire);
-            if cur_tag.saturating_sub(tag) < max_age {
+            if tag != RESETTING_EPOCH && cur_tag.saturating_sub(tag) < max_age {
                 for (idx, slot) in bucket.counts.iter().enumerate() {
                     let v = slot.load(Ordering::Relaxed);
                     totals[idx] = totals[idx].saturating_add(v);
@@ -205,10 +198,70 @@ impl BucketedLatencyHistogram {
     pub fn last_record_ms(&self) -> u64 {
         self.buckets
             .iter()
-            .map(|b| b.epoch_index.load(Ordering::Acquire))
+            .map(|b| epoch_to_record_ms(b.epoch_index.load(Ordering::Acquire), self.bucket_ms))
             .max()
             .unwrap_or(0)
-            .saturating_mul(self.bucket_ms)
+    }
+}
+
+fn prepare_counter_bucket(bucket: &AtomicBucket, tag: u64) {
+    loop {
+        match bucket.epoch_index.load(Ordering::Acquire) {
+            current if current == tag => return,
+            RESETTING_EPOCH => std::hint::spin_loop(),
+            current => {
+                if bucket
+                    .epoch_index
+                    .compare_exchange(
+                        current,
+                        RESETTING_EPOCH,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    bucket.matched.store(0, Ordering::Relaxed);
+                    bucket.total.store(0, Ordering::Relaxed);
+                    bucket.epoch_index.store(tag, Ordering::Release);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn prepare_latency_bucket(bucket: &LatencyBucket, tag: u64) {
+    loop {
+        match bucket.epoch_index.load(Ordering::Acquire) {
+            current if current == tag => return,
+            RESETTING_EPOCH => std::hint::spin_loop(),
+            current => {
+                if bucket
+                    .epoch_index
+                    .compare_exchange(
+                        current,
+                        RESETTING_EPOCH,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    for c in bucket.counts.iter() {
+                        c.store(0, Ordering::Relaxed);
+                    }
+                    bucket.epoch_index.store(tag, Ordering::Release);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn epoch_to_record_ms(tag: u64, bucket_ms: u64) -> u64 {
+    if tag == RESETTING_EPOCH {
+        0
+    } else {
+        tag.saturating_mul(bucket_ms)
     }
 }
 
@@ -388,12 +441,18 @@ impl WindowStore {
 }
 
 impl WindowStore {
-    /// Spawn a background task that periodically evicts stale entries.
-    /// Returns the handle so the plugin can keep ownership and cancel on
-    /// drop if needed (currently fire-and-forget).
-    pub fn start_eviction_task(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+    /// Spawn a background task that periodically evicts stale entries when
+    /// called from inside a Tokio runtime.
+    ///
+    /// Validation paths can instantiate plugins outside a runtime, so this is
+    /// deliberately best-effort. Runtime plugin instances keep the returned
+    /// handle and abort it on drop.
+    pub fn start_eviction_task(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return None;
+        };
         let store = Arc::clone(self);
-        tokio::spawn(async move {
+        Some(handle.spawn(async move {
             // Eviction cadence chosen to be coarse — staleness is determined
             // by per-rule window length, and inactive proxies just take a
             // bit longer to free up.
@@ -406,7 +465,7 @@ impl WindowStore {
                 // floor that covers all reasonable rule windows.
                 store.evict_stale(now_ms, 3_600_000);
             }
-        })
+        }))
     }
 }
 

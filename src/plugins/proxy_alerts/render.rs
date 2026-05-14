@@ -37,8 +37,9 @@ pub fn build_notification(
         NotificationField::new("Window", format!("{}s", common.window_seconds)),
         NotificationField::new("Samples", observation.sample_count.to_string()),
     ];
-    if let Some(ns) = sample.namespace().to_string().into() {
-        fields.push(NotificationField::new("Namespace", ns));
+    let ns = sample.namespace();
+    if !ns.is_empty() {
+        fields.push(NotificationField::new("Namespace", ns.to_string()));
     }
     if !common.channel_names.is_empty() {
         let names: Vec<&str> = common.channel_names.iter().map(|n| n.as_ref()).collect();
@@ -64,7 +65,6 @@ pub fn build_notification(
     } else if let Some(id) = sample.proxy_id() {
         builder = builder.subject_id(Arc::from(id));
     }
-    let ns = sample.namespace();
     if !ns.is_empty() {
         builder = builder.namespace(Arc::from(ns));
     }
