@@ -416,7 +416,8 @@ fn gateway_config_content_changed(new_config: &GatewayConfig, old_config: &Gatew
 
 const K8S_MANAGED_PROXY_ID_PREFIXES: &[&str] = &["gwapi-route-", "gwapi-l4-", "istio-vs-"];
 const K8S_MANAGED_UPSTREAM_ID_PREFIXES: &[&str] = &["gwapi-route-upstream-", "istio-vs-upstream-"];
-const K8S_MANAGED_PLUGIN_CONFIG_ID_PREFIXES: &[&str] = &["istio-vs-fi-", "istio-vs-mrd-"];
+const K8S_MANAGED_PLUGIN_CONFIG_ID_PREFIXES: &[&str] =
+    &["istio-vs-fi-", "istio-vs-mrd-", "istio-vs-rt-"];
 
 fn managed_k8s_namespaces(
     namespace: &str,
@@ -653,6 +654,10 @@ mod tests {
             "istio-vs-mrd-ferrum-old-0",
             json!({"rules": [{"match": {"methods": ["GET"]}, "destination": {"upstream_id": "old"}}]}),
         ));
+        active.plugin_configs.push(plugin_config(
+            "istio-vs-rt-ferrum-old-0",
+            json!({"status_code": 404, "message": "unsupported Istio VirtualService match predicate"}),
+        ));
         active.known_namespaces.push("db".to_string());
 
         let mut k8s = GatewayConfig::default();
@@ -707,6 +712,12 @@ mod tests {
                 .plugin_configs
                 .iter()
                 .all(|plugin| plugin.id != "istio-vs-mrd-ferrum-old-0")
+        );
+        assert!(
+            merged
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != "istio-vs-rt-ferrum-old-0")
         );
         assert!(merged.known_namespaces.contains(&"db".to_string()));
         assert!(merged.known_namespaces.contains(&"k8s".to_string()));
@@ -809,6 +820,11 @@ mod tests {
             json!({"rules": [{"match": {"methods": ["GET"]}, "destination": {"upstream_id": "old"}}]}),
         ));
         active.plugin_configs[1].namespace = "prod".to_string();
+        active.plugin_configs.push(plugin_config(
+            "istio-vs-rt-default-old-0",
+            json!({"status_code": 404, "message": "unsupported Istio VirtualService match predicate"}),
+        ));
+        active.plugin_configs[2].namespace = "default".to_string();
 
         let k8s = GatewayConfig::default();
         let managed = BTreeSet::new();
