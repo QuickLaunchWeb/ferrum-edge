@@ -37,6 +37,9 @@ const DEFAULT_INJECTOR_TRUST_DOMAIN: &str = "cluster.local";
 const ISTIO_EXCLUDE_OUTBOUND_PORTS_ANNOTATION: &str =
     "traffic.sidecar.istio.io/excludeOutboundPorts";
 const FERRUM_EXCLUDE_OUTBOUND_PORTS_ANNOTATION: &str = "ferrum.io/excludeOutboundPorts";
+const ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION: &str =
+    "traffic.sidecar.istio.io/includeOutboundPorts";
+const FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION: &str = "ferrum.io/includeOutboundPorts";
 const ISTIO_EXCLUDE_INBOUND_PORTS_ANNOTATION: &str = "traffic.sidecar.istio.io/excludeInboundPorts";
 const FERRUM_EXCLUDE_INBOUND_PORTS_ANNOTATION: &str = "ferrum.io/excludeInboundPorts";
 const ISTIO_EXCLUDE_OUTBOUND_IP_RANGES_ANNOTATION: &str =
@@ -239,9 +242,9 @@ fn parse_port_list(raw: Option<&str>) -> Result<Vec<u16>, String> {
     {
         let port = token
             .parse::<u16>()
-            .map_err(|e| format!("port exclusion '{token}': {e}"))?;
+            .map_err(|e| format!("port '{token}': {e}"))?;
         if port == 0 {
-            return Err("port exclusion '0': port must be 1-65535".to_string());
+            return Err("port '0': port must be 1-65535".to_string());
         }
         ports.push(port);
     }
@@ -822,6 +825,7 @@ fn capture_config(config: &InjectorConfig, pod: &Value) -> Result<CaptureConfig,
     let mut capture = CaptureConfig::explicit(15006, 15001);
     capture.mode = config.capture_mode;
     capture.proxy_uid = Some(config.proxy_uid.unwrap_or(DEFAULT_PROXY_UID));
+    capture.include_outbound_ports = include_outbound_ports_for_pod(pod)?;
     capture.exclude_ports = exclude_outbound_ports_for_pod(config, pod)?;
     capture.exclude_inbound_ports = exclude_inbound_ports_for_pod(config, pod)?;
 
@@ -870,6 +874,28 @@ fn capture_config(config: &InjectorConfig, pod: &Value) -> Result<CaptureConfig,
     capture.exclude_cidrs = resolved_exclude;
 
     Ok(capture)
+}
+
+fn include_outbound_ports_for_pod(pod: &Value) -> Result<Vec<u16>, String> {
+    let annotations = pod
+        .pointer("/metadata/annotations")
+        .and_then(Value::as_object);
+    let mut ports = Vec::new();
+    for key in [
+        ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
+        FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
+    ] {
+        let annotation_ports = parse_port_list(
+            annotations
+                .and_then(|annotations| annotations.get(key))
+                .and_then(Value::as_str),
+        )
+        .map_err(|e| format!("invalid {key}: {e}"))?;
+        ports.extend(annotation_ports);
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    Ok(ports)
 }
 
 fn exclude_outbound_ports_for_pod(
@@ -1135,6 +1161,64 @@ mod tests {
     }
 
     #[test]
+    fn patch_includes_annotated_outbound_ports() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/includeOutboundPorts": "5432, 9092",
+                    "ferrum.io/includeOutboundPorts": "9092, 15090"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+        let init = patch
+            .iter()
+            .find(|op| op.path == "/spec/initContainers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("init container");
+        let commands = init
+            .pointer("/args/0")
+            .and_then(Value::as_str)
+            .expect("iptables plan");
+
+        for port in [5432, 9092, 15090] {
+            assert!(
+                commands.contains(&format!(
+                    "-p tcp -d 0.0.0.0/0 --dport {port} -j REDIRECT --to-ports 15001"
+                )),
+                "includeOutboundPorts REDIRECT missing for port {port}: {commands}"
+            );
+        }
+        assert!(
+            !commands.contains("-p tcp -d 0.0.0.0/0 -j REDIRECT --to-ports 15001"),
+            "port-scoped include rules should replace the CIDR-only catch-all"
+        );
+    }
+
+    #[test]
+    fn patch_rejects_invalid_include_outbound_ports_annotation() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/includeOutboundPorts": "not-a-port"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+
+        let err = build_sidecar_patch_for_namespace(&pod, &config, None)
+            .expect_err("invalid annotation rejected");
+
+        assert!(err.contains("traffic.sidecar.istio.io/includeOutboundPorts"));
+    }
+
+    #[test]
     fn patch_uses_configurable_container_resources() {
         let pod = json!({
             "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
@@ -1230,6 +1314,42 @@ mod tests {
             .expect("denial message");
         assert!(message.contains("traffic.sidecar.istio.io/excludeOutboundPorts"));
         assert!(!message.contains(": invalid port exclusion"));
+    }
+
+    #[test]
+    fn admission_response_denies_invalid_include_outbound_ports_annotation() {
+        let review = json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "bad-include-ports",
+                "namespace": "payments",
+                "object": {
+                    "metadata": {
+                        "labels": {"ferrum.io/mesh": "enabled"},
+                        "annotations": {
+                            "traffic.sidecar.istio.io/includeOutboundPorts": "not-a-port"
+                        }
+                    },
+                    "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+                }
+            }
+        });
+        let response = admission_response(
+            review.to_string().as_bytes(),
+            &test_config(true, CaptureMode::Iptables),
+        )
+        .expect("admission denial");
+
+        assert_eq!(
+            response.pointer("/response/allowed"),
+            Some(&Value::Bool(false))
+        );
+        let message = response
+            .pointer("/response/status/message")
+            .and_then(Value::as_str)
+            .expect("denial message");
+        assert!(message.contains("traffic.sidecar.istio.io/includeOutboundPorts"));
     }
 
     #[test]
@@ -1721,6 +1841,29 @@ mod tests {
             capture.exclude_inbound_ports,
             vec![22, 8080],
             "duplicate ports across sources must collapse"
+        );
+    }
+
+    #[test]
+    fn capture_config_deduplicates_include_outbound_ports_across_aliases() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/includeOutboundPorts": "5432, 9092",
+                    "ferrum.io/includeOutboundPorts": "5432, 15090"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+
+        let capture = capture_config(&config, &pod).expect("capture config");
+
+        assert_eq!(
+            capture.include_outbound_ports,
+            vec![5432, 9092, 15090],
+            "includeOutboundPorts aliases should merge and deduplicate"
         );
     }
 

@@ -726,12 +726,14 @@ The injector checks annotations and labels to decide whether to inject:
 
 When `FERRUM_INJECTOR_REQUIRE_ANNOTATION=true` (default), pods must explicitly opt in via `ferrum.io/inject: "true"` or the `ferrum.io/mesh: "enabled"` label. When `false`, all pods are injected unless explicitly opted out.
 
-### Port and IP-Range Exclusions
+### Port and IP-Range Capture Overrides
 
 The injector supports per-pod capture overrides via annotations. The Istio annotation namespace is honored byte-for-byte so workloads can migrate without rewriting metadata; Ferrum-native annotations are accepted as aliases for the port lists.
 
 | Annotation | Direction | Semantics |
 |---|---|---|
+| `traffic.sidecar.istio.io/includeOutboundPorts` | outbound | Comma-separated TCP destination ports included in outbound capture; when set, outbound REDIRECT rules are scoped to these ports |
+| `ferrum.io/includeOutboundPorts` | outbound | Ferrum-native alias for the above |
 | `traffic.sidecar.istio.io/excludeOutboundPorts` | outbound | Comma-separated TCP destination ports excluded from outbound capture (Istio-compatible) |
 | `ferrum.io/excludeOutboundPorts` | outbound | Ferrum-native alias for the above |
 | `traffic.sidecar.istio.io/excludeInboundPorts` | inbound | Comma-separated TCP destination ports excluded from inbound capture (Istio-compatible). RETURN rules are emitted BEFORE the inbound REDIRECT so the exclusion is honored |
@@ -739,7 +741,7 @@ The injector supports per-pod capture overrides via annotations. The Istio annot
 | `traffic.sidecar.istio.io/excludeOutboundIPRanges` | outbound | Comma-separated CIDRs appended to the env-derived outbound exclude list (matches Istio: per-pod additive) |
 | `traffic.sidecar.istio.io/includeOutboundIPRanges` | outbound | Comma-separated CIDRs that REPLACE the env-derived outbound include list when present (matches Istio: include-overrides-include) |
 
-Port-list annotations merge with each other and with the injector-level `FERRUM_MESH_EXCLUDE_OUTBOUND_PORTS` / `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` defaults; results are deduplicated. CIDR annotations are validated at admission time -- invalid ports or CIDRs are rejected with a webhook error that names the offending annotation, so a typo cannot silently produce a broken iptables plan.
+Port-list annotations merge with their Ferrum aliases and the applicable injector-level defaults; results are deduplicated. `includeOutboundPorts` narrows outbound REDIRECT rules to the listed TCP destination ports while preserving the configured include CIDRs, and outbound exclude ports still win because their RETURN rules are emitted first. CIDR annotations are validated at admission time -- invalid ports or CIDRs are rejected with a webhook error that names the offending annotation, so a typo cannot silently produce a broken iptables plan.
 
 **Pod-restart caveat:** annotations are evaluated at pod admission time only. Existing pods retain their previous capture rules until restart; bouncing affected workloads is required for previously-ignored annotations to take effect.
 
