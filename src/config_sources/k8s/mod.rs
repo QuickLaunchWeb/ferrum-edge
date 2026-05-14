@@ -640,6 +640,12 @@ pub(crate) fn fault_injection_plugin_for_proxy(
     })
 }
 
+pub(crate) struct MeshRouteDispatchDestination<'a> {
+    pub backend_host: &'a str,
+    pub backend_port: u16,
+    pub upstream_id: Option<&'a str>,
+}
+
 /// Translate a VirtualService `http[]` entry's `match[]` blocks into a
 /// `mesh_route_dispatch` plugin instance for the route's proxy.
 ///
@@ -690,18 +696,54 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
     namespace: &str,
     http: &Value,
     listen_path: Option<&str>,
-    backend_host: &str,
-    backend_port: u16,
-    upstream_id: Option<&str>,
+    destination: MeshRouteDispatchDestination<'_>,
+    prepend_rules: &[Value],
 ) -> Option<PluginConfig> {
-    let matches = http.get("match").and_then(Value::as_array)?;
-    if matches.is_empty() {
+    let (mut rules, has_uri_only_match) =
+        mesh_route_dispatch_rules_for_proxy(http, listen_path, destination, false);
+    if !prepend_rules.is_empty() {
+        let mut combined = Vec::with_capacity(prepend_rules.len() + rules.len());
+        combined.extend(prepend_rules.iter().cloned());
+        combined.append(&mut rules);
+        rules = combined;
+    }
+    if rules.is_empty() {
         return None;
+    }
+
+    let current_route_has_rules = rules.len() > prepend_rules.len();
+    let reject_unmatched = current_route_has_rules && !has_uri_only_match;
+
+    mesh_route_dispatch_plugin_from_rules(proxy_id, namespace, rules, reject_unmatched)
+}
+
+pub(crate) fn mesh_route_dispatch_uri_less_rules(
+    http: &Value,
+    destination: MeshRouteDispatchDestination<'_>,
+) -> Vec<Value> {
+    mesh_route_dispatch_rules_for_proxy(http, None, destination, true).0
+}
+
+fn mesh_route_dispatch_rules_for_proxy(
+    http: &Value,
+    listen_path: Option<&str>,
+    route_destination: MeshRouteDispatchDestination<'_>,
+    uri_less_only: bool,
+) -> (Vec<Value>, bool) {
+    let Some(matches) = http.get("match").and_then(Value::as_array) else {
+        return (Vec::new(), false);
+    };
+    if matches.is_empty() {
+        return (Vec::new(), false);
     }
 
     let mut rules = Vec::new();
     let mut has_uri_only_match = false;
     for entry in matches {
+        if uri_less_only && entry.get("uri").is_some() {
+            continue;
+        }
+
         // Scope to this proxy's listen_path. A match entry with a parseable
         // URI applies only to the proxy whose listen_path was built from
         // that URI; entries without a URI (or with an unsupported URI
@@ -773,14 +815,17 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
         }
 
         let mut destination = serde_json::Map::new();
-        if let Some(uid) = upstream_id {
+        if let Some(uid) = route_destination.upstream_id {
             destination.insert("upstream_id".to_string(), Value::String(uid.to_string()));
         } else {
             destination.insert(
                 "backend_host".to_string(),
-                Value::String(backend_host.to_string()),
+                Value::String(route_destination.backend_host.to_string()),
             );
-            destination.insert("backend_port".to_string(), serde_json::json!(backend_port));
+            destination.insert(
+                "backend_port".to_string(),
+                serde_json::json!(route_destination.backend_port),
+            );
         }
 
         let mut rule = serde_json::Map::new();
@@ -789,10 +834,18 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
         rules.push(Value::Object(rule));
     }
 
+    (rules, has_uri_only_match)
+}
+
+fn mesh_route_dispatch_plugin_from_rules(
+    proxy_id: &str,
+    namespace: &str,
+    rules: Vec<Value>,
+    reject_unmatched: bool,
+) -> Option<PluginConfig> {
     if rules.is_empty() {
         return None;
     }
-
     let now = Utc::now();
     Some(PluginConfig {
         id: format!("istio-vs-mrd-{proxy_id}"),
@@ -811,7 +864,7 @@ pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
         // rationale and the regression scenarios this guards against.
         config: serde_json::json!({
             "rules": rules,
-            "reject_unmatched": !has_uri_only_match,
+            "reject_unmatched": reject_unmatched,
         }),
         scope: PluginScope::Proxy,
         proxy_id: Some(proxy_id.to_string()),

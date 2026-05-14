@@ -15,12 +15,13 @@ use crate::modes::mesh::config::{
 };
 
 use super::{
-    K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions, RouteBackend,
-    RouteProxySpec, SourceKind, exact_path_listen_path, fault_injection_plugin_for_proxy,
-    invalid_resource, mesh_route_dispatch_can_emit_rule,
+    K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions,
+    MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind, exact_path_listen_path,
+    fault_injection_plugin_for_proxy, invalid_resource, mesh_route_dispatch_can_emit_rule,
     mesh_route_dispatch_has_unsupported_predicate, mesh_route_dispatch_plugin_for_proxy,
-    optional_port_field, parse_istio_duration_ms, port_from_u64, proxy_for_route, resource_id,
-    selector_from_istio, string_array, string_field, string_map, upstream_for_route,
+    mesh_route_dispatch_uri_less_rules, optional_port_field, parse_istio_duration_ms,
+    port_from_u64, proxy_for_route, resource_id, selector_from_istio, string_array, string_field,
+    string_map, upstream_for_route,
 };
 use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT, PluginConfig, RetryConfig};
 
@@ -1203,6 +1204,7 @@ fn virtual_service_routes(
     let mut proxies = Vec::new();
     let mut upstreams = Vec::new();
     let mut plugins = Vec::new();
+    let mut prior_uri_less_route_rules: Vec<Value> = Vec::new();
 
     for (index, http) in object
         .spec
@@ -1291,9 +1293,12 @@ fn virtual_service_routes(
                     &object.metadata.namespace,
                     http,
                     listen_path.as_deref(),
-                    backend_host.as_str(),
-                    backend_port,
-                    upstream_id.as_deref(),
+                    MeshRouteDispatchDestination {
+                        backend_host: backend_host.as_str(),
+                        backend_port,
+                        upstream_id: upstream_id.as_deref(),
+                    },
+                    &prior_uri_less_route_rules,
                 )
             {
                 plugins.push(plugin);
@@ -1313,6 +1318,17 @@ fn virtual_service_routes(
                 retry: retry.clone(),
                 backend_read_timeout_ms: timeout_ms,
             }));
+        }
+
+        if acc.options.vs_header_routing_experimental {
+            prior_uri_less_route_rules.extend(mesh_route_dispatch_uri_less_rules(
+                http,
+                MeshRouteDispatchDestination {
+                    backend_host: backend_host.as_str(),
+                    backend_port,
+                    upstream_id: upstream_id.as_deref(),
+                },
+            ));
         }
     }
 
@@ -6178,6 +6194,88 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true),
             "header-only match with no URI-only sibling keeps reject_unmatched on"
+        );
+    }
+
+    #[test]
+    fn virtual_service_header_only_match_decorates_later_default_route() {
+        // Regression for the URI-less catch-all routing order: Ferrum routes
+        // prefix paths before regex paths, so a generated `~.*` header-only
+        // proxy loses to a later default `/` proxy. Attach the earlier
+        // URI-less rule to the later default proxy as an override instead:
+        // matching traffic diverts to canary, non-matching traffic stays on
+        // the default backend.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [
+                        {
+                            "match": [
+                                {"headers": {"x-canary": {"exact": "v2"}}}
+                            ],
+                            "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                        },
+                        {
+                            "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                        }
+                    ]
+                }),
+            )],
+            options().with_vs_header_routing_experimental(true),
+        )
+        .expect("translation succeeds");
+
+        let stable_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| {
+                p.listen_path.as_deref() == Some("/")
+                    && p.backend_host == "stable.default.svc.cluster.local"
+            })
+            .expect("later default proxy");
+
+        let matched = crate::router_cache::RouterCache::new(&result.config, 0)
+            .find_proxy(Some("api.example.com"), "/anything")
+            .expect("default prefix proxy should match");
+        assert_eq!(
+            matched.proxy.id, stable_proxy.id,
+            "the later default prefix is the proxy the hot router selects"
+        );
+
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(stable_proxy.id.as_str())
+            })
+            .expect("prior URI-less rule decorates later default proxy");
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules array");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0]["match"]["headers"]["x-canary"].as_str(),
+            Some("v2")
+        );
+        assert_eq!(
+            rules[0]["destination"]["backend_host"].as_str(),
+            Some("canary.default.svc.cluster.local")
+        );
+        assert_eq!(rules[0]["destination"]["backend_port"].as_u64(), Some(9090));
+        assert_eq!(
+            plugin
+                .config
+                .get("reject_unmatched")
+                .and_then(Value::as_bool),
+            Some(false),
+            "misses must fall through to the selected default proxy backend"
         );
     }
 
