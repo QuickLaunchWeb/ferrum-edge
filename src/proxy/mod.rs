@@ -3954,6 +3954,7 @@ async fn handle_connection(
     remote_addr: SocketAddr,
     state: ProxyState,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    frontend_listen_port: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
@@ -4003,7 +4004,18 @@ async fn handle_connection(
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
         let addr = remote_addr;
-        async move { handle_proxy_request(req, state, addr, false, None, None).await }
+        async move {
+            handle_proxy_request_on_frontend_port(
+                req,
+                state,
+                addr,
+                false,
+                None,
+                None,
+                frontend_listen_port,
+            )
+            .await
+        }
     });
 
     let conn = builder.serve_connection_with_upgrades(io, svc);
@@ -5828,6 +5840,7 @@ async fn run_accept_loop(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     _thread_id: usize,
 ) {
+    let frontend_listen_port = listener.local_addr().ok().map(|addr| addr.port());
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -5886,10 +5899,17 @@ async fn run_accept_loop(
                                     state,
                                     tls_config,
                                     conn_shutdown_rx,
+                                    frontend_listen_port,
                                 )
                                 .await
                             } else {
-                                handle_connection(stream, remote_addr, state, conn_shutdown_rx)
+                                handle_connection(
+                                    stream,
+                                    remote_addr,
+                                    state,
+                                    conn_shutdown_rx,
+                                    frontend_listen_port,
+                                )
                                     .await
                             };
 
@@ -5922,6 +5942,7 @@ async fn handle_tls_connection(
     state: ProxyState,
     tls_config: Arc<rustls::ServerConfig>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    frontend_listen_port: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_rustls::TlsAcceptor;
 
@@ -5998,7 +6019,18 @@ async fn handle_tls_connection(
         let addr = remote_addr;
         let cert = client_cert_der.clone();
         let chain = client_cert_chain_der.clone();
-        async move { handle_proxy_request(req, state, addr, true, cert, chain).await }
+        async move {
+            handle_proxy_request_on_frontend_port(
+                req,
+                state,
+                addr,
+                true,
+                cert,
+                chain,
+                frontend_listen_port,
+            )
+            .await
+        }
     });
 
     let conn = builder.serve_connection_with_upgrades(io, svc);
@@ -6472,6 +6504,7 @@ pub async fn run_authentication_phase(
 }
 
 /// Handle a single proxy request.
+#[allow(dead_code)] // Public test/library entry point; listeners use the port-aware wrapper below.
 pub async fn handle_proxy_request(
     req: Request<Incoming>,
     state: ProxyState,
@@ -6479,6 +6512,27 @@ pub async fn handle_proxy_request(
     is_tls: bool,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+) -> Result<Response<ProxyBody>, hyper::Error> {
+    handle_proxy_request_on_frontend_port(
+        req,
+        state,
+        remote_addr,
+        is_tls,
+        tls_client_cert_der,
+        tls_client_cert_chain_der,
+        None,
+    )
+    .await
+}
+
+async fn handle_proxy_request_on_frontend_port(
+    req: Request<Incoming>,
+    state: ProxyState,
+    remote_addr: SocketAddr,
+    is_tls: bool,
+    tls_client_cert_der: Option<Arc<Vec<u8>>>,
+    tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+    frontend_listen_port: Option<u16>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     // Global request admission control. Single atomic load (~1ns) on the fast
     // path. Rejects with 503 when request pressure exceeds the critical
@@ -6518,6 +6572,7 @@ pub async fn handle_proxy_request(
         is_tls,
         tls_client_cert_der,
         tls_client_cert_chain_der,
+        frontend_listen_port,
     )
     .await;
 
@@ -6539,6 +6594,7 @@ async fn handle_proxy_request_inner(
     is_tls: bool,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+    frontend_listen_port: Option<u16>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
 
@@ -6559,11 +6615,11 @@ async fn handle_proxy_request_inner(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
-    ctx.frontend_listen_port = Some(if is_tls {
+    ctx.frontend_listen_port = Some(frontend_listen_port.unwrap_or(if is_tls {
         state.env_config.proxy_https_port
     } else {
         state.env_config.proxy_http_port
-    });
+    }));
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     // Store raw query string on ctx for lazy parsing. The local `query_string`

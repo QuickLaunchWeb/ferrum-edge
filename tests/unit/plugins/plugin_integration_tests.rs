@@ -243,6 +243,7 @@ async fn test_all_plugins_available() {
         "spiffe_identity",
         "mesh_authz",
         "mesh_route_dispatch",
+        "mesh_outbound_registry",
         "workload_metrics",
         "access_log",
         "ai_federation",
@@ -347,6 +348,9 @@ async fn test_plugin_creation_all_plugins() {
                         "destination": {"upstream_id": "canary"}
                     }]
                 })
+            }
+            "mesh_outbound_registry" => {
+                json!({"registry": ["reviews.default.svc.cluster.local"]})
             }
             _ => json!({}),
         };

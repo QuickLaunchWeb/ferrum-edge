@@ -63,6 +63,7 @@ pub const MESH_AUTHZ_PLUGIN_ID: &str = "__mesh_authz";
 pub const MESH_WORKLOAD_METRICS_PLUGIN_ID: &str = "__mesh_workload_metrics";
 pub const MESH_REQUEST_AUTH_PLUGIN_ID: &str = "__mesh_request_auth";
 pub const MESH_ACCESS_LOG_PLUGIN_ID: &str = "__mesh_access_log";
+pub const MESH_OUTBOUND_REGISTRY_PLUGIN_ID: &str = "__mesh_outbound_registry";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshTrafficDirection {
@@ -215,6 +216,15 @@ pub struct MeshRuntimeConfig {
     /// behavior — listeners are topology-driven. Sourced from
     /// `FERRUM_MESH_CAPTURE_MODE` (default `explicit`).
     pub capture_mode: crate::capture::CaptureMode,
+    /// Operator-set outbound traffic policy. Sourced from
+    /// `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY`. When `RegistryOnly`, the
+    /// slice-apply path injects the `mesh_outbound_registry` plugin with a
+    /// registry built from the slice's known destinations.
+    pub outbound_traffic_policy: crate::modes::mesh::config::OutboundTrafficPolicy,
+    /// HTTP status returned by the auto-injected outbound registry plugin for
+    /// unknown destinations. Sourced from
+    /// `FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS` (default 502).
+    pub outbound_registry_reject_status: u16,
     /// When `true`, the slice builder applies Istio `Sidecar` egress scope
     /// narrowing. Sourced from `FERRUM_MESH_SIDECAR_ENFORCED` (default
     /// `false`). When disabled, `Sidecar` resources are parsed and persisted
@@ -324,6 +334,28 @@ impl MeshRuntimeConfig {
             &resolve_ferrum_var("FERRUM_MESH_CAPTURE_MODE")
                 .unwrap_or_else(|| "explicit".to_string()),
         )?;
+        let outbound_traffic_policy = match env_config
+            .mesh_outbound_traffic_policy
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "" | "allow_any" => crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
+            "registry_only" => crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly,
+            other => {
+                return Err(format!(
+                    "Invalid FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY '{other}'. Expected: \
+                     allow_any or registry_only"
+                ));
+            }
+        };
+        let outbound_registry_reject_status = env_config.mesh_outbound_registry_reject_status;
+        if !(400..=599).contains(&outbound_registry_reject_status) {
+            return Err(format!(
+                "Invalid FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS \
+                 '{outbound_registry_reject_status}'. Expected: 400..=599"
+            ));
+        }
 
         Ok(Self {
             node_id,
@@ -351,6 +383,8 @@ impl MeshRuntimeConfig {
             dns_response_cache_max_entries,
             cluster_domain,
             capture_mode,
+            outbound_traffic_policy,
+            outbound_registry_reject_status,
             sidecar_enforced: env_config.mesh_sidecar_enforced,
         })
     }
@@ -505,6 +539,7 @@ fn gateway_config_from_mesh_slice(
             sidecars: Vec::new(),
             trust_bundles: slice.trust_bundles.clone(),
             multi_cluster: slice.multi_cluster.clone(),
+            outbound_traffic_policy: slice.outbound_traffic_policy,
         })),
         loaded_at,
         ..GatewayConfig::default()
@@ -1693,6 +1728,45 @@ fn inject_mesh_global_plugins(
         }),
         &runtime.namespace,
     );
+
+    // Outbound registry: inject the `mesh_outbound_registry` plugin when
+    // either the slice (CRD path) OR the runtime env var declares
+    // REGISTRY_ONLY. Both default to AllowAny (no plugin) so non-mesh
+    // and permissive deployments pay zero per-request cost.
+    let effective_outbound_policy = mesh_slice
+        .outbound_traffic_policy
+        .unwrap_or(runtime.outbound_traffic_policy);
+    if matches!(
+        effective_outbound_policy,
+        crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly
+    ) {
+        let registry = mesh_slice.build_known_destinations(&runtime.cluster_domain);
+        let outbound_listen_ports = mesh_outbound_registry_listen_ports(runtime);
+        if outbound_listen_ports.is_empty() {
+            config
+                .plugin_configs
+                .retain(|p| p.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID);
+        } else {
+            let plugin_config = serde_json::json!({
+                "registry": registry,
+                "outbound_listen_ports": outbound_listen_ports,
+                "reject_status": runtime.outbound_registry_reject_status,
+            });
+            ensure_global_plugin(
+                config,
+                MESH_OUTBOUND_REGISTRY_PLUGIN_ID,
+                "mesh_outbound_registry",
+                plugin_config,
+                &runtime.namespace,
+            );
+        }
+    } else {
+        // Remove any stale instance (e.g., operator flipped policy back).
+        config
+            .plugin_configs
+            .retain(|p| p.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID);
+    }
+
     // Merge applicable Telemetry resources (most specific scope wins per section).
     let merged_telemetry = merge_applicable_telemetry(mesh_slice);
 
@@ -1762,6 +1836,21 @@ fn inject_mesh_global_plugins(
         access_log_config,
         &runtime.namespace,
     );
+}
+
+fn mesh_outbound_registry_listen_ports(runtime: &MeshRuntimeConfig) -> Vec<u16> {
+    let mut ports: Vec<u16> = runtime
+        .listener_plan()
+        .into_iter()
+        .filter(|listener| listener.direction == MeshTrafficDirection::Outbound)
+        .filter_map(|listener| {
+            let port = listener.addr.port();
+            (port != 0).then_some(port)
+        })
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 /// Merge applicable `MeshTelemetryResource` entries by scope specificity.
@@ -2827,6 +2916,8 @@ mod tests {
             "FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES",
             "FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES",
             "FERRUM_MESH_CLUSTER_DOMAIN",
+            "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY",
+            "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS",
             "FERRUM_XDS_STREAM_CHANNEL_CAPACITY",
             "FERRUM_MESH_XDS_CONNECT_TIMEOUT_SECONDS",
             "FERRUM_POOL_WARMUP_ENABLED",
@@ -2891,6 +2982,7 @@ mod tests {
                     dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES
                 );
                 assert_eq!(runtime.cluster_domain, dns_proxy::DEFAULT_CLUSTER_DOMAIN);
+                assert_eq!(runtime.outbound_registry_reject_status, 502);
             },
         );
     }
@@ -3176,6 +3268,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mesh_runtime_config_parses_outbound_registry_reject_status() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS", "403"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                assert_eq!(runtime.outbound_registry_reject_status, 403);
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_config_rejects_invalid_outbound_registry_reject_status() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS", "399"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let err = MeshRuntimeConfig::from_env_config(&env).unwrap_err();
+                assert!(err.contains("FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS"));
+            },
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn mesh_runtime_starts_listeners_and_shuts_down() {
         let env = EnvConfig {
@@ -3211,6 +3345,8 @@ mod tests {
             dns_response_cache_max_entries: dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
             cluster_domain: dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
             capture_mode: crate::capture::CaptureMode::Explicit,
+            outbound_traffic_policy: crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
+            outbound_registry_reject_status: 502,
             sidecar_enforced: false,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
@@ -3301,6 +3437,8 @@ mod tests {
             dns_response_cache_max_entries: dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
             cluster_domain: dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
             capture_mode: crate::capture::CaptureMode::Explicit,
+            outbound_traffic_policy: crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
+            outbound_registry_reject_status: 502,
             sidecar_enforced: false,
         }
     }
@@ -3904,6 +4042,7 @@ mod tests {
             proxy_configs: Vec::new(),
             trust_bundles: None,
             multi_cluster: None,
+            outbound_traffic_policy: None,
         };
 
         let merged = merge_applicable_telemetry(&mesh_slice);
@@ -3962,6 +4101,284 @@ mod tests {
             .expect("access_log plugin injected");
 
         assert_eq!(access_log.config["filter"]["status_code_min"], 500);
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_injects_outbound_registry_from_slice_policy() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.outbound_listen_addr = "127.0.0.1:15001".parse().unwrap();
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            services: vec![MeshService {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                ports: vec![ServicePort {
+                    port: 8080,
+                    protocol: AppProtocol::Http,
+                    name: Some("http".to_string()),
+                }],
+                workloads: Vec::new(),
+                protocol_overrides: HashMap::new(),
+            }],
+            outbound_traffic_policy: Some(
+                crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly,
+            ),
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+        let registry_plugin = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+            .expect("outbound registry plugin injected");
+        let registry = registry_plugin.config["registry"]
+            .as_array()
+            .expect("registry array");
+
+        assert_eq!(registry_plugin.plugin_name, "mesh_outbound_registry");
+        assert_eq!(
+            registry_plugin.config["outbound_listen_ports"],
+            serde_json::json!([15001])
+        );
+        assert_eq!(registry_plugin.config["reject_status"], 502);
+        assert!(registry.iter().any(|entry| entry == "reviews"));
+        assert!(registry.iter().any(|entry| entry == "reviews.default"));
+        assert!(
+            registry
+                .iter()
+                .any(|entry| entry == "reviews.default.svc.cluster.local:8080")
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_uses_runtime_outbound_registry_reject_status() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.outbound_listen_addr = "127.0.0.1:15001".parse().unwrap();
+        runtime.outbound_traffic_policy =
+            crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly;
+        runtime.outbound_registry_reject_status = 403;
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            outbound_traffic_policy: None,
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+        let registry_plugin = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+            .expect("outbound registry plugin injected");
+
+        assert_eq!(registry_plugin.config["reject_status"], 403);
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_skips_outbound_registry_without_outbound_listener() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.topology = MeshTopology::EgressGateway;
+        runtime.outbound_traffic_policy =
+            crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly;
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            outbound_traffic_policy: None,
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_runtime_registry_only_applies_when_slice_policy_absent() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.outbound_listen_addr = "127.0.0.1:15001".parse().unwrap();
+        runtime.outbound_traffic_policy =
+            crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly;
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            services: vec![MeshService {
+                name: "ratings".to_string(),
+                namespace: "default".to_string(),
+                ports: Vec::new(),
+                workloads: Vec::new(),
+                protocol_overrides: HashMap::new(),
+            }],
+            outbound_traffic_policy: None,
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+
+        let plugin = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+            .expect("outbound registry plugin injected");
+        let registry = plugin
+            .config
+            .get("registry")
+            .and_then(serde_json::Value::as_array)
+            .expect("registry config array");
+        assert!(
+            registry
+                .iter()
+                .any(|entry| entry.as_str() == Some("ratings.default"))
+        );
+        assert!(
+            registry
+                .iter()
+                .any(|entry| entry.as_str() == Some("ratings.default:*"))
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_skips_outbound_registry_when_outbound_port_is_zero() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.outbound_listen_addr = "127.0.0.1:0".parse().unwrap();
+        runtime.outbound_traffic_policy =
+            crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly;
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            outbound_traffic_policy: None,
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_slice_allow_any_overrides_runtime_registry_only() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.outbound_traffic_policy =
+            crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly;
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            outbound_traffic_policy: Some(
+                crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
+            ),
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_removes_stale_outbound_registry_when_allow_any() {
+        let runtime = test_mesh_runtime_config();
+        let now = chrono::Utc::now();
+        let mut config = GatewayConfig {
+            plugin_configs: vec![crate::config::types::PluginConfig {
+                id: MESH_OUTBOUND_REGISTRY_PLUGIN_ID.to_string(),
+                plugin_name: "mesh_outbound_registry".to_string(),
+                namespace: "default".to_string(),
+                config: serde_json::json!({"registry": ["stale.default"]}),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: now,
+                updated_at: now,
+            }],
+            ..GatewayConfig::default()
+        };
+        let mesh_slice = MeshSlice {
+            outbound_traffic_policy: Some(
+                crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
+            ),
+            ..MeshSlice::default()
+        };
+
+        inject_mesh_global_plugins(&mut config, &runtime, &mesh_slice);
+
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_rebuilds_outbound_registry_on_slice_update() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.outbound_listen_addr = "127.0.0.1:15001".parse().unwrap();
+        runtime.outbound_traffic_policy =
+            crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly;
+        let now = chrono::Utc::now();
+        let mut config = GatewayConfig {
+            plugin_configs: vec![crate::config::types::PluginConfig {
+                id: MESH_OUTBOUND_REGISTRY_PLUGIN_ID.to_string(),
+                plugin_name: "mesh_outbound_registry".to_string(),
+                namespace: "default".to_string(),
+                config: serde_json::json!({"registry": ["stale.default"]}),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: now,
+                updated_at: now,
+            }],
+            ..GatewayConfig::default()
+        };
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            services: vec![MeshService {
+                name: "ratings".to_string(),
+                namespace: "default".to_string(),
+                ports: vec![ServicePort {
+                    port: 9080,
+                    protocol: AppProtocol::Http,
+                    name: Some("http".to_string()),
+                }],
+                workloads: Vec::new(),
+                protocol_overrides: HashMap::new(),
+            }],
+            outbound_traffic_policy: None,
+            ..MeshSlice::default()
+        };
+
+        inject_mesh_global_plugins(&mut config, &runtime, &mesh_slice);
+        let registry_plugin = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+            .expect("outbound registry plugin retained");
+        let registry = registry_plugin.config["registry"]
+            .as_array()
+            .expect("registry array");
+
+        assert!(registry.iter().any(|entry| entry == "ratings.default"));
+        assert!(!registry.iter().any(|entry| entry == "stale.default"));
     }
 
     #[test]

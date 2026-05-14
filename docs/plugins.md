@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 59 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 60 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -1601,6 +1601,21 @@ plugin_name: access_control
 config:
   allow_authenticated_identity: true
 ```
+
+### `mesh_outbound_registry`
+
+Rejects HTTP-family requests whose `Host` / `:authority` destination is not in a configured registry. Mesh mode auto-injects this plugin when the effective outbound traffic policy is `REGISTRY_ONLY` and the topology has an outbound capture listener. Operators can also configure it directly on non-mesh gateways as a generic Host allowlist.
+
+**Priority:** 130
+**Supported protocols:** HTTP, gRPC, WebSocket, HTTP/3
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `registry` | String[] | `[]` | Known destinations. Entries can be bare hosts (`reviews.default.svc.cluster.local`), exact host/port pairs (`reviews.default.svc.cluster.local:8080`), any-explicit-port markers (`reviews.default.svc.cluster.local:*`), or one-label wildcards (`*.example.com`, `*.example.com:443`, `*.example.com:*`). |
+| `reject_status` | u16 | `502` | HTTP 4xx/5xx status returned for unknown destinations. Use `404` when you want to mask policy details. |
+| `outbound_listen_ports` | u16[] | `[]` | Optional frontend listener ports where the registry applies. Mesh auto-injection sets this to the outbound capture listener so inbound sidecar/ambient traffic is not gated by outbound policy. Empty applies wherever the plugin runs. |
+
+Bare-host registry entries match only requests whose Host header omits an explicit port. `host:port` entries match only that exact port. `host:*` entries match any explicit Host port; mesh-generated registries use this marker for services, ServiceEntries, or workload addresses with no declared ports so known destinations remain reachable when callers include `Host: service:9080`.
 
 ### `tcp_connection_throttle`
 
