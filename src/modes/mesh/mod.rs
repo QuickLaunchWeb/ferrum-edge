@@ -215,6 +215,12 @@ pub struct MeshRuntimeConfig {
     /// behavior — listeners are topology-driven. Sourced from
     /// `FERRUM_MESH_CAPTURE_MODE` (default `explicit`).
     pub capture_mode: crate::capture::CaptureMode,
+    /// When `true`, the slice builder applies Istio `Sidecar` egress scope
+    /// narrowing. Sourced from `FERRUM_MESH_SIDECAR_ENFORCED` (default
+    /// `false`). When disabled, `Sidecar` resources are parsed and persisted
+    /// in `MeshConfig` but the slice projection ignores them — behavior is
+    /// identical to today, preserving safe-rollout semantics.
+    pub sidecar_enforced: bool,
 }
 
 impl MeshRuntimeConfig {
@@ -345,6 +351,7 @@ impl MeshRuntimeConfig {
             dns_response_cache_max_entries,
             cluster_domain,
             capture_mode,
+            sidecar_enforced: env_config.mesh_sidecar_enforced,
         })
     }
 
@@ -421,6 +428,8 @@ impl MeshRuntimeConfig {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            cluster_domain: self.cluster_domain.clone(),
+            enforce_sidecar_egress: self.sidecar_enforced,
         }
     }
 }
@@ -490,6 +499,10 @@ fn gateway_config_from_mesh_slice(
             telemetry_resources: slice.telemetry_resources.clone(),
             destination_rules: slice.destination_rules.clone(),
             proxy_configs: slice.proxy_configs.clone(),
+            // Slice-narrowing is applied CP-side at `MeshSlice::from_gateway_config`.
+            // DPs receive the already-narrowed set of services / service-entries /
+            // destination-rules; `MeshSidecar` resources are not echoed back.
+            sidecars: Vec::new(),
             trust_bundles: slice.trust_bundles.clone(),
             multi_cluster: slice.multi_cluster.clone(),
         })),
@@ -3198,6 +3211,7 @@ mod tests {
             dns_response_cache_max_entries: dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
             cluster_domain: dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
             capture_mode: crate::capture::CaptureMode::Explicit,
+            sidecar_enforced: false,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
         let mesh_state = MeshRuntimeState::new();
@@ -3287,6 +3301,7 @@ mod tests {
             dns_response_cache_max_entries: dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
             cluster_domain: dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
             capture_mode: crate::capture::CaptureMode::Explicit,
+            sidecar_enforced: false,
         }
     }
 
