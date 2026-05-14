@@ -13,6 +13,13 @@
 //! fresh `Arc<Proxy>` so every downstream pool key, capability-registry
 //! lookup, circuit-breaker target key, and URL construction sees the
 //! effective destination.
+//! When multiple plugin instances run on one proxy, each matching instance
+//! replaces the complete override destination set by earlier instances; a
+//! non-matching instance leaves any prior override intact. Per-rule
+//! `backend_tls` is intentionally direct-backend-only. `upstream_id`
+//! destinations inherit TLS material from the referenced `Upstream` (including
+//! mesh `DestinationRule` TLS projection), so per-canary TLS for upstream
+//! overrides should be modeled as distinct upstream resources.
 //!
 //! The plugin intentionally runs after authentication, authorization, and
 //! rate limiting. Those admission decisions use the public listener proxy
@@ -91,8 +98,9 @@ impl MeshRouteDispatchConfig {
             }
             if rule.destination.is_empty() {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}].destination requires at least one of \
-                     upstream_id / backend_host / backend_port / backend_tls"
+                    "mesh_route_dispatch.rules[{idx}].destination requires upstream_id or \
+                     a direct backend override (backend_host and backend_port); backend_tls \
+                     may only accompany a direct backend"
                 ));
             }
             if let Some(port) = rule.destination.backend_port
@@ -303,6 +311,11 @@ impl Plugin for MeshRouteDispatch {
     ) -> PluginResult {
         for rule in &self.config.rules {
             if rule_matches(&rule.match_, ctx, headers) {
+                // Route overrides are a whole-destination decision, not a
+                // field-wise merge. If an earlier plugin instance matched,
+                // this matching instance intentionally replaces all four
+                // fields; if this instance does not match, any earlier
+                // override remains in place for soft/fallback composition.
                 ctx.route_override_upstream_id = rule.destination.upstream_id.clone();
                 ctx.route_override_backend_host = rule.destination.backend_host.clone();
                 ctx.route_override_backend_port = rule.destination.backend_port;
@@ -459,7 +472,9 @@ mod tests {
             "rules": [{"match": {"methods": ["GET"]}, "destination": {}}]
         }))
         .unwrap_err();
-        assert!(err.contains("at least one of"), "got: {err}");
+        assert!(err.contains("upstream_id"), "got: {err}");
+        assert!(err.contains("direct backend"), "got: {err}");
+        assert!(err.contains("backend_tls"), "got: {err}");
     }
 
     #[test]

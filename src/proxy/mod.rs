@@ -125,6 +125,12 @@ const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 /// matched traffic to the wrong backend instead of failing config
 /// validation, so the contract here matches normal Proxy upstream-id
 /// validation: refuse the config, log every dangling reference once.
+///
+/// `GatewayConfig` is already namespace-scoped by its loader/distributor
+/// before this runtime validator runs. A missing id here can therefore mean
+/// "does not exist" or "exists only in another namespace"; admin admission
+/// performs the broader DB lookup and emits the more specific cross-namespace
+/// error before the config reaches this path.
 pub(crate) fn validate_mesh_route_dispatch_upstream_references(
     config: &GatewayConfig,
 ) -> Result<(), Vec<String>> {
@@ -144,7 +150,7 @@ pub(crate) fn validate_mesh_route_dispatch_upstream_references(
             {
                 let proxy_id = plugin.proxy_id.as_deref().unwrap_or("<none>");
                 errors.push(format!(
-                    "PluginConfig '{}' (mesh_route_dispatch) rule {} for proxy_id '{}' references non-existent upstream_id '{}'",
+                    "PluginConfig '{}' (mesh_route_dispatch) rule {} for proxy_id '{}' references upstream_id '{}' that is not present in the active GatewayConfig namespace",
                     plugin.id, rule_idx, proxy_id, upstream_id
                 ));
             }
@@ -9570,6 +9576,12 @@ pub fn build_backend_url_with_target(
 /// has at least one port override AND (b) the resolved destination port
 /// matches a configured override key AND (c) the override's
 /// `connect_timeout_ms` differs from `proxy.backend_connect_timeout_ms`.
+/// Use this helper when the transport receives the LB-selected
+/// `UpstreamTarget` separately (reqwest/H3 dispatch, TCP/HBONE timeout
+/// derivation) and only needs the per-port timeout rebased onto the proxy.
+/// Do not use it for pools that key or dial from `proxy.backend_host` /
+/// `proxy.backend_port`; those paths need
+/// `resolve_backend_connection_proxy_for_target`.
 ///
 /// `upstream_target` is the LB-selected target whose port we'll connect to;
 /// when `None` the call is a direct-backend proxy with no upstream, so no
@@ -12824,8 +12836,10 @@ async fn proxy_to_backend_http3_retry(
     client_ip: &str,
     is_tls: bool,
 ) -> retry::BackendResponse {
-    // Honor DestinationRule per-port `connect_timeout_ms` overrides — see
-    // `resolve_effective_proxy_for_target` for the Cow-Borrowed fast path.
+    // reqwest dispatch receives `upstream_target` separately, so it only
+    // needs per-port timeout rebasing. gRPC/direct-H2 pool paths use
+    // `resolve_backend_connection_proxy_for_target` because their pool key and
+    // dial target come from `proxy.backend_host` / `proxy.backend_port`.
     let effective_proxy = resolve_effective_proxy_for_target(proxy, upstream_target);
     let proxy: &Proxy = effective_proxy.as_ref();
 

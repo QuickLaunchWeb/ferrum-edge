@@ -247,11 +247,12 @@ pub(super) async fn handle_hbone_request(
     plugin_execution_ns: u64,
 ) -> Response<ProxyBody> {
     // Apply route overrides set before the HBONE branch. HBONE CONNECT
-    // currently branches before the `before_proxy` phase, so
-    // `mesh_route_dispatch` itself does not set these fields for HBONE
-    // streams today; this preserves custom/auth-phase overrides and keeps the
-    // path aligned with normal H1/H2 and HTTP/3 dispatch if HBONE later moves
-    // behind `before_proxy`.
+    // currently branches before the `before_proxy` phase, so the in-tree
+    // `mesh_route_dispatch` plugin cannot set these fields for HBONE streams
+    // today. This hook is deliberately defensive: external/custom plugins or
+    // future auth-phase routing plugins may set `route_override_*` before
+    // backend connect, and keeping this here also preserves the same contract
+    // as normal H1/H2/H3 dispatch if HBONE later moves behind `before_proxy`.
     let proxy_arc = ctx
         .apply_route_overrides_with_upstreams(Arc::clone(proxy), epoch.load_balancer.upstreams());
     let proxy: &Arc<Proxy> = &proxy_arc;
