@@ -1472,24 +1472,6 @@ fn validate_mesh_config_internal(
                     ra.name, i
                 ));
             }
-            if rule.jwks_uri.is_none() && rule.jwks.is_some() {
-                errors.push(format!(
-                    "MeshRequestAuthentication '{}' jwt_rules[{}]: inline jwks is not supported yet; use jwks_uri",
-                    ra.name, i
-                ));
-            }
-            if rule.audiences.len() > 1 {
-                errors.push(format!(
-                    "MeshRequestAuthentication '{}' jwt_rules[{}]: multiple audiences are not supported yet",
-                    ra.name, i
-                ));
-            }
-            if !rule.from_headers.is_empty() || !rule.from_params.is_empty() {
-                errors.push(format!(
-                    "MeshRequestAuthentication '{}' jwt_rules[{}]: custom token locations are not supported yet",
-                    ra.name, i
-                ));
-            }
         }
     }
 

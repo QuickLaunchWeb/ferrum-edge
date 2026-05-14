@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use http::header::HeaderName;
 use jsonwebtoken::{Algorithm, Validation, decode, decode_header};
 use serde_json::Map;
 use serde_json::Value;
@@ -30,7 +31,7 @@ const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
 /// ## Key features
 ///
 /// - **Multiple identity providers**: Configure an array of `providers`,
-///   each with its own issuer, JWKS URI, audience, and claim-based
+///   each with its own issuer, JWKS source, audiences, and claim-based
 ///   authorization rules.
 /// - **Claim-based authorization**: Per-provider `required_scopes` and
 ///   `required_roles` filter requests without needing a separate ACL plugin.
@@ -48,7 +49,7 @@ const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
 ///     {
 ///       "issuer": "https://auth.example.com",
 ///       "jwks_uri": "https://auth.example.com/.well-known/jwks.json",
-///       "audience": "my-api",
+///       "audiences": ["my-api", "my-other-api"],
 ///       "required_scopes": ["read:data"],
 ///       "required_roles": ["admin"],
 ///       "scope_claim": "scp",
@@ -76,14 +77,18 @@ pub struct JwksAuth {
     /// Defaults to `consumer_identity_claim` if not set separately.
     consumer_header_claim: String,
     strip_authorization_on_success: bool,
+    has_custom_token_locations: bool,
+    has_custom_query_token_locations: bool,
 }
 
 /// A single identity provider configuration.
 struct JwksProvider {
     /// Expected `iss` claim value. Used to match incoming tokens to this provider.
     issuer: Option<String>,
-    /// Expected `aud` claim value.
-    audience: Option<String>,
+    /// Accepted `aud` claim values. jsonwebtoken treats this as OR matching.
+    audiences: Vec<String>,
+    /// Configured token extraction locations.
+    token_locations: Vec<TokenLocation>,
     /// Scopes that must be present in the token (all required).
     required_scopes: Vec<String>,
     /// Roles that must be present in the token (any one suffices).
@@ -104,6 +109,18 @@ struct JwksProvider {
     jwks_store: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
     /// Outbound hosts used by direct JWKS or discovery URLs.
     warmup_hostnames: Vec<String>,
+}
+
+#[derive(Clone)]
+struct TokenHeaderLocation {
+    name: String,
+    prefix: Option<String>,
+}
+
+#[derive(Clone)]
+enum TokenLocation {
+    Header(TokenHeaderLocation),
+    QueryParam(String),
 }
 
 impl JwksAuth {
@@ -151,20 +168,22 @@ impl JwksAuth {
 
             let jwks_endpoint = parse_url_field(prov_obj, "jwks_uri", idx)?;
             let discovery_endpoint = parse_url_field(prov_obj, "discovery_url", idx)?;
+            let inline_jwks = parse_inline_jwks(prov_obj, idx)?;
             let jwks_uri = jwks_endpoint.as_ref().map(|endpoint| endpoint.url.clone());
             let discovery_url = discovery_endpoint
                 .as_ref()
                 .map(|endpoint| endpoint.url.clone());
 
-            if jwks_uri.is_none() && discovery_url.is_none() {
+            if jwks_uri.is_none() && discovery_url.is_none() && inline_jwks.is_none() {
                 return Err(format!(
-                    "jwks_auth: provider[{}] requires either 'jwks_uri' or 'discovery_url'",
+                    "jwks_auth: provider[{}] requires one of 'jwks_uri', 'discovery_url', or 'jwks'",
                     idx
                 ));
             }
 
             let issuer = optional_non_empty_string(prov_obj, "issuer", idx)?;
-            let audience = optional_non_empty_string(prov_obj, "audience", idx)?;
+            let audiences = parse_audiences(prov_obj, idx)?;
+            let token_locations = parse_token_locations(prov_obj, idx)?;
 
             let required_scopes = parse_string_array(prov_obj, "required_scopes", idx)?;
             let required_roles = parse_string_array(prov_obj, "required_roles", idx)?;
@@ -195,7 +214,10 @@ impl JwksAuth {
             let jwks_store_slot: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>> =
                 Arc::new(ArcSwap::from_pointee(None));
 
-            if let Some(ref uri) = jwks_uri {
+            if let Some(ref jwks_json) = inline_jwks {
+                let store = JwksKeyStore::from_inline_jwks(jwks_json)?;
+                jwks_store_slot.store(Arc::new(Some(Arc::new(store))));
+            } else if let Some(ref uri) = jwks_uri {
                 // Direct jwks_uri — get-or-create shared store immediately
                 let store = get_or_create_jwks_store(uri, &http_client, refresh_interval);
                 jwks_store_slot.store(Arc::new(Some(store)));
@@ -261,7 +283,8 @@ impl JwksAuth {
 
             providers.push(JwksProvider {
                 issuer,
-                audience,
+                audiences,
+                token_locations,
                 required_scopes,
                 required_roles,
                 scope_claim,
@@ -278,6 +301,15 @@ impl JwksAuth {
         let strip_authorization_on_success = providers
             .iter()
             .any(|provider| !provider.forward_original_token);
+        let has_custom_token_locations = providers
+            .iter()
+            .any(|provider| !provider.token_locations.is_empty());
+        let has_custom_query_token_locations = providers.iter().any(|provider| {
+            provider
+                .token_locations
+                .iter()
+                .any(|location| matches!(location, TokenLocation::QueryParam(_)))
+        });
 
         Ok(Self {
             providers,
@@ -286,6 +318,8 @@ impl JwksAuth {
             consumer_identity_claim,
             consumer_header_claim,
             strip_authorization_on_success,
+            has_custom_token_locations,
+            has_custom_query_token_locations,
         })
     }
 
@@ -518,15 +552,19 @@ impl AuthMechanism for JwksAuth {
     }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
-        match ctx.headers.get("authorization") {
-            None => ExtractedCredential::Missing,
-            Some(value) if value.starts_with("Bearer ") || value.starts_with("bearer ") => {
-                ExtractedCredential::BearerToken(value[7..].to_string())
+        if self.has_custom_token_locations {
+            for provider in &self.providers {
+                for location in &provider.token_locations {
+                    match extract_from_location(location, ctx) {
+                        TokenLocationExtract::Missing => {}
+                        TokenLocationExtract::Credential(credential) => return credential,
+                    }
+                }
             }
-            Some(_) => ExtractedCredential::InvalidFormat(
-                r#"{"error":"Missing Bearer token"}"#.to_string(),
-            ),
+            return ExtractedCredential::Missing;
         }
+
+        extract_authorization_bearer(ctx)
     }
 
     async fn verify(
@@ -560,6 +598,58 @@ impl AuthMechanism for JwksAuth {
 
         self.resolve_identity(&claims, provider, consumer_index)
     }
+}
+
+fn extract_authorization_bearer(ctx: &RequestContext) -> ExtractedCredential {
+    match ctx.headers.get("authorization") {
+        None => ExtractedCredential::Missing,
+        Some(value) if value.starts_with("Bearer ") || value.starts_with("bearer ") => {
+            ExtractedCredential::BearerToken(value[7..].to_string())
+        }
+        Some(_) => {
+            ExtractedCredential::InvalidFormat(r#"{"error":"Missing Bearer token"}"#.to_string())
+        }
+    }
+}
+
+enum TokenLocationExtract {
+    Missing,
+    Credential(ExtractedCredential),
+}
+
+fn extract_from_location(location: &TokenLocation, ctx: &RequestContext) -> TokenLocationExtract {
+    match location {
+        TokenLocation::Header(header) => match ctx.headers.get(&header.name) {
+            Some(value) => extract_location_value(value, header.prefix.as_deref()),
+            None => TokenLocationExtract::Missing,
+        },
+        TokenLocation::QueryParam(name) => match ctx.query_params.get(name) {
+            Some(value) => extract_location_value(value, None),
+            None => TokenLocationExtract::Missing,
+        },
+    }
+}
+
+fn extract_location_value(value: &str, prefix: Option<&str>) -> TokenLocationExtract {
+    let token = match prefix {
+        Some(prefix) => match value.strip_prefix(prefix) {
+            Some(token) => token,
+            None => {
+                return TokenLocationExtract::Credential(ExtractedCredential::InvalidFormat(
+                    r#"{"error":"Missing configured token prefix"}"#.to_string(),
+                ));
+            }
+        },
+        None => value,
+    };
+
+    if token.is_empty() {
+        return TokenLocationExtract::Credential(ExtractedCredential::InvalidFormat(
+            r#"{"error":"Empty token"}"#.to_string(),
+        ));
+    }
+
+    TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token.to_string()))
 }
 
 #[async_trait]
@@ -613,6 +703,7 @@ impl super::Plugin for JwksAuth {
             hosts.extend(prov.warmup_hostnames.iter().cloned());
             let guard = prov.jwks_store.load();
             if let Some(ref store) = **guard
+                && store.is_refreshable()
                 && let Some(host) = hostname_from_url(store.jwks_uri())
                 && !hosts.iter().any(|known| known == &host)
             {
@@ -626,11 +717,17 @@ impl super::Plugin for JwksAuth {
         let mut uris = Vec::new();
         for prov in &self.providers {
             let guard = prov.jwks_store.load();
-            if let Some(ref store) = **guard {
+            if let Some(ref store) = **guard
+                && store.is_refreshable()
+            {
                 uris.push(store.jwks_uri().to_string());
             }
         }
         uris
+    }
+
+    fn requires_decoded_query_params(&self) -> bool {
+        self.has_custom_query_token_locations
     }
 }
 
@@ -662,8 +759,8 @@ async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Opt
         if let Some(ref iss) = provider.issuer {
             validation.set_issuer(&[iss]);
         }
-        if let Some(ref aud) = provider.audience {
-            validation.set_audience(&[aud]);
+        if !provider.audiences.is_empty() {
+            validation.set_audience(&provider.audiences);
         }
         validation
     };
@@ -878,6 +975,49 @@ fn parse_url_field(
     }))
 }
 
+fn parse_inline_jwks(
+    config: &Map<String, Value>,
+    provider_idx: usize,
+) -> Result<Option<String>, String> {
+    let Some(value) = config.get("jwks") else {
+        return Ok(None);
+    };
+
+    match value {
+        Value::String(raw) => {
+            let jwks = raw.trim();
+            if jwks.is_empty() {
+                return Err(format!(
+                    "jwks_auth: 'provider[{provider_idx}].jwks' must not be empty"
+                ));
+            }
+            Ok(Some(jwks.to_string()))
+        }
+        Value::Object(_) => serde_json::to_string(value)
+            .map(Some)
+            .map_err(|e| format!("jwks_auth: 'provider[{provider_idx}].jwks' is invalid: {e}")),
+        _ => Err(format!(
+            "jwks_auth: 'provider[{provider_idx}].jwks' must be a JWKS JSON string or object, got: {value}"
+        )),
+    }
+}
+
+fn parse_audiences(
+    config: &Map<String, Value>,
+    provider_idx: usize,
+) -> Result<Vec<String>, String> {
+    let legacy_audience = optional_non_empty_string(config, "audience", provider_idx)?;
+    let mut audiences = parse_string_array(config, "audiences", provider_idx)?;
+
+    if let Some(audience) = legacy_audience
+        && !audiences.iter().any(|known| known == &audience)
+    {
+        audiences.push(audience);
+    }
+
+    Ok(audiences)
+}
+
 fn parse_string_array(
     config: &Map<String, Value>,
     field: &str,
@@ -907,6 +1047,76 @@ fn parse_string_array(
         values.push(value.to_string());
     }
     Ok(values)
+}
+
+fn parse_token_locations(
+    config: &Map<String, Value>,
+    provider_idx: usize,
+) -> Result<Vec<TokenLocation>, String> {
+    let mut locations = Vec::new();
+
+    if let Some(value) = config.get("from_headers") {
+        let headers = value.as_array().ok_or_else(|| {
+            format!(
+                "jwks_auth: 'provider[{provider_idx}].from_headers' must be an array of objects, got: {value}"
+            )
+        })?;
+        locations.reserve(headers.len());
+        for (idx, header) in headers.iter().enumerate() {
+            let object = header.as_object().ok_or_else(|| {
+                format!(
+                    "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}]' must be an object, got: {header}"
+                )
+            })?;
+            let name_value = object.get("name").ok_or_else(|| {
+                format!(
+                    "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}].name' is required"
+                )
+            })?;
+            let raw_name = name_value.as_str().ok_or_else(|| {
+                format!(
+                    "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}].name' must be a string, got: {name_value}"
+                )
+            })?;
+            let name = raw_name.trim().to_ascii_lowercase();
+            if name.is_empty() {
+                return Err(format!(
+                    "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}].name' must not be empty"
+                ));
+            }
+            let name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| {
+                    format!(
+                        "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}].name' is not a valid HTTP header name: {e}"
+                    )
+                })?
+                .as_str()
+                .to_string();
+            let prefix = match object.get("prefix") {
+                Some(Value::String(raw)) => {
+                    if raw.is_empty() {
+                        return Err(format!(
+                            "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}].prefix' must not be empty"
+                        ));
+                    }
+                    Some(raw.clone())
+                }
+                Some(Value::Null) | None => None,
+                Some(value) => {
+                    return Err(format!(
+                        "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}].prefix' must be a string, got: {value}"
+                    ));
+                }
+            };
+
+            locations.push(TokenLocation::Header(TokenHeaderLocation { name, prefix }));
+        }
+    }
+
+    let params = parse_string_array(config, "from_params", provider_idx)?;
+    locations.extend(params.into_iter().map(TokenLocation::QueryParam));
+
+    Ok(locations)
 }
 
 fn optional_provider_bool(

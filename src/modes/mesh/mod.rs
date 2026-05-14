@@ -1997,16 +1997,33 @@ fn inject_mesh_request_auth_plugin(
 
 /// Build a single `jwks_auth` provider configuration from a [`MeshJwtRule`].
 fn build_jwks_provider_config(rule: &MeshJwtRule) -> Option<serde_json::Value> {
-    let uri = rule.jwks_uri.as_ref()?;
-
     let mut provider = serde_json::json!({
         "issuer": rule.issuer,
-        "jwks_uri": uri,
         "forward_original_token": rule.forward_original_token,
     });
 
+    if let Some(uri) = &rule.jwks_uri {
+        provider["jwks_uri"] = serde_json::json!(uri);
+    } else if let Some(jwks) = &rule.jwks {
+        provider["jwks"] = serde_json::json!(jwks);
+    } else {
+        warn!(
+            issuer = %rule.issuer,
+            "Skipping MeshRequestAuthentication JWT rule with no jwks_uri or jwks"
+        );
+        return None;
+    }
+
     if !rule.audiences.is_empty() {
-        provider["audience"] = serde_json::json!(rule.audiences[0]);
+        provider["audiences"] = serde_json::json!(rule.audiences);
+    }
+
+    if !rule.from_headers.is_empty() {
+        provider["from_headers"] = serde_json::json!(rule.from_headers);
+    }
+
+    if !rule.from_params.is_empty() {
+        provider["from_params"] = serde_json::json!(rule.from_params);
     }
 
     Some(provider)
@@ -5572,9 +5589,12 @@ mod tests {
 
         let provider = &jwks.config["providers"][0];
         assert_eq!(
-            provider.get("audience").and_then(|v| v.as_str()),
-            Some("my-api"),
-            "first audience should be set"
+            provider
+                .get("audiences")
+                .and_then(|v| v.as_array())
+                .cloned(),
+            Some(vec![serde_json::json!("my-api")]),
+            "audiences should be set"
         );
         assert_eq!(
             provider.get("jwks_uri").and_then(|v| v.as_str()),
