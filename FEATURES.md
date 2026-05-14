@@ -19,7 +19,7 @@ A comprehensive feature list for Ferrum Edge.
 - **File** — single-instance with YAML/JSON config, SIGHUP reload (Unix only; restart required on other platforms)
 - **Control Plane (CP)** — centralized config authority, gRPC distribution to DPs
 - **Data Plane (DP)** — horizontally scalable traffic processing nodes with multi-CP failover (`FERRUM_DP_CP_GRPC_URLS`)
-- **Mesh** — service-mesh data plane with four topologies (sidecar, ambient, east-west gateway, egress gateway). Consumes native `MeshSubscribe` slices or standard xDS ADS, waits for an initial valid slice, and hot-applies later valid mesh updates atomically. SPIFFE-identity-aware authorization, HBONE termination (HTTP/2 CONNECT over mTLS), transparent DNS proxy for ServiceEntry resolution, Istio/GAMMA RED metrics, RequestAuthentication JWT validation, Telemetry API per-scope configuration, multi-cluster east-west routing, and trust domain federation. See [docs/mesh.md](docs/mesh.md)
+- **Mesh** — service-mesh data plane with four topologies (sidecar, ambient, east-west gateway, egress gateway). Consumes native `MeshSubscribe` slices or standard xDS ADS, waits for an initial valid slice, and hot-applies later valid mesh updates atomically. SPIFFE-identity-aware authorization, HBONE termination (HTTP/2 CONNECT over mTLS), REGISTRY_ONLY outbound policy, transparent DNS proxy for ServiceEntry resolution, Istio/GAMMA RED metrics, RequestAuthentication JWT validation, Telemetry API per-scope configuration, multi-cluster east-west routing, and trust domain federation. See [docs/mesh.md](docs/mesh.md)
 - **Injector** — Kubernetes admission webhook that injects Ferrum mesh sidecars and init capture containers into opted-in workloads. Derives SPIFFE IDs from pod service accounts, supports iptables/eBPF capture modes, and injects JWT secrets via Kubernetes SecretKeyRef
 
 ## Routing
@@ -65,6 +65,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **Config consumption** — native `MeshSubscribe` gRPC (Ferrum-native) or standard xDS ADS (CDS/EDS/LDS/RDS/SDS) with multi-CP failover and jittered exponential backoff
 - **SPIFFE identity** — extracted from mTLS peer certificates and HBONE W3C Baggage headers with trust-domain aliasing for federated multi-cluster
 - **Mesh authorization** — identity-based `MeshPolicy` with `PolicyScope` filtering (MeshWide / Namespace / WorkloadSelector), DENY-first evaluation, Istio-compatible implicit deny semantics, principal/request/condition matching with glob patterns
+- **Outbound traffic policy** — `REGISTRY_ONLY` auto-injects `mesh_outbound_registry` on outbound capture listeners to reject HTTP-family destinations outside known services, ServiceEntries, wildcard hosts, and workload addresses. `ALLOW_ANY` remains the default.
 - **RequestAuthentication** — declares valid JWTs per workload scope (permissive: valid-not-required, matching Istio semantics). Auto-injects `jwks_auth` plugin from `MeshJwtRule` definitions
 - **PeerAuthentication** — per-workload mTLS mode (strict/permissive/disable) with per-port overrides
 - **Transparent DNS proxy** — resolves mesh ServiceEntry hosts and MeshService names to workload IPs, supports wildcard hosts, forwards non-mesh queries upstream (UDP/TCP, A/AAAA, EDNS(0))
@@ -82,7 +83,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ## Plugin System
 
-- 59 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 60 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
 - Three plugin scopes: **global** (all proxies), **proxy** (single proxy), **proxy_group** (shared across a subset of proxies) — scoped plugins replace global plugins of the same name. Proxy-group plugins share a single instance across all associated proxies, so stateful plugins (e.g., rate_limiting) share counters across the group
@@ -104,6 +105,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 ### Authorization & Security Plugins
 
 - **Access Control** — consumer-based and group-based allow/deny lists (consumers declare `acl_groups` membership; plugins match via `allowed_groups` / `disallowed_groups`)
+- **Mesh Outbound Registry** — HTTP-family Host allowlist used by mesh `REGISTRY_ONLY` outbound policy. It is normally auto-injected from mesh slices but can also be configured directly on non-mesh gateways as a generic Host allowlist.
 - **IP Restriction** — standalone IP/CIDR filtering
 - **Geo Restriction** — GeoIP-based country allow/deny lists using MaxMind .mmdb database files
 - **TCP Connection Throttle** — caps active TCP connections per Consumer or client IP

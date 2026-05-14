@@ -221,7 +221,10 @@ pub async fn start_http3_listener_with_signal(
     server_config.transport_config(Arc::new(transport_config));
 
     let endpoint = quinn::Endpoint::server(server_config, addr)?;
-    info!("HTTP/3 (QUIC) listener started on {}", addr);
+    let bound_addr = endpoint.local_addr().ok();
+    let local_addr = bound_addr.unwrap_or(addr);
+    let frontend_listen_port = bound_addr.map(|addr| addr.port());
+    info!("HTTP/3 (QUIC) listener started on {}", local_addr);
     if let Some(started_tx) = started_tx {
         let _ = started_tx.send(());
     }
@@ -250,8 +253,13 @@ pub async fn start_http3_listener_with_signal(
                         tokio::spawn(async move {
                             let _conn_guard =
                                 crate::overload::ConnectionGuard::new(&state.overload);
-                            if let Err(e) =
-                                handle_h3_connection(connecting, state, handshake_timeout).await
+                            if let Err(e) = handle_h3_connection(
+                                connecting,
+                                state,
+                                handshake_timeout,
+                                frontend_listen_port,
+                            )
+                            .await
                             {
                                 debug!("HTTP/3 connection error: {}", e);
                             }
@@ -346,6 +354,7 @@ async fn handle_h3_connection(
     connecting: quinn::Incoming,
     state: ProxyState,
     handshake_timeout: Duration,
+    frontend_listen_port: Option<u16>,
 ) -> Result<(), anyhow::Error> {
     let early_data_enabled = !state.early_data_methods.is_empty();
 
@@ -516,6 +525,7 @@ async fn handle_h3_connection(
                                 state,
                                 current_addr,
                                 &socket_ip,
+                                frontend_listen_port,
                                 cert,
                                 chain,
                                 is_early_data,
@@ -553,6 +563,7 @@ async fn handle_h3_request(
     state: ProxyState,
     remote_addr: SocketAddr,
     socket_ip: &str,
+    frontend_listen_port: Option<u16>,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
     is_early_data: bool,
@@ -599,7 +610,11 @@ async fn handle_h3_request(
 
     // Build request context (client_ip resolved below after headers are parsed)
     let mut ctx = RequestContext::new(socket_ip.to_owned(), method.clone(), path.clone());
-    ctx.frontend_listen_port = Some(state.env_config.proxy_https_port);
+    // Use the actual UDP listener port so port-scoped plugins such as mesh
+    // outbound registry and mesh authz see the same frontend port that accepted
+    // the H3 request. Fall back to the configured HTTPS port only if Quinn
+    // cannot report the bound local address.
+    ctx.frontend_listen_port = frontend_listen_port.or(Some(state.env_config.proxy_https_port));
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
 

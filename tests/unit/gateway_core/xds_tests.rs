@@ -101,6 +101,7 @@ fn mesh_config() -> MeshConfig {
         sidecars: Vec::new(),
         trust_bundles: None,
         multi_cluster: None,
+        outbound_traffic_policy: None,
     }
 }
 
