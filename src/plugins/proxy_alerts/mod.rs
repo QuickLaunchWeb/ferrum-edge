@@ -51,7 +51,9 @@ pub mod windows;
 use config::{ProxyAlertsConfig, QuietHourWindow};
 use cooldown::{CooldownGate, LifecycleOutcome, RecoveryGate, RuleState};
 use rules::{Rule, RuleObservation, SampleInput};
-use windows::{WindowStore, current_epoch_ms};
+use windows::WindowStore;
+#[cfg(test)]
+use windows::current_epoch_ms;
 
 pub struct ProxyAlerts {
     rules: Arc<Vec<Rule>>,
@@ -112,8 +114,8 @@ impl ProxyAlerts {
         if !self.enabled.load(Ordering::Acquire) {
             return;
         }
-        let now_ms = current_epoch_ms();
         let now = Utc::now();
+        let now_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
         let in_quiet = self.quiet_hours.iter().any(|w| w.matches(now));
         for rule in self.rules.iter() {
             let Some(observation) = rule.observe(sample, &self.windows, now_ms) else {
@@ -133,12 +135,10 @@ impl ProxyAlerts {
         in_quiet: bool,
     ) {
         let proxy_id = sample.proxy_id().unwrap_or("");
+        let previous_state = self.recovery.current_state(rule.id(), proxy_id);
         if observation.breach
             && in_quiet
-            && matches!(
-                self.recovery.current_state(rule.id(), proxy_id),
-                None | Some(RuleState::Healthy)
-            )
+            && matches!(previous_state, None | Some(RuleState::Healthy))
         {
             return;
         }
@@ -152,8 +152,10 @@ impl ProxyAlerts {
             self.recovery
                 .evaluate(rule.id(), proxy_id, observation.breach, recovery_ms, now_ms);
         let Some(event_action) = lifecycle_event_action(outcome) else {
-            self.recovery
-                .observe(rule.id(), proxy_id, observation.breach, recovery_ms, now_ms);
+            if non_event_outcome_needs_commit(outcome, previous_state, recovery_ms) {
+                self.recovery
+                    .observe(rule.id(), proxy_id, observation.breach, recovery_ms, now_ms);
+            }
             return;
         };
         if event_action == EventAction::Trigger && in_quiet {
@@ -270,6 +272,19 @@ fn lifecycle_event_action(outcome: LifecycleOutcome) -> Option<EventAction> {
     }
 }
 
+fn non_event_outcome_needs_commit(
+    outcome: LifecycleOutcome,
+    previous_state: Option<RuleState>,
+    recovery_ms: u64,
+) -> bool {
+    match (outcome, previous_state) {
+        (LifecycleOutcome::EnteringRecovery | LifecycleOutcome::Reactivate, _) => true,
+        (LifecycleOutcome::Quiet, Some(RuleState::Active { .. })) => true,
+        (LifecycleOutcome::Quiet, Some(RuleState::Recovering { .. })) if recovery_ms == 0 => true,
+        _ => false,
+    }
+}
+
 #[async_trait]
 impl Plugin for ProxyAlerts {
     fn name(&self) -> &str {
@@ -282,6 +297,21 @@ impl Plugin for ProxyAlerts {
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         ALL_PROTOCOLS
+    }
+
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
+    fn warmup_hostnames(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = self
+            .channel_by_id
+            .values()
+            .flat_map(|channel| channel.warmup_hostnames())
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        hosts
     }
 
     async fn log(&self, summary: &TransactionSummary) {
@@ -351,6 +381,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn healthy_non_breach_does_not_create_recovery_state() {
+        let cfg = json!({
+            "channels": {
+                "c": { "type": "webhook", "url": "http://127.0.0.1/alert", "body_template": "x" }
+            },
+            "rules": [
+                { "name": "status", "type": "status_code_count",
+                  "status_codes": [500], "threshold_count": 1,
+                  "cooldown_seconds": 1, "channels": ["c"] }
+            ]
+        });
+        let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
+        let summary = TransactionSummary {
+            namespace: "ferrum".to_string(),
+            proxy_id: Some("p1".to_string()),
+            proxy_name: Some("api".to_string()),
+            response_status_code: 200,
+            ..TransactionSummary::default()
+        };
+
+        plugin.log(&summary).await;
+
+        assert_eq!(plugin.recovery.current_state(0, "p1"), None);
+    }
+
+    #[tokio::test]
     async fn dispatch_backpressure_does_not_consume_trigger_cooldown() {
         let cfg = json!({
             "max_concurrent_dispatches": 1,
@@ -385,6 +441,43 @@ mod tests {
                 .try_acquire(0, "p1", 0, 60_000, current_epoch_ms()),
             "a dropped dispatch must not arm the trigger cooldown"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_channel_dispatch_releases_permit() {
+        let cfg = json!({
+            "max_concurrent_dispatches": 1,
+            "channels": {
+                "c": { "type": "webhook", "url": "http://127.0.0.1:1/alert", "body_template": "x" }
+            },
+            "rules": [
+                { "name": "status", "type": "status_code_count",
+                  "status_codes": [500], "threshold_count": 1,
+                  "cooldown_seconds": 1, "channels": ["c"] }
+            ]
+        });
+        let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
+        let summary = TransactionSummary {
+            namespace: "ferrum".to_string(),
+            proxy_id: Some("p1".to_string()),
+            proxy_name: Some("api".to_string()),
+            response_status_code: 500,
+            ..TransactionSummary::default()
+        };
+
+        plugin.log(&summary).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(permit) = plugin.dispatch_sem.clone().try_acquire_owned() {
+                    drop(permit);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failed webhook dispatch should return its semaphore permit promptly");
     }
 
     #[tokio::test]

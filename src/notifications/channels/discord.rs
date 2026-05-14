@@ -37,6 +37,10 @@ impl DiscordChannel {
         &self.name
     }
 
+    pub fn webhook_url(&self) -> &str {
+        &self.webhook_url
+    }
+
     pub fn build_payload(&self, n: &Notification) -> Value {
         let fields: Vec<Value> = n
             .fields

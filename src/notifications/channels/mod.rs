@@ -58,6 +58,15 @@ impl NotificationChannel {
         }
     }
 
+    pub fn warmup_hostnames(&self) -> Vec<String> {
+        match self {
+            Self::Slack(c) => hostname_from_url(c.webhook_url()),
+            Self::Teams(c) => hostname_from_url(c.webhook_url()),
+            Self::Discord(c) => hostname_from_url(c.webhook_url()),
+            Self::Webhook(c) => hostname_from_url(c.url()),
+        }
+    }
+
     /// Dispatch with no extra template variables. Convenience for callers
     /// that don't need to inject domain-specific context (today: anything
     /// except the proxy_alerts plugin).
@@ -207,4 +216,12 @@ pub(super) fn redacted_endpoint_url(raw: &str) -> String {
     url.set_fragment(None);
     url.set_path("/redacted");
     url.to_string()
+}
+
+fn hostname_from_url(raw: &str) -> Vec<String> {
+    Url::parse(raw)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .into_iter()
+        .collect()
 }

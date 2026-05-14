@@ -18,6 +18,7 @@ pub fn build_notification(
     now: DateTime<Utc>,
 ) -> Notification {
     let common = rule.common();
+    let rendered = observation.render(rule);
     let proxy_label = sample
         .proxy_name()
         .or(sample.proxy_id())
@@ -32,8 +33,8 @@ pub fn build_notification(
         NotificationField::new("Type", rule.type_str().to_string()),
         NotificationField::new("Severity", common.severity.as_str().to_string()),
         NotificationField::new("Proxy", proxy_label.to_string()),
-        NotificationField::new("Observed", observation.observed.clone()),
-        NotificationField::new("Threshold", observation.threshold.clone()),
+        NotificationField::new("Observed", rendered.observed.clone()),
+        NotificationField::new("Threshold", rendered.threshold.clone()),
         NotificationField::new("Window", format!("{}s", common.window_seconds)),
         NotificationField::new("Samples", observation.sample_count.to_string()),
     ];
@@ -46,11 +47,10 @@ pub fn build_notification(
         fields.push(NotificationField::full_width("Channels", names.join(", ")));
     }
     let body = match event_action {
-        EventAction::Resolve => format!(
-            "Rule '{}' has recovered: {}",
-            common.name, observation.reason
-        ),
-        _ => observation.reason.clone(),
+        EventAction::Resolve => {
+            format!("Rule '{}' has recovered: {}", common.name, rendered.reason)
+        }
+        _ => rendered.reason,
     };
     let source: Arc<str> = Arc::from(format!("proxy_alerts:{}", common.name).as_str());
     let mut builder = Notification::builder(title)
@@ -79,6 +79,7 @@ pub fn build_webhook_vars(
     now: DateTime<Utc>,
 ) -> HashMap<String, String> {
     let common = rule.common();
+    let rendered = observation.render(rule);
     let mut vars = HashMap::with_capacity(12);
     vars.insert("rule_name".to_string(), common.name.to_string());
     vars.insert(
@@ -91,8 +92,8 @@ pub fn build_webhook_vars(
     );
     vars.insert("namespace".to_string(), sample.namespace().to_string());
     vars.insert("fired_at".to_string(), now.to_rfc3339());
-    vars.insert("observed".to_string(), observation.observed.clone());
-    vars.insert("threshold".to_string(), observation.threshold.clone());
+    vars.insert("observed".to_string(), rendered.observed);
+    vars.insert("threshold".to_string(), rendered.threshold);
     vars.insert(
         "sample_count".to_string(),
         observation.sample_count.to_string(),
@@ -102,7 +103,7 @@ pub fn build_webhook_vars(
         common.window_seconds.to_string(),
     );
     vars.insert("severity".to_string(), common.severity.as_str().to_string());
-    vars.insert("reason".to_string(), observation.reason.clone());
+    vars.insert("reason".to_string(), rendered.reason);
     vars.insert(
         "event_action".to_string(),
         event_action.as_str().to_string(),

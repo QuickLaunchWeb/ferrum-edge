@@ -195,16 +195,126 @@ pub struct RuleObservation {
     /// `true` when the threshold is currently exceeded (subject to
     /// `min_request_count` etc.).
     pub breach: bool,
-    /// Human-readable rendering of the observed value, e.g. `"6.7%"`,
-    /// `"1873ms"`, `"204"`.
-    pub observed: String,
-    /// Human-readable rendering of the threshold.
-    pub threshold: String,
     /// Total number of samples in the window (denominator for rates,
     /// hit count for counters, total observations for histograms).
     pub sample_count: u64,
-    /// Concise "what happened" string suitable for the notification body.
+    /// Raw observation data. Rendered only when a notification is actually
+    /// dispatched so the common non-breaching hot path stays allocation-light.
+    detail: RuleObservationDetail,
+}
+
+#[derive(Debug, Clone)]
+enum RuleObservationDetail {
+    ErrorRate {
+        matched_total: u64,
+        total: u64,
+        percent: f64,
+    },
+    StatusCodeCount {
+        matched_total: u64,
+    },
+    LatencyPercentile {
+        estimate_upper_bound_ms: Option<f64>,
+    },
+    ErrorClass {
+        matched_total: u64,
+    },
+    StreamDisconnectCause {
+        matched_total: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct RenderedRuleObservation {
+    pub observed: String,
+    pub threshold: String,
     pub reason: String,
+}
+
+impl RuleObservation {
+    pub fn render(&self, rule: &Rule) -> RenderedRuleObservation {
+        match (&self.detail, rule) {
+            (
+                RuleObservationDetail::ErrorRate {
+                    matched_total,
+                    total,
+                    percent,
+                },
+                Rule::ErrorRate(rule),
+            ) => RenderedRuleObservation {
+                observed: format!("{percent:.2}%"),
+                threshold: format!("{:.2}%", rule.threshold_percent),
+                reason: format!(
+                    "{}/{} requests matched {:?} over {}s",
+                    matched_total, total, rule.status_codes, rule.common.window_seconds
+                ),
+            },
+            (
+                RuleObservationDetail::StatusCodeCount { matched_total },
+                Rule::StatusCodeCount(rule),
+            ) => RenderedRuleObservation {
+                observed: matched_total.to_string(),
+                threshold: rule.threshold_count.to_string(),
+                reason: format!(
+                    "{} requests with status in {:?} over {}s",
+                    matched_total, rule.status_codes, rule.common.window_seconds
+                ),
+            },
+            (
+                RuleObservationDetail::LatencyPercentile {
+                    estimate_upper_bound_ms,
+                },
+                Rule::LatencyPercentile(rule),
+            ) => RenderedRuleObservation {
+                observed: estimate_upper_bound_ms
+                    .map(format_latency)
+                    .unwrap_or_else(|| "n/a".to_string()),
+                threshold: format!("{:.0}ms", rule.threshold_ms),
+                reason: format!(
+                    "p{} of {} over {}s ({} samples)",
+                    rule.percentile,
+                    rule.metric.as_str(),
+                    rule.common.window_seconds,
+                    self.sample_count
+                ),
+            },
+            (RuleObservationDetail::ErrorClass { matched_total }, Rule::ErrorClass(rule)) => {
+                let class_names: Vec<&'static str> =
+                    rule.classes.iter().map(|c| c.as_str()).collect();
+                RenderedRuleObservation {
+                    observed: matched_total.to_string(),
+                    threshold: rule.threshold_count.to_string(),
+                    reason: format!(
+                        "{} transactions classified as {:?} over {}s",
+                        matched_total, class_names, rule.common.window_seconds
+                    ),
+                }
+            }
+            (
+                RuleObservationDetail::StreamDisconnectCause { matched_total },
+                Rule::StreamDisconnectCause(rule),
+            ) => {
+                let cause_names: Vec<&'static str> = rule
+                    .causes
+                    .iter()
+                    .map(|c| disconnect_cause_str(*c))
+                    .collect();
+                RenderedRuleObservation {
+                    observed: matched_total.to_string(),
+                    threshold: rule.threshold_count.to_string(),
+                    reason: format!(
+                        "{} stream disconnects with cause in {:?} over {}s",
+                        matched_total, cause_names, rule.common.window_seconds
+                    ),
+                }
+            }
+            _ => RenderedRuleObservation {
+                observed: "n/a".to_string(),
+                threshold: "n/a".to_string(),
+                reason: "rule observation mismatch".to_string(),
+            },
+        }
+    }
 }
 
 impl Rule {
@@ -256,13 +366,12 @@ fn observe_error_rate(
     let breach = total >= rule.min_request_count && percent >= rule.threshold_percent;
     Some(RuleObservation {
         breach,
-        observed: format!("{percent:.2}%"),
-        threshold: format!("{:.2}%", rule.threshold_percent),
         sample_count: total,
-        reason: format!(
-            "{}/{} requests matched {:?} over {}s",
-            matched_total, total, rule.status_codes, rule.common.window_seconds
-        ),
+        detail: RuleObservationDetail::ErrorRate {
+            matched_total,
+            total,
+            percent,
+        },
     })
 }
 
@@ -282,13 +391,8 @@ fn observe_status_code_count(
     let breach = matched_total >= rule.threshold_count;
     Some(RuleObservation {
         breach,
-        observed: matched_total.to_string(),
-        threshold: rule.threshold_count.to_string(),
         sample_count: matched_total,
-        reason: format!(
-            "{} requests with status in {:?} over {}s",
-            matched_total, rule.status_codes, rule.common.window_seconds
-        ),
+        detail: RuleObservationDetail::StatusCodeCount { matched_total },
     })
 }
 
@@ -316,17 +420,10 @@ fn observe_latency_percentile(
         let breach = latency_estimate_breaches(estimate, total, rule);
         return Some(RuleObservation {
             breach,
-            observed: estimate
-                .map(format_latency)
-                .unwrap_or_else(|| "n/a".to_string()),
-            threshold: format!("{:.0}ms", rule.threshold_ms),
             sample_count: total,
-            reason: format!(
-                "p{} of {} over {}s",
-                rule.percentile,
-                rule.metric.as_str(),
-                rule.common.window_seconds
-            ),
+            detail: RuleObservationDetail::LatencyPercentile {
+                estimate_upper_bound_ms: estimate,
+            },
         });
     }
     store.record_latency(rule.common.id, proxy_id, latency, now_ms);
@@ -335,18 +432,10 @@ fn observe_latency_percentile(
     let breach = latency_estimate_breaches(estimate, total, rule);
     Some(RuleObservation {
         breach,
-        observed: estimate
-            .map(format_latency)
-            .unwrap_or_else(|| "n/a".to_string()),
-        threshold: format!("{:.0}ms", rule.threshold_ms),
         sample_count: total,
-        reason: format!(
-            "p{} of {} over {}s ({} samples)",
-            rule.percentile,
-            rule.metric.as_str(),
-            rule.common.window_seconds,
-            total
-        ),
+        detail: RuleObservationDetail::LatencyPercentile {
+            estimate_upper_bound_ms: estimate,
+        },
     })
 }
 
@@ -384,16 +473,10 @@ fn observe_error_class(
     store.record_count(rule.common.id, proxy_id, matched, now_ms);
     let (matched_total, _) = store.snapshot_count(rule.common.id, proxy_id, now_ms);
     let breach = matched_total >= rule.threshold_count;
-    let class_names: Vec<&'static str> = rule.classes.iter().map(|c| c.as_str()).collect();
     Some(RuleObservation {
         breach,
-        observed: matched_total.to_string(),
-        threshold: rule.threshold_count.to_string(),
         sample_count: matched_total,
-        reason: format!(
-            "{} transactions classified as {:?} over {}s",
-            matched_total, class_names, rule.common.window_seconds
-        ),
+        detail: RuleObservationDetail::ErrorClass { matched_total },
     })
 }
 
@@ -416,20 +499,10 @@ fn observe_stream_disconnect(
     store.record_count(rule.common.id, proxy_id, matched, now_ms);
     let (matched_total, _) = store.snapshot_count(rule.common.id, proxy_id, now_ms);
     let breach = matched_total >= rule.threshold_count;
-    let cause_names: Vec<&'static str> = rule
-        .causes
-        .iter()
-        .map(|c| disconnect_cause_str(*c))
-        .collect();
     Some(RuleObservation {
         breach,
-        observed: matched_total.to_string(),
-        threshold: rule.threshold_count.to_string(),
         sample_count: matched_total,
-        reason: format!(
-            "{} stream disconnects with cause in {:?} over {}s",
-            matched_total, cause_names, rule.common.window_seconds
-        ),
+        detail: RuleObservationDetail::StreamDisconnectCause { matched_total },
     })
 }
 

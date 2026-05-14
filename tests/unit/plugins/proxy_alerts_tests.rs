@@ -299,6 +299,11 @@ async fn accepts_valid_minimal_config() {
     assert_eq!(plugin.name(), "proxy_alerts");
     assert_eq!(plugin.priority(), 9250);
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
+    assert!(!plugin.is_authorize_plugin());
+    assert_eq!(
+        plugin.warmup_hostnames(),
+        vec!["hooks.slack.com".to_string()]
+    );
 }
 
 #[test]
@@ -565,7 +570,7 @@ fn latency_boundary_threshold_does_not_fire_previous_bucket() {
     let observation = parsed.rules[0]
         .observe(SampleInput::WebSocket(&ctx), &store, 1_000)
         .expect("latency sample should apply");
-    assert_eq!(observation.observed, "300000ms");
+    assert_eq!(observation.render(&parsed.rules[0]).observed, "300000ms");
     assert!(
         !observation.breach,
         "the 300000ms bucket label covers samples below the 300000ms threshold"
@@ -611,7 +616,7 @@ fn latency_non_boundary_threshold_fires_within_estimated_bucket() {
     let observation = parsed.rules[0]
         .observe(SampleInput::WebSocket(&ctx), &store, 1_000)
         .expect("latency sample should apply");
-    assert_eq!(observation.observed, "2500ms");
+    assert_eq!(observation.render(&parsed.rules[0]).observed, "2500ms");
     assert!(
         observation.breach,
         "a 1500ms threshold should fire when the percentile lands in the 2500ms bucket"
@@ -658,7 +663,7 @@ fn latency_overflow_bucket_reports_configured_max_bound() {
         .observe(SampleInput::WebSocket(&ctx), &store, 1_000)
         .expect("overflow latency sample should apply");
     assert!(observation.breach);
-    assert_eq!(observation.observed, ">300000ms");
+    assert_eq!(observation.render(&parsed.rules[0]).observed, ">300000ms");
 }
 
 // -------------------------------------------------------------- BucketedCounter

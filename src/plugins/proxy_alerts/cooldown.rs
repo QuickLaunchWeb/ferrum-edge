@@ -15,9 +15,15 @@ use dashmap::DashMap;
 
 use crate::util::sharding::pool_shard_amount;
 
+type CooldownKey = (u32, u32);
+type CooldownProxyMap = DashMap<String, Arc<AtomicU64>>;
+type SharedCooldownProxyMap = Arc<CooldownProxyMap>;
+type RecoveryRuleMap = DashMap<String, RuleState>;
+type SharedRecoveryRuleMap = Arc<RecoveryRuleMap>;
+
 #[derive(Debug)]
 pub struct CooldownGate {
-    last_sent: DashMap<(u32, u32), Arc<DashMap<String, AtomicU64>>>,
+    last_sent: DashMap<CooldownKey, SharedCooldownProxyMap>,
     inner_shard_amount: usize,
 }
 
@@ -59,10 +65,16 @@ impl CooldownGate {
                     .value(),
             )
         };
-        let entry = per_proxy
-            .entry(proxy_id.to_string())
-            .or_insert_with(|| AtomicU64::new(0));
-        let atomic = entry.value();
+        let atomic = if let Some(existing) = per_proxy.get(proxy_id) {
+            Arc::clone(existing.value())
+        } else {
+            Arc::clone(
+                per_proxy
+                    .entry(proxy_id.to_string())
+                    .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                    .value(),
+            )
+        };
         let mut prev = atomic.load(Ordering::Acquire);
         loop {
             if prev != 0 && now_ms.saturating_sub(prev) < cooldown_ms {
@@ -109,7 +121,8 @@ pub enum LifecycleOutcome {
 
 #[derive(Debug)]
 pub struct RecoveryGate {
-    state: DashMap<(u32, String), RuleState>,
+    state: DashMap<u32, SharedRecoveryRuleMap>,
+    inner_shard_amount: usize,
 }
 
 impl Default for RecoveryGate {
@@ -120,8 +133,10 @@ impl Default for RecoveryGate {
 
 impl RecoveryGate {
     pub fn new() -> Self {
+        let shard_amount = pool_shard_amount(0);
         Self {
-            state: DashMap::with_shard_amount(pool_shard_amount(0)),
+            state: DashMap::with_shard_amount(shard_amount),
+            inner_shard_amount: shard_amount,
         }
     }
 
@@ -138,10 +153,14 @@ impl RecoveryGate {
         recovery_ms: u64,
         now_ms: u64,
     ) -> LifecycleOutcome {
-        let mut entry = self
-            .state
-            .entry((rule_id, proxy_id.to_string()))
-            .or_insert(RuleState::Healthy);
+        let per_rule = self.per_rule(rule_id);
+        let mut entry = if let Some(existing) = per_rule.get_mut(proxy_id) {
+            existing
+        } else {
+            per_rule
+                .entry(proxy_id.to_string())
+                .or_insert(RuleState::Healthy)
+        };
         Self::transition(entry.value_mut(), breach, recovery_ms, now_ms)
     }
 
@@ -160,11 +179,26 @@ impl RecoveryGate {
     ) -> LifecycleOutcome {
         let state = self
             .state
-            .get(&(rule_id, proxy_id.to_string()))
-            .map(|entry| *entry.value())
+            .get(&rule_id)
+            .and_then(|per_rule| per_rule.get(proxy_id).map(|entry| *entry.value()))
             .unwrap_or(RuleState::Healthy);
         let mut state = state;
         Self::transition(&mut state, breach, recovery_ms, now_ms)
+    }
+
+    fn per_rule(&self, rule_id: u32) -> SharedRecoveryRuleMap {
+        if let Some(existing) = self.state.get(&rule_id) {
+            Arc::clone(existing.value())
+        } else {
+            Arc::clone(
+                self.state
+                    .entry(rule_id)
+                    .or_insert_with(|| {
+                        Arc::new(DashMap::with_shard_amount(self.inner_shard_amount))
+                    })
+                    .value(),
+            )
+        }
     }
 
     fn transition(
@@ -229,7 +263,7 @@ impl RecoveryGate {
     #[allow(dead_code)] // Used by external test crate and future admin debug surface.
     pub fn current_state(&self, rule_id: u32, proxy_id: &str) -> Option<RuleState> {
         self.state
-            .get(&(rule_id, proxy_id.to_string()))
-            .map(|e| *e.value())
+            .get(&rule_id)
+            .and_then(|per_rule| per_rule.get(proxy_id).map(|e| *e.value()))
     }
 }

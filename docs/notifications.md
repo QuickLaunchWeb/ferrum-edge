@@ -89,7 +89,7 @@ These are always available for the generic webhook channel, derived from the sup
 - `${subject_id}` — caller-defined subject (e.g., proxy name)
 - `${namespace}` — caller-defined namespace
 
-Callers can supply additional variables via `dispatch_with_vars`. The [`proxy_alerts` plugin](proxy_alerts.md#webhook-template-variables) adds `${rule_name}`, `${proxy_id}`, `${observed}`, `${threshold}`, etc.
+Callers can supply additional variables via `dispatch_with_vars`. The [`proxy_alerts` plugin](proxy_alerts.md#webhook-template-variables) adds `${rule_name}`, `${proxy_id}`, `${observed}`, `${threshold}`, etc. Extra variables are consumed only by generic `webhook` channels because Slack, Teams, and Discord use fixed native payload shapes.
 
 Special characters:
 - `${name}` — variable substitution.

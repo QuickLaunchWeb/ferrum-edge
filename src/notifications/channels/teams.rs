@@ -35,6 +35,10 @@ impl TeamsChannel {
         &self.name
     }
 
+    pub fn webhook_url(&self) -> &str {
+        &self.webhook_url
+    }
+
     pub fn build_payload(&self, n: &Notification) -> Value {
         let facts: Vec<Value> = n
             .fields

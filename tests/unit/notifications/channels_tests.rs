@@ -117,6 +117,38 @@ fn parse_channels_accepts_all_four_kinds() {
     assert_eq!(map["ops_generic"].kind(), "webhook");
 }
 
+#[test]
+fn notification_channels_expose_warmup_hostnames() {
+    let map = parse_channels(&json!({
+        "ops_slack": { "type": "slack", "webhook_url": "https://hooks.slack.com/x" },
+        "ops_teams": { "type": "teams", "webhook_url": "https://outlook.office.com/x" },
+        "ops_discord": { "type": "discord", "webhook_url": "https://discord.com/api/webhooks/x" },
+        "ops_generic": {
+            "type": "webhook",
+            "url": "https://events.pagerduty.com/v2/enqueue",
+            "body_template": "{}",
+        }
+    }))
+    .unwrap();
+
+    assert_eq!(
+        map["ops_slack"].warmup_hostnames(),
+        vec!["hooks.slack.com".to_string()]
+    );
+    assert_eq!(
+        map["ops_teams"].warmup_hostnames(),
+        vec!["outlook.office.com".to_string()]
+    );
+    assert_eq!(
+        map["ops_discord"].warmup_hostnames(),
+        vec!["discord.com".to_string()]
+    );
+    assert_eq!(
+        map["ops_generic"].warmup_hostnames(),
+        vec!["events.pagerduty.com".to_string()]
+    );
+}
+
 // ---------------------------------------------------------------- Slack payload
 
 #[test]
