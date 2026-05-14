@@ -332,6 +332,7 @@ impl DnsCache {
 
             // Fresh entry — return immediately
             if entry.expires_at > now && !entry.addresses.is_empty() && !entry.is_error {
+                crate::runtime_metrics::global().record_dns_hit();
                 return Ok(entry.addresses[0]);
             }
 
@@ -375,11 +376,13 @@ impl DnsCache {
                         hostname
                     );
                 }
+                crate::runtime_metrics::global().record_dns_stale();
                 return Ok(entry.addresses[0]);
             }
 
             // Cached error that hasn't expired — return error immediately
             if entry.is_error && entry.expires_at > now {
+                crate::runtime_metrics::global().record_dns_error();
                 anyhow::bail!("DNS resolution failed for {} (cached error)", hostname);
             }
         }
@@ -397,6 +400,7 @@ impl DnsCache {
                     "DNS resolved {} -> {:?} (native_ttl={:?}, effective_ttl={:?})",
                     hostname, addrs[0], native_ttl, ttl
                 );
+                crate::runtime_metrics::global().record_dns_miss();
                 Ok(addrs[0])
             }
             Ok(_) | Err(_) if hostname == "localhost" => {
@@ -408,14 +412,17 @@ impl DnsCache {
                 let addrs =
                     self.cache_success_entry(hostname, vec![addr], None, ttl, per_proxy_ttl)?;
                 debug!("DNS resolved localhost -> {} (built-in fallback)", addr);
+                crate::runtime_metrics::global().record_dns_miss();
                 Ok(addrs[0])
             }
             Ok(_) => {
                 self.cache_error(hostname, per_proxy_ttl);
+                crate::runtime_metrics::global().record_dns_error();
                 anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
             }
             Err(e) => {
                 self.cache_error(hostname, per_proxy_ttl);
+                crate::runtime_metrics::global().record_dns_error();
                 Err(e)
             }
         }

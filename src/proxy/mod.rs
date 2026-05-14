@@ -10871,6 +10871,7 @@ pub(crate) fn record_status(state: &ProxyState, status: u16) {
 pub(crate) fn record_request(state: &ProxyState, status: u16) {
     state.request_count.fetch_add(1, Ordering::Relaxed);
     record_status(state, status);
+    crate::runtime_metrics::global().record_http_status(status);
 }
 
 /// Collect backend response headers into a HashMap.

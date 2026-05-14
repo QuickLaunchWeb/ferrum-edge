@@ -43,10 +43,13 @@ mod proxy;
 pub mod request_epoch;
 mod retry;
 mod router_cache;
+mod runtime_metrics;
+mod runtime_metrics_tracing_layer;
 mod secrets;
 mod service_discovery;
 mod socket_opts;
 mod startup;
+mod system_metrics;
 mod tls;
 #[allow(dead_code)]
 mod tls_offload;
@@ -59,6 +62,8 @@ use tracing::{Level, Metadata, debug, error, info, warn};
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// The Ferrum Edge binary version (sourced from Cargo.toml at compile time).
 pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -198,16 +203,46 @@ fn init_logging() -> (WorkerGuard, WorkerGuard) {
             .finish(std::io::stderr());
     let log_level =
         config::conf_file::resolve_ferrum_var("FERRUM_LOG_LEVEL").unwrap_or_else(|| "error".into());
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level)),
-        )
-        .json()
-        .with_writer(SeverityWriter {
-            stdout: stdout_writer,
-            stderr: stderr_writer,
-        })
-        .init();
+    let log_counter_enabled =
+        config::conf_file::resolve_ferrum_var("FERRUM_METRICS_LOG_COUNTER_ENABLED")
+            .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+            .unwrap_or(true);
+
+    let installed = if log_counter_enabled {
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(SeverityWriter {
+                stdout: stdout_writer.clone(),
+                stderr: stderr_writer.clone(),
+            });
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .with(crate::runtime_metrics_tracing_layer::CountingLayer::new(
+                crate::runtime_metrics::global(),
+            ))
+            .try_init()
+            .is_ok()
+    } else {
+        false
+    };
+
+    if !installed {
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(SeverityWriter {
+                stdout: stdout_writer,
+                stderr: stderr_writer,
+            });
+        let _ = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .try_init();
+    }
 
     (stdout_guard, stderr_guard)
 }

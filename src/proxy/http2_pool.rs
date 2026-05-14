@@ -400,6 +400,10 @@ impl PoolManager for Http2PoolManager {
     fn destroy(&self, conn: Self::Connection) {
         drop(conn);
     }
+
+    fn runtime_metrics_kind(&self) -> Option<crate::runtime_metrics::PoolKind> {
+        Some(crate::runtime_metrics::PoolKind::Http2Direct)
+    }
 }
 
 /// HTTP/2 connection pool for HTTPS backends.

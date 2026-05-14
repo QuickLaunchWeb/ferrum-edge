@@ -1,0 +1,876 @@
+//! Process-global runtime counters for the admin `/metrics/runtime` endpoint.
+//!
+//! Recording APIs are intentionally tiny and hot-path friendly: existing keys
+//! are a single relaxed atomic increment, and cold inserts are bounded by the
+//! same status counter cap used elsewhere in the gateway.
+
+use arc_swap::ArcSwap;
+use crossbeam_utils::CachePadded;
+use dashmap::DashMap;
+use serde::Serialize;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use crate::plugins::{Direction, StreamTransactionSummary, TransactionSummary};
+use crate::system_metrics::SystemSnapshot;
+
+pub static RUNTIME_METRICS: OnceLock<Arc<RuntimeMetrics>> = OnceLock::new();
+
+pub fn global() -> Arc<RuntimeMetrics> {
+    RUNTIME_METRICS
+        .get_or_init(|| Arc::new(RuntimeMetrics::new()))
+        .clone()
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+pub struct ErrorKey {
+    pub proxy_id: Arc<str>,
+    pub class: &'static str,
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
+pub enum PoolKind {
+    Http1,
+    #[allow(dead_code)] // reqwest may negotiate H2 internally; kept as stable output vocabulary.
+    Http2Reqwest,
+    Http2Direct,
+    Http3,
+    Grpc,
+    Hbone,
+}
+
+impl PoolKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http1 => "http1",
+            Self::Http2Reqwest => "http2_reqwest",
+            Self::Http2Direct => "http2_direct",
+            Self::Http3 => "http3",
+            Self::Grpc => "grpc",
+            Self::Hbone => "hbone",
+        }
+    }
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+pub struct RstKey {
+    pub proxy_id: Arc<str>,
+    pub direction: &'static str,
+}
+
+#[repr(usize)]
+#[derive(Debug, Hash, Eq, PartialEq, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Trace => 0,
+            Self::Debug => 1,
+            Self::Info => 2,
+            Self::Warn => 3,
+            Self::Error => 4,
+        }
+    }
+}
+
+const LOG_LEVELS: [LogLevel; 5] = [
+    LogLevel::Trace,
+    LogLevel::Debug,
+    LogLevel::Info,
+    LogLevel::Warn,
+    LogLevel::Error,
+];
+
+const ERROR_CLASSES: [&str; 15] = [
+    "connection_timeout",
+    "connection_refused",
+    "connection_reset",
+    "connection_closed",
+    "dns_lookup_error",
+    "tls_error",
+    "read_write_timeout",
+    "client_disconnect",
+    "protocol_error",
+    "response_body_too_large",
+    "request_body_too_large",
+    "connection_pool_error",
+    "port_exhaustion",
+    "graceful_remote_close",
+    "request_error",
+];
+
+pub struct RuntimeMetrics {
+    pub http_errors_by_class: DashMap<ErrorKey, CachePadded<AtomicU64>>,
+    pub grpc_errors_by_class: DashMap<ErrorKey, CachePadded<AtomicU64>>,
+    pub body_errors_by_class: DashMap<ErrorKey, CachePadded<AtomicU64>>,
+    pub stream_errors_by_class: DashMap<ErrorKey, CachePadded<AtomicU64>>,
+
+    pub dns_lookups_total: CachePadded<AtomicU64>,
+    pub dns_cache_hits: CachePadded<AtomicU64>,
+    pub dns_cache_misses: CachePadded<AtomicU64>,
+    pub dns_stale_serves: CachePadded<AtomicU64>,
+    pub dns_lookup_errors: CachePadded<AtomicU64>,
+
+    pub pool_handshakes_total: DashMap<PoolKind, CachePadded<AtomicU64>>,
+    pub pool_evictions_total: DashMap<PoolKind, CachePadded<AtomicU64>>,
+    pub pool_failures_total: DashMap<PoolKind, CachePadded<AtomicU64>>,
+
+    pub tcp_rst_observed: DashMap<RstKey, CachePadded<AtomicU64>>,
+
+    pub log_counts: [CachePadded<AtomicU64>; 5],
+    pub log_counts_by_category: DashMap<(LogLevel, &'static str), CachePadded<AtomicU64>>,
+
+    pub status_window_1m: DashMap<u16, AtomicU64>,
+    pub status_window_5m: DashMap<u16, AtomicU64>,
+    pub status_window_rotated_at: AtomicU64,
+
+    pub system: ArcSwap<SystemSnapshot>,
+    pub started_at: Instant,
+
+    max_error_entries: AtomicUsize,
+    pool_tracking_enabled: AtomicBool,
+    client_disconnects: CachePadded<AtomicU64>,
+    status_current_1m: DashMap<u16, CachePadded<AtomicU64>>,
+    status_current_5m: DashMap<u16, CachePadded<AtomicU64>>,
+    requests_current_1m: CachePadded<AtomicU64>,
+    requests_current_5m: CachePadded<AtomicU64>,
+    requests_window_1m: CachePadded<AtomicU64>,
+    requests_window_5m: CachePadded<AtomicU64>,
+}
+
+impl Default for RuntimeMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RuntimeMetrics {
+    pub fn new() -> Self {
+        Self {
+            http_errors_by_class: DashMap::new(),
+            grpc_errors_by_class: DashMap::new(),
+            body_errors_by_class: DashMap::new(),
+            stream_errors_by_class: DashMap::new(),
+            dns_lookups_total: CachePadded::new(AtomicU64::new(0)),
+            dns_cache_hits: CachePadded::new(AtomicU64::new(0)),
+            dns_cache_misses: CachePadded::new(AtomicU64::new(0)),
+            dns_stale_serves: CachePadded::new(AtomicU64::new(0)),
+            dns_lookup_errors: CachePadded::new(AtomicU64::new(0)),
+            pool_handshakes_total: DashMap::new(),
+            pool_evictions_total: DashMap::new(),
+            pool_failures_total: DashMap::new(),
+            tcp_rst_observed: DashMap::new(),
+            log_counts: std::array::from_fn(|_| CachePadded::new(AtomicU64::new(0))),
+            log_counts_by_category: DashMap::new(),
+            status_window_1m: DashMap::new(),
+            status_window_5m: DashMap::new(),
+            status_window_rotated_at: AtomicU64::new(0),
+            system: ArcSwap::from_pointee(SystemSnapshot::empty()),
+            started_at: Instant::now(),
+            max_error_entries: AtomicUsize::new(200),
+            pool_tracking_enabled: AtomicBool::new(true),
+            client_disconnects: CachePadded::new(AtomicU64::new(0)),
+            status_current_1m: DashMap::new(),
+            status_current_5m: DashMap::new(),
+            requests_current_1m: CachePadded::new(AtomicU64::new(0)),
+            requests_current_5m: CachePadded::new(AtomicU64::new(0)),
+            requests_window_1m: CachePadded::new(AtomicU64::new(0)),
+            requests_window_5m: CachePadded::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn configure(&self, max_error_entries: usize, pool_tracking_enabled: bool) {
+        self.max_error_entries
+            .store(max_error_entries.max(1), Ordering::Relaxed);
+        self.pool_tracking_enabled
+            .store(pool_tracking_enabled, Ordering::Relaxed);
+    }
+
+    pub fn record_http_status(&self, status: u16) {
+        self.increment_status_current(status);
+    }
+
+    pub fn record_transaction(&self, summary: &TransactionSummary) {
+        if summary.client_disconnected {
+            self.client_disconnects.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if let Some(class) = summary.error_class {
+            let proxy_id = Arc::<str>::from(summary.proxy_id.as_deref().unwrap_or("unknown"));
+            let key = ErrorKey {
+                proxy_id,
+                class: class.as_str(),
+            };
+            if is_grpc_summary(summary) {
+                self.increment_error_map(&self.grpc_errors_by_class, key);
+            } else {
+                self.increment_error_map(&self.http_errors_by_class, key);
+            }
+        }
+
+        if let Some(class) = summary.body_error_class {
+            let key = ErrorKey {
+                proxy_id: Arc::<str>::from(summary.proxy_id.as_deref().unwrap_or("unknown")),
+                class: class.as_str(),
+            };
+            self.increment_error_map(&self.body_errors_by_class, key);
+        }
+    }
+
+    pub fn record_stream_transaction(&self, summary: &StreamTransactionSummary) {
+        if let Some(class) = summary.error_class {
+            let key = ErrorKey {
+                proxy_id: Arc::<str>::from(summary.proxy_id.as_str()),
+                class: class.as_str(),
+            };
+            self.increment_error_map(&self.stream_errors_by_class, key);
+        }
+    }
+
+    pub fn record_dns_hit(&self) {
+        self.dns_lookups_total.fetch_add(1, Ordering::Relaxed);
+        self.dns_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_dns_miss(&self) {
+        self.dns_lookups_total.fetch_add(1, Ordering::Relaxed);
+        self.dns_cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_dns_stale(&self) {
+        self.dns_lookups_total.fetch_add(1, Ordering::Relaxed);
+        self.dns_stale_serves.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_dns_error(&self) {
+        self.dns_lookups_total.fetch_add(1, Ordering::Relaxed);
+        self.dns_lookup_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_pool_handshake(&self, kind: PoolKind) {
+        if self.pool_tracking_enabled.load(Ordering::Relaxed) {
+            self.increment_pool_map(&self.pool_handshakes_total, kind);
+        }
+    }
+
+    pub fn record_pool_failure(&self, kind: PoolKind) {
+        if self.pool_tracking_enabled.load(Ordering::Relaxed) {
+            self.increment_pool_map(&self.pool_failures_total, kind);
+        }
+    }
+
+    pub fn record_pool_eviction(&self, kind: PoolKind) {
+        if self.pool_tracking_enabled.load(Ordering::Relaxed) {
+            self.increment_pool_map(&self.pool_evictions_total, kind);
+        }
+    }
+
+    pub fn record_tcp_rst(&self, proxy_id: &str, direction: Direction) {
+        let key = RstKey {
+            proxy_id: Arc::<str>::from(proxy_id),
+            direction: direction_label(direction),
+        };
+        if let Some(counter) = self.tcp_rst_observed.get(&key) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        } else if self.tcp_rst_observed.len() < self.max_error_entries.load(Ordering::Relaxed) {
+            self.tcp_rst_observed
+                .entry(key)
+                .or_insert_with(|| CachePadded::new(AtomicU64::new(0)))
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_log(&self, level: LogLevel, category: &'static str) {
+        self.log_counts[level.index()].fetch_add(1, Ordering::Relaxed);
+        self.log_counts_by_category
+            .entry((level, category))
+            .or_insert_with(|| CachePadded::new(AtomicU64::new(0)))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn increment_status_current(&self, status: u16) {
+        self.requests_current_1m.fetch_add(1, Ordering::Relaxed);
+        self.requests_current_5m.fetch_add(1, Ordering::Relaxed);
+        increment_status_map(&self.status_current_1m, status);
+        increment_status_map(&self.status_current_5m, status);
+    }
+
+    fn increment_error_map(&self, map: &DashMap<ErrorKey, CachePadded<AtomicU64>>, key: ErrorKey) {
+        if let Some(counter) = map.get(&key) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        } else if map.len() < self.max_error_entries.load(Ordering::Relaxed) {
+            map.entry(key)
+                .or_insert_with(|| CachePadded::new(AtomicU64::new(0)))
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn increment_pool_map(&self, map: &DashMap<PoolKind, CachePadded<AtomicU64>>, kind: PoolKind) {
+        map.entry(kind)
+            .or_insert_with(|| CachePadded::new(AtomicU64::new(0)))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn rotate_status_window(&self, window: StatusWindow) {
+        let (current, published, request_current, request_published, seconds) = match window {
+            StatusWindow::OneMinute(seconds) => (
+                &self.status_current_1m,
+                &self.status_window_1m,
+                &self.requests_current_1m,
+                &self.requests_window_1m,
+                seconds,
+            ),
+            StatusWindow::FiveMinutes(seconds) => (
+                &self.status_current_5m,
+                &self.status_window_5m,
+                &self.requests_current_5m,
+                &self.requests_window_5m,
+                seconds,
+            ),
+        };
+
+        let seconds = seconds.max(1);
+        let request_delta = request_current.swap(0, Ordering::Relaxed);
+        request_published.store(request_delta / seconds, Ordering::Relaxed);
+
+        for entry in current.iter() {
+            let code = *entry.key();
+            let delta = entry.value().swap(0, Ordering::Relaxed);
+            let rate = delta / seconds;
+            published
+                .entry(code)
+                .or_insert_with(|| AtomicU64::new(0))
+                .store(rate, Ordering::Relaxed);
+        }
+
+        self.status_window_rotated_at
+            .store(unix_seconds(), Ordering::Relaxed);
+    }
+}
+
+fn increment_status_map(map: &DashMap<u16, CachePadded<AtomicU64>>, status: u16) {
+    if let Some(counter) = map.get(&status) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    } else if map.len() < 256 {
+        map.entry(status)
+            .or_insert_with(|| CachePadded::new(AtomicU64::new(0)))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+enum StatusWindow {
+    OneMinute(u64),
+    FiveMinutes(u64),
+}
+
+pub fn start_window_rotator(
+    window_1m_seconds: u64,
+    window_5m_seconds: u64,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let metrics = global();
+    tokio::spawn(async move {
+        let window_1m_seconds = window_1m_seconds.max(1);
+        let window_5m_seconds = window_5m_seconds.max(1);
+        let mut elapsed = 0u64;
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                _ = shutdown_rx.changed() => return,
+            }
+
+            elapsed = elapsed.saturating_add(1);
+            if elapsed.is_multiple_of(window_1m_seconds) {
+                metrics.rotate_status_window(StatusWindow::OneMinute(window_1m_seconds));
+            }
+            if elapsed.is_multiple_of(window_5m_seconds) {
+                metrics.rotate_status_window(StatusWindow::FiveMinutes(window_5m_seconds));
+            }
+        }
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeSnapshot {
+    pub timestamp: String,
+    pub uptime_seconds: u64,
+    pub mode: String,
+    pub ferrum_version: &'static str,
+    pub system: SystemSnapshot,
+    pub http: HttpSnapshot,
+    pub errors: ErrorsSnapshot,
+    pub dns: DnsSnapshot,
+    pub connections: ConnectionsSnapshot,
+    pub logs: LogsSnapshot,
+    pub overload: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HttpSnapshot {
+    pub total_requests: u64,
+    pub requests_per_second_1s: u64,
+    pub requests_per_second_1m: u64,
+    pub requests_per_second_5m: u64,
+    pub status_codes: StatusCodeSnapshot,
+    pub client_disconnects: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatusCodeSnapshot {
+    pub totals: BTreeMap<String, u64>,
+    pub rate_1s: BTreeMap<String, u64>,
+    pub rate_1m: BTreeMap<String, u64>,
+    pub rate_5m: BTreeMap<String, u64>,
+    pub percent_total: BTreeMap<String, f64>,
+    pub percent_1m: BTreeMap<String, f64>,
+    pub percent_5m: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ErrorsSnapshot {
+    pub by_class: BTreeMap<&'static str, ErrorClassCounts>,
+    pub by_proxy: BTreeMap<String, BTreeMap<&'static str, u64>>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct ErrorClassCounts {
+    pub http: u64,
+    pub grpc: u64,
+    pub stream: u64,
+    pub body: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DnsSnapshot {
+    pub lookups_total: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub stale_serves: u64,
+    pub errors: u64,
+    pub hit_ratio: f64,
+    pub error_ratio: f64,
+    pub cache_entries: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConnectionsSnapshot {
+    pub active: u64,
+    pub active_requests: u64,
+    pub pool_handshakes_total: BTreeMap<&'static str, u64>,
+    pub pool_evictions_total: BTreeMap<&'static str, u64>,
+    pub pool_failures_total: BTreeMap<&'static str, u64>,
+    pub tcp_rst_observed: TcpRstSnapshot,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TcpRstSnapshot {
+    pub by_proxy: BTreeMap<String, BTreeMap<&'static str, u64>>,
+    pub total: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LogsSnapshot {
+    pub by_level: BTreeMap<&'static str, u64>,
+    pub by_category: BTreeMap<&'static str, BTreeMap<&'static str, u64>>,
+}
+
+pub fn build_snapshot(
+    mode: &str,
+    proxy_state: Option<&crate::proxy::ProxyState>,
+) -> RuntimeSnapshot {
+    let metrics = global();
+    RuntimeSnapshot {
+        timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        uptime_seconds: metrics.started_at.elapsed().as_secs(),
+        mode: mode.to_string(),
+        ferrum_version: crate::FERRUM_VERSION,
+        system: (**metrics.system.load()).clone(),
+        http: build_http_snapshot(&metrics, proxy_state),
+        errors: build_errors_snapshot(&metrics),
+        dns: build_dns_snapshot(&metrics, proxy_state),
+        connections: build_connections_snapshot(&metrics, proxy_state),
+        logs: build_logs_snapshot(&metrics),
+        overload: build_overload_snapshot(proxy_state),
+    }
+}
+
+fn build_http_snapshot(
+    metrics: &RuntimeMetrics,
+    proxy_state: Option<&crate::proxy::ProxyState>,
+) -> HttpSnapshot {
+    let total_requests = proxy_state
+        .map(|ps| ps.request_count.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    let requests_per_second_1s = proxy_state
+        .map(|ps| {
+            ps.windowed_metrics
+                .requests_per_second
+                .load(Ordering::Relaxed)
+        })
+        .unwrap_or(0);
+
+    let totals = proxy_state
+        .map(|ps| status_map_from_dashmap(&ps.status_counts))
+        .unwrap_or_default();
+    let rate_1s = proxy_state
+        .map(|ps| status_rate_map_from_dashmap(&ps.windowed_metrics.status_codes_per_second))
+        .unwrap_or_default();
+    let rate_1m = status_rate_map_from_dashmap(&metrics.status_window_1m);
+    let rate_5m = status_rate_map_from_dashmap(&metrics.status_window_5m);
+
+    let percent_total = percent_map(&totals, total_requests);
+    let requests_1m = metrics.requests_window_1m.load(Ordering::Relaxed);
+    let requests_5m = metrics.requests_window_5m.load(Ordering::Relaxed);
+    let percent_1m = percent_map(&rate_1m, requests_1m);
+    let percent_5m = percent_map(&rate_5m, requests_5m);
+
+    HttpSnapshot {
+        total_requests,
+        requests_per_second_1s,
+        requests_per_second_1m: requests_1m,
+        requests_per_second_5m: requests_5m,
+        status_codes: StatusCodeSnapshot {
+            totals,
+            rate_1s,
+            rate_1m,
+            rate_5m,
+            percent_total,
+            percent_1m,
+            percent_5m,
+        },
+        client_disconnects: metrics.client_disconnects.load(Ordering::Relaxed),
+    }
+}
+
+fn status_map_from_dashmap(map: &DashMap<u16, AtomicU64>) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    for entry in map.iter() {
+        out.insert(
+            entry.key().to_string(),
+            entry.value().load(Ordering::Relaxed),
+        );
+    }
+    out
+}
+
+fn status_rate_map_from_dashmap(map: &DashMap<u16, AtomicU64>) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    for entry in map.iter() {
+        out.insert(
+            entry.key().to_string(),
+            entry.value().load(Ordering::Relaxed),
+        );
+    }
+    out
+}
+
+fn percent_map(values: &BTreeMap<String, u64>, total: u64) -> BTreeMap<String, f64> {
+    let mut out = BTreeMap::new();
+    if total == 0 {
+        return out;
+    }
+    for (code, count) in values {
+        out.insert(
+            code.clone(),
+            ((*count as f64 / total as f64) * 10_000.0).round() / 100.0,
+        );
+    }
+    out
+}
+
+fn build_errors_snapshot(metrics: &RuntimeMetrics) -> ErrorsSnapshot {
+    let mut by_class: BTreeMap<&'static str, ErrorClassCounts> = ERROR_CLASSES
+        .iter()
+        .copied()
+        .map(|class| (class, ErrorClassCounts::default()))
+        .collect();
+    let mut by_proxy: BTreeMap<String, BTreeMap<&'static str, u64>> = BTreeMap::new();
+
+    fold_error_map(
+        &metrics.http_errors_by_class,
+        |counts| &mut counts.http,
+        &mut by_class,
+        &mut by_proxy,
+    );
+    fold_error_map(
+        &metrics.grpc_errors_by_class,
+        |counts| &mut counts.grpc,
+        &mut by_class,
+        &mut by_proxy,
+    );
+    fold_error_map(
+        &metrics.stream_errors_by_class,
+        |counts| &mut counts.stream,
+        &mut by_class,
+        &mut by_proxy,
+    );
+    fold_error_map(
+        &metrics.body_errors_by_class,
+        |counts| &mut counts.body,
+        &mut by_class,
+        &mut by_proxy,
+    );
+
+    ErrorsSnapshot { by_class, by_proxy }
+}
+
+fn fold_error_map(
+    map: &DashMap<ErrorKey, CachePadded<AtomicU64>>,
+    slot: impl Fn(&mut ErrorClassCounts) -> &mut u64,
+    by_class: &mut BTreeMap<&'static str, ErrorClassCounts>,
+    by_proxy: &mut BTreeMap<String, BTreeMap<&'static str, u64>>,
+) {
+    for entry in map.iter() {
+        let count = entry.value().load(Ordering::Relaxed);
+        let class = entry.key().class;
+        let counts = by_class.entry(class).or_default();
+        let field = slot(counts);
+        *field = field.saturating_add(count);
+        by_proxy
+            .entry(entry.key().proxy_id.to_string())
+            .or_default()
+            .entry(class)
+            .and_modify(|value| *value = value.saturating_add(count))
+            .or_insert(count);
+    }
+}
+
+fn build_dns_snapshot(
+    metrics: &RuntimeMetrics,
+    proxy_state: Option<&crate::proxy::ProxyState>,
+) -> DnsSnapshot {
+    let lookups_total = metrics.dns_lookups_total.load(Ordering::Relaxed);
+    let cache_hits = metrics.dns_cache_hits.load(Ordering::Relaxed);
+    let cache_misses = metrics.dns_cache_misses.load(Ordering::Relaxed);
+    let stale_serves = metrics.dns_stale_serves.load(Ordering::Relaxed);
+    let errors = metrics.dns_lookup_errors.load(Ordering::Relaxed);
+    DnsSnapshot {
+        lookups_total,
+        cache_hits,
+        cache_misses,
+        stale_serves,
+        errors,
+        hit_ratio: ratio(cache_hits, lookups_total),
+        error_ratio: ratio(errors, lookups_total),
+        cache_entries: proxy_state.map(|ps| ps.dns_cache.cache_len()).unwrap_or(0),
+    }
+}
+
+fn build_connections_snapshot(
+    metrics: &RuntimeMetrics,
+    proxy_state: Option<&crate::proxy::ProxyState>,
+) -> ConnectionsSnapshot {
+    let (active, active_requests) = proxy_state
+        .map(|ps| {
+            (
+                ps.overload.active_connections.load(Ordering::Relaxed),
+                ps.overload.active_requests.load(Ordering::Relaxed),
+            )
+        })
+        .unwrap_or((0, 0));
+
+    ConnectionsSnapshot {
+        active,
+        active_requests,
+        pool_handshakes_total: pool_map(&metrics.pool_handshakes_total),
+        pool_evictions_total: pool_map(&metrics.pool_evictions_total),
+        pool_failures_total: pool_map(&metrics.pool_failures_total),
+        tcp_rst_observed: tcp_rst_snapshot(metrics),
+    }
+}
+
+fn pool_map(map: &DashMap<PoolKind, CachePadded<AtomicU64>>) -> BTreeMap<&'static str, u64> {
+    let mut out = BTreeMap::new();
+    for entry in map.iter() {
+        out.insert(entry.key().as_str(), entry.value().load(Ordering::Relaxed));
+    }
+    out
+}
+
+fn tcp_rst_snapshot(metrics: &RuntimeMetrics) -> TcpRstSnapshot {
+    let mut by_proxy: BTreeMap<String, BTreeMap<&'static str, u64>> = BTreeMap::new();
+    let mut total = 0u64;
+    for entry in metrics.tcp_rst_observed.iter() {
+        let count = entry.value().load(Ordering::Relaxed);
+        total = total.saturating_add(count);
+        by_proxy
+            .entry(entry.key().proxy_id.to_string())
+            .or_default()
+            .entry(entry.key().direction)
+            .and_modify(|value| *value = value.saturating_add(count))
+            .or_insert(count);
+    }
+    TcpRstSnapshot { by_proxy, total }
+}
+
+fn build_logs_snapshot(metrics: &RuntimeMetrics) -> LogsSnapshot {
+    let mut by_level = BTreeMap::new();
+    for level in LOG_LEVELS {
+        by_level.insert(
+            level.as_str(),
+            metrics.log_counts[level.index()].load(Ordering::Relaxed),
+        );
+    }
+
+    let mut by_category: BTreeMap<&'static str, BTreeMap<&'static str, u64>> = BTreeMap::new();
+    for entry in metrics.log_counts_by_category.iter() {
+        let ((level, category), counter) = entry.pair();
+        by_category
+            .entry(level.as_str())
+            .or_default()
+            .insert(*category, counter.load(Ordering::Relaxed));
+    }
+
+    LogsSnapshot {
+        by_level,
+        by_category,
+    }
+}
+
+fn build_overload_snapshot(proxy_state: Option<&crate::proxy::ProxyState>) -> Value {
+    if let Some(ps) = proxy_state {
+        let mut value = serde_json::to_value(ps.overload.snapshot()).unwrap_or_else(|_| json!({}));
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "stream_listeners".to_string(),
+                serde_json::to_value(ps.stream_listener_manager.overload_snapshot())
+                    .unwrap_or_else(|_| json!({})),
+            );
+        }
+        value
+    } else {
+        json!({
+            "level": "normal",
+            "draining": false,
+            "active_connections": 0,
+            "active_requests": 0,
+            "red_drop_probability_pct": 0.0,
+            "port_exhaustion_events": 0,
+            "actions": {
+                "disable_keepalive": false,
+                "reject_new_connections": false,
+                "reject_new_requests": false
+            }
+        })
+    }
+}
+
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn is_grpc_summary(summary: &TransactionSummary) -> bool {
+    summary
+        .metadata
+        .get("request_protocol")
+        .or_else(|| summary.metadata.get("mesh.request_protocol"))
+        .is_some_and(|value| value == "grpc" || value == "grpc-web")
+}
+
+fn direction_label(direction: Direction) -> &'static str {
+    match direction {
+        Direction::ClientToBackend => "client_to_backend",
+        Direction::BackendToClient => "backend_to_client",
+        Direction::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::retry::ErrorClass;
+
+    #[test]
+    fn counters_increment_by_class_and_proxy() {
+        let metrics = RuntimeMetrics::new();
+        let summary = TransactionSummary {
+            proxy_id: Some("proxy-a".to_string()),
+            response_status_code: 502,
+            error_class: Some(ErrorClass::ConnectionTimeout),
+            ..TransactionSummary::default()
+        };
+
+        metrics.record_transaction(&summary);
+        let snapshot = build_errors_snapshot(&metrics);
+
+        assert_eq!(
+            snapshot.by_class.get("connection_timeout").map(|c| c.http),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot
+                .by_proxy
+                .get("proxy-a")
+                .and_then(|classes| classes.get("connection_timeout"))
+                .copied(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn status_window_rotation_publishes_rates() {
+        let metrics = RuntimeMetrics::new();
+        for _ in 0..120 {
+            metrics.record_http_status(200);
+        }
+
+        metrics.rotate_status_window(StatusWindow::OneMinute(60));
+
+        assert_eq!(metrics.requests_window_1m.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            metrics
+                .status_window_1m
+                .get(&200)
+                .map(|v| v.load(Ordering::Relaxed)),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn dns_ratios_handle_zero_denominator() {
+        let metrics = RuntimeMetrics::new();
+        let dns = build_dns_snapshot(&metrics, None);
+        assert_eq!(dns.hit_ratio, 0.0);
+        assert_eq!(dns.error_ratio, 0.0);
+
+        metrics.record_dns_hit();
+        metrics.record_dns_error();
+        let dns = build_dns_snapshot(&metrics, None);
+        assert_eq!(dns.lookups_total, 2);
+        assert_eq!(dns.hit_ratio, 0.5);
+        assert_eq!(dns.error_ratio, 0.5);
+    }
+}

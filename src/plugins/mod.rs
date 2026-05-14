@@ -1075,6 +1075,7 @@ pub async fn log_with_mirror(
     for plugin in plugins {
         plugin.log(summary).await;
     }
+    crate::runtime_metrics::global().record_transaction(summary);
     if let Some(mirror_result) = ctx.collect_mirror_result().await {
         let mirror_summary = summary.as_mirror_entry(mirror_result);
         for plugin in plugins {

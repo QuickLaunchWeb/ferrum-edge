@@ -821,6 +821,7 @@ pub async fn handle_admin_request(
         (Method::GET, ["namespaces"]) => handle_list_namespaces(&state).await,
 
         // Metrics
+        (Method::GET, ["metrics", "runtime"]) => handle_metrics_runtime(&state).await,
         (Method::GET, ["admin", "metrics"]) => handle_metrics(&state).await,
 
         // Cluster status (CP/DP connection info)
@@ -1346,9 +1347,15 @@ use std::sync::OnceLock;
 
 /// Process-global cache for the metrics JSON response.
 static METRICS_CACHE: OnceLock<arc_swap::ArcSwap<Option<(Instant, Bytes)>>> = OnceLock::new();
+static RUNTIME_METRICS_CACHE: OnceLock<arc_swap::ArcSwap<Option<(Instant, Bytes)>>> =
+    OnceLock::new();
 
 fn metrics_cache() -> &'static arc_swap::ArcSwap<Option<(Instant, Bytes)>> {
     METRICS_CACHE.get_or_init(|| arc_swap::ArcSwap::new(Arc::new(None)))
+}
+
+fn runtime_metrics_cache() -> &'static arc_swap::ArcSwap<Option<(Instant, Bytes)>> {
+    RUNTIME_METRICS_CACHE.get_or_init(|| arc_swap::ArcSwap::new(Arc::new(None)))
 }
 
 /// Cache TTL for the metrics response.
@@ -1376,6 +1383,46 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
     let body_str = serde_json::to_string(&metrics).unwrap_or_else(|_| "{}".into());
     let body_bytes = Bytes::from(body_str);
 
+    cache.store(Arc::new(Some((Instant::now(), body_bytes.clone()))));
+
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .header("X-Cache", "miss")
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Cache-Control", "no-store")
+        .header("X-Frame-Options", "DENY")
+        .body(Full::new(body_bytes))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+    Ok(resp)
+}
+
+async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let ttl_ms = state
+        .proxy_state
+        .as_ref()
+        .map(|ps| ps.env_config.runtime_metrics_cache_ttl_ms)
+        .unwrap_or(1000);
+    let cache = runtime_metrics_cache();
+    let cached = cache.load();
+    if let Some((cached_at, ref bytes)) = **cached
+        && cached_at.elapsed() < Duration::from_millis(ttl_ms)
+    {
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("X-Cache", "hit")
+            .header("X-Content-Type-Options", "nosniff")
+            .header("Cache-Control", "no-store")
+            .header("X-Frame-Options", "DENY")
+            .body(Full::new(bytes.clone()))
+            .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+        return Ok(resp);
+    }
+
+    let snapshot = crate::runtime_metrics::build_snapshot(&state.mode, state.proxy_state.as_ref());
+    let body_str = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into());
+    let body_bytes = Bytes::from(body_str);
     cache.store(Arc::new(Some((Instant::now(), body_bytes.clone()))));
 
     let resp = Response::builder()

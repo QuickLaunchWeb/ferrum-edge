@@ -188,6 +188,10 @@ impl PoolManager for ReqwestPoolManager {
     fn destroy(&self, conn: Self::Connection) {
         drop(conn);
     }
+
+    fn runtime_metrics_kind(&self) -> Option<crate::runtime_metrics::PoolKind> {
+        Some(crate::runtime_metrics::PoolKind::Http1)
+    }
 }
 
 /// Connection pool manager for reusing HTTP clients.
