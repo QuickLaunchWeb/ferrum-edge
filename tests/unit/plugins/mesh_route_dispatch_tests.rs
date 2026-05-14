@@ -140,6 +140,8 @@ fn direct_backend_override_clears_existing_upstream_id() {
         client_key_path: Some("/certs/upstream.key".to_string()),
         server_ca_cert_path: Some("/certs/upstream-ca.pem".to_string()),
         verify_server_cert: false,
+        sni: None,
+        san_allow_list: Vec::new(),
     };
     let proxy = Arc::new(proxy_template);
     let mut ctx = ctx();
@@ -226,6 +228,8 @@ fn explicit_tls_override_applies_to_clone() {
         client_key_path: Some("/certs/canary.key".to_string()),
         server_ca_cert_path: Some("/certs/canary-ca.pem".to_string()),
         verify_server_cert: false,
+        sni: None,
+        san_allow_list: Vec::new(),
     });
 
     let result = ctx.apply_route_overrides(Arc::clone(&proxy));

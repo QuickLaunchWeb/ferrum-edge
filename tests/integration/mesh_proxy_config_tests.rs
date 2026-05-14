@@ -45,6 +45,8 @@ fn test_runtime() -> MeshRuntimeConfig {
         // Workload labels — must match the ProxyConfig selector below to
         // trigger workload-scoped resolution.
         workload_labels: HashMap::from([("app".to_string(), "api".to_string())]),
+        workload_svid_cert_path: None,
+        workload_svid_key_path: None,
         dns_enabled: false,
         dns_listen_addr: test_addr("127.0.0.1:15053"),
         dns_upstream_addr: test_addr("127.0.0.53:53"),

@@ -190,6 +190,13 @@ pub struct MeshRuntimeConfig {
     /// (`key1=val1,key2=val2`); empty when unset. The Kubernetes injector
     /// (Phase D) can populate this from pod labels via the downward API.
     pub workload_labels: std::collections::HashMap<String, String>,
+    /// Workload X.509-SVID certificate chain used for mesh-originated backend
+    /// mTLS when DestinationRule `ISTIO_MUTUAL` is projected onto an upstream.
+    /// Sourced from `FERRUM_GATEWAY_SVID_CERT_PATH`.
+    pub workload_svid_cert_path: Option<String>,
+    /// Workload X.509-SVID private key used with `workload_svid_cert_path`.
+    /// Sourced from `FERRUM_GATEWAY_SVID_KEY_PATH`.
+    pub workload_svid_key_path: Option<String>,
     /// Whether the transparent DNS proxy is enabled. Opt-in because it
     /// requires iptables/eBPF redirect to be useful.
     /// Sourced from `FERRUM_MESH_DNS_PROXY_ENABLED` (default false).
@@ -279,6 +286,8 @@ impl MeshRuntimeConfig {
         )?;
         let workload_spiffe_id = resolve_ferrum_var("FERRUM_MESH_WORKLOAD_SPIFFE_ID")
             .filter(|value| !value.trim().is_empty());
+        let workload_svid_cert_path = env_config.gateway_svid_cert_path.clone();
+        let workload_svid_key_path = env_config.gateway_svid_key_path.clone();
         let xds_node_cluster = resolve_ferrum_var("FERRUM_MESH_XDS_NODE_CLUSTER")
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| env_config.namespace.clone());
@@ -375,6 +384,8 @@ impl MeshRuntimeConfig {
             xds_connect_timeout_seconds,
             trust_domain_aliases,
             workload_labels,
+            workload_svid_cert_path,
+            workload_svid_key_path,
             dns_enabled,
             dns_listen_addr,
             dns_upstream_addr,
@@ -510,8 +521,9 @@ fn prepare_normalized_gateway_config_for_mesh(
     inject_mesh_global_plugins(&mut config, runtime, mesh_slice);
     materialize_east_west_gateway_proxies(&mut config, runtime, mesh_slice);
     materialize_egress_gateway_proxies(&mut config, runtime, mesh_slice);
-    apply_destination_rules(&mut config, mesh_slice);
+    apply_destination_rules(&mut config, runtime, mesh_slice);
     config.normalize_fields();
+    config.resolve_upstream_tls();
     Ok(config)
 }
 
@@ -796,6 +808,8 @@ fn build_east_west_service_proxies_and_upstreams(
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
             backend_tls_server_ca_cert_path: None,
+            backend_tls_sni: None,
+            backend_tls_san_allow_list: Vec::new(),
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -957,7 +971,11 @@ fn mesh_east_west_service_upstream_id(namespace: &str, name: &str) -> String {
 /// Multiple DRs targeting the same upstream are applied in a deterministic
 /// order — sorted by `(namespace, name)` — so the last-writer-wins outcome
 /// is reproducible across CP restarts and DP subscribers.
-fn apply_destination_rules(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
+fn apply_destination_rules(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
     let mut sorted_destination_rules: Vec<&MeshDestinationRule> =
         mesh_slice.destination_rules.iter().collect();
     sorted_destination_rules.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
@@ -990,7 +1008,7 @@ fn apply_destination_rules(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
             let upstream = &mut config.upstreams[idx];
 
             if let Some(ref policy) = dr.traffic_policy {
-                apply_traffic_policy_to_upstream(upstream, policy);
+                apply_traffic_policy_to_upstream(upstream, policy, runtime);
             }
 
             // Build a set of ports actually exposed by this upstream's
@@ -1157,7 +1175,11 @@ fn destination_rule_host_matches(rule_host: &str, namespace: &str, candidate: &s
 /// posture continues to apply. When `policy.tls` is `Some(...)` the DR's
 /// TLS settings override the PeerAuthentication defaults via
 /// `apply_traffic_policy_tls_to_upstream`.
-fn apply_traffic_policy_to_upstream(upstream: &mut Upstream, policy: &MeshTrafficPolicy) {
+fn apply_traffic_policy_to_upstream(
+    upstream: &mut Upstream,
+    policy: &MeshTrafficPolicy,
+    runtime: &MeshRuntimeConfig,
+) {
     if let Some(lb) = &policy.load_balancer {
         if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
             upstream.algorithm = algorithm;
@@ -1197,7 +1219,7 @@ fn apply_traffic_policy_to_upstream(upstream: &mut Upstream, policy: &MeshTraffi
 
     // Backend TLS posture override from DestinationRule.trafficPolicy.tls.
     if let Some(ref tls) = policy.tls {
-        apply_traffic_policy_tls_to_upstream(upstream, tls);
+        apply_traffic_policy_tls_to_upstream(upstream, tls, runtime);
     }
 }
 
@@ -1215,20 +1237,19 @@ fn apply_traffic_policy_to_upstream(upstream: &mut Upstream, policy: &MeshTraffi
 ///   `ca_certificates`; clear any stale client cert/key.
 /// - `Mutual`: enable server-cert verification; populate CA, client cert,
 ///   and private key from the DR.
-/// - `IstioMutual`: enable server-cert verification; do NOT touch client
-///   cert/key — the workload's SPIFFE identity material (managed by the
-///   `mtls_auth` / `spiffe_identity` plugins) supplies it. This is a
-///   best-effort mapping; a clean Upstream-level SPIFFE identity binding
-///   is tracked as future work.
+/// - `IstioMutual`: enable server-cert verification; project the workload's
+///   X.509-SVID cert/key paths from the mesh runtime onto the upstream.
 ///
 /// `insecure_skip_verify=true` always wins: it forces
 /// `backend_tls_verify_server_cert=false` regardless of mode.
 ///
-/// SNI (`tls.sni`) and `subject_alt_names` are parsed and persisted on the
-/// slice but NOT yet applied here — Ferrum's `Upstream` schema does not
-/// yet expose a per-upstream SNI override or SAN allow-list. A warn log
-/// fires when either is set so operators can plan.
-fn apply_traffic_policy_tls_to_upstream(upstream: &mut Upstream, tls: &MeshTrafficPolicyTls) {
+/// SNI (`tls.sni`) and `subject_alt_names` project onto upstream fields here;
+/// later backend dispatch/verifier work consumes the resolved cache.
+fn apply_traffic_policy_tls_to_upstream(
+    upstream: &mut Upstream,
+    tls: &MeshTrafficPolicyTls,
+    runtime: &MeshRuntimeConfig,
+) {
     match tls.mode {
         MtlsMode::Disable => {
             upstream.backend_tls_client_cert_path = None;
@@ -1250,17 +1271,8 @@ fn apply_traffic_policy_tls_to_upstream(upstream: &mut Upstream, tls: &MeshTraff
             upstream.backend_tls_server_ca_cert_path = tls.ca_certificates.clone();
         }
         MtlsMode::IstioMutual => {
-            // TODO(mesh-tls): wire the workload's SPIFFE identity material
-            // onto the upstream's client cert/key when the mesh runtime
-            // exposes the SVID file paths. For now: leave existing
-            // upstream client material untouched (mtls_auth /
-            // spiffe_identity plugins already consume the workload SVID
-            // from FERRUM_MESH_* paths) and only enforce server-cert
-            // verification semantics below.
-            debug!(
-                upstream = %upstream.id,
-                "DestinationRule trafficPolicy.tls.mode=ISTIO_MUTUAL applied best-effort: server-cert verification enforced; client material continues to come from the workload SPIFFE plugins (no direct backend_tls_client_cert/key projection yet)"
-            );
+            upstream.backend_tls_client_cert_path = runtime.workload_svid_cert_path.clone();
+            upstream.backend_tls_client_key_path = runtime.workload_svid_key_path.clone();
         }
         // PeerAuthentication-side modes are rejected at translate time;
         // an in-memory slice that still carries one is a programming
@@ -1287,19 +1299,8 @@ fn apply_traffic_policy_tls_to_upstream(upstream: &mut Upstream, tls: &MeshTraff
         upstream.backend_tls_verify_server_cert = true;
     }
 
-    if tls.sni.is_some() {
-        warn!(
-            upstream = %upstream.id,
-            "DestinationRule trafficPolicy.tls.sni is parsed but not yet projected onto a per-Upstream SNI override; Ferrum derives SNI from the request host today"
-        );
-    }
-    if !tls.subject_alt_names.is_empty() {
-        warn!(
-            upstream = %upstream.id,
-            sans = tls.subject_alt_names.len(),
-            "DestinationRule trafficPolicy.tls.subjectAltNames are parsed but Ferrum does not yet expose a per-Upstream SAN allow-list; backend cert verification uses the global trust chain"
-        );
-    }
+    upstream.backend_tls_sni = tls.sni.clone();
+    upstream.backend_tls_san_allow_list = tls.subject_alt_names.clone();
 }
 
 /// Convert a mesh LB config to a Ferrum `LoadBalancerAlgorithm`.
@@ -1473,6 +1474,8 @@ fn build_egress_proxies_and_upstreams(
                     backend_tls_client_key_path: None,
                     backend_tls_verify_server_cert: true,
                     backend_tls_server_ca_cert_path: None,
+                    backend_tls_sni: None,
+                    backend_tls_san_allow_list: Vec::new(),
                     api_spec_id: None,
                     created_at: now,
                     updated_at: now,
@@ -3337,6 +3340,8 @@ mod tests {
             xds_connect_timeout_seconds: 10,
             trust_domain_aliases: Vec::new(),
             workload_labels: HashMap::new(),
+            workload_svid_cert_path: None,
+            workload_svid_key_path: None,
             dns_enabled: false,
             dns_listen_addr: DEFAULT_DNS_LISTEN_ADDR.parse().unwrap(),
             dns_upstream_addr: DEFAULT_DNS_UPSTREAM_ADDR.parse().unwrap(),
@@ -3429,6 +3434,8 @@ mod tests {
             xds_connect_timeout_seconds: 10,
             trust_domain_aliases: Vec::new(),
             workload_labels: HashMap::new(),
+            workload_svid_cert_path: None,
+            workload_svid_key_path: None,
             dns_enabled: false,
             dns_listen_addr: DEFAULT_DNS_LISTEN_ADDR.parse().unwrap(),
             dns_upstream_addr: DEFAULT_DNS_UPSTREAM_ADDR.parse().unwrap(),
@@ -3483,6 +3490,8 @@ mod tests {
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
             backend_tls_server_ca_cert_path: None,
+            backend_tls_sni: None,
+            backend_tls_san_allow_list: Vec::new(),
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -3529,7 +3538,7 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        apply_destination_rules(&mut config, &slice);
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice);
 
         assert!(
             config
@@ -3587,7 +3596,7 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        apply_destination_rules(&mut config, &slice);
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice);
 
         assert_eq!(config.upstreams[0].algorithm, LoadBalancerAlgorithm::Random);
         assert_eq!(config.proxies[0].backend_connect_timeout_ms, 9999);
@@ -3611,7 +3620,7 @@ mod tests {
             connect_timeout_ms: Some(1000),
             ..MeshTrafficPolicy::default()
         };
-        apply_traffic_policy_to_upstream(&mut upstream, &policy);
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
 
         // backend_tls_* untouched.
         assert_eq!(
@@ -3645,7 +3654,7 @@ mod tests {
             }),
             ..MeshTrafficPolicy::default()
         };
-        apply_traffic_policy_to_upstream(&mut upstream, &policy);
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
 
         assert_eq!(
             upstream.backend_tls_server_ca_cert_path.as_deref(),
@@ -3654,6 +3663,10 @@ mod tests {
         assert!(upstream.backend_tls_client_cert_path.is_none());
         assert!(upstream.backend_tls_client_key_path.is_none());
         assert!(upstream.backend_tls_verify_server_cert);
+        assert_eq!(
+            upstream.backend_tls_sni.as_deref(),
+            Some("reviews.example.com")
+        );
     }
 
     #[test]
@@ -3671,7 +3684,7 @@ mod tests {
             }),
             ..MeshTrafficPolicy::default()
         };
-        apply_traffic_policy_to_upstream(&mut upstream, &policy);
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
 
         assert_eq!(
             upstream.backend_tls_client_cert_path.as_deref(),
@@ -3707,7 +3720,7 @@ mod tests {
             }),
             ..MeshTrafficPolicy::default()
         };
-        apply_traffic_policy_to_upstream(&mut upstream, &policy);
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
 
         assert!(upstream.backend_tls_client_cert_path.is_none());
         assert!(upstream.backend_tls_client_key_path.is_none());
@@ -3736,7 +3749,7 @@ mod tests {
             }),
             ..MeshTrafficPolicy::default()
         };
-        apply_traffic_policy_to_upstream(&mut upstream, &policy);
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
 
         assert!(!upstream.backend_tls_verify_server_cert);
     }
@@ -3755,22 +3768,23 @@ mod tests {
             }),
             ..MeshTrafficPolicy::default()
         };
-        apply_traffic_policy_to_upstream(&mut upstream, &policy);
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
 
         assert!(!upstream.backend_tls_verify_server_cert);
     }
 
     #[test]
-    fn dr_tls_istio_mutual_enables_verify_without_touching_client_material() {
-        // ISTIO_MUTUAL relies on the workload's SPIFFE identity material
-        // (managed by mtls_auth / spiffe_identity plugins) for client
-        // cert/key — DR.tls must NOT clobber any client material that
-        // may already be on the upstream.
+    fn dr_tls_istio_mutual_projects_runtime_svid_material() {
         let mut upstream =
             destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
-        upstream.backend_tls_client_cert_path = Some("/spiffe/client.pem".to_string());
-        upstream.backend_tls_client_key_path = Some("/spiffe/client.key".to_string());
+        upstream.backend_tls_client_cert_path = Some("/stale/client.pem".to_string());
+        upstream.backend_tls_client_key_path = Some("/stale/client.key".to_string());
         upstream.backend_tls_verify_server_cert = false;
+        let runtime = MeshRuntimeConfig {
+            workload_svid_cert_path: Some("/var/run/secrets/ferrum/svid.pem".to_string()),
+            workload_svid_key_path: Some("/var/run/secrets/ferrum/svid.key".to_string()),
+            ..test_mesh_runtime_config()
+        };
 
         let policy = MeshTrafficPolicy {
             tls: Some(MeshTrafficPolicyTls {
@@ -3779,17 +3793,48 @@ mod tests {
             }),
             ..MeshTrafficPolicy::default()
         };
-        apply_traffic_policy_to_upstream(&mut upstream, &policy);
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime);
 
         assert!(upstream.backend_tls_verify_server_cert);
-        // Existing client cert / key not touched.
         assert_eq!(
             upstream.backend_tls_client_cert_path.as_deref(),
-            Some("/spiffe/client.pem")
+            Some("/var/run/secrets/ferrum/svid.pem")
         );
         assert_eq!(
             upstream.backend_tls_client_key_path.as_deref(),
-            Some("/spiffe/client.key")
+            Some("/var/run/secrets/ferrum/svid.key")
+        );
+    }
+
+    #[test]
+    fn dr_tls_sni_and_sans_project_onto_upstream() {
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        let policy = MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::Simple,
+                sni: Some("reviews.mesh.internal".to_string()),
+                subject_alt_names: vec![
+                    "reviews.mesh.internal".to_string(),
+                    "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
+                ],
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        };
+
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
+
+        assert_eq!(
+            upstream.backend_tls_sni.as_deref(),
+            Some("reviews.mesh.internal")
+        );
+        assert_eq!(
+            upstream.backend_tls_san_allow_list,
+            vec![
+                "reviews.mesh.internal".to_string(),
+                "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
+            ]
         );
     }
 
@@ -3827,7 +3872,7 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        apply_destination_rules(&mut config, &slice);
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice);
 
         let upstream = &config.upstreams[0];
         assert_eq!(
@@ -3880,7 +3925,7 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        apply_destination_rules(&mut config, &slice);
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice);
 
         // Top-level policy still applies to the upstream itself.
         assert_eq!(
@@ -3963,7 +4008,7 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        apply_destination_rules(&mut config, &slice);
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice);
 
         let p8080 = config.upstreams[0]
             .port_overrides

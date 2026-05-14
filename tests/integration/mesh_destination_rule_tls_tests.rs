@@ -8,13 +8,21 @@
 //! to drive the default when unset. These tests pin both halves of that
 //! contract.
 
-use ferrum_edge::config::types::{GatewayConfig, MAX_TARGET_WEIGHT, Upstream, UpstreamTarget};
+use ferrum_edge::capture::CaptureMode;
+use ferrum_edge::config::types::{
+    GatewayConfig, MAX_TARGET_WEIGHT, Proxy, Upstream, UpstreamTarget,
+};
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
-use ferrum_edge::modes::mesh::config::{MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode};
+use ferrum_edge::modes::mesh::config::{
+    MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, OutboundTrafficPolicy,
+};
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+use ferrum_edge::modes::mesh::{
+    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
+};
 
 fn slice_request_for_default_ns() -> MeshSliceRequest {
     MeshSliceRequest {
@@ -41,6 +49,45 @@ fn k8s_options() -> K8sTranslationOptions {
         "default".to_string(),
         TrustDomain::new("cluster.local").expect("trust domain"),
     )
+}
+
+fn test_addr(raw: &str) -> std::net::SocketAddr {
+    raw.parse().expect("valid socket address")
+}
+
+fn test_runtime() -> MeshRuntimeConfig {
+    MeshRuntimeConfig {
+        node_id: "node-a".to_string(),
+        namespace: "default".to_string(),
+        cp_urls: vec!["http://127.0.0.1:1".to_string()],
+        config_protocol: MeshConfigProtocol::Native,
+        topology: MeshTopology::Sidecar,
+        inbound_listen_addr: test_addr("127.0.0.1:15006"),
+        outbound_listen_addr: test_addr("127.0.0.1:15001"),
+        hbone_listen_addr: test_addr("127.0.0.1:15008"),
+        east_west_listen_port: 15443,
+        egress_listen_addr: test_addr("0.0.0.0:15090"),
+        workload_spiffe_id: None,
+        workload_svid_cert_path: None,
+        workload_svid_key_path: None,
+        xds_node_cluster: "default".to_string(),
+        xds_stream_channel_capacity: 32,
+        xds_primary_retry_secs: 300,
+        xds_connect_timeout_seconds: 10,
+        trust_domain_aliases: Vec::new(),
+        workload_labels: Default::default(),
+        dns_enabled: false,
+        dns_listen_addr: test_addr("127.0.0.1:15053"),
+        dns_upstream_addr: test_addr("127.0.0.53:53"),
+        dns_ttl_seconds: 60,
+        dns_max_concurrent_queries: 1024,
+        dns_response_cache_max_entries: 4096,
+        cluster_domain: "cluster.local".to_string(),
+        capture_mode: CaptureMode::Explicit,
+        outbound_traffic_policy: OutboundTrafficPolicy::AllowAny,
+        outbound_registry_reject_status: 502,
+        sidecar_enforced: false,
+    }
 }
 
 /// Build a matching `Upstream` so the DR's host resolves to it during cold-path
@@ -70,11 +117,24 @@ fn build_matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
         port_overrides: HashMap::new(),
         api_spec_id: None,
         created_at: now,
         updated_at: now,
     }
+}
+
+fn build_proxy(id: &str, upstream_id: &str) -> Proxy {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "hosts": [format!("{id}.example.com")],
+        "backend_host": "",
+        "backend_port": 0,
+        "upstream_id": upstream_id
+    }))
+    .expect("test proxy")
 }
 
 /// Translate a single Istio DestinationRule object and return the resulting
@@ -176,6 +236,124 @@ fn dr_tls_istio_mutual_translates_without_explicit_cert_material() {
     assert!(tls.client_certificate.is_none());
     assert!(tls.private_key.is_none());
     assert!(tls.ca_certificates.is_none());
+}
+
+#[test]
+fn dr_istio_mutual_projects_workload_svid_onto_upstream() {
+    let (mut config, tls) = translate_dr(serde_json::json!({
+        "host": "reviews.default.svc.cluster.local",
+        "trafficPolicy": {
+            "tls": {"mode": "ISTIO_MUTUAL"}
+        }
+    }));
+    assert_eq!(
+        tls.expect("DR.tls should be parsed").mode,
+        MtlsMode::IstioMutual
+    );
+
+    config.upstreams.push(build_matching_upstream(
+        "reviews-u",
+        "reviews.default.svc.cluster.local",
+    ));
+    config.proxies.push(build_proxy("reviews-p", "reviews-u"));
+    let runtime = MeshRuntimeConfig {
+        workload_svid_cert_path: Some("/var/run/secrets/ferrum/svid.pem".to_string()),
+        workload_svid_key_path: Some("/var/run/secrets/ferrum/svid.key".to_string()),
+        ..test_runtime()
+    };
+
+    let prepared =
+        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == "reviews-u")
+        .expect("matching upstream");
+    assert_eq!(
+        upstream.backend_tls_client_cert_path.as_deref(),
+        Some("/var/run/secrets/ferrum/svid.pem")
+    );
+    assert_eq!(
+        upstream.backend_tls_client_key_path.as_deref(),
+        Some("/var/run/secrets/ferrum/svid.key")
+    );
+    assert!(upstream.backend_tls_verify_server_cert);
+
+    let proxy = prepared
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == "reviews-p")
+        .expect("proxy");
+    assert_eq!(
+        proxy.resolved_tls.client_cert_path.as_deref(),
+        Some("/var/run/secrets/ferrum/svid.pem")
+    );
+    assert_eq!(
+        proxy.resolved_tls.client_key_path.as_deref(),
+        Some("/var/run/secrets/ferrum/svid.key")
+    );
+}
+
+#[test]
+fn dr_tls_sni_and_sans_project_onto_upstream() {
+    let (mut config, tls) = translate_dr(serde_json::json!({
+        "host": "reviews.default.svc.cluster.local",
+        "trafficPolicy": {
+            "tls": {
+                "mode": "SIMPLE",
+                "sni": "reviews.mesh.internal",
+                "subjectAltNames": [
+                    "reviews.mesh.internal",
+                    "spiffe://cluster.local/ns/default/sa/reviews"
+                ]
+            }
+        }
+    }));
+    let tls = tls.expect("DR.tls should be parsed");
+    assert_eq!(tls.sni.as_deref(), Some("reviews.mesh.internal"));
+    assert_eq!(tls.subject_alt_names.len(), 2);
+
+    config.upstreams.push(build_matching_upstream(
+        "reviews-u",
+        "reviews.default.svc.cluster.local",
+    ));
+    config.proxies.push(build_proxy("reviews-p", "reviews-u"));
+
+    let prepared = prepare_gateway_config_for_mesh(config, &test_runtime())
+        .expect("mesh preparation succeeds");
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == "reviews-u")
+        .expect("matching upstream");
+    assert_eq!(
+        upstream.backend_tls_sni.as_deref(),
+        Some("reviews.mesh.internal")
+    );
+    assert_eq!(
+        upstream.backend_tls_san_allow_list,
+        vec![
+            "reviews.mesh.internal".to_string(),
+            "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
+        ]
+    );
+
+    let proxy = prepared
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == "reviews-p")
+        .expect("proxy");
+    assert_eq!(
+        proxy.resolved_tls.sni.as_deref(),
+        Some("reviews.mesh.internal")
+    );
+    assert_eq!(
+        proxy.resolved_tls.san_allow_list,
+        vec![
+            "reviews.mesh.internal".to_string(),
+            "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
+        ]
+    );
 }
 
 #[test]

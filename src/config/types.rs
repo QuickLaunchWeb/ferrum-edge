@@ -486,6 +486,10 @@ pub struct BackendTlsConfig {
     pub server_ca_cert_path: Option<String>,
     #[serde(default = "default_true")]
     pub verify_server_cert: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub san_allow_list: Vec<String>,
 }
 
 impl BackendTlsConfig {
@@ -496,6 +500,8 @@ impl BackendTlsConfig {
             client_key_path: None,
             server_ca_cert_path: None,
             verify_server_cert: true,
+            sni: None,
+            san_allow_list: Vec::new(),
         }
     }
 
@@ -506,6 +512,8 @@ impl BackendTlsConfig {
             client_key_path: upstream.backend_tls_client_key_path.clone(),
             server_ca_cert_path: upstream.backend_tls_server_ca_cert_path.clone(),
             verify_server_cert: upstream.backend_tls_verify_server_cert,
+            sni: upstream.backend_tls_sni.clone(),
+            san_allow_list: upstream.backend_tls_san_allow_list.clone(),
         }
     }
 
@@ -516,6 +524,8 @@ impl BackendTlsConfig {
             client_key_path: proxy.backend_tls_client_key_path.clone(),
             server_ca_cert_path: proxy.backend_tls_server_ca_cert_path.clone(),
             verify_server_cert: proxy.backend_tls_verify_server_cert,
+            sni: None,
+            san_allow_list: Vec::new(),
         }
     }
 }
@@ -567,6 +577,14 @@ pub struct Upstream {
     /// Path to a PEM CA bundle for verifying backend server certificates.
     #[serde(default)]
     pub backend_tls_server_ca_cert_path: Option<String>,
+    /// Optional backend TLS SNI override, populated by mesh DestinationRule
+    /// `trafficPolicy.tls.sni`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_tls_sni: Option<String>,
+    /// Optional backend certificate SAN allow-list, populated by mesh
+    /// DestinationRule `trafficPolicy.tls.subjectAltNames`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backend_tls_san_allow_list: Vec<String>,
     /// ID of the `ApiSpec` that created this upstream via the spec-import admin API.
     /// `None` for hand-crafted upstreams. Used to scope cascading DELETE when a
     /// spec is removed. NOT loaded by the gateway runtime — admin-only metadata.
@@ -1684,6 +1702,8 @@ impl GatewayConfig {
                         client_key_path: u.backend_tls_client_key_path.clone(),
                         server_ca_cert_path: u.backend_tls_server_ca_cert_path.clone(),
                         verify_server_cert: u.backend_tls_verify_server_cert,
+                        sni: u.backend_tls_sni.clone(),
+                        san_allow_list: u.backend_tls_san_allow_list.clone(),
                     },
                 )
             })
@@ -1701,6 +1721,8 @@ impl GatewayConfig {
                     client_key_path: proxy.backend_tls_client_key_path.clone(),
                     server_ca_cert_path: proxy.backend_tls_server_ca_cert_path.clone(),
                     verify_server_cert: proxy.backend_tls_verify_server_cert,
+                    sni: None,
+                    san_allow_list: Vec::new(),
                 }
             };
         }
