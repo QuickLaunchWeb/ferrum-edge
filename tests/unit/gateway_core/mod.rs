@@ -13,6 +13,7 @@ mod grpc_proxy_tests;
 mod gso_batch_buf_tests;
 mod health_check_tests;
 mod http3_config_tests;
+mod http3_websocket_tests;
 mod lazy_timeout_tests;
 mod load_balancer_tests;
 mod metrics_tests;

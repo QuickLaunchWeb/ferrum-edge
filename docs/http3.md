@@ -11,7 +11,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [Buffering policy](#buffering-policy)
 - [Coalescing and frame cadence](#coalescing-and-frame-cadence)
 - [gRPC trailers over H3](#grpc-trailers-over-h3)
-- [WebSocket over HTTP/3 — not supported](#websocket-over-http3--not-supported)
+- [WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)](#websocket-over-http3-rfc-9220-extended-connect)
 - [QUIC connection migration](#quic-connection-migration)
 - [Header size limits](#header-size-limits)
 - [Flow-control window tuning](#flow-control-window-tuning)
@@ -39,14 +39,15 @@ Every H3 request goes through the same plugin lifecycle as H1/H2 (route match �
 | `HttpsPool` + target classified as `h3` | `Plain` | **Native H3 pool** (quinn/h3 → QUIC upstream) |
 | `HttpsPool` + target not classified as `h3` | `Plain` | Cross-protocol bridge → reqwest / direct H2 as needed |
 | `HttpsPool` | `Grpc` | Cross-protocol bridge → `GrpcConnectionPool` (HTTP/2 + trailers) |
-| `HttpsPool` | `WebSocket` | 501 — see [WebSocket over HTTP/3](#websocket-over-http3--not-supported) |
-| `HttpPool` | any | Cross-protocol bridge → plaintext reqwest (`Plain`) / gRPC h2c (`Grpc`) / 501 (`WebSocket`) |
+| `HttpsPool` | `WebSocket` | [H3 WebSocket bridge](#websocket-over-http3-rfc-9220-extended-connect) → H1.1 / H2 backend WebSocket |
+| `HttpPool` | `Plain` / `Grpc` | Cross-protocol bridge → plaintext reqwest (`Plain`) / gRPC h2c (`Grpc`) |
+| `HttpPool` | `WebSocket` | [H3 WebSocket bridge](#websocket-over-http3-rfc-9220-extended-connect) (`ws://` backend over plaintext H1.1) |
 | `TcpRaw` / `TcpTls` / `UdpRaw` / `UdpDtls` | — | Never routed here (stream proxies route on `listen_port`) |
 
 The `HttpFlavor` is computed once per request by `detect_http_flavor()` in `src/proxy/backend_dispatch.rs` — the same helper H1/H2 uses — so classification is identical on both fronts:
 
 - `application/grpc*` content-type → `Grpc`
-- HTTP/1.1 `Upgrade: websocket` or H2 Extended CONNECT `:protocol=websocket` → `WebSocket`
+- HTTP/1.1 `Upgrade: websocket`, H2 Extended CONNECT `:protocol=websocket` (RFC 8441), or H3 Extended CONNECT `:protocol=websocket` (RFC 9220) → `WebSocket`
 - Everything else → `Plain`
 
 ## Native H3 fast path
@@ -170,22 +171,178 @@ The coalesce loop is identical across the two paths — source of bytes differs 
 
 Either way, `grpc-status` reaches the H3 client intact.
 
-## WebSocket over HTTP/3 — not supported
+## WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)
 
-Requests that arrive on the H3 listener as RFC 9220 Extended CONNECT WebSocket handshakes (`CONNECT` with `:protocol=websocket`) receive an explicit **501 Not Implemented** with a JSON body advising the operator to send the upgrade over HTTP/1.1 or HTTP/2.
+The H3 listener accepts WebSocket Extended CONNECT requests per
+[RFC 9220](https://www.rfc-editor.org/rfc/rfc9220) (the HTTP/3 mirror of
+RFC 8441's HTTP/2 mechanism). A client sends `CONNECT` with
+`:protocol = "websocket"` on a fresh bidirectional QUIC stream; the
+gateway authenticates, authorizes, runs the `before_proxy` plugin chain,
+opens a backend WebSocket connection, replies `:status = 200`, and then
+bridges WebSocket frames between the QUIC stream and the backend
+WebSocket for the lifetime of the session.
 
-### Why
+### Wire-level handshake
 
-RFC 9220 does define "WebSockets over HTTP/3 via Extended CONNECT" — the client sends a `CONNECT` request with `:protocol=websocket` on a single QUIC stream, the server responds 2xx, and the bidirectional stream becomes a WebSocket data channel. But:
+```
+H3 client                              Gateway                      Backend
+──────────                             ───────                      ───────
+:method = CONNECT
+:scheme = https            ─────►
+:authority = example.com               authenticate + authorize
+:path = /chat                          plugin pipeline
+:protocol = websocket                  → connect_websocket_backend()  HTTP/1.1
+sec-websocket-protocol = chat                            Upgrade: websocket  ─────►
+                                                         Sec-WebSocket-Key: ...
+                                                                              ◄──── 101
+                           ◄────       :status = 200
+DATA = ws frame bytes      ────►       ws framer / plugin hooks  ────► ws frame
+DATA = ws frame bytes      ◄────       ws framer                 ◄──── ws frame
+...
+```
 
-1. **Client adoption is effectively zero.** Chrome, Firefox, and Safari all send WebSocket upgrades over HTTP/1.1 or HTTP/2 today, not H3. The browser `WebSocket` constructor and `fetch()`-level upgrade helpers all downgrade the connection for the WebSocket handshake. Node's `ws` library and the common browser-side shims do not issue H3 Extended CONNECT for WS.
-2. **Backend adoption is also effectively zero.** Nginx, HAProxy, Envoy, Traefik, and Caddy do not accept WebSocket over H3 Extended CONNECT today. So even if the H3 frontend accepted it, there would be no supported backend to bridge to.
-3. **Bridging would be non-trivial.** The h3 crate exposes Extended CONNECT detection, but the backend side would need a separate pool (H3 → H2 Extended CONNECT, or H3 → HTTP/1.1 Upgrade) plus frame-level translation between the QUIC bidirectional stream and WebSocket framing. That is a dedicated subsystem for near-zero real-world traffic.
-4. **Operators already have a working path.** The 501 response advises "send the upgrade over HTTP/1.1 or HTTP/2" — which is what every WebSocket client does by default anyway.
+### Backend strategy
 
-### Future
+The gateway does NOT speak WebSocket over H3 to the backend. Common
+WebSocket backends (Node `ws`, browsers acting as servers, Nginx,
+HAProxy, Envoy when configured as a forward proxy) still bootstrap
+WebSockets over HTTP/1.1 Upgrade or HTTP/2 Extended CONNECT — RFC 9220
+adoption on the server side is still emerging. The H3 frontend therefore
+always bridges to a HTTP/1.1 Upgrade backend connection via the same
+`connect_websocket_backend()` helper the H1/H2 frontends use. From the
+backend's perspective, a WebSocket arriving via H3 is indistinguishable
+from one arriving via any other frontend.
 
-If real-world H3-WS traffic ever materializes (tracked in browser bug trackers but no ETA), adding a backend bridge is a straightforward follow-up. Until then, the 501 is an explicit operator signal rather than a silent failure.
+### Frame relay and plugins
+
+The split QUIC stream halves are bridged to a tokio `DuplexStream` by a
+pair of pump tasks (see `src/http3/websocket.rs`). The duplex half on
+the WebSocket-framer side is wrapped in
+`tokio_tungstenite::WebSocketStream` and handed to the generic
+`run_websocket_proxy` function — the same function the H1/H2 path uses.
+Per established H3 WebSocket session the bridge reserves a 64 KiB
+duplex buffer plus a 16 KiB send-pump scratch buffer; protocol frame
+size remains governed separately by
+`FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`.
+This means every WebSocket plugin works on H3 sessions unchanged:
+
+- `on_ws_frame` (frame-level inspection / transformation; `ws_rate_limit`, `ws_message_size_limiting`, `ws_frame_logging`)
+- `on_ws_disconnect` (end-of-session bookkeeping with frame counts and direction attribution)
+- Connection-admission via `FERRUM_WEBSOCKET_MAX_CONNECTIONS` (shared with H1/H2)
+- All authentication, authorization, and `before_proxy` plugins (run BEFORE the bridge accepts the upgrade)
+- Sticky-session cookies on the 200 response (same as H1/H2)
+- All logging plugins (the `TransactionSummary` emitted at upgrade time carries `http_method = "CONNECT"`, mirroring the H2 Extended CONNECT path)
+
+### Frame masking — RFC 9220 §5 vs RFC 6455
+
+RFC 6455 / RFC 8441 require client-to-server WebSocket frames to be
+masked. RFC 9220 §5 REVERSES this: WebSocket frames over HTTP/3 MUST
+be unmasked because QUIC already provides packet-level authentication.
+The gateway's H3 path:
+
+- **Emits unmasked frames to the client** — `tokio_tungstenite`'s
+  `Role::Server` doesn't mask outgoing frames, so this is correct
+  on default settings.
+- **Accepts unmasked frames from the client** —
+  `accept_unmasked_frames = true` is set on the H3 path's
+  WebSocketConfig (it's `false` on the H1/H2 path).
+- **Strict close-on-masked-frame (RFC 9220 §5 SHOULD)** is not
+  implemented today: tungstenite has no "reject masked client frames"
+  mode, only an "accept" mode that is permissive in both directions.
+  Practically, a compliant H3 client sends unmasked frames and works;
+  a non-compliant H3 client sending masked frames is still bridged
+  correctly (data is delivered intact). Strict rejection remains tracked
+  by the `TODO(h3-ws-rfc9220-masked-close)` marker in
+  `src/http3/websocket.rs`.
+
+### Tunnel mode
+
+`FERRUM_WEBSOCKET_TUNNEL_MODE` (raw bidirectional TCP copy) does NOT
+apply to H3 sessions. The H3 frontend has no raw TCP underneath QUIC to
+splice; bytes always pass through the pump tasks. Operators who set
+tunnel mode for H1/H2 throughput automatically get frame-parsing
+semantics on H3 — frame-level plugins continue to work regardless.
+The generic `run_websocket_proxy` carries a `debug_assert!` enforcing
+this invariant (`websocket_tunnel_mode` and `accept_unmasked_client_frames`
+are mutually exclusive) so a future refactor that wires a non-TCP
+transport into the raw-copy fast path fails loudly in debug builds.
+
+### Circuit breaker, load balancer, graceful drain
+
+H3 WebSocket sessions participate in the same backend-isolation +
+session-accounting infrastructure the H1/H2 path uses:
+
+- **Circuit breaker** — backend connect failure records
+  `record_failure(502, is_pre_wire, is_half_open_probe)` against
+  the resolved target, where `is_pre_wire` follows the unified
+  `retry::request_reached_wire` boundary (a backend that received the
+  upgrade and rejected it post-wire does NOT charge the breaker's
+  connect-error counter). Successful 200 upgrades record
+  `record_success(is_half_open_probe)` so a half-open probe that
+  bootstraps a WebSocket counts as a recovery sample.
+- **Load balancer** — `LoadBalancerConnectionGuard` increments the
+  final selected target's connection count on construction (just before
+  the 200 is sent) and decrements on drop, so a long-lived H3 WebSocket
+  session correctly weights least-connection load balancing.
+- **Graceful drain** — a fresh `ConnectionGuard` is captured for the
+  session lifetime; `SIGTERM` drain waits for in-flight H3 WebSocket
+  sessions before exit, honoring `FERRUM_SHUTDOWN_DRAIN_SECONDS`.
+- **Retry / target rotation** — pre-wire backend setup failures honor
+  `retry_on_connect_failure` and rotate upstream targets using the same
+  load-balancer snapshot as H1/H2 WebSockets. Backend-side upgrade
+  rejections are post-wire and are not replayed.
+
+### Pump task teardown
+
+The recv pump (QUIC → WS framer) is `abort()`ed after
+`run_websocket_proxy` returns, before joining. The send pump (WS framer
+→ QUIC) is awaited normally — it exits on EOF when the framer drops
+its sink half, and the await ensures `finish()` runs so the peer sees
+a clean FIN. Aborting the recv pump prevents a non-cooperative client
+(one that exchanges close frames without closing the QUIC stream) from
+pinning the recv task for the QUIC idle-timeout window.
+
+### 0-RTT (TLS 1.3 early data)
+
+RFC 9220 Extended CONNECT can in principle be carried in QUIC 0-RTT
+early data, but `FERRUM_TLS_EARLY_DATA_METHODS` does NOT list `CONNECT`
+by default — operators who want WebSocket upgrades via 0-RTT must opt
+in explicitly. On accepted 0-RTT requests the gateway forwards
+`Early-Data: 1` to the backend (same shim as plain H3 / cross-protocol
+bridge) so origins can apply their own replay-safety policy.
+
+### Disabling H3 WebSocket
+
+Set `FERRUM_HTTP3_WEBSOCKET_ENABLED=false` to disable the bridge. With
+this off the H3 server does NOT advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL`,
+so compliant H3 clients won't attempt Extended CONNECT. As defense in
+depth, the bridge itself also returns 501 if a client somehow sends
+Extended CONNECT anyway. Plain H3, gRPC over H3, and the native H3
+backend pool keep working — only the WebSocket bridge is gated.
+
+### Testing
+
+Unit tests in `tests/unit/gateway_core/http3_websocket_tests.rs` cover:
+
+- `detect_http_flavor` classifies H3 Extended CONNECT with
+  `:protocol=websocket` as `HttpFlavor::WebSocket`.
+- Other `:protocol` values (`webtransport`, `connect-udp`) are NOT
+  classified as WebSocket.
+- The vendored h3 patch (`docs/upstream-h3-patches/002-extended-connect-websocket-protocol/`)
+  exposes `h3::ext::Protocol::WEB_SOCKET` so the wire-level pseudo-header
+  decoder accepts `:protocol=websocket` instead of rejecting the entire
+  HEADERS frame as malformed.
+- Env-config parsing of `FERRUM_HTTP3_WEBSOCKET_ENABLED` (defaults to
+  true, parses `true` / `false` correctly).
+
+End-to-end functional coverage lives in
+`tests/functional/functional_websocket_test.rs`. The tree ships a small
+h3-quinn-based RFC 9220 client because common off-the-shelf clients
+(curl 8.x, h2load, tungstenite) still focus on WebSocket over HTTP/1.1
+/ HTTP/2. The functional shard covers H3 text/binary frame relay,
+masked-frame permissiveness, subprotocol forwarding and the no-subprotocol
+case, backend retry target rotation, failed backend upgrade responses,
+and per-IP request-slot release after the 200 CONNECT response.
 
 ## QUIC connection migration
 
@@ -224,4 +381,5 @@ The default QUIC flow-control windows are moderate by design: 8 MiB per stream, 
 | `FERRUM_HTTP3_COALESCE_MAX_BYTES` | `32,768` | Response coalesce buffer capacity. Same H3-specific bounds — see [docs/response_body_streaming.md](response_body_streaming.md#response-body-coalescing) for the cross-protocol coalescing architecture. |
 | `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | `200` | Response coalesce time-based flush interval. H3-specific (the H1/H2-via-reqwest path uses opportunistic Pending-flush instead, so it has no flush-interval knob). |
 | `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` | `32` | Cross-protocol bridge mpsc capacity (range: 1–1024) |
+| `FERRUM_HTTP3_WEBSOCKET_ENABLED` | `true` | Advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL` and accept RFC 9220 Extended CONNECT WebSocket. See [WebSocket over HTTP/3](#websocket-over-http3-rfc-9220-extended-connect). |
 | `FERRUM_HTTP3_INITIAL_MTU` | `1500` | Initial QUIC path MTU (quinn clamps 1200–65527) |

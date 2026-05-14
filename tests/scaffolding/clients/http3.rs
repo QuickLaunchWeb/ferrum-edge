@@ -9,11 +9,12 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use http::{HeaderMap, Request, StatusCode};
 use quinn::{ClientConfig, Endpoint};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
+use tokio::task::JoinHandle;
 
 /// An H3 client that skips TLS verification. Symmetric with Phase 1's
 /// [`Http1Client::insecure`].
@@ -156,6 +157,78 @@ impl Http3Client {
             body_bytes: Bytes::from(body_bytes),
         })
     }
+
+    /// Open an RFC 9220 WebSocket-over-HTTP/3 Extended CONNECT stream.
+    ///
+    /// The returned stream works with raw WebSocket frames in HTTP/3 DATA
+    /// frames. Test helpers below encode client frames unmasked by default,
+    /// matching RFC 9220 §5.
+    pub async fn websocket(
+        &self,
+        url: &str,
+        options: WebSocketOptions,
+    ) -> Result<Http3WebSocket, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed: http::Uri = url.parse()?;
+        let host = parsed.host().ok_or("missing host in url")?.to_string();
+        let port = parsed.port_u16().unwrap_or(443);
+        let addr = resolve_loopback(&host, port)?;
+
+        let server_name = parsed.host().unwrap_or("localhost").to_string();
+        let conn = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.endpoint.connect(addr, &server_name)?,
+        )
+        .await
+        .map_err(|_| "QUIC handshake timed out")??;
+        let h3_conn = h3_quinn::Connection::new(conn);
+        let (mut driver, mut send_request) = h3::client::new(h3_conn)
+            .await
+            .map_err(|e| format!("h3 new: {e}"))?;
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let mut req_builder = Request::builder()
+            .method(http::Method::CONNECT)
+            .version(http::Version::HTTP_3)
+            .uri(url)
+            .header("sec-websocket-version", "13")
+            .header("user-agent", "ferrum-test-h3-ws/1.0");
+        if !options.subprotocols.is_empty() {
+            req_builder =
+                req_builder.header("sec-websocket-protocol", options.subprotocols.join(", "));
+        }
+        for (name, value) in &options.headers {
+            req_builder = req_builder.header(name.as_str(), value.as_str());
+        }
+
+        let mut req = req_builder
+            .body(())
+            .map_err(|e| format!("build request: {e}"))?;
+        req.extensions_mut().insert(h3::ext::Protocol::WEB_SOCKET);
+
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(15), send_request.send_request(req))
+                .await
+                .map_err(|_| "send_request timed out")?
+                .map_err(|e| format!("send_request: {e}"))?;
+
+        let resp = tokio::time::timeout(Duration::from_secs(15), stream.recv_response())
+            .await
+            .map_err(|_| "recv_response timed out")?
+            .map_err(|e| format!("recv_response: {e}"))?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+
+        Ok(Http3WebSocket {
+            stream,
+            _send_request: send_request,
+            driver_task,
+            read_buf: Vec::new(),
+            status,
+            headers,
+        })
+    }
 }
 
 /// Resolve a host into a `SocketAddr`, pinning it to loopback for test use.
@@ -189,6 +262,255 @@ impl Http3Response {
     }
 }
 
+/// Options for [`Http3Client::websocket`].
+#[derive(Debug, Default, Clone)]
+pub struct WebSocketOptions {
+    pub subprotocols: Vec<String>,
+    pub headers: Vec<(String, String)>,
+}
+
+impl WebSocketOptions {
+    pub fn subprotocols<I, S>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.subprotocols = values.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// Minimal RFC 9220 WebSocket stream over HTTP/3 DATA frames.
+pub struct Http3WebSocket {
+    stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    driver_task: JoinHandle<()>,
+    read_buf: Vec<u8>,
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+}
+
+impl Http3WebSocket {
+    pub async fn send_text(
+        &mut self,
+        text: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send_frame(0x1, text.as_bytes(), false).await
+    }
+
+    pub async fn send_masked_text(
+        &mut self,
+        text: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send_frame(0x1, text.as_bytes(), true).await
+    }
+
+    pub async fn send_binary(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send_frame(0x2, bytes, false).await
+    }
+
+    pub async fn send_close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send_frame(0x8, &[], false).await?;
+        let _ = self.stream.finish().await;
+        Ok(())
+    }
+
+    pub async fn recv_text(&mut self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        match self.recv_frame().await? {
+            H3WebSocketFrame::Text(text) => Ok(text),
+            other => Err(format!("expected text frame, got {other:?}").into()),
+        }
+    }
+
+    /// Drain a non-101/non-200 response body from a WebSocket CONNECT attempt.
+    /// Failed H3 upgrades return regular DATA bytes, not WebSocket frames.
+    pub async fn recv_body_bytes(
+        &mut self,
+    ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+        let mut body = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(15), self.stream.recv_data()).await {
+                Ok(Ok(Some(mut chunk))) => {
+                    while chunk.has_remaining() {
+                        let take = chunk.chunk().to_vec();
+                        body.extend_from_slice(&take);
+                        chunk.advance(take.len());
+                    }
+                }
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => return Err(format!("websocket response body recv_data: {e}").into()),
+                Err(_) => return Err("websocket response body recv_data timed out".into()),
+            }
+        }
+        Ok(Bytes::from(body))
+    }
+
+    pub async fn recv_body_text(
+        &mut self,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let body = self.recv_body_bytes().await?;
+        Ok(String::from_utf8_lossy(&body).to_string())
+    }
+
+    pub async fn recv_frame(
+        &mut self,
+    ) -> Result<H3WebSocketFrame, Box<dyn std::error::Error + Send + Sync>> {
+        loop {
+            if let Some(frame) = try_parse_ws_frame(&mut self.read_buf)? {
+                return Ok(frame);
+            }
+            let mut chunk = tokio::time::timeout(Duration::from_secs(15), self.stream.recv_data())
+                .await
+                .map_err(|_| "websocket recv_data timed out")?
+                .map_err(|e| format!("websocket recv_data: {e}"))?
+                .ok_or("websocket stream ended before next frame")?;
+            while chunk.has_remaining() {
+                let bytes = chunk.copy_to_bytes(chunk.remaining());
+                self.read_buf.extend_from_slice(&bytes);
+            }
+        }
+    }
+
+    async fn send_frame(
+        &mut self,
+        opcode: u8,
+        payload: &[u8],
+        masked: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let frame = encode_ws_frame(opcode, payload, masked);
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            self.stream.send_data(Bytes::from(frame)),
+        )
+        .await
+        .map_err(|_| "websocket send_data timed out")?
+        .map_err(|e| format!("websocket send_data: {e}"))?;
+        Ok(())
+    }
+}
+
+impl Drop for Http3WebSocket {
+    fn drop(&mut self) {
+        self.driver_task.abort();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum H3WebSocketFrame {
+    Text(String),
+    Binary(Vec<u8>),
+    Close(Vec<u8>),
+    Ping(Vec<u8>),
+    Pong(Vec<u8>),
+    Other { opcode: u8, payload: Vec<u8> },
+}
+
+fn encode_ws_frame(opcode: u8, payload: &[u8], masked: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(14 + payload.len());
+    out.push(0x80 | (opcode & 0x0f));
+    let mask_bit = if masked { 0x80 } else { 0 };
+    match payload.len() {
+        len @ 0..=125 => out.push(mask_bit | len as u8),
+        len @ 126..=65_535 => {
+            out.push(mask_bit | 126);
+            out.extend_from_slice(&(len as u16).to_be_bytes());
+        }
+        len => {
+            out.push(mask_bit | 127);
+            out.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+    }
+    if masked {
+        let mask = [0x12, 0x34, 0x56, 0x78];
+        out.extend_from_slice(&mask);
+        out.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+    } else {
+        out.extend_from_slice(payload);
+    }
+    out
+}
+
+fn try_parse_ws_frame(
+    buf: &mut Vec<u8>,
+) -> Result<Option<H3WebSocketFrame>, Box<dyn std::error::Error + Send + Sync>> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+    let opcode = buf[0] & 0x0f;
+    let masked = (buf[1] & 0x80) != 0;
+    let len7 = buf[1] & 0x7f;
+    let mut offset = 2usize;
+    let payload_len = match len7 {
+        0..=125 => len7 as usize,
+        126 => {
+            if buf.len() < offset + 2 {
+                return Ok(None);
+            }
+            let len = u16::from_be_bytes([buf[offset], buf[offset + 1]]) as usize;
+            offset += 2;
+            len
+        }
+        127 => {
+            if buf.len() < offset + 8 {
+                return Ok(None);
+            }
+            let len = u64::from_be_bytes([
+                buf[offset],
+                buf[offset + 1],
+                buf[offset + 2],
+                buf[offset + 3],
+                buf[offset + 4],
+                buf[offset + 5],
+                buf[offset + 6],
+                buf[offset + 7],
+            ]);
+            offset += 8;
+            usize::try_from(len).map_err(|_| "websocket frame too large for test client")?
+        }
+        _ => unreachable!(),
+    };
+
+    let mask = if masked {
+        if buf.len() < offset + 4 {
+            return Ok(None);
+        }
+        let mask = [
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+        ];
+        offset += 4;
+        Some(mask)
+    } else {
+        None
+    };
+
+    if buf.len() < offset + payload_len {
+        return Ok(None);
+    }
+    let mut payload = buf[offset..offset + payload_len].to_vec();
+    if let Some(mask) = mask {
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b ^= mask[i % 4];
+        }
+    }
+    buf.drain(..offset + payload_len);
+
+    let frame = match opcode {
+        0x1 => H3WebSocketFrame::Text(String::from_utf8(payload)?),
+        0x2 => H3WebSocketFrame::Binary(payload),
+        0x8 => H3WebSocketFrame::Close(payload),
+        0x9 => H3WebSocketFrame::Ping(payload),
+        0xA => H3WebSocketFrame::Pong(payload),
+        _ => H3WebSocketFrame::Other { opcode, payload },
+    };
+    Ok(Some(frame))
+}
+
 /// Per-request overrides for `Http3Client::get_with_options`.
 #[derive(Debug, Default, Clone)]
 pub struct GetOptions {
@@ -208,8 +530,6 @@ pub enum HostHeader {
     /// Send an explicit Host header with a caller-supplied value.
     Explicit(String),
 }
-
-use bytes::Buf;
 
 #[derive(Debug)]
 struct DangerousAcceptAnyServer;
@@ -266,5 +586,21 @@ mod tests {
     #[tokio::test]
     async fn insecure_client_builds() {
         Http3Client::insecure().expect("client");
+    }
+
+    #[test]
+    fn websocket_frame_encoder_uses_unmasked_h3_shape_by_default() {
+        let frame = encode_ws_frame(0x1, b"hi", false);
+        assert_eq!(frame, vec![0x81, 0x02, b'h', b'i']);
+    }
+
+    #[test]
+    fn websocket_frame_parser_unmasks_client_frames_for_gap_test() {
+        let mut frame = encode_ws_frame(0x1, b"masked", true);
+        let parsed = try_parse_ws_frame(&mut frame)
+            .expect("parse")
+            .expect("frame");
+        assert_eq!(parsed, H3WebSocketFrame::Text("masked".to_string()));
+        assert!(frame.is_empty());
     }
 }

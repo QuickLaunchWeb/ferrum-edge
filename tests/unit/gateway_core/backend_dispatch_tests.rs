@@ -17,6 +17,19 @@ fn detect_http_flavor_classifies_http3_extended_connect_websocket_as_websocket()
 }
 
 #[test]
+fn detect_http_flavor_classifies_native_h3_protocol_extension_as_websocket() {
+    let mut req = Request::builder()
+        .method("CONNECT")
+        .uri("https://example.com/socket")
+        .version(hyper::Version::HTTP_3)
+        .body(())
+        .unwrap();
+    req.extensions_mut().insert(h3::ext::Protocol::WEB_SOCKET);
+
+    assert_eq!(detect_http_flavor(&req), HttpFlavor::WebSocket);
+}
+
+#[test]
 fn detect_http_flavor_keeps_non_websocket_http3_connect_plain() {
     let mut req = Request::builder()
         .method("CONNECT")
@@ -26,6 +39,19 @@ fn detect_http_flavor_keeps_non_websocket_http3_connect_plain() {
         .unwrap();
     req.extensions_mut()
         .insert(hyper::ext::Protocol::from_static("connect-udp"));
+
+    assert_eq!(detect_http_flavor(&req), HttpFlavor::Plain);
+}
+
+#[test]
+fn detect_http_flavor_keeps_native_h3_non_websocket_connect_plain() {
+    let mut req = Request::builder()
+        .method("CONNECT")
+        .uri("https://example.com/socket")
+        .version(hyper::Version::HTTP_3)
+        .body(())
+        .unwrap();
+    req.extensions_mut().insert(h3::ext::Protocol::CONNECT_UDP);
 
     assert_eq!(detect_http_flavor(&req), HttpFlavor::Plain);
 }

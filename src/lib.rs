@@ -160,7 +160,7 @@ pub mod _test_support {
     > {
         let env_config = crate::config::EnvConfig::default();
         let crls: crate::tls::CrlList = Arc::new(Vec::new());
-        crate::proxy::connect_websocket_backend(
+        let handshake = crate::proxy::connect_websocket_backend(
             backend_url,
             proxy,
             &env_config,
@@ -170,7 +170,54 @@ pub mod _test_support {
             65_536,
             4_096,
         )
-        .await
+        .await?;
+        Ok(handshake.stream)
+    }
+
+    /// Variant of `connect_websocket_backend_for_test` that returns the
+    /// negotiated `Sec-WebSocket-Protocol` value alongside the stream so
+    /// tests can assert that the backend's chosen subprotocol survives the
+    /// gateway-side handshake.
+    pub async fn connect_websocket_backend_with_subprotocol_for_test(
+        backend_url: &str,
+        proxy: &crate::config::types::Proxy,
+        client_subprotocols: &[&str],
+    ) -> Result<
+        (
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Option<String>,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let env_config = crate::config::EnvConfig::default();
+        let crls: crate::tls::CrlList = Arc::new(Vec::new());
+        let client_headers: Vec<(String, String)> = if client_subprotocols.is_empty() {
+            Vec::new()
+        } else {
+            vec![(
+                "sec-websocket-protocol".to_string(),
+                client_subprotocols.join(", "),
+            )]
+        };
+        let handshake = crate::proxy::connect_websocket_backend(
+            backend_url,
+            proxy,
+            &env_config,
+            &client_headers,
+            None,
+            &crls,
+            65_536,
+            4_096,
+        )
+        .await?;
+        let proto = handshake
+            .negotiated_subprotocol
+            .as_ref()
+            .and_then(|hv| hv.to_str().ok())
+            .map(|s| s.to_string());
+        Ok((handshake.stream, proto))
     }
 
     /// Invoke the internal `bidirectional_splice` (Linux zero-copy relay) for
