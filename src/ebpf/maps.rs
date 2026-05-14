@@ -17,7 +17,7 @@ use aya::maps::lpm_trie::Key as LpmKey;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::maps::{HashMap as BpfHashMap, LpmTrie, MapData};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use ferrum_ebpf_common::PodInfo as BpfPodInfo;
+use ferrum_ebpf_common::{BpfCaptureConfig, FERRUM_CAPTURE_CONFIG_KEY, PodInfo as BpfPodInfo};
 use ferrum_ebpf_common::{CidrKey4, CidrKey6};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -32,6 +32,7 @@ pub struct BpfMaps {
     cidr_include4: LpmTrie<MapData, CidrKey4, u8>,
     cidr_include6: LpmTrie<MapData, CidrKey6, u8>,
     port_exclude: BpfHashMap<MapData, u16, u8>,
+    capture_config: BpfHashMap<MapData, u32, BpfCaptureConfig>,
 }
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -86,6 +87,13 @@ impl BpfMaps {
         )
         .map_err(|e| format!("FERRUM_PORT_EXCLUDE type mismatch: {e}"))?;
 
+        let capture_config = BpfHashMap::try_from(
+            bpf.map("FERRUM_CAPTURE_CONFIG")
+                .ok_or("FERRUM_CAPTURE_CONFIG map not found")?
+                .clone(),
+        )
+        .map_err(|e| format!("FERRUM_CAPTURE_CONFIG type mismatch: {e}"))?;
+
         Ok(Self {
             pod_ips,
             bypass_uids,
@@ -94,6 +102,7 @@ impl BpfMaps {
             cidr_include4,
             cidr_include6,
             port_exclude,
+            capture_config,
         })
     }
 
@@ -155,6 +164,12 @@ impl BpfMaps {
         let mut map = self.port_exclude.clone();
         map.insert(port, 1u8, 0)
             .map_err(|e| format!("Failed to insert exclude port {port}: {e}"))
+    }
+
+    pub fn update_capture_config(&self, config: &BpfCaptureConfig) -> Result<(), String> {
+        let mut map = self.capture_config.clone();
+        map.insert(FERRUM_CAPTURE_CONFIG_KEY, *config, 0)
+            .map_err(|e| format!("Failed to update capture config: {e}"))
     }
 }
 

@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use super::mesh::prometheus_helpers::{self, MeshRequestKey};
 use super::{Direction, Plugin, StreamTransactionSummary, TransactionSummary};
+use crate::ebpf::NodeAgentMetrics;
 use crate::retry::ErrorClass;
 
 /// Global metrics registry (singleton per process).
@@ -258,6 +259,8 @@ pub struct MetricsRegistry {
     /// Incremented when the background CONNECT relay observes a copy failure
     /// after the client already received `200 OK`.
     pub hbone_relay_failure_counter: DashMap<HboneRelayFailureKey, TimestampedCounter>,
+    /// Node-agent metrics registered by `FERRUM_MODE=node_agent`.
+    node_agent_metrics: ArcSwap<Option<Arc<NodeAgentMetrics>>>,
     /// Cached render output with generation timestamp
     render_cache: ArcSwap<Option<(Instant, String)>>,
     /// Configurable render cache TTL in seconds
@@ -296,6 +299,7 @@ impl MetricsRegistry {
             stream_disconnect_counter: DashMap::new(),
             mesh_dns_upstream_id_exhaustions: AtomicU64::new(0),
             hbone_relay_failure_counter: DashMap::new(),
+            node_agent_metrics: ArcSwap::from_pointee(None),
             render_cache: ArcSwap::from_pointee(None),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
             stale_entry_ttl_nanos: AtomicU64::new(DEFAULT_STALE_TTL_NANOS),
@@ -389,6 +393,11 @@ impl MetricsRegistry {
             .increment(self.epoch);
 
         self.maybe_invalidate_cache();
+    }
+
+    pub fn set_node_agent_metrics(&self, metrics: Arc<NodeAgentMetrics>) {
+        self.node_agent_metrics.store(Arc::new(Some(metrics)));
+        self.render_cache.store(Arc::new(None));
     }
 
     pub fn record(&self, summary: &TransactionSummary) {
@@ -607,7 +616,12 @@ impl MetricsRegistry {
             + self.mesh_request_duration_buckets.len() * 1800
             + self.stream_connection_counter.len() * 200
             + self.stream_duration_buckets.len() * 800
-            + self.hbone_relay_failure_counter.len() * 240;
+            + self.hbone_relay_failure_counter.len() * 240
+            + if self.node_agent_metrics.load().is_some() {
+                512
+            } else {
+                0
+            };
         let mut output = String::with_capacity(estimated_cap);
 
         // Read namespace label fragment once for the render pass.
@@ -830,7 +844,50 @@ impl MetricsRegistry {
             }
         }
 
+        let node_agent_metrics = self.node_agent_metrics.load_full();
+        if let Some(metrics) = node_agent_metrics.as_ref() {
+            let snapshot = metrics.snapshot();
+            output.push_str(
+                "# HELP ferrum_node_agent_pods_enrolled_total Pods enrolled for node-agent capture.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_pods_enrolled_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_node_agent_pods_enrolled_total",
+                snapshot.pods_enrolled,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_node_agent_pods_unenrolled_total Pods unenrolled from node-agent capture.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_pods_unenrolled_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_node_agent_pods_unenrolled_total",
+                snapshot.pods_unenrolled,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_node_agent_attach_errors_total Node-agent BPF attachment or map update errors.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_attach_errors_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_node_agent_attach_errors_total",
+                snapshot.attach_errors,
+                &ns_label,
+            );
+        }
+
         output
+    }
+}
+
+fn render_process_counter(output: &mut String, metric_name: &str, value: u64, ns_label: &str) {
+    if ns_label.is_empty() {
+        output.push_str(&format!("{metric_name} {value}\n"));
+    } else {
+        output.push_str(&format!("{metric_name}{{{}}} {value}\n", &ns_label[1..]));
     }
 }
 

@@ -9,7 +9,8 @@
 //! responsibility.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dashmap::DashMap;
 use futures_util::StreamExt;
@@ -18,6 +19,8 @@ use kube::api::Api;
 use kube::runtime::watcher::{self as kube_watcher, Event};
 use tracing::{debug, error, info, warn};
 
+use crate::admin::jwt_auth::create_jwt_manager_from_env;
+use crate::admin::{self, AdminState};
 use crate::capture::{CaptureConfig, IptablesPlan};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
@@ -25,7 +28,10 @@ use crate::ebpf::cgroup;
 use crate::ebpf::kernel_probe::{self, KernelProbeResult};
 use crate::ebpf::pod_watcher::{self, EnrollmentDecision};
 use crate::ebpf::veth;
-use crate::ebpf::{EbpfBackend, FallbackMode, PodAttachmentState, PodInfo};
+use crate::ebpf::{
+    CaptureContract, DEFAULT_NODE_AGENT_SOCKET_PATH, EbpfBackend, FallbackMode, NodeAgentMetrics,
+    PodAttachmentState, PodInfo,
+};
 
 const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const DEFAULT_BPF_FS_PATH: &str = "/sys/fs/bpf";
@@ -40,10 +46,11 @@ pub struct NodeAgentConfig {
     pub bpf_fs_path: String,
     pub fallback_mode: FallbackMode,
     pub excluded_namespaces: HashSet<String>,
+    pub capture_contract: CaptureContract,
 }
 
 impl NodeAgentConfig {
-    pub fn from_env_config(_env_config: &EnvConfig) -> Result<Self, String> {
+    pub fn from_env_config(env_config: &EnvConfig) -> Result<Self, String> {
         let node_name = resolve_ferrum_var("FERRUM_NODE_AGENT_NODE_NAME").ok_or(
             "FERRUM_NODE_AGENT_NODE_NAME is required in node_agent mode \
              (set via Kubernetes downward API: spec.nodeName)"
@@ -73,6 +80,12 @@ impl NodeAgentConfig {
                 })
                 .unwrap_or_default();
         let excluded_namespaces = pod_watcher::build_excluded_namespaces(&extra_excluded);
+        let capture_contract = CaptureContract::new(
+            env_config.node_agent_proxy_mode,
+            capture_config.outbound_port,
+            env_config.node_agent_hbone_redirect_port,
+            DEFAULT_NODE_AGENT_SOCKET_PATH,
+        )?;
 
         Ok(Self {
             node_name,
@@ -81,6 +94,7 @@ impl NodeAgentConfig {
             bpf_fs_path,
             fallback_mode,
             excluded_namespaces,
+            capture_contract,
         })
     }
 }
@@ -90,10 +104,16 @@ pub async fn run(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<(), anyhow::Error> {
     let config = NodeAgentConfig::from_env_config(&env_config).map_err(anyhow::Error::msg)?;
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    crate::plugins::prometheus_metrics::global_registry().set_node_agent_metrics(metrics.clone());
+    let _admin_handles = start_node_agent_admin_listeners(&env_config, &shutdown_tx).await?;
 
     info!(
         node_name = %config.node_name,
         capture_mode = ?config.capture_config.mode,
+        proxy_mode = %config.capture_contract.proxy_mode,
+        outbound_capture_port = config.capture_contract.outbound_capture_port,
+        hbone_redirect_port = config.capture_contract.hbone_redirect_port,
         cgroup_root = %config.cgroup_root,
         bpf_fs_path = %config.bpf_fs_path,
         fallback_mode = ?config.fallback_mode,
@@ -113,7 +133,75 @@ pub async fn run(
         return handle_fallback(&config, &probe, &shutdown_tx).await;
     }
 
-    run_with_backend(create_backend(), &config, &shutdown_tx).await
+    run_with_backend(create_backend(), &config, metrics, &shutdown_tx).await
+}
+
+async fn start_node_agent_admin_listeners(
+    env_config: &EnvConfig,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+) -> Result<Vec<tokio::task::JoinHandle<()>>, anyhow::Error> {
+    let mut handles = Vec::new();
+    if env_config.admin_http_port == 0 {
+        return Ok(handles);
+    }
+
+    let admin_allowed_cidrs = Arc::new(
+        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
+            .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
+    );
+    let startup_ready = Arc::new(AtomicBool::new(true));
+    let jwt_manager = match create_jwt_manager_from_env() {
+        Ok(manager) => manager,
+        Err(err) => {
+            warn!(
+                "Admin JWT not configured for node_agent mode ({}), authenticated admin endpoints will reject operator tokens",
+                err
+            );
+            let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+            crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
+                secret: random_secret,
+                ..Default::default()
+            })
+        }
+    };
+
+    let admin_state = AdminState {
+        db: None,
+        jwt_manager,
+        proxy_state: None,
+        cached_config: None,
+        mode: "node_agent".to_string(),
+        read_only: true,
+        startup_ready: Some(startup_ready),
+        db_available: None,
+        admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+        admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
+        reserved_ports: env_config.reserved_gateway_ports(),
+        stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
+        admin_allowed_cidrs,
+        cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        dp_registry: None,
+        mesh_registry: None,
+        cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
+        admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
+    };
+
+    let admin_http_addr = env_config.admin_socket_addr(env_config.admin_http_port);
+    let shutdown = shutdown_tx.subscribe();
+    let handle = tokio::spawn(async move {
+        info!(
+            "Starting node_agent admin HTTP listener on {}",
+            admin_http_addr
+        );
+        if let Err(err) = admin::start_admin_listener(admin_http_addr, admin_state, shutdown).await
+        {
+            error!("Node agent admin HTTP listener error: {}", err);
+        }
+    });
+    handles.push(handle);
+
+    Ok(handles)
 }
 
 fn create_backend() -> Box<dyn EbpfBackend> {
@@ -128,32 +216,15 @@ fn create_backend() -> Box<dyn EbpfBackend> {
     }
 }
 
-/// Metrics tracked by the node agent.
-pub struct NodeAgentMetrics {
-    pub pods_enrolled: AtomicU64,
-    pub pods_unenrolled: AtomicU64,
-    pub attach_errors: AtomicU64,
-}
-
-impl Default for NodeAgentMetrics {
-    fn default() -> Self {
-        Self {
-            pods_enrolled: AtomicU64::new(0),
-            pods_unenrolled: AtomicU64::new(0),
-            attach_errors: AtomicU64::new(0),
-        }
-    }
-}
-
 async fn run_with_backend(
     mut backend: Box<dyn EbpfBackend>,
     config: &NodeAgentConfig,
+    metrics: Arc<NodeAgentMetrics>,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
 ) -> Result<(), anyhow::Error> {
     initialize_backend(backend.as_mut(), config)?;
 
     let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
-    let metrics = NodeAgentMetrics::default();
 
     let mut shutdown_rx = shutdown_tx.subscribe();
     let client = build_node_agent_kube_client().await?;
@@ -185,13 +256,13 @@ async fn run_with_backend(
                             backend.as_mut(),
                             &pod_states,
                             config,
-                            &metrics,
+                            metrics.as_ref(),
                             &pod,
                         );
                     }
                     Some(Ok(Event::Delete(pod))) => {
                         if let Some(uid) = pod_uid(&pod) {
-                            handle_pod_removed(backend.as_mut(), &pod_states, &metrics, &uid);
+                            handle_pod_removed(backend.as_mut(), &pod_states, metrics.as_ref(), &uid);
                         }
                     }
                     Some(Ok(Event::Init)) => {
@@ -202,7 +273,7 @@ async fn run_with_backend(
                             backend.as_mut(),
                             &pod_states,
                             config,
-                            &metrics,
+                            metrics.as_ref(),
                             &pod,
                         ) && let Some(seen) = &mut init_seen {
                             seen.insert(uid);
@@ -216,7 +287,7 @@ async fn run_with_backend(
                                 .map(|entry| entry.key().clone())
                                 .collect();
                             for uid in stale_uids {
-                                handle_pod_removed(backend.as_mut(), &pod_states, &metrics, &uid);
+                                handle_pod_removed(backend.as_mut(), &pod_states, metrics.as_ref(), &uid);
                             }
                         }
                     }
@@ -623,6 +694,9 @@ fn initialize_backend(
     config: &NodeAgentConfig,
 ) -> Result<(), anyhow::Error> {
     backend.load_programs().map_err(anyhow::Error::msg)?;
+    backend
+        .update_capture_config(&config.capture_contract.bpf_capture_config())
+        .map_err(anyhow::Error::msg)?;
 
     if let Some(uid) = config.capture_config.proxy_uid {
         backend.update_bypass_uid(uid).map_err(anyhow::Error::msg)?;
@@ -689,6 +763,7 @@ mod tests {
             bpf_fs_path: "/sys/fs/bpf".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
 
         let mut backend = MockEbpfBackend::default();
@@ -699,6 +774,10 @@ mod tests {
         assert_eq!(backend.cidr_includes, vec!["10.0.0.0/8"]);
         assert_eq!(backend.cidr_excludes, vec!["10.0.0.1/32"]);
         assert_eq!(backend.port_excludes, vec![15020]);
+        assert_eq!(
+            backend.capture_config,
+            Some(config.capture_contract.bpf_capture_config())
+        );
     }
 
     #[test]
@@ -760,6 +839,7 @@ mod tests {
             bpf_fs_path: "/sys/fs/bpf".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
@@ -808,6 +888,7 @@ mod tests {
             bpf_fs_path: "/nonexistent".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
@@ -845,6 +926,7 @@ mod tests {
             bpf_fs_path: "/nonexistent".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
@@ -875,6 +957,7 @@ mod tests {
             bpf_fs_path: "/nonexistent".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let event = PodEvent {
             pod_uid: "pod-uid-2",
@@ -916,6 +999,7 @@ mod tests {
             bpf_fs_path: "/nonexistent".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let event = PodEvent {
             pod_uid: "pod-uid-2",
@@ -947,6 +1031,7 @@ mod tests {
             bpf_fs_path: "/nonexistent".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: excluded,
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
@@ -1025,6 +1110,7 @@ mod tests {
             bpf_fs_path: "/nonexistent".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
 
@@ -1068,6 +1154,7 @@ mod tests {
             bpf_fs_path: "/nonexistent".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
 
@@ -1111,6 +1198,7 @@ mod tests {
             bpf_fs_path: "/sys/fs/bpf".to_string(),
             fallback_mode: FallbackMode::Fail,
             excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
