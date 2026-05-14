@@ -837,13 +837,8 @@ pub struct MeshSidecarEgress {
     ///   - `namespace/host` — `host` in the specified namespace
     ///   - `namespace/*`   — anything in the specified namespace
     pub hosts: Vec<String>,
-    /// Optional Istio Port object; when set, narrows by listener port too.
-    ///
-    /// TODO: this field is parsed from `spec.egress[].port.number` and round-
-    /// trips through the slice, but `sidecar_egress_includes_service` does
-    /// NOT yet consult it — slice narrowing today is host-only. Setting
-    /// `port` on a Sidecar egress entry does not constrain traffic; the
-    /// follow-up is tracked in `docs/mesh.md`.
+    /// Optional Istio Port object; when set, narrows MeshService and
+    /// ServiceEntry port lists during Sidecar egress slice projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
 }
