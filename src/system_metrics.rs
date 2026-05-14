@@ -249,12 +249,15 @@ fn ephemeral_snapshot(
         };
     };
 
-    let http_pool_entries = ps.connection_pool.pool_size() as u64;
+    let reqwest_backend_requests =
+        crate::runtime_metrics::global_ref().reqwest_active_backend_requests();
     let stream_backend_sessions = ps.stream_listener_manager.active_backend_session_estimate();
     // Only backend/outbound pools and stream backend sessions consume ephemeral
-    // client ports. Frontend active connections are listener-side sessions and
-    // would inflate this estimate during inbound-heavy traffic.
-    let active_outbound_estimate = http_pool_entries
+    // client ports. The reqwest pool entry count is deliberately excluded
+    // because it counts cached client objects, not sockets; active reqwest
+    // backend requests are tracked while a request is in flight or a streaming
+    // response body is still alive.
+    let active_outbound_estimate = reqwest_backend_requests
         .saturating_add(ps.grpc_pool.pool_size() as u64)
         .saturating_add(ps.http2_pool.pool_size() as u64)
         .saturating_add(ps.h3_pool.pool_size() as u64)

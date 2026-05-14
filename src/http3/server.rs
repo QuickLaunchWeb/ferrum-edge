@@ -3898,6 +3898,7 @@ fn record_request(state: &ProxyState, status: u16) {
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
     }
+    crate::runtime_metrics::global_ref().record_http_status(status);
 }
 
 #[cfg(test)]

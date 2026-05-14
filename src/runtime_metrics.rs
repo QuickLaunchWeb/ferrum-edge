@@ -157,6 +157,7 @@ pub struct RuntimeMetrics {
     pool_tracking_enabled: AtomicBool,
     cache_ttl_ms: AtomicU64,
     client_disconnects: CachePadded<AtomicU64>,
+    reqwest_active_backend_requests: CachePadded<AtomicU64>,
     status_current_1m: DashMap<u16, CachePadded<AtomicU64>>,
     status_current_5m: DashMap<u16, CachePadded<AtomicU64>>,
     requests_current_1m: CachePadded<AtomicU64>,
@@ -198,6 +199,7 @@ impl RuntimeMetrics {
             pool_tracking_enabled: AtomicBool::new(true),
             cache_ttl_ms: AtomicU64::new(1000),
             client_disconnects: CachePadded::new(AtomicU64::new(0)),
+            reqwest_active_backend_requests: CachePadded::new(AtomicU64::new(0)),
             status_current_1m: DashMap::new(),
             status_current_5m: DashMap::new(),
             requests_current_1m: CachePadded::new(AtomicU64::new(0)),
@@ -226,6 +228,16 @@ impl RuntimeMetrics {
 
     pub fn record_http_status(&self, status: u16) {
         self.increment_status_current(status);
+    }
+
+    pub fn reqwest_backend_request_guard(&'static self) -> ReqwestBackendRequestGuard {
+        self.reqwest_active_backend_requests
+            .fetch_add(1, Ordering::Relaxed);
+        ReqwestBackendRequestGuard { metrics: self }
+    }
+
+    pub fn reqwest_active_backend_requests(&self) -> u64 {
+        self.reqwest_active_backend_requests.load(Ordering::Relaxed)
     }
 
     pub fn record_transaction(&self, summary: &TransactionSummary) {
@@ -412,6 +424,18 @@ impl RuntimeMetrics {
 
         self.status_window_rotated_at
             .store(unix_seconds(), Ordering::Relaxed);
+    }
+}
+
+pub struct ReqwestBackendRequestGuard {
+    metrics: &'static RuntimeMetrics,
+}
+
+impl Drop for ReqwestBackendRequestGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .reqwest_active_backend_requests
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -948,6 +972,31 @@ mod tests {
             snapshot
                 .by_class
                 .get("read_write_timeout")
+                .map(|counts| (counts.http, counts.grpc)),
+            Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn request_protocol_metadata_classifies_error_as_grpc() {
+        let metrics = RuntimeMetrics::new();
+        let mut summary = TransactionSummary {
+            proxy_id: Some("grpc-a".to_string()),
+            response_status_code: 200,
+            error_class: Some(ErrorClass::RequestBodyTooLarge),
+            ..TransactionSummary::default()
+        };
+        summary
+            .metadata
+            .insert("request_protocol".to_string(), "grpc".to_string());
+
+        metrics.record_transaction(&summary);
+        let snapshot = build_errors_snapshot(&metrics);
+
+        assert_eq!(
+            snapshot
+                .by_class
+                .get("request_body_too_large")
                 .map(|counts| (counts.http, counts.grpc)),
             Some((0, 1))
         );

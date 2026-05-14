@@ -1512,7 +1512,7 @@ fn via_header_for_backend_response_body<'a>(
     response_body: &ResponseBody,
 ) -> &'a Option<String> {
     match response_body {
-        ResponseBody::Streaming(response) => {
+        ResponseBody::Streaming { response, .. } => {
             via_header_for_inbound_version(state, response.version())
         }
         ResponseBody::StreamingH2(_) => &state.via_header_http2,
@@ -8115,6 +8115,10 @@ async fn handle_proxy_request_inner(
                     let request_bytes = ctx
                         .request_bytes_observed
                         .load(std::sync::atomic::Ordering::Acquire);
+                    let mut metadata = ctx.metadata.clone();
+                    metadata
+                        .entry("request_protocol".to_string())
+                        .or_insert_with(|| "grpc".to_string());
                     let summary = TransactionSummary {
                         namespace: proxy.namespace.clone(),
                         timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -8139,7 +8143,7 @@ async fn handle_proxy_request_inner(
                         response_streamed: streamed,
                         error_class: final_error_class,
                         request_bytes,
-                        metadata: ctx.metadata.clone(),
+                        metadata,
                         ..TransactionSummary::default()
                     };
                     if body_exceeded {
@@ -8939,7 +8943,9 @@ async fn handle_proxy_request_inner(
     // so we mark total as unknown (-1.0) to avoid silently reporting TTFB as total.
     let is_streaming_response = matches!(
         &response_body,
-        ResponseBody::Streaming(_) | ResponseBody::StreamingH2(_) | ResponseBody::StreamingH3(_)
+        ResponseBody::Streaming { .. }
+            | ResponseBody::StreamingH2(_)
+            | ResponseBody::StreamingH3(_)
     );
     let backend_total_ms = if is_streaming_response {
         -1.0
@@ -9099,7 +9105,9 @@ async fn handle_proxy_request_inner(
     // (which tracks the original backend behavior for observability).
     let body_will_stream = matches!(
         &response_body,
-        ResponseBody::Streaming(_) | ResponseBody::StreamingH2(_) | ResponseBody::StreamingH3(_)
+        ResponseBody::Streaming { .. }
+            | ResponseBody::StreamingH2(_)
+            | ResponseBody::StreamingH3(_)
     );
     let needs_transaction_summary =
         !plugins.is_empty() || body_will_stream || backend_error_class.is_some();
@@ -9293,7 +9301,10 @@ async fn handle_proxy_request_inner(
     // supplementary log with accurate backend_total_ms.
     // Default (false): streaming responses pass through with zero tracking overhead.
     let body = match response_body {
-        ResponseBody::Streaming(resp) => {
+        ResponseBody::Streaming {
+            response,
+            reqwest_backend_guard,
+        } => {
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
@@ -9310,17 +9321,22 @@ async fn handle_proxy_request_inner(
             let base = if state.response_buffer_cutoff_bytes == 0
                 && state.max_response_body_size_bytes == 0
             {
-                crate::proxy::body::direct_streaming_body(resp, cl)
+                crate::proxy::body::direct_streaming_body(response, cl)
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 // No Content-Length — enforce size limit while streaming instead
                 // of buffering the entire body into memory.
                 crate::proxy::body::size_limited_streaming_body(
-                    resp,
+                    response,
                     state.max_response_body_size_bytes,
                     cl,
                 )
             } else {
-                crate::proxy::body::coalescing_body(resp, cl)
+                crate::proxy::body::coalescing_body(response, cl)
+            };
+            let base = if let Some(guard) = reqwest_backend_guard {
+                base.with_reqwest_backend_guard(guard)
+            } else {
+                base
             };
 
             if state.env_config.enable_streaming_latency_tracking {
@@ -9804,6 +9820,8 @@ pub(crate) async fn proxy_to_backend_retry(
         req_builder = req_builder.body(body.to_vec());
     }
 
+    let mut reqwest_backend_guard =
+        Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
     match req_builder.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
@@ -9887,7 +9905,10 @@ pub(crate) async fn proxy_to_backend_retry(
                     // size limit is configured, so no enforcement needed here.
                     retry::BackendResponse {
                         status_code: status,
-                        body: ResponseBody::Streaming(response),
+                        body: ResponseBody::Streaming {
+                            response,
+                            reqwest_backend_guard: reqwest_backend_guard.take(),
+                        },
                         headers: resp_headers,
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
@@ -10540,6 +10561,8 @@ async fn proxy_to_backend(
     }
 
     // Send
+    let mut reqwest_backend_guard =
+        Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
     let response = match req_builder.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
@@ -10610,7 +10633,10 @@ async fn proxy_to_backend(
                     return (
                         retry::BackendResponse {
                             status_code: status,
-                            body: ResponseBody::Streaming(response),
+                            body: ResponseBody::Streaming {
+                                response,
+                                reqwest_backend_guard: reqwest_backend_guard.take(),
+                            },
                             headers: resp_headers,
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
@@ -10627,7 +10653,10 @@ async fn proxy_to_backend(
                     return (
                         retry::BackendResponse {
                             status_code: status,
-                            body: ResponseBody::Streaming(response),
+                            body: ResponseBody::Streaming {
+                                response,
+                                reqwest_backend_guard: reqwest_backend_guard.take(),
+                            },
                             headers: resp_headers,
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
@@ -10699,7 +10728,10 @@ async fn proxy_to_backend(
                 } else {
                     retry::BackendResponse {
                         status_code: status,
-                        body: ResponseBody::Streaming(response),
+                        body: ResponseBody::Streaming {
+                            response,
+                            reqwest_backend_guard: reqwest_backend_guard.take(),
+                        },
                         headers: resp_headers,
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
