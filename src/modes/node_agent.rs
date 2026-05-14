@@ -539,15 +539,26 @@ where
             );
 
             let plan = IptablesPlan::for_config(&config.capture_config);
-            execute(plan.commands, "setup").await;
+            let include_v6_cleanup = !plan.v6_commands.is_empty();
+            execute(
+                vec![plan.script(config.capture_config.ip6tables_mode)],
+                "setup",
+            )
+            .await;
 
             info!("Iptables fallback rules applied, awaiting shutdown signal");
 
             wait_for_shutdown(shutdown_tx).await;
 
             info!("Shutdown signal received, cleaning up iptables rules");
-            let cleanup = IptablesPlan::cleanup_commands();
-            execute(cleanup, "cleanup").await;
+            execute(
+                vec![IptablesPlan::cleanup_script(
+                    include_v6_cleanup,
+                    config.capture_config.ip6tables_mode,
+                )],
+                "cleanup",
+            )
+            .await;
 
             Ok(())
         }
@@ -571,7 +582,8 @@ where
     }
 }
 
-/// Execute a list of shell commands (iptables setup or cleanup) sequentially.
+/// Execute a list of shell commands (iptables/ip6tables setup or cleanup)
+/// sequentially.
 ///
 /// Each command is run via `sh -c` so that shell operators (`||`, `2>/dev/null`)
 /// are interpreted correctly. Failures are logged but do not abort the remaining
@@ -668,7 +680,7 @@ fn cleanup_all_pods(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::CaptureMode;
+    use crate::capture::{CaptureMode, Ip6TablesMode};
     use crate::ebpf::MockEbpfBackend;
 
     #[test]
@@ -684,6 +696,7 @@ mod tests {
                 exclude_cidrs: vec!["10.0.0.1/32".to_string()],
                 exclude_ports: vec![15020],
                 exclude_inbound_ports: Vec::new(),
+                ip6tables_mode: Ip6TablesMode::Auto,
             },
             cgroup_root: "/sys/fs/cgroup".to_string(),
             bpf_fs_path: "/sys/fs/bpf".to_string(),
