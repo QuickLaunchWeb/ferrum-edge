@@ -4,6 +4,7 @@ use ferrum_edge::config::types::{
     PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget, hosts_overlap, validate_host_entry,
     validate_resource_id, wildcard_matches,
 };
+use ferrum_edge::modes::mesh::config::{MeshTracingConfig, TracingProvider};
 use std::collections::HashMap;
 
 /// Helper to create a minimal proxy with required fields.
@@ -2044,4 +2045,50 @@ fn test_validate_unique_listen_paths_allows_host_only_alongside_path_proxy_same_
         config.validate_unique_listen_paths().is_ok(),
         "host-only + path-carrying proxy on same host is allowed (different tiers)"
     );
+}
+
+#[test]
+fn mesh_tracing_config_deserializes_legacy_singular_provider_alias() {
+    let config: MeshTracingConfig = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "kind": "zipkin",
+            "config": {
+                "url": "http://zipkin:9411/api/v2/spans"
+            }
+        }
+    }))
+    .expect("legacy provider alias deserializes");
+
+    assert_eq!(config.providers.len(), 1);
+    match &config.providers[0] {
+        TracingProvider::Zipkin { url } => {
+            assert_eq!(url, "http://zipkin:9411/api/v2/spans");
+        }
+        other => panic!("expected Zipkin provider, got {other:?}"),
+    }
+}
+
+#[test]
+fn mesh_tracing_config_deserializes_provider_array() {
+    let config: MeshTracingConfig = serde_json::from_value(serde_json::json!({
+        "providers": [
+            {
+                "kind": "zipkin",
+                "config": {
+                    "url": "http://zipkin:9411/api/v2/spans"
+                }
+            },
+            {
+                "kind": "opentelemetry",
+                "config": {
+                    "endpoint": "http://otel:4318/v1/traces"
+                }
+            }
+        ],
+        "disableSpanReporting": true
+    }))
+    .expect("provider array deserializes");
+
+    assert!(config.disable_span_reporting);
+    assert_eq!(config.providers.len(), 2);
 }

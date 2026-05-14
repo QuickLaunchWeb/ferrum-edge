@@ -2,7 +2,7 @@
 
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, TransactionSummary,
-    otel_tracing::OtelTracing, utils::PluginHttpClient,
+    mesh::workload_metrics::WorkloadMetrics, otel_tracing::OtelTracing, utils::PluginHttpClient,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -58,6 +58,28 @@ fn make_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         mirror: false,
         metadata,
     }
+}
+
+fn make_trace_metadata() -> HashMap<String, String> {
+    HashMap::from([
+        (
+            "trace_id".to_string(),
+            "abcdef1234567890abcdef1234567890".to_string(),
+        ),
+        ("span_id".to_string(), "1234567890abcdef".to_string()),
+    ])
+}
+
+async fn received_json(server: &wiremock::MockServer) -> serde_json::Value {
+    for _ in 0..20 {
+        if let Some(requests) = server.received_requests().await
+            && let Some(request) = requests.first()
+        {
+            return request.body_json().expect("valid JSON body");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("mock server did not receive exporter request");
 }
 
 fn make_rich_summary(metadata: HashMap<String, String>) -> TransactionSummary {
@@ -383,6 +405,213 @@ async fn test_otel_tracing_with_otlp_endpoint() {
 
     // The mock server should have received at least one request
     // (verified by the expect(1..) on the mock)
+}
+
+#[tokio::test]
+async fn test_workload_metrics_opentelemetry_exporter_payload() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/traces"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "tracing_providers": [{
+            "kind": "opentelemetry",
+            "config": {
+                "endpoint": format!("{}/v1/traces", mock_server.uri())
+            }
+        }]
+    }))
+    .expect("workload metrics with otlp provider");
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    let payload = received_json(&mock_server).await;
+    assert_eq!(
+        payload["resourceSpans"][0]["resource"]["attributes"][0]["value"]["stringValue"],
+        "reviews"
+    );
+    assert_eq!(
+        payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
+        "GET /api/test"
+    );
+}
+
+#[tokio::test]
+async fn test_workload_metrics_zipkin_exporter_payload() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/api/v2/spans"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "tracing_providers": [{
+            "kind": "zipkin",
+            "config": {
+                "url": format!("{}/api/v2/spans", mock_server.uri())
+            }
+        }]
+    }))
+    .expect("workload metrics with zipkin provider");
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    let payload = received_json(&mock_server).await;
+    assert_eq!(payload[0]["localEndpoint"]["serviceName"], "reviews");
+    assert_eq!(payload[0]["name"], "GET /api/test");
+    assert_eq!(payload[0]["tags"]["http.status_code"], "200");
+}
+
+#[tokio::test]
+async fn test_workload_metrics_datadog_exporter_payload() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v0.3/traces"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews-default",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "tracing_providers": [{
+            "kind": "datadog",
+            "config": {
+                "agent_url": mock_server.uri(),
+                "service": "reviews"
+            }
+        }]
+    }))
+    .expect("workload metrics with datadog provider");
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    let payload = received_json(&mock_server).await;
+    assert_eq!(payload[0][0]["service"], "reviews");
+    assert_eq!(payload[0][0]["resource"], "GET /api/test");
+    assert_eq!(payload[0][0]["meta"]["http.method"], "GET");
+}
+
+#[tokio::test]
+async fn test_workload_metrics_lightstep_exporter_uses_otlp_bearer_payload() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/traces/otlp"))
+        .and(wiremock::matchers::header(
+            "Authorization",
+            "Bearer test-token",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "tracing_providers": [{
+            "kind": "lightstep",
+            "config": {
+                "collector_url": format!("{}/traces/otlp", mock_server.uri()),
+                "access_token": "test-token"
+            }
+        }]
+    }))
+    .expect("workload metrics with lightstep provider");
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    let payload = received_json(&mock_server).await;
+    assert_eq!(
+        payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
+        "GET /api/test"
+    );
+}
+
+#[tokio::test]
+async fn test_workload_metrics_multi_provider_fanout() {
+    let zipkin = wiremock::MockServer::start().await;
+    let otlp = wiremock::MockServer::start().await;
+    for (server, path) in [(&zipkin, "/api/v2/spans"), (&otlp, "/v1/traces")] {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(path))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "tracing_providers": [
+            {
+                "kind": "zipkin",
+                "config": {
+                    "url": format!("{}/api/v2/spans", zipkin.uri())
+                }
+            },
+            {
+                "kind": "opentelemetry",
+                "config": {
+                    "endpoint": format!("{}/v1/traces", otlp.uri())
+                }
+            }
+        ]
+    }))
+    .expect("workload metrics with multiple providers");
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    let zipkin_payload = received_json(&zipkin).await;
+    let otlp_payload = received_json(&otlp).await;
+    assert_eq!(zipkin_payload[0]["name"], "GET /api/test");
+    assert_eq!(
+        otlp_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
+        "GET /api/test"
+    );
+}
+
+#[tokio::test]
+async fn test_workload_metrics_disable_span_reporting_suppresses_export() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "span_reporting_disabled": true,
+        "batch_size": 1,
+        "tracing_providers": [{
+            "kind": "zipkin",
+            "config": {
+                "url": format!("{}/api/v2/spans", mock_server.uri())
+            }
+        }]
+    }))
+    .expect("disabled workload metrics tracing provider");
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(mock_server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

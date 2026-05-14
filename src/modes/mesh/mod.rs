@@ -1797,8 +1797,11 @@ fn inject_mesh_global_plugins(
             workload_metrics_config["custom_header_tags"] =
                 serde_json::json!(tracing.custom_header_tags);
         }
-        if let Some(provider) = &tracing.provider {
-            workload_metrics_config["tracing_provider"] = serde_json::json!(provider);
+        if tracing.disable_span_reporting {
+            workload_metrics_config["span_reporting_disabled"] = serde_json::json!(true);
+        }
+        if !tracing.providers.is_empty() && !tracing.disable_span_reporting {
+            workload_metrics_config["tracing_providers"] = serde_json::json!(tracing.providers);
         }
     }
     if let Some(metrics) = &merged_telemetry.metrics {
@@ -1905,15 +1908,21 @@ fn merge_tracing_config(
     next: &crate::modes::mesh::config::MeshTracingConfig,
 ) {
     let current = merged.get_or_insert_with(|| crate::modes::mesh::config::MeshTracingConfig {
+        mode: None,
         sampling_percentage: None,
+        disable_span_reporting: false,
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
-        provider: None,
+        providers: Vec::new(),
     });
 
+    if next.mode.is_some() {
+        current.mode = next.mode;
+    }
     if next.sampling_percentage.is_some() {
         current.sampling_percentage = next.sampling_percentage;
     }
+    current.disable_span_reporting = next.disable_span_reporting;
     if !next.custom_tags.is_empty() {
         current.custom_tags.clone_from(&next.custom_tags);
     }
@@ -1922,8 +1931,8 @@ fn merge_tracing_config(
             .custom_header_tags
             .clone_from(&next.custom_header_tags);
     }
-    if next.provider.is_some() {
-        current.provider.clone_from(&next.provider);
+    if !next.providers.is_empty() {
+        current.providers.clone_from(&next.providers);
     }
 }
 
@@ -4007,10 +4016,12 @@ mod tests {
                     scope: PolicyScope::MeshWide,
                     config: MeshTelemetryConfig {
                         tracing: Some(MeshTracingConfig {
+                            mode: None,
                             sampling_percentage: Some(100.0),
+                            disable_span_reporting: false,
                             custom_tags: HashMap::new(),
                             custom_header_tags: HashMap::new(),
-                            provider: None,
+                            providers: Vec::new(),
                         }),
                         ..MeshTelemetryConfig::default()
                     },
@@ -4026,13 +4037,15 @@ mod tests {
                     },
                     config: MeshTelemetryConfig {
                         tracing: Some(MeshTracingConfig {
+                            mode: None,
                             sampling_percentage: None,
+                            disable_span_reporting: false,
                             custom_tags: HashMap::from([("env".to_string(), "prod".to_string())]),
                             custom_header_tags: HashMap::from([(
                                 "tenant".to_string(),
                                 "x-tenant".to_string(),
                             )]),
-                            provider: None,
+                            providers: Vec::new(),
                         }),
                         ..MeshTelemetryConfig::default()
                     },
@@ -4400,12 +4413,14 @@ mod tests {
                 },
                 config: MeshTelemetryConfig {
                     tracing: Some(MeshTracingConfig {
+                        mode: None,
                         sampling_percentage: Some(10.0),
+                        disable_span_reporting: false,
                         custom_tags: HashMap::new(),
                         custom_header_tags: HashMap::new(),
-                        provider: Some(TracingProvider::Zipkin {
+                        providers: vec![TracingProvider::Zipkin {
                             url: "http://zipkin.istio-system:9411/api/v2/spans".to_string(),
-                        }),
+                        }],
                     }),
                     ..MeshTelemetryConfig::default()
                 },
@@ -4421,10 +4436,12 @@ mod tests {
             .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
             .expect("workload_metrics plugin injected");
 
-        let provider = workload_metrics
+        let providers = workload_metrics
             .config
-            .get("tracing_provider")
-            .expect("tracing_provider merged into workload_metrics");
+            .get("tracing_providers")
+            .and_then(serde_json::Value::as_array)
+            .expect("tracing_providers merged into workload_metrics");
+        let provider = providers.first().expect("zipkin provider present");
         assert_eq!(
             provider.get("kind").and_then(serde_json::Value::as_str),
             Some("zipkin")

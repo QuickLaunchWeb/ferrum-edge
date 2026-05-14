@@ -9,14 +9,20 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::Value;
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::TracingProvider;
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::plugins::mesh::authz::parse_trust_domain_aliases;
+use crate::plugins::otel_tracing::{
+    SpanData, TraceExporter, ensure_trace_metadata, trace_exporters_from_providers,
+    trace_is_sampled,
+};
+use crate::plugins::utils::PluginHttpClient;
 use crate::plugins::{
     ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
-    priority,
+    StreamTransactionSummary, TransactionSummary, priority,
 };
 
 const MESH_SOURCE_PRINCIPAL: &str = "mesh.source.principal";
@@ -24,7 +30,7 @@ const MESH_SOURCE_TRUST_DOMAIN: &str = "mesh.source.trust_domain";
 const MESH_SOURCE_NAMESPACE: &str = "mesh.source.namespace";
 const MESH_SOURCE_SERVICE_ACCOUNT: &str = "mesh.source.service_account";
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct WorkloadMetrics {
     node_id: Option<String>,
     topology: Option<String>,
@@ -40,18 +46,14 @@ pub struct WorkloadMetrics {
     custom_header_tags: HashMap<String, String>,
     metric_tag_overrides: Vec<MetricTagOverrideConfig>,
     disabled_metrics: Vec<String>,
-    /// Provider-specific tracing backend (Zipkin / Datadog / Lightstep /
-    /// OpenTelemetry) surfaced from Istio Telemetry CRD via the mesh slice.
-    ///
-    /// Today this is recorded for round-trip / introspection only — actual
-    /// span emission is wired by sink plugins on the logging side. The field
-    /// is additive and unused by the request hot path; serde keeps it None
-    /// for any config that omits it so existing configs are byte-identical.
-    /// `#[allow(dead_code)]` because the only readers today are introspection
-    /// tests via `tracing_provider()`; production usage will land alongside
-    /// the sink-plugin wiring follow-up.
+    /// Provider-specific tracing backends surfaced from Istio Telemetry CRD
+    /// via the mesh slice. Exporter queues are constructed once at plugin
+    /// creation; the request path only samples and enqueues completed spans.
     #[allow(dead_code)]
-    tracing_provider: Option<TracingProvider>,
+    tracing_providers: Vec<TracingProvider>,
+    trace_exporters: Vec<Arc<dyn TraceExporter>>,
+    span_reporting_disabled: bool,
+    service_name: String,
 }
 
 #[derive(Debug)]
@@ -62,7 +64,15 @@ enum MetricTagOverrideConfig {
 }
 
 impl WorkloadMetrics {
+    #[allow(dead_code)]
     pub fn new(config: &Value) -> Result<Self, String> {
+        Self::new_with_http_client(config, PluginHttpClient::default())
+    }
+
+    pub fn new_with_http_client(
+        config: &Value,
+        http_client: PluginHttpClient,
+    ) -> Result<Self, String> {
         let workload_spiffe_id = config
             .get("workload_spiffe_id")
             .and_then(Value::as_str)
@@ -111,13 +121,26 @@ impl WorkloadMetrics {
             })
             .unwrap_or_default();
         let (metric_tag_overrides, disabled_metrics) = parse_metric_config(config.get("metrics"))?;
-        let tracing_provider = match config.get("tracing_provider") {
-            None | Some(Value::Null) => None,
-            Some(value) => Some(
-                serde_json::from_value::<TracingProvider>(value.clone()).map_err(|e| {
-                    format!("workload_metrics: invalid tracing_provider config: {e}")
-                })?,
-            ),
+        let tracing_providers = parse_tracing_providers(config)?;
+        let span_reporting_disabled = config
+            .get("span_reporting_disabled")
+            .or_else(|| config.get("disable_span_reporting"))
+            .or_else(|| config.get("disableSpanReporting"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let service_name = string_config(config, "service_name").unwrap_or_else(|| {
+            config
+                .get("namespace")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(|namespace| format!("ferrum-edge-mesh-{namespace}"))
+                .unwrap_or_else(|| "ferrum-edge-mesh".to_string())
+        });
+        let trace_exporters = if span_reporting_disabled {
+            Vec::new()
+        } else {
+            trace_exporters_from_providers(&tracing_providers, &service_name, config, http_client)
+                .map_err(|e| format!("workload_metrics: invalid tracing exporter config: {e}"))?
         };
 
         Ok(Self {
@@ -132,22 +155,32 @@ impl WorkloadMetrics {
             custom_header_tags,
             metric_tag_overrides,
             disabled_metrics,
-            tracing_provider,
+            tracing_providers,
+            trace_exporters,
+            span_reporting_disabled,
+            service_name,
         })
     }
 
     /// Test/introspection helper — returns the currently configured tracing
-    /// backend (if any). Mesh runtime today records this only; sink plugins
-    /// emit spans via their own configuration. Kept `pub(crate)` so the field
-    /// can be asserted on without exposing internal struct shape.
+    /// backends. Kept `pub(crate)` so tests can assert the config without
+    /// exposing internal struct shape.
     #[cfg(test)]
-    pub(crate) fn tracing_provider(&self) -> Option<&TracingProvider> {
-        self.tracing_provider.as_ref()
+    pub(crate) fn tracing_providers(&self) -> &[TracingProvider] {
+        &self.tracing_providers
+    }
+
+    #[cfg(test)]
+    pub(crate) fn span_reporting_disabled(&self) -> bool {
+        self.span_reporting_disabled
     }
 
     fn annotate_http_context(&self, ctx: &mut RequestContext, headers: &HashMap<String, String>) {
         self.insert_common_metadata(&mut ctx.metadata);
         self.apply_telemetry_metadata(&mut ctx.metadata, headers);
+        if !self.trace_exporters.is_empty() && trace_is_sampled(&ctx.metadata) {
+            ensure_trace_metadata(&mut ctx.metadata, &ctx.headers);
+        }
         let hbone_identity = hbone_identity_from_headers(ctx, headers);
         // For authenticated ambient HBONE, the peer cert identifies the
         // ztunnel, while baggage identifies the originating workload. If the
@@ -328,6 +361,24 @@ impl WorkloadMetrics {
         metadata.insert("mesh.source.app".to_string(), app.to_string());
         metadata.insert("mesh.source.service".to_string(), service.to_string());
     }
+
+    fn export_span(&self, span: Option<SpanData>) {
+        if self.span_reporting_disabled || self.trace_exporters.is_empty() {
+            return;
+        }
+        let Some(span) = span else {
+            return;
+        };
+        for exporter in &self.trace_exporters {
+            if let Err(error) = exporter.try_export(span.clone()) {
+                tracing::warn!(
+                    provider = exporter.provider_name(),
+                    "workload_metrics tracing export buffer full — dropping span: {}",
+                    error
+                );
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -357,6 +408,9 @@ impl Plugin for WorkloadMetrics {
         let metadata = ctx.metadata.get_or_insert_with(Default::default);
         self.insert_common_metadata(metadata);
         self.apply_telemetry_metadata(metadata, &HashMap::new());
+        if !self.trace_exporters.is_empty() && trace_is_sampled(metadata) {
+            ensure_trace_metadata(metadata, &HashMap::new());
+        }
         metadata.insert(
             "mesh.connection_security_policy".to_string(),
             if ctx.tls_client_cert_der.is_some() {
@@ -384,6 +438,30 @@ impl Plugin for WorkloadMetrics {
         }
         PluginResult::Continue
     }
+
+    async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
+        if !trace_is_sampled(&summary.metadata) {
+            return;
+        }
+        self.export_span(SpanData::from_stream_summary(summary, &self.service_name));
+    }
+
+    async fn log(&self, summary: &TransactionSummary) {
+        if !trace_is_sampled(&summary.metadata) {
+            return;
+        }
+        self.export_span(SpanData::from_transaction_summary(
+            summary,
+            &self.service_name,
+        ));
+    }
+
+    fn warmup_hostnames(&self) -> Vec<String> {
+        self.trace_exporters
+            .iter()
+            .filter_map(|exporter| exporter.hostname().map(ToOwned::to_owned))
+            .collect()
+    }
 }
 
 fn string_config(config: &Value, key: &str) -> Option<String> {
@@ -392,6 +470,24 @@ fn string_config(config: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn parse_tracing_providers(config: &Value) -> Result<Vec<TracingProvider>, String> {
+    if let Some(value) = config.get("tracing_providers") {
+        if value.is_null() {
+            return Ok(Vec::new());
+        }
+        return serde_json::from_value::<Vec<TracingProvider>>(value.clone())
+            .map_err(|e| format!("workload_metrics: invalid tracing_providers config: {e}"));
+    }
+
+    match config.get("tracing_provider") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(value) => Ok(vec![
+            serde_json::from_value::<TracingProvider>(value.clone())
+                .map_err(|e| format!("workload_metrics: invalid tracing_provider config: {e}"))?,
+        ]),
+    }
 }
 
 fn parse_metric_config(
@@ -633,8 +729,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tracing_provider_zipkin_round_trips_through_config() {
+    #[tokio::test]
+    async fn tracing_provider_zipkin_round_trips_through_config() {
         let metrics = WorkloadMetrics::new(&json!({
             "tracing_provider": {
                 "kind": "zipkin",
@@ -644,7 +740,11 @@ mod tests {
             }
         }))
         .expect("zipkin provider accepted");
-        match metrics.tracing_provider().expect("provider stored") {
+        match metrics
+            .tracing_providers()
+            .first()
+            .expect("provider stored")
+        {
             TracingProvider::Zipkin { url } => {
                 assert_eq!(url, "http://zipkin:9411/api/v2/spans");
             }
@@ -652,8 +752,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tracing_provider_datadog_optional_service_round_trips() {
+    #[tokio::test]
+    async fn tracing_provider_datadog_optional_service_round_trips() {
         let metrics = WorkloadMetrics::new(&json!({
             "tracing_provider": {
                 "kind": "datadog",
@@ -664,7 +764,11 @@ mod tests {
             }
         }))
         .expect("datadog provider accepted");
-        match metrics.tracing_provider().expect("provider stored") {
+        match metrics
+            .tracing_providers()
+            .first()
+            .expect("provider stored")
+        {
             TracingProvider::Datadog { agent_url, service } => {
                 assert_eq!(agent_url, "http://datadog-agent:8126");
                 assert_eq!(service.as_deref(), Some("checkout"));
@@ -673,8 +777,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tracing_provider_lightstep_requires_collector_and_token() {
+    #[tokio::test]
+    async fn tracing_provider_lightstep_requires_collector_and_token() {
         let metrics = WorkloadMetrics::new(&json!({
             "tracing_provider": {
                 "kind": "lightstep",
@@ -685,7 +789,11 @@ mod tests {
             }
         }))
         .expect("lightstep provider accepted");
-        match metrics.tracing_provider().expect("provider stored") {
+        match metrics
+            .tracing_providers()
+            .first()
+            .expect("provider stored")
+        {
             TracingProvider::Lightstep {
                 collector_url,
                 access_token,
@@ -697,8 +805,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tracing_provider_opentelemetry_round_trips() {
+    #[tokio::test]
+    async fn tracing_provider_opentelemetry_round_trips() {
         let metrics = WorkloadMetrics::new(&json!({
             "tracing_provider": {
                 "kind": "opentelemetry",
@@ -708,7 +816,11 @@ mod tests {
             }
         }))
         .expect("opentelemetry provider accepted");
-        match metrics.tracing_provider().expect("provider stored") {
+        match metrics
+            .tracing_providers()
+            .first()
+            .expect("provider stored")
+        {
             TracingProvider::OpenTelemetry { endpoint } => {
                 assert_eq!(endpoint, "http://otel-collector:4317");
             }
@@ -722,7 +834,7 @@ mod tests {
             "custom_tags": {"literal": "constant"}
         }))
         .expect("config without provider accepted");
-        assert!(metrics.tracing_provider().is_none());
+        assert!(metrics.tracing_providers().is_empty());
     }
 
     #[test]
@@ -733,7 +845,47 @@ mod tests {
                 "config": {"endpoint": "x"}
             }
         }))
-        .expect_err("unknown provider kind should fail");
+        .err()
+        .expect("unknown provider kind should fail");
         assert!(err.contains("invalid tracing_provider config"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn tracing_providers_array_round_trips() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "tracing_providers": [
+                {
+                    "kind": "zipkin",
+                    "config": {
+                        "url": "http://zipkin:9411/api/v2/spans"
+                    }
+                },
+                {
+                    "kind": "datadog",
+                    "config": {
+                        "agent_url": "http://datadog-agent:8126"
+                    }
+                }
+            ]
+        }))
+        .expect("provider array accepted");
+        assert_eq!(metrics.tracing_providers().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn disable_span_reporting_keeps_provider_config_but_builds_no_exporters() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "span_reporting_disabled": true,
+            "tracing_providers": [{
+                "kind": "zipkin",
+                "config": {
+                    "url": "http://zipkin:9411/api/v2/spans"
+                }
+            }]
+        }))
+        .expect("disabled tracing accepted");
+        assert!(metrics.span_reporting_disabled());
+        assert_eq!(metrics.tracing_providers().len(), 1);
+        assert!(metrics.warmup_hostnames().is_empty());
     }
 }

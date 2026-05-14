@@ -176,10 +176,12 @@ fn telemetry_tracing_sampling_overrides_proxy_config_tracing_sampling() {
             },
             config: MeshTelemetryConfig {
                 tracing: Some(MeshTracingConfig {
+                    mode: None,
                     sampling_percentage: Some(99.0),
+                    disable_span_reporting: false,
                     custom_tags: HashMap::new(),
                     custom_header_tags: HashMap::new(),
-                    provider: None,
+                    providers: Vec::new(),
                 }),
                 metrics: None,
                 access_logging: None,
@@ -242,10 +244,12 @@ fn proxy_config_tracing_sampling_survives_telemetry_without_sampling_field() {
             },
             config: MeshTelemetryConfig {
                 tracing: Some(MeshTracingConfig {
+                    mode: None,
                     sampling_percentage: None,
+                    disable_span_reporting: false,
                     custom_tags: HashMap::from([("region".to_string(), "us-east".to_string())]),
                     custom_header_tags: HashMap::new(),
-                    provider: None,
+                    providers: Vec::new(),
                 }),
                 metrics: None,
                 access_logging: None,
