@@ -197,6 +197,22 @@ fn proxy_scoped_plugin(id: &str, proxy_id: &str) -> Value {
     })
 }
 
+fn mesh_route_dispatch_plugin(id: &str, proxy_id: &str, upstream_id: &str) -> Value {
+    json!({
+        "id": id,
+        "plugin_name": "mesh_route_dispatch",
+        "scope": "proxy",
+        "proxy_id": proxy_id,
+        "config": {
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": upstream_id},
+            }],
+        },
+        "enabled": true,
+    })
+}
+
 fn err_string(body: &Value) -> String {
     body.get("error")
         .and_then(|v| v.as_str())
@@ -382,6 +398,136 @@ async fn same_namespace_plugin_config_proxy_reference_is_accepted() {
     );
 }
 
+// ── mesh_route_dispatch destination.upstream_id ─────────────────────────────
+
+#[tokio::test]
+async fn mesh_route_dispatch_missing_destination_upstream_is_rejected() {
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    let (status, body) = ns_post(
+        &base_url,
+        "/proxies",
+        NAMESPACE_A,
+        &token,
+        &plain_proxy("p-a-route", "/route"),
+    )
+    .await;
+    assert_eq!(status, 201, "seed proxy failed: {:?}", body);
+
+    let (status, body) = ns_post(
+        &base_url,
+        "/plugins/config",
+        NAMESPACE_A,
+        &token,
+        &mesh_route_dispatch_plugin("pc-route", "p-a-route", "missing-upstream"),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "missing mesh_route_dispatch destination upstream must be rejected: {:?}",
+        body
+    );
+    let err = err_string(&body);
+    assert!(
+        err.contains("mesh_route_dispatch") && err.contains("missing-upstream"),
+        "error must mention plugin type and upstream id; got: {}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_cross_namespace_destination_upstream_is_rejected() {
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    let (status, body) = ns_post(
+        &base_url,
+        "/upstreams",
+        NAMESPACE_A,
+        &token,
+        &upstream_payload("up-shared", "shared"),
+    )
+    .await;
+    assert_eq!(status, 201, "seed upstream in A failed: {:?}", body);
+
+    let (status, body) = ns_post(
+        &base_url,
+        "/proxies",
+        NAMESPACE_B,
+        &token,
+        &plain_proxy("p-b-route", "/route"),
+    )
+    .await;
+    assert_eq!(status, 201, "seed proxy in B failed: {:?}", body);
+
+    let (status, body) = ns_post(
+        &base_url,
+        "/plugins/config",
+        NAMESPACE_B,
+        &token,
+        &mesh_route_dispatch_plugin("pc-b-route", "p-b-route", "up-shared"),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "cross-namespace mesh_route_dispatch destination upstream must be rejected: {:?}",
+        body
+    );
+    let err = err_string(&body);
+    assert!(
+        err.contains("cross-namespace") && err.contains("up-shared") && err.contains(NAMESPACE_A),
+        "error must identify cross-namespace upstream ref; got: {}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_same_namespace_destination_upstream_is_accepted() {
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    let (status, body) = ns_post(
+        &base_url,
+        "/upstreams",
+        NAMESPACE_A,
+        &token,
+        &upstream_payload("up-a-route", "route-pool"),
+    )
+    .await;
+    assert_eq!(status, 201, "seed upstream failed: {:?}", body);
+
+    let (status, body) = ns_post(
+        &base_url,
+        "/proxies",
+        NAMESPACE_A,
+        &token,
+        &plain_proxy("p-a-route", "/route"),
+    )
+    .await;
+    assert_eq!(status, 201, "seed proxy failed: {:?}", body);
+
+    let (status, body) = ns_post(
+        &base_url,
+        "/plugins/config",
+        NAMESPACE_A,
+        &token,
+        &mesh_route_dispatch_plugin("pc-a-route", "p-a-route", "up-a-route"),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "same-namespace mesh_route_dispatch destination upstream should succeed: {:?}",
+        body
+    );
+}
+
 // ── proxy plugin associations ────────────────────────────────────────────────
 
 #[tokio::test]
@@ -503,5 +649,79 @@ async fn batch_cross_namespace_upstream_reference_is_rejected() {
         joined.contains("up-shared") && joined.contains(NAMESPACE_A),
         "batch error must mention upstream id + source namespace; got: {}",
         joined
+    );
+}
+
+#[tokio::test]
+async fn batch_mesh_route_dispatch_missing_destination_upstream_is_rejected() {
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    let batch = json!({
+        "proxies": [{
+            "id": "p-batch-route",
+            "listen_path": "/route",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+        }],
+        "plugin_configs": [
+            mesh_route_dispatch_plugin("pc-batch-route", "p-batch-route", "missing-upstream"),
+        ],
+    });
+    let (status, body) = ns_post(&base_url, "/batch", NAMESPACE_A, &token, &batch).await;
+    assert_eq!(
+        status, 400,
+        "batch mesh_route_dispatch missing upstream must be rejected: {:?}",
+        body
+    );
+    let errors = body
+        .get("validation_errors")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let joined = errors
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    assert!(
+        joined.contains("mesh_route_dispatch") && joined.contains("missing-upstream"),
+        "batch error must mention plugin type and upstream id; got: {}",
+        joined
+    );
+}
+
+#[tokio::test]
+async fn batch_mesh_route_dispatch_destination_can_reference_batch_upstream() {
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    let batch = json!({
+        "upstreams": [
+            upstream_payload("up-batch-route", "route-pool"),
+        ],
+        "proxies": [{
+            "id": "p-batch-route",
+            "listen_path": "/route",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+        }],
+        "plugin_configs": [
+            mesh_route_dispatch_plugin("pc-batch-route", "p-batch-route", "up-batch-route"),
+        ],
+    });
+    let (status, body) = ns_post(&base_url, "/batch", NAMESPACE_A, &token, &batch).await;
+    assert_eq!(
+        status, 201,
+        "batch mesh_route_dispatch should accept upstreams created in the same batch: {:?}",
+        body
     );
 }

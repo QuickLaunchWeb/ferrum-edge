@@ -51,6 +51,12 @@ pub struct K8sTranslationOptions {
     pub prefer_istio_on_overlap: bool,
     pub istio_root_namespace: String,
     pub cluster_domain: String,
+    /// When `true`, the Istio VirtualService translator emits a
+    /// `mesh_route_dispatch` plugin instance for routes with method/header/
+    /// query-param predicates. When `false` (default), those predicates are
+    /// silently dropped — preserving existing behavior. Operator opts in via
+    /// `FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL`.
+    pub vs_header_routing_experimental: bool,
     source_namespaces: Option<HashSet<String>>,
 }
 
@@ -63,8 +69,14 @@ impl K8sTranslationOptions {
             prefer_istio_on_overlap: true,
             istio_root_namespace: "istio-system".to_string(),
             cluster_domain: "cluster.local".to_string(),
+            vs_header_routing_experimental: false,
             source_namespaces: Some(source_namespaces),
         }
+    }
+
+    pub fn with_vs_header_routing_experimental(mut self, enabled: bool) -> Self {
+        self.vs_header_routing_experimental = enabled;
+        self
     }
 
     pub fn with_istio_root_namespace(mut self, namespace: String) -> Self {
@@ -559,6 +571,40 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
     }
 }
 
+pub(crate) fn attach_route_plugins_to_proxy(proxy: &mut Proxy, plugins: &[PluginConfig]) {
+    proxy
+        .plugins
+        .extend(plugins.iter().map(|plugin| PluginAssociation {
+            plugin_config_id: plugin.id.clone(),
+        }));
+}
+
+/// Build a `request_termination` plugin config for a translated route that
+/// cannot safely be represented by Ferrum's current routing dimensions.
+pub(crate) fn request_termination_plugin_for_proxy(
+    proxy_id: &str,
+    namespace: &str,
+    message: &str,
+) -> PluginConfig {
+    let now = Utc::now();
+    PluginConfig {
+        id: format!("istio-vs-rt-{proxy_id}"),
+        plugin_name: "request_termination".to_string(),
+        namespace: namespace.to_string(),
+        config: serde_json::json!({
+            "status_code": 404,
+            "message": message,
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some(proxy_id.to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 /// Build a `fault_injection` plugin config scoped to a specific proxy.
 pub(crate) fn fault_injection_plugin_for_proxy(
     proxy_id: &str,
@@ -626,6 +672,339 @@ pub(crate) fn fault_injection_plugin_for_proxy(
         created_at: now,
         updated_at: now,
     })
+}
+
+pub(crate) struct MeshRouteDispatchDestination<'a> {
+    pub backend_host: &'a str,
+    pub backend_port: u16,
+    pub upstream_id: Option<&'a str>,
+}
+
+/// Translate a VirtualService `http[]` entry's `match[]` blocks into a
+/// `mesh_route_dispatch` plugin instance for the route's proxy.
+///
+/// Each in-scope `match[]` entry becomes one rule. URI predicates are
+/// already captured at the proxy level via `listen_path`, so this helper
+/// extracts only the non-URI predicates (`method`, `headers`,
+/// `queryParams`). If no in-scope match entry has non-URI predicates,
+/// returns `None` — no plugin emitted.
+///
+/// `listen_path` scopes the in-scope entries to this proxy: a `match[]`
+/// entry with a `uri` predicate only contributes to the proxy whose
+/// `listen_path` was derived from that same URI. URI-less entries (Istio
+/// "any URI with these predicates") apply to every proxy emitted from
+/// this `http[]` rule. Without this scoping, a `[{uri:/a}, {uri:/b,
+/// headers:...}]` `match[]` would bleed the `/b` header rule into the
+/// `/a` proxy, and the second P1 below would also fire.
+///
+/// `reject_unmatched` is forced to `false` when any in-scope entry is
+/// URI-only. Istio `match[]` entries are ORed: a URI-only entry is an
+/// unconditional catch-all for its listen_path, so requests that miss
+/// every other predicate must still be allowed to fall through to the
+/// proxy's default backend. With `reject_unmatched: true` and a URI-only
+/// sibling silently dropped, plain `/api` traffic on a `[{uri:/api},
+/// {uri:/api, headers:...}]` `match[]` would 404. When every in-scope
+/// entry carries non-URI predicates, `reject_unmatched: true` is kept so
+/// e.g. a GET-only route does not silently serve POST traffic.
+///
+/// Entries carrying predicates we cannot represent in the rule
+/// (`method.regex` / `.prefix`, `headers.X.regex` / `.prefix`,
+/// `queryParams.X.regex`, or fully-unsupported keys like `authority`,
+/// `scheme`, `port`, `sourceLabels`, `gateways`, `withoutHeaders`,
+/// `sourceNamespace`, `ignoreUriCase`) are skipped by the dispatch-rule
+/// extractor — they do NOT collapse onto the URI-only catch-all branch. The
+/// VirtualService translator emits a separate proxy-scoped
+/// `request_termination` artifact for unsupported-only route candidates so
+/// later broader routes do not silently serve gated traffic. If unsupported
+/// entries collapsed here, a mixed `match[]` with one supported exact rule
+/// plus one unsupported regex sibling would disable `reject_unmatched` and
+/// silently forward exactly the requests the operator gated.
+///
+/// The rule's destination overrides to the route's own destination
+/// (`backend_host`/`backend_port` or `upstream_id`). The destination is
+/// effectively the proxy's default backend, so the override is a no-op for
+/// the single-route case. The plugin is still emitted so:
+///   1. Predicate config is captured and visible via the admin API.
+///   2. Future enhancements (multi-destination canary routing collapsing
+///      multiple `http[]` entries into one proxy + multi-rule plugin) reuse
+///      the same plugin contract.
+#[allow(dead_code)]
+pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
+    proxy_id: &str,
+    namespace: &str,
+    http: &Value,
+    listen_path: Option<&str>,
+    destination: MeshRouteDispatchDestination<'_>,
+    prepend_rules: &[Value],
+) -> Option<PluginConfig> {
+    let (mut rules, has_uri_only_match) =
+        mesh_route_dispatch_rules_for_proxy(http, listen_path, destination, false);
+    if !prepend_rules.is_empty() {
+        let mut combined = Vec::with_capacity(prepend_rules.len() + rules.len());
+        combined.extend(prepend_rules.iter().cloned());
+        combined.append(&mut rules);
+        rules = combined;
+    }
+    if rules.is_empty() {
+        return None;
+    }
+
+    let current_route_has_rules = rules.len() > prepend_rules.len();
+    let reject_unmatched = current_route_has_rules && !has_uri_only_match;
+
+    mesh_route_dispatch_plugin_from_rules(proxy_id, namespace, rules, reject_unmatched)
+}
+
+#[allow(dead_code)]
+pub(crate) fn mesh_route_dispatch_uri_less_rules(
+    http: &Value,
+    destination: MeshRouteDispatchDestination<'_>,
+) -> Vec<Value> {
+    mesh_route_dispatch_rules_for_proxy(http, None, destination, true).0
+}
+
+pub(crate) fn mesh_route_dispatch_rules_for_proxy(
+    http: &Value,
+    listen_path: Option<&str>,
+    route_destination: MeshRouteDispatchDestination<'_>,
+    uri_less_only: bool,
+) -> (Vec<Value>, bool) {
+    let Some(matches) = http.get("match").and_then(Value::as_array) else {
+        return (Vec::new(), false);
+    };
+    if matches.is_empty() {
+        return (Vec::new(), false);
+    }
+
+    let mut rules = Vec::new();
+    let mut has_uri_only_match = false;
+    for entry in matches {
+        if uri_less_only && entry.get("uri").is_some() {
+            continue;
+        }
+
+        // Scope to this proxy's listen_path. A match entry with a parseable
+        // URI applies only to the proxy whose listen_path was built from
+        // that URI; entries without a URI (or with an unsupported URI
+        // shape, which never produces a proxy) apply to every listen_path
+        // derived from this http[] rule and are not filtered out here.
+        let entry_path = entry.get("uri").and_then(istio::path_match);
+        if let (Some(entry_path), Some(listen_path)) = (entry_path.as_deref(), listen_path)
+            && entry_path != listen_path
+        {
+            continue;
+        }
+
+        let mut match_criteria = serde_json::Map::new();
+        // Track whether this entry carries any non-URI predicate that we
+        // cannot represent in the mesh_route_dispatch rule. Keep this
+        // classification in one helper so path materialization and plugin
+        // rule emission agree: a URI-less entry that would be skipped here
+        // must not create an unguarded catch-all proxy in `match_paths`.
+        let had_unsupported_predicate = mesh_route_dispatch_has_unsupported_predicate(entry);
+
+        if let Some(method_obj) = entry.get("method").and_then(Value::as_object)
+            && let Some(method) = method_obj.get("exact").and_then(Value::as_str)
+        {
+            match_criteria.insert("methods".to_string(), serde_json::json!([method]));
+        }
+
+        if let Some(headers_obj) = entry.get("headers").and_then(Value::as_object) {
+            let mut headers = serde_json::Map::new();
+            for (name, value) in headers_obj {
+                if let Some(exact) = value.get("exact").and_then(Value::as_str) {
+                    headers.insert(name.to_ascii_lowercase(), Value::String(exact.to_string()));
+                }
+            }
+            if !headers.is_empty() {
+                match_criteria.insert("headers".to_string(), Value::Object(headers));
+            }
+        }
+
+        if let Some(qp_obj) = entry.get("queryParams").and_then(Value::as_object) {
+            let mut params = serde_json::Map::new();
+            for (name, value) in qp_obj {
+                if let Some(exact) = value.get("exact").and_then(Value::as_str) {
+                    params.insert(name.to_string(), Value::String(exact.to_string()));
+                }
+            }
+            if !params.is_empty() {
+                match_criteria.insert("query_params".to_string(), Value::Object(params));
+            }
+        }
+
+        if had_unsupported_predicate {
+            // Entry has predicates we can't represent. Emitting a partial
+            // rule would widen traffic; classifying as URI-only would
+            // disable reject_unmatched and forward gated traffic. Skip the
+            // entry — with reject_unmatched: true, unmatched requests get
+            // a 404, which is the fail-closed VirtualService semantic.
+            continue;
+        }
+
+        if match_criteria.is_empty() {
+            // In-scope entry with no non-URI predicate keys at all: its
+            // URI already matched at proxy level, so this is an
+            // unconditional catch-all branch for `listen_path`. Mark it so
+            // `reject_unmatched` is disabled below; otherwise a co-located
+            // header/method rule would force 404 on traffic the URI-only
+            // branch is supposed to allow through.
+            has_uri_only_match = true;
+            continue;
+        }
+
+        let mut destination = serde_json::Map::new();
+        if let Some(uid) = route_destination.upstream_id {
+            destination.insert("upstream_id".to_string(), Value::String(uid.to_string()));
+        } else {
+            destination.insert(
+                "backend_host".to_string(),
+                Value::String(route_destination.backend_host.to_string()),
+            );
+            destination.insert(
+                "backend_port".to_string(),
+                serde_json::json!(route_destination.backend_port),
+            );
+        }
+
+        let mut rule = serde_json::Map::new();
+        rule.insert("match".to_string(), Value::Object(match_criteria));
+        rule.insert("destination".to_string(), Value::Object(destination));
+        rules.push(Value::Object(rule));
+    }
+
+    (rules, has_uri_only_match)
+}
+
+pub(crate) fn mesh_route_dispatch_plugin_from_rules(
+    proxy_id: &str,
+    namespace: &str,
+    rules: Vec<Value>,
+    reject_unmatched: bool,
+) -> Option<PluginConfig> {
+    if rules.is_empty() {
+        return None;
+    }
+    let now = Utc::now();
+    Some(PluginConfig {
+        id: format!("istio-vs-mrd-{proxy_id}"),
+        plugin_name: "mesh_route_dispatch".to_string(),
+        namespace: namespace.to_string(),
+        // `reject_unmatched: true` enforces VirtualService match semantics:
+        // a route whose `match[]` specifies `method`/`headers`/`queryParams`
+        // must not serve requests that miss those predicates via the proxy's
+        // default backend. Without this, e.g., a GET-only route would
+        // silently forward POST traffic to the same upstream.
+        //
+        // It flips to `false` when any in-scope entry is URI-only -- that
+        // entry is an unconditional ORed match for this listen_path, so
+        // unmatched requests must fall through to the default backend
+        // rather than 404. See the function docstring for the full
+        // rationale and the regression scenarios this guards against.
+        config: serde_json::json!({
+            "rules": rules,
+            "reject_unmatched": reject_unmatched,
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some(proxy_id.to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+pub(crate) fn mesh_route_dispatch_has_supported_non_uri_predicate(entry: &Value) -> bool {
+    if entry
+        .get("method")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get("exact"))
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return true;
+    }
+    if let Some(headers) = entry.get("headers").and_then(Value::as_object)
+        && headers
+            .values()
+            .any(|v| v.get("exact").and_then(Value::as_str).is_some())
+    {
+        return true;
+    }
+    if let Some(qp) = entry.get("queryParams").and_then(Value::as_object)
+        && qp
+            .values()
+            .any(|v| v.get("exact").and_then(Value::as_str).is_some())
+    {
+        return true;
+    }
+    false
+}
+
+pub(crate) fn mesh_route_dispatch_has_unsupported_predicate(entry: &Value) -> bool {
+    if let Some(ignore_uri_case) = entry.get("ignoreUriCase") {
+        match ignore_uri_case.as_bool() {
+            Some(true) => return true,
+            Some(false) => {}
+            None => return true,
+        }
+    }
+
+    if entry.get("method").is_some()
+        && entry
+            .get("method")
+            .and_then(Value::as_object)
+            .and_then(|m| m.get("exact"))
+            .and_then(Value::as_str)
+            .is_none()
+    {
+        return true;
+    }
+
+    if let Some(headers) = entry.get("headers") {
+        let Some(headers) = headers.as_object() else {
+            return true;
+        };
+        if headers
+            .values()
+            .any(|v| v.get("exact").and_then(Value::as_str).is_none())
+        {
+            return true;
+        }
+    }
+
+    if let Some(qp) = entry.get("queryParams") {
+        let Some(qp) = qp.as_object() else {
+            return true;
+        };
+        if qp
+            .values()
+            .any(|v| v.get("exact").and_then(Value::as_str).is_none())
+        {
+            return true;
+        }
+    }
+
+    entry.as_object().is_some_and(|obj| {
+        obj.keys().any(|key| {
+            matches!(
+                key.as_str(),
+                "authority"
+                    | "scheme"
+                    | "port"
+                    | "sourceLabels"
+                    | "gateways"
+                    | "withoutHeaders"
+                    | "sourceNamespace"
+            )
+        })
+    })
+}
+
+pub(crate) fn mesh_route_dispatch_can_emit_rule(entry: &Value) -> bool {
+    mesh_route_dispatch_has_supported_non_uri_predicate(entry)
+        && !mesh_route_dispatch_has_unsupported_predicate(entry)
 }
 
 /// Parse an Istio duration string to milliseconds. Supports the same suffix

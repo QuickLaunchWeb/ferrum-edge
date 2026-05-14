@@ -1094,9 +1094,16 @@ async fn handle_h3_request(
     }
     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
 
-    // Materialize query params before authentication (raw, no percent-decoding
-    // for HTTP/3 — preserves existing behavior).
-    ctx.materialize_query_params_raw();
+    // Materialize query params before authentication. HTTP/3 historically
+    // exposed raw, non-percent-decoded values to plugins; keep that default
+    // so enabling this PR does not silently change auth/cache keys. Plugins
+    // with query-param semantics that require H1/H2 parity opt in via the
+    // capability bit below.
+    if capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS) {
+        ctx.materialize_query_params();
+    } else {
+        ctx.materialize_query_params_raw();
+    }
 
     // Some auth plugins (for example `hmac_auth`) verify request body integrity
     // at authenticate time. Buffer the body before the auth phase runs so those
@@ -1374,6 +1381,17 @@ async fn handle_h3_request(
         &mut proxy_headers,
         &state.mesh_egress_strip_baggage_keys,
     );
+
+    // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
+    // Istio VirtualService header/method match). When no overrides are set,
+    // this is an `Arc::clone` — no per-request allocation. When overrides
+    // are set, the override values are baked into a fresh `Arc<Proxy>` so
+    // downstream pool keys, capability-registry lookups, URL construction,
+    // and circuit-breaker target keys all derive from the effective
+    // destination. Keep in sync with the H1/H2 dispatch path in
+    // `src/proxy/mod.rs::handle_proxy_request_inner`.
+    let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
 
     // Enforce request body size limit via Content-Length fast path. Apply
     // the gRPC-specific ceiling to gRPC requests so H3 matches H1/H2.

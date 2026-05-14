@@ -150,8 +150,10 @@ pub(crate) struct UpstreamSelection {
 /// Select an upstream target for the given proxy using load balancing with
 /// health-aware filtering.
 ///
-/// When the proxy has no `upstream_id`, returns a no-op selection with
-/// `lb_hash_key: None` — the key is never read without an upstream.
+/// When the effective upstream id (after plugin overrides) is `None`,
+/// returns a no-op selection with `lb_hash_key: None` — the key is never
+/// read without an upstream.
+///
 pub(crate) fn select_upstream_target(
     proxy: &Proxy,
     state: &ProxyState,
@@ -159,7 +161,7 @@ pub(crate) fn select_upstream_target(
     client_ip: &str,
     proxy_headers: &HashMap<String, String>,
 ) -> UpstreamSelection {
-    let Some(upstream_id) = &proxy.upstream_id else {
+    let Some(upstream_id) = proxy.upstream_id.as_deref() else {
         return UpstreamSelection {
             lb_hash_key: None,
             target: None,
@@ -284,8 +286,7 @@ pub(crate) fn check_circuit_breaker(
     state: &ProxyState,
     upstream_target: Option<&UpstreamTarget>,
 ) -> Result<(Option<String>, bool), ()> {
-    let cb_target_key =
-        upstream_target.map(|t| crate::circuit_breaker::target_key(&t.host, t.port));
+    let cb_target_key = circuit_breaker_target_key(proxy, upstream_target);
 
     if let Some(cb_config) = &proxy.circuit_breaker {
         match state.circuit_breaker_cache.can_execute(
@@ -304,11 +305,31 @@ pub(crate) fn check_circuit_breaker(
     Ok((cb_target_key, false))
 }
 
+fn circuit_breaker_target_key(
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> Option<String> {
+    upstream_target
+        .map(|t| crate::circuit_breaker::target_key(&t.host, t.port))
+        .or_else(|| {
+            (proxy.upstream_id.is_none()
+                && !proxy.backend_host.is_empty()
+                && proxy.backend_port != 0)
+                .then(|| {
+                    crate::circuit_breaker::target_key(&proxy.backend_host, proxy.backend_port)
+                })
+        })
+}
+
 /// Record the outcome of a backend request across all observability systems:
 /// - Circuit breaker (success/failure)
 /// - Passive health checks
 /// - Least-latency load balancer (backend TTFB)
 /// - Least-connections load balancer (connection end)
+///
+/// Route-override plugins must pass the shadowed effective proxy so passive
+/// health and least-latency reporting attribute to the upstream that was
+/// actually dispatched to.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_backend_outcome(
     state: &ProxyState,
@@ -337,7 +358,7 @@ pub(crate) fn record_backend_outcome(
     //      precedence over passive TTFB which includes variable application processing time
     if !connection_error
         && response_status < 500
-        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
+        && let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
     {
         let upstream = LoadBalancerCache::get_upstream_from(lb_snapshot, upstream_id);
         let has_active_hc = upstream
@@ -373,7 +394,7 @@ pub(crate) fn record_backend_outcome(
     }
 
     // Passive health check reporting (O(1) upstream lookup via index)
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
+    if let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
         && let Some(upstream) = LoadBalancerCache::get_upstream_from(lb_snapshot, upstream_id)
         && let Some(hc) = &upstream.health_checks
     {
@@ -459,5 +480,20 @@ mod tests {
                 .expect("target remains");
 
         assert!(Arc::ptr_eq(&original, &concrete));
+    }
+
+    #[test]
+    fn circuit_breaker_target_key_uses_direct_backend_override() {
+        let proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "backend_host": "canary.svc",
+            "backend_port": 9090,
+        }))
+        .expect("minimal proxy should deserialize");
+
+        assert_eq!(
+            circuit_breaker_target_key(&proxy, None).as_deref(),
+            Some("canary.svc:9090"),
+            "direct backend overrides must partition circuit breaker state by effective host:port"
+        );
     }
 }

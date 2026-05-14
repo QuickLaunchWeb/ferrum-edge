@@ -821,6 +821,17 @@ pub async fn connect_and_subscribe_with_startup_ready(
                             error!("Ignoring config update with invalid plugin references");
                             continue;
                         }
+                        if let Err(errors) =
+                            crate::proxy::validate_mesh_route_dispatch_upstream_references(&config)
+                        {
+                            for msg in &errors {
+                                error!("CP config rejected — {}", msg);
+                            }
+                            error!(
+                                "Ignoring config update with invalid mesh_route_dispatch upstream references"
+                            );
+                            continue;
+                        }
                         proxy_state.update_config(config);
                         apply_gateway_trust_bundle_update(proxy_state, gateway_trust_bundle_update);
                         update_state_config_received(connection_state);

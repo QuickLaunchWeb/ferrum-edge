@@ -1832,3 +1832,43 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
             .any(|e| e.contains("Upstream") && e.contains("169.254.169.254"))
     );
 }
+
+#[test]
+fn test_validate_backend_ip_policy_mesh_route_dispatch_trims_direct_ip() {
+    let plugin = PluginConfig {
+        id: "mrd-private-ip".to_string(),
+        plugin_name: "mesh_route_dispatch".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        config: serde_json::json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {
+                    "backend_host": " 169.254.169.254 ",
+                    "backend_port": 8080
+                }
+            }]
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("p1".to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let config = GatewayConfig {
+        plugin_configs: vec![plugin],
+        ..Default::default()
+    };
+
+    let result = config.validate_all_fields_with_ip_policy(30, &BackendAllowIps::Public);
+
+    assert!(result.is_err());
+    let errs = result.unwrap_err();
+    assert!(errs.iter().any(|e| {
+        e.contains("PluginConfig")
+            && e.contains("mesh_route_dispatch")
+            && e.contains("169.254.169.254")
+            && e.contains("FERRUM_BACKEND_ALLOW_IPS")
+    }));
+}

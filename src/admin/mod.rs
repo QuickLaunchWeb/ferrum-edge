@@ -1866,6 +1866,21 @@ async fn handle_batch_create(
                 )),
             }
         }
+
+        match crud::validate_mesh_route_dispatch_plugin_upstream_references(
+            db.as_ref(),
+            namespace,
+            plugin_config,
+            Some(&batch_upstream_ids),
+        )
+        .await
+        {
+            Ok(errs) => validation_errors.extend(errs),
+            Err(err) => validation_errors.push(format!(
+                "PluginConfig '{}' mesh_route_dispatch upstream reference check failed: {}",
+                plugin_config.id, err
+            )),
+        }
     }
 
     if !validation_errors.is_empty() {
@@ -2130,7 +2145,9 @@ async fn handle_restore(
             .validate_regex_listen_paths(ValidationAction::Collect)
             .validate_unique_listen_paths(ValidationAction::Collect)
             .validate_stream_proxies(ValidationAction::Collect)
+            .validate_plugin_configs(ValidationAction::Collect)
             .validate_upstream_references(ValidationAction::Collect)
+            .validate_mesh_route_dispatch_references(ValidationAction::Collect)
             .validate_plugin_references(ValidationAction::Collect)
             .run()
         {

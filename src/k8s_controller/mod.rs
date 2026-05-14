@@ -37,6 +37,11 @@ pub struct K8sControllerConfig {
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
     pub kubeconfig_path: Option<String>,
+    /// `FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL` — when true, the Istio
+    /// VirtualService translator emits a `mesh_route_dispatch` plugin
+    /// instance for routes with method/header/query-param predicates.
+    /// Default false (existing predicate-drop behavior).
+    pub vs_header_routing_experimental: bool,
 }
 
 pub struct K8sControllerHandle {
@@ -97,6 +102,7 @@ pub async fn start_k8s_controller(
         watch_namespaces: controller_config.watch_namespaces.clone(),
         debounce_ms: controller_config.debounce_ms,
         full_sync_interval_secs: controller_config.full_sync_interval_secs,
+        vs_header_routing_experimental: controller_config.vs_header_routing_experimental,
     };
 
     let reconciler_handle = spawn_reconcile_loop(

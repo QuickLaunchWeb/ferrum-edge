@@ -699,6 +699,11 @@ pub struct RequestContext {
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
     /// Cumulative nanoseconds spent by plugins making external HTTP calls.
     pub plugin_http_call_ns: Arc<AtomicU64>,
+    /// Optional routing overrides consumed after `before_proxy`.
+    pub route_override_upstream_id: Option<String>,
+    pub route_override_backend_host: Option<String>,
+    pub route_override_backend_port: Option<u16>,
+    pub route_override_resolved_tls: Option<BackendTlsConfig>,
 }
 ```
 
@@ -706,6 +711,8 @@ pub struct RequestContext {
 - `effective_identity()` — returns the stable identity (Consumer username preferred over external identity)
 - `backend_consumer_username()` — returns the identity for the `X-Consumer-Username` backend header
 - `backend_consumer_custom_id()` — returns the Consumer custom ID, if a gateway Consumer was resolved
+- `apply_route_overrides(proxy)` — returns an `Arc<Proxy>` with direct route overrides applied. This helper cannot re-resolve upstream TLS for `route_override_upstream_id`.
+- `apply_route_overrides_with_upstreams(proxy, upstreams)` — use this in custom dispatch paths that honor `route_override_upstream_id`; it re-resolves `resolved_tls` from the effective upstream snapshot.
 
 ### Inter-Plugin Communication
 

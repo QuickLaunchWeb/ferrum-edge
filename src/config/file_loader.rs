@@ -208,6 +208,9 @@ pub fn load_config_from_file(
         .validate_upstream_references(ValidationAction::FatalCount(
             "Configuration validation failed: {} invalid upstream reference(s) found",
         ))
+        .validate_mesh_route_dispatch_references(ValidationAction::FatalCount(
+            "Configuration validation failed: {} invalid mesh_route_dispatch upstream reference(s) found",
+        ))
         .validate_plugin_references(ValidationAction::FatalCount(
             "Configuration validation failed: {} invalid plugin reference(s) found",
         ))

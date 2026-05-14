@@ -209,6 +209,9 @@ impl Plugin for PriorityOverridePlugin {
     async fn on_ws_disconnect(&self, ctx: &crate::plugins::WsDisconnectContext) {
         self.inner.on_ws_disconnect(ctx).await;
     }
+    fn requires_decoded_query_params(&self) -> bool {
+        self.inner.requires_decoded_query_params()
+    }
     fn active_jwks_uris(&self) -> Vec<String> {
         self.inner.active_jwks_uris()
     }
@@ -310,6 +313,7 @@ impl PluginCapabilities {
     pub const HAS_BODY_BEFORE_BEFORE_PROXY: u8 = 1 << 3;
     pub const NEEDS_REQUEST_BODY_BYTES: u8 = 1 << 4;
     pub const HAS_BODY_BEFORE_AUTHENTICATE: u8 = 1 << 5;
+    pub const NEEDS_DECODED_QUERY_PARAMS: u8 = 1 << 6;
 
     #[inline(always)]
     pub fn has(self, flag: u8) -> bool {
@@ -356,6 +360,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.needs_request_body_bytes() {
             caps |= PluginCapabilities::NEEDS_REQUEST_BODY_BYTES;
+        }
+        if p.requires_decoded_query_params() {
+            caps |= PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS;
         }
     }
     PluginPhaseData {

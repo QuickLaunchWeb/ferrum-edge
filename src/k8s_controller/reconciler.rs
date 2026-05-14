@@ -29,6 +29,10 @@ pub struct ReconcilerConfig {
     pub watch_namespaces: Vec<String>,
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
+    /// When true, the Istio VirtualService translator emits a
+    /// `mesh_route_dispatch` plugin instance for routes with method/header/
+    /// query-param predicates. Default false (existing behavior).
+    pub vs_header_routing_experimental: bool,
 }
 
 pub struct ReconcileBroadcasters {
@@ -92,6 +96,7 @@ pub fn spawn_reconcile_loop(
                 cluster_domain: &reconciler_config.cluster_domain,
                 watch_namespaces: &reconciler_config.watch_namespaces,
                 trust_domain: &trust_domain,
+                vs_header_routing_experimental: reconciler_config.vs_header_routing_experimental,
                 metrics: &metrics,
             },
         )
@@ -121,6 +126,7 @@ pub fn spawn_reconcile_loop(
                             cluster_domain: &reconciler_config.cluster_domain,
                             watch_namespaces: &reconciler_config.watch_namespaces,
                             trust_domain: &trust_domain,
+                            vs_header_routing_experimental: reconciler_config.vs_header_routing_experimental,
                             metrics: &metrics,
                         },
                     ).await;
@@ -144,6 +150,7 @@ pub fn spawn_reconcile_loop(
                             cluster_domain: &reconciler_config.cluster_domain,
                             watch_namespaces: &reconciler_config.watch_namespaces,
                             trust_domain: &trust_domain,
+                            vs_header_routing_experimental: reconciler_config.vs_header_routing_experimental,
                             metrics: &metrics,
                         },
                     ).await;
@@ -304,6 +311,7 @@ struct ReconcileContext<'a> {
     cluster_domain: &'a str,
     watch_namespaces: &'a [String],
     trust_domain: &'a TrustDomain,
+    vs_header_routing_experimental: bool,
     metrics: &'a ControllerMetrics,
 }
 
@@ -326,7 +334,8 @@ async fn do_reconcile(
 
     let options = K8sTranslationOptions::new(ctx.namespace.to_string(), ctx.trust_domain.clone())
         .with_cluster_domain(ctx.cluster_domain.to_string())
-        .with_source_namespaces(ctx.watch_namespaces.to_vec());
+        .with_source_namespaces(ctx.watch_namespaces.to_vec())
+        .with_vs_header_routing_experimental(ctx.vs_header_routing_experimental);
     let Some(translation) = translate_with_skip_retries(&objects, options, ctx.metrics) else {
         return;
     };
@@ -407,6 +416,8 @@ fn gateway_config_content_changed(new_config: &GatewayConfig, old_config: &Gatew
 
 const K8S_MANAGED_PROXY_ID_PREFIXES: &[&str] = &["gwapi-route-", "gwapi-l4-", "istio-vs-"];
 const K8S_MANAGED_UPSTREAM_ID_PREFIXES: &[&str] = &["gwapi-route-upstream-", "istio-vs-upstream-"];
+const K8S_MANAGED_PLUGIN_CONFIG_ID_PREFIXES: &[&str] =
+    &["istio-vs-fi-", "istio-vs-mrd-", "istio-vs-rt-"];
 
 fn managed_k8s_namespaces(
     namespace: &str,
@@ -444,9 +455,16 @@ fn merge_k8s_translation(
         !(namespace_is_managed(&upstream.namespace, managed_namespaces)
             && has_any_prefix(&upstream.id, K8S_MANAGED_UPSTREAM_ID_PREFIXES))
     });
+    merged.plugin_configs.retain(|plugin| {
+        !(namespace_is_managed(&plugin.namespace, managed_namespaces)
+            && has_any_prefix(&plugin.id, K8S_MANAGED_PLUGIN_CONFIG_ID_PREFIXES))
+    });
 
     merged.proxies.extend(k8s_config.proxies.clone());
     merged.upstreams.extend(k8s_config.upstreams.clone());
+    merged
+        .plugin_configs
+        .extend(k8s_config.plugin_configs.clone());
 
     let mut namespaces: BTreeSet<String> = merged.known_namespaces.iter().cloned().collect();
     namespaces.extend(k8s_config.known_namespaces.iter().cloned());
@@ -621,12 +639,24 @@ mod tests {
     fn merge_k8s_translation_preserves_db_resources_and_replaces_k8s_overlay() {
         let mut active = GatewayConfig::default();
         active.proxies.push(proxy("db-proxy", "db.internal"));
+        active.plugin_configs.push(plugin_config(
+            "operator-rate-limit",
+            json!({"max_requests": 100}),
+        ));
         active
             .proxies
             .push(proxy("gwapi-route-ferrum-old-0", "old.internal"));
         active.upstreams.push(upstream(
             "gwapi-route-upstream-ferrum-old-0",
             "old.internal",
+        ));
+        active.plugin_configs.push(plugin_config(
+            "istio-vs-mrd-ferrum-old-0",
+            json!({"rules": [{"match": {"methods": ["GET"]}, "destination": {"upstream_id": "old"}}]}),
+        ));
+        active.plugin_configs.push(plugin_config(
+            "istio-vs-rt-ferrum-old-0",
+            json!({"status_code": 404, "message": "unsupported Istio VirtualService match predicate"}),
         ));
         active.known_namespaces.push("db".to_string());
 
@@ -636,6 +666,10 @@ mod tests {
         k8s.upstreams.push(upstream(
             "gwapi-route-upstream-ferrum-new-0",
             "new.internal",
+        ));
+        k8s.plugin_configs.push(plugin_config(
+            "istio-vs-mrd-ferrum-new-0",
+            json!({"rules": [{"match": {"methods": ["GET"]}, "destination": {"upstream_id": "new"}}]}),
         ));
         k8s.known_namespaces.push("k8s".to_string());
 
@@ -660,6 +694,30 @@ mod tests {
                 .upstreams
                 .iter()
                 .all(|upstream| upstream.id != "gwapi-route-upstream-ferrum-old-0")
+        );
+        assert!(
+            merged
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id == "operator-rate-limit")
+        );
+        assert!(
+            merged
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id == "istio-vs-mrd-ferrum-new-0")
+        );
+        assert!(
+            merged
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != "istio-vs-mrd-ferrum-old-0")
+        );
+        assert!(
+            merged
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != "istio-vs-rt-ferrum-old-0")
         );
         assert!(merged.known_namespaces.contains(&"db".to_string()));
         assert!(merged.known_namespaces.contains(&"k8s".to_string()));
@@ -701,6 +759,11 @@ mod tests {
             "db.internal",
         ));
         active.upstreams[0].namespace = "ops".to_string();
+        active.plugin_configs.push(plugin_config(
+            "istio-vs-mrd-operator-owned",
+            json!({"rules": [{"match": {"methods": ["GET"]}, "destination": {"upstream_id": "operator"}}]}),
+        ));
+        active.plugin_configs[0].namespace = "ops".to_string();
 
         let k8s = GatewayConfig::default();
         let managed = BTreeSet::from(["ferrum".to_string()]);
@@ -717,6 +780,12 @@ mod tests {
                 .upstreams
                 .iter()
                 .any(|upstream| upstream.id == "gwapi-route-upstream-operator-owned")
+        );
+        assert!(
+            merged
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id == "istio-vs-mrd-operator-owned")
         );
     }
 
@@ -741,6 +810,21 @@ mod tests {
             "old.prod.internal",
         ));
         active.upstreams[1].namespace = "prod".to_string();
+        active.plugin_configs.push(plugin_config(
+            "istio-vs-fi-default-old-0",
+            json!({"abort": {"percentage": 10.0, "status_code": 503}}),
+        ));
+        active.plugin_configs[0].namespace = "default".to_string();
+        active.plugin_configs.push(plugin_config(
+            "istio-vs-mrd-prod-old-0",
+            json!({"rules": [{"match": {"methods": ["GET"]}, "destination": {"upstream_id": "old"}}]}),
+        ));
+        active.plugin_configs[1].namespace = "prod".to_string();
+        active.plugin_configs.push(plugin_config(
+            "istio-vs-rt-default-old-0",
+            json!({"status_code": 404, "message": "unsupported Istio VirtualService match predicate"}),
+        ));
+        active.plugin_configs[2].namespace = "default".to_string();
 
         let k8s = GatewayConfig::default();
         let managed = BTreeSet::new();
@@ -748,6 +832,7 @@ mod tests {
 
         assert!(merged.proxies.is_empty());
         assert!(merged.upstreams.is_empty());
+        assert!(merged.plugin_configs.is_empty());
     }
 
     #[test]

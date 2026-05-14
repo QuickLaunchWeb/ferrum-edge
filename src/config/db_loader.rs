@@ -25,6 +25,7 @@ use crate::config::types::{
     ResponseBodyMode, RetryConfig, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
+use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -47,6 +48,30 @@ struct PluginConfigRef {
     id: String,
     scope: PluginScope,
     proxy_id: Option<String>,
+}
+
+fn mesh_route_dispatch_references_upstream_id(plugin: &PluginConfig, upstream_id: &str) -> bool {
+    if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+        return false;
+    }
+    MeshRouteDispatchConfig::from_value(&plugin.config)
+        .is_ok_and(|config| config.references_upstream_id(upstream_id))
+}
+
+fn mesh_route_dispatch_referenced_upstream(
+    plugin: &PluginConfig,
+    upstream_ids: &HashSet<String>,
+) -> Option<String> {
+    if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+        return None;
+    }
+    let config = MeshRouteDispatchConfig::from_value(&plugin.config).ok()?;
+    config
+        .rules
+        .iter()
+        .filter_map(|rule| rule.destination.upstream_id.as_deref())
+        .find(|upstream_id| upstream_ids.contains(*upstream_id))
+        .map(ToOwned::to_owned)
 }
 
 fn declared_proxy_plugin_association_ids_from_spec(
@@ -553,6 +578,9 @@ impl DatabaseStore {
             .validate_unique_consumer_credentials(ValidationAction::Warn)
             .validate_upstream_references(ValidationAction::FatalStatic(
                 "Database has invalid upstream reference(s)",
+            ))
+            .validate_mesh_route_dispatch_references(ValidationAction::FatalStatic(
+                "Database has invalid mesh_route_dispatch upstream reference(s)",
             ))
             .validate_plugin_references(ValidationAction::FatalStatic(
                 "Database has invalid plugin reference(s)",
@@ -1099,7 +1127,13 @@ impl DatabaseStore {
                     .bind(uid)
                     .fetch_all(&mut *tx)
                     .await?;
-            if ref_rows.is_empty() {
+            let dispatch_ref = if ref_rows.is_empty() {
+                self.find_mesh_route_dispatch_upstream_ref_tx(&mut tx, uid)
+                    .await?
+            } else {
+                None
+            };
+            if ref_rows.is_empty() && dispatch_ref.is_none() {
                 info!("Cascade-deleting orphaned upstream {}", uid);
                 sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ?"))
                     .bind(uid)
@@ -1705,6 +1739,35 @@ impl DatabaseStore {
         Ok(())
     }
 
+    async fn mesh_route_dispatch_plugin_configs_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<Vec<PluginConfig>, anyhow::Error> {
+        let rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND enabled != 0"),
+        )
+        .bind("mesh_route_dispatch")
+        .fetch_all(&mut **tx)
+        .await?;
+
+        let mut plugins = Vec::with_capacity(rows.len());
+        for row in &rows {
+            plugins.push(row_to_plugin_config(row)?);
+        }
+        Ok(plugins)
+    }
+
+    async fn find_mesh_route_dispatch_upstream_ref_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        upstream_id: &str,
+    ) -> Result<Option<PluginConfig>, anyhow::Error> {
+        let plugins = self.mesh_route_dispatch_plugin_configs_tx(tx).await?;
+        Ok(plugins
+            .into_iter()
+            .find(|plugin| mesh_route_dispatch_references_upstream_id(plugin, upstream_id)))
+    }
+
     /// Delete an upstream only if it is not referenced by any proxy.
     /// Returns `Err` if the upstream is still in use.
     /// Uses a transaction to prevent race conditions between the reference
@@ -1724,6 +1787,17 @@ impl DatabaseStore {
             anyhow::bail!(
                 "Upstream {} is referenced by one or more proxies and cannot be deleted",
                 id
+            );
+        }
+        if let Some(plugin) = self
+            .find_mesh_route_dispatch_upstream_ref_tx(&mut tx, id)
+            .await?
+        {
+            tx.rollback().await?;
+            anyhow::bail!(
+                "Upstream {} is referenced by mesh_route_dispatch plugin_config '{}' and cannot be deleted",
+                id,
+                plugin.id
             );
         }
 
@@ -1754,7 +1828,14 @@ impl DatabaseStore {
                 .fetch_all(&mut *tx)
                 .await?;
 
-        if ref_rows.is_empty() {
+        let dispatch_ref = if ref_rows.is_empty() {
+            self.find_mesh_route_dispatch_upstream_ref_tx(&mut tx, old_upstream_id)
+                .await?
+        } else {
+            None
+        };
+
+        if ref_rows.is_empty() && dispatch_ref.is_none() {
             info!(
                 "Cleaning up orphaned upstream {} after proxy reassignment",
                 old_upstream_id
@@ -4098,6 +4179,45 @@ impl DatabaseStore {
                 upstream_id,
                 spec_id
             );
+        }
+
+        let upstream_rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT id FROM upstreams WHERE namespace = ? AND api_spec_id = ?"),
+        )
+        .bind(namespace)
+        .bind(spec_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        let spec_upstream_ids: HashSet<String> = upstream_rows
+            .iter()
+            .filter_map(|row| row.try_get::<String, _>("id").ok())
+            .collect();
+        if spec_upstream_ids.is_empty() {
+            return Ok(());
+        }
+
+        let plugin_rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND enabled != 0"),
+        )
+        .bind("mesh_route_dispatch")
+        .fetch_all(&mut **tx)
+        .await?;
+        for row in &plugin_rows {
+            let plugin = row_to_plugin_config(row)?;
+            if plugin.api_spec_id.as_deref() == Some(spec_id) {
+                continue;
+            }
+            if let Some(upstream_id) =
+                mesh_route_dispatch_referenced_upstream(&plugin, &spec_upstream_ids)
+            {
+                anyhow::bail!(
+                    "mesh_route_dispatch plugin_config '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                     detach it before replacing or deleting the API spec",
+                    plugin.id,
+                    upstream_id,
+                    spec_id
+                );
+            }
         }
 
         Ok(())

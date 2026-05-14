@@ -1614,6 +1614,68 @@ async fn test_restore_requires_confirm() {
 }
 
 #[tokio::test]
+async fn test_restore_rejects_invalid_plugin_config_before_delete() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let seed = json!({
+        "proxies": [
+            {"id": "restore-keep", "listen_path": "/keep", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+        ]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "Seed failed: {:?}", body);
+
+    let restore_payload = json!({
+        "proxies": [
+            {"id": "restore-new", "listen_path": "/new", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+        ],
+        "plugin_configs": [{
+            "id": "bad-mrd",
+            "plugin_name": "mesh_route_dispatch",
+            "scope": "proxy",
+            "proxy_id": "restore-new",
+            "enabled": true,
+            "config": {
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "backend_tls": {"verify_server_cert": false}
+                    }
+                }]
+            }
+        }]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+
+    assert_eq!(
+        status, 400,
+        "Invalid plugin restore should fail: {:?}",
+        body
+    );
+    let errors = body["validation_errors"]
+        .as_array()
+        .expect("validation errors");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.as_str().unwrap_or("").contains("mesh_route_dispatch")),
+        "expected plugin validation error: {:?}",
+        body
+    );
+
+    let (status, _, _) = admin_get(&base_url, "/proxies/restore-keep", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "restore validation must happen before destructive delete"
+    );
+}
+
+#[tokio::test]
 async fn test_restore_replaces_all_config() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;
@@ -2258,6 +2320,64 @@ async fn test_upstream_delete_referenced_by_proxy_returns_409() {
     assert!(
         body["error"].as_str().unwrap_or("").contains("referenced"),
         "Error should mention upstream is referenced: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_upstream_delete_referenced_by_mesh_route_dispatch_returns_409() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "id": "mrd-ref-u1",
+        "name": "mrd-referenced-upstream",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, _) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201);
+
+    let proxy = json!({
+        "id": "mrd-ref-p1",
+        "listen_path": "/mrd-ref-test",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create proxy failed: {:?}", body);
+
+    let plugin = json!({
+        "id": "mrd-ref-plugin",
+        "plugin_name": "mesh_route_dispatch",
+        "scope": "proxy",
+        "proxy_id": "mrd-ref-p1",
+        "enabled": true,
+        "config": {
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "mrd-ref-u1"}
+            }]
+        }
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+    assert_eq!(status, 201, "Create plugin failed: {:?}", body);
+
+    let (status, body) = admin_delete(&base_url, "/upstreams/mrd-ref-u1", &token).await;
+    assert_eq!(
+        status, 409,
+        "Should return 409 CONFLICT when upstream is referenced by mesh_route_dispatch: {:?}",
+        body
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("mesh_route_dispatch"),
+        "Error should mention mesh_route_dispatch reference: {:?}",
         body
     );
 }

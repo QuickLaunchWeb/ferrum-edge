@@ -552,6 +552,14 @@ pub struct EnvConfig {
     /// pass.
     pub mesh_sidecar_enforced: bool,
 
+    /// Opt-in: emit `mesh_route_dispatch` plugin instances for Istio
+    /// VirtualService routes that carry method/header/queryParam predicates.
+    /// Default false (existing predicate-drop behavior). Operators turn this
+    /// on to surface the predicates as a per-proxy plugin config — the
+    /// override channel runs through `RequestContext.route_override_*` and
+    /// is applied to dispatch after admission plugins have run.
+    pub mesh_vs_header_routing_experimental: bool,
+
     // Kubernetes CRD controller (Layer 8)
     /// Enable the Kubernetes CRD controller in CP mode. When true, the CP
     /// watches Istio and Gateway API CRDs and reconciles them into Ferrum
@@ -1300,6 +1308,7 @@ impl Default for EnvConfig {
             mesh_outbound_traffic_policy: "allow_any".to_string(),
             mesh_outbound_registry_reject_status: 502,
             mesh_sidecar_enforced: false,
+            mesh_vs_header_routing_experimental: false,
             k8s_controller_enabled: false,
             k8s_watch_namespaces: Vec::new(),
             k8s_kubeconfig_path: None,
@@ -1590,6 +1599,7 @@ impl EnvConfig {
             mesh_outbound_traffic_policy: String = "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY" => "allow_any".to_string();
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
+            mesh_vs_header_routing_experimental: bool = "FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL" => false;
             k8s_controller_enabled: bool = "FERRUM_K8S_CONTROLLER_ENABLED" => false;
             k8s_watch_namespaces: Vec<String> = "FERRUM_K8S_WATCH_NAMESPACES" => Vec::new();
             k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
@@ -1952,6 +1962,7 @@ impl EnvConfig {
             mesh_outbound_traffic_policy,
             mesh_outbound_registry_reject_status,
             mesh_sidecar_enforced,
+            mesh_vs_header_routing_experimental,
             k8s_controller_enabled,
             k8s_watch_namespaces,
             k8s_kubeconfig_path,

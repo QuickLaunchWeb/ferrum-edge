@@ -55,7 +55,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, upgrade::OnUpgrade};
 use hyper_util::rt::TokioIo;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -71,8 +71,8 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::types::{
-    AuthMode, BackendScheme, DispatchKind, GatewayConfig, HttpFlavor, PluginConfig, PluginScope,
-    Proxy, ResponseBodyMode, UpstreamTarget,
+    AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HttpFlavor,
+    PluginConfig, PluginScope, Proxy, ResponseBodyMode, Upstream, UpstreamTarget,
 };
 use crate::config::{EnvConfig, PoolConfig};
 use crate::connection_pool::ConnectionPool;
@@ -85,7 +85,7 @@ use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
-    WebSocketFrameDirection,
+    WebSocketFrameDirection, mesh_route_dispatch::MeshRouteDispatchConfig,
 };
 use crate::proxy::headers as headers_mod;
 use crate::request_epoch::{RequestEpoch, RequestEpochStore, StagedRequestEpoch};
@@ -111,6 +111,58 @@ static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+
+/// Validate that every `mesh_route_dispatch` rule's
+/// `destination.upstream_id` points at a real upstream in the config.
+///
+/// Treated as a rejecting validator (same bucket as
+/// `validate_upstream_references` for `Proxy.upstream_id`): a typo in a
+/// rule's upstream_id is observationally equivalent to a typo on
+/// `Proxy.upstream_id` — `apply_route_overrides_with_upstreams` still
+/// bakes the missing id into the request proxy, `select_upstream_target`
+/// returns no target, and HTTP/H2/H3 dispatch falls back to the proxy's
+/// default `backend_host:backend_port`. That silent fallback can route
+/// matched traffic to the wrong backend instead of failing config
+/// validation, so the contract here matches normal Proxy upstream-id
+/// validation: refuse the config, log every dangling reference once.
+///
+/// `GatewayConfig` is already namespace-scoped by its loader/distributor
+/// before this runtime validator runs. A missing id here can therefore mean
+/// "does not exist" or "exists only in another namespace"; admin admission
+/// performs the broader DB lookup and emits the more specific cross-namespace
+/// error before the config reaches this path.
+pub(crate) fn validate_mesh_route_dispatch_upstream_references(
+    config: &GatewayConfig,
+) -> Result<(), Vec<String>> {
+    let upstream_ids: HashSet<&str> = config.upstreams.iter().map(|u| u.id.as_str()).collect();
+    let mut errors = Vec::new();
+
+    for plugin in &config.plugin_configs {
+        if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+            continue;
+        }
+        let Ok(dispatch_config) = MeshRouteDispatchConfig::from_value(&plugin.config) else {
+            continue;
+        };
+        for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
+            if let Some(upstream_id) = rule.destination.upstream_id.as_deref()
+                && !upstream_ids.contains(upstream_id)
+            {
+                let proxy_id = plugin.proxy_id.as_deref().unwrap_or("<none>");
+                errors.push(format!(
+                    "PluginConfig '{}' (mesh_route_dispatch) rule {} for proxy_id '{}' references upstream_id '{}' that is not present in the active GatewayConfig namespace",
+                    plugin.id, rule_idx, proxy_id, upstream_id
+                ));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
 
 /// Capability probes run during startup and background refresh, so they should
 /// not inherit long per-request connect timeouts that could hold readiness.
@@ -1580,6 +1632,15 @@ impl ProxyState {
         tls_policy: Option<TlsPolicy>,
         health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
+        if let Err(errors) = validate_mesh_route_dispatch_upstream_references(&config) {
+            for msg in &errors {
+                error!("Initial config rejected: {}", msg);
+            }
+            return Err(anyhow::anyhow!(
+                "Initial config has invalid mesh_route_dispatch upstream references"
+            ));
+        }
+
         let alt_svc_header = if env_config.enable_http3 {
             Some(format!("h3=\":{}\"; ma=86400", env_config.proxy_https_port))
         } else {
@@ -2031,10 +2092,15 @@ impl ProxyState {
         &self,
         config: &GatewayConfig,
     ) -> Vec<BackendCapabilityProbeTarget> {
-        let upstream_map: HashMap<&str, &crate::config::types::Upstream> = config
+        let upstream_map: HashMap<&str, &Upstream> = config
             .upstreams
             .iter()
             .map(|upstream| (upstream.id.as_str(), upstream))
+            .collect();
+        let proxy_map: HashMap<&str, &Proxy> = config
+            .proxies
+            .iter()
+            .map(|proxy| (proxy.id.as_str(), proxy))
             .collect();
         let mut seen = std::collections::HashSet::new();
         let mut targets = Vec::new();
@@ -2063,8 +2129,96 @@ impl ProxyState {
             }
         }
 
+        self.collect_mesh_route_dispatch_capability_targets(
+            config,
+            &proxy_map,
+            &upstream_map,
+            &mut seen,
+            &mut targets,
+        );
+
         self.backend_capabilities.retain_keys(&seen);
         targets
+    }
+
+    fn collect_mesh_route_dispatch_capability_targets(
+        &self,
+        config: &GatewayConfig,
+        proxy_map: &HashMap<&str, &Proxy>,
+        upstream_map: &HashMap<&str, &Upstream>,
+        seen: &mut std::collections::HashSet<String>,
+        targets: &mut Vec<BackendCapabilityProbeTarget>,
+    ) {
+        for plugin in &config.plugin_configs {
+            if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+                continue;
+            }
+            let Some(proxy_id) = plugin.proxy_id.as_deref() else {
+                continue;
+            };
+            let Some(base_proxy) = proxy_map.get(proxy_id) else {
+                continue;
+            };
+            if !base_proxy.dispatch_kind.is_http_family() {
+                continue;
+            }
+            let Ok(dispatch_config) =
+                MeshRouteDispatchConfig::from_value_normalized(&plugin.config)
+            else {
+                warn!(
+                    plugin_id = %plugin.id,
+                    proxy_id = %proxy_id,
+                    "Skipping mesh_route_dispatch capability targets: config failed to parse"
+                );
+                continue;
+            };
+
+            for rule in dispatch_config.rules {
+                let destination = rule.destination;
+                let direct_backend_override = destination.upstream_id.is_none()
+                    && (destination.backend_host.is_some() || destination.backend_port.is_some());
+                let mut effective_proxy = (*base_proxy).clone();
+                if let Some(upstream_id) = destination.upstream_id {
+                    effective_proxy.upstream_id = Some(upstream_id.clone());
+                    let Some(upstream) = upstream_map.get(upstream_id.as_str()) else {
+                        continue;
+                    };
+                    effective_proxy.resolved_tls = BackendTlsConfig::from_upstream(upstream);
+                    for target in &upstream.targets {
+                        let probe_target = BackendCapabilityProbeTarget::from_proxy(
+                            &effective_proxy,
+                            Some(target),
+                        );
+                        if seen.insert(probe_target.key.clone()) {
+                            targets.push(probe_target);
+                        }
+                    }
+                    continue;
+                }
+
+                if let Some(host) = destination.backend_host {
+                    effective_proxy.backend_host = host;
+                }
+                if let Some(port) = destination.backend_port {
+                    effective_proxy.backend_port = port;
+                }
+                if direct_backend_override {
+                    let reset_direct_tls = effective_proxy.upstream_id.is_some();
+                    effective_proxy.upstream_id = None;
+                    if reset_direct_tls {
+                        effective_proxy.resolved_tls = BackendTlsConfig::from_proxy(base_proxy);
+                    }
+                }
+                if let Some(tls) = destination.backend_tls {
+                    effective_proxy.resolved_tls = tls;
+                }
+
+                let probe_target = BackendCapabilityProbeTarget::from_proxy(&effective_proxy, None);
+                if seen.insert(probe_target.key.clone()) {
+                    targets.push(probe_target);
+                }
+            }
+        }
     }
 
     fn build_backend_capability_probe_proxy(proxy: &Proxy) -> Proxy {
@@ -2831,6 +2985,15 @@ impl ProxyState {
     ///     500 every request through that proxy.
     ///   - `validate_plugin_references` — dangling plugin IDs / wrong
     ///     scope.
+    ///   - `validate_mesh_route_dispatch_upstream_references` — dangling
+    ///     `mesh_route_dispatch.destination.upstream_id` references are
+    ///     observationally identical to a dangling `Proxy.upstream_id`:
+    ///     `apply_route_overrides_with_upstreams` bakes the missing id
+    ///     into the request proxy, `select_upstream_target` returns no
+    ///     target, and dispatch silently falls back to the proxy's
+    ///     default backend host/port. Reject before swap so the typo
+    ///     surfaces as a config error instead of silent traffic
+    ///     misrouting.
     ///   - `validate_stream_proxy_port_conflicts` — rejects in non-DP
     ///     modes, warns in DP mode (the DP doesn't control its config and
     ///     one bad stream proxy port shouldn't block all other config
@@ -2882,6 +3045,9 @@ impl ProxyState {
             errors.extend(errs);
         }
         if let Err(errs) = config.validate_plugin_references() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = validate_mesh_route_dispatch_upstream_references(config) {
             errors.extend(errs);
         }
 
@@ -7350,6 +7516,16 @@ async fn handle_proxy_request_inner(
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
+    // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
+    // Istio VirtualService header/method match). When no overrides are set,
+    // this is an `Arc::clone` — no per-request allocation. When overrides
+    // are set, the override values are baked into a fresh `Arc<Proxy>` so
+    // downstream pool keys, capability-registry lookups, URL construction,
+    // and circuit-breaker target keys all derive from the effective
+    // destination (pool-poisoning invariant).
+    let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
+
     // Resolve upstream target and hash key from the request epoch.
     let selection = backend_dispatch::select_upstream_target(
         &proxy,
@@ -7465,21 +7641,19 @@ async fn handle_proxy_request_inner(
     // the right content-type. The gRPC pool uses h2c (plaintext HTTP/2) for
     // `BackendScheme::Http` and TLS+ALPN=h2 for `BackendScheme::Https`.
     if is_grpc_request && proxy.dispatch_kind.is_http_family() {
-        let (grpc_effective_host, grpc_effective_port) = if let Some(ref target) = upstream_target {
-            (target.host.as_str(), target.port)
-        } else {
-            (proxy.backend_host.as_str(), proxy.backend_port)
-        };
         // Honor DestinationRule per-port `connect_timeout_ms` overrides on
         // the gRPC path — the gRPC transport reads
-        // `proxy.backend_connect_timeout_ms` directly (grpc_proxy.rs), so we
-        // must pass the resolved Cow<Proxy> through dispatch. Borrowed when
-        // no override applies; cloned only when an override differs.
-        let grpc_effective_proxy =
-            resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref());
-        let grpc_dispatch_proxy: &Proxy = grpc_effective_proxy.as_ref();
+        // `proxy.backend_{host,port,connect_timeout_ms}` directly
+        // (grpc_proxy.rs), so we must pass the resolved Cow<Proxy> through
+        // dispatch. Borrowed when no override applies; cloned only when the
+        // selected target or per-port timeout differs.
+        let grpc_connection_proxy =
+            resolve_backend_connection_proxy_for_target(&proxy, upstream_target.as_deref());
+        let grpc_dispatch_proxy: &Proxy = grpc_connection_proxy.as_ref();
+        let grpc_effective_host = grpc_dispatch_proxy.backend_host.as_str();
+        let grpc_effective_port = grpc_dispatch_proxy.backend_port;
         let mut grpc_backend_url = build_backend_url_with_target(
-            &proxy,
+            grpc_dispatch_proxy,
             &path,
             &query_string,
             grpc_effective_host,
@@ -7813,8 +7987,10 @@ async fn handle_proxy_request_inner(
                 // current target so per-port `connect_timeout_ms` overrides
                 // apply to the retried backend. Same per-target-rotation
                 // contract as `proxy_to_backend_inner`.
-                let grpc_retry_effective_proxy =
-                    resolve_effective_proxy_for_target(&proxy, grpc_current_target.as_deref());
+                let grpc_retry_effective_proxy = resolve_backend_connection_proxy_for_target(
+                    &proxy,
+                    grpc_current_target.as_deref(),
+                );
                 grpc_result = grpc_proxy::proxy_grpc_request_from_bytes(
                     grpc_method.clone(),
                     grpc_req_headers.clone(),
@@ -9400,6 +9576,12 @@ pub fn build_backend_url_with_target(
 /// has at least one port override AND (b) the resolved destination port
 /// matches a configured override key AND (c) the override's
 /// `connect_timeout_ms` differs from `proxy.backend_connect_timeout_ms`.
+/// Use this helper when the transport receives the LB-selected
+/// `UpstreamTarget` separately (reqwest/H3 dispatch, TCP/HBONE timeout
+/// derivation) and only needs the per-port timeout rebased onto the proxy.
+/// Do not use it for pools that key or dial from `proxy.backend_host` /
+/// `proxy.backend_port`; those paths need
+/// `resolve_backend_connection_proxy_for_target`.
 ///
 /// `upstream_target` is the LB-selected target whose port we'll connect to;
 /// when `None` the call is a direct-backend proxy with no upstream, so no
@@ -9424,6 +9606,31 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     let mut owned = proxy.clone();
     owned.backend_connect_timeout_ms = override_ms;
     std::borrow::Cow::Owned(owned)
+}
+
+/// Resolve the effective `Proxy` for backend pools that build their key and
+/// dial target from `proxy.backend_host` / `proxy.backend_port`.
+///
+/// Generic reqwest and H3 dispatch pass the selected upstream target as an
+/// explicit argument to their transport. The gRPC and direct-H2 pools do not:
+/// their pool keys and connection establishment read the `Proxy` fields
+/// directly. After an upstream override or normal load-balanced selection,
+/// those pool-backed paths must bake the concrete target host/port into the
+/// proxy clone or they can reuse/dial a connection for the route template's
+/// original backend.
+pub(crate) fn resolve_backend_connection_proxy_for_target<'a>(
+    proxy: &'a Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> std::borrow::Cow<'a, Proxy> {
+    let mut effective = resolve_effective_proxy_for_target(proxy, upstream_target);
+    if let Some(target) = upstream_target
+        && (effective.backend_host != target.host || effective.backend_port != target.port)
+    {
+        let owned = effective.to_mut();
+        owned.backend_host = target.host.clone();
+        owned.backend_port = target.port;
+    }
+    effective
 }
 
 /// Retry a backend request, replaying the original request body if available.
@@ -9926,13 +10133,9 @@ async fn proxy_to_backend(
         let pool_config = state.connection_pool.global_pool_config().for_proxy(proxy);
         // Mirror the warmup path: the direct H2 pool must key and dial on the
         // load-balanced target, not the proxy's template backend_host/port.
-        let direct_h2_target_proxy = upstream_target.map(|target| {
-            let mut target_proxy = proxy.clone();
-            target_proxy.backend_host = target.host.clone();
-            target_proxy.backend_port = target.port;
-            target_proxy
-        });
-        let direct_h2_proxy = direct_h2_target_proxy.as_ref().unwrap_or(proxy);
+        let direct_h2_effective_proxy =
+            resolve_backend_connection_proxy_for_target(proxy, upstream_target);
+        let direct_h2_proxy = direct_h2_effective_proxy.as_ref();
         if can_use_direct_http2_pool(
             pool_config.enable_http2,
             retain_request_body,
@@ -12633,8 +12836,10 @@ async fn proxy_to_backend_http3_retry(
     client_ip: &str,
     is_tls: bool,
 ) -> retry::BackendResponse {
-    // Honor DestinationRule per-port `connect_timeout_ms` overrides — see
-    // `resolve_effective_proxy_for_target` for the Cow-Borrowed fast path.
+    // reqwest dispatch receives `upstream_target` separately, so it only
+    // needs per-port timeout rebasing. gRPC/direct-H2 pool paths use
+    // `resolve_backend_connection_proxy_for_target` because their pool key and
+    // dial target come from `proxy.backend_host` / `proxy.backend_port`.
     let effective_proxy = resolve_effective_proxy_for_target(proxy, upstream_target);
     let proxy: &Proxy = effective_proxy.as_ref();
 
@@ -13747,6 +13952,292 @@ mod tests {
     /// explicit string.
     fn fake_pool_key(proxy_id: &str) -> String {
         format!("test-pool-key|{proxy_id}")
+    }
+
+    #[tokio::test]
+    async fn capability_targets_include_mesh_route_dispatch_override_upstreams() {
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
+        let mut upstream = upstream_with_targets("canary", &[("canary.test", 8443)]);
+        upstream.backend_tls_client_cert_path = Some("/certs/canary.pem".to_string());
+        upstream.backend_tls_client_key_path = Some("/certs/canary.key".to_string());
+        upstream.backend_tls_server_ca_cert_path = Some("/certs/canary-ca.pem".to_string());
+        upstream.backend_tls_verify_server_cert = false;
+
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "mrd-p".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "canary"}
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+        let state = make_test_proxy_state(config);
+        let loaded = state.config.load_full();
+
+        let targets = state.collect_backend_capability_targets(&loaded);
+        let canary = targets
+            .iter()
+            .find(|target| target.host() == "canary.test" && target.port() == 8443)
+            .expect("override upstream target should be probed");
+        assert_eq!(
+            canary.proxy.resolved_tls.client_cert_path.as_deref(),
+            Some("/certs/canary.pem")
+        );
+        assert_eq!(
+            canary.proxy.resolved_tls.client_key_path.as_deref(),
+            Some("/certs/canary.key")
+        );
+        assert_eq!(
+            canary.proxy.resolved_tls.server_ca_cert_path.as_deref(),
+            Some("/certs/canary-ca.pem")
+        );
+        assert!(!canary.proxy.resolved_tls.verify_server_cert);
+    }
+
+    #[tokio::test]
+    async fn capability_targets_reset_tls_for_mesh_route_dispatch_direct_backends() {
+        let mut proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
+        proxy.upstream_id = Some("stable".to_string());
+        proxy.backend_tls_client_cert_path = Some("/certs/direct.pem".to_string());
+        proxy.backend_tls_client_key_path = Some("/certs/direct.key".to_string());
+        proxy.backend_tls_server_ca_cert_path = Some("/certs/direct-ca.pem".to_string());
+        proxy.resolved_tls = BackendTlsConfig {
+            client_cert_path: Some("/certs/stale-upstream.pem".to_string()),
+            client_key_path: Some("/certs/stale-upstream.key".to_string()),
+            server_ca_cert_path: Some("/certs/stale-upstream-ca.pem".to_string()),
+            verify_server_cert: false,
+        };
+
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "mrd-p".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "backend_host": "direct.test",
+                        "backend_port": 9443
+                    }
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+        let state = make_test_proxy_state(config);
+        let loaded = state.config.load_full();
+
+        let targets = state.collect_backend_capability_targets(&loaded);
+        let direct = targets
+            .iter()
+            .find(|target| target.host() == "direct.test" && target.port() == 9443)
+            .expect("direct backend override target should be probed");
+        assert_eq!(direct.proxy.upstream_id, None);
+        assert_eq!(
+            direct.proxy.resolved_tls.client_cert_path.as_deref(),
+            Some("/certs/direct.pem")
+        );
+        assert_eq!(
+            direct.proxy.resolved_tls.client_key_path.as_deref(),
+            Some("/certs/direct.key")
+        );
+        assert_eq!(
+            direct.proxy.resolved_tls.server_ca_cert_path.as_deref(),
+            Some("/certs/direct-ca.pem")
+        );
+        assert!(
+            direct.proxy.resolved_tls.verify_server_cert,
+            "direct backend probe should reset stale upstream verify policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_targets_normalize_mesh_route_dispatch_direct_backend_hosts() {
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "mrd-p".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "backend_host": " Direct.TEST ",
+                        "backend_port": 9443
+                    }
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+        let state = make_test_proxy_state(config);
+        let loaded = state.config.load_full();
+
+        let targets = state.collect_backend_capability_targets(&loaded);
+
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.host() == "direct.test" && target.port() == 9443),
+            "capability probes must use the same normalized direct backend host as the runtime plugin"
+        );
+        assert!(
+            !targets
+                .iter()
+                .any(|target| target.host() == " Direct.TEST "),
+            "raw mesh_route_dispatch backend_host must not become a separate capability key"
+        );
+    }
+
+    #[test]
+    fn validate_mesh_route_dispatch_upstream_references_rejects_missing_upstream() {
+        // A typo'd upstream_id in a mesh_route_dispatch rule must fail
+        // validation, not just warn. The reviewer correctly flagged that
+        // the previous warn-only behavior let traffic silently fall back
+        // to the proxy's default backend_host/backend_port -- matched
+        // requests would observe wrong-backend routing while the gateway
+        // continued serving. The reject path now mirrors normal
+        // Proxy.upstream_id validation.
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "mrd-p".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "missing-upstream"}
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+
+        let result = validate_mesh_route_dispatch_upstream_references(&config);
+        let errs = result.expect_err("dangling upstream_id must be rejected");
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("missing-upstream"), "{errs:?}");
+        assert!(errs[0].contains("mrd-p"), "{errs:?}");
+    }
+
+    #[test]
+    fn validate_mesh_route_dispatch_upstream_references_ok_for_existing_upstream() {
+        // When the rule's upstream_id resolves to a real upstream, the
+        // validator returns Ok. Sanity check that we're not over-rejecting.
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
+        let now = chrono::Utc::now();
+        let upstream = upstream_with_targets("real-upstream", &[("backend.test", 8080)]);
+        let plugin = PluginConfig {
+            id: "mrd-p".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "real-upstream"}
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+
+        validate_mesh_route_dispatch_upstream_references(&config).expect("existing upstream ok");
+    }
+
+    #[test]
+    fn validate_mesh_route_dispatch_upstream_references_skips_disabled_plugins() {
+        // Disabled plugins don't execute on the hot path, so a typo in a
+        // disabled instance shouldn't block config reload. This mirrors
+        // the existing `enabled` check in the validator.
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "mrd-p".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "missing-upstream"}
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p".to_string()),
+            enabled: false,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+
+        validate_mesh_route_dispatch_upstream_references(&config)
+            .expect("disabled plugin must not block validation");
     }
 
     #[test]
@@ -14874,6 +15365,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_full_config_rejects_dangling_mesh_route_dispatch_upstream_id() {
+        // External-review P2: mesh_route_dispatch.destination.upstream_id
+        // typos used to be warn-only and silently routed matched traffic
+        // to the proxy's default backend. The reject contract now matches
+        // normal Proxy.upstream_id references -- a typo refuses the swap
+        // before in-flight requests can observe wrong-backend dispatch.
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let proxy = make_validation_proxy("p1", "/api");
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "mrd-p1".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "does-not-exist"}
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p1".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut bad_config = make_validation_config(vec![proxy]);
+        bad_config.plugin_configs = vec![plugin];
+
+        let err = state
+            .validate_full_config(&bad_config)
+            .expect_err("dangling mesh_route_dispatch upstream_id must be rejected");
+        assert!(
+            err.iter().any(|e| e.contains("does-not-exist")),
+            "error must reference the missing upstream; got {err:?}"
+        );
+        assert!(
+            err.iter().any(|e| e.contains("mesh_route_dispatch")),
+            "error must identify the plugin family; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_state_new_rejects_dangling_mesh_route_dispatch_upstream_id() {
+        // The same reject contract must hold for the initial constructor, not
+        // only reloads. File/database/mesh startup call ProxyState::new()
+        // directly after loader validation, and the loader pipeline does not
+        // inspect mesh_route_dispatch destinations.
+        let proxy = make_validation_proxy("p1", "/api");
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "mrd-p1".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "does-not-exist"}
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p1".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut bad_config = make_validation_config(vec![proxy]);
+        bad_config.plugin_configs = vec![plugin];
+
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let result = ProxyState::new(bad_config, dns_cache, env_config, None, None);
+
+        assert!(result.is_err(), "constructor must reject dangling upstream");
+        let err = result.err().expect("error present").to_string();
+        assert!(
+            err.contains("mesh_route_dispatch"),
+            "error must identify the invalid plugin family; got {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn update_config_rejects_invalid_config_without_swapping() {
         // End-to-end check: when validate_full_config rejects, the swap
         // must not happen. This is the security-relevant contract — a
@@ -14950,8 +15526,12 @@ mod tests {
     }
 
     fn target_for_test(port: u16) -> UpstreamTarget {
+        target_with_host_for_test("backend.local", port)
+    }
+
+    fn target_with_host_for_test(host: &str, port: u16) -> UpstreamTarget {
         UpstreamTarget {
-            host: "backend.local".to_string(),
+            host: host.to_string(),
             port,
             weight: 1,
             tags: HashMap::new(),
@@ -15020,6 +15600,50 @@ mod tests {
             "missing upstream_target must take the borrowed branch"
         );
         assert_eq!(effective.backend_connect_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn resolve_backend_connection_proxy_rebases_selected_target_host_port() {
+        let proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        let target = target_with_host_for_test("canary.local", 9090);
+        let effective = resolve_backend_connection_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Owned(_)),
+            "pool-backed dispatch must clone when the selected target differs"
+        );
+        assert_eq!(effective.backend_host, "canary.local");
+        assert_eq!(effective.backend_port, 9090);
+        assert_eq!(effective.backend_connect_timeout_ms, 5000);
+        assert_eq!(proxy.backend_host, "backend.local");
+        assert_eq!(proxy.backend_port, 8080);
+    }
+
+    #[test]
+    fn resolve_backend_connection_proxy_preserves_port_override_when_rebasing_target() {
+        let proxy = proxy_with_port_overrides_for_test(5000, &[(9090, 750)]);
+        let target = target_with_host_for_test("canary.local", 9090);
+        let effective = resolve_backend_connection_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Owned(_)),
+            "target rebase plus port override must use the owned branch"
+        );
+        assert_eq!(effective.backend_host, "canary.local");
+        assert_eq!(effective.backend_port, 9090);
+        assert_eq!(effective.backend_connect_timeout_ms, 750);
+        assert_eq!(proxy.backend_connect_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn resolve_backend_connection_proxy_borrows_when_target_matches() {
+        let proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        let target = target_for_test(8080);
+        let effective = resolve_backend_connection_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Borrowed(_)),
+            "matching target with no policy override must stay zero-alloc"
+        );
+        assert_eq!(effective.backend_host, "backend.local");
+        assert_eq!(effective.backend_port, 8080);
     }
 
     #[test]
