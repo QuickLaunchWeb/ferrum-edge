@@ -159,6 +159,13 @@ impl MeshRouteDispatch {
                     "mesh_route_dispatch.rules[{idx}].destination.backend_port must be non-zero"
                 ));
             }
+            if let Some(host) = rule.destination.backend_host.as_deref()
+                && host.is_empty()
+            {
+                return Err(format!(
+                    "mesh_route_dispatch.rules[{idx}].destination.backend_host must not be empty"
+                ));
+            }
             let has_backend_host = rule.destination.backend_host.is_some();
             let has_backend_port = rule.destination.backend_port.is_some();
             if rule.destination.upstream_id.is_some()
@@ -407,6 +414,18 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.contains("non-zero"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_destination_with_empty_backend_host() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"backend_host": "", "backend_port": 443}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("backend_host must not be empty"), "got: {err}");
     }
 
     #[test]
