@@ -1321,6 +1321,18 @@ mod tests {
             .collect()
     }
 
+    fn route_names(response: &DiscoveryResponse) -> Vec<String> {
+        response
+            .resources
+            .iter()
+            .map(|resource| {
+                super::super::proto::RouteConfiguration::decode(resource.value.as_slice())
+                    .expect("route resource should decode")
+                    .name
+            })
+            .collect()
+    }
+
     fn delta_cluster_names(response: &DeltaDiscoveryResponse) -> Vec<String> {
         response
             .resources
@@ -1332,6 +1344,22 @@ mod tests {
                     .expect("delta resource should carry an Any payload");
                 super::super::proto::Cluster::decode(resource.value.as_slice())
                     .expect("cluster resource should decode")
+                    .name
+            })
+            .collect()
+    }
+
+    fn delta_route_names(response: &DeltaDiscoveryResponse) -> Vec<String> {
+        response
+            .resources
+            .iter()
+            .map(|resource| {
+                let resource = resource
+                    .resource
+                    .as_ref()
+                    .expect("delta resource should carry an Any payload");
+                super::super::proto::RouteConfiguration::decode(resource.value.as_slice())
+                    .expect("route resource should decode")
                     .name
             })
             .collect()
@@ -1716,6 +1744,65 @@ mod tests {
         assert!(!subscription.wildcard);
         assert_eq!(subscription.resource_names, vec![name]);
         assert_eq!(response.resources.len(), 1);
+    }
+
+    #[test]
+    fn sotw_explicit_rds_subscription_returns_only_requested_route() {
+        let config = gateway_config_with_services(&["api", "admin"], 0);
+        let server = test_server(config.clone());
+        let mut subscriptions = HashMap::new();
+        let requested = "route/default/api".to_string();
+        let request = DiscoveryRequest {
+            type_url: super::super::translator::RDS_TYPE_URL.to_string(),
+            resource_names: vec![requested.clone()],
+            ..DiscoveryRequest::default()
+        };
+
+        let (_, response) = server
+            .sotw_response_for_request("node-a", &config, &mut subscriptions, &request)
+            .expect("explicit RDS request should receive a response");
+
+        assert_eq!(route_names(&response), vec![requested.clone()]);
+        let subscription = subscriptions
+            .get(super::super::translator::RDS_TYPE_URL)
+            .expect("RDS subscription should be tracked");
+        assert!(!subscription.wildcard);
+        assert_eq!(subscription.resource_names, vec![requested]);
+    }
+
+    #[test]
+    fn delta_explicit_rds_subscription_returns_only_requested_route() {
+        let config = gateway_config_with_services(&["api", "admin"], 0);
+        let server = test_server(config);
+        let requested = "route/default/api".to_string();
+        let request = DeltaDiscoveryRequest {
+            type_url: super::super::translator::RDS_TYPE_URL.to_string(),
+            resource_names_subscribe: vec![requested.clone()],
+            ..DeltaDiscoveryRequest::default()
+        };
+        let (subscription, changed, explicit) = build_delta_subscription(
+            None,
+            "node-a",
+            &request.type_url,
+            &request.resource_names_subscribe,
+            &request.resource_names_unsubscribe,
+        );
+        assert!(changed);
+        assert!(explicit);
+        assert!(!subscription.wildcard);
+
+        let snapshot = server.rebuild_snapshot("node-a");
+        let response = server.delta_response(
+            &snapshot,
+            None,
+            &subscription,
+            &request.initial_resource_versions,
+            &request.resource_names_subscribe,
+            &request.resource_names_unsubscribe,
+        );
+
+        assert_eq!(delta_route_names(&response), vec![requested]);
+        assert!(response.removed_resources.is_empty());
     }
 
     #[test]

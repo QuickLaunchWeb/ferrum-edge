@@ -971,6 +971,12 @@ spec:
               name: http        # resolves to 8080 via the Service index above
 ```
 
+## xDS ADS Compatibility
+
+Ferrum's ADS server honors explicit SotW and delta resource subscriptions per type URL. A client that subscribes to one named RDS/CDS/LDS/EDS/SDS resource receives only that resource, while wildcard subscriptions (`*` or an initial empty SotW/delta request) continue to receive the full collection for the requested type URL. Subsequent empty SotW requests preserve the established wildcard or explicit state, and delta subscribe/unsubscribe updates mutate that per-stream subscription state without broadcasting unrelated resources.
+
+Delta xDS wire-byte optimization and ECDS `TypedExtensionConfig` resources remain staged follow-ups in the GAP-2L track; the current support is the explicit-resource subscription state machine.
+
 ## Istio Compatibility Gaps
 
 The following Istio mesh surfaces are either deferred or have Ferrum-specific support notes:
