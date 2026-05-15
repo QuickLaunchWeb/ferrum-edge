@@ -11,6 +11,7 @@ use tracing::warn;
 use crate::config::conf_file::resolve_ferrum_var;
 
 pub const DEFAULT_PROXY_UID: u32 = 1337;
+const XTABLES_LOCK_WAIT_SECONDS: u8 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureMode {
@@ -443,7 +444,7 @@ fn iptables_script(
     {
         chunks.push(
             "command -v ip6tables >/dev/null 2>&1 || { echo \"ip6tables is required for IPv6 mesh capture\" >&2; exit 1; }\n\
-             ip6tables -t nat -L >/dev/null 2>&1 || { echo \"ip6tables nat table is required for IPv6 mesh capture\" >&2; exit 1; }"
+             ip6tables -t nat -w 5 -L >/dev/null 2>&1 || { echo \"ip6tables nat table is required for IPv6 mesh capture\" >&2; exit 1; }"
                 .to_string(),
         );
     }
@@ -454,7 +455,7 @@ fn iptables_script(
         let v6_script = v6_commands.join("\n");
         match ip6tables_mode {
             Ip6TablesMode::Auto => chunks.push(format!(
-                "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -L >/dev/null 2>&1; then\n{v6_script}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\necho \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
+                "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -w 5 -L >/dev/null 2>&1; then\n{v6_script}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\necho \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
             )),
             Ip6TablesMode::Required => chunks.push(v6_script),
             Ip6TablesMode::Disabled => {}
@@ -478,25 +479,27 @@ fn cleanup_commands_for(binary: &str) -> Vec<String> {
 }
 
 fn idempotent_new_chain(binary: &str, table: &str, chain: &str) -> String {
-    format!("{binary} -t {table} -N {chain} 2>/dev/null || true")
+    format!("{binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -N {chain} 2>/dev/null || true")
 }
 
 fn idempotent_append(binary: &str, table: &str, chain: &str, rule: &str) -> String {
     format!(
-        "{binary} -t {table} -C {chain} {rule} 2>/dev/null || {binary} -t {table} -A {chain} {rule}"
+        "{binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -C {chain} {rule} 2>/dev/null || {binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -A {chain} {rule}"
     )
 }
 
 fn idempotent_delete(binary: &str, table: &str, chain: &str, rule: &str) -> String {
-    format!("{binary} -t {table} -D {chain} {rule} 2>/dev/null || true")
+    format!(
+        "{binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -D {chain} {rule} 2>/dev/null || true"
+    )
 }
 
 fn flush_chain(binary: &str, table: &str, chain: &str) -> String {
-    format!("{binary} -t {table} -F {chain} 2>/dev/null || true")
+    format!("{binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -F {chain} 2>/dev/null || true")
 }
 
 fn delete_chain(binary: &str, table: &str, chain: &str) -> String {
-    format!("{binary} -t {table} -X {chain} 2>/dev/null || true")
+    format!("{binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -X {chain} 2>/dev/null || true")
 }
 
 #[cfg(test)]
@@ -679,6 +682,18 @@ mod tests {
             assert!(
                 cmd.contains("|| true"),
                 "cleanup command must tolerate missing chains: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn iptables_plan_waits_for_xtables_lock() {
+        let plan = IptablesPlan::for_config(&CaptureConfig::explicit(15006, 15001));
+
+        for cmd in plan.v4_commands {
+            assert!(
+                cmd.contains(" -w 5 "),
+                "iptables command should wait briefly for xtables lock: {cmd}"
             );
         }
     }
@@ -962,7 +977,7 @@ mod tests {
         let script = IptablesPlan::for_config(&config).script(Ip6TablesMode::Auto);
 
         assert!(script.contains("command -v ip6tables"));
-        assert!(script.contains("ip6tables -t nat -L"));
+        assert!(script.contains("ip6tables -t nat -w 5 -L"));
         assert!(script.contains("ip6tables nat table unavailable"));
         assert!(script.contains("skipping IPv6 mesh capture rules"));
         assert!(script.contains("ip6tables -t nat"));
@@ -980,7 +995,7 @@ mod tests {
 
         assert!(script.contains("ip6tables is required for IPv6 mesh capture"));
         assert!(script.contains("ip6tables nat table is required for IPv6 mesh capture"));
-        assert!(script.contains("ip6tables -t nat -L"));
+        assert!(script.contains("ip6tables -t nat -w 5 -L"));
         assert!(script.contains("exit 1"));
         assert!(script.contains("ip6tables -t nat"));
         assert!(

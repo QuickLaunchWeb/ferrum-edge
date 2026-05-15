@@ -539,7 +539,7 @@ where
             );
 
             let plan = IptablesPlan::for_config(&config.capture_config);
-            let include_v6_cleanup = !plan.v6_commands.is_empty();
+            let include_v6_cleanup = true;
             let setup = setup_commands_for_plan(&plan, config.capture_config.ip6tables_mode);
             if let Err(setup_err) = execute(setup, "setup").await {
                 let cleanup = cleanup_commands_for_plan(
@@ -596,7 +596,7 @@ fn setup_commands_for_plan(plan: &IptablesPlan, ip6tables_mode: Ip6TablesMode) -
     if !plan.v6_commands.is_empty() && ip6tables_mode == Ip6TablesMode::Required {
         commands.push(
             "command -v ip6tables >/dev/null 2>&1 || { echo \"ip6tables is required for IPv6 mesh capture\" >&2; exit 1; }\n\
-             ip6tables -t nat -L >/dev/null 2>&1 || { echo \"ip6tables nat table is required for IPv6 mesh capture\" >&2; exit 1; }"
+             ip6tables -t nat -w 5 -L >/dev/null 2>&1 || { echo \"ip6tables nat table is required for IPv6 mesh capture\" >&2; exit 1; }"
                 .to_string(),
         );
     }
@@ -618,13 +618,12 @@ fn cleanup_commands_for_plan(include_v6: bool, ip6tables_mode: Ip6TablesMode) ->
     let mut commands = IptablesPlan::cleanup_commands();
     if include_v6 {
         match ip6tables_mode {
-            Ip6TablesMode::Auto => commands.extend(
+            Ip6TablesMode::Auto | Ip6TablesMode::Disabled => commands.extend(
                 IptablesPlan::cleanup_v6_commands()
                     .iter()
                     .map(|cmd| ip6tables_auto_wrapped_command(cmd)),
             ),
             Ip6TablesMode::Required => commands.extend(IptablesPlan::cleanup_v6_commands()),
-            Ip6TablesMode::Disabled => {}
         }
     }
     commands
@@ -632,7 +631,7 @@ fn cleanup_commands_for_plan(include_v6: bool, ip6tables_mode: Ip6TablesMode) ->
 
 fn ip6tables_auto_wrapped_command(cmd: &str) -> String {
     format!(
-        "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -L >/dev/null 2>&1; then\n    {cmd}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\necho \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
+        "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -w 5 -L >/dev/null 2>&1; then\n    {cmd}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\necho \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
     )
 }
 
@@ -883,6 +882,33 @@ mod tests {
                 .iter()
                 .any(|(phase, count)| *phase == "setup" && *count > 1),
             "fallback setup should execute individual plan commands, got {command_counts:?}"
+        );
+    }
+
+    #[test]
+    fn cleanup_commands_try_ipv6_teardown_when_ip6tables_disabled() {
+        let commands = cleanup_commands_for_plan(true, Ip6TablesMode::Disabled);
+
+        assert!(
+            commands.iter().any(|cmd| cmd.contains("ip6tables")),
+            "cleanup should remove stale IPv6 chains even when current config disables IPv6 capture"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| cmd.contains("ip6tables -t nat -w 5 -L")),
+            "disabled-mode IPv6 cleanup should remain best-effort behind the auto nat probe"
+        );
+    }
+
+    #[test]
+    fn setup_commands_wait_for_xtables_lock() {
+        let plan = IptablesPlan::for_config(&CaptureConfig::explicit(15006, 15001));
+        let commands = setup_commands_for_plan(&plan, Ip6TablesMode::Auto);
+
+        assert!(
+            commands.iter().all(|cmd| cmd.contains(" -w 5 ")),
+            "setup commands should wait briefly for xtables lock: {commands:?}"
         );
     }
 

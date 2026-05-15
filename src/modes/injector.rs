@@ -1880,7 +1880,7 @@ mod tests {
 
         assert!(commands.contains("ip6tables is required for IPv6 mesh capture"));
         assert!(commands.contains("ip6tables nat table is required for IPv6 mesh capture"));
-        assert!(commands.contains("ip6tables -t nat -L"));
+        assert!(commands.contains("ip6tables -t nat -w 5 -L"));
         assert!(commands.contains("exit 1"));
         assert!(commands.contains("ip6tables -t nat"));
     }
