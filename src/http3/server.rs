@@ -1386,6 +1386,8 @@ async fn handle_h3_request(
         &mut proxy_headers,
         &state.mesh_egress_strip_baggage_keys,
     );
+    let effective_query_string =
+        crate::proxy::query_string_after_plugin_strips(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
     // Istio VirtualService header/method match). When no overrides are set,
@@ -1488,7 +1490,7 @@ async fn handle_h3_request(
         &proxy,
         http_flavor,
         &path,
-        &query_string,
+        effective_query_string.as_ref(),
         upstream_target.as_deref(),
     );
     let backend_start = std::time::Instant::now();
@@ -1612,7 +1614,7 @@ async fn handle_h3_request(
             cb_target_key,
             cb_is_half_open_probe,
             backend_url,
-            query_string,
+            effective_query_string.to_string(),
             proxy_headers,
             requires_ws_frame_hooks,
             is_early_data,
@@ -1667,7 +1669,7 @@ async fn handle_h3_request(
                 method: &method,
                 proxy_headers: &proxy_headers,
                 path: &path,
-                query_string: &query_string,
+                query_string: effective_query_string.as_ref(),
                 backend_url: &backend_url,
                 lb_hash_key: lb_hash_key.as_deref(),
                 upstream_target: upstream_target.as_deref(),
@@ -2549,7 +2551,7 @@ async fn handle_h3_request(
                     current_url = crate::proxy::build_backend_url_with_target(
                         &proxy,
                         &path,
-                        &query_string,
+                        effective_query_string.as_ref(),
                         &next.host,
                         next.port,
                         strip_len,

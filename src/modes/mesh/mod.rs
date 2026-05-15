@@ -2088,16 +2088,33 @@ fn inject_mesh_request_auth_plugin(
 
 /// Build a single `jwks_auth` provider configuration from a [`MeshJwtRule`].
 fn build_jwks_provider_config(rule: &MeshJwtRule) -> Option<serde_json::Value> {
-    let uri = rule.jwks_uri.as_ref()?;
-
     let mut provider = serde_json::json!({
         "issuer": rule.issuer,
-        "jwks_uri": uri,
         "forward_original_token": rule.forward_original_token,
     });
 
+    if let Some(uri) = &rule.jwks_uri {
+        provider["jwks_uri"] = serde_json::json!(uri);
+    } else if let Some(jwks) = &rule.jwks {
+        provider["jwks"] = serde_json::json!(jwks);
+    } else {
+        warn!(
+            issuer = %rule.issuer,
+            "Skipping MeshRequestAuthentication JWT rule with no jwks_uri or jwks"
+        );
+        return None;
+    }
+
     if !rule.audiences.is_empty() {
-        provider["audience"] = serde_json::json!(rule.audiences[0]);
+        provider["audiences"] = serde_json::json!(rule.audiences);
+    }
+
+    if !rule.from_headers.is_empty() {
+        provider["from_headers"] = serde_json::json!(rule.from_headers);
+    }
+
+    if !rule.from_params.is_empty() {
+        provider["from_params"] = serde_json::json!(rule.from_params);
     }
 
     Some(provider)
@@ -2989,10 +3006,10 @@ mod tests {
     use crate::dns::{DnsCache, DnsConfig};
     use crate::identity::{SpiffeId, TrustDomain};
     use crate::modes::mesh::config::{
-        AccessLogFilter, AppProtocol, EastWestGateway, MeshAccessLoggingConfig, MeshConfig,
-        MeshEndpoint, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule, MeshService,
-        MeshTelemetryResource, MeshTracingConfig, MultiClusterConfig, PolicyAction, PolicyScope,
-        PrincipalMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+        AccessLogFilter, AppProtocol, EastWestGateway, JwtHeader, MeshAccessLoggingConfig,
+        MeshConfig, MeshEndpoint, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule,
+        MeshService, MeshTelemetryResource, MeshTracingConfig, MultiClusterConfig, PolicyAction,
+        PolicyScope, PrincipalMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
         TracingProvider, Workload, WorkloadPort, WorkloadSelector,
     };
     use std::collections::{BTreeMap, HashMap};
@@ -5900,13 +5917,81 @@ mod tests {
 
         let provider = &jwks.config["providers"][0];
         assert_eq!(
-            provider.get("audience").and_then(|v| v.as_str()),
-            Some("my-api"),
-            "first audience should be set"
+            provider
+                .get("audiences")
+                .and_then(|v| v.as_array())
+                .cloned(),
+            Some(vec![serde_json::json!("my-api")]),
+            "audiences should be set"
         );
         assert_eq!(
             provider.get("jwks_uri").and_then(|v| v.as_str()),
             Some("https://auth.example.com/jwks")
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_request_auth_jwks_config_emits_inline_jwks_and_custom_locations() {
+        let runtime = test_mesh_runtime_config();
+        let inline_jwks = r#"{"keys":[]}"#.to_string();
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                request_authentications: vec![MeshRequestAuthentication {
+                    name: "with-inline".to_string(),
+                    namespace: "default".to_string(),
+                    scope: PolicyScope::MeshWide,
+                    jwt_rules: vec![MeshJwtRule {
+                        issuer: "https://auth.example.com".to_string(),
+                        audiences: vec!["my-api".to_string()],
+                        jwks_uri: None,
+                        jwks: Some(inline_jwks.clone()),
+                        from_headers: vec![
+                            JwtHeader {
+                                name: "X-Token".to_string(),
+                                prefix: Some("Token ".to_string()),
+                            },
+                            JwtHeader {
+                                name: "X-Raw-Token".to_string(),
+                                prefix: Some(String::new()),
+                            },
+                        ],
+                        from_params: vec!["access_token".to_string()],
+                        forward_original_token: false,
+                    }],
+                }],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let jwks = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID)
+            .expect("jwks_auth plugin");
+
+        let provider = &jwks.config["providers"][0];
+        assert_eq!(
+            provider.get("jwks").and_then(|v| v.as_str()),
+            Some(inline_jwks.as_str())
+        );
+        assert_eq!(
+            provider.get("from_headers"),
+            Some(&serde_json::json!([
+                {"name": "X-Token", "prefix": "Token "},
+                {"name": "X-Raw-Token", "prefix": ""}
+            ]))
+        );
+        assert_eq!(
+            provider.get("from_params"),
+            Some(&serde_json::json!(["access_token"]))
+        );
+        assert_eq!(
+            provider
+                .get("forward_original_token")
+                .and_then(|value| value.as_bool()),
+            Some(false)
         );
     }
 

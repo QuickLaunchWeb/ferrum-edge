@@ -55,6 +55,8 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, upgrade::OnUpgrade};
 use hyper_util::rt::TokioIo;
+use percent_encoding::percent_decode_str;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -4118,6 +4120,7 @@ async fn handle_websocket_request_authenticated(
     remote_addr: SocketAddr,
     proxy: Arc<Proxy>,
     ctx: RequestContext,
+    proxy_headers: HashMap<String, String>,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     plugin_execution_ns: u64,
     epoch: Arc<RequestEpoch>,
@@ -4130,6 +4133,7 @@ async fn handle_websocket_request_authenticated(
     is_tls: bool,
     cb_is_half_open_probe: bool,
     requires_ws_frame_hooks: bool,
+    query_string: String,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -4138,7 +4142,6 @@ async fn handle_websocket_request_authenticated(
     );
 
     // Build backend URL using upstream target if available
-    let query_string = req.uri().query().unwrap_or("").to_string();
     let (effective_host, effective_port) = if let Some(ref target) = upstream_target {
         (target.host.as_str(), target.port)
     } else {
@@ -4155,6 +4158,7 @@ async fn handle_websocket_request_authenticated(
 
     // Get the upgrade parts from the request
     let (mut parts, _body) = req.into_parts();
+    let mut client_headers = collect_forwardable_websocket_headers(&parts.headers, &proxy_headers);
 
     // Extract the OnUpgrade future
     let on_upgrade = match parts.extensions.remove::<OnUpgrade>() {
@@ -4198,22 +4202,26 @@ async fn handle_websocket_request_authenticated(
             }
         };
 
-    // Collect client headers to forward to backend
-    let mut client_headers = collect_forwardable_headers(&parts.headers);
-
     // Inject authenticated identity headers for WebSocket connections.
     if let Some(username) = ctx.backend_consumer_username() {
-        client_headers.push(("x-consumer-username".to_string(), username.to_string()));
+        push_forwardable_header_override(
+            &mut client_headers,
+            "x-consumer-username",
+            username.to_string(),
+        );
     }
     if let Some(custom_id) = ctx.backend_consumer_custom_id() {
-        client_headers.push(("x-consumer-custom-id".to_string(), custom_id.to_string()));
+        push_forwardable_header_override(
+            &mut client_headers,
+            "x-consumer-custom-id",
+            custom_id.to_string(),
+        );
     }
 
     // Egress baggage strip — see `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`.
-    // The WebSocket handshake builds its own header collection from
-    // `parts.headers`, so the central strip in `handle_proxy_request_inner`
-    // doesn't reach here. Apply the same shared helper to keep mesh-internal
-    // identity claims out of WS upgrade requests.
+    // The WebSocket handshake gets the same sanitized `proxy_headers` as the
+    // HTTP/gRPC dispatch paths. Keep applying the vector helper here because
+    // this function may append identity headers before backend dial.
     hbone_proxy::strip_egress_baggage_in_vec(
         &mut client_headers,
         &state.mesh_egress_strip_baggage_keys,
@@ -4697,40 +4705,141 @@ async fn handle_websocket_request_authenticated(
     Ok(upgrade_response)
 }
 
-/// Collect headers from the client request that should be forwarded to the backend WebSocket.
+/// Collect sanitized proxy headers that should be forwarded to the backend WebSocket.
 /// Hop-by-hop headers and WebSocket handshake headers are excluded.
-fn collect_forwardable_headers(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
-    /// Headers that must not be forwarded (hop-by-hop per RFC 9110 §7.6.1 + WS handshake).
-    const SKIP_HEADERS: &[&str] = &[
-        "connection",
-        "upgrade",
-        "sec-websocket-key",
-        "sec-websocket-version",
-        "sec-websocket-accept",
-        "host",
-        "transfer-encoding",
-        "te",
-        "trailer",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "proxy-connection",
-    ];
-
+#[cfg(test)]
+fn collect_forwardable_proxy_headers(headers: &HashMap<String, String>) -> Vec<(String, String)> {
     headers
         .iter()
         .filter_map(|(name, value)| {
-            // hyper already lowercases header names per HTTP/2 spec
-            let name_str = name.as_str();
-            if SKIP_HEADERS.contains(&name_str) {
+            let lower_name = name.to_ascii_lowercase();
+            if headers_mod::is_backend_request_strip_header(lower_name.as_str())
+                || is_websocket_backend_strip_header(lower_name.as_str())
+            {
                 return None;
             }
-            value
-                .to_str()
-                .ok()
-                .map(|v| (name_str.to_string(), v.to_string()))
+            Some((name.clone(), value.clone()))
         })
         .collect()
+}
+
+/// Collect backend WebSocket headers while preserving repeated client-provided
+/// values when the sanitized proxy header map still represents the full raw set.
+///
+/// `RequestContext::headers` is a `HashMap`, so repeated fields are necessarily
+/// collapsed or comma-folded after materialization. The raw `HeaderMap` is
+/// still available from the upgrade request; use it to retain handshake-
+/// equivalent repeated headers such as multiple `Sec-WebSocket-Protocol`
+/// values, while still honoring plugin-driven strips and rewrites reflected in
+/// `proxy_headers`.
+fn collect_forwardable_websocket_headers(
+    raw_headers: &hyper::HeaderMap,
+    proxy_headers: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut forwarded = Vec::new();
+    let mut preserved_raw_names = HashSet::new();
+
+    for name in raw_headers.keys() {
+        let lower_name = name.as_str().to_ascii_lowercase();
+        if headers_mod::is_backend_request_strip_header(lower_name.as_str())
+            || is_websocket_backend_strip_header(lower_name.as_str())
+        {
+            continue;
+        }
+
+        let Some((sanitized_name, sanitized_value)) =
+            proxy_header_entry_case_insensitive(proxy_headers, lower_name.as_str())
+        else {
+            continue;
+        };
+
+        let raw_values: Vec<&str> = raw_headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        if sanitized_value_preserves_raw_values(&raw_values, sanitized_value)
+            || sanitized_value == &materialized_raw_header_value(name.as_str(), &raw_values)
+        {
+            preserved_raw_names.insert(lower_name);
+            for value in raw_values {
+                forwarded.push((name.as_str().to_string(), value.to_string()));
+            }
+        } else {
+            forwarded.push((sanitized_name.clone(), sanitized_value.clone()));
+        }
+    }
+
+    for (name, value) in proxy_headers {
+        let lower_name = name.to_ascii_lowercase();
+        if preserved_raw_names.contains(lower_name.as_str())
+            || headers_mod::is_backend_request_strip_header(lower_name.as_str())
+            || is_websocket_backend_strip_header(lower_name.as_str())
+        {
+            continue;
+        }
+        if raw_headers.contains_key(lower_name.as_str()) {
+            continue;
+        }
+        forwarded.push((name.clone(), value.clone()));
+    }
+
+    forwarded
+}
+
+fn sanitized_value_preserves_raw_values(raw_values: &[&str], sanitized_value: &str) -> bool {
+    match raw_values {
+        [] => false,
+        [only] => *only == sanitized_value,
+        _ => {
+            // This exact fast-path only applies to list-style values where
+            // individual raw values do not contain literal commas. If that is
+            // not true, callers fall back to the shared materialized form.
+            let mut sanitized_values = sanitized_value.split(',').map(str::trim);
+            raw_values
+                .iter()
+                .map(|value| value.trim())
+                .all(|raw_value| sanitized_values.next() == Some(raw_value))
+                && sanitized_values.next().is_none()
+        }
+    }
+}
+
+fn materialized_raw_header_value(name: &str, raw_values: &[&str]) -> String {
+    if crate::plugins::is_comma_folded_list_header(name) {
+        raw_values.join(",")
+    } else {
+        raw_values.last().copied().unwrap_or_default().to_string()
+    }
+}
+
+fn proxy_header_entry_case_insensitive<'a>(
+    headers: &'a HashMap<String, String>,
+    name: &str,
+) -> Option<(&'a String, &'a String)> {
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+}
+
+fn is_websocket_backend_strip_header(name: &str) -> bool {
+    matches!(
+        name,
+        "host"
+            | "proxy-authenticate"
+            | "sec-websocket-key"
+            | "sec-websocket-version"
+            | "sec-websocket-accept"
+    )
+}
+
+fn push_forwardable_header_override(
+    headers: &mut Vec<(String, String)>,
+    name: &'static str,
+    value: String,
+) {
+    headers.retain(|(existing_name, _)| !existing_name.eq_ignore_ascii_case(name));
+    headers.push((name.to_string(), value));
 }
 
 /// Build a WebSocket backend URL using a specific target host/port,
@@ -4992,7 +5101,7 @@ pub(crate) async fn connect_websocket_backend(
             hyper::header::HeaderName::from_bytes(name.as_bytes()),
             hyper::header::HeaderValue::from_str(value),
         ) {
-            ws_request.headers_mut().insert(header_name, header_value);
+            ws_request.headers_mut().append(header_name, header_value);
         }
     }
 
@@ -7523,6 +7632,7 @@ async fn handle_proxy_request_inner(
     );
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+    let effective_query_string = query_string_after_plugin_strips(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
     // Istio VirtualService header/method match). When no overrides are set,
@@ -7622,12 +7732,14 @@ async fn handle_proxy_request_inner(
             }
         };
         let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
+        let websocket_proxy_headers = proxy_headers.clone();
         return handle_websocket_request_authenticated(
             request,
             state,
             remote_addr,
             proxy,
             ctx,
+            websocket_proxy_headers,
             plugins,
             plugin_execution_ns,
             Arc::clone(&epoch),
@@ -7640,6 +7752,7 @@ async fn handle_proxy_request_inner(
             is_tls,
             cb_is_half_open_probe,
             requires_ws_frame_hooks,
+            effective_query_string.to_string(),
         )
         .await;
     }
@@ -7663,7 +7776,7 @@ async fn handle_proxy_request_inner(
         let mut grpc_backend_url = build_backend_url_with_target(
             grpc_dispatch_proxy,
             &path,
-            &query_string,
+            effective_query_string.as_ref(),
             grpc_effective_host,
             grpc_effective_port,
             strip_len,
@@ -7962,7 +8075,7 @@ async fn handle_proxy_request_inner(
                     grpc_backend_url = build_backend_url_with_target(
                         &proxy,
                         &path,
-                        &query_string,
+                        effective_query_string.as_ref(),
                         &next.host,
                         next.port,
                         strip_len,
@@ -8635,7 +8748,7 @@ async fn handle_proxy_request_inner(
     let backend_url = build_backend_url_with_target(
         &proxy,
         &path,
-        &query_string,
+        effective_query_string.as_ref(),
         effective_host,
         effective_port,
         strip_len,
@@ -8805,7 +8918,7 @@ async fn handle_proxy_request_inner(
                 current_url = build_backend_url_with_target(
                     &proxy,
                     &path,
-                    &query_string,
+                    effective_query_string.as_ref(),
                     &next.host,
                     next.port,
                     strip_len,
@@ -10899,6 +11012,50 @@ pub(crate) fn build_sticky_cookie_header(
 
 pub(crate) fn strip_query_params(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
+}
+
+pub(crate) fn query_string_after_plugin_strips<'a>(
+    ctx: &RequestContext,
+    query_string: &'a str,
+) -> Cow<'a, str> {
+    if query_string.is_empty() {
+        return Cow::Borrowed(query_string);
+    }
+
+    let strip_names: HashSet<&str> = ctx
+        .metadata
+        .keys()
+        .filter_map(|key| {
+            key.strip_prefix(crate::plugins::jwks_auth::STRIP_QUERY_PARAM_METADATA_PREFIX)
+        })
+        .collect();
+    if strip_names.is_empty() {
+        return Cow::Borrowed(query_string);
+    }
+
+    let mut stripped = String::with_capacity(query_string.len());
+    let mut removed_any = false;
+    for pair in query_string.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
+        let decoded_name = percent_decode_str(raw_name).decode_utf8_lossy();
+        if strip_names.contains(raw_name) || strip_names.contains(decoded_name.as_ref()) {
+            removed_any = true;
+            continue;
+        }
+        if !stripped.is_empty() {
+            stripped.push('&');
+        }
+        stripped.push_str(pair);
+    }
+
+    if removed_any {
+        Cow::Owned(stripped)
+    } else {
+        Cow::Borrowed(query_string)
+    }
 }
 
 pub(crate) fn record_status(state: &ProxyState, status: u16) {
@@ -13146,6 +13303,214 @@ mod tests {
         );
 
         assert_eq!(url, "ws://backend.local:8080/?token=1");
+    }
+
+    #[test]
+    fn websocket_forwardable_headers_use_sanitized_proxy_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "edge.example".to_string());
+        headers.insert("connection".to_string(), "upgrade".to_string());
+        headers.insert("x-request-id".to_string(), "req-1".to_string());
+        headers.insert("x-added-by-plugin".to_string(), "kept".to_string());
+
+        let forwarded = collect_forwardable_proxy_headers(&headers);
+
+        assert!(forwarded.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-request-id") && value == "req-1"
+        }));
+        assert!(forwarded.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-added-by-plugin") && value == "kept"
+        }));
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("host")
+                    || name.eq_ignore_ascii_case("connection"))
+        );
+    }
+
+    #[test]
+    fn websocket_forwardable_headers_preserve_repeated_raw_values_when_sanitized_keeps_full_set() {
+        let mut raw = hyper::HeaderMap::new();
+        raw.append(
+            "sec-websocket-protocol",
+            hyper::header::HeaderValue::from_static("chat"),
+        );
+        raw.append(
+            "sec-websocket-protocol",
+            hyper::header::HeaderValue::from_static("superchat"),
+        );
+        raw.append("x-token", hyper::header::HeaderValue::from_static("secret"));
+
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/ws".to_string(),
+        );
+        ctx.set_raw_headers(raw.clone());
+        ctx.materialize_headers();
+        let mut sanitized = ctx.headers;
+        sanitized.remove("x-token");
+        sanitized.insert("x-added-by-plugin".to_string(), "kept".to_string());
+
+        let forwarded = collect_forwardable_websocket_headers(&raw, &sanitized);
+        let protocols: Vec<&str> = forwarded
+            .iter()
+            .filter_map(|(name, value)| {
+                name.eq_ignore_ascii_case("sec-websocket-protocol")
+                    .then_some(value.as_str())
+            })
+            .collect();
+
+        assert_eq!(protocols, vec!["chat", "superchat"]);
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-token")),
+            "headers stripped from the sanitized proxy map must not be restored from raw headers"
+        );
+        assert!(forwarded.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-added-by-plugin") && value == "kept"
+        }));
+    }
+
+    #[test]
+    fn websocket_forwardable_headers_do_not_restore_raw_duplicates_after_sanitized_rewrite() {
+        let mut raw = hyper::HeaderMap::new();
+        raw.append(
+            "sec-websocket-protocol",
+            hyper::header::HeaderValue::from_static("chat"),
+        );
+        raw.append(
+            "sec-websocket-protocol",
+            hyper::header::HeaderValue::from_static("superchat"),
+        );
+
+        let mut sanitized = HashMap::new();
+        sanitized.insert(
+            "sec-websocket-protocol".to_string(),
+            "superchat".to_string(),
+        );
+
+        let forwarded = collect_forwardable_websocket_headers(&raw, &sanitized);
+        let protocols: Vec<&str> = forwarded
+            .iter()
+            .filter_map(|(name, value)| {
+                name.eq_ignore_ascii_case("sec-websocket-protocol")
+                    .then_some(value.as_str())
+            })
+            .collect();
+
+        assert_eq!(protocols, vec!["superchat"]);
+    }
+
+    #[test]
+    fn websocket_forwardable_headers_preserve_repeated_non_list_raw_values_when_unmodified() {
+        let mut raw = hyper::HeaderMap::new();
+        raw.append(
+            "x-forwarded-for",
+            hyper::header::HeaderValue::from_static("203.0.113.1"),
+        );
+        raw.append(
+            "x-forwarded-for",
+            hyper::header::HeaderValue::from_static("198.51.100.2"),
+        );
+
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/ws".to_string(),
+        );
+        ctx.set_raw_headers(raw.clone());
+        ctx.materialize_headers();
+
+        let forwarded = collect_forwardable_websocket_headers(&raw, &ctx.headers);
+        let xff_values: Vec<&str> = forwarded
+            .iter()
+            .filter_map(|(name, value)| {
+                name.eq_ignore_ascii_case("x-forwarded-for")
+                    .then_some(value.as_str())
+            })
+            .collect();
+
+        assert_eq!(xff_values, vec!["203.0.113.1", "198.51.100.2"]);
+    }
+
+    #[test]
+    fn websocket_identity_headers_override_client_supplied_values() {
+        let mut headers = vec![
+            ("x-consumer-username".to_string(), "spoofed".to_string()),
+            (
+                "X-Consumer-Username".to_string(),
+                "also-spoofed".to_string(),
+            ),
+            (
+                "x-consumer-custom-id".to_string(),
+                "spoofed-custom".to_string(),
+            ),
+            ("x-request-id".to_string(), "req-1".to_string()),
+        ];
+
+        push_forwardable_header_override(
+            &mut headers,
+            "x-consumer-username",
+            "trusted-user".to_string(),
+        );
+        push_forwardable_header_override(
+            &mut headers,
+            "x-consumer-custom-id",
+            "trusted-custom".to_string(),
+        );
+
+        let usernames: Vec<&str> = headers
+            .iter()
+            .filter_map(|(name, value)| {
+                name.eq_ignore_ascii_case("x-consumer-username")
+                    .then_some(value.as_str())
+            })
+            .collect();
+        let custom_ids: Vec<&str> = headers
+            .iter()
+            .filter_map(|(name, value)| {
+                name.eq_ignore_ascii_case("x-consumer-custom-id")
+                    .then_some(value.as_str())
+            })
+            .collect();
+
+        assert_eq!(usernames, vec!["trusted-user"]);
+        assert_eq!(custom_ids, vec!["trusted-custom"]);
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-request-id") && value == "req-1"
+        }));
+    }
+
+    #[test]
+    fn query_string_after_plugin_strips_removes_marked_token_params() {
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        ctx.metadata.insert(
+            format!(
+                "{}{}",
+                crate::plugins::jwks_auth::STRIP_QUERY_PARAM_METADATA_PREFIX,
+                "access_token"
+            ),
+            "true".to_string(),
+        );
+        ctx.metadata.insert(
+            format!(
+                "{}{}",
+                crate::plugins::jwks_auth::STRIP_QUERY_PARAM_METADATA_PREFIX,
+                "encoded token"
+            ),
+            "true".to_string(),
+        );
+
+        let stripped = query_string_after_plugin_strips(
+            &ctx,
+            "a=1&access_token=secret&encoded%20token=secret2&keep=2",
+        );
+
+        assert_eq!(stripped.as_ref(), "a=1&keep=2");
     }
 
     fn route_delta_proxy(
