@@ -210,7 +210,18 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
     };
     let addresses = pod_addresses(object);
     for address in &addresses {
-        acc.core.pod_by_ip.insert(address.clone(), key.clone());
+        if let Some(previous) = acc.core.pod_by_ip.insert(address.clone(), key.clone())
+            && previous != key
+        {
+            tracing::debug!(
+                ip = %address,
+                previous_namespace = %previous.namespace,
+                previous_pod = %previous.name,
+                replacement_namespace = %key.namespace,
+                replacement_pod = %key.name,
+                "Kubernetes pod IP mapping overwritten by later pod"
+            );
+        }
     }
     let pod = CorePod {
         namespace: object.metadata.namespace.clone(),
@@ -489,6 +500,8 @@ fn endpoint_is_ready(endpoint: &Value) -> bool {
     {
         return false;
     }
+    // EndpointSlice readiness fields are tri-state; Kubernetes treats omitted
+    // `ready`/`serving` as true for endpoints that are not terminating.
     let ready = conditions.get("ready").and_then(Value::as_bool);
     let serving = conditions
         .get("serving")
