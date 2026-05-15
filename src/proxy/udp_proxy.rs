@@ -405,7 +405,15 @@ async fn try_gso_send_or_fallback(
                     size = data.len(),
                     "GSO post-flush push refused datagram, sending directly"
                 );
-                let _ = frontend.send_to(data, client_addr).await;
+                if let Err(e) = frontend.send_to(data, client_addr).await {
+                    warn!(
+                        proxy_id = %proxy_id,
+                        client = %client_addr,
+                        size = data.len(),
+                        error = %e,
+                        "UDP fallback direct-send failed; datagram lost"
+                    );
+                }
             }
         }
         Err(e) => {
@@ -437,7 +445,15 @@ async fn try_gso_send_or_fallback(
                         size = data.len(),
                         "sendmmsg post-flush push refused datagram, sending directly"
                     );
-                    let _ = frontend.send_to(data, client_addr).await;
+                    if let Err(e) = frontend.send_to(data, client_addr).await {
+                        warn!(
+                            proxy_id = %proxy_id,
+                            client = %client_addr,
+                            size = data.len(),
+                            error = %e,
+                            "UDP fallback direct-send failed; datagram lost"
+                        );
+                    }
                 }
             }
         }
