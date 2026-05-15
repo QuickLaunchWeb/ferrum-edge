@@ -745,6 +745,8 @@ Port-list annotations merge with their Ferrum aliases; exclude lists also merge 
 
 **Pod-restart caveat:** annotations are evaluated at pod admission time only. Existing pods retain their previous capture rules until restart; bouncing affected workloads is required for previously-ignored annotations to take effect.
 
+**eBPF/ambient capture caveat:** today `include_outbound_ports` only flows through the iptables init container; the eBPF/ambient capture path ignores per-pod include-port annotations. The `EbpfBackend` trait exposes `update_port_exclude` but no corresponding `update_port_include`, and `CaptureConfig::from_env()` always seeds an empty `include_outbound_ports`, so the field is silently unused on the ambient path. Tracked as `GAP-2K`.
+
 **IPv6 CIDRs:** `includeOutboundIPRanges` / `excludeOutboundIPRanges` accept IPv6 CIDR literals (e.g. `fd00::/8`) at admission for forward compatibility, but `IptablesPlan::for_config` strips non-IPv4 CIDRs before emitting rules (with a `warn!` log naming each skipped CIDR). The init container only invokes the IPv4 `iptables` binary; feeding it a raw `-d fd00::/8` would fail the rule append and leave the capture chain half-populated. `ip6tables` fan-out is deferred. If an include list contains ONLY IPv6 CIDRs and `includeOutboundPorts` is unset, no outbound REDIRECT is emitted, so outbound capture is disabled for that pod. If explicit include ports are set, the IPv6 CIDRs are still stripped and the rendered REDIRECTs match those TCP destination ports for any IPv4 destination; if include ports is `*`, all IPv4 destinations are redirected. Check init-container logs for skip warnings.
 
 ### SPIFFE ID Derivation

@@ -643,6 +643,10 @@ fn initialize_backend(
             .update_port_exclude(*port)
             .map_err(anyhow::Error::msg)?;
     }
+    // TODO(GAP-2K): Propagate `include_outbound_ports` to EbpfBackend when
+    // ambient/eBPF picks up per-pod annotations. Today this is fine because
+    // per-pod annotations are injector-only and CaptureConfig::from_env()
+    // seeds an empty Vec; the iptables init container is the only consumer.
 
     info!("BPF programs loaded and maps initialized");
     Ok(())
