@@ -1167,13 +1167,26 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         .get("service")
         .and_then(Value::as_str)
         .unwrap_or(&object.metadata.name);
-    let service_name = service_key_from_host(
+    let service_key = service_key_from_host(
         service_raw,
         &object.metadata.namespace,
         &acc.options.cluster_domain,
-    )
-    .map(|key| key.name)
-    .unwrap_or_else(|| service_raw.to_string());
+    );
+    match service_key.as_ref() {
+        Some(key) if key.namespace != object.metadata.namespace => {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "WorkloadEntry.service '{service_raw}' references Service namespace '{}' but WorkloadEntry namespace is '{}'; cross-namespace WorkloadEntry service hosts are not supported",
+                    key.namespace, object.metadata.namespace
+                ),
+            ));
+        }
+        _ => {}
+    }
+    let service_name = service_key
+        .map(|key| key.name)
+        .unwrap_or_else(|| service_raw.to_string());
 
     Ok(Workload {
         spiffe_id: spiffe_id.clone(),
@@ -3140,6 +3153,35 @@ mod tests {
             "spiffe://cluster.local/ns/default/sa/api"
         );
         assert_eq!(workload.service_account.as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn workload_entry_cross_namespace_service_host_fails_closed() {
+        let err = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5",
+                    "service": "reviews.prod.svc.cluster.local"
+                }),
+            )],
+            options(),
+        )
+        .expect_err("cross-namespace WorkloadEntry service host must fail closed");
+
+        let err = err.to_string();
+        assert!(
+            err.contains("WorkloadEntry.service"),
+            "error should mention WorkloadEntry.service: {err}"
+        );
+        assert!(
+            err.contains("reviews.prod.svc.cluster.local"),
+            "error should include the offending host: {err}"
+        );
+        assert!(
+            err.contains("cross-namespace"),
+            "error should identify the unsupported cross-namespace reference: {err}"
+        );
     }
 
     #[test]

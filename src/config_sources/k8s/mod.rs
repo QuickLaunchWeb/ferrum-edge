@@ -512,7 +512,9 @@ fn collect_explicit_workload_service(acc: &mut K8sAccumulator, object: &K8sObjec
         service,
         &object.metadata.namespace,
         &acc.options.cluster_domain,
-    ) {
+    )
+    .filter(|key| key.namespace == object.metadata.namespace)
+    {
         acc.record_explicit_workload_service(key);
     }
 }
