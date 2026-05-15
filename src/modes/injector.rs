@@ -1391,6 +1391,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_include_port_list_rejects_repeated_wildcard() {
+        let err = parse_include_port_list(Some("*,*"))
+            .err()
+            .expect("repeated wildcard rejected");
+
+        assert_eq!(
+            err,
+            "wildcard '*' must be the only includeOutboundPorts token"
+        );
+    }
+
+    #[test]
     fn patch_uses_configurable_container_resources() {
         let pod = json!({
             "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
