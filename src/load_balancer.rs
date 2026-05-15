@@ -1077,14 +1077,13 @@ impl LoadBalancer {
                 if target_indices.is_empty() {
                     continue;
                 }
-                let effective_algorithm = override_config
-                    .algorithm
-                    .unwrap_or(LoadBalancerAlgorithm::RoundRobin);
-                let inherited_hash_on = match override_config.algorithm {
-                    Some(LoadBalancerAlgorithm::ConsistentHashing) => hash_on.as_deref(),
-                    _ => None,
-                };
-                let effective_hash_on = override_config.hash_on.as_deref().or(inherited_hash_on);
+                let effective_algorithm = override_config.algorithm.unwrap_or(algorithm);
+                let effective_hash_on =
+                    if effective_algorithm == LoadBalancerAlgorithm::ConsistentHashing {
+                        override_config.hash_on.as_deref().or(hash_on.as_deref())
+                    } else {
+                        None
+                    };
                 let hash_ring = if effective_algorithm == LoadBalancerAlgorithm::ConsistentHashing {
                     build_hash_ring_for_indices(&host_port_keys, target_indices.iter().copied())
                 } else {
