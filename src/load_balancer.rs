@@ -1091,17 +1091,23 @@ impl LoadBalancer {
                 } else {
                     Vec::new()
                 };
+                let wrr_state = if effective_algorithm == LoadBalancerAlgorithm::WeightedRoundRobin
+                {
+                    // Keep WRR state indexed by the full upstream target
+                    // vector, even when only a subset serves this port, so
+                    // bitset, subset, and Vec fallback paths can share the
+                    // same target-index bookkeeping.
+                    vec![0; targets.len()]
+                } else {
+                    Vec::new()
+                };
                 port_states.insert(
                     *port,
                     PortLbState {
                         target_indices,
                         algorithm: effective_algorithm,
                         rr_counter: AtomicU64::new(0),
-                        // Keep WRR state indexed by the full upstream target
-                        // vector, even when only a subset serves this port,
-                        // so bitset, subset, and Vec fallback paths can share
-                        // the same target-index bookkeeping.
-                        wrr_state: std::sync::Mutex::new(vec![0; targets.len()]),
+                        wrr_state: std::sync::Mutex::new(wrr_state),
                         wrr_needs_stale_check: AtomicBool::new(false),
                         hash_ring,
                         hash_on_strategy: HashOnStrategy::parse(effective_hash_on),
@@ -3045,6 +3051,58 @@ mod tests {
             let result = lb.select("ignored", None);
             assert!(result.is_some());
         }
+    }
+
+    #[test]
+    fn non_wrr_port_override_does_not_allocate_wrr_state() {
+        let targets = vec![
+            make_target("10.0.0.1", 8080),
+            make_target("10.0.0.2", 8080),
+            make_target("10.0.0.3", 9090),
+        ];
+        let mut port_overrides = HashMap::new();
+        port_overrides.insert(
+            8080,
+            UpstreamPortOverride {
+                algorithm: Some(LoadBalancerAlgorithm::Random),
+                ..Default::default()
+            },
+        );
+        port_overrides.insert(
+            9090,
+            UpstreamPortOverride {
+                algorithm: Some(LoadBalancerAlgorithm::WeightedRoundRobin),
+                ..Default::default()
+            },
+        );
+
+        let lb = LoadBalancer::with_subsets_and_port_overrides(
+            "upstream-port-wrr-state",
+            LoadBalancerAlgorithm::RoundRobin,
+            &targets,
+            None,
+            None,
+            Some(&port_overrides),
+        );
+
+        let random_state = lb.port_overrides.get(&8080).expect("random override");
+        assert!(
+            random_state
+                .wrr_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+
+        let wrr_state = lb.port_overrides.get(&9090).expect("wrr override");
+        assert_eq!(
+            wrr_state
+                .wrr_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            targets.len()
+        );
     }
 
     #[test]
