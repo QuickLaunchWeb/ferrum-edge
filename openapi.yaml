@@ -4072,7 +4072,7 @@ components:
 
     RuntimeLogsSnapshot:
       type: object
-      description: Ferrum project tracing event counters, independent of the output log-level filter.
+      description: Ferrum project tracing event counters after applying the output log-level filter.
       properties:
         by_level:
           type: object

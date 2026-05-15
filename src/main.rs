@@ -211,7 +211,9 @@ fn init_logging() -> (WorkerGuard, WorkerGuard) {
             .unwrap_or(true);
 
     let installed = if log_counter_enabled {
-        let env_filter =
+        let fmt_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
+        let log_counter_level_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
         let fmt_layer = tracing_subscriber::fmt::layer()
             .json()
@@ -219,7 +221,7 @@ fn init_logging() -> (WorkerGuard, WorkerGuard) {
                 stdout: stdout_writer.clone(),
                 stderr: stderr_writer.clone(),
             })
-            .with_filter(env_filter);
+            .with_filter(fmt_filter);
         let log_counter_filter = filter_fn(|metadata| {
             crate::runtime_metrics_tracing_layer::should_count_target(metadata.target())
         });
@@ -229,7 +231,8 @@ fn init_logging() -> (WorkerGuard, WorkerGuard) {
                 crate::runtime_metrics_tracing_layer::CountingLayer::new(
                     crate::runtime_metrics::global(),
                 )
-                .with_filter(log_counter_filter),
+                .with_filter(log_counter_filter)
+                .with_filter(log_counter_level_filter),
             )
             .try_init()
             .is_ok()

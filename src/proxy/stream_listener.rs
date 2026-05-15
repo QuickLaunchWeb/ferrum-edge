@@ -868,7 +868,7 @@ fn active_backend_session_estimate_from_entries(entries: &[StreamBackendMetricEn
     entries.iter().fold(0u64, |total, entry| {
         let active = match entry {
             StreamBackendMetricEntry::Tcp(metrics) => {
-                metrics.active_connections.load(Ordering::Relaxed)
+                metrics.active_backend_connections.load(Ordering::Relaxed)
             }
             StreamBackendMetricEntry::Udp(metrics) => {
                 metrics.active_sessions.load(Ordering::Relaxed)
@@ -888,7 +888,10 @@ mod tests {
     fn active_backend_session_estimate_sums_tcp_and_udp_stream_sessions() {
         let tcp_metrics = Arc::new(TcpProxyMetrics::default());
         let udp_metrics = Arc::new(UdpProxyMetrics::default());
-        tcp_metrics.active_connections.store(2, Ordering::Relaxed);
+        tcp_metrics.active_connections.store(99, Ordering::Relaxed);
+        tcp_metrics
+            .active_backend_connections
+            .store(2, Ordering::Relaxed);
         udp_metrics.active_sessions.store(3, Ordering::Relaxed);
         let entries = vec![
             StreamBackendMetricEntry::Tcp(tcp_metrics),
