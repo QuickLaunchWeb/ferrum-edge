@@ -833,6 +833,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn iptables_plan_emits_any_ipv4_port_redirect_when_include_ports_and_only_ipv6_cidrs() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.include_cidrs = vec!["fd00::/8".to_string()];
+        config.include_outbound_ports = vec![5432];
+
+        let plan = IptablesPlan::for_config(&config);
+
+        assert!(
+            plan.commands
+                .iter()
+                .any(|cmd| { cmd.contains("-p tcp --dport 5432 -j REDIRECT --to-ports 15001") }),
+            "includeOutboundPorts should still emit a per-port redirect after IPv6 CIDRs are stripped: {:?}",
+            plan.commands
+        );
+        assert!(
+            !plan.commands.iter().any(|cmd| cmd.contains("fd00::/8")),
+            "IPv6 include CIDR must not appear in the IPv4 iptables plan: {:?}",
+            plan.commands
+        );
+    }
+
+    #[test]
+    fn iptables_plan_orders_exclude_port_before_overlapping_include_port() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.exclude_ports = vec![5432];
+        config.include_outbound_ports = vec![5432];
+
+        let plan = IptablesPlan::for_config(&config);
+        let exclude_idx = plan
+            .commands
+            .iter()
+            .position(|cmd| cmd.contains("-p tcp --dport 5432 -j RETURN"))
+            .expect("exclude port RETURN rule should be emitted");
+        let include_idx = plan
+            .commands
+            .iter()
+            .position(|cmd| cmd.contains("--dport 5432 -j REDIRECT --to-ports 15001"))
+            .expect("include port REDIRECT rule should be emitted");
+
+        assert!(
+            exclude_idx < include_idx,
+            "excludeOutboundPorts must win over includeOutboundPorts by rule order: {:?}",
+            plan.commands
+        );
+    }
+
     // The init container only invokes the IPv4 `iptables` binary. Passing an
     // IPv6 CIDR like `fd00::/8` as a raw `-d` argument makes the append fail
     // at runtime, which silently leaves the capture chain partially populated
