@@ -253,7 +253,7 @@ fn parse_port_list(raw: Option<&str>) -> Result<Vec<u16>, String> {
     Ok(ports)
 }
 
-enum IncludePortList {
+enum ParsedIncludePorts {
     Absent,
     All,
     Ports(Vec<u16>),
@@ -265,9 +265,9 @@ struct IncludeOutboundPorts {
     ports: Vec<u16>,
 }
 
-fn parse_include_port_list(raw: Option<&str>) -> Result<IncludePortList, String> {
+fn parse_include_port_list(raw: Option<&str>) -> Result<ParsedIncludePorts, String> {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(IncludePortList::Absent);
+        return Ok(ParsedIncludePorts::Absent);
     };
 
     let mut ports = Vec::new();
@@ -296,11 +296,11 @@ fn parse_include_port_list(raw: Option<&str>) -> Result<IncludePortList, String>
         ports.push(port);
     }
     if saw_wildcard {
-        return Ok(IncludePortList::All);
+        return Ok(ParsedIncludePorts::All);
     }
     ports.sort_unstable();
     ports.dedup();
-    Ok(IncludePortList::Ports(ports))
+    Ok(ParsedIncludePorts::Ports(ports))
 }
 
 fn parse_injector_proxy_uid(value: Option<String>) -> Result<Option<u32>, String> {
@@ -952,8 +952,8 @@ fn include_outbound_ports_for_pod(pod: &Value) -> Result<IncludeOutboundPorts, S
         )
         .map_err(|e| format!("invalid {key}: {e}"))?
         {
-            IncludePortList::Absent => {}
-            IncludePortList::All => {
+            ParsedIncludePorts::Absent => {}
+            ParsedIncludePorts::All => {
                 if !ports.is_empty() {
                     let explicit_key =
                         explicit_ports_key.unwrap_or("another includeOutboundPorts annotation");
@@ -964,7 +964,7 @@ fn include_outbound_ports_for_pod(pod: &Value) -> Result<IncludeOutboundPorts, S
                 saw_wildcard = true;
                 wildcard_key.get_or_insert(key);
             }
-            IncludePortList::Ports(annotation_ports) => {
+            ParsedIncludePorts::Ports(annotation_ports) => {
                 if saw_wildcard && !annotation_ports.is_empty() {
                     let wildcard_key =
                         wildcard_key.unwrap_or("another includeOutboundPorts annotation");

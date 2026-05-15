@@ -57,6 +57,16 @@ pub struct CaptureConfig {
 }
 
 impl CaptureConfig {
+    /// Build an `Explicit`-mode capture config with the implicit `0.0.0.0/0`
+    /// include CIDR default.
+    ///
+    /// `include_cidrs_explicit` is set to `false` here because the included
+    /// `0.0.0.0/0` is the implicit catch-all default, not an operator-supplied
+    /// value. Callers populating `include_cidrs` manually (e.g., tests) that
+    /// want the operator-supplied-`0.0.0.0/0` semantics — where the catch-all
+    /// is treated as an explicit choice rather than swallowed by
+    /// `includeOutboundPorts` narrowing — should also set
+    /// `include_cidrs_explicit: true` after construction.
     pub fn explicit(inbound_port: u16, outbound_port: u16) -> Self {
         Self {
             mode: CaptureMode::Explicit,
