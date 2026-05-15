@@ -583,14 +583,17 @@ fn jwt_from_headers(object: &K8sObject, rule: &Value) -> Result<Vec<JwtHeader>, 
                 )
             })?;
             let prefix = match header.get("prefix") {
-                Some(prefix) => Some(prefix.as_str().ok_or_else(|| {
-                    invalid_resource(
-                        object,
-                        format!(
-                            "RequestAuthentication jwtRules[].fromHeaders[{index}].prefix must be a string"
-                        ),
-                    )
-                })?),
+                Some(prefix) => {
+                    let prefix = prefix.as_str().ok_or_else(|| {
+                        invalid_resource(
+                            object,
+                            format!(
+                                "RequestAuthentication jwtRules[].fromHeaders[{index}].prefix must be a string"
+                            ),
+                        )
+                    })?;
+                    (!prefix.is_empty()).then_some(prefix)
+                }
                 None => None,
             };
             Ok(JwtHeader {
@@ -3788,7 +3791,8 @@ mod tests {
                         "audiences": ["my-app"],
                         "fromHeaders": [
                             {"name": "Authorization", "prefix": "Bearer "},
-                            {"name": "X-Custom-Token"}
+                            {"name": "X-Custom-Token"},
+                            {"name": "X-Raw-Token", "prefix": ""}
                         ],
                         "fromParams": ["access_token"],
                         "forwardOriginalToken": true
@@ -3815,11 +3819,13 @@ mod tests {
             Some("https://www.googleapis.com/oauth2/v3/certs")
         );
         assert_eq!(rule.audiences, vec!["my-app"]);
-        assert_eq!(rule.from_headers.len(), 2);
+        assert_eq!(rule.from_headers.len(), 3);
         assert_eq!(rule.from_headers[0].name, "Authorization");
         assert_eq!(rule.from_headers[0].prefix.as_deref(), Some("Bearer "));
         assert_eq!(rule.from_headers[1].name, "X-Custom-Token");
         assert!(rule.from_headers[1].prefix.is_none());
+        assert_eq!(rule.from_headers[2].name, "X-Raw-Token");
+        assert!(rule.from_headers[2].prefix.is_none());
         assert_eq!(rule.from_params, vec!["access_token"]);
         assert!(rule.forward_original_token);
     }

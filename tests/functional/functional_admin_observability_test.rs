@@ -2,10 +2,11 @@
 //!
 //! Exercises admin endpoints that surface operational state:
 //! - `/cluster` — CP/DP connection status (database mode returns informational)
+//! - `/metrics/runtime` — JWT-authenticated combined runtime JSON
 //! - `/overload` — unauthenticated JSON shape + 503 under request-critical load
 //! - `/namespaces` — distinct sorted namespaces (JWT required)
 //! - `/restore` — body-size limit (413) and malformed JSON (400)
-//! - JWT auth required on `/cluster` and `/namespaces`; `/overload` unauthenticated
+//! - JWT auth required on `/cluster`, `/metrics/runtime`, and `/namespaces`; `/overload` unauthenticated
 //!
 //! Run with:
 //!   cargo build --bin ferrum-edge
@@ -447,7 +448,80 @@ async fn test_cluster_requires_jwt() {
     );
 }
 
-/// Test 7: `/restore` body-size limit — POST a 2 MiB body with a 1 MiB limit → 413.
+/// Test 7: `/metrics/runtime` requires JWT auth and returns a live system sample.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_runtime_metrics_endpoint_requires_jwt_and_returns_system_json() {
+    let harness = TestGateway::builder()
+        .log_level("warn")
+        .env("FERRUM_METRICS_SYSTEM_SAMPLE_INTERVAL_MS", "100")
+        .env("FERRUM_METRICS_RUNTIME_CACHE_MS", "0")
+        .spawn()
+        .await
+        .expect("Failed to create harness");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let unauth = client
+        .get(format!("{}/metrics/runtime", harness.admin_base_url))
+        .send()
+        .await
+        .expect("GET /metrics/runtime without auth failed");
+    let status = unauth.status().as_u16();
+    assert!(
+        status == 401 || status == 403,
+        "/metrics/runtime without auth should be 401 or 403, got {status}"
+    );
+
+    let mut last_body = serde_json::Value::Null;
+    for _ in 0..20 {
+        sleep(Duration::from_millis(100)).await;
+        let resp = client
+            .get(format!("{}/metrics/runtime", harness.admin_base_url))
+            .header("Authorization", harness.auth_header())
+            .send()
+            .await
+            .expect("GET /metrics/runtime with auth failed");
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: serde_json::Value = resp.json().await.expect("runtime metrics JSON");
+        if body["system"]["memory"]["rss_bytes"].as_u64().unwrap_or(0) > 0 {
+            last_body = body;
+            break;
+        }
+        last_body = body;
+    }
+
+    assert_eq!(last_body["mode"].as_str(), Some("database"));
+    assert!(last_body["timestamp"].as_str().is_some(), "{last_body}");
+    assert!(
+        last_body["system"]["sampled_at_unix_ms"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "{last_body}"
+    );
+    assert!(
+        last_body["system"]["cpu"]["cpu_count"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "{last_body}"
+    );
+    assert!(
+        last_body["system"]["memory"]["rss_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "system sampler did not populate RSS within 2s: {last_body}"
+    );
+    assert!(last_body["http"]["status_codes"]["totals"].is_object());
+    assert_eq!(last_body["overload"]["level"].as_str(), Some("normal"));
+}
+
+/// Test 8: `/restore` body-size limit — POST a 2 MiB body with a 1 MiB limit → 413.
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_restore_body_size_limit() {
@@ -581,7 +655,7 @@ async fn test_restore_body_size_limit() {
     }
 }
 
-/// Test 8: `/restore` with malformed JSON → 400 with parse error in body.
+/// Test 9: `/restore` with malformed JSON → 400 with parse error in body.
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_restore_malformed_json() {

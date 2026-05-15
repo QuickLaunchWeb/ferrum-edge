@@ -276,11 +276,15 @@ async fn emit_udp_stream_disconnect(
     plugins: &[Arc<dyn Plugin>],
     context: UdpDisconnectContext<'_>,
 ) {
-    if plugins.is_empty() {
+    if plugins.is_empty() && context.error_class.is_none() {
         return;
     }
 
     let summary = build_udp_stream_summary(context);
+    crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
+    if plugins.is_empty() {
+        return;
+    }
     for plugin in plugins {
         plugin.on_stream_disconnect(&summary).await;
     }
@@ -1526,9 +1530,18 @@ async fn start_dtls_frontend_listener(
                 let handler_datagram_plugins = Arc::clone(&datagram_plugins);
                 let handler_proxy_name = proxy_name.clone();
                 let handler_proxy_namespace = proxy_namespace.clone();
-                let handler_consumer_username = stream_ctx.effective_identity().map(str::to_owned);
+                let handler_has_plugins = !plugins.is_empty();
+                let handler_consumer_username = if handler_has_plugins {
+                    stream_ctx.effective_identity().map(str::to_owned)
+                } else {
+                    None
+                };
                 let handler_auth_method = stream_ctx.auth_method;
-                let handler_metadata = stream_ctx.take_metadata();
+                let handler_metadata = if handler_has_plugins {
+                    stream_ctx.take_metadata()
+                } else {
+                    Default::default()
+                };
                 let handler_cb_cache = circuit_breaker_cache.clone();
                 let connected_at = chrono::Utc::now();
 
@@ -1589,8 +1602,7 @@ async fn start_dtls_frontend_listener(
                             }
                         };
 
-                    // Fire on_stream_disconnect plugins
-                    if !handler_plugins.is_empty() {
+                    if !handler_plugins.is_empty() || error_class.is_some() {
                         let disconnected_at = chrono::Utc::now();
                         let summary = build_dtls_stream_summary(DtlsDisconnectContext {
                             namespace: &handler_proxy_namespace,
@@ -1613,8 +1625,13 @@ async fn start_dtls_frontend_listener(
                             disconnect_cause,
                             metadata: &handler_metadata,
                         });
-                        for plugin in handler_plugins.iter() {
-                            plugin.on_stream_disconnect(&summary).await;
+                        crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
+
+                        // Fire on_stream_disconnect plugins
+                        if !handler_plugins.is_empty() {
+                            for plugin in handler_plugins.iter() {
+                                plugin.on_stream_disconnect(&summary).await;
+                            }
                         }
                     }
 

@@ -628,10 +628,10 @@ impl RequestContext {
                     // spec), and hyper normalizes HTTP/1.1 header names to
                     // lowercase at parse time. No `to_lowercase()` needed.
                     let key = name.as_str();
-                    if key == "baggage" {
-                        // W3C baggage is a list header, so multiple field lines
-                        // are equivalent to one comma-separated value. Preserve
-                        // that before raw headers are consumed by materialization.
+                    if is_comma_folded_list_header(key) {
+                        // These are list headers, so multiple field lines are
+                        // equivalent to one comma-separated value. Preserve that
+                        // before raw headers are consumed by materialization.
                         self.headers
                             .entry(key.to_owned())
                             .and_modify(|existing| {
@@ -745,6 +745,15 @@ impl RequestContext {
             .as_ref()
             .and_then(|consumer| consumer.custom_id.as_deref())
     }
+}
+
+/// Headers that are materialized by comma-folding repeated request values.
+///
+/// This is used both when `RequestContext` is built and when the WebSocket
+/// proxy path reconstructs the materialized form to decide whether raw
+/// repeated headers can be preserved for the backend handshake.
+pub(crate) fn is_comma_folded_list_header(name: &str) -> bool {
+    matches!(name, "baggage" | "sec-websocket-protocol")
 }
 
 fn dispatch_port_overrides_from_upstream(upstream: &Upstream) -> Option<HashMap<u16, u64>> {
@@ -1067,6 +1076,9 @@ impl TransactionSummary {
 /// spawned mirror task maximum time to complete. The mirror entry uses the
 /// same `TransactionSummary` schema with `mirror: true` so existing log
 /// pipelines work without changes.
+///
+/// Some proxy paths call this with an empty plugin slice so runtime transaction
+/// metrics still see no-plugin error and streaming-disconnect outcomes.
 pub async fn log_with_mirror(
     plugins: &[Arc<dyn Plugin>],
     summary: &TransactionSummary,
@@ -1075,6 +1087,7 @@ pub async fn log_with_mirror(
     for plugin in plugins {
         plugin.log(summary).await;
     }
+    crate::runtime_metrics::global_ref().record_transaction(summary);
     if let Some(mirror_result) = ctx.collect_mirror_result().await {
         let mirror_summary = summary.as_mirror_entry(mirror_result);
         for plugin in plugins {

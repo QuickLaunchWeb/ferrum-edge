@@ -180,6 +180,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **Transaction Debugger** — verbose request/response diagnostics via `tracing::debug` with header redaction (development only)
 - **Correlation ID** — UUID generation and propagation
 - **Prometheus Metrics** — exposition format endpoint
+- **Runtime Metrics Endpoint** — JWT-gated `/metrics/runtime` JSON snapshot with process/system metrics, HTTP status windows, error classes, DNS outcomes, backend pool churn, TCP reset counts, bounded log counters, and overload state
 - **API Chargeback** — per-consumer API usage charge tracking with configurable pricing tiers by status code, exposed via `/charges` admin endpoint in Prometheus and JSON formats for external billing integration
 - **OpenTelemetry Tracing** — W3C Trace Context propagation + OTLP/HTTP span export with batching, custom headers, rich semantic attributes, and propagation-only mode
 - **Customizable Transaction Log Schema** — per-plugin `schema:` (or shared `transaction_log_schema` with `schema_ref:`) lets operators rename keys, drop fields, reorder output, inject static stamping, emit derived fields (`status_class`/`outcome`/`backend_host`/`summary_kind`), flatten metadata, and choose timestamp format — without forking the gateway. Applies to stdout / http / tcp / udp / ws / kafka / loki / access_log JSON output and statsd tag rename / omit. Sensitive-key redaction always applies. See `docs/log_schema.md`.

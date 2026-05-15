@@ -368,12 +368,14 @@ Each `MeshJwtRule` specifies:
 | Field | Description |
 |---|---|
 | `issuer` | Expected JWT issuer (`iss` claim) |
-| `audiences` | Accepted audience values (`aud` claim) |
+| `audiences` | Accepted audience values (`aud` claim); any configured value may match |
 | `jwks_uri` | URL to fetch the JWKS key set |
-| `jwks` | Inline JWKS JSON (alternative to `jwks_uri`) |
+| `jwks` | Inline JWKS JSON (alternative to `jwks_uri`); keys are loaded from config without a fetch loop |
 | `from_headers` | Headers to extract the JWT from (with optional prefix stripping) |
 | `from_params` | Query parameters to extract the JWT from |
 | `forward_original_token` | Whether to forward the original token to the backend |
+
+Each JWT rule resolves token locations independently. Rules with custom `from_headers` or `from_params` check those locations in declaration order; rules without custom locations continue to use the standard `Authorization: Bearer ...` lookup. When `forward_original_token: false`, the backend-bound request strips the matched rule's configured token headers or query parameters (or `Authorization` for standard lookup).
 
 ## PeerAuthentication
 

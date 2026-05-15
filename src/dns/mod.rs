@@ -332,6 +332,7 @@ impl DnsCache {
 
             // Fresh entry — return immediately
             if entry.expires_at > now && !entry.addresses.is_empty() && !entry.is_error {
+                crate::runtime_metrics::global_ref().record_dns_hit();
                 return Ok(entry.addresses[0]);
             }
 
@@ -375,11 +376,13 @@ impl DnsCache {
                         hostname
                     );
                 }
+                crate::runtime_metrics::global_ref().record_dns_stale();
                 return Ok(entry.addresses[0]);
             }
 
             // Cached error that hasn't expired — return error immediately
             if entry.is_error && entry.expires_at > now {
+                crate::runtime_metrics::global_ref().record_dns_error();
                 anyhow::bail!("DNS resolution failed for {} (cached error)", hostname);
             }
         }
@@ -390,13 +393,25 @@ impl DnsCache {
         match self.timed_resolve(hostname).await {
             Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
                 let ttl = self.effective_ttl(native_ttl, per_proxy_ttl);
-                let addrs =
-                    self.cache_success_entry(hostname, addrs, record_type, ttl, per_proxy_ttl)?;
+                let addrs = match self.cache_success_entry(
+                    hostname,
+                    addrs,
+                    record_type,
+                    ttl,
+                    per_proxy_ttl,
+                ) {
+                    Ok(addrs) => addrs,
+                    Err(err) => {
+                        crate::runtime_metrics::global_ref().record_dns_error();
+                        return Err(err);
+                    }
+                };
 
                 debug!(
                     "DNS resolved {} -> {:?} (native_ttl={:?}, effective_ttl={:?})",
                     hostname, addrs[0], native_ttl, ttl
                 );
+                crate::runtime_metrics::global_ref().record_dns_miss();
                 Ok(addrs[0])
             }
             Ok(_) | Err(_) if hostname == "localhost" => {
@@ -405,17 +420,31 @@ impl DnsCache {
                 // if AAAA appears before A, prefer IPv6 loopback.
                 let addr = self.localhost_addr();
                 let ttl = self.effective_ttl(Duration::from_secs(3600), per_proxy_ttl);
-                let addrs =
-                    self.cache_success_entry(hostname, vec![addr], None, ttl, per_proxy_ttl)?;
+                let addrs = match self.cache_success_entry(
+                    hostname,
+                    vec![addr],
+                    None,
+                    ttl,
+                    per_proxy_ttl,
+                ) {
+                    Ok(addrs) => addrs,
+                    Err(err) => {
+                        crate::runtime_metrics::global_ref().record_dns_error();
+                        return Err(err);
+                    }
+                };
                 debug!("DNS resolved localhost -> {} (built-in fallback)", addr);
+                crate::runtime_metrics::global_ref().record_dns_miss();
                 Ok(addrs[0])
             }
             Ok(_) => {
                 self.cache_error(hostname, per_proxy_ttl);
+                crate::runtime_metrics::global_ref().record_dns_error();
                 anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
             }
             Err(e) => {
                 self.cache_error(hostname, per_proxy_ttl);
+                crate::runtime_metrics::global_ref().record_dns_error();
                 Err(e)
             }
         }
@@ -451,6 +480,7 @@ impl DnsCache {
             prior_per_proxy_ttl = entry.original_per_proxy_ttl;
 
             if entry.expires_at > now && !entry.addresses.is_empty() && !entry.is_error {
+                crate::runtime_metrics::global_ref().record_dns_hit();
                 return Ok(entry.addresses.clone());
             }
 
@@ -474,10 +504,12 @@ impl DnsCache {
                         }
                     }
                 }
+                crate::runtime_metrics::global_ref().record_dns_stale();
                 return Ok(entry.addresses.clone());
             }
 
             if entry.is_error && entry.expires_at > now {
+                crate::runtime_metrics::global_ref().record_dns_error();
                 anyhow::bail!("DNS resolution failed for {} (cached error)", hostname);
             }
         }
@@ -488,19 +520,49 @@ impl DnsCache {
         match self.timed_resolve(hostname).await {
             Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
                 let ttl = self.effective_ttl(native_ttl, per_proxy_ttl);
-                self.cache_success_entry(hostname, addrs, record_type, ttl, per_proxy_ttl)
+                let addrs = match self.cache_success_entry(
+                    hostname,
+                    addrs,
+                    record_type,
+                    ttl,
+                    per_proxy_ttl,
+                ) {
+                    Ok(addrs) => addrs,
+                    Err(err) => {
+                        crate::runtime_metrics::global_ref().record_dns_error();
+                        return Err(err);
+                    }
+                };
+                crate::runtime_metrics::global_ref().record_dns_miss();
+                Ok(addrs)
             }
             Ok(_) | Err(_) if hostname == "localhost" => {
                 let addr = self.localhost_addr();
                 let ttl = self.effective_ttl(Duration::from_secs(3600), per_proxy_ttl);
-                self.cache_success_entry(hostname, vec![addr], None, ttl, per_proxy_ttl)
+                let addrs = match self.cache_success_entry(
+                    hostname,
+                    vec![addr],
+                    None,
+                    ttl,
+                    per_proxy_ttl,
+                ) {
+                    Ok(addrs) => addrs,
+                    Err(err) => {
+                        crate::runtime_metrics::global_ref().record_dns_error();
+                        return Err(err);
+                    }
+                };
+                crate::runtime_metrics::global_ref().record_dns_miss();
+                Ok(addrs)
             }
             Ok(_) => {
                 self.cache_error(hostname, per_proxy_ttl);
+                crate::runtime_metrics::global_ref().record_dns_error();
                 anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
             }
             Err(e) => {
                 self.cache_error(hostname, per_proxy_ttl);
+                crate::runtime_metrics::global_ref().record_dns_error();
                 Err(e)
             }
         }
@@ -1369,6 +1431,66 @@ mod tests {
         assert!(
             cache.cache.get("metadata.internal").is_none(),
             "Denied DNS answers must not be inserted for foreground or background refresh paths"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_denied_answer_counts_runtime_dns_error() {
+        let before_total = crate::runtime_metrics::global_ref()
+            .dns_lookups_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let before_errors = crate::runtime_metrics::global_ref()
+            .dns_lookup_errors
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let cache = DnsCache::new(DnsConfig {
+            backend_allow_ips: BackendAllowIps::Public,
+            ..DnsConfig::default()
+        });
+
+        let result = cache.resolve("localhost", None, None).await;
+
+        assert!(result.is_err());
+        assert!(
+            crate::runtime_metrics::global_ref()
+                .dns_lookups_total
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > before_total
+        );
+        assert!(
+            crate::runtime_metrics::global_ref()
+                .dns_lookup_errors
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > before_errors
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_all_policy_denied_answer_counts_runtime_dns_error() {
+        let before_total = crate::runtime_metrics::global_ref()
+            .dns_lookups_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let before_errors = crate::runtime_metrics::global_ref()
+            .dns_lookup_errors
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let cache = DnsCache::new(DnsConfig {
+            backend_allow_ips: BackendAllowIps::Public,
+            ..DnsConfig::default()
+        });
+
+        let result = cache.resolve_all("localhost", None, None).await;
+
+        assert!(result.is_err());
+        assert!(
+            crate::runtime_metrics::global_ref()
+                .dns_lookups_total
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > before_total
+        );
+        assert!(
+            crate::runtime_metrics::global_ref()
+                .dns_lookup_errors
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > before_errors
         );
     }
 

@@ -787,6 +787,10 @@ impl PoolManager for GrpcPoolManager {
     fn destroy(&self, conn: Self::Connection) {
         drop(conn);
     }
+
+    fn runtime_metrics_kind(&self) -> Option<crate::runtime_metrics::PoolKind> {
+        Some(crate::runtime_metrics::PoolKind::Grpc)
+    }
 }
 
 /// Which phase of a gRPC backend interaction timed out.
