@@ -2017,15 +2017,19 @@ fn merge_tracing_config(
         current.disable_span_reporting = next.disable_span_reporting;
     }
     if !next.custom_tags.is_empty() {
-        current.custom_tags.clone_from(&next.custom_tags);
+        current.custom_tags.extend(next.custom_tags.clone());
     }
     if !next.custom_header_tags.is_empty() {
         current
             .custom_header_tags
-            .clone_from(&next.custom_header_tags);
+            .extend(next.custom_header_tags.clone());
     }
     if !next.providers.is_empty() {
-        current.providers.clone_from(&next.providers);
+        for provider in &next.providers {
+            if !current.providers.contains(provider) {
+                current.providers.push(provider.clone());
+            }
+        }
     }
 }
 
@@ -4381,6 +4385,109 @@ mod tests {
             tracing.custom_header_tags.get("tenant").map(String::as_str),
             Some("x-tenant")
         );
+    }
+
+    #[test]
+    fn telemetry_tracing_merge_adds_tags_and_providers_across_scopes() {
+        let mesh_slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            version: "test".to_string(),
+            telemetry_resources: vec![
+                MeshTelemetryResource {
+                    name: "mesh-defaults".to_string(),
+                    namespace: "istio-system".to_string(),
+                    scope: PolicyScope::MeshWide,
+                    config: MeshTelemetryConfig {
+                        tracing: Some(MeshTracingConfig {
+                            mode: None,
+                            sampling_percentage: Some(25.0),
+                            disable_span_reporting: None,
+                            custom_tags: HashMap::from([
+                                ("env".to_string(), "staging".to_string()),
+                                ("mesh".to_string(), "ferrum".to_string()),
+                            ]),
+                            custom_header_tags: HashMap::from([(
+                                "mesh-tenant".to_string(),
+                                "x-mesh-tenant".to_string(),
+                            )]),
+                            providers: vec![TracingProvider::Zipkin {
+                                url: "http://zipkin:9411/api/v2/spans".to_string(),
+                            }],
+                        }),
+                        ..MeshTelemetryConfig::default()
+                    },
+                },
+                MeshTelemetryResource {
+                    name: "workload-override".to_string(),
+                    namespace: "default".to_string(),
+                    scope: PolicyScope::WorkloadSelector {
+                        selector: WorkloadSelector {
+                            labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                            namespace: Some("default".to_string()),
+                        },
+                    },
+                    config: MeshTelemetryConfig {
+                        tracing: Some(MeshTracingConfig {
+                            mode: None,
+                            sampling_percentage: None,
+                            disable_span_reporting: None,
+                            custom_tags: HashMap::from([
+                                ("env".to_string(), "prod".to_string()),
+                                ("region".to_string(), "us-east".to_string()),
+                            ]),
+                            custom_header_tags: HashMap::from([(
+                                "tenant".to_string(),
+                                "x-tenant".to_string(),
+                            )]),
+                            providers: vec![TracingProvider::OpenTelemetry {
+                                endpoint: "http://otel:4318/v1/traces".to_string(),
+                            }],
+                        }),
+                        ..MeshTelemetryConfig::default()
+                    },
+                },
+            ],
+            ..MeshSlice::default()
+        };
+
+        let merged = merge_applicable_telemetry(&mesh_slice);
+        let tracing = merged.tracing.expect("tracing merged");
+
+        assert_eq!(tracing.sampling_percentage, Some(25.0));
+        assert_eq!(
+            tracing.custom_tags.get("env").map(String::as_str),
+            Some("prod")
+        );
+        assert_eq!(
+            tracing.custom_tags.get("mesh").map(String::as_str),
+            Some("ferrum")
+        );
+        assert_eq!(
+            tracing.custom_tags.get("region").map(String::as_str),
+            Some("us-east")
+        );
+        assert_eq!(
+            tracing
+                .custom_header_tags
+                .get("mesh-tenant")
+                .map(String::as_str),
+            Some("x-mesh-tenant")
+        );
+        assert_eq!(
+            tracing.custom_header_tags.get("tenant").map(String::as_str),
+            Some("x-tenant")
+        );
+        assert_eq!(tracing.providers.len(), 2);
+        assert!(matches!(
+            tracing.providers.first(),
+            Some(TracingProvider::Zipkin { .. })
+        ));
+        assert!(matches!(
+            tracing.providers.get(1),
+            Some(TracingProvider::OpenTelemetry { .. })
+        ));
     }
 
     #[test]

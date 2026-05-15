@@ -340,6 +340,17 @@ impl Plugin for OtelTracing {
             bytes_received = %summary.bytes_received,
             "stream trace"
         );
+
+        if let Some(exporter) = &self.exporter
+            && let Some(span_data) = SpanData::from_stream_summary(summary, &self.service_name)
+            && let Err(error) = exporter.try_export(span_data)
+        {
+            warn!(
+                "{} export buffer full — dropping span: {}",
+                exporter.provider_name(),
+                error
+            );
+        }
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {

@@ -356,9 +356,13 @@ impl WorkloadMetrics {
         if metadata_has_sampling_decision(metadata) {
             return false;
         }
-        // Defensive fallback for metadata producers that bypassed
-        // apply_telemetry_metadata() but still carry local sampling config.
-        self.sampling_percentage.is_some_and(trace_sampled)
+        if self.sampling_percentage.is_some() {
+            tracing::debug!(
+                plugin = "workload_metrics",
+                "missing trace sampling decision; skipping span export"
+            );
+        }
+        false
     }
 
     fn insert_source_workload_labels(
@@ -977,6 +981,26 @@ mod tests {
             Some("constant")
         );
         assert_eq!(metadata.get("tenant").map(String::as_str), Some("acme"));
+    }
+
+    #[test]
+    fn sampling_config_without_recorded_decision_does_not_resample_on_export() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "sampling_percentage": 100.0
+        }))
+        .expect("sampling-only metrics config");
+        let metadata = HashMap::from([
+            (
+                "trace_id".to_string(),
+                "abcdef1234567890abcdef1234567890".to_string(),
+            ),
+            ("span_id".to_string(), "1234567890abcdef".to_string()),
+        ]);
+
+        assert!(
+            !metrics.should_export_metadata(&metadata),
+            "export should rely on the request-time sampling decision"
+        );
     }
 
     #[test]

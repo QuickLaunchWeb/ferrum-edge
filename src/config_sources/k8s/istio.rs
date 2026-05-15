@@ -2066,7 +2066,7 @@ fn telemetry(
                     continue;
                 }
                 saw_server_entry = true;
-                let sampling = t.get("randomSamplingPercentage").and_then(Value::as_f64);
+                let sampling = telemetry_sampling_percentage(object, t)?;
                 let mut custom_header_tags: HashMap<String, String> = HashMap::new();
                 let custom_tags: HashMap<String, String> = t
                     .get("customTags")
@@ -2112,13 +2112,13 @@ fn telemetry(
                     merged.disable_span_reporting = Some(disabled);
                 }
                 if !custom_tags.is_empty() {
-                    merged.custom_tags = custom_tags;
+                    merged.custom_tags.extend(custom_tags);
                 }
                 if !custom_header_tags.is_empty() {
-                    merged.custom_header_tags = custom_header_tags;
+                    merged.custom_header_tags.extend(custom_header_tags);
                 }
                 if !providers.is_empty() {
-                    merged.providers = providers;
+                    extend_unique_tracing_providers(&mut merged.providers, providers);
                 }
             }
             Ok::<_, K8sTranslateError>(saw_server_entry.then_some(merged))
@@ -2214,6 +2214,41 @@ fn telemetry(
             access_logging,
         },
     })
+}
+
+fn telemetry_sampling_percentage(
+    object: &K8sObject,
+    tracing_entry: &Value,
+) -> Result<Option<f64>, K8sTranslateError> {
+    let Some(value) = tracing_entry.get("randomSamplingPercentage") else {
+        return Ok(None);
+    };
+    let Some(sampling) = value.as_f64() else {
+        return Err(invalid_resource(
+            object,
+            "Telemetry tracing.randomSamplingPercentage must be a finite number between 0 and 100",
+        ));
+    };
+    if !sampling.is_finite() || !(0.0..=100.0).contains(&sampling) {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "Telemetry tracing.randomSamplingPercentage must be between 0 and 100 (got {sampling})"
+            ),
+        ));
+    }
+    Ok(Some(sampling))
+}
+
+fn extend_unique_tracing_providers(
+    current: &mut Vec<TracingProvider>,
+    providers: Vec<TracingProvider>,
+) {
+    for provider in providers {
+        if !current.contains(&provider) {
+            current.push(provider);
+        }
+    }
 }
 
 /// Extract every inline `tracing[].providers[]` entry as [`TracingProvider`]s.
@@ -4079,6 +4114,108 @@ mod tests {
         assert_eq!(
             tracing.custom_tags.get("region").map(String::as_str),
             Some("us-east-1")
+        );
+    }
+
+    #[test]
+    fn telemetry_tracing_entries_merge_custom_tags_and_providers() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [
+                        {
+                            "randomSamplingPercentage": 15.0,
+                            "customTags": {
+                                "env": {"literal": {"value": "staging"}},
+                                "mesh": {"literal": {"value": "ferrum"}}
+                            },
+                            "providers": [{
+                                "name": "zipkin",
+                                "url": "http://zipkin:9411/api/v2/spans"
+                            }]
+                        },
+                        {
+                            "customTags": {
+                                "env": {"literal": {"value": "prod"}},
+                                "region": {"literal": {"value": "us-east"}}
+                            },
+                            "providers": [{
+                                "name": "opentelemetry",
+                                "endpoint": "http://otel:4318/v1/traces"
+                            }]
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+        assert_eq!(tracing.sampling_percentage, Some(15.0));
+        assert_eq!(
+            tracing.custom_tags.get("env").map(String::as_str),
+            Some("prod")
+        );
+        assert_eq!(
+            tracing.custom_tags.get("mesh").map(String::as_str),
+            Some("ferrum")
+        );
+        assert_eq!(
+            tracing.custom_tags.get("region").map(String::as_str),
+            Some("us-east")
+        );
+        assert_eq!(tracing.providers.len(), 2);
+        assert!(matches!(
+            tracing.providers.first(),
+            Some(TracingProvider::Zipkin { .. })
+        ));
+        assert!(matches!(
+            tracing.providers.get(1),
+            Some(TracingProvider::OpenTelemetry { .. })
+        ));
+    }
+
+    #[test]
+    fn telemetry_tracing_rejects_invalid_sampling_percentage() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{"randomSamplingPercentage": 150.0}]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("out-of-range sampling should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("randomSamplingPercentage must be between 0 and 100"),
+            "got: {err}"
+        );
+
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{"randomSamplingPercentage": "100"}]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("non-numeric sampling should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("randomSamplingPercentage must be a finite number"),
+            "got: {err}"
         );
     }
 

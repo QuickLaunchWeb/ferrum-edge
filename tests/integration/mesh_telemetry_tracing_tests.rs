@@ -73,6 +73,7 @@ fn traced_summary() -> TransactionSummary {
                 "abcdef1234567890abcdef1234567890".to_string(),
             ),
             ("span_id".to_string(), "1234567890abcdef".to_string()),
+            ("trace_sampled".to_string(), "true".to_string()),
         ]),
         ..TransactionSummary::default()
     }

@@ -1,8 +1,9 @@
 //! Tests for otel_tracing plugin
 
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, TransactionSummary,
-    mesh::workload_metrics::WorkloadMetrics, otel_tracing::OtelTracing, utils::PluginHttpClient,
+    ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, StreamTransactionSummary,
+    TransactionSummary, mesh::workload_metrics::WorkloadMetrics, otel_tracing::OtelTracing,
+    utils::PluginHttpClient,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -79,6 +80,32 @@ fn make_trace_metadata_without_sampling() -> HashMap<String, String> {
         ),
         ("span_id".to_string(), "1234567890abcdef".to_string()),
     ])
+}
+
+fn make_stream_summary(metadata: HashMap<String, String>) -> StreamTransactionSummary {
+    StreamTransactionSummary {
+        namespace: "ferrum".to_string(),
+        proxy_id: "tcp-proxy".to_string(),
+        proxy_name: Some("postgres".to_string()),
+        client_ip: "10.0.0.1".to_string(),
+        consumer_username: Some("alice".to_string()),
+        auth_method: None,
+        backend_target: "10.0.0.20:5432".to_string(),
+        backend_resolved_ip: Some("10.0.0.20".to_string()),
+        protocol: "tcp".to_string(),
+        listen_port: 5432,
+        duration_ms: 42.0,
+        bytes_sent: 128,
+        bytes_received: 512,
+        connection_error: None,
+        error_class: None,
+        disconnect_direction: None,
+        disconnect_cause: None,
+        timestamp_connected: "2026-03-23T12:00:00Z".to_string(),
+        timestamp_disconnected: "2026-03-23T12:00:00.042Z".to_string(),
+        sni_hostname: None,
+        metadata,
+    }
 }
 
 async fn received_json(server: &wiremock::MockServer) -> serde_json::Value {
@@ -416,6 +443,43 @@ async fn test_otel_tracing_with_otlp_endpoint() {
 
     // The mock server should have received at least one request
     // (verified by the expect(1..) on the mock)
+}
+
+#[tokio::test]
+async fn test_otel_tracing_exports_stream_disconnect_span() {
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/traces"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = new_otel(&json!({
+        "endpoint": format!("{}/v1/traces", mock_server.uri()),
+        "batch_size": 1,
+        "flush_interval_ms": 100
+    }));
+
+    plugin
+        .on_stream_disconnect(&make_stream_summary(make_trace_metadata()))
+        .await;
+
+    let payload = received_json(&mock_server).await;
+    let span = &payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+    assert_eq!(span["name"], "tcp 10.0.0.20:5432");
+    let attributes = span["attributes"].as_array().expect("span attributes");
+    let protocol = attributes
+        .iter()
+        .find(|attribute| attribute["key"].as_str() == Some("network.protocol.name"))
+        .expect("network protocol attribute");
+    assert_eq!(protocol["value"]["stringValue"], "tcp");
+    let bytes_sent = attributes
+        .iter()
+        .find(|attribute| attribute["key"].as_str() == Some("gateway.stream.bytes_sent"))
+        .expect("bytes sent attribute");
+    assert_eq!(bytes_sent["value"]["intValue"], "128");
 }
 
 #[tokio::test]
