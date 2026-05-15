@@ -880,7 +880,10 @@ fn sidecar_egress_port_admission(
 
     let resource_port_set: BTreeSet<u16> = resource_ports.iter().copied().collect();
     if resource_port_set.is_empty() {
-        return None;
+        return sidecar_egress
+            .iter()
+            .any(host_matches)
+            .then_some(SidecarPortAdmission::All);
     }
 
     let specific_ports: BTreeSet<u16> = sidecar_egress
@@ -3417,6 +3420,48 @@ mod tests {
         let config = config_with_mesh(mesh);
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
         assert!(slice.services.is_empty());
+    }
+
+    #[test]
+    fn sidecar_narrowing_keeps_host_admitted_service_with_no_declared_ports() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "host-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews"]],
+            )],
+            services: vec![make_service_with_ports("alpha", "reviews", &[])],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.services.len(), 1);
+        assert!(slice.services[0].ports.is_empty());
+    }
+
+    #[test]
+    fn sidecar_narrowing_keeps_host_admitted_service_entry_with_no_declared_ports() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "host-sc",
+                "alpha",
+                None,
+                vec![vec!["*/api.example.com"]],
+            )],
+            service_entries: vec![make_se_with_host_and_ports(
+                "api",
+                "alpha",
+                "api.example.com",
+                &[],
+                vec!["*".into()],
+            )],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.service_entries.len(), 1);
+        assert!(slice.service_entries[0].ports.is_empty());
     }
 
     #[test]
