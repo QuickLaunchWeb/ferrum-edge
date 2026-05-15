@@ -500,12 +500,34 @@ impl CachedBackendTlsConfig {
 #[derive(Default)]
 pub struct TcpProxyMetrics {
     pub active_connections: AtomicU64,
+    pub active_backend_connections: AtomicU64,
     pub total_connections: AtomicU64,
     pub bytes_in: AtomicU64,
     pub bytes_out: AtomicU64,
     /// Bytes transferred via splice(2) zero-copy (Linux only, plaintext paths).
     /// When non-zero, indicates splice was used instead of userspace copy.
     pub splice_bytes_transferred: AtomicU64,
+}
+
+struct TcpBackendSessionGuard<'a> {
+    metrics: &'a TcpProxyMetrics,
+}
+
+impl<'a> TcpBackendSessionGuard<'a> {
+    fn new(metrics: &'a TcpProxyMetrics) -> Self {
+        metrics
+            .active_backend_connections
+            .fetch_add(1, Ordering::Relaxed);
+        Self { metrics }
+    }
+}
+
+impl Drop for TcpBackendSessionGuard<'_> {
+    fn drop(&mut self) {
+        self.metrics
+            .active_backend_connections
+            .fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Configuration for starting a TCP proxy listener.
@@ -867,6 +889,7 @@ async fn run_tcp_accept_loop(
                         ktls_enabled,
                         io_uring_splice_enabled,
                         &overload_for_conn,
+                        metrics.as_ref(),
                     )
                     .await;
 
@@ -983,10 +1006,13 @@ async fn run_tcp_accept_loop(
                         }
                     };
 
-                    // Run on_stream_disconnect plugins (logging, metrics, etc.)
-                    if !plugins.is_empty() {
+                    if !plugins.is_empty() || error_class.is_some() {
                         let disconnected_wall_at = chrono::Utc::now();
-                        let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
+                        let consumer_username = if !plugins.is_empty() {
+                            stream_ctx.effective_identity().map(str::to_owned)
+                        } else {
+                            None
+                        };
                         let summary = StreamTransactionSummary {
                             namespace: proxy_namespace,
                             proxy_id: final_proxy_id,
@@ -1008,10 +1034,25 @@ async fn run_tcp_accept_loop(
                             timestamp_connected: connected_wall_at.to_rfc3339(),
                             timestamp_disconnected: disconnected_wall_at.to_rfc3339(),
                             sni_hostname: stream_ctx.sni_hostname.clone(),
-                            metadata: stream_ctx.take_metadata(),
+                            metadata: if !plugins.is_empty() {
+                                stream_ctx.take_metadata()
+                            } else {
+                                Default::default()
+                            },
                         };
-                        for plugin in plugins.iter() {
-                            plugin.on_stream_disconnect(&summary).await;
+                        crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
+                        if summary.error_class == Some(crate::retry::ErrorClass::ConnectionReset)
+                            && let Some(direction) = summary.disconnect_direction
+                        {
+                            crate::runtime_metrics::global_ref()
+                                .record_tcp_rst(&summary.proxy_id, direction);
+                        }
+
+                        // Run on_stream_disconnect plugins (logging, metrics, etc.)
+                        if !plugins.is_empty() {
+                            for plugin in plugins.iter() {
+                                plugin.on_stream_disconnect(&summary).await;
+                            }
                         }
                     }
 
@@ -1135,6 +1176,7 @@ async fn handle_tcp_connection(
     ktls_enabled: bool,
     io_uring_splice_enabled: bool,
     overload: &crate::overload::OverloadState,
+    metrics: &TcpProxyMetrics,
 ) -> TcpConnectionResult {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
@@ -1168,6 +1210,7 @@ async fn handle_tcp_connection(
         ktls_enabled,
         io_uring_splice_enabled,
         overload,
+        metrics,
     )
     .await;
 
@@ -1225,6 +1268,7 @@ async fn handle_tcp_connection_inner(
     ktls_enabled: bool,
     io_uring_splice_enabled: bool,
     overload: &crate::overload::OverloadState,
+    metrics: &TcpProxyMetrics,
 ) -> Result<TcpConnectionSuccess, anyhow::Error> {
     // Bound the passthrough SNI peek by the same deadline as terminating-TLS
     // handshakes. Without this, a peer that opens a TCP connection and never
@@ -1791,6 +1835,7 @@ async fn handle_tcp_connection_inner(
     };
     let (_backend_socket_addr, backend_stream) = backend_addr;
     let _ = last_connect_err; // consumed by retry loop logging
+    let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
 
     // Start bidirectional copy. From here, no retries — bytes may be exchanged.
     let mut used_splice = false;

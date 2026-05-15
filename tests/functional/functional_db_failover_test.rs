@@ -89,18 +89,12 @@ fn binary_path() -> &'static str {
     }
 }
 
-/// Build the gateway binary if not already present. Shared across all tests in
-/// this file — subsequent invocations are no-ops because cargo handles caching.
+/// Build the gateway binary. Thin wrapper over the shared
+/// [`crate::common::ensure_gateway_built`] so this file's tests share the
+/// same `OnceLock` memoization and `FERRUM_SKIP_GATEWAY_BUILD=1` contract as
+/// the [`crate::common::TestGateway`] builder.
 fn ensure_built() -> Result<(), Box<dyn std::error::Error>> {
-    let status = Command::new("cargo")
-        .args(["build", "--bin", "ferrum-edge"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if !status.success() {
-        return Err("Failed to build ferrum-edge".into());
-    }
-    Ok(())
+    crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
 async fn wait_for_health(admin_port: u16) -> bool {

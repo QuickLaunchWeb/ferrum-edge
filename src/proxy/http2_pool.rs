@@ -24,7 +24,9 @@ use crate::config::types::Proxy;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::pool::{GenericPool, PoolManager};
 use crate::tls::TlsPolicy;
-use crate::tls::backend::{BackendTlsConfigBuilder, BackendTlsConfigCache};
+use crate::tls::backend::{
+    BackendTlsConfigBuilder, BackendTlsConfigCache, append_backend_tls_pool_key_fields,
+};
 
 thread_local! {
     /// Reused per-thread buffer for direct H2 pool-key construction on the
@@ -65,27 +67,13 @@ fn write_http2_pool_key(buf: &mut String, host: &str, port: u16, proxy: &Proxy) 
     let _ = write!(buf, "{}|{}|", host, port);
     buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
     buf.push('|');
-    buf.push_str(
-        proxy
-            .resolved_tls
-            .server_ca_cert_path
-            .as_deref()
-            .unwrap_or_default(),
+    append_backend_tls_pool_key_fields(
+        buf,
+        &proxy.resolved_tls,
+        proxy.resolved_tls.client_cert_path.as_deref(),
+        proxy.resolved_tls.client_key_path.as_deref(),
+        proxy.resolved_tls.verify_server_cert,
     );
-    buf.push('|');
-    buf.push_str(
-        proxy
-            .resolved_tls
-            .client_cert_path
-            .as_deref()
-            .unwrap_or_default(),
-    );
-    buf.push('|');
-    buf.push(if proxy.resolved_tls.verify_server_cert {
-        '1'
-    } else {
-        '0'
-    });
 }
 
 fn pool_key_owned(proxy: &Proxy) -> String {
@@ -399,6 +387,10 @@ impl PoolManager for Http2PoolManager {
 
     fn destroy(&self, conn: Self::Connection) {
         drop(conn);
+    }
+
+    fn runtime_metrics_kind(&self) -> Option<crate::runtime_metrics::PoolKind> {
+        Some(crate::runtime_metrics::PoolKind::Http2Direct)
     }
 }
 

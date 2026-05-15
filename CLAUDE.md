@@ -4,6 +4,10 @@
 
 High-performance Rust edge proxy (HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC, raw TCP/UDP) with 58+ plugins, four operating modes, LB + health checks. Rust (edition 2024) on tokio + hyper 1.0. Single binary `ferrum-edge` (CLI subcommands + env config). License: PolyForm Noncommercial 1.0.0 (dual-licensed commercial).
 
+## Build-Out Compatibility Policy
+
+Ferrum Edge is in active build-out. Do not add schema DB migrations for new schema changes; fold schema changes into the current baseline schema instead. Do not add or preserve legacy compatibility shims for old fields, environment variables, config shapes, or database values unless explicitly requested. Breaking changes are acceptable in this phase.
+
 ## Read Before Touching
 
 - Mesh behavior → [docs/mesh.md](docs/mesh.md) + `src/modes/mesh/` + mesh plugin injection notes below
@@ -87,6 +91,8 @@ PRs: format → tests (parallel) → lint → perf regression → build 5 target
 **Admin JWT asymmetry (intentional)**: the admin API only *validates* JWTs — it never mints them (operators pre-sign tokens externally). DB/CP require `FERRUM_ADMIN_JWT_SECRET` (≥32 chars) because their R/W admin API needs a stable, known secret so operator-minted tokens stay valid across instances and restarts. File mode is read-only, so it generates a random secret at startup — externally crafted tokens can never validate.
 
 **`/health` DB check cached 15s via lock-free `ArcSwap`** (`AdminState.CachedDbHealthResult`). Endpoints unauthenticated; without caching an attacker could flood `SELECT 1` and exhaust `FERRUM_DB_POOL_MAX_CONNECTIONS` (default 32). Do not remove. Response includes `database.pool` stats when connected.
+
+**`/metrics/runtime` JSON response cached via lock-free `ArcSwap`** (`runtime_metrics_cache()`). Endpoint is JWT-authenticated; without caching, aggressive polling would amplify system sampling and serialization work. Do not remove.
 
 **`GET /cluster`** (JWT-auth): CP returns connected DPs (from `DpNodeRegistry`, auto-removed on stream drop via `TrackedStream`); DP returns CP connection state (from `DpCpConnectionState`, primary vs fallback, `last_config_received_at`).
 
