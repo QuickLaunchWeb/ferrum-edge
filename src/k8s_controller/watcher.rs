@@ -32,6 +32,7 @@ pub struct WatcherSelection {
     pub watch_istio: bool,
     pub watch_gateway_api: bool,
     pub watch_core: bool,
+    pub watch_node_locality: bool,
 }
 
 pub const ISTIO_CRDS: &[CrdSpec] = &[
@@ -154,9 +155,24 @@ pub const K8S_CORE_RESOURCES: &[CoreResourceSpec] = &[
     },
 ];
 
+pub const K8S_NODE_LOCALITY_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec {
+    group: "",
+    version: "v1",
+    kind: "Node",
+    plural: "nodes",
+    namespaced: false,
+}];
+
 // Node labels can enrich workloads with topology.kubernetes.io/{region,zone},
 // but locality is optional. Keep Node out of the unconditional pod-discovery
 // watcher set so namespaced discovery does not require cluster-scoped RBAC.
+fn selected_core_resources(watch_node_locality: bool) -> Vec<&'static CoreResourceSpec> {
+    let mut resources: Vec<&'static CoreResourceSpec> = K8S_CORE_RESOURCES.iter().collect();
+    if watch_node_locality {
+        resources.extend(K8S_NODE_LOCALITY_RESOURCES);
+    }
+    resources
+}
 
 fn watch_scopes(namespaces: &[String]) -> Vec<Option<String>> {
     if namespaces.is_empty() {
@@ -207,19 +223,17 @@ fn find_crd_resource(api_group: &discovery::ApiGroup, crd: &CrdSpec) -> Option<A
 pub async fn start_crd_watchers(
     client: Client,
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
-    watch_istio: bool,
-    watch_gateway_api: bool,
-    watch_core: bool,
+    selection: WatcherSelection,
     namespaces: Vec<String>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut handles = Vec::new();
 
     let mut crd_specs: Vec<&CrdSpec> = Vec::new();
-    if watch_istio {
+    if selection.watch_istio {
         crd_specs.extend(ISTIO_CRDS);
     }
-    if watch_gateway_api {
+    if selection.watch_gateway_api {
         crd_specs.extend(GATEWAY_API_CRDS);
     }
 
@@ -360,8 +374,8 @@ pub async fn start_crd_watchers(
         }
     }
 
-    if watch_core {
-        for resource in K8S_CORE_RESOURCES {
+    if selection.watch_core {
+        for resource in selected_core_resources(selection.watch_node_locality) {
             let api_version = if resource.group.is_empty() {
                 resource.version.to_string()
             } else {
@@ -502,9 +516,7 @@ pub fn spawn_crd_reprobe_task(
                     let new_handles = start_crd_watchers(
                         client.clone(),
                         store_set.clone(),
-                        selection.watch_istio,
-                        selection.watch_gateway_api,
-                        selection.watch_core,
+                        selection,
                         namespaces.clone(),
                         shutdown.clone(),
                     ).await;
@@ -551,5 +563,23 @@ mod tests {
             !kinds.contains("Node"),
             "Node locality is optional and must not require cluster-scoped RBAC for pod discovery"
         );
+    }
+
+    #[test]
+    fn selected_core_resources_adds_node_only_for_locality_enrichment() {
+        let base_kinds: HashSet<&str> = selected_core_resources(false)
+            .into_iter()
+            .map(|resource| resource.kind)
+            .collect();
+        let locality_kinds: HashSet<&str> = selected_core_resources(true)
+            .into_iter()
+            .map(|resource| resource.kind)
+            .collect();
+
+        assert!(!base_kinds.contains("Node"));
+        assert!(locality_kinds.contains("Node"));
+        assert!(locality_kinds.contains("Pod"));
+        assert!(locality_kinds.contains("Service"));
+        assert!(locality_kinds.contains("EndpointSlice"));
     }
 }

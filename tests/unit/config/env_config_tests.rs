@@ -4058,6 +4058,10 @@ fn test_k8s_pod_discovery_default_disabled() {
         !config.k8s_pod_discovery_enabled,
         "Pod auto-discovery is opt-in for the first rollout"
     );
+    assert!(
+        !config.k8s_node_locality_enabled,
+        "Node locality enrichment is a separate cluster-scoped opt-in"
+    );
 }
 
 #[test]
@@ -4067,10 +4071,12 @@ fn test_k8s_pod_discovery_parsed_from_env() {
             ("FERRUM_MODE", "file"),
             ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
             ("FERRUM_K8S_POD_DISCOVERY_ENABLED", "true"),
+            ("FERRUM_K8S_NODE_LOCALITY_ENABLED", "true"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
             assert!(config.k8s_pod_discovery_enabled);
+            assert!(config.k8s_node_locality_enabled);
         },
     );
 }

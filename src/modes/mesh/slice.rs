@@ -299,11 +299,7 @@ impl MeshSlice {
             .filter(|w| w.namespace == namespace)
             .cloned()
             .collect();
-        let selected_workload = request.workload_spiffe_id.as_ref().and_then(|spiffe_id| {
-            workloads
-                .iter()
-                .find(|workload| workload.spiffe_id.as_str() == spiffe_id)
-        });
+        let selected_workload = selected_workload_for_request(&workloads, &request);
         let effective_namespace = selected_workload
             .map(|workload| workload.namespace.as_str())
             .unwrap_or(namespace.as_str());
@@ -488,6 +484,28 @@ impl MeshSlice {
             multi_cluster: mesh.multi_cluster.clone(),
             outbound_traffic_policy: mesh.outbound_traffic_policy,
         }
+    }
+}
+
+fn selected_workload_for_request<'a>(
+    workloads: &'a [Workload],
+    request: &MeshSliceRequest,
+) -> Option<&'a Workload> {
+    let spiffe_id = request.workload_spiffe_id.as_deref()?;
+    let mut matches = workloads
+        .iter()
+        .filter(|workload| workload.spiffe_id.as_str() == spiffe_id);
+    let selected = matches.next()?;
+    if matches.next().is_some() {
+        warn!(
+            node_id = %request.node_id,
+            namespace = %request.namespace,
+            workload_spiffe_id = %spiffe_id,
+            "Mesh slice request matched multiple workloads with the same SPIFFE ID; explicit workload labels are required for selector-scoped policy"
+        );
+        None
+    } else {
+        Some(selected)
     }
 }
 
@@ -1916,6 +1934,52 @@ mod tests {
         // The workload-selector policy should match via inherited labels.
         assert_eq!(slice.mesh_policies.len(), 1);
         assert_eq!(slice.mesh_policies[0].name, "selector-policy");
+    }
+
+    #[test]
+    fn from_gateway_config_does_not_inherit_labels_from_ambiguous_spiffe_id() {
+        let td = td();
+        let spiffe_id = SpiffeId::from_parts(&td, "ns/alpha/sa/shared").unwrap();
+        let mut web = make_workload(
+            "alpha",
+            "web",
+            HashMap::from([("app".into(), "web".into())]),
+        );
+        let mut api = make_workload(
+            "alpha",
+            "api",
+            HashMap::from([("app".into(), "api".into())]),
+        );
+        web.spiffe_id = spiffe_id.clone();
+        api.spiffe_id = spiffe_id.clone();
+        let mesh = MeshConfig {
+            workloads: vec![web, api],
+            mesh_policies: vec![make_policy(
+                "web-selector-policy",
+                "alpha",
+                PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".into(), "web".into())]),
+                        namespace: None,
+                    },
+                },
+            )],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let request = MeshSliceRequest {
+            node_id: "node-1".into(),
+            namespace: "alpha".into(),
+            workload_spiffe_id: Some(spiffe_id.to_string()),
+            labels: BTreeMap::new(),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            enforce_sidecar_egress: false,
+        };
+
+        let slice = MeshSlice::from_gateway_config(&config, request);
+
+        assert!(slice.labels.is_empty());
+        assert!(slice.mesh_policies.is_empty());
     }
 
     #[test]

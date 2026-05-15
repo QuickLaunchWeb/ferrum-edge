@@ -35,6 +35,7 @@ pub struct K8sControllerConfig {
     pub watch_istio: bool,
     pub watch_gateway_api: bool,
     pub watch_core: bool,
+    pub watch_node_locality: bool,
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
     pub kubeconfig_path: Option<String>,
@@ -75,6 +76,7 @@ pub async fn start_k8s_controller(
         watch_istio = controller_config.watch_istio,
         watch_gateway_api = controller_config.watch_gateway_api,
         watch_core = controller_config.watch_core,
+        watch_node_locality = controller_config.watch_node_locality,
         watch_namespaces = ?controller_config.watch_namespaces,
         namespace = controller_config.namespace,
         "Starting Kubernetes controller"
@@ -84,13 +86,17 @@ pub async fn start_k8s_controller(
 
     let store_set = Arc::new(tokio::sync::Mutex::new(ResourceStoreSet::new()));
     let metrics = Arc::new(ControllerMetrics::new());
+    let watcher_selection = WatcherSelection {
+        watch_istio: controller_config.watch_istio,
+        watch_gateway_api: controller_config.watch_gateway_api,
+        watch_core: controller_config.watch_core,
+        watch_node_locality: controller_config.watch_node_locality,
+    };
 
     let watcher_handles = start_crd_watchers(
         client.clone(),
         store_set.clone(),
-        controller_config.watch_istio,
-        controller_config.watch_gateway_api,
-        controller_config.watch_core,
+        watcher_selection,
         controller_config.watch_namespaces.clone(),
         shutdown.clone(),
     )
@@ -126,11 +132,7 @@ pub async fn start_k8s_controller(
     let reprobe_handle = spawn_crd_reprobe_task(
         client,
         store_set,
-        WatcherSelection {
-            watch_istio: controller_config.watch_istio,
-            watch_gateway_api: controller_config.watch_gateway_api,
-            watch_core: controller_config.watch_core,
-        },
+        watcher_selection,
         controller_config.watch_namespaces,
         shutdown,
         Duration::from_secs(300),

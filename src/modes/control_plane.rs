@@ -480,6 +480,12 @@ pub async fn run(
     // When enabled, watches Istio + Gateway API CRDs and reconciles them into
     // Ferrum config via translate_k8s_objects(). Runs alongside DB polling.
     let _k8s_controller_handle = if env_config.k8s_controller_enabled {
+        if env_config.k8s_node_locality_enabled && !env_config.k8s_pod_discovery_enabled {
+            warn!(
+                "FERRUM_K8S_NODE_LOCALITY_ENABLED=true has no effect because \
+                 FERRUM_K8S_POD_DISCOVERY_ENABLED=false"
+            );
+        }
         let controller_config = crate::k8s_controller::K8sControllerConfig {
             namespace: env_config.namespace.clone(),
             trust_domain: env_config.k8s_trust_domain.clone(),
@@ -488,6 +494,7 @@ pub async fn run(
             watch_istio: env_config.k8s_watch_istio_crds,
             watch_gateway_api: env_config.k8s_watch_gateway_api_crds,
             watch_core: env_config.k8s_pod_discovery_enabled,
+            watch_node_locality: env_config.k8s_node_locality_enabled,
             debounce_ms: env_config.k8s_reconcile_debounce_ms,
             full_sync_interval_secs: env_config.k8s_full_sync_interval_secs,
             kubeconfig_path: env_config.k8s_kubeconfig_path.clone(),
@@ -521,6 +528,12 @@ pub async fn run(
         if env_config.k8s_pod_discovery_enabled {
             warn!(
                 "FERRUM_K8S_POD_DISCOVERY_ENABLED=true has no effect because \
+                 FERRUM_K8S_CONTROLLER_ENABLED=false"
+            );
+        }
+        if env_config.k8s_node_locality_enabled {
+            warn!(
+                "FERRUM_K8S_NODE_LOCALITY_ENABLED=true has no effect because \
                  FERRUM_K8S_CONTROLLER_ENABLED=false"
             );
         }
