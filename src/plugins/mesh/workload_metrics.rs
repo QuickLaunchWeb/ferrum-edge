@@ -49,8 +49,8 @@ pub struct WorkloadMetrics {
     metric_tag_overrides: Vec<MetricTagOverrideConfig>,
     disabled_metrics: Vec<String>,
     /// Provider-specific tracing backends surfaced from Istio Telemetry CRD
-    /// via the mesh slice. Exporter queues are constructed once at plugin
-    /// creation; the request path only samples and enqueues completed spans.
+    /// via the mesh slice. These also enable trace-context propagation when
+    /// span reporting is disabled.
     #[allow(dead_code)]
     tracing_providers: Vec<TracingProvider>,
     trace_exporters: Vec<Arc<dyn TraceExporter>>,
@@ -177,10 +177,14 @@ impl WorkloadMetrics {
         self.span_reporting_disabled
     }
 
+    fn trace_context_enabled(&self) -> bool {
+        !self.tracing_providers.is_empty()
+    }
+
     fn annotate_http_context(&self, ctx: &mut RequestContext, headers: &HashMap<String, String>) {
         self.insert_common_metadata(&mut ctx.metadata);
         self.apply_telemetry_metadata(&mut ctx.metadata, headers);
-        if !self.trace_exporters.is_empty() && trace_is_sampled(&ctx.metadata) {
+        if self.trace_context_enabled() && trace_is_sampled(&ctx.metadata) {
             ensure_trace_metadata(&mut ctx.metadata, headers);
             if let Some(tracestate) = header_value(headers, TRACESTATE_HEADER) {
                 ctx.metadata
@@ -402,7 +406,7 @@ impl Plugin for WorkloadMetrics {
     }
 
     fn modifies_request_headers(&self) -> bool {
-        !self.trace_exporters.is_empty()
+        self.trace_context_enabled()
     }
 
     async fn before_proxy(
@@ -436,7 +440,7 @@ impl Plugin for WorkloadMetrics {
         let metadata = ctx.metadata.get_or_insert_with(Default::default);
         self.insert_common_metadata(metadata);
         self.apply_telemetry_metadata(metadata, &HashMap::new());
-        if !self.trace_exporters.is_empty() && trace_is_sampled(metadata) {
+        if self.trace_context_enabled() && trace_is_sampled(metadata) {
             ensure_trace_metadata(metadata, &HashMap::new());
         }
         metadata.insert(
@@ -992,5 +996,21 @@ mod tests {
         assert!(metrics.span_reporting_disabled());
         assert_eq!(metrics.tracing_providers().len(), 1);
         assert!(metrics.warmup_hostnames().is_empty());
+        assert!(metrics.modifies_request_headers());
+
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        let mut headers = HashMap::new();
+
+        let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert!(ctx.metadata.contains_key("trace_id"));
+        assert!(ctx.metadata.contains_key("span_id"));
+        assert!(ctx.metadata.contains_key(TRACEPARENT_HEADER));
+        assert!(headers.contains_key(TRACEPARENT_HEADER));
     }
 }
