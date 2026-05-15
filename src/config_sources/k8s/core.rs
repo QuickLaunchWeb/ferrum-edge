@@ -906,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_slice_serving_defaults_to_ready() {
+    fn endpoint_slice_serving_inherits_unready_when_ready_absent() {
         let mut slice = endpoint_slice(vec![("reviews-v1", "10.1.0.10")]);
         slice.spec["endpoints"][0]["conditions"] = json!({"ready": false});
 

@@ -34,7 +34,6 @@ pub struct K8sControllerConfig {
     pub watch_namespaces: Vec<String>,
     pub watch_istio: bool,
     pub watch_gateway_api: bool,
-    pub watch_core: bool,
     pub pod_discovery_enabled: bool,
     pub watch_node_locality: bool,
     pub debounce_ms: u64,
@@ -76,7 +75,6 @@ pub async fn start_k8s_controller(
     info!(
         watch_istio = controller_config.watch_istio,
         watch_gateway_api = controller_config.watch_gateway_api,
-        watch_core = controller_config.watch_core,
         pod_discovery_enabled = controller_config.pod_discovery_enabled,
         watch_node_locality = controller_config.watch_node_locality,
         watch_namespaces = ?controller_config.watch_namespaces,
@@ -91,7 +89,7 @@ pub async fn start_k8s_controller(
     let watcher_selection = WatcherSelection {
         watch_istio: controller_config.watch_istio,
         watch_gateway_api: controller_config.watch_gateway_api,
-        watch_core: controller_config.watch_core,
+        watch_core: controller_config.pod_discovery_enabled,
         watch_node_locality: controller_config.watch_node_locality,
     };
 
