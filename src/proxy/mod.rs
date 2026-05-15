@@ -4204,14 +4204,14 @@ async fn handle_websocket_request_authenticated(
 
     // Inject authenticated identity headers for WebSocket connections.
     if let Some(username) = ctx.backend_consumer_username() {
-        push_forwardable_header_if_absent(
+        push_forwardable_header_override(
             &mut client_headers,
             "x-consumer-username",
             username.to_string(),
         );
     }
     if let Some(custom_id) = ctx.backend_consumer_custom_id() {
-        push_forwardable_header_if_absent(
+        push_forwardable_header_override(
             &mut client_headers,
             "x-consumer-custom-id",
             custom_id.to_string(),
@@ -4827,17 +4827,13 @@ fn is_websocket_backend_strip_header(name: &str) -> bool {
     )
 }
 
-fn push_forwardable_header_if_absent(
+fn push_forwardable_header_override(
     headers: &mut Vec<(String, String)>,
     name: &'static str,
     value: String,
 ) {
-    if !headers
-        .iter()
-        .any(|(existing_name, _)| existing_name.eq_ignore_ascii_case(name))
-    {
-        headers.push((name.to_string(), value));
-    }
+    headers.retain(|(existing_name, _)| !existing_name.eq_ignore_ascii_case(name));
+    headers.push((name.to_string(), value));
 }
 
 /// Build a WebSocket backend URL using a specific target host/port,
@@ -13383,6 +13379,54 @@ mod tests {
             .collect();
 
         assert_eq!(xff_values, vec!["203.0.113.1", "198.51.100.2"]);
+    }
+
+    #[test]
+    fn websocket_identity_headers_override_client_supplied_values() {
+        let mut headers = vec![
+            ("x-consumer-username".to_string(), "spoofed".to_string()),
+            (
+                "X-Consumer-Username".to_string(),
+                "also-spoofed".to_string(),
+            ),
+            (
+                "x-consumer-custom-id".to_string(),
+                "spoofed-custom".to_string(),
+            ),
+            ("x-request-id".to_string(), "req-1".to_string()),
+        ];
+
+        push_forwardable_header_override(
+            &mut headers,
+            "x-consumer-username",
+            "trusted-user".to_string(),
+        );
+        push_forwardable_header_override(
+            &mut headers,
+            "x-consumer-custom-id",
+            "trusted-custom".to_string(),
+        );
+
+        let usernames: Vec<&str> = headers
+            .iter()
+            .filter_map(|(name, value)| {
+                name.eq_ignore_ascii_case("x-consumer-username")
+                    .then_some(value.as_str())
+            })
+            .collect();
+        let custom_ids: Vec<&str> = headers
+            .iter()
+            .filter_map(|(name, value)| {
+                name.eq_ignore_ascii_case("x-consumer-custom-id")
+                    .then_some(value.as_str())
+            })
+            .collect();
+
+        assert_eq!(usernames, vec!["trusted-user"]);
+        assert_eq!(custom_ids, vec!["trusted-custom"]);
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-request-id") && value == "req-1"
+        }));
     }
 
     #[test]
