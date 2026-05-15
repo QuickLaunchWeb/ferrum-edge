@@ -208,7 +208,16 @@ async fn start_node_agent_admin_listeners(
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
     };
 
-    let admin_http_addr = env_config.admin_socket_addr(env_config.admin_http_port);
+    // Safe-by-default bind: when the operator opts into the node-agent admin
+    // listener but configures none of the auth / explicit-bind / allowlist
+    // signals, fall back to loopback so unauthenticated `/metrics` and
+    // `/health` are not exposed on the network. See `decide_admin_bind_address`.
+    let signals = AdminBindSignals::from_env();
+    let admin_http_addr = decide_admin_bind_address(
+        &env_config.admin_bind_address,
+        env_config.admin_http_port,
+        &signals,
+    )?;
     let shutdown = shutdown_tx.subscribe();
     let handle = tokio::spawn(async move {
         info!(
@@ -223,6 +232,78 @@ async fn start_node_agent_admin_listeners(
     handles.push(handle);
 
     Ok(handles)
+}
+
+/// Operator signals that confirm the node-agent admin listener is intentionally
+/// reachable beyond loopback. Captured at startup via `resolve_ferrum_var` so
+/// the env > conf-file precedence chain matches the rest of the gateway.
+#[derive(Debug, Clone)]
+struct AdminBindSignals {
+    /// `FERRUM_ADMIN_BIND_ADDRESS` set explicitly (env or ferrum.conf).
+    bind_address_explicit: bool,
+    /// `FERRUM_ADMIN_JWT_SECRET` set (auth is configured).
+    jwt_secret_set: bool,
+    /// `FERRUM_ADMIN_ALLOWED_CIDRS` set to a non-empty allowlist.
+    allowed_cidrs_set: bool,
+}
+
+impl AdminBindSignals {
+    fn from_env() -> Self {
+        Self {
+            bind_address_explicit: resolve_ferrum_var("FERRUM_ADMIN_BIND_ADDRESS")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false),
+            jwt_secret_set: resolve_ferrum_var("FERRUM_ADMIN_JWT_SECRET")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false),
+            allowed_cidrs_set: resolve_ferrum_var("FERRUM_ADMIN_ALLOWED_CIDRS")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false),
+        }
+    }
+}
+
+/// Pure helper: pick the admin listener bind address for node-agent mode.
+///
+/// When the operator opts in to the node-agent admin listener but has NOT
+/// configured any of the three escape hatches (`FERRUM_ADMIN_BIND_ADDRESS`,
+/// `FERRUM_ADMIN_JWT_SECRET`, `FERRUM_ADMIN_ALLOWED_CIDRS`) AND the resolved
+/// bind address is the unspecified-default `0.0.0.0`, override it to
+/// `127.0.0.1` and emit a `warn!` pointing operators at the escape hatches.
+/// This prevents accidentally exposing unauthenticated `/metrics` and
+/// `/health` to the network when the operator just flips
+/// `FERRUM_NODE_AGENT_ADMIN_ENABLED=true` without further config.
+fn decide_admin_bind_address(
+    configured_bind: &str,
+    port: u16,
+    signals: &AdminBindSignals,
+) -> Result<std::net::SocketAddr, anyhow::Error> {
+    let configured_ip: std::net::IpAddr = configured_bind.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "Invalid FERRUM_ADMIN_BIND_ADDRESS '{}' (expected a valid IP address)",
+            configured_bind
+        )
+    })?;
+
+    let any_signal_present = signals.bind_address_explicit
+        || signals.jwt_secret_set
+        || signals.allowed_cidrs_set;
+    let is_default_unspecified = !signals.bind_address_explicit
+        && (configured_ip.is_unspecified() || configured_bind == "0.0.0.0");
+
+    if !any_signal_present && is_default_unspecified {
+        warn!(
+            "FERRUM_NODE_AGENT_ADMIN_ENABLED=true with no auth, allowlist, or explicit bind address configured; \
+             defaulting node-agent admin listener to 127.0.0.1:{port} so unauthenticated /metrics and /health \
+             are not exposed on the network. To bind elsewhere, set one of: \
+             FERRUM_ADMIN_BIND_ADDRESS=<address> (e.g. 0.0.0.0 if intentional), \
+             FERRUM_ADMIN_JWT_SECRET=<secret>, or FERRUM_ADMIN_ALLOWED_CIDRS=<cidr-list>"
+        );
+        let loopback: std::net::IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+        return Ok(std::net::SocketAddr::new(loopback, port));
+    }
+
+    Ok(std::net::SocketAddr::new(configured_ip, port))
 }
 
 fn create_backend() -> Box<dyn EbpfBackend> {
@@ -1412,5 +1493,116 @@ mod tests {
             .expect_err("invalid CIDR should fail before spawning");
 
         assert!(err.to_string().contains("FERRUM_ADMIN_ALLOWED_CIDRS"));
+    }
+
+    fn signals(bind_explicit: bool, jwt: bool, cidrs: bool) -> AdminBindSignals {
+        AdminBindSignals {
+            bind_address_explicit: bind_explicit,
+            jwt_secret_set: jwt,
+            allowed_cidrs_set: cidrs,
+        }
+    }
+
+    #[test]
+    fn decide_admin_bind_defaults_to_loopback_when_no_signals() {
+        // Default unspecified bind + no auth, no allowlist, no explicit bind →
+        // override to 127.0.0.1 to avoid exposing unauthenticated /metrics.
+        let addr =
+            decide_admin_bind_address("0.0.0.0", 9000, &signals(false, false, false))
+                .expect("default 0.0.0.0 bind should be valid");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 9000)
+        );
+    }
+
+    #[test]
+    fn decide_admin_bind_respects_explicit_bind_address() {
+        // Operator explicitly set FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0 → respected.
+        let addr =
+            decide_admin_bind_address("0.0.0.0", 9000, &signals(true, false, false))
+                .expect("explicit bind should be valid");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                9000
+            )
+        );
+    }
+
+    #[test]
+    fn decide_admin_bind_respects_jwt_secret_signal() {
+        // JWT secret configured → operator opted into auth, respect 0.0.0.0.
+        let addr =
+            decide_admin_bind_address("0.0.0.0", 9000, &signals(false, true, false))
+                .expect("0.0.0.0 with JWT secret should be valid");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                9000
+            )
+        );
+    }
+
+    #[test]
+    fn decide_admin_bind_respects_allowed_cidrs_signal() {
+        // Allowlist configured → operator scoped network exposure, respect 0.0.0.0.
+        let addr =
+            decide_admin_bind_address("0.0.0.0", 9000, &signals(false, false, true))
+                .expect("0.0.0.0 with allowed cidrs should be valid");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                9000
+            )
+        );
+    }
+
+    #[test]
+    fn decide_admin_bind_respects_explicit_loopback() {
+        // Operator explicitly set FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 → respected.
+        let addr =
+            decide_admin_bind_address("127.0.0.1", 9000, &signals(true, false, false))
+                .expect("loopback should be valid");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 9000)
+        );
+    }
+
+    #[test]
+    fn decide_admin_bind_respects_explicit_v6_unspecified() {
+        // IPv6 :: with explicit-bind signal → respected (don't override).
+        let addr = decide_admin_bind_address("::", 9000, &signals(true, false, false))
+            .expect("explicit :: should be valid");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                9000
+            )
+        );
+    }
+
+    #[test]
+    fn decide_admin_bind_overrides_v6_unspecified_with_no_signals() {
+        // IPv6 :: with NO signals → also unsafe, override to loopback.
+        let addr =
+            decide_admin_bind_address("::", 9000, &signals(false, false, false))
+                .expect("default :: bind should be valid");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 9000)
+        );
+    }
+
+    #[test]
+    fn decide_admin_bind_rejects_invalid_address() {
+        let err = decide_admin_bind_address("not-an-ip", 9000, &signals(true, false, false))
+            .expect_err("invalid IP should be rejected");
+        assert!(err.to_string().contains("FERRUM_ADMIN_BIND_ADDRESS"));
     }
 }

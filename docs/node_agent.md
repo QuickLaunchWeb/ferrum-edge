@@ -32,4 +32,10 @@ When node-agent mode starts its admin listener, `/metrics` includes:
 
 The node agent starts the read-only admin HTTP listener on `FERRUM_ADMIN_HTTP_PORT` unless that port is set to `0`. Node-agent mode does not start an HTTPS admin listener yet, even when `FERRUM_ADMIN_HTTPS_PORT` is set.
 
-`/metrics` is unauthenticated, matching the rest of Ferrum's Prometheus surface. In node-agent deployments prefer binding admin to loopback (`FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1`) behind a local scraper, or set a narrow `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist when scraping over the cluster network.
+`/metrics` is unauthenticated, matching the rest of Ferrum's Prometheus surface. To prevent an opt-in to `FERRUM_NODE_AGENT_ADMIN_ENABLED=true` from accidentally exposing unauthenticated `/metrics` and `/health` to the network, the node-agent admin listener defaults to loopback (`127.0.0.1`) when **none** of the following operator signals are configured:
+
+- `FERRUM_ADMIN_BIND_ADDRESS` is set explicitly (any value, including `0.0.0.0` if intentional), or
+- `FERRUM_ADMIN_JWT_SECRET` is set (admin auth is configured), or
+- `FERRUM_ADMIN_ALLOWED_CIDRS` is set to a non-empty allowlist.
+
+If any one of those is set, the configured `FERRUM_ADMIN_BIND_ADDRESS` (default `0.0.0.0`) is honored as-is. When the loopback fallback engages, the gateway emits a `warn!` at startup pointing at the three escape hatches. For node-agent deployments scraped over the cluster network, prefer either an explicit `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist or front the listener with a local sidecar scraper bound to loopback.
