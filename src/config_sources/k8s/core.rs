@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::Value;
 
@@ -287,8 +287,7 @@ fn auto_workloads_for_service(
     service_key: &K8sServiceKey,
     endpoint_slice_indices: &[usize],
 ) -> Result<Vec<Workload>, K8sTranslateError> {
-    let mut seen_pods = BTreeSet::new();
-    let mut workloads = Vec::new();
+    let mut endpoints_by_pod = BTreeMap::new();
     for &slice_index in endpoint_slice_indices {
         let Some(slice) = acc.core.endpoint_slices.get(slice_index) else {
             continue;
@@ -304,17 +303,30 @@ fn auto_workloads_for_service(
             let Some(pod_key) = pod_key else {
                 continue;
             };
-            if !seen_pods.insert(pod_key.clone()) {
-                continue;
+            let merged = endpoints_by_pod
+                .entry(pod_key.clone())
+                .or_insert_with(|| CoreEndpoint {
+                    pod_key: Some(pod_key),
+                    addresses: Vec::new(),
+                    ready: true,
+                    node_name: endpoint.node_name.clone(),
+                });
+            merged.addresses.extend(endpoint.addresses.iter().cloned());
+            if merged.node_name.is_none() {
+                merged.node_name = endpoint.node_name.clone();
             }
-            let Some(pod) = acc.core.pods.get(&pod_key) else {
-                continue;
-            };
-            if !pod.ready {
-                continue;
-            }
-            workloads.push(workload_from_pod(acc, service_key, pod, endpoint)?);
         }
+    }
+
+    let mut workloads = Vec::with_capacity(endpoints_by_pod.len());
+    for (pod_key, endpoint) in endpoints_by_pod {
+        let Some(pod) = acc.core.pods.get(&pod_key) else {
+            continue;
+        };
+        if !pod.ready {
+            continue;
+        }
+        workloads.push(workload_from_pod(acc, service_key, pod, &endpoint)?);
     }
     Ok(workloads)
 }
@@ -711,6 +723,34 @@ mod tests {
             mesh.workloads[0].spiffe_id.as_str(),
             "spiffe://cluster.local/ns/workloads/sa/reviews"
         );
+    }
+
+    #[test]
+    fn auto_workload_merges_addresses_from_multiple_endpoint_slices() {
+        let mut ipv4_slice = endpoint_slice(vec![("reviews-v1", "10.1.0.10")]);
+        ipv4_slice.metadata.name = "reviews-ipv4".to_string();
+        let mut ipv6_slice = endpoint_slice(vec![("reviews-v1", "fd00::10")]);
+        ipv6_slice.metadata.name = "reviews-ipv6".to_string();
+        ipv6_slice.spec["addressType"] = json!("IPv6");
+
+        let translation = translate_k8s_objects(
+            &[
+                service(),
+                ready_pod("reviews-v1", "10.1.0.10"),
+                ipv4_slice,
+                ipv6_slice,
+            ],
+            options(),
+        )
+        .expect("core translation succeeds");
+
+        let mesh = translation.config.mesh.expect("mesh config");
+        assert_eq!(mesh.workloads.len(), 1);
+        assert_eq!(
+            mesh.workloads[0].addresses,
+            vec!["10.1.0.10".to_string(), "fd00::10".to_string()]
+        );
+        assert_eq!(mesh.services[0].workloads.len(), 1);
     }
 
     #[test]
