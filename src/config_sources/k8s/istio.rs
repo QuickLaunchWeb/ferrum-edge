@@ -24,7 +24,11 @@ use super::{
     port_from_u64, proxy_for_route, request_termination_plugin_for_proxy, resource_id,
     selector_from_istio, string_array, string_field, string_map, upstream_for_route,
 };
-use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT, PluginConfig, Proxy, RetryConfig};
+use crate::config::types::{
+    BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
+    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH, MAX_TARGET_WEIGHT, PluginConfig, Proxy,
+    RetryConfig, validate_backend_tls_san_allow_list_entry, validate_backend_tls_sni,
+};
 
 const URI_LESS_MATCH_LISTEN_PATH: &str = "~.*";
 
@@ -852,6 +856,42 @@ fn translate_client_tls_settings(
     let client_certificate = string_field(value, "clientCertificate").map(ToOwned::to_owned);
     let private_key = string_field(value, "privateKey").map(ToOwned::to_owned);
     let subject_alt_names = string_array(value, "subjectAltNames");
+    if subject_alt_names.len() > MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.tls.subjectAltNames must not have more than {} entries (got {})",
+                MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
+                subject_alt_names.len()
+            ),
+        ));
+    }
+    for (idx, san) in subject_alt_names.iter().enumerate() {
+        if san.len() > MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "trafficPolicy.tls.subjectAltNames[{idx}] must not exceed {} characters (got {})",
+                    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
+                    san.len()
+                ),
+            ));
+        }
+        if let Err(e) = validate_backend_tls_san_allow_list_entry(san) {
+            return Err(invalid_resource(
+                object,
+                format!("trafficPolicy.tls.subjectAltNames[{idx}]: {e}"),
+            ));
+        }
+    }
+    if let Some(ref sni_value) = sni
+        && let Err(e) = validate_backend_tls_sni(sni_value)
+    {
+        return Err(invalid_resource(
+            object,
+            format!("trafficPolicy.tls.sni: {e}"),
+        ));
+    }
     let insecure_skip_verify = value
         .get("insecureSkipVerify")
         .and_then(Value::as_bool)
@@ -8146,6 +8186,112 @@ mod tests {
             vec!["spiffe://example/sa/reviews".to_string()]
         );
         assert!(!tls.insecure_skip_verify);
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_rejects_too_many_subject_alt_names() {
+        let too_many_sans: Vec<String> = (0..=MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES)
+            .map(|i| format!("san-{i}.example.com"))
+            .collect();
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "subjectAltNames": too_many_sans
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("too many subjectAltNames must fail");
+
+        assert!(
+            err.to_string()
+                .contains("subjectAltNames must not have more than"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_rejects_overlong_subject_alt_name() {
+        let overlong_san = format!(
+            "{}.example.com",
+            "a".repeat(MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH)
+        );
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "subjectAltNames": [overlong_san]
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("overlong subjectAltNames entry must fail");
+
+        assert!(
+            err.to_string()
+                .contains("subjectAltNames[0] must not exceed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_rejects_invalid_sni() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "sni": "*.mesh.internal"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("wildcard SNI must fail");
+
+        assert!(
+            err.to_string().contains("trafficPolicy.tls.sni"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_rejects_invalid_san_content() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "subjectAltNames": ["spiffe://cluster.local"]
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("SPIFFE URI without path must fail");
+
+        assert!(err.to_string().contains("subjectAltNames[0]"), "got: {err}");
     }
 
     #[test]
