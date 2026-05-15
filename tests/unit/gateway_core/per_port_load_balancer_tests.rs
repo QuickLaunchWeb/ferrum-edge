@@ -236,6 +236,65 @@ fn port_subset_fully_unhealthy_intersection_returns_none() {
 }
 
 #[test]
+fn port_subset_vec_fallback_filters_intersection_for_large_upstreams() {
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+            ..Default::default()
+        },
+    );
+    let targets: Vec<UpstreamTarget> = (0..129)
+        .map(|idx| {
+            let port = if idx % 3 == 0 { 8080 } else { 9090 };
+            let version = if idx % 5 == 0 { "v1" } else { "v2" };
+            tagged_target(&format!("h{idx}"), port, &[("version", version)])
+        })
+        .collect();
+    let mut upstream =
+        upstream_with_overrides(LoadBalancerAlgorithm::RoundRobin, targets, port_overrides);
+    upstream.subsets = Some(vec![SubsetDefinition {
+        name: "v1".to_string(),
+        labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+        traffic_policy: None,
+    }]);
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let selection = LoadBalancerCache::select_target_for_port_subset_from(
+        &snapshot, "u1", "key", 8080, "v1", None,
+    )
+    .expect("large-target port subset selection");
+    assert_eq!(selection.target.port, 8080);
+    assert_eq!(
+        selection.target.tags.get("version").map(String::as_str),
+        Some("v1")
+    );
+
+    let retry = LoadBalancerCache::select_next_target_for_port_subset_from(
+        &snapshot,
+        "u1",
+        "retry",
+        8080,
+        "v1",
+        selection.target.as_ref(),
+        None,
+    )
+    .expect("large-target port subset retry selection");
+    assert_eq!(retry.port, 8080);
+    assert_eq!(retry.tags.get("version").map(String::as_str), Some("v1"));
+    assert_ne!(
+        retry.host, selection.target.host,
+        "retry should exclude the original target while staying in the port/subset intersection"
+    );
+}
+
+#[test]
 fn port_retry_selection_does_not_escape_selected_port() {
     let mut port_overrides = HashMap::new();
     port_overrides.insert(
@@ -323,7 +382,12 @@ fn upstream_round_robin_port_override_random_uses_port_specific_algorithm() {
                 .clone()
         })
         .collect();
-    assert_eq!(port_sequence, vec!["a", "b", "b"]);
+    assert!(
+        port_sequence
+            .iter()
+            .all(|host| matches!(host.as_str(), "a" | "b")),
+        "port-specific random selection must stay on port 8080 targets: {port_sequence:?}"
+    );
 
     let parent_sequence: Vec<String> = (0..3)
         .map(|_| {

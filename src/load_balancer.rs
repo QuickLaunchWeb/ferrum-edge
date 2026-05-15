@@ -1456,6 +1456,16 @@ impl LoadBalancer {
         healthy
     }
 
+    fn subset_membership_mask(&self, subset_indices: &[usize]) -> Vec<bool> {
+        let mut mask = vec![false; self.targets.len()];
+        for &idx in subset_indices {
+            if let Some(slot) = mask.get_mut(idx) {
+                *slot = true;
+            }
+        }
+        mask
+    }
+
     pub fn select(
         &self,
         ctx_key: &str,
@@ -1704,10 +1714,11 @@ impl LoadBalancer {
         subset_indices: &[usize],
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
+        let subset_mask = self.subset_membership_mask(subset_indices);
         let candidates: Vec<(usize, &Arc<UpstreamTarget>)> = self
             .healthy_targets_vec_for_indices(health, &port_state.target_indices)
             .into_iter()
-            .filter(|(idx, _)| subset_indices.contains(idx))
+            .filter(|(idx, _)| subset_mask[*idx])
             .collect();
         if candidates.is_empty() {
             return None;
@@ -2273,12 +2284,11 @@ impl LoadBalancer {
         exclude_idx: Option<usize>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
+        let subset_mask = self.subset_membership_mask(subset_indices);
         let candidates: Vec<(usize, &Arc<UpstreamTarget>)> = self
             .healthy_targets_vec_for_indices(health, &port_state.target_indices)
             .into_iter()
-            .filter(|(idx, _)| {
-                subset_indices.contains(idx) && exclude_idx.is_none_or(|ei| ei != *idx)
-            })
+            .filter(|(idx, _)| subset_mask[*idx] && exclude_idx.is_none_or(|ei| ei != *idx))
             .collect();
         if candidates.is_empty() {
             return None;
