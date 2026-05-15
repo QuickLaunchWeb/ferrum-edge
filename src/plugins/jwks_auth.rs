@@ -742,6 +742,7 @@ fn mark_original_token_stripping_metadata(ctx: &mut RequestContext, provider: &J
                     format!("{STRIP_QUERY_PARAM_METADATA_PREFIX}{name}"),
                     "true".to_string(),
                 );
+                ctx.query_params.remove(name);
             }
         }
     }

@@ -231,6 +231,8 @@ async fn custom_query_token_marks_param_for_backend_strip() {
     let mut ctx = make_ctx();
     ctx.query_params
         .insert("access_token".to_string(), token_for("query-user"));
+    ctx.query_params
+        .insert("safe".to_string(), "visible-to-egress-plugins".to_string());
 
     let result = plugin
         .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
@@ -240,6 +242,14 @@ async fn custom_query_token_marks_param_for_backend_strip() {
     assert!(
         ctx.metadata
             .contains_key("jwks_auth.strip_query_param.access_token")
+    );
+    assert!(
+        !ctx.query_params.contains_key("access_token"),
+        "query-token credentials should be removed before before_proxy egress plugins run"
+    );
+    assert_eq!(
+        ctx.query_params.get("safe").map(String::as_str),
+        Some("visible-to-egress-plugins")
     );
 }
 
