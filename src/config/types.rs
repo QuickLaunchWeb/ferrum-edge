@@ -240,6 +240,25 @@ pub struct ResolvedPortOverride {
     pub passive_health_check: Option<PassiveHealthCheck>,
 }
 
+impl ResolvedPortOverride {
+    pub fn from_upstream_override(value: &UpstreamPortOverride) -> Option<Self> {
+        let resolved = Self {
+            connect_timeout_ms: value.connect_timeout_ms,
+            algorithm: value.algorithm,
+            hash_on: value.hash_on.clone(),
+            passive_health_check: value.passive_health_check.clone(),
+        };
+        (!resolved.is_empty()).then_some(resolved)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.connect_timeout_ms.is_none()
+            && self.algorithm.is_none()
+            && self.hash_on.is_none()
+            && self.passive_health_check.is_none()
+    }
+}
+
 /// A named subset of upstream targets identified by label selectors.
 ///
 /// Targets whose `tags` are a superset of `labels` belong to this subset.
@@ -1789,17 +1808,8 @@ impl GatewayConfig {
                     .port_overrides
                     .iter()
                     .filter_map(|(port, ovr)| {
-                        let resolved = ResolvedPortOverride {
-                            connect_timeout_ms: ovr.connect_timeout_ms,
-                            algorithm: ovr.algorithm,
-                            hash_on: ovr.hash_on.clone(),
-                            passive_health_check: ovr.passive_health_check.clone(),
-                        };
-                        (resolved.connect_timeout_ms.is_some()
-                            || resolved.algorithm.is_some()
-                            || resolved.hash_on.is_some()
-                            || resolved.passive_health_check.is_some())
-                        .then_some((*port, resolved))
+                        ResolvedPortOverride::from_upstream_override(ovr)
+                            .map(|resolved| (*port, resolved))
                     })
                     .collect();
                 (u.id.as_str(), ports)

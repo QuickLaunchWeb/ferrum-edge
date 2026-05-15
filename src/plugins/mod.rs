@@ -756,17 +756,7 @@ fn dispatch_port_overrides_from_upstream(
         .port_overrides
         .iter()
         .filter_map(|(port, ovr)| {
-            let resolved = ResolvedPortOverride {
-                connect_timeout_ms: ovr.connect_timeout_ms,
-                algorithm: ovr.algorithm,
-                hash_on: ovr.hash_on.clone(),
-                passive_health_check: ovr.passive_health_check.clone(),
-            };
-            (resolved.connect_timeout_ms.is_some()
-                || resolved.algorithm.is_some()
-                || resolved.hash_on.is_some()
-                || resolved.passive_health_check.is_some())
-            .then_some((*port, resolved))
+            ResolvedPortOverride::from_upstream_override(ovr).map(|resolved| (*port, resolved))
         })
         .collect();
     if overrides.is_empty() {
