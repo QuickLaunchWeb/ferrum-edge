@@ -93,7 +93,7 @@ impl SlackChannel {
         let redacted_url = redacted_endpoint_url(&self.webhook_url);
         let req = http.get().post(self.webhook_url.as_ref()).json(&payload);
         let resp = http
-            .execute_redacted(req, "proxy_alerts_slack", &redacted_url)
+            .execute_redacted(req, "notification_slack", &redacted_url)
             .await
             .map_err(|e| format!("slack dispatch failed: {e}"))?;
         if !resp.status().is_success() {

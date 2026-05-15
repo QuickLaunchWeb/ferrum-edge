@@ -188,7 +188,7 @@ impl WebhookChannel {
         req = req.body(body);
         let redacted_url = redacted_endpoint_url(&self.url);
         let resp = http
-            .execute_redacted(req, "proxy_alerts_webhook", &redacted_url)
+            .execute_redacted(req, "notification_webhook", &redacted_url)
             .await
             .map_err(|e| format!("webhook dispatch failed: {e}"))?;
         if !resp.status().is_success() {
