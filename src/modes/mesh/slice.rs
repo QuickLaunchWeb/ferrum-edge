@@ -761,6 +761,10 @@ fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
         } else if !root_namespace.is_empty() && sidecar.namespace == root_namespace {
             match sidecar.workload_selector.as_ref() {
                 Some(selector) if !selector.labels.is_empty() => {
+                    // Kubernetes Sidecar selectors in the root namespace remain
+                    // namespace-scoped. This tier is primarily for native config
+                    // that intentionally omits selector.namespace to opt in to a
+                    // mesh-wide workload selector.
                     if workload_selector_matches(selector, workload_namespace, workload_labels)
                         && root_workload_scoped
                             .map(|current| sidecar.name.as_str() < current.name.as_str())
