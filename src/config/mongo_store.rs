@@ -20,8 +20,14 @@
 //! requires a replica set.
 //!
 //! **Index creation**: The `run_migrations()` method creates indexes instead of
-//! running SQL migrations. Indexes are idempotent (`createIndex` is a no-op if
-//! the index already exists).
+//! running SQL migrations. `createIndex` is idempotent **only when the full
+//! index spec (keys + options) matches**; if the keys match but options differ
+//! (e.g. a new `partialFilterExpression`), MongoDB raises
+//! `IndexOptionsConflict` (server error 85). Where this baseline ships a
+//! changed-option index over a previously-shipped one, `run_migrations()`
+//! detects the conflict, drops the legacy index, and recreates with the new
+//! options. See the api_specs `(namespace, proxy_id)` unique index for the
+//! pattern.
 
 #[allow(dead_code)] // MongoStore is wired up in mode dispatch (database.rs, control_plane.rs)
 mod inner {
@@ -47,6 +53,34 @@ mod inner {
     use tracing::{debug, info, warn};
     // regex::escape is used for safe MongoDB $regex pattern construction in list filters.
     use regex::escape as regex_escape;
+
+    // MongoDB server error codes used by the index-upgrade logic in
+    // `run_migrations`. Source: src/mongo/db/operation_exit_code.idl (server)
+    // and https://www.mongodb.com/docs/manual/reference/error-codes/.
+    const MONGO_ERR_INDEX_NOT_FOUND: i32 = 27;
+    const MONGO_ERR_INDEX_ALREADY_EXISTS: i32 = 68;
+    const MONGO_ERR_INDEX_OPTIONS_CONFLICT: i32 = 85;
+    const MONGO_ERR_INDEX_KEY_SPECS_CONFLICT: i32 = 86;
+
+    fn is_mongo_command_error_with_code(err: &mongodb::error::Error, code: i32) -> bool {
+        matches!(
+            err.kind.as_ref(),
+            mongodb::error::ErrorKind::Command(cmd) if cmd.code == code
+        )
+    }
+
+    fn is_index_options_conflict(err: &mongodb::error::Error) -> bool {
+        is_mongo_command_error_with_code(err, MONGO_ERR_INDEX_OPTIONS_CONFLICT)
+            || is_mongo_command_error_with_code(err, MONGO_ERR_INDEX_KEY_SPECS_CONFLICT)
+    }
+
+    fn is_index_not_found(err: &mongodb::error::Error) -> bool {
+        is_mongo_command_error_with_code(err, MONGO_ERR_INDEX_NOT_FOUND)
+    }
+
+    fn is_index_already_exists(err: &mongodb::error::Error) -> bool {
+        is_mongo_command_error_with_code(err, MONGO_ERR_INDEX_ALREADY_EXISTS)
+    }
 
     fn mesh_route_dispatch_references_upstream_id(
         plugin: &PluginConfig,
@@ -2621,21 +2655,58 @@ mod inner {
             // (namespace, name), (namespace, custom_id), and (namespace, listen_port)
             // elsewhere — guards against the null-collision case if a future doc
             // is ever inserted without a proxy_id. SQL is safe via NOT NULL.
-            self.api_specs()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "proxy_id": 1 })
-                        .options(
-                            IndexOptions::builder()
-                                .unique(true)
-                                .partial_filter_expression(doc! {
-                                    "proxy_id": { "$type": "string" }
-                                })
-                                .build(),
-                        )
+            //
+            // Upgrade path: the previous V001 baseline created the same-keyed
+            // index with `unique(true)` only. MongoDB raises
+            // IndexOptionsConflict (code 85) when keys match but options
+            // differ, so a plain `create_index` fails on upgrade. Drop the
+            // legacy index on conflict and recreate — fresh DBs skip the
+            // branch, upgraded DBs take it exactly once. IndexNotFound on
+            // drop and IndexAlreadyExists on recreate are both tolerated to
+            // make the path safe under concurrent multi-instance startup.
+            let api_specs_unique = IndexModel::builder()
+                .keys(doc! { "namespace": 1, "proxy_id": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .unique(true)
+                        .partial_filter_expression(doc! {
+                            "proxy_id": { "$type": "string" }
+                        })
                         .build(),
                 )
-                .await?;
+                .build();
+            match self
+                .api_specs()
+                .create_index(api_specs_unique.clone())
+                .await
+            {
+                Ok(_) => {}
+                Err(e) if is_index_options_conflict(&e) => {
+                    warn!(
+                        "MongoDB api_specs (namespace, proxy_id) unique index exists \
+                         without partialFilterExpression. Dropping the legacy index and \
+                         recreating with the new options — one-time upgrade step."
+                    );
+                    match self.api_specs().drop_index("namespace_1_proxy_id_1").await {
+                        Ok(_) => {}
+                        Err(drop_err) if is_index_not_found(&drop_err) => {}
+                        Err(drop_err) => {
+                            return Err(anyhow::anyhow!(
+                                "Failed to drop legacy api_specs (namespace, proxy_id) index \
+                                 during upgrade: {drop_err}. Run \
+                                 `db.api_specs.dropIndex(\"namespace_1_proxy_id_1\")` \
+                                 manually and restart."
+                            ));
+                        }
+                    }
+                    match self.api_specs().create_index(api_specs_unique).await {
+                        Ok(_) => {}
+                        Err(create_err) if is_index_already_exists(&create_err) => {}
+                        Err(create_err) => return Err(create_err.into()),
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
             self.api_specs()
                 .create_index(
                     IndexModel::builder()
