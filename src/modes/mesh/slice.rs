@@ -713,11 +713,11 @@ fn split_canonical_service_host(host: &str) -> Option<(&str, &str)> {
 /// Resolve the most-specific applicable Sidecar for a workload.
 ///
 /// Most specific wins: a Sidecar with a non-empty `workload_selector` in the
-/// workload namespace whose labels match the workload outranks an Istio
-/// root-namespace Sidecar with a matching mesh-wide selector, which outranks
-/// the workload namespace-default Sidecar (no `workload_selector`), which
-/// outranks the Istio root-namespace default Sidecar. Within the same tier the
-/// ASCII-smallest name wins so reconciles stay deterministic.
+/// workload namespace whose labels match the workload outranks a root-namespace
+/// Sidecar with an explicitly mesh-wide selector, which outranks the workload
+/// namespace-default Sidecar (no `workload_selector`), which outranks the Istio
+/// root-namespace default Sidecar. Within the same tier the ASCII-smallest name
+/// wins so reconciles stay deterministic.
 ///
 /// Returns `None` if no Sidecar in `sidecars` applies to the workload.
 fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
@@ -3911,7 +3911,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_root_namespace_selector_applies_across_namespaces() {
+    fn sidecar_root_namespace_explicit_mesh_wide_selector_applies_across_namespaces() {
         let mesh = MeshConfig {
             sidecars: vec![
                 make_sidecar("namespace-default", "alpha", None, vec![vec!["gamma/*"]]),
@@ -3949,6 +3949,47 @@ mod tests {
         );
         assert_eq!(slice.service_entries.len(), 1);
         assert_eq!(slice.service_entries[0].name, "reviews-beta");
+    }
+
+    #[test]
+    fn sidecar_root_namespace_namespaced_selector_does_not_apply_across_namespaces() {
+        let mesh = MeshConfig {
+            sidecars: vec![
+                make_sidecar("namespace-default", "alpha", None, vec![vec!["gamma/*"]]),
+                make_sidecar(
+                    "mesh-frontend",
+                    "istio-system",
+                    Some(WorkloadSelector {
+                        labels: HashMap::from([("app".into(), "frontend".into())]),
+                        namespace: Some("istio-system".into()),
+                    }),
+                    vec![vec!["beta/*"]],
+                ),
+            ],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews-beta",
+                    "beta",
+                    "reviews.beta.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "payments-gamma",
+                    "gamma",
+                    "payments.gamma.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let labels = BTreeMap::from([("app".into(), "frontend".into())]);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_labels("alpha", labels),
+        );
+        assert_eq!(slice.service_entries.len(), 1);
+        assert_eq!(slice.service_entries[0].name, "payments-gamma");
     }
 
     #[test]
