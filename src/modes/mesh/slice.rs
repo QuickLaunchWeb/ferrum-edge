@@ -787,6 +787,12 @@ fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
         .or(root_namespace_default)?;
     if selected.egress_inherits_defaults {
         if let Some(namespace_default) = namespace_default {
+            // Intentional Istio divergence for partial snapshots: once a
+            // workload namespace declares its own default Sidecar, an
+            // inheriting Sidecar in that namespace does not fall through to
+            // the root namespace default. If the namespace default also
+            // inherits, we leave the slice unnarrowed rather than guessing
+            // which outbound defaults the control plane omitted.
             if !std::ptr::eq(selected, namespace_default)
                 && !namespace_default.egress_inherits_defaults
             {
@@ -4098,6 +4104,56 @@ mod tests {
         );
         assert_eq!(slice.service_entries.len(), 1);
         assert_eq!(slice.service_entries[0].name, "reviews-beta");
+    }
+
+    #[test]
+    fn sidecar_workload_scoped_with_inheriting_root_default_is_noop() {
+        let mesh = MeshConfig {
+            sidecars: vec![
+                MeshSidecar {
+                    name: "mesh-default".into(),
+                    namespace: "istio-system".into(),
+                    workload_selector: None,
+                    egress_inherits_defaults: true,
+                    egress: Vec::new(),
+                },
+                make_inheriting_sidecar(
+                    "frontend-ingress-only",
+                    "alpha",
+                    WorkloadSelector {
+                        labels: HashMap::from([("app".into(), "frontend".into())]),
+                        namespace: Some("alpha".into()),
+                    },
+                ),
+            ],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews-beta",
+                    "beta",
+                    "reviews.beta.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "payments-gamma",
+                    "gamma",
+                    "payments.gamma.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let labels = BTreeMap::from([("app".into(), "frontend".into())]);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_labels("alpha", labels),
+        );
+        let names: BTreeSet<&str> = slice
+            .service_entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, BTreeSet::from(["payments-gamma", "reviews-beta"]));
     }
 
     #[test]
