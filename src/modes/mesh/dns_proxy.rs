@@ -8,7 +8,7 @@
 //! `MeshSlice` is updated, so there are no locks on the query hot path.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -275,7 +275,11 @@ impl DnsResolutionTable {
         // workload addresses through SPIFFE ID references.
         for svc in &slice.services {
             let mut svc_ips: Vec<IpAddr> = Vec::new();
+            let mut seen_workload_refs = HashSet::new();
             for wl_ref in &svc.workloads {
+                if !seen_workload_refs.insert(wl_ref.spiffe_id.as_str()) {
+                    continue;
+                }
                 if let Some(entries) =
                     workload_ips.get(&(wl_ref.spiffe_id.as_str(), svc.namespace.as_str()))
                 {
@@ -2318,6 +2322,27 @@ mod tests {
         assert!(ips.contains(&"10.1.0.1".parse::<IpAddr>().unwrap()));
         assert!(ips.contains(&"10.1.0.2".parse::<IpAddr>().unwrap()));
         assert!(ips.contains(&"10.1.0.3".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn resolution_table_dedups_duplicate_service_workload_refs() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/api";
+        let slice = MeshSlice {
+            workloads: vec![test_workload(spiffe, vec!["10.1.0.1", "10.1.0.2"])],
+            services: vec![test_mesh_service(
+                "my-api",
+                "default",
+                vec![spiffe, spiffe, spiffe],
+            )],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        let ips = table.resolve("my-api.default.svc.cluster.local").unwrap();
+
+        assert_eq!(ips.len(), 2);
+        assert!(ips.contains(&"10.1.0.1".parse::<IpAddr>().unwrap()));
+        assert!(ips.contains(&"10.1.0.2".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
