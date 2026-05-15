@@ -239,7 +239,6 @@ impl IptablesPlan {
 pub struct EbpfPlan {
     pub enabled: bool,
     pub fallback: IptablesPlan,
-    pub ip6tables_mode: Ip6TablesMode,
     pub required_kernel: &'static str,
 }
 
@@ -249,7 +248,6 @@ impl EbpfPlan {
         Self {
             enabled: config.mode == CaptureMode::Ebpf,
             fallback: IptablesPlan::for_config(config),
-            ip6tables_mode: config.ip6tables_mode,
             required_kernel: "5.7",
         }
     }
@@ -581,7 +579,7 @@ mod tests {
 
         assert!(plan.enabled);
         assert_eq!(plan.required_kernel, "5.7");
-        assert_eq!(plan.ip6tables_mode, Ip6TablesMode::Auto);
+        assert_eq!(plan.fallback.ip6tables_mode, Ip6TablesMode::Auto);
         assert!(
             plan.fallback
                 .v4_commands
@@ -623,7 +621,7 @@ mod tests {
         let plan = EbpfPlan::for_config(&config);
         let script = plan.fallback_script();
 
-        assert_eq!(plan.ip6tables_mode, Ip6TablesMode::Required);
+        assert_eq!(plan.fallback.ip6tables_mode, Ip6TablesMode::Required);
         assert!(script.contains("ip6tables is required for IPv6 mesh capture"));
         assert!(script.contains("ip6tables nat table is required for IPv6 mesh capture"));
     }
