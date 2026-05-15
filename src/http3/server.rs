@@ -2511,6 +2511,31 @@ async fn handle_h3_request(
                     && let Some(next) = {
                         let retry_override_port =
                             crate::proxy::retry_port_override_dispatch_port(&proxy, prev_target);
+                        // When the retry rotates into a per-port override
+                        // lane whose `hash_on` strategy differs from the
+                        // initial dispatch port (e.g. `Cookie:sid` on the
+                        // override port vs `Ip` on the upstream), the
+                        // initial `lb_hash_key` no longer maps to the
+                        // right consistent-hash bucket. Recompute against
+                        // the per-port strategy. Mirrors the HTTP/H2/WS
+                        // retry sites in `src/proxy/mod.rs`.
+                        let rehashed;
+                        let retry_key: &str = if let Some(port) = retry_override_port {
+                            let strategy = LoadBalancerCache::get_hash_on_strategy_for_port_from(
+                                &epoch.load_balancer,
+                                upstream_id,
+                                port,
+                            );
+                            rehashed = crate::proxy::backend_dispatch::resolve_hash_key(
+                                &strategy,
+                                &ctx.client_ip,
+                                &proxy_headers,
+                            )
+                            .0;
+                            &rehashed
+                        } else {
+                            hash_key
+                        };
                         let health_ctx = crate::load_balancer::HealthContext {
                             active_unhealthy: &state.health_checker.active_unhealthy_targets,
                             proxy_passive: state
@@ -2537,7 +2562,7 @@ async fn handle_h3_request(
                                 LoadBalancerCache::select_next_target_for_port_subset_from(
                                     &epoch.load_balancer,
                                     upstream_id,
-                                    hash_key,
+                                    retry_key,
                                     port,
                                     subset_name,
                                     prev_target,
@@ -2547,7 +2572,7 @@ async fn handle_h3_request(
                                 LoadBalancerCache::select_next_target_subset_from(
                                     &epoch.load_balancer,
                                     upstream_id,
-                                    hash_key,
+                                    retry_key,
                                     subset_name,
                                     prev_target,
                                     Some(&health_ctx),
@@ -2557,7 +2582,7 @@ async fn handle_h3_request(
                             LoadBalancerCache::select_next_target_for_port_from(
                                 &epoch.load_balancer,
                                 upstream_id,
-                                hash_key,
+                                retry_key,
                                 port,
                                 prev_target,
                                 Some(&health_ctx),
@@ -2566,7 +2591,7 @@ async fn handle_h3_request(
                             LoadBalancerCache::select_next_target_from(
                                 &epoch.load_balancer,
                                 upstream_id,
-                                hash_key,
+                                retry_key,
                                 prev_target,
                                 Some(&health_ctx),
                             )

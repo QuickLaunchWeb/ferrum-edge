@@ -213,6 +213,7 @@ fn record_cross_protocol_retry_failure(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_next_cross_protocol_retry_target(
     state: &ProxyState,
     epoch: &RequestEpoch,
@@ -221,6 +222,8 @@ fn select_next_cross_protocol_retry_target(
     current_target: Option<&Arc<UpstreamTarget>>,
     path: &str,
     query_string: &str,
+    client_ip: &str,
+    proxy_headers: &HashMap<String, String>,
 ) -> Option<(Arc<UpstreamTarget>, String, String)> {
     let (Some(upstream_id), Some(prev_target), Some(hash_key)) =
         (&proxy.upstream_id, current_target, lb_hash_key)
@@ -229,6 +232,26 @@ fn select_next_cross_protocol_retry_target(
     };
 
     let retry_override_port = crate::proxy::retry_port_override_dispatch_port(proxy, prev_target);
+    // When the retry rotates into a per-port override lane whose
+    // `hash_on` strategy differs from the initial dispatch port (e.g.
+    // `Cookie:sid` on the override port vs `Ip` on the upstream), the
+    // initial `lb_hash_key` no longer maps to the right consistent-hash
+    // bucket. Recompute against the per-port strategy. Mirrors the
+    // HTTP/H2/WS retry sites in `src/proxy/mod.rs`.
+    let rehashed;
+    let retry_key: &str = if let Some(port) = retry_override_port {
+        let strategy = crate::load_balancer::LoadBalancerCache::get_hash_on_strategy_for_port_from(
+            &epoch.load_balancer,
+            upstream_id,
+            port,
+        );
+        rehashed =
+            crate::proxy::backend_dispatch::resolve_hash_key(&strategy, client_ip, proxy_headers).0;
+        &rehashed
+    } else {
+        hash_key
+    };
+
     let health_ctx = crate::load_balancer::HealthContext {
         active_unhealthy: &state.health_checker.active_unhealthy_targets,
         proxy_passive: state
@@ -256,7 +279,7 @@ fn select_next_cross_protocol_retry_target(
             crate::load_balancer::LoadBalancerCache::select_next_target_for_port_subset_from(
                 &epoch.load_balancer,
                 upstream_id,
-                hash_key,
+                retry_key,
                 port,
                 subset_name,
                 prev_target,
@@ -266,7 +289,7 @@ fn select_next_cross_protocol_retry_target(
             crate::load_balancer::LoadBalancerCache::select_next_target_subset_from(
                 &epoch.load_balancer,
                 upstream_id,
-                hash_key,
+                retry_key,
                 subset_name,
                 prev_target,
                 Some(&health_ctx),
@@ -276,7 +299,7 @@ fn select_next_cross_protocol_retry_target(
         crate::load_balancer::LoadBalancerCache::select_next_target_for_port_from(
             &epoch.load_balancer,
             upstream_id,
-            hash_key,
+            retry_key,
             port,
             prev_target,
             Some(&health_ctx),
@@ -285,7 +308,7 @@ fn select_next_cross_protocol_retry_target(
         crate::load_balancer::LoadBalancerCache::select_next_target_from(
             &epoch.load_balancer,
             upstream_id,
-            hash_key,
+            retry_key,
             prev_target,
             Some(&health_ctx),
         )
@@ -791,6 +814,8 @@ where
                                     current_target.as_ref(),
                                     path,
                                     query_string,
+                                    client_ip,
+                                    proxy_headers,
                                 )
                             {
                                 current_target = Some(next_target);
@@ -851,6 +876,8 @@ where
                                     current_target.as_ref(),
                                     path,
                                     query_string,
+                                    client_ip,
+                                    proxy_headers,
                                 )
                             {
                                 current_target = Some(next_target);
@@ -1700,6 +1727,8 @@ where
                     current_target.as_ref(),
                     path,
                     query_string,
+                    client_ip,
+                    proxy_headers,
                 )
             {
                 current_target = Some(next_target);
