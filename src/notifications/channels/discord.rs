@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 use crate::plugins::utils::http_client::PluginHttpClient;
 
 use super::super::notification::Notification;
-use super::{redacted_endpoint_url, resolve_optional_string, validate_webhook_url};
+use super::{
+    drain_response_body_redacted, redacted_endpoint_url, resolve_optional_string,
+    validate_webhook_url,
+};
 
 #[derive(Debug, Clone)]
 pub struct DiscordChannel {
@@ -82,10 +85,7 @@ impl DiscordChannel {
             .await
             .map_err(|e| format!("discord dispatch failed: {e}"))?;
         let status = resp.status();
-        let _body = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("discord dispatch body read failed: {e}"))?;
+        drain_response_body_redacted(resp, "discord", &redacted_url).await?;
         if !status.is_success() {
             return Err(format!(
                 "discord dispatch returned non-success status {status}"

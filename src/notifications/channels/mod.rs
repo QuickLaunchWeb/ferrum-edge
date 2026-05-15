@@ -237,6 +237,39 @@ pub(super) fn redacted_endpoint_url(raw: &str) -> String {
     url.to_string()
 }
 
+pub(super) async fn drain_response_body_redacted(
+    resp: reqwest::Response,
+    channel: &str,
+    redacted_url: &str,
+) -> Result<(), String> {
+    resp.bytes().await.map(|_| ()).map_err(|e| {
+        format!(
+            "{channel} dispatch body read failed: {} reading response from {redacted_url}",
+            reqwest_error_class(&e)
+        )
+    })
+}
+
+fn reqwest_error_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect error"
+    } else if error.is_body() {
+        "body error"
+    } else if error.is_decode() {
+        "decode error"
+    } else if error.is_status() {
+        "status error"
+    } else if error.is_redirect() {
+        "redirect error"
+    } else if error.is_request() {
+        "request error"
+    } else {
+        "error"
+    }
+}
+
 fn hostname_from_url(raw: &str) -> Vec<String> {
     Url::parse(raw)
         .ok()

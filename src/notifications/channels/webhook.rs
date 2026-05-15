@@ -17,7 +17,7 @@ use super::super::notification::Notification;
 use super::super::templating::{
     render_template, render_template_json_string_escaped, validate_template,
 };
-use super::{redacted_endpoint_url, resolve_optional_string};
+use super::{drain_response_body_redacted, redacted_endpoint_url, resolve_optional_string};
 
 /// Template variable names the webhook channel projects from a generic
 /// [`Notification`]. Callers (the proxy_alerts plugin in particular) supply
@@ -193,10 +193,7 @@ impl WebhookChannel {
             .await
             .map_err(|e| format!("webhook dispatch failed: {e}"))?;
         let status = resp.status();
-        let _body = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("webhook dispatch body read failed: {e}"))?;
+        drain_response_body_redacted(resp, "webhook", &redacted_url).await?;
         if !status.is_success() {
             return Err(format!(
                 "webhook dispatch returned non-success status {status}"

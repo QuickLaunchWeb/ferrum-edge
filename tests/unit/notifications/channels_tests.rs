@@ -13,6 +13,8 @@ use ferrum_edge::notifications::channels::{
 use ferrum_edge::notifications::{EventAction, Notification, NotificationField, Severity};
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 fn fixed_notification() -> Notification {
     Notification {
@@ -444,6 +446,41 @@ async fn webhook_dispatch_error_redacts_secret_url() {
         .dispatch(&fixed_notification(), &PluginHttpClient::default())
         .await
         .unwrap_err();
+    assert!(err.contains("redacted"), "got: {err}");
+    assert!(!err.contains("TOKEN123"), "got: {err}");
+    assert!(!err.contains("abc123"), "got: {err}");
+}
+
+#[tokio::test]
+async fn webhook_body_read_error_redacts_secret_url() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0; 1024];
+        let _ = socket.read(&mut buf).await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\nshort")
+            .await
+            .unwrap();
+    });
+
+    let webhook = WebhookChannel::new(
+        "pd",
+        &json!({
+            "type": "webhook",
+            "url": format!("http://{addr}/hooks/TOKEN123?routing_key=abc123"),
+            "body_template": "x",
+        }),
+    )
+    .unwrap();
+    let err = webhook
+        .dispatch(&fixed_notification(), &PluginHttpClient::default())
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+
+    assert!(err.contains("body read failed"), "got: {err}");
     assert!(err.contains("redacted"), "got: {err}");
     assert!(!err.contains("TOKEN123"), "got: {err}");
     assert!(!err.contains("abc123"), "got: {err}");
