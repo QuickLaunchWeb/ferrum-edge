@@ -72,6 +72,10 @@ pub(super) fn is_core_resource_kind(kind: &str) -> bool {
     matches!(kind, "Pod" | "Service" | "EndpointSlice" | "Node")
 }
 
+pub(super) fn is_cluster_scoped_core_resource_kind(kind: &str) -> bool {
+    matches!(kind, "Node")
+}
+
 pub(super) fn collect(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -831,6 +835,44 @@ mod tests {
         )
         .expect("core translation succeeds");
 
+        let mesh = translation.config.mesh.expect("mesh config");
+        assert_eq!(
+            mesh.workloads[0].locality.as_deref(),
+            Some("us-east1/us-east1-b")
+        );
+    }
+
+    #[test]
+    fn cluster_scoped_node_survives_namespace_filter_for_pod_discovery() {
+        let mut node = object("Node", "", "node-a", json!({}));
+        node.metadata.labels.insert(
+            "topology.kubernetes.io/region".to_string(),
+            "us-east1".to_string(),
+        );
+        node.metadata.labels.insert(
+            "topology.kubernetes.io/zone".to_string(),
+            "us-east1-b".to_string(),
+        );
+        let mut service = service();
+        service.metadata.namespace = "prod".to_string();
+        let mut pod = ready_pod("reviews-v1", "10.1.0.10");
+        pod.metadata.namespace = "prod".to_string();
+        let mut slice = endpoint_slice(vec![("reviews-v1", "10.1.0.10")]);
+        slice.metadata.namespace = "prod".to_string();
+        slice.spec["endpoints"][0]["targetRef"]["namespace"] = json!("prod");
+
+        let translation = translate_k8s_objects(
+            &[node, service, pod, slice],
+            K8sTranslationOptions::new(
+                "prod".to_string(),
+                TrustDomain::new("cluster.local").expect("test trust domain"),
+            )
+            .with_source_namespaces(vec!["prod".to_string()])
+            .with_pod_discovery_enabled(true),
+        )
+        .expect("core translation succeeds");
+
+        assert_eq!(translation.config.known_namespaces, vec!["prod"]);
         let mesh = translation.config.mesh.expect("mesh config");
         assert_eq!(
             mesh.workloads[0].locality.as_deref(),

@@ -400,10 +400,10 @@ where
     let mut acc = K8sAccumulator::new(options);
 
     for object in objects.iter().filter(|object| include(object)) {
-        if !acc.options.includes_namespace(&object.metadata.namespace) {
+        if !includes_object_namespace(&acc.options, object) {
             continue;
         }
-        acc.observe_namespace(&object.metadata.namespace);
+        observe_object_namespace(&mut acc, object);
         if object.kind == "ReferenceGrant" {
             gateway_api::collect_reference_grant(&mut acc, object)?;
         } else if object.kind == "Service" {
@@ -421,10 +421,10 @@ where
     }
 
     for object in objects.iter().filter(|object| include(object)) {
-        if !acc.options.includes_namespace(&object.metadata.namespace) {
+        if !includes_object_namespace(&acc.options, object) {
             continue;
         }
-        acc.observe_namespace(&object.metadata.namespace);
+        observe_object_namespace(&mut acc, object);
 
         if object.kind == "EnvoyFilter" {
             return Err(K8sTranslateError::Unsupported(UnsupportedK8sResource {
@@ -460,6 +460,18 @@ where
     }
 
     Ok(acc.finish())
+}
+
+fn includes_object_namespace(options: &K8sTranslationOptions, object: &K8sObject) -> bool {
+    options.includes_namespace(&object.metadata.namespace)
+        || (options.pod_discovery_enabled
+            && core::is_cluster_scoped_core_resource_kind(&object.kind))
+}
+
+fn observe_object_namespace(acc: &mut K8sAccumulator, object: &K8sObject) {
+    if !core::is_cluster_scoped_core_resource_kind(&object.kind) {
+        acc.observe_namespace(&object.metadata.namespace);
+    }
 }
 
 /// Collect the `ports[].name → port` map from a core/v1 Service so later

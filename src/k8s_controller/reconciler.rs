@@ -560,8 +560,42 @@ fn sort_mesh_collection(value: &mut Value, field: &str, key: &str) {
     items.sort_by(|left, right| {
         let left_key = left.get(key).and_then(Value::as_str).unwrap_or_default();
         let right_key = right.get(key).and_then(Value::as_str).unwrap_or_default();
-        left_key.cmp(right_key)
+        left_key
+            .cmp(right_key)
+            .then_with(|| canonical_json_sort_key(left).cmp(&canonical_json_sort_key(right)))
     });
+}
+
+fn canonical_json_sort_key(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            let mut key = String::from("{");
+            for (index, (name, child)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    key.push(',');
+                }
+                key.push_str(&serde_json::to_string(name).unwrap_or_default());
+                key.push(':');
+                key.push_str(&canonical_json_sort_key(child));
+            }
+            key.push('}');
+            key
+        }
+        Value::Array(items) => {
+            let mut key = String::from("[");
+            for (index, child) in items.iter().enumerate() {
+                if index > 0 {
+                    key.push(',');
+                }
+                key.push_str(&canonical_json_sort_key(child));
+            }
+            key.push(']');
+            key
+        }
+        _ => value.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -686,6 +720,30 @@ mod tests {
         let old_config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
                 workloads: vec![mesh_workload("b"), mesh_workload("a")],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let mut new_config = old_config.clone();
+        new_config
+            .mesh
+            .as_mut()
+            .expect("mesh config")
+            .workloads
+            .reverse();
+
+        assert!(!gateway_config_content_changed(&new_config, &old_config));
+    }
+
+    #[test]
+    fn content_change_ignores_duplicate_spiffe_mesh_workload_order() {
+        let mut workload_a = mesh_workload("reviews");
+        workload_a.addresses = vec!["10.1.0.10".to_string()];
+        let mut workload_b = mesh_workload("reviews");
+        workload_b.addresses = vec!["10.1.0.11".to_string()];
+        let old_config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![workload_a, workload_b],
                 ..MeshConfig::default()
             })),
             ..GatewayConfig::default()
