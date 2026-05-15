@@ -91,7 +91,22 @@ fn binary_path() -> &'static str {
 
 /// Build the gateway binary if not already present. Shared across all tests in
 /// this file — subsequent invocations are no-ops because cargo handles caching.
+///
+/// Honors `FERRUM_SKIP_GATEWAY_BUILD=1` (set by CI when a prebuilt binary is
+/// already on disk). Without the short-circuit, every test invocation acquires
+/// cargo's filesystem lock and serializes parallel nextest runs even though
+/// the build itself is a no-op.
 fn ensure_built() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var_os("FERRUM_SKIP_GATEWAY_BUILD").is_some() {
+        if std::path::Path::new("./target/debug/ferrum-edge").exists()
+            || std::path::Path::new("./target/release/ferrum-edge").exists()
+        {
+            return Ok(());
+        }
+        return Err(
+            "FERRUM_SKIP_GATEWAY_BUILD set but ferrum-edge binary not found in ./target/debug/ or ./target/release/".into(),
+        );
+    }
     let status = Command::new("cargo")
         .args(["build", "--bin", "ferrum-edge"])
         .stdout(Stdio::null())

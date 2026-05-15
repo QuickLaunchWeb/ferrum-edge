@@ -130,7 +130,22 @@ async fn start_grpc_echo_backend(port: u16) -> tokio::task::JoinHandle<()> {
 }
 
 /// Build the gateway binary (debug profile).
+///
+/// Honors `FERRUM_SKIP_GATEWAY_BUILD=1` (set by CI when a prebuilt binary is
+/// already on disk) — without this short-circuit every test invocation racks
+/// up cargo's filesystem lock and serializes parallel nextest runs, inflating
+/// per-test wall-clock by minutes under load.
 fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var_os("FERRUM_SKIP_GATEWAY_BUILD").is_some() {
+        if std::path::Path::new("./target/debug/ferrum-edge").exists()
+            || std::path::Path::new("./target/release/ferrum-edge").exists()
+        {
+            return Ok(());
+        }
+        return Err(
+            "FERRUM_SKIP_GATEWAY_BUILD set but ferrum-edge binary not found in ./target/debug/ or ./target/release/".into(),
+        );
+    }
     let output = std::process::Command::new("cargo")
         .args(["build", "--bin", "ferrum-edge"])
         .output()?;
