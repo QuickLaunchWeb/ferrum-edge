@@ -82,10 +82,14 @@ impl DiscordChannel {
             .execute_redacted(req, "notification_discord", &redacted_url)
             .await
             .map_err(|e| format!("discord dispatch failed: {e}"))?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        let _body = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("discord dispatch body read failed: {e}"))?;
+        if !status.is_success() {
             return Err(format!(
-                "discord dispatch returned non-success status {}",
-                resp.status()
+                "discord dispatch returned non-success status {status}"
             ));
         }
         Ok(())

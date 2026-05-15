@@ -162,10 +162,8 @@ impl WebhookChannel {
         n: &Notification,
         extras: &HashMap<String, String>,
     ) -> Result<String, String> {
-        let mut vars = base_vars(n);
-        for (k, v) in extras {
-            vars.insert(k.clone(), v.clone());
-        }
+        let mut vars = extras.clone();
+        vars.extend(base_vars(n));
         self.render_body_from_vars(&vars)
     }
 
@@ -191,10 +189,14 @@ impl WebhookChannel {
             .execute_redacted(req, "notification_webhook", &redacted_url)
             .await
             .map_err(|e| format!("webhook dispatch failed: {e}"))?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        let _body = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("webhook dispatch body read failed: {e}"))?;
+        if !status.is_success() {
             return Err(format!(
-                "webhook dispatch returned non-success status {}",
-                resp.status()
+                "webhook dispatch returned non-success status {status}"
             ));
         }
         Ok(())

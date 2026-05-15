@@ -39,7 +39,7 @@ impl Severity {
         }
     }
 
-    /// Slack `attachments[].color` — hex color (no leading `#`).
+    /// Slack `attachments[].color` — hex color.
     pub const fn slack_color(&self) -> &'static str {
         match self {
             Self::Info => "#2196F3",

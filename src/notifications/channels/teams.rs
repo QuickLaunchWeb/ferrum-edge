@@ -80,10 +80,14 @@ impl TeamsChannel {
             .execute_redacted(req, "notification_teams", &redacted_url)
             .await
             .map_err(|e| format!("teams dispatch failed: {e}"))?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        let _body = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("teams dispatch body read failed: {e}"))?;
+        if !status.is_success() {
             return Err(format!(
-                "teams dispatch returned non-success status {}",
-                resp.status()
+                "teams dispatch returned non-success status {status}"
             ));
         }
         Ok(())

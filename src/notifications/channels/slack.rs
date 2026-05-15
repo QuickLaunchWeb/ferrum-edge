@@ -96,10 +96,14 @@ impl SlackChannel {
             .execute_redacted(req, "notification_slack", &redacted_url)
             .await
             .map_err(|e| format!("slack dispatch failed: {e}"))?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        let _body = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("slack dispatch body read failed: {e}"))?;
+        if !status.is_success() {
             return Err(format!(
-                "slack dispatch returned non-success status {}",
-                resp.status()
+                "slack dispatch returned non-success status {status}"
             ));
         }
         Ok(())

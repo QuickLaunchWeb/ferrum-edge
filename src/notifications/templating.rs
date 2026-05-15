@@ -74,10 +74,9 @@ where
             i += 2 + close + 1;
             continue;
         }
-        let ch = rest
-            .chars()
-            .next()
-            .expect("i is always on a character boundary and below len");
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
         out.push(ch);
         i += ch.len_utf8();
     }
@@ -95,7 +94,7 @@ fn push_json_string_content(value: &str, out: &mut String) {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if c <= '\u{1f}' => {
-                write!(out, "\\u{:04x}", c as u32).expect("writing to String cannot fail");
+                let _ = write!(out, "\\u{:04x}", c as u32);
             }
             c => out.push(c),
         }
@@ -129,10 +128,9 @@ pub fn unknown_variables(template: &str, known: &HashSet<&str>) -> Result<Vec<St
             i += 2 + close + 1;
             continue;
         }
-        let ch = rest
-            .chars()
-            .next()
-            .expect("i is always on a character boundary and below len");
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
         i += ch.len_utf8();
     }
     Ok(unknown)
@@ -156,10 +154,9 @@ pub fn validate_template(template: &str) -> Result<(), String> {
             i += 2 + close + 1;
             continue;
         }
-        let ch = rest
-            .chars()
-            .next()
-            .expect("i is always on a character boundary and below len");
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
         i += ch.len_utf8();
     }
     Ok(())

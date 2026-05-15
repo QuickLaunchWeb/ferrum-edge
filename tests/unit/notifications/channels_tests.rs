@@ -273,6 +273,33 @@ fn webhook_renders_template_with_caller_extras() {
 }
 
 #[test]
+fn webhook_base_vars_override_caller_extra_collisions() {
+    let chan = parse_one(
+        "pd",
+        json!({
+            "type": "webhook",
+            "url": "https://events.pagerduty.com/v2/enqueue",
+            "body_template": "{\"title\":\"${title}\",\"severity\":\"${severity}\",\"rule\":\"${rule_name}\"}",
+        }),
+    );
+    let NotificationChannel::Webhook(webhook) = chan else {
+        panic!("expected webhook");
+    };
+    let mut extras: HashMap<String, String> = HashMap::new();
+    extras.insert("title".to_string(), "operator override".to_string());
+    extras.insert("severity".to_string(), "critical".to_string());
+    extras.insert("rule_name".to_string(), "proxy_5xx".to_string());
+
+    let body = webhook
+        .render_body_with_vars(&fixed_notification(), &extras)
+        .unwrap();
+    assert_eq!(
+        body,
+        "{\"title\":\"[ALERT] proxy_5xx on api-gateway\",\"severity\":\"high\",\"rule\":\"proxy_5xx\"}"
+    );
+}
+
+#[test]
 fn webhook_json_template_escapes_variable_values() {
     let chan = parse_one(
         "pd",
