@@ -528,7 +528,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     inject_mesh_global_plugins(&mut config, runtime, mesh_slice);
     materialize_east_west_gateway_proxies(&mut config, runtime, mesh_slice);
     materialize_egress_gateway_proxies(&mut config, runtime, mesh_slice);
-    apply_destination_rules(&mut config, runtime, mesh_slice);
+    apply_destination_rules(&mut config, runtime, mesh_slice)?;
     config.normalize_fields();
     config.resolve_upstream_tls();
     Ok(config)
@@ -982,7 +982,7 @@ fn apply_destination_rules(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
-) {
+) -> Result<(), anyhow::Error> {
     let mut sorted_destination_rules: Vec<&MeshDestinationRule> =
         mesh_slice.destination_rules.iter().collect();
     sorted_destination_rules.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
@@ -1014,7 +1014,7 @@ fn apply_destination_rules(
         for idx in matching_upstream_indices {
             let upstream = &mut config.upstreams[idx];
             if let Some(ref policy) = dr.traffic_policy {
-                apply_traffic_policy_to_upstream(upstream, policy, runtime);
+                apply_traffic_policy_to_upstream(upstream, policy, runtime)?;
             }
 
             // Build a set of ports actually exposed by this upstream's
@@ -1116,6 +1116,8 @@ fn apply_destination_rules(
             }
         }
     }
+
+    Ok(())
 }
 
 /// Project a `MeshTrafficPolicy` onto a per-port `UpstreamPortOverride` slot.
@@ -1185,7 +1187,7 @@ fn apply_traffic_policy_to_upstream(
     upstream: &mut Upstream,
     policy: &MeshTrafficPolicy,
     runtime: &MeshRuntimeConfig,
-) {
+) -> Result<(), anyhow::Error> {
     if let Some(lb) = &policy.load_balancer {
         if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
             upstream.algorithm = algorithm;
@@ -1225,8 +1227,10 @@ fn apply_traffic_policy_to_upstream(
 
     // Backend TLS posture override from DestinationRule.trafficPolicy.tls.
     if let Some(ref tls) = policy.tls {
-        apply_traffic_policy_tls_to_upstream(upstream, tls, runtime);
+        apply_traffic_policy_tls_to_upstream(upstream, tls, runtime)?;
     }
+
+    Ok(())
 }
 
 /// Project `MeshTrafficPolicyTls` onto an `Upstream`'s `backend_tls_*`
@@ -1257,7 +1261,7 @@ fn apply_traffic_policy_tls_to_upstream(
     upstream: &mut Upstream,
     tls: &MeshTrafficPolicyTls,
     runtime: &MeshRuntimeConfig,
-) {
+) -> Result<(), anyhow::Error> {
     match tls.mode {
         MtlsMode::Disable => {
             upstream.backend_tls_client_cert_path = None;
@@ -1281,6 +1285,15 @@ fn apply_traffic_policy_tls_to_upstream(
             upstream.backend_tls_server_ca_cert_path = tls.ca_certificates.clone();
         }
         MtlsMode::IstioMutual => {
+            let (Some(cert_path), Some(key_path)) = (
+                runtime.workload_svid_cert_path.clone(),
+                runtime.workload_svid_key_path.clone(),
+            ) else {
+                return Err(anyhow::anyhow!(
+                    "DestinationRule ISTIO_MUTUAL for upstream '{}' requires FERRUM_GATEWAY_SVID_CERT_PATH and FERRUM_GATEWAY_SVID_KEY_PATH",
+                    upstream.id
+                ));
+            };
             upstream.backend_tls_server_ca_cert_path =
                 runtime.workload_svid_trust_bundle_path.clone();
             if runtime.workload_svid_trust_bundle_path.is_none() {
@@ -1289,21 +1302,8 @@ fn apply_traffic_policy_tls_to_upstream(
                     "DestinationRule ISTIO_MUTUAL requested but workload SVID trust bundle path is not configured; clearing any stale upstream CA and falling back to global/default trust"
                 );
             }
-            match (
-                runtime.workload_svid_cert_path.clone(),
-                runtime.workload_svid_key_path.clone(),
-            ) {
-                (Some(cert_path), Some(key_path)) => {
-                    upstream.backend_tls_client_cert_path = Some(cert_path);
-                    upstream.backend_tls_client_key_path = Some(key_path);
-                }
-                _ => {
-                    warn!(
-                        upstream = %upstream.id,
-                        "DestinationRule ISTIO_MUTUAL requested but workload SVID cert/key paths are not both configured; preserving existing backend client certificate settings"
-                    );
-                }
-            }
+            upstream.backend_tls_client_cert_path = Some(cert_path);
+            upstream.backend_tls_client_key_path = Some(key_path);
         }
         // PeerAuthentication-side modes are rejected at translate time;
         // an in-memory slice that still carries one is a programming
@@ -1314,7 +1314,7 @@ fn apply_traffic_policy_tls_to_upstream(
                 mode = ?tls.mode,
                 "DestinationRule trafficPolicy.tls.mode is a server-side mode and cannot apply to client-side backend TLS; ignoring"
             );
-            return;
+            return Ok(());
         }
     }
 
@@ -1335,6 +1335,8 @@ fn apply_traffic_policy_tls_to_upstream(
         upstream.backend_tls_san_allow_list =
             bounded_backend_tls_san_allow_list(&upstream.id, &tls.subject_alt_names);
     }
+
+    Ok(())
 }
 
 fn bounded_backend_tls_sni(upstream_id: &str, sni: Option<&str>) -> Option<String> {
@@ -3626,7 +3628,8 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice);
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
 
         assert!(
             config
@@ -3684,7 +3687,8 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice);
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
 
         assert_eq!(config.upstreams[0].algorithm, LoadBalancerAlgorithm::Random);
         assert_eq!(config.proxies[0].backend_connect_timeout_ms, 9999);
@@ -3708,7 +3712,8 @@ mod tests {
             connect_timeout_ms: Some(1000),
             ..MeshTrafficPolicy::default()
         };
-        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config())
+            .expect("traffic policy applies");
 
         // backend_tls_* untouched.
         assert_eq!(
@@ -3742,7 +3747,8 @@ mod tests {
             }),
             ..MeshTrafficPolicy::default()
         };
-        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config())
+            .expect("traffic policy applies");
 
         assert_eq!(
             upstream.backend_tls_server_ca_cert_path.as_deref(),
@@ -3772,7 +3778,8 @@ mod tests {
             }),
             ..MeshTrafficPolicy::default()
         };
-        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config())
+            .expect("traffic policy applies");
 
         assert_eq!(
             upstream.backend_tls_client_cert_path.as_deref(),
@@ -3810,7 +3817,8 @@ mod tests {
             }),
             ..MeshTrafficPolicy::default()
         };
-        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config())
+            .expect("traffic policy applies");
 
         assert!(upstream.backend_tls_client_cert_path.is_none());
         assert!(upstream.backend_tls_client_key_path.is_none());
@@ -3841,7 +3849,8 @@ mod tests {
             }),
             ..MeshTrafficPolicy::default()
         };
-        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config())
+            .expect("traffic policy applies");
 
         assert!(!upstream.backend_tls_verify_server_cert);
     }
@@ -3860,7 +3869,8 @@ mod tests {
             }),
             ..MeshTrafficPolicy::default()
         };
-        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config())
+            .expect("traffic policy applies");
 
         assert!(!upstream.backend_tls_verify_server_cert);
     }
@@ -3889,7 +3899,8 @@ mod tests {
             }),
             ..MeshTrafficPolicy::default()
         };
-        apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime);
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime)
+            .expect("traffic policy applies");
 
         assert!(upstream.backend_tls_verify_server_cert);
         assert_eq!(
@@ -3907,7 +3918,7 @@ mod tests {
     }
 
     #[test]
-    fn dr_tls_istio_mutual_without_svid_preserves_existing_client_material() {
+    fn dr_tls_istio_mutual_without_svid_fails_closed() {
         let mut upstream =
             destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
         upstream.backend_tls_client_cert_path = Some("/existing/client.pem".to_string());
@@ -3930,28 +3941,13 @@ mod tests {
             }),
             ..MeshTrafficPolicy::default()
         };
-        apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime);
+        let err = apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime)
+            .expect_err("ISTIO_MUTUAL without SVID cert/key must fail closed");
 
-        assert!(upstream.backend_tls_verify_server_cert);
-        assert_eq!(
-            upstream.backend_tls_client_cert_path.as_deref(),
-            Some("/existing/client.pem")
-        );
-        assert_eq!(
-            upstream.backend_tls_client_key_path.as_deref(),
-            Some("/existing/client.key")
-        );
         assert!(
-            upstream.backend_tls_server_ca_cert_path.is_none(),
-            "ISTIO_MUTUAL without a configured trust bundle must not preserve a stale upstream CA"
-        );
-        assert_eq!(
-            upstream.backend_tls_sni.as_deref(),
-            Some("reviews.mesh.internal")
-        );
-        assert_eq!(
-            upstream.backend_tls_san_allow_list,
-            vec!["reviews.mesh.internal".to_string()]
+            err.to_string()
+                .contains("requires FERRUM_GATEWAY_SVID_CERT_PATH"),
+            "got: {err}"
         );
     }
 
@@ -3972,7 +3968,8 @@ mod tests {
             ..MeshTrafficPolicy::default()
         };
 
-        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config())
+            .expect("traffic policy applies");
 
         assert_eq!(
             upstream.backend_tls_sni.as_deref(),
@@ -4009,7 +4006,8 @@ mod tests {
             ..MeshTrafficPolicy::default()
         };
 
-        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config())
+            .expect("traffic policy applies");
 
         assert!(upstream.backend_tls_sni.is_none());
         assert_eq!(
@@ -4035,7 +4033,8 @@ mod tests {
             ..MeshTrafficPolicy::default()
         };
 
-        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config())
+            .expect("traffic policy applies");
 
         assert!(upstream.backend_tls_sni.is_none());
     }
@@ -4055,7 +4054,8 @@ mod tests {
             ..MeshTrafficPolicy::default()
         };
 
-        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config())
+            .expect("traffic policy applies");
 
         assert_eq!(
             upstream.backend_tls_san_allow_list.len(),
@@ -4089,7 +4089,8 @@ mod tests {
             ..MeshTrafficPolicy::default()
         };
 
-        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config());
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config())
+            .expect("traffic policy applies");
 
         assert_eq!(
             upstream.backend_tls_san_allow_list,
@@ -4131,7 +4132,8 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice);
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
 
         let upstream = &config.upstreams[0];
         assert_eq!(
@@ -4184,7 +4186,8 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice);
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
 
         // Top-level policy still applies to the upstream itself.
         assert_eq!(
@@ -4267,7 +4270,8 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice);
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
 
         let p8080 = config.upstreams[0]
             .port_overrides

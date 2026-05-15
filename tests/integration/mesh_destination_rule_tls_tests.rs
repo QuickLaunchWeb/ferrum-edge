@@ -307,6 +307,35 @@ fn dr_istio_mutual_projects_workload_svid_onto_upstream() {
 }
 
 #[test]
+fn dr_istio_mutual_without_runtime_svid_fails_mesh_preparation() {
+    let (mut config, tls) = translate_dr(serde_json::json!({
+        "host": "reviews.default.svc.cluster.local",
+        "trafficPolicy": {
+            "tls": {"mode": "ISTIO_MUTUAL"}
+        }
+    }));
+    assert_eq!(
+        tls.expect("DR.tls should be parsed").mode,
+        MtlsMode::IstioMutual
+    );
+
+    let mut upstream = build_matching_upstream("reviews-u", "reviews.default.svc.cluster.local");
+    upstream.backend_tls_client_cert_path = Some("/existing/client.pem".to_string());
+    upstream.backend_tls_client_key_path = Some("/existing/client.key".to_string());
+    config.upstreams.push(upstream);
+    config.proxies.push(build_proxy("reviews-p", "reviews-u"));
+
+    let err = prepare_gateway_config_for_mesh(config, &test_runtime())
+        .expect_err("ISTIO_MUTUAL without runtime SVID material must fail");
+
+    assert!(
+        err.to_string()
+            .contains("requires FERRUM_GATEWAY_SVID_CERT_PATH"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn dr_tls_sni_and_sans_project_onto_upstream() {
     let (mut config, tls) = translate_dr(serde_json::json!({
         "host": "reviews.default.svc.cluster.local",

@@ -223,6 +223,32 @@ async fn connection_pool_key_with_backend_tls_sni_and_sans() {
 }
 
 #[tokio::test]
+async fn connection_pool_key_canonicalizes_backend_tls_san_allow_list() {
+    let pool = pool_with_defaults();
+    let mut p1 = minimal_proxy();
+    p1.resolved_tls.sni = Some("reviews.mesh.internal".to_string());
+    p1.resolved_tls.san_allow_list = vec![
+        "ratings.mesh.internal".to_string(),
+        "reviews.mesh.internal".to_string(),
+        "reviews.mesh.internal".to_string(),
+    ];
+    p1.resolved_tls.recompute_san_digest();
+
+    let mut p2 = p1.clone();
+    p2.resolved_tls.san_allow_list = vec![
+        "reviews.mesh.internal".to_string(),
+        "ratings.mesh.internal".to_string(),
+    ];
+    p2.resolved_tls.recompute_san_digest();
+
+    assert_eq!(
+        pool.pool_key_for_warmup(&p1),
+        pool.pool_key_for_warmup(&p2),
+        "backend TLS SAN allow-list order and duplicates must not fragment generic HTTP pools"
+    );
+}
+
+#[tokio::test]
 async fn connection_pool_key_verify_disabled() {
     let pool = pool_with_defaults();
     let mut proxy = minimal_proxy();

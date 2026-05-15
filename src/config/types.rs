@@ -547,15 +547,18 @@ impl BackendTlsConfig {
         if sans.is_empty() {
             return None;
         }
+        let mut canonical_sans: Vec<&str> = sans.iter().map(String::as_str).collect();
+        canonical_sans.sort_unstable();
+        canonical_sans.dedup();
         // FNV-1a 64-bit: stable across Rust versions unlike DefaultHasher.
         const FNV_OFFSET: u64 = 0xcbf29ce484222325;
         const FNV_PRIME: u64 = 0x00000100000001B3;
         let mut h = FNV_OFFSET;
-        for byte in (sans.len() as u64).to_le_bytes() {
+        for byte in (canonical_sans.len() as u64).to_le_bytes() {
             h ^= byte as u64;
             h = h.wrapping_mul(FNV_PRIME);
         }
-        for san in sans {
+        for san in canonical_sans {
             for byte in san.as_bytes() {
                 h ^= *byte as u64;
                 h = h.wrapping_mul(FNV_PRIME);
