@@ -624,7 +624,7 @@ async fn handle_fallback_with<F, Fut>(
 ) -> Result<(), anyhow::Error>
 where
     F: FnMut(Vec<String>, &'static str) -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: std::future::Future<Output = Result<(), anyhow::Error>>,
 {
     match config.fallback_mode {
         FallbackMode::Iptables => {
@@ -637,7 +637,7 @@ where
             );
 
             let plan = IptablesPlan::for_config(&config.capture_config);
-            execute(plan.commands, "setup").await;
+            execute(plan.commands, "setup").await?;
             startup_ready.store(true, Ordering::Release);
 
             info!("Iptables fallback rules applied, awaiting shutdown signal");
@@ -646,7 +646,9 @@ where
 
             info!("Shutdown signal received, cleaning up iptables rules");
             let cleanup = IptablesPlan::cleanup_commands();
-            execute(cleanup, "cleanup").await;
+            if let Err(e) = execute(cleanup, "cleanup").await {
+                warn!(error = %e, "Failed to clean up iptables fallback rules");
+            }
 
             Ok(())
         }
@@ -682,7 +684,7 @@ where
 /// `IptablesPlan::for_config` / `cleanup_commands`, both of which use
 /// hardcoded chain names and operator inputs validated upstream
 /// (`validate_cidr_list`, `parse_port_list`, `parse_proxy_uid`).
-async fn execute_iptables_commands(commands: &[String], phase: &str) {
+async fn execute_iptables_commands(commands: &[String], phase: &str) -> Result<(), anyhow::Error> {
     for cmd in commands {
         debug!(command = %cmd, phase, "Executing iptables command");
         match tokio::process::Command::new("sh")
@@ -696,12 +698,18 @@ async fn execute_iptables_commands(commands: &[String], phase: &str) {
                     debug!(command = %cmd, phase, "iptables command succeeded");
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
+                    let exit_code = output.status.code();
                     error!(
                         command = %cmd,
                         phase,
-                        exit_code = output.status.code(),
+                        exit_code,
                         stderr = %stderr.trim(),
                         "iptables command failed"
+                    );
+                    anyhow::bail!(
+                        "iptables {phase} command failed with exit code {:?}: {}",
+                        exit_code,
+                        stderr.trim()
                     );
                 }
             }
@@ -712,9 +720,13 @@ async fn execute_iptables_commands(commands: &[String], phase: &str) {
                     error = %e,
                     "Failed to spawn iptables command"
                 );
+                return Err(anyhow::anyhow!(
+                    "failed to spawn iptables {phase} command: {e}"
+                ));
             }
         }
     }
+    Ok(())
 }
 
 fn initialize_backend(
@@ -918,6 +930,7 @@ mod tests {
                     let phases = std::sync::Arc::clone(&phases_for_runner);
                     async move {
                         phases.lock().expect("phases mutex").push(phase);
+                        Ok(())
                     }
                 },
                 startup_ready.clone(),
@@ -931,6 +944,48 @@ mod tests {
             *phases.lock().expect("phases mutex"),
             vec!["setup", "cleanup"]
         );
+    }
+
+    #[tokio::test]
+    async fn handle_fallback_iptables_setup_failure_is_not_ready() {
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/sys/fs/bpf".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        let probe = kernel_probe::KernelProbeResult {
+            kernel_release: "4.19.0".to_string(),
+            meets_version_requirement: false,
+            cgroup_v2_available: false,
+            bpf_fs_available: false,
+        };
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let startup_ready = Arc::new(AtomicBool::new(false));
+        let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let phases_for_runner = std::sync::Arc::clone(&phases);
+
+        let result = handle_fallback_with(
+            &config,
+            &probe,
+            &shutdown_tx,
+            move |_, phase| {
+                let phases = std::sync::Arc::clone(&phases_for_runner);
+                async move {
+                    phases.lock().expect("phases mutex").push(phase);
+                    anyhow::bail!("setup failed")
+                }
+            },
+            startup_ready.clone(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!startup_ready.load(Ordering::Acquire));
+        assert_eq!(*phases.lock().expect("phases mutex"), vec!["setup"]);
     }
 
     #[test]
