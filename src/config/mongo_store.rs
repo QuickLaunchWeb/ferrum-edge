@@ -259,6 +259,16 @@ mod inner {
             )
             .await?;
 
+            if !replica_set_configured {
+                warn!(
+                    "MongoDB connected without a replica set (FERRUM_MONGO_REPLICA_SET is unset). \
+                     Multi-document writes (proxy delete/update, api_spec submit/replace) will \
+                     fall back to compensating rollback instead of transactions, leaving a small \
+                     window where partial failure can orphan documents until the polling cycle \
+                     cleans them. Configure FERRUM_MONGO_REPLICA_SET to enable transactions."
+                );
+            }
+
             Ok(Self {
                 client: Arc::new(ArcSwap::from_pointee(client)),
                 db: Arc::new(ArcSwap::from_pointee(db)),
@@ -2456,9 +2466,10 @@ mod inner {
             // unique index would reject valid host-partitioned routes before
             // the host-overlap check in `check_listen_path_unique` runs.
             // Uniqueness is enforced at the application layer instead.
-            self.proxies()
-                .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
-                .await?;
+            //
+            // No standalone {namespace} index: the {namespace, updated_at}
+            // compound below covers namespace-only lookups via the
+            // leading-column rule.
             self.proxies()
                 .create_index(
                     IndexModel::builder()
@@ -2494,9 +2505,7 @@ mod inner {
             self.consumers()
                 .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
                 .await?;
-            self.consumers()
-                .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
-                .await?;
+            // No standalone {namespace} index — covered by {namespace, updated_at} below.
             self.consumers()
                 .create_index(
                     IndexModel::builder()
@@ -2512,9 +2521,7 @@ mod inner {
             self.plugin_configs()
                 .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
                 .await?;
-            self.plugin_configs()
-                .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
-                .await?;
+            // No standalone {namespace} index — covered by {namespace, updated_at} below.
             self.plugin_configs()
                 .create_index(
                     IndexModel::builder()
@@ -2534,6 +2541,26 @@ mod inner {
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "plugin_name": 1 })
+                        .build(),
+                )
+                .await?;
+            // Cold-path index for cross-namespace mesh_route_dispatch lookups in
+            // `find_mesh_route_dispatch_upstream_ref_opt_session` and
+            // `ensure_no_external_spec_upstream_refs_opt_session`. Both query
+            // `{plugin_name: "mesh_route_dispatch", enabled: true}` across all
+            // namespaces (upstream IDs are globally unique, so a cross-namespace
+            // reference is real and must be caught). The partial filter halves
+            // index size and write amplification in deployments with many
+            // disabled plugin_configs.
+            self.plugin_configs()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "plugin_name": 1, "enabled": 1 })
+                        .options(
+                            IndexOptions::builder()
+                                .partial_filter_expression(doc! { "enabled": true })
+                                .build(),
+                        )
                         .build(),
                 )
                 .await?;
@@ -2569,9 +2596,7 @@ mod inner {
             self.upstreams()
                 .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
                 .await?;
-            self.upstreams()
-                .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
-                .await?;
+            // No standalone {namespace} index — covered by {namespace, updated_at} below.
             // Sparse index on api_spec_id — mirrors plugin_configs above.
             self.upstreams()
                 .create_index(
@@ -2592,11 +2617,22 @@ mod inner {
             // api_specs indexes (admin-only; runtime never reads this collection).
             // Unique (namespace, proxy_id) mirrors the SQL unique index and prevents
             // a second spec from claiming ownership of an already-spec-owned proxy.
+            // Partial filter mirrors the sparse-unique pattern used for
+            // (namespace, name), (namespace, custom_id), and (namespace, listen_port)
+            // elsewhere — guards against the null-collision case if a future doc
+            // is ever inserted without a proxy_id. SQL is safe via NOT NULL.
             self.api_specs()
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "proxy_id": 1 })
-                        .options(IndexOptions::builder().unique(true).build())
+                        .options(
+                            IndexOptions::builder()
+                                .unique(true)
+                                .partial_filter_expression(doc! {
+                                    "proxy_id": { "$type": "string" }
+                                })
+                                .build(),
+                        )
                         .build(),
                 )
                 .await?;
