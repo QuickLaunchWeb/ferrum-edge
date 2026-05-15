@@ -558,12 +558,14 @@ fn sort_mesh_collection(value: &mut Value, field: &str, key: &str) {
         return;
     };
 
-    items.sort_by(|left, right| {
-        let left_key = left.get(key).and_then(Value::as_str).unwrap_or_default();
-        let right_key = right.get(key).and_then(Value::as_str).unwrap_or_default();
-        left_key
-            .cmp(right_key)
-            .then_with(|| canonical_json_sort_key(left).cmp(&canonical_json_sort_key(right)))
+    items.sort_by_cached_key(|item| {
+        (
+            item.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            canonical_json_sort_key(item),
+        )
     });
 }
 
@@ -581,18 +583,14 @@ fn sort_mesh_service_workloads(value: &mut Value) {
         let Some(workloads) = service.get_mut("workloads").and_then(Value::as_array_mut) else {
             continue;
         };
-        workloads.sort_by(|left, right| {
-            let left_key = left
-                .get("spiffe_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let right_key = right
-                .get("spiffe_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            left_key
-                .cmp(right_key)
-                .then_with(|| canonical_json_sort_key(left).cmp(&canonical_json_sort_key(right)))
+        workloads.sort_by_cached_key(|item| {
+            (
+                item.get("spiffe_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                canonical_json_sort_key(item),
+            )
         });
     }
 }

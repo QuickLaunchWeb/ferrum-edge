@@ -325,7 +325,7 @@ fn workload_from_pod(
     pod: &CorePod,
     endpoint: &CoreEndpoint,
 ) -> Result<Workload, K8sTranslateError> {
-    let path = format!("ns/{}/sa/{}", service_key.namespace, pod.service_account);
+    let path = format!("ns/{}/sa/{}", pod.namespace, pod.service_account);
     let spiffe_id = SpiffeId::from_parts(&acc.options.trust_domain, &path)
         .map_err(|e| invalid_resource_for_core_pod(pod, format!("invalid pod SPIFFE ID: {e}")))?;
     let mut addresses = if endpoint.addresses.is_empty() {
@@ -342,13 +342,13 @@ fn workload_from_pod(
         spiffe_id,
         selector: WorkloadSelector {
             labels: pod.labels.clone(),
-            namespace: Some(service_key.namespace.clone()),
+            namespace: Some(pod.namespace.clone()),
         },
         service_name: service_key.name.clone(),
         addresses,
         ports: pod.ports.clone(),
         trust_domain: acc.options.trust_domain.clone(),
-        namespace: service_key.namespace.clone(),
+        namespace: pod.namespace.clone(),
         network: None,
         cluster: None,
         weight: None,
@@ -685,6 +685,31 @@ mod tests {
         assert_eq!(
             mesh.workloads[0].spiffe_id.as_str(),
             "spiffe://cluster.local/ns/default/sa/reviews"
+        );
+    }
+
+    #[test]
+    fn auto_workload_identity_uses_referenced_pod_namespace() {
+        let mut pod = ready_pod("reviews-v1", "10.1.0.10");
+        pod.metadata.namespace = "workloads".to_string();
+        let mut slice = endpoint_slice(vec![("reviews-v1", "10.1.0.10")]);
+        slice.spec["endpoints"][0]["targetRef"]["namespace"] = json!("workloads");
+
+        let translation = translate_k8s_objects(&[service(), pod, slice], options())
+            .expect("core translation succeeds");
+
+        let mesh = translation.config.mesh.expect("mesh config");
+        assert_eq!(mesh.services.len(), 1);
+        assert_eq!(mesh.services[0].namespace, "default");
+        assert_eq!(mesh.workloads.len(), 1);
+        assert_eq!(mesh.workloads[0].namespace, "workloads");
+        assert_eq!(
+            mesh.workloads[0].selector.namespace.as_deref(),
+            Some("workloads")
+        );
+        assert_eq!(
+            mesh.workloads[0].spiffe_id.as_str(),
+            "spiffe://cluster.local/ns/workloads/sa/reviews"
         );
     }
 
