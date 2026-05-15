@@ -2555,9 +2555,16 @@ impl EnvConfig {
             }
         }
 
-        if matches!(self.mode, OperatingMode::NodeAgent) && self.node_agent_hbone_redirect_port == 0
-        {
-            return Err("FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT must be non-zero".into());
+        if matches!(self.mode, OperatingMode::NodeAgent) {
+            if self.node_agent_hbone_redirect_port == 0 {
+                return Err("FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT must be non-zero".into());
+            }
+            if self.node_agent_hbone_redirect_port == ferrum_ebpf_common::OUTBOUND_CAPTURE_PORT {
+                return Err(
+                    "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT must differ from the outbound capture port"
+                        .into(),
+                );
+            }
         }
 
         self.validate_db_tls_config()?;

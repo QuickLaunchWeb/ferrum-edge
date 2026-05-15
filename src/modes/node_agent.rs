@@ -637,7 +637,16 @@ where
             );
 
             let plan = IptablesPlan::for_config(&config.capture_config);
-            execute(plan.commands, "setup").await?;
+            if let Err(setup_err) = execute(plan.commands, "setup").await {
+                let cleanup = IptablesPlan::cleanup_commands();
+                if let Err(cleanup_err) = execute(cleanup, "cleanup").await {
+                    warn!(
+                        error = %cleanup_err,
+                        "Failed to clean up iptables fallback rules after setup failure"
+                    );
+                }
+                return Err(setup_err);
+            }
             startup_ready.store(true, Ordering::Release);
 
             info!("Iptables fallback rules applied, awaiting shutdown signal");
@@ -985,7 +994,10 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!startup_ready.load(Ordering::Acquire));
-        assert_eq!(*phases.lock().expect("phases mutex"), vec!["setup"]);
+        assert_eq!(
+            *phases.lock().expect("phases mutex"),
+            vec!["setup", "cleanup"]
+        );
     }
 
     #[test]

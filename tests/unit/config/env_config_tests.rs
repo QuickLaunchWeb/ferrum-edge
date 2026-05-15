@@ -3767,6 +3767,26 @@ fn test_env_config_node_agent_rejects_invalid_proxy_mode() {
     );
 }
 
+#[test]
+fn test_env_config_node_agent_rejects_hbone_port_equal_to_outbound_capture() {
+    let outbound_capture_port = ferrum_ebpf_common::OUTBOUND_CAPTURE_PORT.to_string();
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "node_agent"),
+            ("FERRUM_NODE_AGENT_NODE_NAME", "node-a"),
+            (
+                "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT",
+                outbound_capture_port.as_str(),
+            ),
+        ],
+        || {
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(err.contains("FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT"));
+            assert!(err.contains("outbound capture port"));
+        },
+    );
+}
+
 // --- DP CP failover URL tests ---
 
 #[test]
