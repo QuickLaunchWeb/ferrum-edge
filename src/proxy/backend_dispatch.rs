@@ -289,7 +289,7 @@ pub(crate) fn select_upstream_target(
 }
 
 #[inline]
-fn initial_dispatch_port(proxy: &Proxy, upstream: Option<&Upstream>) -> u16 {
+pub(crate) fn initial_dispatch_port(proxy: &Proxy, upstream: Option<&Upstream>) -> u16 {
     if proxy.backend_port != 0 {
         return proxy.backend_port;
     }
