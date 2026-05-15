@@ -44,12 +44,10 @@ async fn test_migration_runner_fresh_database() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    // V1 + V2 should be applied on a fresh database
-    assert_eq!(applied.len(), 2);
+    // V1 should be applied on a fresh database.
+    assert_eq!(applied.len(), 1);
     assert_eq!(applied[0].version, 1);
     assert_eq!(applied[0].name, "initial_schema");
-    assert_eq!(applied[1].version, 2);
-    assert_eq!(applied[1].name, "destination_rule_fields");
 
     // Running again should apply nothing
     let applied_again = runner.run_pending().await.unwrap();
@@ -68,12 +66,42 @@ async fn test_migration_runner_fresh_database() {
 }
 
 #[tokio::test]
+async fn test_v001_schema_includes_upstream_backend_tls_identity_fields() {
+    let pool = test_pool().await;
+
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    runner.run_pending().await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO upstreams \
+         (id, name, targets, algorithm, backend_tls_sni, backend_tls_san_allow_list, created_at, updated_at) \
+         VALUES ('tls-upstream', 'tls', '[]', 'round_robin', ?, ?, '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+    )
+    .bind("reviews.mesh.internal")
+    .bind("[\"reviews.mesh.internal\"]")
+    .execute(&pool)
+    .await
+    .expect("INSERT with backend TLS identity fields should succeed");
+
+    let row = sqlx::query(
+        "SELECT backend_tls_sni, backend_tls_san_allow_list FROM upstreams WHERE id = 'tls-upstream'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let sni: String = row.try_get("backend_tls_sni").unwrap();
+    let sans: String = row.try_get("backend_tls_san_allow_list").unwrap();
+    assert_eq!(sni, "reviews.mesh.internal");
+    assert_eq!(sans, "[\"reviews.mesh.internal\"]");
+}
+
+#[tokio::test]
 async fn test_migration_runner_rejects_existing_untracked_schema() {
     let pool = test_pool().await;
 
     // Simulate a pre-migration database by creating the tables directly.
-    // A real pre-migration DB has all five tables; we create them all so V003
-    // can add its indexes without hitting "no such table".
+    // A real pre-migration DB has all five tables; this should fail instead
+    // of trying to bootstrap over an untracked schema.
     sqlx::query(
         "CREATE TABLE upstreams (id TEXT PRIMARY KEY, namespace TEXT NOT NULL DEFAULT 'ferrum', name TEXT, targets TEXT NOT NULL DEFAULT '[]', algorithm TEXT NOT NULL DEFAULT 'round_robin', hash_on TEXT, hash_on_cookie_config TEXT, health_checks TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
     )
@@ -119,9 +147,8 @@ async fn test_migration_runner_rejects_existing_untracked_schema() {
     // No bootstrap marker is inserted, so all migrations are still pending.
     let status = runner.status().await.unwrap();
     assert!(status.applied.is_empty());
-    assert_eq!(status.pending.len(), 2);
+    assert_eq!(status.pending.len(), 1);
     assert_eq!(status.pending[0].version, 1);
-    assert_eq!(status.pending[1].version, 2);
 }
 
 #[tokio::test]
@@ -130,17 +157,17 @@ async fn test_migration_status() {
 
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
 
-    // Before running: V1 + V2 should be pending
+    // Before running: V1 should be pending.
     let status = runner.status().await.unwrap();
     assert!(status.applied.is_empty());
-    assert_eq!(status.pending.len(), 2);
+    assert_eq!(status.pending.len(), 1);
 
     // Run migrations
     runner.run_pending().await.unwrap();
 
-    // After running: V1 + V2 should be applied
+    // After running: V1 should be applied.
     let status = runner.status().await.unwrap();
-    assert_eq!(status.applied.len(), 2);
+    assert_eq!(status.applied.len(), 1);
     assert!(status.pending.is_empty());
 }
 
@@ -151,10 +178,9 @@ async fn test_v001_accepts_full_rfc3339_timestamps() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    // V1 + V2 should be applied on a fresh database
-    assert_eq!(applied.len(), 2);
+    // V1 should be applied on a fresh database.
+    assert_eq!(applied.len(), 1);
     assert_eq!(applied[0].version, 1);
-    assert_eq!(applied[1].version, 2);
 
     // Verify the schema accepts a full nanosecond-precision RFC 3339 timestamp
     // (35 chars, the maximum chrono produces)

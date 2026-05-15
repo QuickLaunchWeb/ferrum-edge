@@ -2071,6 +2071,9 @@ mod tests {
             client_key_path: Some("/certs/stable.key".to_string()),
             server_ca_cert_path: Some("/certs/stable-ca.pem".to_string()),
             verify_server_cert: true,
+            sni: None,
+            san_allow_list: Vec::new(),
+            san_allow_list_key_digest: None,
         };
 
         let canary: Upstream = serde_json::from_value(json!({

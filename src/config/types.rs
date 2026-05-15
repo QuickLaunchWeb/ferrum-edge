@@ -43,6 +43,10 @@ pub const MAX_TARGETS_PER_UPSTREAM: usize = 1000;
 pub const MAX_TAGS_PER_TARGET: usize = 50;
 /// Maximum number of subset definitions per upstream.
 pub const MAX_SUBSETS_PER_UPSTREAM: usize = 100;
+/// Maximum number of backend TLS SAN allow-list entries per upstream.
+pub const MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES: usize = 256;
+/// Maximum length for one backend TLS SAN allow-list entry.
+pub const MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH: usize = 2048;
 /// Maximum length for a subset name.
 pub const MAX_SUBSET_NAME_LENGTH: usize = 255;
 /// Maximum length for a tag key or value.
@@ -506,6 +510,12 @@ pub struct BackendTlsConfig {
     pub server_ca_cert_path: Option<String>,
     #[serde(default = "default_true")]
     pub verify_server_cert: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub san_allow_list: Vec<String>,
+    #[serde(skip)]
+    pub san_allow_list_key_digest: Option<String>,
 }
 
 impl BackendTlsConfig {
@@ -516,16 +526,23 @@ impl BackendTlsConfig {
             client_key_path: None,
             server_ca_cert_path: None,
             verify_server_cert: true,
+            sni: None,
+            san_allow_list: Vec::new(),
+            san_allow_list_key_digest: None,
         }
     }
 
     /// Project an upstream's backend TLS fields into the resolved runtime form.
     pub fn from_upstream(upstream: &Upstream) -> Self {
+        let digest = Self::compute_san_digest(&upstream.backend_tls_san_allow_list);
         Self {
             client_cert_path: upstream.backend_tls_client_cert_path.clone(),
             client_key_path: upstream.backend_tls_client_key_path.clone(),
             server_ca_cert_path: upstream.backend_tls_server_ca_cert_path.clone(),
             verify_server_cert: upstream.backend_tls_verify_server_cert,
+            sni: upstream.backend_tls_sni.clone(),
+            san_allow_list: upstream.backend_tls_san_allow_list.clone(),
+            san_allow_list_key_digest: digest,
         }
     }
 
@@ -536,7 +553,40 @@ impl BackendTlsConfig {
             client_key_path: proxy.backend_tls_client_key_path.clone(),
             server_ca_cert_path: proxy.backend_tls_server_ca_cert_path.clone(),
             verify_server_cert: proxy.backend_tls_verify_server_cert,
+            sni: None,
+            san_allow_list: Vec::new(),
+            san_allow_list_key_digest: None,
         }
+    }
+
+    pub fn recompute_san_digest(&mut self) {
+        self.san_allow_list_key_digest = Self::compute_san_digest(&self.san_allow_list);
+    }
+
+    pub(crate) fn compute_san_digest(sans: &[String]) -> Option<String> {
+        if sans.is_empty() {
+            return None;
+        }
+        let mut canonical_sans: Vec<&str> = sans.iter().map(String::as_str).collect();
+        canonical_sans.sort_unstable();
+        canonical_sans.dedup();
+        // FNV-1a 64-bit: stable across Rust versions unlike DefaultHasher.
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x00000100000001B3;
+        let mut h = FNV_OFFSET;
+        for byte in (canonical_sans.len() as u64).to_le_bytes() {
+            h ^= byte as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        for san in canonical_sans {
+            for byte in san.as_bytes() {
+                h ^= *byte as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+            h ^= 0xFF;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        Some(format!("{:016x}", h))
     }
 }
 
@@ -587,6 +637,14 @@ pub struct Upstream {
     /// Path to a PEM CA bundle for verifying backend server certificates.
     #[serde(default)]
     pub backend_tls_server_ca_cert_path: Option<String>,
+    /// Optional backend TLS SNI override, populated by mesh DestinationRule
+    /// `trafficPolicy.tls.sni`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_tls_sni: Option<String>,
+    /// Optional backend certificate SAN allow-list, populated by mesh
+    /// DestinationRule `trafficPolicy.tls.subjectAltNames`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backend_tls_san_allow_list: Vec<String>,
     /// ID of the `ApiSpec` that created this upstream via the spec-import admin API.
     /// `None` for hand-crafted upstreams. Used to scope cascading DELETE when a
     /// spec is removed. NOT loaded by the gateway runtime — admin-only metadata.
@@ -1696,17 +1754,7 @@ impl GatewayConfig {
         let upstream_tls: HashMap<&str, BackendTlsConfig> = self
             .upstreams
             .iter()
-            .map(|u| {
-                (
-                    u.id.as_str(),
-                    BackendTlsConfig {
-                        client_cert_path: u.backend_tls_client_cert_path.clone(),
-                        client_key_path: u.backend_tls_client_key_path.clone(),
-                        server_ca_cert_path: u.backend_tls_server_ca_cert_path.clone(),
-                        verify_server_cert: u.backend_tls_verify_server_cert,
-                    },
-                )
-            })
+            .map(|u| (u.id.as_str(), BackendTlsConfig::from_upstream(u)))
             .collect();
 
         for proxy in &mut self.proxies {
@@ -1716,12 +1764,7 @@ impl GatewayConfig {
                     .cloned()
                     .unwrap_or_else(BackendTlsConfig::default_verify)
             } else {
-                BackendTlsConfig {
-                    client_cert_path: proxy.backend_tls_client_cert_path.clone(),
-                    client_key_path: proxy.backend_tls_client_key_path.clone(),
-                    server_ca_cert_path: proxy.backend_tls_server_ca_cert_path.clone(),
-                    verify_server_cert: proxy.backend_tls_verify_server_cert,
-                }
+                BackendTlsConfig::from_proxy(proxy)
             };
         }
     }
@@ -3400,6 +3443,12 @@ impl Upstream {
         for target in &mut self.targets {
             target.host = target.host.to_ascii_lowercase();
         }
+        if let Some(sni) = &mut self.backend_tls_sni {
+            *sni = sni.to_ascii_lowercase();
+        }
+        for san in &mut self.backend_tls_san_allow_list {
+            normalize_backend_tls_san_allow_list_entry(san);
+        }
     }
 
     /// Resolve the effective backend connect timeout for a request destined to
@@ -3676,6 +3725,23 @@ impl Upstream {
         {
             errors.push(e);
         }
+        if let Some(ref sni) = self.backend_tls_sni
+            && let Err(e) = validate_backend_tls_sni(sni)
+        {
+            errors.push(e);
+        }
+        if self.backend_tls_san_allow_list.len() > MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES {
+            errors.push(format!(
+                "backend_tls_san_allow_list must not have more than {} entries (got {})",
+                MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
+                self.backend_tls_san_allow_list.len()
+            ));
+        }
+        for (i, san) in self.backend_tls_san_allow_list.iter().enumerate() {
+            if let Err(e) = validate_backend_tls_san_allow_list_entry(san) {
+                errors.push(format!("backend_tls_san_allow_list[{}].{}", i, e));
+            }
+        }
 
         // TLS cert/key pairing: both must be set or neither
         match (
@@ -3763,6 +3829,75 @@ impl Upstream {
             Err(errors)
         }
     }
+}
+
+pub(crate) fn validate_backend_tls_sni(sni: &str) -> Result<(), String> {
+    validate_string_field("backend_tls_sni", sni, MAX_HOST_LENGTH)?;
+    if sni.trim().is_empty() {
+        return Err("backend_tls_sni must not be empty".to_string());
+    }
+    if sni.trim() != sni {
+        return Err("backend_tls_sni must not have leading or trailing whitespace".to_string());
+    }
+    if sni.contains('*') {
+        return Err("backend_tls_sni must be an exact hostname, not a wildcard".to_string());
+    }
+    // RFC 6066 §3: the SNI host_name MUST NOT be an IP literal. validate_host_entry
+    // accepts dotted-digit strings as hostnames, so we reject IP addresses explicitly here.
+    if sni.parse::<std::net::IpAddr>().is_ok() {
+        return Err(
+            "backend_tls_sni must be a DNS hostname, not an IP address (RFC 6066 §3)".to_string(),
+        );
+    }
+    validate_host_entry(&sni.to_ascii_lowercase())
+        .map_err(|e| format!("backend_tls_sni is invalid: {}", e))
+}
+
+pub(crate) fn validate_backend_tls_san_allow_list_entry(san: &str) -> Result<(), String> {
+    validate_string_field("entry", san, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH)?;
+    if san.trim().is_empty() {
+        return Err("entry must not be empty".to_string());
+    }
+    if san.trim() != san {
+        return Err("entry must not have leading or trailing whitespace".to_string());
+    }
+    if san.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let spiffe_rest = san.get(..9).and_then(|prefix| {
+        if prefix.eq_ignore_ascii_case("spiffe://") {
+            Some(&san[9..])
+        } else {
+            None
+        }
+    });
+    if let Some(rest) = spiffe_rest {
+        let has_path = rest
+            .find('/')
+            .is_some_and(|slash| slash > 0 && slash + 1 < rest.len());
+        if !has_path || rest.contains(char::is_whitespace) {
+            return Err("entry is invalid: SPIFFE URI must include a non-empty path after the trust domain (e.g. spiffe://domain/ns/default/sa/name)".to_string());
+        }
+        return Ok(());
+    }
+    if san.contains("://") {
+        return Err("entry is invalid: URI SAN allow-list entries must be SPIFFE URIs".to_string());
+    }
+    if san.contains('*') {
+        return Err("entry must be an exact DNS name, SPIFFE URI, or IP address".to_string());
+    }
+    validate_host_entry(&san.to_ascii_lowercase()).map_err(|e| format!("entry is invalid: {}", e))
+}
+
+pub(crate) fn normalize_backend_tls_san_allow_list_entry(san: &mut String) {
+    if san
+        .get(..9)
+        .is_some_and(|s| s.eq_ignore_ascii_case("spiffe://"))
+        || san.parse::<std::net::IpAddr>().is_ok()
+    {
+        return;
+    }
+    *san = san.to_ascii_lowercase();
 }
 
 impl PluginConfig {

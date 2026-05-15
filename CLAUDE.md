@@ -4,6 +4,10 @@
 
 High-performance Rust edge proxy (HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC, raw TCP/UDP) with 58+ plugins, four operating modes, LB + health checks. Rust (edition 2024) on tokio + hyper 1.0. Single binary `ferrum-edge` (CLI subcommands + env config). License: PolyForm Noncommercial 1.0.0 (dual-licensed commercial).
 
+## Build-Out Compatibility Policy
+
+Ferrum Edge is in active build-out. Do not add schema DB migrations for new schema changes; fold schema changes into the current baseline schema instead. Do not add or preserve legacy compatibility shims for old fields, environment variables, config shapes, or database values unless explicitly requested. Breaking changes are acceptable in this phase.
+
 ## Read Before Touching
 
 - Mesh behavior → [docs/mesh.md](docs/mesh.md) + `src/modes/mesh/` + mesh plugin injection notes below
