@@ -414,6 +414,9 @@ fn commands_for_family(
             &format!("-p tcp --dport {port} -j RETURN"),
         ));
     }
+    // CIDR include/exclude settings scope outbound capture only. Once this
+    // address family is active, inbound capture stays protocol-wide so replies
+    // and server-initiated inbound connections are consistently redirected.
     commands.push(idempotent_append(
         binary,
         "nat",
@@ -456,7 +459,8 @@ fn iptables_script(
         let v6_script = v6_commands.join("\n");
         match ip6tables_mode {
             Ip6TablesMode::Auto => chunks.push(format!(
-                "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1; then\n{v6_script}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\necho \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
+                "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1; then\n    {}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\n  echo \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi",
+                v6_script.replace('\n', "\n    ")
             )),
             Ip6TablesMode::Required => chunks.push(v6_script),
             Ip6TablesMode::Disabled => {}

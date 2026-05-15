@@ -630,7 +630,7 @@ fn cleanup_commands_for_plan(include_v6: bool, ip6tables_mode: Ip6TablesMode) ->
 
 fn ip6tables_auto_wrapped_command(cmd: &str) -> String {
     format!(
-        "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1; then\n    {cmd}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\necho \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
+        "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1; then\n    {cmd}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\n  echo \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
     )
 }
 
