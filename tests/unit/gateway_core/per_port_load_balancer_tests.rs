@@ -7,7 +7,9 @@ use ferrum_edge::config::types::{
     SubsetDefinition, Upstream, UpstreamPortOverride, UpstreamTarget,
 };
 use ferrum_edge::health_check::HealthChecker;
-use ferrum_edge::load_balancer::{HealthContext, LoadBalancerCache, target_host_port_key};
+use ferrum_edge::load_balancer::{
+    HashOnStrategy, HealthContext, LoadBalancerCache, target_host_port_key,
+};
 
 fn target(host: &str, port: u16) -> UpstreamTarget {
     weighted_target(host, port, 1)
@@ -333,6 +335,45 @@ fn upstream_round_robin_port_override_random_uses_port_specific_algorithm() {
         })
         .collect();
     assert_eq!(parent_sequence, vec!["a", "b", "c"]);
+}
+
+#[test]
+fn port_override_without_hash_on_clears_upstream_hash_strategy() {
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            algorithm: Some(LoadBalancerAlgorithm::Random),
+            ..Default::default()
+        },
+    );
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::ConsistentHashing,
+        vec![target("a", 8080), target("b", 8080), target("c", 9090)],
+        port_overrides,
+    );
+    upstream.hash_on = Some("cookie:srv".to_string());
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    assert_eq!(
+        LoadBalancerCache::get_hash_on_strategy_from(&snapshot, "u1"),
+        HashOnStrategy::Cookie("srv".to_string())
+    );
+    assert_eq!(
+        LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "u1", 8080),
+        HashOnStrategy::Ip,
+        "omitting hash_on on a port override should clear upstream sticky hash state"
+    );
+    assert_eq!(
+        LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "u1", 9090),
+        HashOnStrategy::Cookie("srv".to_string()),
+        "ports without an override should keep the upstream strategy"
+    );
 }
 
 #[test]

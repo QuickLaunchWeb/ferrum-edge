@@ -1059,7 +1059,10 @@ impl LoadBalancer {
                     continue;
                 }
                 let effective_algorithm = override_config.algorithm.unwrap_or(algorithm);
-                let effective_hash_on = override_config.hash_on.as_deref().or(hash_on.as_deref());
+                // A present port override owns its hash key. `None` intentionally
+                // clears the upstream hash_on so stale cookie/header stickiness
+                // does not leak into ports that switch algorithms.
+                let effective_hash_on = override_config.hash_on.as_deref();
                 let hash_ring = if effective_algorithm == LoadBalancerAlgorithm::ConsistentHashing {
                     build_hash_ring_for_indices(&host_port_keys, target_indices.iter().copied())
                 } else {
