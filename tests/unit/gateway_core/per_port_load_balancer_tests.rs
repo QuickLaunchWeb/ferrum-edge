@@ -7,7 +7,7 @@ use ferrum_edge::config::types::{
     SubsetDefinition, Upstream, UpstreamPortOverride, UpstreamTarget,
 };
 use ferrum_edge::health_check::HealthChecker;
-use ferrum_edge::load_balancer::{HealthContext, LoadBalancerCache};
+use ferrum_edge::load_balancer::{HealthContext, LoadBalancerCache, target_host_port_key};
 
 fn target(host: &str, port: u16) -> UpstreamTarget {
     weighted_target(host, port, 1)
@@ -233,6 +233,53 @@ fn port_subset_fully_unhealthy_intersection_returns_none() {
     );
 }
 
+#[test]
+fn port_retry_selection_does_not_escape_selected_port() {
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+            ..Default::default()
+        },
+    );
+    let targets = vec![target("a", 8080), target("b", 8080), target("c", 9090)];
+    let upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        targets.clone(),
+        port_overrides,
+    );
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+    let active_unhealthy = DashMap::new();
+    active_unhealthy.insert("u1::a:8080".to_string(), 0);
+    let health = HealthContext {
+        active_unhealthy: &active_unhealthy,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    };
+
+    let selection = LoadBalancerCache::select_next_target_for_port_from(
+        &snapshot,
+        "u1",
+        "key",
+        8080,
+        &targets[1],
+        Some(&health),
+    )
+    .expect("port retry selection");
+
+    assert_eq!(
+        selection.port, 8080,
+        "retry selection for a port override must not escape to another destination port"
+    );
+    assert_eq!(selection.host, "a");
+}
+
 fn proxy_for_upstream() -> Proxy {
     serde_json::from_value(serde_json::json!({
         "id": "p1",
@@ -345,5 +392,190 @@ fn per_port_passive_health_threshold_differs_from_upstream_level() {
     assert!(
         proxy_state.unhealthy.contains_key("a:8080"),
         "port-level threshold 1 should eject after one matching failure"
+    );
+}
+
+#[test]
+fn port_passive_ejection_cap_uses_only_targets_on_selected_port() {
+    let port_passive = PassiveHealthCheck {
+        unhealthy_threshold: 1,
+        max_ejection_percent: Some(50),
+        ..PassiveHealthCheck::default()
+    };
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            passive_health_check: Some(port_passive.clone()),
+            ..Default::default()
+        },
+    );
+    let targets = vec![
+        target("a", 8080),
+        target("b", 8080),
+        target("c", 9090),
+        target("d", 9090),
+    ];
+    let upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        targets.clone(),
+        port_overrides,
+    );
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let checker = HealthChecker::new();
+    checker.report_response("p1", &targets[0], 500, false, Some(&port_passive));
+    checker.report_response("p1", &targets[1], 500, false, Some(&port_passive));
+    let proxy_state = checker
+        .passive_health
+        .get("p1")
+        .expect("passive health state created")
+        .clone();
+    proxy_state
+        .unhealthy
+        .insert(target_host_port_key(&targets[0]), 100);
+    proxy_state
+        .unhealthy
+        .insert(target_host_port_key(&targets[1]), 200);
+
+    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let health = HealthContext {
+        active_unhealthy: &active_unhealthy,
+        proxy_passive: Some(proxy_state),
+        max_ejection_percent: Some(50),
+    };
+
+    let selection =
+        LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "key", 8080, Some(&health))
+            .expect("port selection");
+
+    assert!(
+        !selection.is_fallback,
+        "one of two passively ejected port targets should be re-admitted under a 50% port cap"
+    );
+    assert_eq!(selection.target.host, "a");
+}
+
+#[test]
+fn port_passive_ejection_cap_uses_only_targets_on_selected_port_vec_path() {
+    let port_passive = PassiveHealthCheck {
+        unhealthy_threshold: 1,
+        max_ejection_percent: Some(50),
+        ..PassiveHealthCheck::default()
+    };
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            passive_health_check: Some(port_passive.clone()),
+            ..Default::default()
+        },
+    );
+    let mut targets = vec![target("a", 8080), target("b", 8080)];
+    targets.extend((0..128).map(|idx| target(&format!("other-{idx}"), 9090)));
+    let upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        targets.clone(),
+        port_overrides,
+    );
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let checker = HealthChecker::new();
+    checker.report_response("p1", &targets[0], 500, false, Some(&port_passive));
+    checker.report_response("p1", &targets[1], 500, false, Some(&port_passive));
+    let proxy_state = checker
+        .passive_health
+        .get("p1")
+        .expect("passive health state created")
+        .clone();
+    proxy_state
+        .unhealthy
+        .insert(target_host_port_key(&targets[0]), 100);
+    proxy_state
+        .unhealthy
+        .insert(target_host_port_key(&targets[1]), 200);
+
+    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let health = HealthContext {
+        active_unhealthy: &active_unhealthy,
+        proxy_passive: Some(proxy_state),
+        max_ejection_percent: Some(50),
+    };
+
+    let selection =
+        LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "key", 8080, Some(&health))
+            .expect("port selection");
+
+    assert!(
+        !selection.is_fallback,
+        "Vec fallback should also apply the ejection cap to the selected port's target set"
+    );
+    assert_eq!(selection.target.host, "a");
+}
+
+#[test]
+fn port_passive_override_without_max_ejection_does_not_inherit_upstream_cap() {
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            passive_health_check: Some(PassiveHealthCheck {
+                unhealthy_threshold: 1,
+                max_ejection_percent: None,
+                ..PassiveHealthCheck::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![target("a", 8080), target("b", 9090)],
+        port_overrides,
+    );
+    upstream.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck {
+            max_ejection_percent: Some(25),
+            ..PassiveHealthCheck::default()
+        }),
+    });
+    let mut config = GatewayConfig {
+        proxies: vec![proxy_for_upstream()],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    config.resolve_dispatch_port_overrides();
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    assert_eq!(
+        LoadBalancerCache::max_ejection_percent_for_port_from(
+            &snapshot,
+            "u1",
+            &config.proxies[0],
+            8080,
+        ),
+        None,
+        "a port-level passive-health override owns the port cap even when it omits max_ejection_percent"
+    );
+    assert_eq!(
+        LoadBalancerCache::max_ejection_percent_for_port_from(
+            &snapshot,
+            "u1",
+            &config.proxies[0],
+            9090,
+        ),
+        Some(25),
+        "ports without a passive override should still inherit the upstream cap"
     );
 }

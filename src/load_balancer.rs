@@ -749,13 +749,16 @@ impl LoadBalancerCache {
         proxy: &Proxy,
         port: u16,
     ) -> Option<u8> {
-        proxy
+        if let Some(port_passive) = proxy
             .dispatch_port_overrides
             .as_ref()
             .and_then(|overrides| overrides.get(&port))
             .and_then(|override_config| override_config.passive_health_check.as_ref())
-            .and_then(|passive| passive.max_ejection_percent)
-            .or_else(|| Self::max_ejection_percent_from(snapshot, upstream_id))
+        {
+            return port_passive.max_ejection_percent;
+        }
+
+        Self::max_ejection_percent_from(snapshot, upstream_id)
     }
 
     /// Snapshot of active connection counts per upstream for metrics.
@@ -1315,6 +1318,60 @@ impl LoadBalancer {
         bitset
     }
 
+    /// Compute healthy indices for a pre-filtered target set. This keeps
+    /// passive max-ejection caps scoped to the actual candidate pool, such as a
+    /// DestinationRule port-level override, instead of diluting the cap across
+    /// unrelated targets on other ports.
+    #[inline]
+    fn compute_health_bitset_for_indices(
+        &self,
+        health: Option<&HealthContext<'_>>,
+        indices: &[usize],
+    ) -> HealthBitset {
+        let Some(h) = health else {
+            return bitset_for_indices(indices);
+        };
+
+        if h.active_unhealthy.is_empty()
+            && h.proxy_passive
+                .as_ref()
+                .is_none_or(|ps| ps.unhealthy.is_empty())
+        {
+            return bitset_for_indices(indices);
+        }
+
+        let mut bitset = HealthBitset::empty();
+        let mut passive_ejected: Vec<(usize, u64)> = Vec::new();
+
+        for &i in indices {
+            debug_assert!(i < self.targets.len());
+            if i >= self.targets.len() {
+                continue;
+            }
+            if h.active_unhealthy.contains_key(&self.target_keys[i]) {
+                continue;
+            }
+            if let Some(ref ps) = h.proxy_passive
+                && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
+            {
+                passive_ejected.push((i, *entry));
+                continue;
+            }
+            bitset.set(i);
+        }
+
+        let to_readmit = passive_ejections_to_readmit(
+            &mut passive_ejected,
+            indices.len(),
+            h.max_ejection_percent,
+        );
+        for &(idx, _) in passive_ejected.iter().take(to_readmit) {
+            bitset.set(idx);
+        }
+
+        bitset
+    }
+
     /// Collect healthy targets into a Vec — fallback for upstreams with >128
     /// targets that cannot use the bitset fast path.
     fn healthy_targets_vec(
@@ -1344,6 +1401,51 @@ impl LoadBalancer {
 
         let to_readmit =
             passive_ejections_to_readmit(&mut passive_ejected, n, h.max_ejection_percent);
+        for &(idx, _) in passive_ejected.iter().take(to_readmit) {
+            healthy.push((idx, &self.targets[idx]));
+        }
+
+        healthy
+    }
+
+    /// Vec fallback equivalent of `compute_health_bitset_for_indices`.
+    fn healthy_targets_vec_for_indices(
+        &self,
+        health: Option<&HealthContext<'_>>,
+        indices: &[usize],
+    ) -> Vec<(usize, &Arc<UpstreamTarget>)> {
+        let Some(h) = health else {
+            return indices
+                .iter()
+                .copied()
+                .filter_map(|idx| self.targets.get(idx).map(|target| (idx, target)))
+                .collect();
+        };
+
+        let mut healthy: Vec<(usize, &Arc<UpstreamTarget>)> = Vec::new();
+        let mut passive_ejected: Vec<(usize, u64)> = Vec::new();
+
+        for &i in indices {
+            let Some(target) = self.targets.get(i) else {
+                continue;
+            };
+            if h.active_unhealthy.contains_key(&self.target_keys[i]) {
+                continue;
+            }
+            if let Some(ref ps) = h.proxy_passive
+                && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
+            {
+                passive_ejected.push((i, *entry));
+                continue;
+            }
+            healthy.push((i, target));
+        }
+
+        let to_readmit = passive_ejections_to_readmit(
+            &mut passive_ejected,
+            indices.len(),
+            h.max_ejection_percent,
+        );
         for &(idx, _) in passive_ejected.iter().take(to_readmit) {
             healthy.push((idx, &self.targets[idx]));
         }
@@ -1468,13 +1570,8 @@ impl LoadBalancer {
             return self.select_port_vec_fallback(ctx_key, port_state, health);
         }
 
-        let healthy = self.compute_health_bitset(health);
-        let mut port_healthy = HealthBitset::empty();
-        for &idx in &port_state.target_indices {
-            if healthy.contains(idx) {
-                port_healthy.set(idx);
-            }
-        }
+        let port_healthy =
+            self.compute_health_bitset_for_indices(health, &port_state.target_indices);
 
         if port_healthy.is_empty() {
             let all_port_targets = bitset_for_indices(&port_state.target_indices);
@@ -1539,7 +1636,7 @@ impl LoadBalancer {
             );
         }
 
-        let healthy = self.compute_health_bitset(health);
+        let healthy = self.compute_health_bitset_for_indices(health, &port_state.target_indices);
         let subset_mask = bitset_for_indices(subset_target_indices);
         let mut port_subset_healthy = HealthBitset::empty();
         for &idx in &port_state.target_indices {
@@ -1572,17 +1669,8 @@ impl LoadBalancer {
         port_state: &PortLbState,
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
-        let all_healthy = self.healthy_targets_vec(health);
-        let mut healthy_mask = vec![false; self.targets.len()];
-        for (idx, _) in all_healthy {
-            healthy_mask[idx] = true;
-        }
-        let mut candidates: Vec<(usize, &Arc<UpstreamTarget>)> = port_state
-            .target_indices
-            .iter()
-            .filter(|&&idx| healthy_mask[idx])
-            .map(|&idx| (idx, &self.targets[idx]))
-            .collect();
+        let mut candidates =
+            self.healthy_targets_vec_for_indices(health, &port_state.target_indices);
         let is_fallback = candidates.is_empty();
         if is_fallback {
             candidates = port_state
@@ -1613,16 +1701,10 @@ impl LoadBalancer {
         subset_indices: &[usize],
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
-        let all_healthy = self.healthy_targets_vec(health);
-        let mut healthy_mask = vec![false; self.targets.len()];
-        for (idx, _) in all_healthy {
-            healthy_mask[idx] = true;
-        }
-        let candidates: Vec<(usize, &Arc<UpstreamTarget>)> = port_state
-            .target_indices
-            .iter()
-            .filter(|&&idx| healthy_mask[idx] && subset_indices.contains(&idx))
-            .map(|&idx| (idx, &self.targets[idx]))
+        let candidates: Vec<(usize, &Arc<UpstreamTarget>)> = self
+            .healthy_targets_vec_for_indices(health, &port_state.target_indices)
+            .into_iter()
+            .filter(|(idx, _)| subset_indices.contains(idx))
             .collect();
         if candidates.is_empty() {
             return None;
@@ -1958,19 +2040,13 @@ impl LoadBalancer {
             );
         }
 
-        let mut healthy = self.compute_health_bitset(health);
+        let mut healthy =
+            self.compute_health_bitset_for_indices(health, &port_state.target_indices);
         if let Some(ei) = exclude_idx {
             healthy.clear(ei);
         }
 
-        let mut port_healthy = HealthBitset::empty();
-        for &idx in &port_state.target_indices {
-            if healthy.contains(idx) {
-                port_healthy.set(idx);
-            }
-        }
-
-        if port_healthy.is_empty() {
+        if healthy.is_empty() {
             let mut fallback = bitset_for_indices(&port_state.target_indices);
             if let Some(ei) = exclude_idx {
                 fallback.clear(ei);
@@ -1990,7 +2066,7 @@ impl LoadBalancer {
 
         self.select_with_bitset_using(
             ctx_key,
-            &port_healthy,
+            &healthy,
             port_state.algorithm,
             &port_state.rr_counter,
             &port_state.wrr_state,
@@ -2093,7 +2169,8 @@ impl LoadBalancer {
             );
         }
 
-        let mut healthy = self.compute_health_bitset(health);
+        let mut healthy =
+            self.compute_health_bitset_for_indices(health, &port_state.target_indices);
         if let Some(ei) = exclude_idx {
             healthy.clear(ei);
         }
@@ -2157,18 +2234,10 @@ impl LoadBalancer {
         exclude_idx: Option<usize>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        let all_healthy = self.healthy_targets_vec(health);
-        let mut healthy_mask = vec![false; self.targets.len()];
-        for (idx, _) in all_healthy {
-            healthy_mask[idx] = true;
-        }
-
-        let mut candidates: Vec<(usize, &Arc<UpstreamTarget>)> = port_state
-            .target_indices
-            .iter()
-            .copied()
-            .filter(|&idx| healthy_mask[idx] && exclude_idx.is_none_or(|ei| ei != idx))
-            .map(|idx| (idx, &self.targets[idx]))
+        let mut candidates: Vec<(usize, &Arc<UpstreamTarget>)> = self
+            .healthy_targets_vec_for_indices(health, &port_state.target_indices)
+            .into_iter()
+            .filter(|(idx, _)| exclude_idx.is_none_or(|ei| ei != *idx))
             .collect();
         if candidates.is_empty() {
             candidates = port_state
@@ -2201,22 +2270,12 @@ impl LoadBalancer {
         exclude_idx: Option<usize>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        let all_healthy = self.healthy_targets_vec(health);
-        let mut healthy_mask = vec![false; self.targets.len()];
-        for (idx, _) in all_healthy {
-            healthy_mask[idx] = true;
-        }
-
-        let candidates: Vec<(usize, &Arc<UpstreamTarget>)> = port_state
-            .target_indices
-            .iter()
-            .copied()
-            .filter(|&idx| {
-                healthy_mask[idx]
-                    && subset_indices.contains(&idx)
-                    && exclude_idx.is_none_or(|ei| ei != idx)
+        let candidates: Vec<(usize, &Arc<UpstreamTarget>)> = self
+            .healthy_targets_vec_for_indices(health, &port_state.target_indices)
+            .into_iter()
+            .filter(|(idx, _)| {
+                subset_indices.contains(idx) && exclude_idx.is_none_or(|ei| ei != *idx)
             })
-            .map(|idx| (idx, &self.targets[idx]))
             .collect();
         if candidates.is_empty() {
             return None;
