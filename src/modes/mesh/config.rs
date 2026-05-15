@@ -1059,11 +1059,10 @@ pub struct MeshTrafficPolicyTls {
     /// defaulting semantics treat it as `SIMPLE`.
     #[serde(default = "default_client_tls_mode")]
     pub mode: MtlsMode,
-    /// Optional Server Name Indication value sent on the backend handshake.
-    /// Today this is a schema-compatibility field — `Upstream` does not yet
-    /// have a per-upstream SNI override (Ferrum's reqwest path derives SNI
-    /// from the host header / target address). Captured here so cold-path
-    /// apply can warn when set and future work can wire it through.
+    /// Optional Server Name Indication value for backend TLS origination.
+    /// Cold-path DestinationRule application projects this onto
+    /// `Upstream.backend_tls_sni` and then into `Proxy.resolved_tls` so the
+    /// backend handshake layer can consume the cached value when wired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sni: Option<String>,
     /// Optional path to a PEM CA bundle for verifying the backend server's
@@ -1081,10 +1080,11 @@ pub struct MeshTrafficPolicyTls {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_key: Option<String>,
     /// Optional list of acceptable Subject Alternative Names for the
-    /// backend's server certificate (Istio `subjectAltNames`). Today this
-    /// is a schema-compatibility field — Ferrum's `backend_tls_*` surface
-    /// does not yet expose a per-upstream SAN allow-list. Captured here
-    /// so cold-path apply can warn when set.
+    /// backend's server certificate (Istio `subjectAltNames`). Cold-path
+    /// DestinationRule application projects this onto
+    /// `Upstream.backend_tls_san_allow_list` and then into
+    /// `Proxy.resolved_tls` so certificate-verifier enforcement can consume
+    /// the cached value when wired.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subject_alt_names: Vec<String>,
     /// When true, suppress server-cert verification on the backend handshake

@@ -11,6 +11,23 @@ Ferrum Edge uses a versioned migration system that:
 - **Auto-migrates on startup** (no manual intervention required for normal operation)
 - **Provides a CLI mode** for operators who want explicit control
 
+## Build-Out Schema Policy
+
+Ferrum Edge is still in active build-out. During this phase, core database
+schema changes are folded into the current baseline schema (`V001`) instead of
+being added as new core schema migrations (`V002`, `V003`, etc.). Breaking
+database-schema changes are acceptable during build-out, and compatibility
+shims for legacy columns, fields, environment variables, config shapes, or
+database values are not required unless explicitly requested.
+
+Operationally, anyone running a build-out branch or recent `main` snapshot
+should treat core schema changes as requiring a fresh database or an explicit
+operator-managed rebuild of the affected tables. The versioned core migration
+guide below documents the migration framework and the post-stabilization path;
+it is not the default workflow for new core schema fields during build-out.
+Custom plugin migrations still use the plugin migration system because plugin
+storage is independently owned.
+
 ## Database Migrations
 
 ### How It Works
@@ -37,13 +54,16 @@ CREATE TABLE _ferrum_migrations (
 
 ### Upgrading from Pre-Migration Versions
 
-If you're upgrading from a version of Ferrum Edge that predates the migration system (any version before this feature was added), the process is automatic:
+If you're upgrading from a version of Ferrum Edge that predates the migration system (any version before this feature was added), the process is automatic for the tracked baseline schema:
 
 1. The MigrationRunner detects that the `proxies` table exists but `_ferrum_migrations` does not contain any records
 2. It marks the V1 (initial_schema) migration as already applied
 3. Any subsequent migrations (V2, V3, etc.) are then applied normally
 
-**No manual intervention is required.** Just upgrade the binary and start it.
+Build-out caveat: newer development snapshots may intentionally fold schema
+changes into the baseline instead of adding an upgrade migration. In that case,
+operators running those snapshots need to recreate or rebuild the database
+schema as described in [Build-Out Schema Policy](#build-out-schema-policy).
 
 ### Cross-Database Support
 
@@ -260,6 +280,16 @@ FERRUM_MODE=migrate \
 ## Writing New Migrations (Developer Guide)
 
 ### Adding a Database Migration
+
+Do not add new core schema migrations during the active build-out phase. For
+new built-in tables, columns, or indexes, update the baseline schema in
+`src/config/migrations/v001_initial_schema.rs` /
+`src/config/migrations/sql_dialect.rs` and the corresponding tests. Add a new
+versioned core migration only after the schema is declared stable, or when a
+task explicitly asks for an upgrade path.
+
+The steps below are retained for post-stabilization core migrations and for
+reference when working on the migration framework itself.
 
 1. Create a new file `src/config/migrations/v002_your_migration_name.rs`:
 
