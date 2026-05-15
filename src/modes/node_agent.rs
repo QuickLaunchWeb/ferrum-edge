@@ -106,7 +106,9 @@ pub async fn run(
     let config = NodeAgentConfig::from_env_config(&env_config).map_err(anyhow::Error::msg)?;
     let metrics = Arc::new(NodeAgentMetrics::default());
     crate::plugins::prometheus_metrics::global_registry().set_node_agent_metrics(metrics.clone());
-    let _admin_handles = start_node_agent_admin_listeners(&env_config, &shutdown_tx).await?;
+    let startup_ready = Arc::new(AtomicBool::new(false));
+    let admin_handles =
+        start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready.clone()).await?;
 
     info!(
         node_name = %config.node_name,
@@ -129,16 +131,33 @@ pub async fn run(
         "Kernel probe complete"
     );
 
-    if !probe.supports_ebpf() {
-        return handle_fallback(&config, &probe, &shutdown_tx).await;
+    let result = if !probe.supports_ebpf() {
+        handle_fallback(&config, &probe, &shutdown_tx, startup_ready).await
+    } else {
+        run_with_backend(
+            create_backend(),
+            &config,
+            metrics,
+            &shutdown_tx,
+            startup_ready,
+        )
+        .await
+    };
+
+    let _ = shutdown_tx.send(true);
+    for handle in admin_handles {
+        if let Err(err) = handle.await {
+            warn!(error = %err, "Node agent admin listener task failed");
+        }
     }
 
-    run_with_backend(create_backend(), &config, metrics, &shutdown_tx).await
+    result
 }
 
 async fn start_node_agent_admin_listeners(
     env_config: &EnvConfig,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    startup_ready: Arc<AtomicBool>,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>, anyhow::Error> {
     let mut handles = Vec::new();
     if env_config.admin_http_port == 0 {
@@ -149,7 +168,6 @@ async fn start_node_agent_admin_listeners(
         crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
             .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
     );
-    let startup_ready = Arc::new(AtomicBool::new(true));
     let jwt_manager = match create_jwt_manager_from_env() {
         Ok(manager) => manager,
         Err(err) => {
@@ -221,6 +239,7 @@ async fn run_with_backend(
     config: &NodeAgentConfig,
     metrics: Arc<NodeAgentMetrics>,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    startup_ready: Arc<AtomicBool>,
 ) -> Result<(), anyhow::Error> {
     initialize_backend(backend.as_mut(), config)?;
 
@@ -290,6 +309,8 @@ async fn run_with_backend(
                                 handle_pod_removed(backend.as_mut(), &pod_states, metrics.as_ref(), &uid);
                             }
                         }
+                        startup_ready.store(true, Ordering::Release);
+                        info!("Node agent initial pod sync complete; /health now reports ready");
                     }
                     Some(Err(e)) => {
                         warn!(error = %e, "Pod watcher error; kube-rs will retry");
@@ -576,10 +597,15 @@ async fn handle_fallback(
     config: &NodeAgentConfig,
     probe: &KernelProbeResult,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    startup_ready: Arc<AtomicBool>,
 ) -> Result<(), anyhow::Error> {
-    handle_fallback_with(config, probe, shutdown_tx, |cmds, phase| async move {
-        execute_iptables_commands(&cmds, phase).await
-    })
+    handle_fallback_with(
+        config,
+        probe,
+        shutdown_tx,
+        |cmds, phase| async move { execute_iptables_commands(&cmds, phase).await },
+        startup_ready,
+    )
     .await
 }
 
@@ -594,6 +620,7 @@ async fn handle_fallback_with<F, Fut>(
     probe: &KernelProbeResult,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     mut execute: F,
+    startup_ready: Arc<AtomicBool>,
 ) -> Result<(), anyhow::Error>
 where
     F: FnMut(Vec<String>, &'static str) -> Fut,
@@ -611,6 +638,7 @@ where
 
             let plan = IptablesPlan::for_config(&config.capture_config);
             execute(plan.commands, "setup").await;
+            startup_ready.store(true, Ordering::Release);
 
             info!("Iptables fallback rules applied, awaiting shutdown signal");
 
@@ -781,6 +809,31 @@ mod tests {
     }
 
     #[test]
+    fn initialize_backend_capture_config_failure_is_fatal() {
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/sys/fs/bpf".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        let mut backend = MockEbpfBackend {
+            fail_update_capture_config: true,
+            ..MockEbpfBackend::default()
+        };
+
+        let err = initialize_backend(&mut backend, &config)
+            .err()
+            .expect("capture-config failure should abort initialization");
+
+        assert!(err.to_string().contains("capture config update failed"));
+        assert!(backend.programs_loaded);
+        assert!(backend.capture_config.is_none());
+    }
+
+    #[test]
     fn cleanup_all_pods_detaches_attached() {
         let mut backend = MockEbpfBackend::default();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
@@ -851,22 +904,30 @@ mod tests {
         shutdown_tx
             .send(true)
             .expect("watch channel should be open");
+        let startup_ready = Arc::new(AtomicBool::new(false));
 
         let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let phases_for_runner = std::sync::Arc::clone(&phases);
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            handle_fallback_with(&config, &probe, &shutdown_tx, move |_, phase| {
-                let phases = std::sync::Arc::clone(&phases_for_runner);
-                async move {
-                    phases.lock().expect("phases mutex").push(phase);
-                }
-            }),
+            handle_fallback_with(
+                &config,
+                &probe,
+                &shutdown_tx,
+                move |_, phase| {
+                    let phases = std::sync::Arc::clone(&phases_for_runner);
+                    async move {
+                        phases.lock().expect("phases mutex").push(phase);
+                    }
+                },
+                startup_ready.clone(),
+            ),
         )
         .await
         .expect("handle_fallback should complete within timeout");
         assert!(result.is_ok());
+        assert!(startup_ready.load(Ordering::Acquire));
         assert_eq!(
             *phases.lock().expect("phases mutex"),
             vec!["setup", "cleanup"]
@@ -1207,12 +1268,14 @@ mod tests {
             bpf_fs_available: false,
         };
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let startup_ready = Arc::new(AtomicBool::new(false));
 
         assert!(
-            handle_fallback(&config, &probe, &shutdown_tx)
+            handle_fallback(&config, &probe, &shutdown_tx, startup_ready.clone())
                 .await
                 .is_err()
         );
+        assert!(!startup_ready.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -1232,5 +1295,35 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), wait)
             .await
             .expect("shutdown wait should resolve after signal");
+    }
+
+    #[tokio::test]
+    async fn admin_listener_http_port_zero_spawns_no_tasks() {
+        let mut env_config = EnvConfig::default();
+        env_config.admin_http_port = 0;
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let startup_ready = Arc::new(AtomicBool::new(false));
+
+        let handles = start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready)
+            .await
+            .expect("port zero should be accepted");
+
+        assert!(handles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_listener_invalid_allowed_cidrs_returns_error() {
+        let mut env_config = EnvConfig::default();
+        env_config.admin_http_port = 18081;
+        env_config.admin_allowed_cidrs = "not-a-cidr".to_string();
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let startup_ready = Arc::new(AtomicBool::new(false));
+
+        let err = start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready)
+            .await
+            .err()
+            .expect("invalid CIDR should fail before spawning");
+
+        assert!(err.to_string().contains("FERRUM_ADMIN_ALLOWED_CIDRS"));
     }
 }

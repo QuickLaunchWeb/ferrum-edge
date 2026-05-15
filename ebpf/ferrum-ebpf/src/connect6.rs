@@ -70,7 +70,7 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
 fn outbound_capture_port() -> u32 {
     let key = FERRUM_CAPTURE_CONFIG_KEY;
     match unsafe { FERRUM_CAPTURE_CONFIG.get(&key) } {
-        Some(config) if config.outbound_capture_port != 0 => config.outbound_capture_port,
+        Some(config) if config.outbound_capture_port != 0 => config.outbound_capture_port & 0xffff,
         _ => OUTBOUND_CAPTURE_PORT as u32,
     }
 }

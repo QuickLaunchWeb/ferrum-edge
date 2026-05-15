@@ -22,51 +22,49 @@ async fn node_agent_boots_with_contract_env_and_exposes_metrics() {
     let cgroup_root = tmp.path().join("missing-cgroup-root");
     let bpf_root = tmp.path().join("missing-bpf-root");
 
-    for _ in 0..5 {
-        let admin_port = reserve_port()
-            .await
-            .expect("reserve admin port")
-            .drop_and_take_port();
-        let mut child = Command::new(gateway_binary_path())
-            .env("FERRUM_MODE", "node_agent")
-            .env("FERRUM_NODE_AGENT_NODE_NAME", "functional-node")
-            .env("FERRUM_NODE_AGENT_PROXY_MODE", "node_waypoint")
-            .env("FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT", "16008")
-            .env("FERRUM_NODE_AGENT_CGROUP_ROOT", &cgroup_root)
-            .env("FERRUM_NODE_AGENT_BPF_FS_PATH", &bpf_root)
-            .env("FERRUM_NODE_AGENT_FALLBACK_MODE", "iptables")
-            .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-            .env("FERRUM_ADMIN_HTTPS_PORT", "0")
-            .env("FERRUM_LOG_LEVEL", "debug")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn node_agent");
+    let admin_port = reserve_port()
+        .await
+        .expect("reserve admin port")
+        .drop_and_take_port();
+    let mut child = Command::new(gateway_binary_path())
+        .env("FERRUM_MODE", "node_agent")
+        .env("FERRUM_NODE_AGENT_NODE_NAME", "functional-node")
+        .env("FERRUM_NODE_AGENT_PROXY_MODE", "node_waypoint")
+        .env("FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT", "16008")
+        .env("FERRUM_NODE_AGENT_CGROUP_ROOT", &cgroup_root)
+        .env("FERRUM_NODE_AGENT_BPF_FS_PATH", &bpf_root)
+        .env("FERRUM_NODE_AGENT_FALLBACK_MODE", "iptables")
+        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
+        .env("FERRUM_ADMIN_HTTPS_PORT", "0")
+        .env("FERRUM_LOG_LEVEL", "debug")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn node_agent");
 
-        let client = reqwest::Client::new();
-        let url = format!("http://127.0.0.1:{admin_port}/metrics");
-        let mut last_body = String::new();
-        for _ in 0..50 {
-            if let Some(status) = child.try_wait().expect("poll node_agent") {
-                panic!("node_agent exited before metrics scrape: {status}");
-            }
-            if let Ok(response) = client.get(&url).send().await
-                && response.status().is_success()
-            {
-                last_body = response.text().await.expect("metrics body");
-                if last_body.contains("ferrum_node_agent_pods_enrolled_total") {
-                    terminate(child);
-                    return;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{admin_port}/metrics");
+    let mut last_body = String::new();
+    for _ in 0..50 {
+        if let Some(status) = child.try_wait().expect("poll node_agent") {
+            terminate(child);
+            panic!("node_agent exited before metrics scrape: {status}");
         }
-
-        terminate(child);
-        if !last_body.is_empty() {
-            panic!("node_agent /metrics missing node-agent counters:\n{last_body}");
+        if let Ok(response) = client.get(&url).send().await
+            && response.status().is_success()
+        {
+            last_body = response.text().await.expect("metrics body");
+            if last_body.contains("ferrum_node_agent_pods_enrolled_total") {
+                terminate(child);
+                return;
+            }
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    panic!("node_agent metrics endpoint did not become ready");
+    terminate(child);
+    if last_body.is_empty() {
+        panic!("node_agent metrics endpoint did not become ready at {url}");
+    }
+    panic!("node_agent /metrics missing node-agent counters:\n{last_body}");
 }

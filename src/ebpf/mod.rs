@@ -123,6 +123,12 @@ impl CaptureContract {
         if hbone_redirect_port == 0 {
             return Err("CaptureContract hbone_redirect_port must be non-zero".to_string());
         }
+        if outbound_capture_port == hbone_redirect_port {
+            return Err(
+                "CaptureContract outbound_capture_port and hbone_redirect_port must differ"
+                    .to_string(),
+            );
+        }
         let unix_socket_path = unix_socket_path.into();
         if unix_socket_path.trim().is_empty() {
             return Err("CaptureContract unix_socket_path must not be empty".to_string());
@@ -263,6 +269,7 @@ pub struct MockEbpfBackend {
     pub capture_config: Option<BpfCaptureConfig>,
     pub detached_pods: Vec<String>,
     pub cleaned_up: bool,
+    pub fail_update_capture_config: bool,
 }
 
 impl EbpfBackend for MockEbpfBackend {
@@ -272,6 +279,9 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn update_capture_config(&mut self, config: &BpfCaptureConfig) -> Result<(), String> {
+        if self.fail_update_capture_config {
+            return Err("capture config update failed".to_string());
+        }
         self.capture_config = Some(*config);
         Ok(())
     }
@@ -402,6 +412,15 @@ mod tests {
         assert!(
             CaptureContract::new(NodeAgentProxyMode::LocalPod, 15001, 0, "/tmp/ferrum.sock")
                 .is_err()
+        );
+        assert!(
+            CaptureContract::new(
+                NodeAgentProxyMode::LocalPod,
+                15001,
+                15001,
+                "/tmp/ferrum.sock"
+            )
+            .is_err()
         );
         assert!(CaptureContract::new(NodeAgentProxyMode::LocalPod, 15001, 15008, "").is_err());
     }

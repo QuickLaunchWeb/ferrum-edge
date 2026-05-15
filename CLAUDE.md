@@ -80,6 +80,7 @@ PRs: format → tests (parallel) → lint → perf regression → build 5 target
 - `dp` (Data Plane) — R/O admin + proxy; gRPC from CP (multi-CP failover via `FERRUM_DP_CP_GRPC_URLS`)
 - `mesh` — R/O admin + proxy; service-mesh data plane consuming xDS or native MeshSubscribe
 - `injector` — Kubernetes admission webhook; emits JSON patches that add Ferrum mesh sidecars/init capture
+- `node_agent` — per-node eBPF capture manager for ambient mesh; no proxy listeners
 - `migrate` — runs DB migrations, exits
 
 **TLS-only listeners**: port `0` on `FERRUM_PROXY_HTTP_PORT`/`FERRUM_ADMIN_HTTP_PORT`/inside `FERRUM_CP_GRPC_LISTEN_ADDR` disables plaintext. Excluded from `reserved_gateway_ports()`. Gateway warns if plaintext disabled and no TLS configured.
@@ -548,7 +549,7 @@ Imperative mood, concise (e.g., `Fix rate limiter to handle zero-window edge cas
 **Canonical reference**: [docs/configuration.md](docs/configuration.md). **Runtime parsing**: `src/config/env_config.rs`. **Editable template**: `ferrum.conf`. Only the load-bearing ones are listed here — for the full list (90+ vars), use the docs.
 
 **Required by mode:**
-- `FERRUM_MODE` (`database`/`file`/`cp`/`dp`/`mesh`/`injector`/`migrate`)
+- `FERRUM_MODE` (`database`/`file`/`cp`/`dp`/`mesh`/`injector`/`node_agent`/`migrate`)
 - `FERRUM_NAMESPACE` (`ferrum`) — which namespace this instance loads
 - `FERRUM_FILE_CONFIG_PATH` (required `file`)
 - `FERRUM_DB_TYPE` + `FERRUM_DB_URL` (required `database`/`cp`)
