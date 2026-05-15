@@ -563,6 +563,8 @@ struct BufferedTraceExporter {
     hostname: String,
     sender: mpsc::Sender<SpanData>,
     started: AtomicBool,
+    // Cold-path only: try_export() reaches this only before the deferred
+    // exporter task starts, then the AtomicBool gates all steady-state calls.
     deferred_start: Mutex<Option<(mpsc::Receiver<SpanData>, TraceHttpExporterConfig)>>,
 }
 

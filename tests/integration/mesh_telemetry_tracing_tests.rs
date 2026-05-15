@@ -133,6 +133,15 @@ fn workload_metrics_plugin_config(tracing: MeshTracingConfig) -> Value {
     plugin_config.config
 }
 
+fn otlp_resource_string_attr<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
+    payload["resourceSpans"][0]["resource"]["attributes"]
+        .as_array()?
+        .iter()
+        .find(|attr| attr.get("key").and_then(Value::as_str) == Some(key))
+        .and_then(|attr| attr.get("value"))
+        .and_then(|value| value.get("stringValue")?.as_str())
+}
+
 #[tokio::test]
 async fn telemetry_provider_from_mesh_slice_emits_otlp_span() {
     let collector = wiremock::MockServer::start().await;
@@ -162,8 +171,8 @@ async fn telemetry_provider_from_mesh_slice_emits_otlp_span() {
 
     let payload = received_json(&collector).await;
     assert_eq!(
-        payload["resourceSpans"][0]["resource"]["attributes"][0]["value"]["stringValue"],
-        "reviews"
+        otlp_resource_string_attr(&payload, "service.name"),
+        Some("reviews")
     );
     assert_eq!(
         payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],

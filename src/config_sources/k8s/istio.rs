@@ -2396,6 +2396,8 @@ fn telemetry_tracing_mode(
     };
     match mode {
         "SERVER" | "server" => Ok(Some(TelemetryTracingMode::Server)),
+        // Ferrum emits server-side spans today; keep CLIENT_AND_SERVER entries
+        // by collapsing them to Server until client-side span emission exists.
         "CLIENT_AND_SERVER" | "client_and_server" => Ok(Some(TelemetryTracingMode::Server)),
         "CLIENT" | "client" => Ok(Some(TelemetryTracingMode::Client)),
         other => Err(invalid_resource(

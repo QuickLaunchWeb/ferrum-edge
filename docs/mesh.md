@@ -672,6 +672,7 @@ Each section (tracing, metrics, access logging) is merged independently. Within 
 - `sampling_percentage`: 0.0--100.0 (deterministic hash-based sampling).
 - `custom_tags`: literal key-value tags injected into every span.
 - `custom_header_tags`: tags resolved from request headers at runtime.
+- Istio `customTags.environment` resolves environment variable values during translation and emits them as span tags. Treat write access to Telemetry resources as privileged: referencing secret-bearing env vars can expose those values through tracing sinks.
 - `providers`: inline span exporters for Zipkin v2, Datadog Agent `/v0.3/traces`, Lightstep OTLP, and OpenTelemetry OTLP/HTTP JSON. Multiple providers receive the same sampled span.
 - `disable_span_reporting` / Istio `disableSpanReporting`: when explicitly true, suppresses span export while leaving the rest of the merged tracing config visible. Omitted values inherit from less-specific scopes; explicit false can re-enable a more-specific scope.
 

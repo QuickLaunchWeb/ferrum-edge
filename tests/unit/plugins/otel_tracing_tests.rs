@@ -543,8 +543,8 @@ async fn test_workload_metrics_opentelemetry_exporter_payload() {
 
     let payload = received_json(&mock_server).await;
     assert_eq!(
-        payload["resourceSpans"][0]["resource"]["attributes"][0]["value"]["stringValue"],
-        "reviews"
+        otlp_resource_string_attr(&payload, "service.name"),
+        Some("reviews")
     );
     assert_eq!(
         payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],

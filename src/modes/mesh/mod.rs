@@ -1892,6 +1892,8 @@ fn inject_mesh_global_plugins(
             workload_metrics_config["span_reporting_disabled"] = serde_json::json!(true);
         }
         if !tracing.providers.is_empty() {
+            // Keep provider config visible for introspection and propagation even
+            // when span_reporting_disabled makes WorkloadMetrics skip exporters.
             workload_metrics_config["tracing_providers"] = serde_json::json!(tracing.providers);
         }
     }
