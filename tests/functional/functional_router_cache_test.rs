@@ -114,6 +114,29 @@ async fn wait_for_gateway(admin_port: u16) -> bool {
     false
 }
 
+/// Wait until a proxy route itself is serving traffic.
+///
+/// Admin `/health` can become reachable before a loaded runner has fully
+/// settled the proxy listener and route cache. The cache-pressure tests send
+/// large bursts immediately after startup, so gate them on the actual hot path
+/// instead of only the admin listener.
+async fn wait_for_proxy_path(proxy_port: u16, path: &str) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{}{}", proxy_port, path);
+    for _ in 0..120 {
+        if let Ok(resp) = client.get(&url).send().await
+            && resp.status().is_success()
+        {
+            return true;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    false
+}
+
 /// Start the gateway with retry logic for port allocation races.
 /// Each attempt allocates fresh ports.
 async fn start_gateway_with_retry(
@@ -211,6 +234,10 @@ async fn test_router_cache_500_proxies_normal_routing() {
 
     let (mut gw, proxy_port, _admin_port) =
         start_gateway_with_retry(config_path.to_str().unwrap(), 1000).await;
+    assert!(
+        wait_for_proxy_path(proxy_port, "/p000/smoke").await,
+        "proxy route /p000 did not become ready"
+    );
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -289,6 +316,10 @@ async fn test_router_cache_scanner_traffic_preserves_valid_routes() {
 
     let (mut gw, proxy_port, _admin_port) =
         start_gateway_with_retry(config_path.to_str().unwrap(), 1000).await;
+    assert!(
+        wait_for_proxy_path(proxy_port, "/p000/foo").await,
+        "proxy route /p000 did not become ready"
+    );
 
     let client = Arc::new(
         reqwest::Client::builder()
@@ -444,6 +475,10 @@ async fn test_router_cache_hot_entry_survives_scanner_burst() {
 
     let (mut gw, proxy_port, _admin_port) =
         start_gateway_with_retry(config_path.to_str().unwrap(), 1000).await;
+    assert!(
+        wait_for_proxy_path(proxy_port, "/p000/hot").await,
+        "proxy route /p000 did not become ready"
+    );
 
     let client = Arc::new(
         reqwest::Client::builder()
@@ -580,6 +615,10 @@ async fn test_router_cache_negative_cache_no_degradation() {
 
     let (mut gw, proxy_port, _admin_port) =
         start_gateway_with_retry(config_path.to_str().unwrap(), 1000).await;
+    assert!(
+        wait_for_proxy_path(proxy_port, "/p000/checkpoint").await,
+        "proxy route /p000 did not become ready"
+    );
 
     let client = Arc::new(
         reqwest::Client::builder()
