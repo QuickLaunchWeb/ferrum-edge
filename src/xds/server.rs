@@ -579,6 +579,89 @@ impl XdsAdsServer {
         }
     }
 
+    fn delta_response_for_stream_request(
+        &self,
+        node_id: &str,
+        stream_config: &XdsStreamConfig,
+        subscriptions: &mut HashMap<String, XdsSubscription>,
+        request: &DeltaDiscoveryRequest,
+        previous: Option<&XdsSnapshot>,
+    ) -> Option<(Arc<XdsSnapshot>, DeltaDiscoveryResponse)> {
+        self.delta_response_for_request_with_fingerprint(
+            node_id,
+            &stream_config.config,
+            &stream_config.fingerprint,
+            subscriptions,
+            request,
+            previous,
+        )
+    }
+
+    fn delta_response_for_request_with_fingerprint(
+        &self,
+        node_id: &str,
+        config: &GatewayConfig,
+        fingerprint: &XdsConfigFingerprint,
+        subscriptions: &mut HashMap<String, XdsSubscription>,
+        request: &DeltaDiscoveryRequest,
+        previous: Option<&XdsSnapshot>,
+    ) -> Option<(Arc<XdsSnapshot>, DeltaDiscoveryResponse)> {
+        if !request.response_nonce.is_empty() {
+            match self.record_delta_ack(node_id, request) {
+                AckOutcome::Acked | AckOutcome::VersionDrift { .. } => debug!(
+                    node_id = %node_id,
+                    type_url = %request.type_url,
+                    "xDS delta ACK accepted"
+                ),
+                AckOutcome::Nacked { message } => {
+                    warn!(
+                        node_id = %node_id,
+                        type_url = %request.type_url,
+                        error = %message,
+                        "xDS delta NACK received"
+                    );
+                }
+                outcome => {
+                    warn!(
+                        node_id = %node_id,
+                        type_url = %request.type_url,
+                        outcome = ?outcome,
+                        "xDS delta ACK ignored"
+                    );
+                }
+            }
+        }
+
+        let previous_subscription = subscriptions.get(&request.type_url);
+        let (subscription, resource_names_changed, explicit_subscription_request) =
+            build_delta_subscription(
+                previous_subscription,
+                node_id,
+                &request.type_url,
+                &request.resource_names_subscribe,
+                &request.resource_names_unsubscribe,
+            );
+        subscriptions.insert(request.type_url.clone(), subscription.clone());
+        if should_send_delta_response(
+            request,
+            resource_names_changed,
+            explicit_subscription_request,
+        ) {
+            let snapshot = self.snapshot_for_config_with_fingerprint(node_id, config, fingerprint);
+            let response = self.delta_response(
+                &snapshot,
+                previous,
+                &subscription,
+                &request.initial_resource_versions,
+                &request.resource_names_subscribe,
+                &request.resource_names_unsubscribe,
+            );
+            Some((snapshot, response))
+        } else {
+            None
+        }
+    }
+
     fn delta_responses_for_subscriptions(
         &self,
         node_id: &str,
@@ -972,58 +1055,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             server.catch_up_pending_updates(&mut updates, &mut stream_config);
                         }
 
-                        if !request.response_nonce.is_empty() {
-                            match server.record_delta_ack(&current_node_id, &request) {
-                                AckOutcome::Acked | AckOutcome::VersionDrift { .. } => debug!(
-                                    node_id = %current_node_id,
-                                    type_url = %request.type_url,
-                                    "xDS delta ACK accepted"
-                                ),
-                                AckOutcome::Nacked { message } => {
-                                    warn!(
-                                        node_id = %current_node_id,
-                                        type_url = %request.type_url,
-                                        error = %message,
-                                        "xDS delta NACK received"
-                                    );
-                                }
-                                outcome => {
-                                    warn!(
-                                        node_id = %current_node_id,
-                                        type_url = %request.type_url,
-                                        outcome = ?outcome,
-                                        "xDS delta ACK ignored"
-                                    );
-                                }
-                            }
-                        }
-
-                        let previous_subscription = subscriptions.get(&request.type_url);
-                        let (subscription, resource_names_changed, explicit_subscription_request) =
-                            build_delta_subscription(
-                                previous_subscription,
-                                &current_node_id,
-                                &request.type_url,
-                                &request.resource_names_subscribe,
-                                &request.resource_names_unsubscribe,
-                            );
-                        subscriptions.insert(request.type_url.clone(), subscription.clone());
-                        if should_send_delta_response(
+                        let previous = last_snapshot.clone();
+                        if let Some((snapshot, response)) = server.delta_response_for_stream_request(
+                            &current_node_id,
+                            &stream_config,
+                            &mut subscriptions,
                             &request,
-                            resource_names_changed,
-                            explicit_subscription_request,
+                            previous.as_deref(),
                         ) {
-                            let previous = last_snapshot.clone();
-                            let snapshot =
-                                server.snapshot_for_stream_config(&current_node_id, &stream_config);
-                            let response = server.delta_response(
-                                &snapshot,
-                                previous.as_deref(),
-                                &subscription,
-                                &request.initial_resource_versions,
-                                &request.resource_names_subscribe,
-                                &request.resource_names_unsubscribe,
-                            );
                             last_snapshot = Some(snapshot);
                             if tx.send(Ok(response)).await.is_err() {
                                 return;
@@ -1762,47 +1801,44 @@ mod tests {
             .sotw_response_for_request("node-a", &config, &mut subscriptions, &request)
             .expect("explicit RDS request should receive a response");
 
-        assert_eq!(route_names(&response), vec![requested.clone()]);
         let subscription = subscriptions
             .get(super::super::translator::RDS_TYPE_URL)
             .expect("RDS subscription should be tracked");
         assert!(!subscription.wildcard);
         assert_eq!(subscription.resource_names, vec![requested]);
+        assert_eq!(route_names(&response), subscription.resource_names);
     }
 
     #[test]
     fn delta_explicit_rds_subscription_returns_only_requested_route() {
         let config = gateway_config_with_services(&["api", "admin"], 0);
-        let server = test_server(config);
+        let server = test_server(config.clone());
+        let stream_config = XdsStreamConfig::new(config);
+        let mut subscriptions = HashMap::new();
         let requested = "route/default/api".to_string();
         let request = DeltaDiscoveryRequest {
             type_url: super::super::translator::RDS_TYPE_URL.to_string(),
             resource_names_subscribe: vec![requested.clone()],
             ..DeltaDiscoveryRequest::default()
         };
-        let (subscription, changed, explicit) = build_delta_subscription(
-            None,
-            "node-a",
-            &request.type_url,
-            &request.resource_names_subscribe,
-            &request.resource_names_unsubscribe,
-        );
-        assert!(changed);
-        assert!(explicit);
-        assert!(!subscription.wildcard);
 
-        let snapshot = server.rebuild_snapshot("node-a");
-        let response = server.delta_response(
-            &snapshot,
-            None,
-            &subscription,
-            &request.initial_resource_versions,
-            &request.resource_names_subscribe,
-            &request.resource_names_unsubscribe,
-        );
+        let (_, response) = server
+            .delta_response_for_stream_request(
+                "node-a",
+                &stream_config,
+                &mut subscriptions,
+                &request,
+                None,
+            )
+            .expect("explicit RDS delta request should receive a response");
 
         assert_eq!(delta_route_names(&response), vec![requested]);
         assert!(response.removed_resources.is_empty());
+        let subscription = subscriptions
+            .get(super::super::translator::RDS_TYPE_URL)
+            .expect("RDS subscription should be tracked");
+        assert!(!subscription.wildcard);
+        assert_eq!(subscription.resource_names, delta_route_names(&response));
     }
 
     #[test]
