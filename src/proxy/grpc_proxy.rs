@@ -1782,6 +1782,7 @@ mod tests {
         let mut p1 = grpc_pool_test_proxy();
         p1.resolved_tls.sni = Some("reviews.mesh.internal".to_string());
         p1.resolved_tls.san_allow_list = vec!["reviews.mesh.internal".to_string()];
+        p1.resolved_tls.recompute_san_digest();
         let mut p2 = p1.clone();
         p2.resolved_tls.sni = Some("ratings.mesh.internal".to_string());
 
@@ -1793,6 +1794,7 @@ mod tests {
 
         p2.resolved_tls.sni = p1.resolved_tls.sni.clone();
         p2.resolved_tls.san_allow_list = vec!["ratings.mesh.internal".to_string()];
+        p2.resolved_tls.recompute_san_digest();
         assert_ne!(
             grpc_pool_key_owned(&p1),
             grpc_pool_key_owned(&p2),
