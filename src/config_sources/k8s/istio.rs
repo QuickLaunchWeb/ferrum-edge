@@ -22,7 +22,8 @@ use super::{
     mesh_route_dispatch_has_unsupported_predicate, mesh_route_dispatch_plugin_from_rules,
     mesh_route_dispatch_rules_for_proxy, optional_port_field, parse_istio_duration_ms,
     port_from_u64, proxy_for_route, request_termination_plugin_for_proxy, resource_id,
-    selector_from_istio, string_array, string_field, string_map, upstream_for_route,
+    selector_from_istio, service_key_from_host, string_array, string_field, string_map,
+    upstream_for_route,
 };
 use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT, PluginConfig, Proxy, RetryConfig};
 
@@ -1161,6 +1162,19 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned);
 
+    let service_raw = object
+        .spec
+        .get("service")
+        .and_then(Value::as_str)
+        .unwrap_or(&object.metadata.name);
+    let service_name = service_key_from_host(
+        service_raw,
+        &object.metadata.namespace,
+        &acc.options.cluster_domain,
+    )
+    .map(|key| key.name)
+    .unwrap_or_else(|| service_raw.to_string());
+
     Ok(Workload {
         spiffe_id: spiffe_id.clone(),
         selector: WorkloadSelector {
@@ -1171,12 +1185,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
                 .unwrap_or_default(),
             namespace: Some(object.metadata.namespace.clone()),
         },
-        service_name: object
-            .spec
-            .get("service")
-            .and_then(Value::as_str)
-            .unwrap_or(&object.metadata.name)
-            .to_string(),
+        service_name,
         addresses: string_field(&object.spec, "address")
             .map(|address| vec![address.to_string()])
             .unwrap_or_default(),

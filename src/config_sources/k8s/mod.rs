@@ -508,7 +508,11 @@ pub(crate) fn collect_service(
 
 fn collect_explicit_workload_service(acc: &mut K8sAccumulator, object: &K8sObject) {
     let service = string_field(&object.spec, "service").unwrap_or(&object.metadata.name);
-    if let Some(key) = K8sServiceKey::new(object.metadata.namespace.clone(), service.to_string()) {
+    if let Some(key) = service_key_from_host(
+        service,
+        &object.metadata.namespace,
+        &acc.options.cluster_domain,
+    ) {
         acc.record_explicit_workload_service(key);
     }
 }

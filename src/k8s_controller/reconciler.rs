@@ -505,6 +505,7 @@ fn stable_config_value(config: &GatewayConfig) -> Value {
     sort_top_level_collection(&mut value, "upstreams", "id");
     sort_string_array(&mut value, "known_namespaces");
     sort_mesh_collection(&mut value, "workloads", "spiffe_id");
+    sort_mesh_service_workloads(&mut value);
     value
 }
 
@@ -566,6 +567,36 @@ fn sort_mesh_collection(value: &mut Value, field: &str, key: &str) {
     });
 }
 
+fn sort_mesh_service_workloads(value: &mut Value) {
+    let Some(services) = value
+        .get_mut("mesh")
+        .and_then(Value::as_object_mut)
+        .and_then(|mesh| mesh.get_mut("services"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+
+    for service in services {
+        let Some(workloads) = service.get_mut("workloads").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        workloads.sort_by(|left, right| {
+            let left_key = left
+                .get("spiffe_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let right_key = right
+                .get("spiffe_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            left_key
+                .cmp(right_key)
+                .then_with(|| canonical_json_sort_key(left).cmp(&canonical_json_sort_key(right)))
+        });
+    }
+}
+
 fn canonical_json_sort_key(value: &Value) -> String {
     match value {
         Value::Object(map) => {
@@ -604,11 +635,14 @@ mod tests {
     use crate::config::types::{PluginConfig, PluginScope, Proxy, Upstream};
     use crate::identity::spiffe::SpiffeId;
     use crate::k8s_controller::resource_store::CrdResourceStore;
-    use crate::modes::mesh::config::{MeshConfig, Workload, WorkloadSelector};
+    use crate::modes::mesh::config::{
+        MeshConfig, MeshService, Workload, WorkloadRef, WorkloadSelector,
+    };
     use chrono::{Duration as ChronoDuration, Utc};
     use kube::api::ApiResource;
     use kube::runtime::reflector;
     use serde_json::json;
+    use std::collections::HashMap;
 
     fn plugin_config(id: &str, config: Value) -> PluginConfig {
         PluginConfig {
@@ -671,6 +705,25 @@ mod tests {
             weight: None,
             locality: None,
             service_account: Some(service_account.to_string()),
+        }
+    }
+
+    fn mesh_workload_ref(service_account: &str) -> WorkloadRef {
+        WorkloadRef {
+            spiffe_id: SpiffeId::new(format!(
+                "spiffe://cluster.local/ns/default/sa/{service_account}"
+            ))
+            .expect("test SPIFFE ID"),
+        }
+    }
+
+    fn mesh_service_with_workloads(workloads: Vec<WorkloadRef>) -> MeshService {
+        MeshService {
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ports: Vec::new(),
+            workloads,
+            protocol_overrides: HashMap::new(),
         }
     }
 
@@ -755,6 +808,31 @@ mod tests {
             .expect("mesh config")
             .workloads
             .reverse();
+
+        assert!(!gateway_config_content_changed(&new_config, &old_config));
+    }
+
+    #[test]
+    fn content_change_ignores_mesh_service_workload_ref_order() {
+        let workload_a = mesh_workload_ref("a");
+        let workload_b = mesh_workload_ref("b");
+        let old_config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![mesh_service_with_workloads(vec![
+                    workload_b.clone(),
+                    workload_a.clone(),
+                ])],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let new_config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![mesh_service_with_workloads(vec![workload_a, workload_b])],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
 
         assert!(!gateway_config_content_changed(&new_config, &old_config));
     }
