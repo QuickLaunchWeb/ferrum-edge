@@ -3721,9 +3721,11 @@ fn test_env_config_node_agent_contract_defaults() {
         ],
         || {
             remove_var("FERRUM_NODE_AGENT_PROXY_MODE");
+            remove_var("FERRUM_NODE_AGENT_ADMIN_ENABLED");
             remove_var("FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT");
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.node_agent_proxy_mode, NodeAgentProxyMode::LocalPod);
+            assert!(!config.node_agent_admin_enabled);
             assert_eq!(
                 config.node_agent_hbone_redirect_port,
                 ferrum_ebpf_common::INBOUND_HBONE_PORT
@@ -3739,6 +3741,7 @@ fn test_env_config_node_agent_contract_custom_values() {
             ("FERRUM_MODE", "node_agent"),
             ("FERRUM_NODE_AGENT_NODE_NAME", "node-a"),
             ("FERRUM_NODE_AGENT_PROXY_MODE", "node_waypoint"),
+            ("FERRUM_NODE_AGENT_ADMIN_ENABLED", "true"),
             ("FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT", "16008"),
         ],
         || {
@@ -3747,6 +3750,7 @@ fn test_env_config_node_agent_contract_custom_values() {
                 config.node_agent_proxy_mode,
                 NodeAgentProxyMode::NodeWaypoint
             );
+            assert!(config.node_agent_admin_enabled);
             assert_eq!(config.node_agent_hbone_redirect_port, 16008);
         },
     );

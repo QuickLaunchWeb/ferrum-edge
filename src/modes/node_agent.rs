@@ -160,6 +160,9 @@ async fn start_node_agent_admin_listeners(
     startup_ready: Arc<AtomicBool>,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>, anyhow::Error> {
     let mut handles = Vec::new();
+    if !env_config.node_agent_admin_enabled {
+        return Ok(handles);
+    }
     if env_config.admin_http_port == 0 {
         return Ok(handles);
     }
@@ -1366,6 +1369,7 @@ mod tests {
     #[tokio::test]
     async fn admin_listener_http_port_zero_spawns_no_tasks() {
         let env_config = EnvConfig {
+            node_agent_admin_enabled: true,
             admin_http_port: 0,
             ..EnvConfig::default()
         };
@@ -1380,8 +1384,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_listener_default_disabled_spawns_no_tasks() {
+        let env_config = EnvConfig::default();
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let startup_ready = Arc::new(AtomicBool::new(false));
+
+        let handles = start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready)
+            .await
+            .expect("disabled admin listener should be accepted");
+
+        assert!(handles.is_empty());
+    }
+
+    #[tokio::test]
     async fn admin_listener_invalid_allowed_cidrs_returns_error() {
         let env_config = EnvConfig {
+            node_agent_admin_enabled: true,
             admin_http_port: 18081,
             admin_allowed_cidrs: "not-a-cidr".to_string(),
             ..EnvConfig::default()

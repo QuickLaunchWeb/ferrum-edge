@@ -69,6 +69,7 @@ async fn node_agent_boots_with_contract_env_and_exposes_metrics() {
         .env("FERRUM_MODE", "node_agent")
         .env("FERRUM_NODE_AGENT_NODE_NAME", "functional-node")
         .env("FERRUM_NODE_AGENT_PROXY_MODE", "node_waypoint")
+        .env("FERRUM_NODE_AGENT_ADMIN_ENABLED", "true")
         .env("FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT", "16008")
         .env("FERRUM_NODE_AGENT_CGROUP_ROOT", &cgroup_root)
         .env("FERRUM_NODE_AGENT_BPF_FS_PATH", &bpf_root)
