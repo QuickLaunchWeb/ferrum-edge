@@ -1,5 +1,8 @@
 //! Functional smoke coverage for node_agent metrics.
 
+use std::env;
+use std::fs;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -15,6 +18,40 @@ fn terminate(mut child: Child) {
     let _ = child.wait();
 }
 
+fn prepend_noop_shell(command: &mut Command, temp_dir: &Path) {
+    let bin_dir = temp_dir.join("bin");
+    fs::create_dir_all(&bin_dir).expect("create fake shell bin dir");
+
+    let shell_path = bin_dir.join(if cfg!(windows) { "sh.cmd" } else { "sh" });
+    fs::write(
+        &shell_path,
+        if cfg!(windows) {
+            "@echo off\r\nexit /b 0\r\n"
+        } else {
+            "#!/bin/sh\nexit 0\n"
+        },
+    )
+    .expect("write fake sh");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(&shell_path)
+            .expect("stat fake sh")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&shell_path, permissions).expect("chmod fake sh");
+    }
+
+    let mut paths = vec![bin_dir];
+    if let Some(existing_path) = env::var_os("PATH") {
+        paths.extend(env::split_paths(&existing_path));
+    }
+    let path = env::join_paths(paths).expect("join PATH for fake sh");
+    command.env("PATH", path);
+}
+
 #[ignore]
 #[tokio::test]
 async fn node_agent_boots_with_contract_env_and_exposes_metrics() {
@@ -26,7 +63,9 @@ async fn node_agent_boots_with_contract_env_and_exposes_metrics() {
         .await
         .expect("reserve admin port")
         .drop_and_take_port();
-    let mut child = Command::new(gateway_binary_path())
+    let mut command = Command::new(gateway_binary_path());
+    prepend_noop_shell(&mut command, tmp.path());
+    let mut child = command
         .env("FERRUM_MODE", "node_agent")
         .env("FERRUM_NODE_AGENT_NODE_NAME", "functional-node")
         .env("FERRUM_NODE_AGENT_PROXY_MODE", "node_waypoint")

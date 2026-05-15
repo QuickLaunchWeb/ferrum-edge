@@ -127,6 +127,7 @@ jobs:
               scenarios::
               functional_shared_harness_smoke_test
               functional_cli_test
+              functional_node_agent_test
               functional_ci_shard_coverage_test
           - shard: admin-routing
             filters: |
