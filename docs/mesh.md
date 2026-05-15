@@ -973,7 +973,9 @@ spec:
 
 ## xDS ADS Compatibility
 
-Ferrum's ADS server honors explicit SotW and delta resource subscriptions per type URL. A client that subscribes to one named RDS/CDS/LDS/EDS/SDS resource receives only that resource, while wildcard subscriptions (`*` or an initial empty SotW/delta request) continue to receive the full collection for the requested type URL. Subsequent empty SotW requests preserve the established wildcard or explicit state, and delta subscribe/unsubscribe updates mutate that per-stream subscription state additively by appending subscribed names and removing unsubscribed names without broadcasting unrelated resources.
+Ferrum's ADS server honors explicit SotW (State-of-the-World) resource subscriptions per type URL across CDS/EDS/LDS/RDS/SDS. A SotW request with a non-empty `resource_names` returns only the named resources for that type URL, while a wildcard subscription (`*` or an initial empty `resource_names`) returns the full collection per the Envoy ADS protocol. Subsequent empty SotW requests on the same stream preserve the established wildcard or explicit state rather than re-broadcasting it as a fresh subscription.
+
+Delta-xDS subscriptions across the same CDS/EDS/LDS/RDS/SDS type URLs are additive: `resource_names_subscribe` appends to the per-stream subscription set and `resource_names_unsubscribe` removes from it, with empty lists treated as no-ops. Subscriptions persist across requests on the same stream, and updates only mutate the explicit subscription state without broadcasting unrelated resources.
 
 Delta xDS wire-byte optimization and ECDS `TypedExtensionConfig` resources remain staged follow-ups in the GAP-2L track; the current support is the explicit-resource subscription state machine.
 
