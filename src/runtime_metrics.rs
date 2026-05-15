@@ -404,14 +404,22 @@ impl RuntimeMetrics {
             return;
         }
 
+        // Determine new-vs-existing atomically via the Entry API. A prior
+        // `contains_key` + `entry` split would race two concurrent inserts of
+        // the same (class, proxy_id) into both bumping `error_entry_count`
+        // even though only one of them actually creates an entry — drifting
+        // the count above the real cardinality and clamping the cap early.
         let class_map = map.entry(class).or_default();
-        let is_new = !class_map.contains_key(proxy_id);
-        class_map
-            .entry(Arc::<str>::from(proxy_id))
-            .or_insert_with(|| CachePadded::new(AtomicU64::new(0)))
-            .fetch_add(1, Ordering::Relaxed);
-        if is_new {
-            self.error_entry_count.fetch_add(1, Ordering::Relaxed);
+        match class_map.entry(Arc::<str>::from(proxy_id)) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                occupied.get().fetch_add(1, Ordering::Relaxed);
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant
+                    .insert(CachePadded::new(AtomicU64::new(0)))
+                    .fetch_add(1, Ordering::Relaxed);
+                self.error_entry_count.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -947,6 +955,21 @@ mod tests {
                 .copied(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn error_entry_count_bumps_once_per_unique_pair() {
+        let metrics = RuntimeMetrics::new();
+
+        metrics.record_http_error(Some("proxy-a"), ErrorClass::ConnectionTimeout);
+        metrics.record_http_error(Some("proxy-a"), ErrorClass::ConnectionTimeout);
+        metrics.record_http_error(Some("proxy-a"), ErrorClass::ConnectionTimeout);
+        // Second class for the same proxy adds one entry.
+        metrics.record_http_error(Some("proxy-a"), ErrorClass::TlsError);
+        // Same class on a different proxy adds one entry.
+        metrics.record_http_error(Some("proxy-b"), ErrorClass::ConnectionTimeout);
+
+        assert_eq!(metrics.error_entry_count.load(Ordering::Relaxed), 3);
     }
 
     #[test]
