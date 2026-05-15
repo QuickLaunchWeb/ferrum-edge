@@ -531,6 +531,125 @@ pub(crate) fn resolve_hash_key(
     }
 }
 
+/// Select the next retry target with per-port DestinationRule awareness.
+///
+/// Six retry sites (HTTP/H2, gRPC, and WebSocket in `src/proxy/mod.rs` plus
+/// the three H3 paths in `src/http3/{cross_protocol,server,websocket}.rs`)
+/// previously open-coded the same five-step sequence:
+///
+/// 1. Compute the per-port override port that covers `prev_target` (if any).
+/// 2. If the failed target sits in an override lane whose `hash_on` differs
+///    from the upstream-level strategy, recompute the retry hash key against
+///    the per-port `hash_on` so consistent-hash buckets stay consistent on
+///    the retry attempt; otherwise reuse the steady-state `base_hash_key`.
+/// 3. Build a `HealthContext` whose `max_ejection_percent` honours the
+///    per-port `passive_health_check` override when one is configured.
+/// 4. Dispatch to the appropriate `select_next_target_*_from` variant —
+///    subset-vs-no-subset crossed with port-vs-no-port (four variants).
+/// 5. Hand the next `Arc<UpstreamTarget>` back to the caller, which still
+///    owns its own URL building, circuit-breaker key updates, and per-protocol
+///    plumbing.
+///
+/// Drift between the open-coded copies of step 2 is what produced the H3
+/// retry hash-key bug fixed in commit `a8d62bd1`. Centralising the sequence
+/// here keeps future per-port LB additions from re-introducing that drift.
+///
+/// # Performance
+///
+/// Hot-path safe: `epoch.load_balancer` is an already-cloned `Arc` snapshot,
+/// `HealthContext` is borrowed, and the only allocation is the optional
+/// `String` produced by `resolve_hash_key()` when the override-lane branch
+/// fires. Steady-state retries (no port override OR matching `hash_on`)
+/// reuse the borrowed `base_hash_key` with zero allocations.
+pub(crate) fn select_next_retry_target(
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    proxy: &Proxy,
+    prev_target: &UpstreamTarget,
+    base_hash_key: &str,
+    client_ip: &str,
+    proxy_headers: &HashMap<String, String>,
+) -> Option<Arc<UpstreamTarget>> {
+    let upstream_id = proxy.upstream_id.as_deref()?;
+
+    let retry_override_port = crate::proxy::retry_port_override_dispatch_port(proxy, prev_target);
+
+    // Recompute the retry hash key when the per-port `hash_on` strategy
+    // differs from the upstream-level one. Steady-state retries reuse the
+    // borrowed `base_hash_key`, keeping zero-allocation behavior.
+    let rehashed;
+    let retry_key: &str = if let Some(port) = retry_override_port {
+        let strategy = LoadBalancerCache::get_hash_on_strategy_for_port_from(
+            &epoch.load_balancer,
+            upstream_id,
+            port,
+        );
+        rehashed = resolve_hash_key(&strategy, client_ip, proxy_headers).0;
+        &rehashed
+    } else {
+        base_hash_key
+    };
+
+    let health_ctx = HealthContext {
+        active_unhealthy: &state.health_checker.active_unhealthy_targets,
+        proxy_passive: state
+            .health_checker
+            .passive_health
+            .get(&proxy.id)
+            .map(|r| r.value().clone()),
+        max_ejection_percent: if let Some(port) = retry_override_port {
+            LoadBalancerCache::max_ejection_percent_for_port_from(
+                &epoch.load_balancer,
+                upstream_id,
+                proxy,
+                port,
+            )
+        } else {
+            LoadBalancerCache::max_ejection_percent_from(&epoch.load_balancer, upstream_id)
+        },
+    };
+
+    if let Some(subset_name) = proxy.upstream_subset.as_deref() {
+        if let Some(port) = retry_override_port {
+            LoadBalancerCache::select_next_target_for_port_subset_from(
+                &epoch.load_balancer,
+                upstream_id,
+                retry_key,
+                port,
+                subset_name,
+                prev_target,
+                Some(&health_ctx),
+            )
+        } else {
+            LoadBalancerCache::select_next_target_subset_from(
+                &epoch.load_balancer,
+                upstream_id,
+                retry_key,
+                subset_name,
+                prev_target,
+                Some(&health_ctx),
+            )
+        }
+    } else if let Some(port) = retry_override_port {
+        LoadBalancerCache::select_next_target_for_port_from(
+            &epoch.load_balancer,
+            upstream_id,
+            retry_key,
+            port,
+            prev_target,
+            Some(&health_ctx),
+        )
+    } else {
+        LoadBalancerCache::select_next_target_from(
+            &epoch.load_balancer,
+            upstream_id,
+            retry_key,
+            prev_target,
+            Some(&health_ctx),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
