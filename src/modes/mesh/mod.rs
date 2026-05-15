@@ -3982,6 +3982,76 @@ mod tests {
     }
 
     #[test]
+    fn destination_rule_per_port_outlier_detection_merges_partial_overrides() {
+        let mut config = GatewayConfig {
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        let mut first_port_policy = HashMap::new();
+        first_port_policy.insert(
+            8080,
+            MeshTrafficPolicy {
+                outlier_detection: Some(MeshOutlierDetection {
+                    consecutive_errors: Some(7),
+                    interval_seconds: Some(30),
+                    base_ejection_seconds: Some(60),
+                    max_ejection_percent: Some(40),
+                }),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        let mut second_port_policy = HashMap::new();
+        second_port_policy.insert(
+            8080,
+            MeshTrafficPolicy {
+                outlier_detection: Some(MeshOutlierDetection {
+                    consecutive_errors: Some(2),
+                    interval_seconds: None,
+                    base_ejection_seconds: None,
+                    max_ejection_percent: None,
+                }),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        let slice = MeshSlice {
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "a-base".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: None,
+                    port_level_settings: first_port_policy,
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "b-partial".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: None,
+                    port_level_settings: second_port_policy,
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &slice);
+
+        let passive = config.upstreams[0]
+            .port_overrides
+            .get(&8080)
+            .and_then(|override_config| override_config.passive_health_check.as_ref())
+            .expect("port passive health");
+        assert_eq!(passive.unhealthy_threshold, 2);
+        assert_eq!(passive.unhealthy_window_seconds, 30);
+        assert_eq!(passive.healthy_after_seconds, 60);
+        assert_eq!(passive.max_ejection_percent, Some(40));
+    }
+
+    #[test]
     fn telemetry_tracing_merge_preserves_inherited_sampling_for_tag_only_override() {
         let mesh_slice = MeshSlice {
             node_id: "node-a".to_string(),

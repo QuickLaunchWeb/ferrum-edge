@@ -1068,6 +1068,10 @@ impl LoadBalancer {
                         target_indices,
                         algorithm: effective_algorithm,
                         rr_counter: AtomicU64::new(0),
+                        // Keep WRR state indexed by the full upstream target
+                        // vector, even when only a subset serves this port,
+                        // so bitset, subset, and Vec fallback paths can share
+                        // the same target-index bookkeeping.
                         wrr_state: std::sync::Mutex::new(vec![0; targets.len()]),
                         wrr_needs_stale_check: AtomicBool::new(false),
                         hash_ring,
@@ -1789,11 +1793,15 @@ impl LoadBalancer {
                 };
                 Some(Arc::clone(&self.targets[target_idx]))
             }
-            LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr_bitset(healthy, wrr_state),
+            LoadBalancerAlgorithm::WeightedRoundRobin => {
+                self.select_wrr_bitset(healthy, rr_counter, wrr_state)
+            }
             LoadBalancerAlgorithm::LeastConnections => {
                 self.select_least_connections_bitset(healthy)
             }
-            LoadBalancerAlgorithm::LeastLatency => self.select_least_latency_bitset(healthy),
+            LoadBalancerAlgorithm::LeastLatency => {
+                self.select_least_latency_bitset(healthy, rr_counter)
+            }
             LoadBalancerAlgorithm::ConsistentHashing => {
                 self.select_consistent_hash_bitset_with_ring(ctx_key, healthy, hash_ring)
             }
@@ -1861,11 +1869,15 @@ impl LoadBalancer {
                 let hash = golden_ratio_hash(idx) as usize;
                 Some(Arc::clone(candidates[hash % candidates.len()].1))
             }
-            LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr_vec(candidates, wrr_state),
+            LoadBalancerAlgorithm::WeightedRoundRobin => {
+                self.select_wrr_vec(candidates, rr_counter, wrr_state)
+            }
             LoadBalancerAlgorithm::LeastConnections => {
                 self.select_least_connections_vec(candidates)
             }
-            LoadBalancerAlgorithm::LeastLatency => self.select_least_latency_vec(candidates),
+            LoadBalancerAlgorithm::LeastLatency => {
+                self.select_least_latency_vec(candidates, rr_counter)
+            }
             LoadBalancerAlgorithm::ConsistentHashing => {
                 self.select_consistent_hash_vec_with_ring(ctx_key, candidates, hash_ring)
             }
@@ -2268,6 +2280,7 @@ impl LoadBalancer {
     fn select_wrr_bitset(
         &self,
         healthy: &HealthBitset,
+        rr_counter: &AtomicU64,
         wrr_state: &std::sync::Mutex<Vec<i64>>,
     ) -> Option<Arc<UpstreamTarget>> {
         let total_weight: i64 = self
@@ -2279,7 +2292,7 @@ impl LoadBalancer {
             .sum();
 
         if total_weight == 0 {
-            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             let target_idx = healthy.nth_set_bit(idx);
             return Some(Arc::clone(&self.targets[target_idx]));
         }
@@ -2357,7 +2370,11 @@ impl LoadBalancer {
     /// See the module-level documentation on `select_least_latency_vec` for
     /// the warm-up / late-joiner / steady-state semantics — this is the
     /// zero-allocation equivalent using a `HealthBitset`.
-    fn select_least_latency_bitset(&self, healthy: &HealthBitset) -> Option<Arc<UpstreamTarget>> {
+    fn select_least_latency_bitset(
+        &self,
+        healthy: &HealthBitset,
+        rr_counter: &AtomicU64,
+    ) -> Option<Arc<UpstreamTarget>> {
         let hcount = healthy.count();
         if hcount == 0 {
             return None;
@@ -2386,7 +2403,7 @@ impl LoadBalancer {
 
         // Initial warm-up: round-robin so all targets get baseline measurements.
         if warmed_count == 0 || !any_has_data {
-            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             let target_idx = healthy.nth_set_bit(idx);
             return Some(Arc::clone(&self.targets[target_idx]));
         }
@@ -2445,7 +2462,7 @@ impl LoadBalancer {
         }
 
         if best_latency == LATENCY_UNSET {
-            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             let target_idx = healthy.nth_set_bit(idx);
             return Some(Arc::clone(&self.targets[target_idx]));
         }
@@ -2506,6 +2523,7 @@ impl LoadBalancer {
     fn select_wrr_vec(
         &self,
         candidates: &[(usize, &Arc<UpstreamTarget>)],
+        rr_counter: &AtomicU64,
         wrr_state: &std::sync::Mutex<Vec<i64>>,
     ) -> Option<Arc<UpstreamTarget>> {
         if candidates.is_empty() {
@@ -2514,7 +2532,7 @@ impl LoadBalancer {
 
         let total_weight: i64 = candidates.iter().map(|(_, t)| t.weight as i64).sum();
         if total_weight == 0 {
-            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             return Some(Arc::clone(candidates[idx % candidates.len()].1));
         }
 
@@ -2592,6 +2610,7 @@ impl LoadBalancer {
     fn select_least_latency_vec(
         &self,
         candidates: &[(usize, &Arc<UpstreamTarget>)],
+        rr_counter: &AtomicU64,
     ) -> Option<Arc<UpstreamTarget>> {
         if candidates.is_empty() {
             return None;
@@ -2615,7 +2634,7 @@ impl LoadBalancer {
         }
 
         if warmed_count == 0 || !any_has_data {
-            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             return Some(Arc::clone(candidates[idx % candidates.len()].1));
         }
 
@@ -2664,7 +2683,7 @@ impl LoadBalancer {
         }
 
         if best_latency == LATENCY_UNSET {
-            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             return Some(Arc::clone(candidates[idx % candidates.len()].1));
         }
 
@@ -2948,7 +2967,7 @@ mod tests {
         );
 
         let healthy = HealthBitset::all(targets.len());
-        let _ = lb.select_wrr_bitset(&healthy, &lb.wrr_state);
+        let _ = lb.select_wrr_bitset(&healthy, &lb.rr_counter, &lb.wrr_state);
 
         assert!(!lb.wrr_needs_stale_check.load(Ordering::Acquire));
         assert!(
