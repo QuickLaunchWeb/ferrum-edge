@@ -702,6 +702,9 @@ fn traceparent_sampling_decision(value: &str) -> Option<bool> {
 }
 
 fn b3_sampling_decision(headers: &HashMap<String, String>) -> Option<bool> {
+    if let Some(value) = header_value(headers, "b3") {
+        return b3_single_sampling_decision(value);
+    }
     if let Some(flags) = header_value(headers, "x-b3-flags")
         && flags.trim() == "1"
     {
@@ -716,11 +719,66 @@ fn b3_sampling_decision(headers: &HashMap<String, String>) -> Option<bool> {
     })
 }
 
+#[derive(Debug, Clone)]
+struct B3SingleTraceContext {
+    trace_id: String,
+    span_id: String,
+    sampled: Option<bool>,
+}
+
+fn b3_single_sampling_decision(value: &str) -> Option<bool> {
+    let trimmed = value.trim();
+    if !trimmed.contains('-') {
+        return b3_sampling_state(trimmed);
+    }
+
+    parse_b3_single_trace_context(trimmed).and_then(|context| context.sampled)
+}
+
+fn parse_b3_single_trace_context(value: &str) -> Option<B3SingleTraceContext> {
+    let mut parts = value.trim().split('-');
+    let trace_id = normalize_b3_trace_id(parts.next()?)?;
+    let span_id = normalize_b3_span_id(parts.next()?)?;
+    let sampled = match parts.next() {
+        Some(state) => Some(b3_sampling_state(state)?),
+        None => None,
+    };
+    if let Some(parent_span_id) = parts.next() {
+        normalize_b3_span_id(parent_span_id)?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+
+    Some(B3SingleTraceContext {
+        trace_id,
+        span_id,
+        sampled,
+    })
+}
+
+fn b3_sampling_state(value: &str) -> Option<bool> {
+    match value.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        value if value.eq_ignore_ascii_case("d") => Some(true),
+        value if value.eq_ignore_ascii_case("true") => Some(true),
+        value if value.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    }
+}
+
 fn import_b3_trace_metadata(
     metadata: &mut HashMap<String, String>,
     headers: &HashMap<String, String>,
 ) {
     if metadata.contains_key(TRACEPARENT_HEADER) {
+        return;
+    }
+    if let Some(value) = header_value(headers, "b3") {
+        if let Some(context) = parse_b3_single_trace_context(value) {
+            import_b3_trace_context(metadata, context.trace_id, context.span_id);
+        }
         return;
     }
     let Some(trace_id) = header_value(headers, "x-b3-traceid").and_then(normalize_b3_trace_id)
@@ -732,6 +790,14 @@ fn import_b3_trace_metadata(
         return;
     };
 
+    import_b3_trace_context(metadata, trace_id, parent_span_id);
+}
+
+fn import_b3_trace_context(
+    metadata: &mut HashMap<String, String>,
+    trace_id: String,
+    parent_span_id: String,
+) {
     let span_id = OtelTracing::generate_span_id();
     let flags = if trace_is_sampled(metadata) {
         "01"
@@ -1261,6 +1327,96 @@ mod tests {
         let outgoing_traceparent = headers
             .get(TRACEPARENT_HEADER)
             .expect("traceparent propagated from B3 context");
+        assert!(outgoing_traceparent.starts_with(&format!("00-{trace_id}-")));
+        assert!(outgoing_traceparent.ends_with("-01"));
+        assert_ne!(
+            outgoing_traceparent,
+            &format!("00-{trace_id}-{parent_span_id}-01")
+        );
+    }
+
+    #[tokio::test]
+    async fn before_proxy_keeps_b3_single_sampling_decision_when_local_sampling_configured() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "sampling_percentage": 0.0
+        }))
+        .expect("sampling-only workload metrics accepted");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        let mut headers = HashMap::from([("b3".to_string(), "1".to_string())]);
+
+        let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            ctx.metadata.get("trace_sampled").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn before_proxy_prefers_b3_single_sampling_over_multi_headers() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "sampling_percentage": 100.0
+        }))
+        .expect("sampling-only workload metrics accepted");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        let mut headers = HashMap::from([
+            ("b3".to_string(), "0".to_string()),
+            ("x-b3-flags".to_string(), "1".to_string()),
+            ("x-b3-sampled".to_string(), "1".to_string()),
+        ]);
+
+        let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            ctx.metadata.get("trace_sampled").map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[tokio::test]
+    async fn before_proxy_imports_b3_single_trace_ids_when_honoring_b3_sampling() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "sampling_percentage": 0.0
+        }))
+        .expect("sampling-only workload metrics accepted");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let parent_span_id = "00f067aa0ba902b7";
+        let mut headers =
+            HashMap::from([("b3".to_string(), format!("{trace_id}-{parent_span_id}-1"))]);
+
+        let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            ctx.metadata.get("trace_sampled").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            ctx.metadata.get("trace_id").map(String::as_str),
+            Some(trace_id)
+        );
+        assert_eq!(
+            ctx.metadata.get("parent_span_id").map(String::as_str),
+            Some(parent_span_id)
+        );
+        let outgoing_traceparent = headers
+            .get(TRACEPARENT_HEADER)
+            .expect("traceparent propagated from B3 single context");
         assert!(outgoing_traceparent.starts_with(&format!("00-{trace_id}-")));
         assert!(outgoing_traceparent.ends_with("-01"));
         assert_ne!(
