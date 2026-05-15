@@ -129,16 +129,12 @@ async fn start_grpc_echo_backend(port: u16) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// Build the gateway binary (debug profile).
+/// Build the gateway binary. Thin wrapper over the shared
+/// [`crate::common::ensure_gateway_built`] so this file's tests share the
+/// same `OnceLock` memoization and `FERRUM_SKIP_GATEWAY_BUILD=1` contract as
+/// the [`crate::common::TestGateway`] builder.
 fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
-    let output = std::process::Command::new("cargo")
-        .args(["build", "--bin", "ferrum-edge"])
-        .output()?;
-    if !output.status.success() {
-        eprintln!("Build stderr: {}", String::from_utf8_lossy(&output.stderr));
-        return Err("Failed to build gateway binary".into());
-    }
-    Ok(())
+    crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
 /// Find the gateway binary path.
