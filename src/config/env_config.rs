@@ -151,11 +151,9 @@ fn validate_k8s_namespace(ns: &str) -> Result<(), String> {
             ns.len()
         ));
     }
-    let mut chars = ns.chars();
-    let Some(first) = chars.next() else {
-        return Err("namespace must not be empty".to_string());
-    };
-    let last = ns.chars().last().unwrap_or(first);
+    let bytes = ns.as_bytes();
+    let first = bytes[0];
+    let last = bytes[bytes.len() - 1];
     if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
         return Err(format!(
             "namespace '{}' is invalid: must start with lowercase alphanumeric",
