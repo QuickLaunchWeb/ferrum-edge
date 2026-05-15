@@ -672,6 +672,10 @@ Each section (tracing, metrics, access logging) is merged independently. Within 
 - `sampling_percentage`: 0.0--100.0 (deterministic hash-based sampling).
 - `custom_tags`: literal key-value tags injected into every span.
 - `custom_header_tags`: tags resolved from request headers at runtime.
+- `providers`: inline span exporters for Zipkin v2, Datadog Agent `/v0.3/traces`, Lightstep OTLP, and OpenTelemetry OTLP/HTTP JSON. Multiple providers receive the same sampled span.
+- `disable_span_reporting` / Istio `disableSpanReporting`: when explicitly true, suppresses span export while leaving the rest of the merged tracing config visible. Omitted values inherit from less-specific scopes; explicit false can re-enable a more-specific scope.
+
+Datadog export groups spans by trace in the Agent v0.3 payload shape and sends the upper 64 bits of W3C 128-bit trace IDs via `_dd.p.tid` while the numeric `trace_id` field carries the low 64 bits.
 
 **Metrics configuration**:
 

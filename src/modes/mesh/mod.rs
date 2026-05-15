@@ -1797,10 +1797,10 @@ fn inject_mesh_global_plugins(
             workload_metrics_config["custom_header_tags"] =
                 serde_json::json!(tracing.custom_header_tags);
         }
-        if tracing.disable_span_reporting {
+        if tracing.disable_span_reporting.unwrap_or(false) {
             workload_metrics_config["span_reporting_disabled"] = serde_json::json!(true);
         }
-        if !tracing.providers.is_empty() && !tracing.disable_span_reporting {
+        if !tracing.providers.is_empty() && !tracing.disable_span_reporting.unwrap_or(false) {
             workload_metrics_config["tracing_providers"] = serde_json::json!(tracing.providers);
         }
     }
@@ -1910,7 +1910,7 @@ fn merge_tracing_config(
     let current = merged.get_or_insert_with(|| crate::modes::mesh::config::MeshTracingConfig {
         mode: None,
         sampling_percentage: None,
-        disable_span_reporting: false,
+        disable_span_reporting: None,
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
         providers: Vec::new(),
@@ -1922,7 +1922,9 @@ fn merge_tracing_config(
     if next.sampling_percentage.is_some() {
         current.sampling_percentage = next.sampling_percentage;
     }
-    current.disable_span_reporting = next.disable_span_reporting;
+    if next.disable_span_reporting.is_some() {
+        current.disable_span_reporting = next.disable_span_reporting;
+    }
     if !next.custom_tags.is_empty() {
         current.custom_tags.clone_from(&next.custom_tags);
     }
@@ -4018,7 +4020,7 @@ mod tests {
                         tracing: Some(MeshTracingConfig {
                             mode: None,
                             sampling_percentage: Some(100.0),
-                            disable_span_reporting: false,
+                            disable_span_reporting: Some(true),
                             custom_tags: HashMap::new(),
                             custom_header_tags: HashMap::new(),
                             providers: Vec::new(),
@@ -4039,7 +4041,7 @@ mod tests {
                         tracing: Some(MeshTracingConfig {
                             mode: None,
                             sampling_percentage: None,
-                            disable_span_reporting: false,
+                            disable_span_reporting: None,
                             custom_tags: HashMap::from([("env".to_string(), "prod".to_string())]),
                             custom_header_tags: HashMap::from([(
                                 "tenant".to_string(),
@@ -4062,6 +4064,7 @@ mod tests {
         let tracing = merged.tracing.expect("tracing merged");
 
         assert_eq!(tracing.sampling_percentage, Some(100.0));
+        assert_eq!(tracing.disable_span_reporting, Some(true));
         assert_eq!(
             tracing.custom_tags.get("env").map(String::as_str),
             Some("prod")
@@ -4415,7 +4418,7 @@ mod tests {
                     tracing: Some(MeshTracingConfig {
                         mode: None,
                         sampling_percentage: Some(10.0),
-                        disable_span_reporting: false,
+                        disable_span_reporting: None,
                         custom_tags: HashMap::new(),
                         custom_header_tags: HashMap::new(),
                         providers: vec![TracingProvider::Zipkin {

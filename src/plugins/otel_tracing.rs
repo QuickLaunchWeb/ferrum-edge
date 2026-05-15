@@ -12,7 +12,7 @@
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -1149,63 +1149,76 @@ fn build_zipkin_payload(service_name: &str, spans: &[SpanData]) -> Value {
 }
 
 fn build_datadog_payload(service_name: &str, spans: &[SpanData]) -> Value {
-    let datadog_spans: Vec<Value> = spans
-        .iter()
-        .map(|span| {
-            let start_ns = timestamp_nanos(&span.timestamp_received);
-            let duration_ns = (span.duration_ms.max(0.0) * 1_000_000.0) as i64;
-            let mut meta = serde_json::Map::new();
-            insert_tag(&mut meta, "http.method", &span.http_method);
-            insert_tag(&mut meta, "http.url", &span.http_url);
-            insert_tag(&mut meta, "client.ip", &span.client_ip);
-            if let Some(ref proxy_id) = span.proxy_id {
-                insert_tag(&mut meta, "gateway.proxy.id", proxy_id);
-            }
-            if let Some(ref route) = span.matched_route {
-                insert_tag(&mut meta, "http.route", route);
-            }
-            if let Some(ref target) = span.backend_target_url {
-                insert_tag(&mut meta, "server.address", target);
-            }
-            if let Some(ref protocol) = span.stream_protocol {
-                insert_tag(&mut meta, "network.protocol.name", protocol);
-            }
-            for (key, value) in &span.mesh_attributes {
-                insert_tag(&mut meta, key, value);
-            }
+    let mut traces: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+    for span in spans {
+        traces
+            .entry(span.trace_id.as_str())
+            .or_default()
+            .push(datadog_span_value(service_name, span));
+    }
+    Value::Array(
+        traces
+            .into_values()
+            .map(Value::Array)
+            .collect::<Vec<Value>>(),
+    )
+}
 
-            let mut metrics = serde_json::Map::new();
-            metrics.insert(
-                "_sampling_priority_v1".to_string(),
-                serde_json::json!(1.0_f64),
-            );
-            metrics.insert(
-                "gateway.latency.total_ms".to_string(),
-                serde_json::json!(span.duration_ms),
-            );
-            if let Some(status_code) = span.http_status_code {
-                metrics.insert(
-                    "http.status_code".to_string(),
-                    serde_json::json!(status_code as i64),
-                );
-            }
+fn datadog_span_value(service_name: &str, span: &SpanData) -> Value {
+    let start_ns = timestamp_nanos(&span.timestamp_received);
+    let duration_ns = (span.duration_ms.max(0.0) * 1_000_000.0) as i64;
+    let mut meta = serde_json::Map::new();
+    insert_tag(&mut meta, "http.method", &span.http_method);
+    insert_tag(&mut meta, "http.url", &span.http_url);
+    insert_tag(&mut meta, "client.ip", &span.client_ip);
+    if let Some(high_trace_bits) = datadog_high_trace_id(&span.trace_id) {
+        insert_tag(&mut meta, "_dd.p.tid", high_trace_bits);
+    }
+    if let Some(ref proxy_id) = span.proxy_id {
+        insert_tag(&mut meta, "gateway.proxy.id", proxy_id);
+    }
+    if let Some(ref route) = span.matched_route {
+        insert_tag(&mut meta, "http.route", route);
+    }
+    if let Some(ref target) = span.backend_target_url {
+        insert_tag(&mut meta, "server.address", target);
+    }
+    if let Some(ref protocol) = span.stream_protocol {
+        insert_tag(&mut meta, "network.protocol.name", protocol);
+    }
+    for (key, value) in &span.mesh_attributes {
+        insert_tag(&mut meta, key, value);
+    }
 
-            serde_json::json!({
-                "trace_id": hex_low_u64(&span.trace_id),
-                "span_id": hex_low_u64(&span.span_id),
-                "parent_id": hex_low_u64(&span.parent_span_id),
-                "name": "ferrum.edge.request",
-                "resource": span.span_name.clone(),
-                "service": service_name,
-                "type": "web",
-                "start": start_ns,
-                "duration": duration_ns,
-                "meta": meta,
-                "metrics": metrics,
-            })
-        })
-        .collect();
-    Value::Array(vec![Value::Array(datadog_spans)])
+    let mut metrics = serde_json::Map::new();
+    metrics.insert(
+        "_sampling_priority_v1".to_string(),
+        serde_json::json!(1.0_f64),
+    );
+    metrics.insert(
+        "gateway.latency.total_ms".to_string(),
+        serde_json::json!(span.duration_ms),
+    );
+    if let Some(status_code) = span.http_status_code {
+        metrics.insert(
+            "http.status_code".to_string(),
+            serde_json::json!(status_code as i64),
+        );
+    }
+
+    serde_json::json!({
+        "trace_id": hex_low_u64(&span.trace_id),
+        "span_id": hex_low_u64(&span.span_id),
+        "parent_id": hex_low_u64(&span.parent_span_id),
+        "name": "ferrum.edge.request",
+        "resource": span.span_name.clone(),
+        "service": service_name,
+        "type": "web",
+        "start": start_ns,
+        "duration": duration_ns,
+        "meta": meta,
+        "metrics": metrics,
+    })
 }
 
 fn insert_tag(map: &mut serde_json::Map<String, Value>, key: &str, value: &str) {
@@ -1226,6 +1239,14 @@ fn timestamp_micros(timestamp: &str) -> i64 {
 fn hex_low_u64(hex: &str) -> u64 {
     let start = hex.len().saturating_sub(16);
     u64::from_str_radix(&hex[start..], 16).unwrap_or(0)
+}
+
+fn datadog_high_trace_id(hex: &str) -> Option<&str> {
+    if hex.len() != 32 {
+        return None;
+    }
+    let high = &hex[..16];
+    high.chars().any(|ch| ch != '0').then_some(high)
 }
 
 fn string_config(config: &Value, key: &str, default: &str) -> Result<String, String> {
@@ -1468,6 +1489,42 @@ fn hex_to_base64(hex: &str) -> String {
 mod tests {
     use super::*;
 
+    fn test_span(trace_id: &str, span_id: &str) -> SpanData {
+        SpanData {
+            trace_id: trace_id.to_string(),
+            span_id: span_id.to_string(),
+            parent_span_id: String::new(),
+            service_name: "ferrum-edge".to_string(),
+            span_name: "GET /api".to_string(),
+            span_kind: 2,
+            http_method: "GET".to_string(),
+            http_url: "/api".to_string(),
+            http_status_code: Some(200),
+            client_ip: "127.0.0.1".to_string(),
+            duration_ms: 10.0,
+            gateway_processing_ms: 1.0,
+            backend_ttfb_ms: 2.0,
+            backend_ms: 3.0,
+            plugin_execution_ms: 1.0,
+            gateway_overhead_ms: 1.0,
+            consumer: None,
+            timestamp_received: "2025-01-01T00:00:00Z".to_string(),
+            user_agent: None,
+            proxy_id: Some("proxy-a".to_string()),
+            matched_route: Some("api".to_string()),
+            backend_target_url: None,
+            backend_resolved_ip: None,
+            error_class: None,
+            response_streamed: false,
+            client_disconnected: false,
+            mesh_attributes: Vec::new(),
+            stream_protocol: None,
+            stream_listen_port: None,
+            stream_bytes_sent: None,
+            stream_bytes_received: None,
+        }
+    }
+
     #[test]
     fn hex_to_base64_decodes_even_length_input() {
         // Standard 16-byte trace_id (32 hex chars).
@@ -1504,6 +1561,50 @@ mod tests {
         // Non-hex chars are filtered out via from_str_radix Err.
         let encoded = hex_to_base64("XX");
         assert_eq!(encoded, ""); // no valid bytes decoded
+    }
+
+    #[test]
+    fn datadog_payload_groups_spans_by_trace_and_preserves_128_bit_id() {
+        let trace_a = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let trace_b = "0000000000000000000000000000002a";
+        let payload = build_datadog_payload(
+            "ferrum-edge",
+            &[
+                test_span(trace_a, "00f067aa0ba902b7"),
+                test_span(trace_b, "00f067aa0ba902b8"),
+                test_span(trace_a, "00f067aa0ba902b9"),
+            ],
+        );
+
+        let traces = payload.as_array().expect("datadog trace array");
+        assert_eq!(traces.len(), 2);
+        assert!(
+            traces
+                .iter()
+                .any(|trace| trace.as_array().unwrap().len() == 2)
+        );
+        assert!(
+            traces
+                .iter()
+                .any(|trace| trace.as_array().unwrap().len() == 1)
+        );
+
+        let first_trace_span = traces
+            .iter()
+            .flat_map(|trace| trace.as_array().unwrap())
+            .find(|span| span["meta"]["_dd.p.tid"] == "4bf92f3577b34da6")
+            .expect("128-bit trace high bits preserved");
+        assert_eq!(
+            first_trace_span["trace_id"],
+            serde_json::json!(0xa3ce_929d_0e0e_4736_u64)
+        );
+
+        let low_only_span = traces
+            .iter()
+            .flat_map(|trace| trace.as_array().unwrap())
+            .find(|span| span["trace_id"] == serde_json::json!(42_u64))
+            .expect("low-only trace present");
+        assert!(low_only_span["meta"].get("_dd.p.tid").is_none());
     }
 
     #[test]

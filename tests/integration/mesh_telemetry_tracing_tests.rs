@@ -111,7 +111,7 @@ async fn telemetry_provider_from_mesh_slice_emits_otlp_span() {
                 tracing: Some(MeshTracingConfig {
                     mode: None,
                     sampling_percentage: Some(100.0),
-                    disable_span_reporting: false,
+                    disable_span_reporting: None,
                     custom_tags: HashMap::new(),
                     custom_header_tags: HashMap::new(),
                     providers: vec![TracingProvider::OpenTelemetry {

@@ -435,9 +435,9 @@ pub struct MeshTracingConfig {
     #[serde(
         default,
         alias = "disableSpanReporting",
-        skip_serializing_if = "std::ops::Not::not"
+        skip_serializing_if = "Option::is_none"
     )]
-    pub disable_span_reporting: bool,
+    pub disable_span_reporting: Option<bool>,
     /// Literal/environment custom tags injected into every span / transaction metadata.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_tags: HashMap<String, String>,

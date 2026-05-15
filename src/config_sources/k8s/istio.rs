@@ -2014,7 +2014,7 @@ fn telemetry(
             let mut merged = MeshTracingConfig {
                 mode: Some(TelemetryTracingMode::Server),
                 sampling_percentage: None,
-                disable_span_reporting: false,
+                disable_span_reporting: None,
                 custom_tags: HashMap::new(),
                 custom_header_tags: HashMap::new(),
                 providers: Vec::new(),
@@ -2062,11 +2062,8 @@ fn telemetry(
                 if sampling.is_some() {
                     merged.sampling_percentage = sampling;
                 }
-                if t.get("disableSpanReporting")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    merged.disable_span_reporting = true;
+                if let Some(disabled) = t.get("disableSpanReporting").and_then(Value::as_bool) {
+                    merged.disable_span_reporting = Some(disabled);
                 }
                 if !custom_tags.is_empty() {
                     merged.custom_tags = custom_tags;
@@ -4542,7 +4539,7 @@ mod tests {
             .tracing
             .as_ref()
             .expect("tracing config");
-        assert!(tracing.disable_span_reporting);
+        assert_eq!(tracing.disable_span_reporting, Some(true));
         assert_eq!(tracing.providers.len(), 1);
     }
 

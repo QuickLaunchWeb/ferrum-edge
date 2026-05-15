@@ -29,6 +29,8 @@ const MESH_SOURCE_PRINCIPAL: &str = "mesh.source.principal";
 const MESH_SOURCE_TRUST_DOMAIN: &str = "mesh.source.trust_domain";
 const MESH_SOURCE_NAMESPACE: &str = "mesh.source.namespace";
 const MESH_SOURCE_SERVICE_ACCOUNT: &str = "mesh.source.service_account";
+const TRACEPARENT_HEADER: &str = "traceparent";
+const TRACESTATE_HEADER: &str = "tracestate";
 
 #[derive(Default)]
 pub struct WorkloadMetrics {
@@ -179,7 +181,11 @@ impl WorkloadMetrics {
         self.insert_common_metadata(&mut ctx.metadata);
         self.apply_telemetry_metadata(&mut ctx.metadata, headers);
         if !self.trace_exporters.is_empty() && trace_is_sampled(&ctx.metadata) {
-            ensure_trace_metadata(&mut ctx.metadata, &ctx.headers);
+            ensure_trace_metadata(&mut ctx.metadata, headers);
+            if let Some(tracestate) = header_value(headers, TRACESTATE_HEADER) {
+                ctx.metadata
+                    .insert(TRACESTATE_HEADER.to_string(), tracestate.to_string());
+            }
         }
         let hbone_identity = hbone_identity_from_headers(ctx, headers);
         // For authenticated ambient HBONE, the peer cert identifies the
@@ -395,12 +401,34 @@ impl Plugin for WorkloadMetrics {
         ALL_PROTOCOLS
     }
 
+    fn modifies_request_headers(&self) -> bool {
+        !self.trace_exporters.is_empty()
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         self.annotate_http_context(ctx, headers);
+        if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
+            headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
+        }
+        if let Some(tracestate) = ctx.metadata.get(TRACESTATE_HEADER) {
+            headers.insert(TRACESTATE_HEADER.to_string(), tracestate.clone());
+        }
+        PluginResult::Continue
+    }
+
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
+            response_headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
+        }
         PluginResult::Continue
     }
 
@@ -870,6 +898,67 @@ mod tests {
         }))
         .expect("provider array accepted");
         assert_eq!(metrics.tracing_providers().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn before_proxy_propagates_trace_context_from_header_parameter() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "tracing_providers": [{
+                "kind": "zipkin",
+                "config": {
+                    "url": "http://zipkin:9411/api/v2/spans"
+                }
+            }]
+        }))
+        .expect("zipkin provider accepted");
+        assert!(metrics.modifies_request_headers());
+
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let parent_span_id = "00f067aa0ba902b7";
+        let incoming_traceparent = format!("00-{trace_id}-{parent_span_id}-01");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        let mut headers = HashMap::from([
+            (TRACEPARENT_HEADER.to_string(), incoming_traceparent),
+            (TRACESTATE_HEADER.to_string(), "dd=s:1".to_string()),
+        ]);
+
+        let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            ctx.metadata.get("trace_id").map(String::as_str),
+            Some(trace_id)
+        );
+        assert_eq!(
+            ctx.metadata.get("parent_span_id").map(String::as_str),
+            Some(parent_span_id)
+        );
+        let outgoing_traceparent = headers
+            .get(TRACEPARENT_HEADER)
+            .expect("traceparent propagated");
+        assert!(outgoing_traceparent.starts_with(&format!("00-{trace_id}-")));
+        assert!(outgoing_traceparent.ends_with("-01"));
+        assert_ne!(
+            outgoing_traceparent,
+            &format!("00-{trace_id}-{parent_span_id}-01")
+        );
+        assert_eq!(
+            headers.get(TRACESTATE_HEADER).map(String::as_str),
+            Some("dd=s:1")
+        );
+
+        let mut response_headers = HashMap::new();
+        metrics
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        assert_eq!(
+            response_headers.get(TRACEPARENT_HEADER),
+            headers.get(TRACEPARENT_HEADER)
+        );
     }
 
     #[tokio::test]

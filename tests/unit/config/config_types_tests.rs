@@ -2089,6 +2089,6 @@ fn mesh_tracing_config_deserializes_provider_array() {
     }))
     .expect("provider array deserializes");
 
-    assert!(config.disable_span_reporting);
+    assert_eq!(config.disable_span_reporting, Some(true));
     assert_eq!(config.providers.len(), 2);
 }

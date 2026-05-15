@@ -118,7 +118,7 @@ Body-aware `before_proxy` plugins such as `graphql`, request-side `body_validato
 | `udp_logging` | | ✓ | Sends stream connection logs to UDP/DTLS endpoint |
 | `ws_logging` | | ✓ | Sends stream connection logs to WebSocket endpoint |
 | `prometheus_metrics` | | ✓ | Records `ferrum_stream_connections_total` counter and `ferrum_stream_duration_ms` histogram |
-| `workload_metrics` | ✓ | | Adds mesh workload/source labels to stream metadata |
+| `workload_metrics` | ✓ | ✓ | Adds mesh workload/source labels to stream metadata and emits mesh spans when Telemetry providers are configured |
 | `access_log` | | ✓ | Emits identity-aware mesh access logs |
 | `transaction_debugger` | | ✓ | Prints debug info for stream connections |
 
@@ -305,7 +305,7 @@ Given all built-in plugins enabled, the execution order is:
 | 61 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
 | 62 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
 | 63 | `api_chargeback` | 9350 | log |
-| 64 | `workload_metrics` | 9360 | before_proxy, on_stream_connect |
+| 64 | `workload_metrics` | 9360 | before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
 | 65 | `access_log` | 9375 | log, on_stream_disconnect |
 
 ## Why This Order Matters
