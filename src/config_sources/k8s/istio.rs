@@ -2092,12 +2092,24 @@ fn telemetry(
                                     .or_else(|| {
                                         let env_tag = val.get("environment")?;
                                         let name = env_tag.get("name").and_then(Value::as_str)?;
-                                        std::env::var(name).ok().or_else(|| {
-                                            env_tag
-                                                .get("defaultValue")
-                                                .and_then(Value::as_str)
-                                                .map(str::to_string)
-                                        })
+                                        match std::env::var(name) {
+                                            Ok(value) => Some(value),
+                                            Err(error) => {
+                                                let default_value = env_tag
+                                                    .get("defaultValue")
+                                                    .and_then(Value::as_str)
+                                                    .map(str::to_string);
+                                                if default_value.is_none() {
+                                                    tracing::debug!(
+                                                        tag = %key,
+                                                        env_var = %name,
+                                                        %error,
+                                                        "dropping telemetry custom tag with unresolved environment value"
+                                                    );
+                                                }
+                                                default_value
+                                            }
+                                        }
                                     });
                                 value.map(|v| (key.clone(), v))
                             })

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
-use tracing::warn;
+use tracing::{debug, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -991,9 +991,7 @@ fn build_otlp_payload(
             };
 
             // Parse start time from ISO 8601 timestamp
-            let start_ns = chrono::DateTime::parse_from_rfc3339(&s.timestamp_received)
-                .map(|dt| dt.timestamp_nanos_opt().unwrap_or(0))
-                .unwrap_or(0);
+            let start_ns = timestamp_nanos(&s.timestamp_received);
             let end_ns = start_ns + (s.duration_ms * 1_000_000.0) as i64;
 
             let mut attributes = vec![
@@ -1282,10 +1280,29 @@ fn insert_tag(map: &mut serde_json::Map<String, Value>, key: &str, value: &str) 
 }
 
 fn timestamp_nanos(timestamp: &str) -> i64 {
-    chrono::DateTime::parse_from_rfc3339(timestamp)
-        .ok()
-        .and_then(|dt| dt.timestamp_nanos_opt())
-        .unwrap_or(0)
+    if timestamp.is_empty() {
+        return 0;
+    }
+    match chrono::DateTime::parse_from_rfc3339(timestamp) {
+        Ok(dt) => match dt.timestamp_nanos_opt() {
+            Some(nanos) => nanos,
+            None => {
+                debug!(
+                    timestamp,
+                    "trace timestamp outside nanosecond range; using unix epoch fallback"
+                );
+                0
+            }
+        },
+        Err(error) => {
+            debug!(
+                timestamp,
+                %error,
+                "invalid trace timestamp; using unix epoch fallback"
+            );
+            0
+        }
+    }
 }
 
 fn timestamp_micros(timestamp: &str) -> i64 {

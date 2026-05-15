@@ -13,7 +13,7 @@ use ferrum_edge::modes::mesh::{
     prepare_gateway_config_for_mesh,
 };
 use ferrum_edge::plugins::{TransactionSummary, create_plugin};
-use serde_json::json;
+use serde_json::{Value, json};
 
 fn test_addr(s: &str) -> SocketAddr {
     s.parse().expect("valid socket address")
@@ -91,16 +91,12 @@ async fn received_json(server: &wiremock::MockServer) -> serde_json::Value {
     panic!("collector did not receive a span export");
 }
 
-#[tokio::test]
-async fn telemetry_provider_from_mesh_slice_emits_otlp_span() {
-    let collector = wiremock::MockServer::start().await;
-    wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/v1/traces"))
-        .respond_with(wiremock::ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&collector)
-        .await;
+async fn assert_no_requests(server: &wiremock::MockServer) {
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
 
+fn workload_metrics_plugin_config(tracing: MeshTracingConfig) -> Value {
     let mesh = MeshConfig {
         telemetry_resources: vec![MeshTelemetryResource {
             name: "api-tracing".to_string(),
@@ -112,16 +108,7 @@ async fn telemetry_provider_from_mesh_slice_emits_otlp_span() {
                 },
             },
             config: MeshTelemetryConfig {
-                tracing: Some(MeshTracingConfig {
-                    mode: None,
-                    sampling_percentage: Some(100.0),
-                    disable_span_reporting: None,
-                    custom_tags: HashMap::new(),
-                    custom_header_tags: HashMap::new(),
-                    providers: vec![TracingProvider::OpenTelemetry {
-                        endpoint: format!("{}/v1/traces", collector.uri()),
-                    }],
-                }),
+                tracing: Some(tracing),
                 ..MeshTelemetryConfig::default()
             },
         }],
@@ -143,8 +130,31 @@ async fn telemetry_provider_from_mesh_slice_emits_otlp_span() {
     plugin_config.config["batch_size"] = json!(1);
     plugin_config.config["flush_interval_ms"] = json!(100);
     plugin_config.config["service_name"] = json!("reviews");
+    plugin_config.config
+}
 
-    let plugin = create_plugin("workload_metrics", &plugin_config.config)
+#[tokio::test]
+async fn telemetry_provider_from_mesh_slice_emits_otlp_span() {
+    let collector = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/traces"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&collector)
+        .await;
+
+    let plugin_config = workload_metrics_plugin_config(MeshTracingConfig {
+        mode: None,
+        sampling_percentage: Some(100.0),
+        disable_span_reporting: None,
+        custom_tags: HashMap::new(),
+        custom_header_tags: HashMap::new(),
+        providers: vec![TracingProvider::OpenTelemetry {
+            endpoint: format!("{}/v1/traces", collector.uri()),
+        }],
+    });
+
+    let plugin = create_plugin("workload_metrics", &plugin_config)
         .expect("plugin creation succeeds")
         .expect("plugin exists");
     plugin.log(&traced_summary()).await;
@@ -159,4 +169,34 @@ async fn telemetry_provider_from_mesh_slice_emits_otlp_span() {
         payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
         "GET /reviews"
     );
+}
+
+#[tokio::test]
+async fn telemetry_disable_span_reporting_from_mesh_slice_suppresses_export() {
+    let collector = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/traces"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&collector)
+        .await;
+
+    let plugin_config = workload_metrics_plugin_config(MeshTracingConfig {
+        mode: None,
+        sampling_percentage: Some(100.0),
+        disable_span_reporting: Some(true),
+        custom_tags: HashMap::new(),
+        custom_header_tags: HashMap::new(),
+        providers: vec![TracingProvider::OpenTelemetry {
+            endpoint: format!("{}/v1/traces", collector.uri()),
+        }],
+    });
+
+    let plugin = create_plugin("workload_metrics", &plugin_config)
+        .expect("plugin creation succeeds")
+        .expect("plugin exists");
+    plugin.log(&traced_summary()).await;
+    drop(plugin);
+
+    assert_no_requests(&collector).await;
 }
