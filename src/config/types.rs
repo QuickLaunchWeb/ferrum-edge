@@ -543,7 +543,7 @@ impl BackendTlsConfig {
         self.san_allow_list_key_digest = Self::compute_san_digest(&self.san_allow_list);
     }
 
-    fn compute_san_digest(sans: &[String]) -> Option<String> {
+    pub(crate) fn compute_san_digest(sans: &[String]) -> Option<String> {
         if sans.is_empty() {
             return None;
         }
@@ -2987,6 +2987,7 @@ impl Proxy {
         {
             errors.push(e);
         }
+
         // TLS cert/key pairing: both must be set or neither
         match (
             &self.backend_tls_client_cert_path,
@@ -3806,6 +3807,13 @@ pub(crate) fn validate_backend_tls_sni(sni: &str) -> Result<(), String> {
     }
     if sni.contains('*') {
         return Err("backend_tls_sni must be an exact hostname, not a wildcard".to_string());
+    }
+    // RFC 6066 §3: the SNI host_name MUST NOT be an IP literal. validate_host_entry
+    // accepts dotted-digit strings as hostnames, so we reject IP addresses explicitly here.
+    if sni.parse::<std::net::IpAddr>().is_ok() {
+        return Err(
+            "backend_tls_sni must be a DNS hostname, not an IP address (RFC 6066 §3)".to_string(),
+        );
     }
     validate_host_entry(&sni.to_ascii_lowercase())
         .map_err(|e| format!("backend_tls_sni is invalid: {}", e))

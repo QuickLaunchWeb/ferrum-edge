@@ -80,6 +80,16 @@ pub fn append_backend_tls_pool_key_fields(
     client_key_path: Option<&str>,
     verify_server_cert: bool,
 ) {
+    // The SAN digest is precomputed (see BackendTlsConfig::compute_san_digest) so
+    // pool-key emission stays allocation-free. If a caller mutates san_allow_list
+    // without calling recompute_san_digest, the digest goes stale and pool keys
+    // collide across distinct SAN configs. This assert catches that drift in dev
+    // and tests; it compiles out of release builds.
+    debug_assert_eq!(
+        tls.san_allow_list_key_digest,
+        BackendTlsConfig::compute_san_digest(&tls.san_allow_list),
+        "BackendTlsConfig.san_allow_list_key_digest is stale; call recompute_san_digest() after mutating san_allow_list"
+    );
     buf.push_str(tls.server_ca_cert_path.as_deref().unwrap_or_default());
     buf.push('|');
     buf.push_str(client_cert_path.unwrap_or_default());

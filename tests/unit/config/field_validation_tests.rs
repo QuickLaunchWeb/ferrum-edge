@@ -541,6 +541,27 @@ fn test_upstream_backend_tls_sni_validated() {
 }
 
 #[test]
+fn test_upstream_backend_tls_sni_rejects_ip_literals() {
+    // RFC 6066 §3: SNI host_name must not be an IP address.
+    let mut upstream = make_upstream("test");
+    upstream.backend_tls_sni = Some("10.0.0.8".into());
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_sni") && e.contains("IP address")),
+        "got: {errs:?}"
+    );
+
+    upstream.backend_tls_sni = Some("2001:db8::1".into());
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_sni") && e.contains("IP address")),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
 fn test_upstream_backend_tls_san_allow_list_validated() {
     let mut upstream = make_upstream("test");
     upstream.backend_tls_san_allow_list = vec![
