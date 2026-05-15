@@ -179,9 +179,18 @@ impl JwksAuth {
                 .as_ref()
                 .map(|endpoint| endpoint.url.clone());
 
-            if jwks_uri.is_none() && discovery_url.is_none() && inline_jwks.is_none() {
+            let configured_jwks_sources = usize::from(jwks_uri.is_some())
+                + usize::from(discovery_url.is_some())
+                + usize::from(inline_jwks.is_some());
+            if configured_jwks_sources == 0 {
                 return Err(format!(
                     "jwks_auth: provider[{}] requires one of 'jwks_uri', 'discovery_url', or 'jwks'",
+                    idx
+                ));
+            }
+            if configured_jwks_sources > 1 {
+                return Err(format!(
+                    "jwks_auth: provider[{}] must configure exactly one of 'jwks_uri', 'discovery_url', or 'jwks'",
                     idx
                 ));
             }

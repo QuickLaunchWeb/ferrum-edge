@@ -66,6 +66,31 @@ fn inline_jwks_rejects_malformed_json() {
     );
 }
 
+#[test]
+fn inline_jwks_rejects_remote_source_conflict() {
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let inline_jwks = build_rsa_jwks_from_pem(public_key_pem).to_string();
+    let result = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "issuer": "https://issuer.example.com",
+                "jwks": inline_jwks,
+                "jwks_uri": "https://issuer.example.com/.well-known/jwks.json"
+            }]
+        }),
+        default_client(),
+    );
+
+    assert!(result.is_err());
+    assert!(
+        result
+            .as_ref()
+            .err()
+            .unwrap()
+            .contains("must configure exactly one")
+    );
+}
+
 #[tokio::test]
 async fn inline_jwks_with_no_keys_rejects_tokens() {
     let plugin = JwksAuth::new(
