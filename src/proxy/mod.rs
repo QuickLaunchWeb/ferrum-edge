@@ -4120,6 +4120,7 @@ async fn handle_websocket_request_authenticated(
     remote_addr: SocketAddr,
     proxy: Arc<Proxy>,
     ctx: RequestContext,
+    mut client_headers: Vec<(String, String)>,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     plugin_execution_ns: u64,
     epoch: Arc<RequestEpoch>,
@@ -4200,22 +4201,26 @@ async fn handle_websocket_request_authenticated(
             }
         };
 
-    // Collect client headers to forward to backend
-    let mut client_headers = collect_forwardable_headers(&parts.headers);
-
     // Inject authenticated identity headers for WebSocket connections.
     if let Some(username) = ctx.backend_consumer_username() {
-        client_headers.push(("x-consumer-username".to_string(), username.to_string()));
+        push_forwardable_header_if_absent(
+            &mut client_headers,
+            "x-consumer-username",
+            username.to_string(),
+        );
     }
     if let Some(custom_id) = ctx.backend_consumer_custom_id() {
-        client_headers.push(("x-consumer-custom-id".to_string(), custom_id.to_string()));
+        push_forwardable_header_if_absent(
+            &mut client_headers,
+            "x-consumer-custom-id",
+            custom_id.to_string(),
+        );
     }
 
     // Egress baggage strip — see `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`.
-    // The WebSocket handshake builds its own header collection from
-    // `parts.headers`, so the central strip in `handle_proxy_request_inner`
-    // doesn't reach here. Apply the same shared helper to keep mesh-internal
-    // identity claims out of WS upgrade requests.
+    // The WebSocket handshake gets the same sanitized `proxy_headers` as the
+    // HTTP/gRPC dispatch paths. Keep applying the vector helper here because
+    // this function may append identity headers before backend dial.
     hbone_proxy::strip_egress_baggage_in_vec(
         &mut client_headers,
         &state.mesh_egress_strip_baggage_keys,
@@ -4696,40 +4701,45 @@ async fn handle_websocket_request_authenticated(
     Ok(upgrade_response)
 }
 
-/// Collect headers from the client request that should be forwarded to the backend WebSocket.
+/// Collect sanitized proxy headers that should be forwarded to the backend WebSocket.
 /// Hop-by-hop headers and WebSocket handshake headers are excluded.
-fn collect_forwardable_headers(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
-    /// Headers that must not be forwarded (hop-by-hop per RFC 9110 §7.6.1 + WS handshake).
-    const SKIP_HEADERS: &[&str] = &[
-        "connection",
-        "upgrade",
-        "sec-websocket-key",
-        "sec-websocket-version",
-        "sec-websocket-accept",
-        "host",
-        "transfer-encoding",
-        "te",
-        "trailer",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "proxy-connection",
-    ];
-
+fn collect_forwardable_proxy_headers(headers: &HashMap<String, String>) -> Vec<(String, String)> {
     headers
         .iter()
         .filter_map(|(name, value)| {
-            // hyper already lowercases header names per HTTP/2 spec
-            let name_str = name.as_str();
-            if SKIP_HEADERS.contains(&name_str) {
+            let lower_name = name.to_ascii_lowercase();
+            if headers_mod::is_backend_request_strip_header(lower_name.as_str())
+                || is_websocket_backend_strip_header(lower_name.as_str())
+            {
                 return None;
             }
-            value
-                .to_str()
-                .ok()
-                .map(|v| (name_str.to_string(), v.to_string()))
+            Some((name.clone(), value.clone()))
         })
         .collect()
+}
+
+fn is_websocket_backend_strip_header(name: &str) -> bool {
+    matches!(
+        name,
+        "host"
+            | "proxy-authenticate"
+            | "sec-websocket-key"
+            | "sec-websocket-version"
+            | "sec-websocket-accept"
+    )
+}
+
+fn push_forwardable_header_if_absent(
+    headers: &mut Vec<(String, String)>,
+    name: &'static str,
+    value: String,
+) {
+    if !headers
+        .iter()
+        .any(|(existing_name, _)| existing_name.eq_ignore_ascii_case(name))
+    {
+        headers.push((name.to_string(), value));
+    }
 }
 
 /// Build a WebSocket backend URL using a specific target host/port,
@@ -7617,12 +7627,14 @@ async fn handle_proxy_request_inner(
             }
         };
         let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
+        let websocket_client_headers = collect_forwardable_proxy_headers(proxy_headers);
         return handle_websocket_request_authenticated(
             request,
             state,
             remote_addr,
             proxy,
             ctx,
+            websocket_client_headers,
             plugins,
             plugin_execution_ns,
             Arc::clone(&epoch),
@@ -13142,6 +13154,30 @@ mod tests {
         );
 
         assert_eq!(url, "ws://backend.local:8080/?token=1");
+    }
+
+    #[test]
+    fn websocket_forwardable_headers_use_sanitized_proxy_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "edge.example".to_string());
+        headers.insert("connection".to_string(), "upgrade".to_string());
+        headers.insert("x-request-id".to_string(), "req-1".to_string());
+        headers.insert("x-added-by-plugin".to_string(), "kept".to_string());
+
+        let forwarded = collect_forwardable_proxy_headers(&headers);
+
+        assert!(forwarded.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-request-id") && value == "req-1"
+        }));
+        assert!(forwarded.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-added-by-plugin") && value == "kept"
+        }));
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("host")
+                    || name.eq_ignore_ascii_case("connection"))
+        );
     }
 
     #[test]
