@@ -477,7 +477,7 @@ async fn test_workload_metrics_zipkin_exporter_payload() {
 #[tokio::test]
 async fn test_workload_metrics_datadog_exporter_payload() {
     let mock_server = wiremock::MockServer::start().await;
-    wiremock::Mock::given(wiremock::matchers::method("POST"))
+    wiremock::Mock::given(wiremock::matchers::method("PUT"))
         .and(wiremock::matchers::path("/v0.3/traces"))
         .respond_with(wiremock::ResponseTemplate::new(200))
         .expect(1)

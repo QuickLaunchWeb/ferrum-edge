@@ -887,10 +887,11 @@ async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
     };
 
     for attempt in 1..=total_attempts {
-        let mut req = cfg
-            .http_client
-            .get()
-            .post(&cfg.endpoint)
+        let request = match cfg.payload_kind {
+            TracePayloadKind::Datadog => cfg.http_client.get().put(&cfg.endpoint),
+            _ => cfg.http_client.get().post(&cfg.endpoint),
+        };
+        let mut req = request
             .header("Content-Type", "application/json")
             .json(&payload);
 
