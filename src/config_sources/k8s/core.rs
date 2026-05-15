@@ -301,7 +301,7 @@ fn auto_workloads_for_service(
     endpoint_slice_indices: &[usize],
 ) -> Result<Vec<Workload>, K8sTranslateError> {
     let mut endpoints_by_pod = BTreeMap::new();
-    let mut seen_endpoint_addresses = HashSet::new();
+    let mut seen_endpoint_addresses: BTreeMap<PodKey, HashSet<String>> = BTreeMap::new();
     for &slice_index in endpoint_slice_indices {
         let Some(slice) = acc.core.endpoint_slices.get(slice_index) else {
             continue;
@@ -325,8 +325,9 @@ fn auto_workloads_for_service(
                     ready: true,
                     node_name: endpoint.node_name.clone(),
                 });
+            let seen_addresses = seen_endpoint_addresses.entry(pod_key).or_default();
             for address in &endpoint.addresses {
-                if seen_endpoint_addresses.insert((pod_key.clone(), address.clone())) {
+                if seen_addresses.insert(address.clone()) {
                     merged.addresses.push(address.clone());
                 }
             }
@@ -558,7 +559,11 @@ fn app_protocol_from_hint(value: &str) -> Option<AppProtocol> {
         // Keep this before generic HTTP prefix matching so service hints like
         // `https` keep their TLS transport semantics instead of becoming HTTP.
         Some(AppProtocol::Tls)
-    } else if value.starts_with("http") || value == "kubernetes.io/ws" {
+    } else if value.starts_with("http")
+        || value == "kubernetes.io/ws"
+        || value == "ws"
+        || value == "wss"
+    {
         Some(AppProtocol::Http)
     } else if value.starts_with("mongo") {
         Some(AppProtocol::Mongo)
@@ -677,6 +682,12 @@ mod tests {
         assert_eq!(app_protocol_from_hint("HTTPS"), Some(AppProtocol::Tls));
         assert_eq!(app_protocol_from_hint("http"), Some(AppProtocol::Http));
         assert_eq!(app_protocol_from_hint("http2"), Some(AppProtocol::Http2));
+        assert_eq!(app_protocol_from_hint("ws"), Some(AppProtocol::Http));
+        assert_eq!(app_protocol_from_hint("wss"), Some(AppProtocol::Http));
+        assert_eq!(
+            app_protocol_from_hint("kubernetes.io/ws"),
+            Some(AppProtocol::Http)
+        );
     }
 
     fn endpoint_slice(pods: Vec<(&str, &str)>) -> K8sObject {

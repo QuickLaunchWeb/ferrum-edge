@@ -295,7 +295,7 @@ impl DnsResolutionTable {
                             let (_, ips) = &entries[0];
                             svc_ips.extend(ips.iter());
                         } else {
-                            debug!(
+                            warn!(
                                 service = %svc.name,
                                 namespace = %svc.namespace,
                                 spiffe_id = %wl_ref.spiffe_id,
