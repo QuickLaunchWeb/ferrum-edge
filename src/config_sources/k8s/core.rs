@@ -115,6 +115,8 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
         if let Some(key) =
             K8sServiceKey::new(workload.namespace.clone(), workload.service_name.clone())
         {
+            // Keep duplicate SPIFFE IDs: replicated pods can share one service
+            // account identity while still requiring distinct WorkloadRefs.
             workload_refs_by_service
                 .entry(key)
                 .or_default()
@@ -1313,13 +1315,13 @@ mod tests {
         assert_eq!(mesh.services.len(), 1);
         assert_eq!(mesh.workloads.len(), 10_000);
         assert!(
-            current_rss_bytes() < 2 * 1024 * 1024 * 1024,
-            "synthetic 10k-pod translation should stay below 2 GiB RSS"
+            peak_rss_bytes() < 2 * 1024 * 1024 * 1024,
+            "synthetic 10k-pod translation should keep peak RSS below 2 GiB"
         );
     }
 
     #[cfg(target_os = "linux")]
-    fn current_rss_bytes() -> u64 {
+    fn peak_rss_bytes() -> u64 {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
         // SAFETY: getrusage initializes the provided rusage struct on success.
         let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };

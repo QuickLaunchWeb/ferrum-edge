@@ -828,6 +828,8 @@ fn build_east_west_service_targets(
     local_cluster: Option<&str>,
 ) -> Vec<UpstreamTarget> {
     let mut targets = Vec::new();
+    // WorkloadRefs are intentionally matched one-to-one by workload index:
+    // replicated pods can share a SPIFFE ID and still produce distinct targets.
     let mut used_workload_indices = std::collections::HashSet::new();
 
     for workload_ref in &service.workloads {

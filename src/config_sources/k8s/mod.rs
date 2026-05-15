@@ -575,7 +575,7 @@ pub(crate) fn workload_entry_service_key_from_host(
         let host = normalized_service_host(host)?;
         let parts: Vec<&str> = host.split('.').collect();
         match parts.as_slice() {
-            [name, namespace] if known_namespaces.iter().any(|known| known == namespace) => {
+            [name, namespace] if known_namespaces.contains(*namespace) => {
                 K8sServiceKey::new((*namespace).to_string(), (*name).to_string())
             }
             _ => None,

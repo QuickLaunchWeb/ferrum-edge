@@ -70,7 +70,7 @@ impl MeshServiceDiscoverer {
     fn workload_matches_service(
         service: &MeshService,
         workload: &Workload,
-        all_workloads: &[Workload],
+        matching_service_spiffe_ids: &HashSet<&str>,
     ) -> bool {
         if workload.namespace != service.namespace {
             return false;
@@ -97,11 +97,7 @@ impl MeshServiceDiscoverer {
         // points at another logical service. Prefer a matching service_name when
         // duplicate SPIFFE entries exist, but do not blackhole explicit refs when
         // the metadata is stale or absent.
-        !all_workloads.iter().any(|candidate| {
-            candidate.namespace == service.namespace
-                && candidate.spiffe_id == workload.spiffe_id
-                && candidate.service_name == service.name
-        })
+        !matching_service_spiffe_ids.contains(workload.spiffe_id.as_str())
     }
 
     fn target_port_for_workload(
@@ -192,11 +188,17 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
 
         let mut targets = Vec::new();
         let mut seen = HashSet::new();
-        for workload in mesh
+        let matching_service_spiffe_ids: HashSet<&str> = mesh
             .workloads
             .iter()
-            .filter(|workload| Self::workload_matches_service(service, workload, &mesh.workloads))
-        {
+            .filter(|workload| {
+                workload.namespace == service.namespace && workload.service_name == service.name
+            })
+            .map(|workload| workload.spiffe_id.as_str())
+            .collect();
+        for workload in mesh.workloads.iter().filter(|workload| {
+            Self::workload_matches_service(service, workload, &matching_service_spiffe_ids)
+        }) {
             let Some(selected_port) =
                 Self::target_port_for_workload(selected_service_port.as_ref(), workload)
             else {
