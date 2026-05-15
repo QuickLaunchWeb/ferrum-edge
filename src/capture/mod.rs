@@ -205,6 +205,9 @@ impl IptablesPlan {
                 true
             })
             .collect();
+        // includeOutboundPorts without an explicit include-CIDR annotation means
+        // "capture only these ports" rather than "add these ports to the
+        // implicit 0.0.0.0/0 catch-all". Explicit include CIDRs stay additive.
         let emit_include_cidrs =
             config.include_outbound_ports.is_empty() || config.include_cidrs_explicit;
         if emit_include_cidrs {

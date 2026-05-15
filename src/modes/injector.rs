@@ -2058,6 +2058,27 @@ mod tests {
     }
 
     #[test]
+    fn capture_config_ferrum_include_outbound_ports_wildcard_clears_port_filter() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "ferrum.io/includeOutboundPorts": "*"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+
+        let capture = capture_config(&config, &pod).expect("capture config");
+
+        assert!(
+            capture.include_outbound_ports.is_empty(),
+            "Ferrum wildcard includeOutboundPorts means all ports, so no port filter should be carried"
+        );
+    }
+
+    #[test]
     fn capture_config_accepts_duplicate_include_outbound_ports_wildcard_aliases() {
         let pod = json!({
             "metadata": {
