@@ -228,10 +228,8 @@ fn select_next_cross_protocol_retry_target(
         return None;
     };
 
-    let has_port_override = proxy
-        .dispatch_port_overrides
-        .as_ref()
-        .is_some_and(|overrides| overrides.contains_key(&prev_target.port));
+    let retry_override_port =
+        crate::proxy::retry_port_override_dispatch_port(epoch, upstream_id, proxy);
     let health_ctx = crate::load_balancer::HealthContext {
         active_unhealthy: &state.health_checker.active_unhealthy_targets,
         proxy_passive: state
@@ -239,12 +237,12 @@ fn select_next_cross_protocol_retry_target(
             .passive_health
             .get(&proxy.id)
             .map(|r| r.value().clone()),
-        max_ejection_percent: if has_port_override {
+        max_ejection_percent: if let Some(port) = retry_override_port {
             crate::load_balancer::LoadBalancerCache::max_ejection_percent_for_port_from(
                 &epoch.load_balancer,
                 upstream_id,
                 proxy,
-                prev_target.port,
+                port,
             )
         } else {
             crate::load_balancer::LoadBalancerCache::max_ejection_percent_from(
@@ -255,12 +253,12 @@ fn select_next_cross_protocol_retry_target(
     };
 
     let next = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
-        if has_port_override {
+        if let Some(port) = retry_override_port {
             crate::load_balancer::LoadBalancerCache::select_next_target_for_port_subset_from(
                 &epoch.load_balancer,
                 upstream_id,
                 hash_key,
-                prev_target.port,
+                port,
                 subset_name,
                 prev_target,
                 Some(&health_ctx),
@@ -275,12 +273,12 @@ fn select_next_cross_protocol_retry_target(
                 Some(&health_ctx),
             )
         }
-    } else if has_port_override {
+    } else if let Some(port) = retry_override_port {
         crate::load_balancer::LoadBalancerCache::select_next_target_for_port_from(
             &epoch.load_balancer,
             upstream_id,
             hash_key,
-            prev_target.port,
+            port,
             prev_target,
             Some(&health_ctx),
         )

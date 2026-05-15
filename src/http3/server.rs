@@ -2509,10 +2509,11 @@ async fn handle_h3_request(
                     (&proxy.upstream_id, &current_target)
                     && let Some(ref hash_key) = lb_hash_key
                     && let Some(next) = {
-                        let has_port_override = proxy
-                            .dispatch_port_overrides
-                            .as_ref()
-                            .is_some_and(|overrides| overrides.contains_key(&prev_target.port));
+                        let retry_override_port = crate::proxy::retry_port_override_dispatch_port(
+                            &epoch,
+                            upstream_id,
+                            &proxy,
+                        );
                         let health_ctx = crate::load_balancer::HealthContext {
                             active_unhealthy: &state.health_checker.active_unhealthy_targets,
                             proxy_passive: state
@@ -2520,12 +2521,12 @@ async fn handle_h3_request(
                                 .passive_health
                                 .get(&proxy.id)
                                 .map(|r| r.value().clone()),
-                            max_ejection_percent: if has_port_override {
+                            max_ejection_percent: if let Some(port) = retry_override_port {
                                 LoadBalancerCache::max_ejection_percent_for_port_from(
                                     &epoch.load_balancer,
                                     upstream_id,
                                     &proxy,
-                                    prev_target.port,
+                                    port,
                                 )
                             } else {
                                 LoadBalancerCache::max_ejection_percent_from(
@@ -2535,12 +2536,12 @@ async fn handle_h3_request(
                             },
                         };
                         if let Some(subset_name) = proxy.upstream_subset.as_deref() {
-                            if has_port_override {
+                            if let Some(port) = retry_override_port {
                                 LoadBalancerCache::select_next_target_for_port_subset_from(
                                     &epoch.load_balancer,
                                     upstream_id,
                                     hash_key,
-                                    prev_target.port,
+                                    port,
                                     subset_name,
                                     prev_target,
                                     Some(&health_ctx),
@@ -2555,12 +2556,12 @@ async fn handle_h3_request(
                                     Some(&health_ctx),
                                 )
                             }
-                        } else if has_port_override {
+                        } else if let Some(port) = retry_override_port {
                             LoadBalancerCache::select_next_target_for_port_from(
                                 &epoch.load_balancer,
                                 upstream_id,
                                 hash_key,
-                                prev_target.port,
+                                port,
                                 prev_target,
                                 Some(&health_ctx),
                             )

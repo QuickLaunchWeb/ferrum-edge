@@ -9741,7 +9741,7 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     std::borrow::Cow::Owned(owned)
 }
 
-fn retry_port_override_dispatch_port(
+pub(crate) fn retry_port_override_dispatch_port(
     epoch: &RequestEpoch,
     upstream_id: &str,
     proxy: &Proxy,
