@@ -291,8 +291,17 @@ impl DnsResolutionTable {
                         }
                     }
                     if !found_matching_service {
-                        for (_, ips) in entries {
+                        if entries.len() == 1 {
+                            let (_, ips) = &entries[0];
                             svc_ips.extend(ips.iter());
+                        } else {
+                            debug!(
+                                service = %svc.name,
+                                namespace = %svc.namespace,
+                                spiffe_id = %wl_ref.spiffe_id,
+                                service_identities = entries.len(),
+                                "Skipping ambiguous mesh DNS workload fallback"
+                            );
                         }
                     }
                 }
@@ -2369,6 +2378,25 @@ mod tests {
         assert!(api_ips.contains(&"10.1.0.1".parse::<IpAddr>().unwrap()));
         assert_eq!(metrics_ips.len(), 1);
         assert!(metrics_ips.contains(&"10.1.0.2".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn resolution_table_skips_ambiguous_mismatched_service_fallback() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/shared";
+        let api = test_workload_for_service(spiffe, "api", "default", vec!["10.1.0.1"]);
+        let metrics = test_workload_for_service(spiffe, "metrics", "default", vec!["10.1.0.2"]);
+        let slice = MeshSlice {
+            workloads: vec![api, metrics],
+            services: vec![test_mesh_service("reviews", "default", vec![spiffe])],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+
+        assert!(
+            table.resolve("reviews.default.svc.cluster.local").is_none(),
+            "ambiguous fallback must not include every service sharing the SPIFFE ID"
+        );
     }
 
     #[test]

@@ -324,7 +324,11 @@ fn auto_workloads_for_service(
                     ready: true,
                     node_name: endpoint.node_name.clone(),
                 });
-            merged.addresses.extend(endpoint.addresses.iter().cloned());
+            for address in &endpoint.addresses {
+                if !merged.addresses.contains(address) {
+                    merged.addresses.push(address.clone());
+                }
+            }
             if merged.node_name.is_none() {
                 merged.node_name = endpoint.node_name.clone();
             }
@@ -548,6 +552,8 @@ fn app_protocol_from_hint(value: &str) -> Option<AppProtocol> {
     } else if value.contains("http2") || value.contains("h2c") {
         Some(AppProtocol::Http2)
     } else if value.starts_with("tls") || value == "https" {
+        // Keep this before generic HTTP prefix matching so service hints like
+        // `https` keep their TLS transport semantics instead of becoming HTTP.
         Some(AppProtocol::Tls)
     } else if value.starts_with("http") || value == "kubernetes.io/ws" {
         Some(AppProtocol::Http)

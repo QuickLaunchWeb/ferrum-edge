@@ -494,6 +494,7 @@ pub async fn run(
             watch_istio: env_config.k8s_watch_istio_crds,
             watch_gateway_api: env_config.k8s_watch_gateway_api_crds,
             watch_core: env_config.k8s_pod_discovery_enabled,
+            pod_discovery_enabled: env_config.k8s_pod_discovery_enabled,
             watch_node_locality: env_config.k8s_node_locality_enabled,
             debounce_ms: env_config.k8s_reconcile_debounce_ms,
             full_sync_interval_secs: env_config.k8s_full_sync_interval_secs,

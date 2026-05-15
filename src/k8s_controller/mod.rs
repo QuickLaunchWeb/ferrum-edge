@@ -35,6 +35,7 @@ pub struct K8sControllerConfig {
     pub watch_istio: bool,
     pub watch_gateway_api: bool,
     pub watch_core: bool,
+    pub pod_discovery_enabled: bool,
     pub watch_node_locality: bool,
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
@@ -76,6 +77,7 @@ pub async fn start_k8s_controller(
         watch_istio = controller_config.watch_istio,
         watch_gateway_api = controller_config.watch_gateway_api,
         watch_core = controller_config.watch_core,
+        pod_discovery_enabled = controller_config.pod_discovery_enabled,
         watch_node_locality = controller_config.watch_node_locality,
         watch_namespaces = ?controller_config.watch_namespaces,
         namespace = controller_config.namespace,
@@ -112,7 +114,7 @@ pub async fn start_k8s_controller(
         debounce_ms: controller_config.debounce_ms,
         full_sync_interval_secs: controller_config.full_sync_interval_secs,
         vs_header_routing_experimental: controller_config.vs_header_routing_experimental,
-        pod_discovery_enabled: controller_config.watch_core,
+        pod_discovery_enabled: controller_config.pod_discovery_enabled,
     };
 
     let reconciler_handle = spawn_reconcile_loop(
