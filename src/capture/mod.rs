@@ -39,6 +39,10 @@ pub struct CaptureConfig {
     pub inbound_port: u16,
     pub outbound_port: u16,
     pub include_cidrs: Vec<String>,
+    /// True when `include_cidrs` came from operator or pod configuration rather
+    /// than the implicit catch-all default. When includeOutboundPorts is set,
+    /// the implicit default must not swallow all ports before port rules match.
+    pub include_cidrs_explicit: bool,
     pub include_outbound_ports: Vec<u16>,
     pub exclude_cidrs: Vec<String>,
     pub exclude_ports: Vec<u16>,
@@ -56,6 +60,7 @@ impl CaptureConfig {
             inbound_port,
             outbound_port,
             include_cidrs: vec!["0.0.0.0/0".to_string()],
+            include_cidrs_explicit: false,
             include_outbound_ports: Vec::new(),
             exclude_cidrs: Vec::new(),
             exclude_ports: Vec::new(),
@@ -72,10 +77,10 @@ impl CaptureConfig {
             Some(raw) => Some(parse_proxy_uid(&raw)?),
             None => Some(DEFAULT_PROXY_UID),
         };
-        let include_cidrs = parse_cidr_env(
-            &resolve_ferrum_var("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS")
-                .unwrap_or_else(|| "0.0.0.0/0".to_string()),
-        );
+        let include_cidrs_raw = resolve_ferrum_var("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS");
+        let include_cidrs_explicit = include_cidrs_raw.is_some();
+        let include_cidrs =
+            parse_cidr_env(&include_cidrs_raw.unwrap_or_else(|| "0.0.0.0/0".to_string()));
         validate_cidr_list(&include_cidrs)?;
         let exclude_cidrs = parse_cidr_env(
             &resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS").unwrap_or_default(),
@@ -96,6 +101,7 @@ impl CaptureConfig {
             inbound_port: 15006,
             outbound_port: 15001,
             include_cidrs,
+            include_cidrs_explicit,
             include_outbound_ports: Vec::new(),
             exclude_cidrs,
             exclude_ports,
@@ -199,15 +205,19 @@ impl IptablesPlan {
                 true
             })
             .collect();
-        for cidr in include_cidrs {
-            commands.push(idempotent_append(
-                "nat",
-                "FERRUM_MESH_OUTBOUND",
-                &format!(
-                    "-p tcp -d {cidr} -j REDIRECT --to-ports {}",
-                    config.outbound_port
-                ),
-            ));
+        let emit_include_cidrs =
+            config.include_outbound_ports.is_empty() || config.include_cidrs_explicit;
+        if emit_include_cidrs {
+            for cidr in include_cidrs {
+                commands.push(idempotent_append(
+                    "nat",
+                    "FERRUM_MESH_OUTBOUND",
+                    &format!(
+                        "-p tcp -d {cidr} -j REDIRECT --to-ports {}",
+                        config.outbound_port
+                    ),
+                ));
+            }
         }
         for port in &config.include_outbound_ports {
             commands.push(idempotent_append(
@@ -785,10 +795,11 @@ mod tests {
             );
         }
         assert!(
-            plan.commands
+            !plan
+                .commands
                 .iter()
                 .any(|cmd| cmd.contains("-p tcp -d 0.0.0.0/0 -j REDIRECT")),
-            "port-scoped includes should not remove CIDR captures"
+            "implicit catch-all CIDR must not capture all ports before port rules"
         );
     }
 
@@ -797,6 +808,7 @@ mod tests {
         let mut config = CaptureConfig::explicit(15006, 15001);
         config.mode = CaptureMode::Iptables;
         config.include_cidrs = vec!["10.0.0.0/8".to_string()];
+        config.include_cidrs_explicit = true;
         config.include_outbound_ports = vec![5432];
 
         let plan = IptablesPlan::for_config(&config);
@@ -831,6 +843,7 @@ mod tests {
         let mut config = CaptureConfig::explicit(15006, 15001);
         config.mode = CaptureMode::Iptables;
         config.include_cidrs = vec!["fd00::/8".to_string()];
+        config.include_cidrs_explicit = true;
         config.include_outbound_ports = vec![5432];
 
         let plan = IptablesPlan::for_config(&config);

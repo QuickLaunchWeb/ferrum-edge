@@ -681,6 +681,7 @@ mod tests {
                 inbound_port: 15006,
                 outbound_port: 15001,
                 include_cidrs: vec!["10.0.0.0/8".to_string()],
+                include_cidrs_explicit: true,
                 include_outbound_ports: Vec::new(),
                 exclude_cidrs: vec!["10.0.0.1/32".to_string()],
                 exclude_ports: vec![15020],

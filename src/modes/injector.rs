@@ -887,17 +887,20 @@ fn capture_config(config: &InjectorConfig, pod: &Value) -> Result<CaptureConfig,
         .and_then(|m| m.get(ISTIO_INCLUDE_OUTBOUND_IP_RANGES_ANNOTATION))
         .and_then(Value::as_str);
     let include_annotation_cidrs = include_annotation.map(|raw| parse_cidr_list_env(Some(raw)));
-    let resolved_include = match include_annotation_cidrs {
+    let (resolved_include, include_cidrs_explicit) = match include_annotation_cidrs {
         Some(cidrs) if !cidrs.is_empty() => {
             validate_cidr_list(&cidrs).map_err(|e| {
                 format!("invalid {ISTIO_INCLUDE_OUTBOUND_IP_RANGES_ANNOTATION}: {e}")
             })?;
-            cidrs
+            (cidrs, true)
         }
-        _ if !config.include_outbound_cidrs.is_empty() => config.include_outbound_cidrs.clone(),
-        _ => vec!["0.0.0.0/0".to_string()],
+        _ if !config.include_outbound_cidrs.is_empty() => {
+            (config.include_outbound_cidrs.clone(), true)
+        }
+        _ => (vec!["0.0.0.0/0".to_string()], false),
     };
     capture.include_cidrs = resolved_include;
+    capture.include_cidrs_explicit = include_cidrs_explicit;
 
     let mut resolved_exclude = config.exclude_outbound_cidrs.clone();
     if let Some(raw) = annotations
@@ -1254,7 +1257,7 @@ mod tests {
         for port in [5432, 9092, 15090] {
             assert!(
                 commands.contains(&format!(
-                    "-p tcp -d 0.0.0.0/0 --dport {port} -j REDIRECT --to-ports 15001"
+                    "-p tcp --dport {port} -j REDIRECT --to-ports 15001"
                 )),
                 "includeOutboundPorts REDIRECT missing for port {port}: {commands}"
             );
@@ -1262,6 +1265,45 @@ mod tests {
         assert!(
             !commands.contains("-p tcp -d 0.0.0.0/0 -j REDIRECT --to-ports 15001"),
             "port-scoped include rules should replace the CIDR-only catch-all"
+        );
+    }
+
+    #[test]
+    fn patch_includes_outbound_ports_additive_to_explicit_outbound_ip_ranges() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/includeOutboundIPRanges": "10.0.0.0/8",
+                    "traffic.sidecar.istio.io/includeOutboundPorts": "5432"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+        let init = patch
+            .iter()
+            .find(|op| op.path == "/spec/initContainers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("init container");
+        let commands = init
+            .pointer("/args/0")
+            .and_then(Value::as_str)
+            .expect("iptables plan");
+
+        assert!(
+            commands.contains("-p tcp -d 10.0.0.0/8 -j REDIRECT --to-ports 15001"),
+            "explicit includeOutboundIPRanges rule missing: {commands}"
+        );
+        assert!(
+            commands.contains("-p tcp --dport 5432 -j REDIRECT --to-ports 15001"),
+            "includeOutboundPorts rule missing: {commands}"
+        );
+        assert!(
+            !commands.contains("-p tcp -d 10.0.0.0/8 --dport 5432 -j REDIRECT"),
+            "includeOutboundPorts must not be intersected with includeOutboundIPRanges: {commands}"
         );
     }
 
@@ -1835,6 +1877,10 @@ mod tests {
         let capture = capture_config(&config, &pod).expect("capture config");
 
         assert_eq!(capture.include_cidrs, vec!["0.0.0.0/0".to_string()]);
+        assert!(
+            !capture.include_cidrs_explicit,
+            "implicit catch-all include must be distinguishable from operator-provided CIDRs"
+        );
         assert!(capture.exclude_cidrs.is_empty());
         assert!(capture.exclude_inbound_ports.is_empty());
     }
@@ -1865,6 +1911,7 @@ mod tests {
             vec!["10.0.0.0/8".to_string()],
             "whitespace-only annotation must fall through to env-derived value"
         );
+        assert!(capture.include_cidrs_explicit);
     }
 
     #[test]
@@ -1888,6 +1935,7 @@ mod tests {
             vec!["10.0.0.0/8".to_string()],
             "comma-only annotation must fall through to env-derived value"
         );
+        assert!(capture.include_cidrs_explicit);
     }
 
     #[test]
@@ -1910,6 +1958,7 @@ mod tests {
             vec!["0.0.0.0/0".to_string()],
             "empty annotation + empty env must default to 0.0.0.0/0 (must NOT produce zero include rules)"
         );
+        assert!(!capture.include_cidrs_explicit);
     }
 
     // Same fall-through rule on the exclude path: a comma-only annotation must
