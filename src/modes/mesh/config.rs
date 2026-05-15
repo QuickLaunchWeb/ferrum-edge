@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use crate::identity::spiffe::{SpiffeId, TrustDomain};
 use crate::identity::{JwtAuthority as IdentityJwtAuthority, TrustBundle as IdentityTrustBundle};
@@ -472,7 +473,7 @@ pub enum TelemetryTracingMode {
 /// shim on older DPs (serde will simply fail to deserialise an unknown
 /// variant and the slice update is rejected at slice-apply time, consistent
 /// with the rest of the mesh slice contract).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "config")]
 pub enum TracingProvider {
     Zipkin {
@@ -491,6 +492,28 @@ pub enum TracingProvider {
     OpenTelemetry {
         endpoint: String,
     },
+}
+
+impl fmt::Debug for TracingProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zipkin { url } => f.debug_struct("Zipkin").field("url", url).finish(),
+            Self::Datadog { agent_url, service } => f
+                .debug_struct("Datadog")
+                .field("agent_url", agent_url)
+                .field("service", service)
+                .finish(),
+            Self::Lightstep { collector_url, .. } => f
+                .debug_struct("Lightstep")
+                .field("collector_url", collector_url)
+                .field("access_token", &"<redacted>")
+                .finish(),
+            Self::OpenTelemetry { endpoint } => f
+                .debug_struct("OpenTelemetry")
+                .field("endpoint", endpoint)
+                .finish(),
+        }
+    }
 }
 
 fn deserialize_tracing_providers<'de, D>(deserializer: D) -> Result<Vec<TracingProvider>, D::Error>

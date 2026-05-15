@@ -2262,6 +2262,19 @@ fn telemetry_sampling_percentage(
 
 fn telemetry_custom_tag_env_var_is_sensitive(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
+    if [
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "TOKEN",
+        "PRIVATE_KEY",
+        "CLIENT_KEY",
+    ]
+    .iter()
+    .any(|marker| upper.contains(marker))
+    {
+        return true;
+    }
     if matches!(
         upper.as_str(),
         "DATABASE_URL"
@@ -2273,18 +2286,9 @@ fn telemetry_custom_tag_env_var_is_sensitive(name: &str) -> bool {
         return true;
     }
     upper.starts_with("FERRUM_")
-        && [
-            "SECRET",
-            "PASSWORD",
-            "PASSWD",
-            "TOKEN",
-            "PRIVATE_KEY",
-            "CLIENT_KEY",
-            "DB_URL",
-            "DATABASE_URL",
-        ]
-        .iter()
-        .any(|marker| upper.contains(marker))
+        && ["DB_URL", "DATABASE_URL"]
+            .iter()
+            .any(|marker| upper.contains(marker))
 }
 
 fn extend_unique_tracing_providers(
@@ -4179,6 +4183,12 @@ mod tests {
                                     "name": "FERRUM_ADMIN_JWT_SECRET",
                                     "defaultValue": "must-not-leak"
                                 }
+                            },
+                            "redis_password": {
+                                "environment": {
+                                    "name": "REDIS_PASSWORD",
+                                    "defaultValue": "must-not-leak"
+                                }
                             }
                         }
                     }]
@@ -4196,6 +4206,7 @@ mod tests {
             .expect("tracing config");
 
         assert!(!tracing.custom_tags.contains_key("admin_secret"));
+        assert!(!tracing.custom_tags.contains_key("redis_password"));
     }
 
     #[test]
@@ -4562,12 +4573,15 @@ mod tests {
             .as_ref()
             .expect("tracing config");
         match tracing.providers.first().expect("provider translated") {
-            TracingProvider::Lightstep {
+            provider @ TracingProvider::Lightstep {
                 collector_url,
                 access_token,
             } => {
                 assert_eq!(collector_url, "https://ingest.lightstep.com:443");
                 assert_eq!(access_token, "secret-token");
+                let debug = format!("{provider:?}");
+                assert!(debug.contains("<redacted>"));
+                assert!(!debug.contains("secret-token"));
             }
             other => panic!("expected Lightstep, got {other:?}"),
         }
