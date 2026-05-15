@@ -3,6 +3,7 @@ use ferrum_edge::config::types::{
     ActiveHealthCheck, AuthMode, BackendScheme, BackoffStrategy, CircuitBreakerConfig,
     ConsulConfig, Consumer, DispatchKind, GatewayConfig, HealthCheckConfig, KubernetesConfig,
     LoadBalancerAlgorithm, MAX_BACKEND_HOST_LENGTH, MAX_BACKEND_PATH_LENGTH,
+    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
     MAX_CREDENTIAL_VALUE_LENGTH, MAX_CREDENTIALS_SIZE, MAX_FILE_PATH_LENGTH, MAX_HOSTS_PER_PROXY,
     MAX_HTTP2_MAX_FRAME_SIZE, MAX_HTTP3_CONNECTIONS_PER_BACKEND, MAX_LISTEN_PATH_LENGTH,
     MAX_NAME_LENGTH, MAX_PLUGIN_CONFIG_SIZE, MAX_SD_STRING_LENGTH, MAX_TARGETS_PER_UPSTREAM,
@@ -108,6 +109,8 @@ fn make_upstream(id: &str) -> Upstream {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -515,6 +518,113 @@ fn test_consumer_acl_groups_control_chars_rejected() {
 #[test]
 fn test_upstream_valid_fields_passes() {
     let upstream = make_upstream("test");
+    assert!(upstream.validate_fields().is_ok());
+}
+
+#[test]
+fn test_upstream_backend_tls_sni_validated() {
+    let mut upstream = make_upstream("test");
+    upstream.backend_tls_sni = Some("http://reviews.mesh.internal".into());
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_sni") && e.contains("scheme"))
+    );
+
+    let mut upstream = make_upstream("test");
+    upstream.backend_tls_sni = Some("*.mesh.internal".into());
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_sni") && e.contains("exact hostname"))
+    );
+}
+
+#[test]
+fn test_upstream_backend_tls_sni_rejects_ip_literals() {
+    // RFC 6066 §3: SNI host_name must not be an IP address.
+    let mut upstream = make_upstream("test");
+    upstream.backend_tls_sni = Some("10.0.0.8".into());
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_sni") && e.contains("IP address")),
+        "got: {errs:?}"
+    );
+
+    upstream.backend_tls_sni = Some("2001:db8::1".into());
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_sni") && e.contains("IP address")),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn test_upstream_backend_tls_san_allow_list_validated() {
+    let mut upstream = make_upstream("test");
+    upstream.backend_tls_san_allow_list = vec![
+        "reviews.mesh.internal".into(),
+        "spiffe://cluster.local/ns/default/sa/reviews".into(),
+        "10.0.0.8".into(),
+    ];
+    assert!(upstream.validate_fields().is_ok());
+
+    upstream.backend_tls_san_allow_list.push(String::new());
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_san_allow_list[3]") && e.contains("empty"))
+    );
+}
+
+#[test]
+fn test_upstream_backend_tls_san_allow_list_limit() {
+    let mut upstream = make_upstream("test");
+    upstream.backend_tls_san_allow_list = (0..=MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES)
+        .map(|i| format!("san-{i}.mesh.internal"))
+        .collect();
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_san_allow_list") && e.contains("more than"))
+    );
+}
+
+#[test]
+fn test_upstream_backend_tls_san_allow_list_entry_length_limit() {
+    let mut upstream = make_upstream("test");
+    upstream.backend_tls_san_allow_list = vec![format!(
+        "{}.mesh.internal",
+        "a".repeat(MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH)
+    )];
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_san_allow_list[0]") && e.contains("must not exceed"))
+    );
+}
+
+#[test]
+fn test_upstream_backend_tls_san_allow_list_rejects_spiffe_without_path() {
+    let mut upstream = make_upstream("test");
+    upstream.backend_tls_san_allow_list = vec!["spiffe://cluster.local".into()];
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_san_allow_list[0]") && e.contains("non-empty path"))
+    );
+
+    upstream.backend_tls_san_allow_list = vec!["spiffe://cluster.local/".into()];
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_san_allow_list[0]") && e.contains("non-empty path"))
+    );
+
+    upstream.backend_tls_san_allow_list =
+        vec!["spiffe://cluster.local/ns/default/sa/reviews".into()];
     assert!(upstream.validate_fields().is_ok());
 }
 
@@ -1816,6 +1926,8 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

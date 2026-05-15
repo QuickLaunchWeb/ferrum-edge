@@ -48,7 +48,9 @@ use crate::proxy::headers::{
     parse_connection_listed_headers,
 };
 use crate::tls::TlsPolicy;
-use crate::tls::backend::{BackendTlsConfigBuilder, BackendTlsConfigCache};
+use crate::tls::backend::{
+    BackendTlsConfigBuilder, BackendTlsConfigCache, append_backend_tls_pool_key_fields,
+};
 
 /// Sum type for gRPC request bodies: either pre-buffered or streaming from the
 /// client. This allows a single pool type (`SendRequest<GrpcBody>`) to handle
@@ -184,27 +186,13 @@ fn write_grpc_pool_key(buf: &mut String, host: &str, port: u16, proxy: &Proxy) {
     let _ = write!(buf, "{}|{}|{}|", host, port, tls);
     buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
     buf.push('|');
-    buf.push_str(
-        proxy
-            .resolved_tls
-            .server_ca_cert_path
-            .as_deref()
-            .unwrap_or_default(),
+    append_backend_tls_pool_key_fields(
+        buf,
+        &proxy.resolved_tls,
+        proxy.resolved_tls.client_cert_path.as_deref(),
+        proxy.resolved_tls.client_key_path.as_deref(),
+        proxy.resolved_tls.verify_server_cert,
     );
-    buf.push('|');
-    buf.push_str(
-        proxy
-            .resolved_tls
-            .client_cert_path
-            .as_deref()
-            .unwrap_or_default(),
-    );
-    buf.push('|');
-    buf.push(if proxy.resolved_tls.verify_server_cert {
-        '1'
-    } else {
-        '0'
-    });
 }
 
 fn grpc_pool_key_owned(proxy: &Proxy) -> String {
@@ -1786,6 +1774,31 @@ mod tests {
             owned, from_thread_local,
             "thread-local key must equal grpc_pool_key_owned bytes — \
              divergence would split the cache"
+        );
+    }
+
+    #[test]
+    fn grpc_pool_key_distinguishes_backend_tls_sni_and_sans() {
+        let mut p1 = grpc_pool_test_proxy();
+        p1.resolved_tls.sni = Some("reviews.mesh.internal".to_string());
+        p1.resolved_tls.san_allow_list = vec!["reviews.mesh.internal".to_string()];
+        p1.resolved_tls.recompute_san_digest();
+        let mut p2 = p1.clone();
+        p2.resolved_tls.sni = Some("ratings.mesh.internal".to_string());
+
+        assert_ne!(
+            grpc_pool_key_owned(&p1),
+            grpc_pool_key_owned(&p2),
+            "backend TLS SNI must separate gRPC pool keys"
+        );
+
+        p2.resolved_tls.sni = p1.resolved_tls.sni.clone();
+        p2.resolved_tls.san_allow_list = vec!["ratings.mesh.internal".to_string()];
+        p2.resolved_tls.recompute_san_digest();
+        assert_ne!(
+            grpc_pool_key_owned(&p1),
+            grpc_pool_key_owned(&p2),
+            "backend TLS SAN allow-list must separate gRPC pool keys"
         );
     }
 

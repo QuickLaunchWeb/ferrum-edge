@@ -105,10 +105,111 @@ fn make_upstream(id: &str) -> Upstream {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
+}
+
+#[test]
+fn upstream_backend_tls_sni_and_sans_round_trip_through_serde() {
+    let mut upstream = make_upstream("tls-upstream");
+    upstream.backend_tls_sni = Some("reviews.mesh.internal".to_string());
+    upstream.backend_tls_san_allow_list = vec![
+        "reviews.mesh.internal".to_string(),
+        "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
+    ];
+
+    let json = serde_json::to_string(&upstream).expect("serialize upstream");
+    let parsed: Upstream = serde_json::from_str(&json).expect("deserialize upstream");
+
+    assert_eq!(
+        parsed.backend_tls_sni.as_deref(),
+        Some("reviews.mesh.internal")
+    );
+    assert_eq!(
+        parsed.backend_tls_san_allow_list,
+        upstream.backend_tls_san_allow_list
+    );
+}
+
+#[test]
+fn upstream_backend_tls_new_fields_default_when_absent() {
+    let upstream: Upstream = serde_json::from_value(serde_json::json!({
+        "id": "old-upstream",
+        "targets": [{"host": "reviews.default.svc.cluster.local", "port": 8080}]
+    }))
+    .expect("old upstream shape should deserialize");
+
+    assert!(upstream.backend_tls_sni.is_none());
+    assert!(upstream.backend_tls_san_allow_list.is_empty());
+
+    let json = serde_json::to_value(&upstream).expect("serialize upstream");
+    let object = json.as_object().expect("upstream object");
+    assert!(!object.contains_key("backend_tls_sni"));
+    assert!(!object.contains_key("backend_tls_san_allow_list"));
+}
+
+#[test]
+fn resolve_upstream_tls_projects_sni_and_sans_to_proxy_cache() {
+    let mut upstream = make_upstream("reviews-u");
+    upstream.backend_tls_sni = Some("reviews.mesh.internal".to_string());
+    upstream.backend_tls_san_allow_list =
+        vec!["spiffe://cluster.local/ns/default/sa/reviews".to_string()];
+    let mut proxy = make_proxy("reviews-p", "/reviews");
+    proxy.upstream_id = Some("reviews-u".to_string());
+
+    let mut config = GatewayConfig {
+        upstreams: vec![upstream],
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    config.resolve_upstream_tls();
+
+    let resolved = &config.proxies[0].resolved_tls;
+    assert_eq!(resolved.sni.as_deref(), Some("reviews.mesh.internal"));
+    assert_eq!(
+        resolved.san_allow_list,
+        vec!["spiffe://cluster.local/ns/default/sa/reviews".to_string()]
+    );
+}
+
+#[test]
+fn upstream_normalize_fields_lowercases_backend_tls_sni() {
+    let mut upstream = make_upstream("tls-upstream");
+    upstream.backend_tls_sni = Some("Reviews.Mesh.Internal".to_string());
+
+    upstream.normalize_fields();
+
+    assert_eq!(
+        upstream.backend_tls_sni.as_deref(),
+        Some("reviews.mesh.internal")
+    );
+}
+
+#[test]
+fn upstream_normalize_fields_lowercases_dns_sans_only() {
+    let mut upstream = make_upstream("tls-upstream");
+    upstream.backend_tls_san_allow_list = vec![
+        "Reviews.Mesh.Internal".to_string(),
+        "spiffe://Cluster.Local/ns/Default/sa/Reviews".to_string(),
+        "10.0.0.8".to_string(),
+        "2001:db8::1".to_string(),
+    ];
+
+    upstream.normalize_fields();
+
+    assert_eq!(
+        upstream.backend_tls_san_allow_list,
+        vec![
+            "reviews.mesh.internal".to_string(),
+            "spiffe://Cluster.Local/ns/Default/sa/Reviews".to_string(),
+            "10.0.0.8".to_string(),
+            "2001:db8::1".to_string(),
+        ]
+    );
 }
 
 /// Helper to create an empty gateway config.

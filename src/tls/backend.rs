@@ -10,7 +10,7 @@ use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKey
 use rustls::{ClientConfig, RootCertStore};
 use thiserror::Error;
 
-use crate::config::types::Proxy;
+use crate::config::types::{BackendTlsConfig, Proxy};
 use crate::tls::{
     NoVerifier, TlsPolicy, backend_client_config_builder, build_server_verifier_with_crls,
 };
@@ -67,6 +67,40 @@ impl BackendTlsConfigCache {
             }
         }
     }
+}
+
+/// Append the backend TLS identity fields that partition runtime client caches.
+///
+/// Keep this in one place so HTTP, H2, H3, gRPC, and backend capability probes
+/// agree on which TLS dimensions can change a reusable backend connection.
+pub fn append_backend_tls_pool_key_fields(
+    buf: &mut String,
+    tls: &BackendTlsConfig,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
+    verify_server_cert: bool,
+) {
+    // The SAN digest is precomputed (see BackendTlsConfig::compute_san_digest) so
+    // pool-key emission stays allocation-free. If a caller mutates san_allow_list
+    // without calling recompute_san_digest, the digest goes stale and pool keys
+    // collide across distinct SAN configs. This assert catches that drift in dev
+    // and tests; it compiles out of release builds.
+    debug_assert_eq!(
+        tls.san_allow_list_key_digest,
+        BackendTlsConfig::compute_san_digest(&tls.san_allow_list),
+        "BackendTlsConfig.san_allow_list_key_digest is stale; call recompute_san_digest() after mutating san_allow_list"
+    );
+    buf.push_str(tls.server_ca_cert_path.as_deref().unwrap_or_default());
+    buf.push('|');
+    buf.push_str(client_cert_path.unwrap_or_default());
+    buf.push('|');
+    buf.push_str(client_key_path.unwrap_or_default());
+    buf.push('|');
+    buf.push_str(tls.sni.as_deref().unwrap_or_default());
+    buf.push('|');
+    buf.push_str(tls.san_allow_list_key_digest.as_deref().unwrap_or_default());
+    buf.push('|');
+    buf.push(if verify_server_cert { '1' } else { '0' });
 }
 
 /// Build the backend trust store using the CA chain resolution from CLAUDE.md:
