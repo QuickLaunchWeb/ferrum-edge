@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -301,6 +301,7 @@ fn auto_workloads_for_service(
     endpoint_slice_indices: &[usize],
 ) -> Result<Vec<Workload>, K8sTranslateError> {
     let mut endpoints_by_pod = BTreeMap::new();
+    let mut seen_endpoint_addresses = HashSet::new();
     for &slice_index in endpoint_slice_indices {
         let Some(slice) = acc.core.endpoint_slices.get(slice_index) else {
             continue;
@@ -319,13 +320,13 @@ fn auto_workloads_for_service(
             let merged = endpoints_by_pod
                 .entry(pod_key.clone())
                 .or_insert_with(|| CoreEndpoint {
-                    pod_key: Some(pod_key),
+                    pod_key: Some(pod_key.clone()),
                     addresses: Vec::new(),
                     ready: true,
                     node_name: endpoint.node_name.clone(),
                 });
             for address in &endpoint.addresses {
-                if !merged.addresses.contains(address) {
+                if seen_endpoint_addresses.insert((pod_key.clone(), address.clone())) {
                     merged.addresses.push(address.clone());
                 }
             }
@@ -340,6 +341,8 @@ fn auto_workloads_for_service(
         let Some(pod) = acc.core.pods.get(&pod_key) else {
             continue;
         };
+        // EndpointSlice readiness controls service membership, while pod readiness
+        // keeps stale cache entries from resurfacing terminating pods.
         if !pod.ready {
             continue;
         }

@@ -630,7 +630,7 @@ DestinationRule `subsets` are preserved as named subsets in the Ferrum upstream.
 
 ### Deferred Fields
 
-TLS settings on DestinationRule (`trafficPolicy.tls`) are not yet translated -- use per-proxy `backend_tls_*` fields. Port-level traffic policy overrides are also deferred.
+Top-level DestinationRule TLS settings (`trafficPolicy.tls`) are translated onto the matching Ferrum upstream's `backend_tls_*` fields. Per-subset `trafficPolicy.tls` is parsed and warned but not applied per subset. Port-level `connectionPool.tcp.connectTimeout` is enforced; port-level load balancer and outlier detection overrides are parsed and warned but not enforced per port.
 
 ## Observability
 
