@@ -4323,6 +4323,24 @@ async fn handle_websocket_request_authenticated(
                         && let Some(next) = {
                             let retry_override_port =
                                 retry_port_override_dispatch_port(&proxy, prev_target);
+                            let rehashed;
+                            let retry_key: &str = if let Some(port) = retry_override_port {
+                                let strategy =
+                                    LoadBalancerCache::get_hash_on_strategy_for_port_from(
+                                        &epoch.load_balancer,
+                                        upstream_id,
+                                        port,
+                                    );
+                                rehashed = backend_dispatch::resolve_hash_key(
+                                    &strategy,
+                                    &ctx.client_ip,
+                                    &ctx.headers,
+                                )
+                                .0;
+                                &rehashed
+                            } else {
+                                hash_key
+                            };
                             let health_ctx = crate::load_balancer::HealthContext {
                                 active_unhealthy: &state.health_checker.active_unhealthy_targets,
                                 proxy_passive: state
@@ -4349,7 +4367,7 @@ async fn handle_websocket_request_authenticated(
                                     LoadBalancerCache::select_next_target_for_port_subset_from(
                                         &epoch.load_balancer,
                                         upstream_id,
-                                        hash_key,
+                                        retry_key,
                                         port,
                                         subset_name,
                                         prev_target,
@@ -4359,7 +4377,7 @@ async fn handle_websocket_request_authenticated(
                                     LoadBalancerCache::select_next_target_subset_from(
                                         &epoch.load_balancer,
                                         upstream_id,
-                                        hash_key,
+                                        retry_key,
                                         subset_name,
                                         prev_target,
                                         Some(&health_ctx),
@@ -4369,7 +4387,7 @@ async fn handle_websocket_request_authenticated(
                                 LoadBalancerCache::select_next_target_for_port_from(
                                     &epoch.load_balancer,
                                     upstream_id,
-                                    hash_key,
+                                    retry_key,
                                     port,
                                     prev_target,
                                     Some(&health_ctx),
@@ -4378,7 +4396,7 @@ async fn handle_websocket_request_authenticated(
                                 LoadBalancerCache::select_next_target_from(
                                     &epoch.load_balancer,
                                     upstream_id,
-                                    hash_key,
+                                    retry_key,
                                     prev_target,
                                     Some(&health_ctx),
                                 )
@@ -7964,6 +7982,23 @@ async fn handle_proxy_request_inner(
                     && let Some(next) = {
                         let retry_override_port =
                             retry_port_override_dispatch_port(&proxy, prev_target);
+                        let rehashed;
+                        let retry_key: &str = if let Some(port) = retry_override_port {
+                            let strategy = LoadBalancerCache::get_hash_on_strategy_for_port_from(
+                                &epoch.load_balancer,
+                                upstream_id,
+                                port,
+                            );
+                            rehashed = backend_dispatch::resolve_hash_key(
+                                &strategy,
+                                &ctx.client_ip,
+                                proxy_headers,
+                            )
+                            .0;
+                            &rehashed
+                        } else {
+                            hash_key
+                        };
                         let health_ctx = crate::load_balancer::HealthContext {
                             active_unhealthy: &state.health_checker.active_unhealthy_targets,
                             proxy_passive: state
@@ -7990,7 +8025,7 @@ async fn handle_proxy_request_inner(
                                 LoadBalancerCache::select_next_target_for_port_subset_from(
                                     &epoch.load_balancer,
                                     upstream_id,
-                                    hash_key,
+                                    retry_key,
                                     port,
                                     subset_name,
                                     prev_target,
@@ -8000,7 +8035,7 @@ async fn handle_proxy_request_inner(
                                 LoadBalancerCache::select_next_target_subset_from(
                                     &epoch.load_balancer,
                                     upstream_id,
-                                    hash_key,
+                                    retry_key,
                                     subset_name,
                                     prev_target,
                                     Some(&health_ctx),
@@ -8010,7 +8045,7 @@ async fn handle_proxy_request_inner(
                             LoadBalancerCache::select_next_target_for_port_from(
                                 &epoch.load_balancer,
                                 upstream_id,
-                                hash_key,
+                                retry_key,
                                 port,
                                 prev_target,
                                 Some(&health_ctx),
@@ -8019,7 +8054,7 @@ async fn handle_proxy_request_inner(
                             LoadBalancerCache::select_next_target_from(
                                 &epoch.load_balancer,
                                 upstream_id,
-                                hash_key,
+                                retry_key,
                                 prev_target,
                                 Some(&health_ctx),
                             )
@@ -8837,6 +8872,23 @@ async fn handle_proxy_request_inner(
                 && let Some(next) = {
                     let retry_override_port =
                         retry_port_override_dispatch_port(&proxy, prev_target);
+                    let rehashed;
+                    let retry_key: &str = if let Some(port) = retry_override_port {
+                        let strategy = LoadBalancerCache::get_hash_on_strategy_for_port_from(
+                            &epoch.load_balancer,
+                            upstream_id,
+                            port,
+                        );
+                        rehashed = backend_dispatch::resolve_hash_key(
+                            &strategy,
+                            &ctx.client_ip,
+                            proxy_headers,
+                        )
+                        .0;
+                        &rehashed
+                    } else {
+                        hash_key
+                    };
                     let health_ctx = crate::load_balancer::HealthContext {
                         active_unhealthy: &state.health_checker.active_unhealthy_targets,
                         proxy_passive: state
@@ -8863,7 +8915,7 @@ async fn handle_proxy_request_inner(
                             LoadBalancerCache::select_next_target_for_port_subset_from(
                                 &epoch.load_balancer,
                                 upstream_id,
-                                hash_key,
+                                retry_key,
                                 port,
                                 subset_name,
                                 prev_target,
@@ -8873,7 +8925,7 @@ async fn handle_proxy_request_inner(
                             LoadBalancerCache::select_next_target_subset_from(
                                 &epoch.load_balancer,
                                 upstream_id,
-                                hash_key,
+                                retry_key,
                                 subset_name,
                                 prev_target,
                                 Some(&health_ctx),
@@ -8883,7 +8935,7 @@ async fn handle_proxy_request_inner(
                         LoadBalancerCache::select_next_target_for_port_from(
                             &epoch.load_balancer,
                             upstream_id,
-                            hash_key,
+                            retry_key,
                             port,
                             prev_target,
                             Some(&health_ctx),
@@ -8892,7 +8944,7 @@ async fn handle_proxy_request_inner(
                         LoadBalancerCache::select_next_target_from(
                             &epoch.load_balancer,
                             upstream_id,
-                            hash_key,
+                            retry_key,
                             prev_target,
                             Some(&health_ctx),
                         )

@@ -265,6 +265,29 @@ pub(crate) fn select_upstream_target(
                     "Upstream target selected"
                 );
             }
+            // Recompute sticky-cookie decision when the selected target's
+            // port differs from the initial dispatch port — the target may
+            // have landed in a port override lane with a different hash_on
+            // strategy.
+            let needs_set = if selection.target.port != dispatch_port {
+                let tp = selection.target.port;
+                let tp_override = proxy
+                    .dispatch_port_overrides
+                    .as_ref()
+                    .is_some_and(|overrides| overrides.contains_key(&tp));
+                let tp_strategy = if tp_override {
+                    LoadBalancerCache::get_hash_on_strategy_for_port_from(
+                        balancers,
+                        upstream_id,
+                        tp,
+                    )
+                } else {
+                    LoadBalancerCache::get_hash_on_strategy_from(balancers, upstream_id)
+                };
+                resolve_hash_key(&tp_strategy, client_ip, proxy_headers).1
+            } else {
+                needs_set
+            };
             UpstreamSelection {
                 lb_hash_key: Some(hash_key),
                 target: Some(selection.target),
