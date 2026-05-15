@@ -181,6 +181,8 @@ pub struct IptablesPlan {
 
 impl IptablesPlan {
     pub fn for_config(config: &CaptureConfig) -> Self {
+        // IPv4 always emits chains because inbound capture is protocol-wide for
+        // an active address family, even when only IPv6 outbound CIDRs exist.
         let v4_commands = commands_for_family("iptables", config, CidrFamily::V4, true);
         let v6_enabled = config.ip6tables_mode != Ip6TablesMode::Disabled;
         let v6_has_cidrs = config
@@ -191,7 +193,7 @@ impl IptablesPlan {
         let v6_commands = if v6_enabled && v6_has_cidrs {
             commands_for_family("ip6tables", config, CidrFamily::V6, false)
         } else {
-            if !v6_enabled && v6_has_cidrs {
+            if v6_has_cidrs {
                 warn!(
                     "Skipping IPv6 mesh capture rules because FERRUM_MESH_IP6TABLES_ENABLED=false"
                 );

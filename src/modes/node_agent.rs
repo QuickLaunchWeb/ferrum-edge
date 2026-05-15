@@ -539,6 +539,8 @@ where
             );
 
             let plan = IptablesPlan::for_config(&config.capture_config);
+            // Always try IPv6 cleanup: an earlier process/config may have
+            // created ip6tables chains even when the current plan has none.
             let include_v6_cleanup = true;
             let setup = setup_commands_for_plan(&plan, config.capture_config.ip6tables_mode);
             if let Err(setup_err) = execute(setup, "setup").await {
@@ -638,9 +640,10 @@ fn ip6tables_auto_wrapped_command(cmd: &str) -> String {
 /// sequentially.
 ///
 /// Each command is run via `sh -c` so that shell operators (`||`, `2>/dev/null`)
-/// are interpreted correctly. Failures are logged but do not abort the remaining
-/// commands — iptables rules are idempotent, so partial application is safe and
-/// a subsequent retry will converge.
+/// are interpreted correctly. Execution stops on the first command failure so
+/// setup never reports success after a partially applied ruleset. Cleanup
+/// commands include their own best-effort `|| true` guards where continuing
+/// after an absent chain is safe.
 ///
 /// Only invoked from `handle_fallback`, which is reached only on `node_agent`
 /// mode after kernel-probe failure. The commands are formed from
