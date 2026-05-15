@@ -1854,6 +1854,38 @@ mod tests {
     }
 
     #[test]
+    fn patch_requires_ip6tables_when_configured_true() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/excludeOutboundIPRanges": "fd00::/8"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let mut config = test_config(true, CaptureMode::Iptables);
+        config.ip6tables_mode = Ip6TablesMode::Required;
+
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+        let init = patch
+            .iter()
+            .find(|op| op.path == "/spec/initContainers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("init container");
+        let commands = init
+            .pointer("/args/0")
+            .and_then(Value::as_str)
+            .expect("iptables plan");
+
+        assert!(commands.contains("ip6tables is required for IPv6 mesh capture"));
+        assert!(commands.contains("ip6tables nat table is required for IPv6 mesh capture"));
+        assert!(commands.contains("ip6tables -t nat -L"));
+        assert!(commands.contains("exit 1"));
+        assert!(commands.contains("ip6tables -t nat"));
+    }
+
+    #[test]
     fn patch_omits_ipv6_cidr_when_ip6tables_disabled() {
         let pod = json!({
             "metadata": {

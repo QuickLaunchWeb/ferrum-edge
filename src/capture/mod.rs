@@ -267,7 +267,7 @@ impl EbpfPlan {
 
 impl IptablesPlan {
     pub fn script(&self, ip6tables_mode: Ip6TablesMode) -> String {
-        iptables_script(&self.v4_commands, &self.v6_commands, ip6tables_mode)
+        iptables_script(&self.v4_commands, &self.v6_commands, ip6tables_mode, true)
     }
 
     pub fn cleanup_script(include_v6: bool, ip6tables_mode: Ip6TablesMode) -> String {
@@ -277,7 +277,7 @@ impl IptablesPlan {
         } else {
             Vec::new()
         };
-        iptables_script(&v4_commands, &v6_commands, ip6tables_mode)
+        iptables_script(&v4_commands, &v6_commands, ip6tables_mode, false)
     }
 }
 
@@ -435,11 +435,14 @@ fn iptables_script(
     v4_commands: &[String],
     v6_commands: &[String],
     ip6tables_mode: Ip6TablesMode,
+    require_v6_preflight: bool,
 ) -> String {
     let mut chunks = Vec::new();
-    if !v6_commands.is_empty() && ip6tables_mode == Ip6TablesMode::Required {
+    if require_v6_preflight && !v6_commands.is_empty() && ip6tables_mode == Ip6TablesMode::Required
+    {
         chunks.push(
-            "command -v ip6tables >/dev/null 2>&1 || { echo \"ip6tables is required for IPv6 mesh capture\" >&2; exit 1; }"
+            "command -v ip6tables >/dev/null 2>&1 || { echo \"ip6tables is required for IPv6 mesh capture\" >&2; exit 1; }\n\
+             ip6tables -t nat -L >/dev/null 2>&1 || { echo \"ip6tables nat table is required for IPv6 mesh capture\" >&2; exit 1; }"
                 .to_string(),
         );
     }
@@ -973,6 +976,8 @@ mod tests {
         let script = plan.script(config.ip6tables_mode);
 
         assert!(script.contains("ip6tables is required for IPv6 mesh capture"));
+        assert!(script.contains("ip6tables nat table is required for IPv6 mesh capture"));
+        assert!(script.contains("ip6tables -t nat -L"));
         assert!(script.contains("exit 1"));
         assert!(script.contains("ip6tables -t nat"));
         assert!(
@@ -981,6 +986,22 @@ mod tests {
                 .expect("ip6tables preflight")
                 < script.find("iptables -t nat").expect("IPv4 setup"),
             "hard-required ip6tables preflight should run before IPv4 setup: {script}"
+        );
+    }
+
+    #[test]
+    fn cleanup_script_does_not_preflight_required_ip6tables() {
+        let script = IptablesPlan::cleanup_script(true, Ip6TablesMode::Required);
+
+        assert!(script.contains("iptables -t nat"));
+        assert!(script.contains("ip6tables -t nat"));
+        assert!(
+            !script.contains("ip6tables is required for IPv6 mesh capture"),
+            "cleanup must remain best-effort and avoid aborting v4 teardown when ip6tables is unavailable: {script}"
+        );
+        assert!(
+            !script.contains("ip6tables -t nat -L"),
+            "cleanup must not probe ip6tables nat availability before best-effort teardown: {script}"
         );
     }
 
