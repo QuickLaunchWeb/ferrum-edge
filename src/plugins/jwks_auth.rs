@@ -583,6 +583,7 @@ impl JwksAuth {
     }
 
     fn extract_jwks_credential(&self, ctx: &RequestContext) -> JwksExtractedCredential {
+        let mut first_invalid_format: Option<String> = None;
         for (idx, provider) in self.providers.iter().enumerate() {
             if provider.token_locations.is_empty() {
                 continue;
@@ -592,7 +593,7 @@ impl JwksAuth {
                 match extract_from_location(location, ctx) {
                     TokenLocationExtract::Missing => {}
                     TokenLocationExtract::Credential(ExtractedCredential::InvalidFormat(body)) => {
-                        return JwksExtractedCredential::InvalidFormat(body);
+                        first_invalid_format.get_or_insert(body);
                     }
                     TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token)) => {
                         let mut provider_indices = Vec::with_capacity(1);
@@ -624,14 +625,18 @@ impl JwksAuth {
             .filter_map(|(idx, provider)| provider.token_locations.is_empty().then_some(idx))
             .collect();
         if provider_indices.is_empty() {
-            return JwksExtractedCredential::Missing;
+            return first_invalid_format
+                .map(JwksExtractedCredential::InvalidFormat)
+                .unwrap_or(JwksExtractedCredential::Missing);
         }
 
         match extract_authorization_bearer(ctx) {
-            ExtractedCredential::Missing => JwksExtractedCredential::Missing,
-            ExtractedCredential::InvalidFormat(body) => {
-                JwksExtractedCredential::InvalidFormat(body)
-            }
+            ExtractedCredential::Missing => first_invalid_format
+                .map(JwksExtractedCredential::InvalidFormat)
+                .unwrap_or(JwksExtractedCredential::Missing),
+            ExtractedCredential::InvalidFormat(body) => first_invalid_format
+                .map(JwksExtractedCredential::InvalidFormat)
+                .unwrap_or(JwksExtractedCredential::InvalidFormat(body)),
             ExtractedCredential::BearerToken(token) => JwksExtractedCredential::BearerToken {
                 token,
                 provider_indices,

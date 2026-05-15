@@ -193,6 +193,22 @@ async fn custom_header_missing_prefix_continues_to_later_location() {
 }
 
 #[tokio::test]
+async fn custom_header_empty_token_continues_to_later_location() {
+    let plugin = plugin_with_custom_locations();
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("x-token".to_string(), "Token ".to_string());
+    ctx.query_params
+        .insert("access_token".to_string(), token_for("query-user"));
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("query-user"));
+}
+
+#[tokio::test]
 async fn custom_header_token_is_stripped_when_forward_original_token_false() {
     let jwks = build_rsa_jwks_from_pem(include_bytes!(
         "../../../tests/fixtures/test_rsa_public.pem"
