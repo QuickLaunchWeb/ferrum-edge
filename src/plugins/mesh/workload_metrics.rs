@@ -301,7 +301,12 @@ impl WorkloadMetrics {
         metadata: &mut HashMap<String, String>,
         headers: &HashMap<String, String>,
     ) {
-        if let Some(sampling_percentage) = self.sampling_percentage {
+        if let Some(sampled) = existing_sampling_decision(metadata, headers) {
+            metadata.insert(
+                "trace_sampled".to_string(),
+                if sampled { "true" } else { "false" }.to_string(),
+            );
+        } else if let Some(sampling_percentage) = self.sampling_percentage {
             let sampled = trace_sampled(sampling_percentage);
             metadata.insert(
                 "trace_sampled".to_string(),
@@ -655,6 +660,43 @@ fn trace_sampled(sampling_percentage: f64) -> bool {
     (random as f64 / u64::MAX as f64) * 100.0 < sampling_percentage
 }
 
+fn existing_sampling_decision(
+    metadata: &HashMap<String, String>,
+    headers: &HashMap<String, String>,
+) -> Option<bool> {
+    if let Some(value) = metadata.get("trace_sampled") {
+        return Some(value.eq_ignore_ascii_case("true"));
+    }
+    metadata
+        .get(TRACEPARENT_HEADER)
+        .and_then(|value| traceparent_sampling_decision(value))
+        .or_else(|| {
+            header_value(headers, TRACEPARENT_HEADER).and_then(traceparent_sampling_decision)
+        })
+        .or_else(|| b3_sampling_decision(headers))
+}
+
+fn traceparent_sampling_decision(value: &str) -> Option<bool> {
+    OtelTracing::parse_traceparent(value)
+        .and_then(|parsed| u8::from_str_radix(parsed.flags, 16).ok())
+        .map(|flags| flags & 0x01 == 0x01)
+}
+
+fn b3_sampling_decision(headers: &HashMap<String, String>) -> Option<bool> {
+    if let Some(flags) = header_value(headers, "x-b3-flags")
+        && flags.trim() == "1"
+    {
+        return Some(true);
+    }
+    header_value(headers, "x-b3-sampled").and_then(|value| match value.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        value if value.eq_ignore_ascii_case("true") => Some(true),
+        value if value.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    })
+}
+
 fn next_sampling_u64() -> u64 {
     TRACE_SAMPLING_STATE.with(|state| {
         let next = state.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -999,7 +1041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn before_proxy_propagates_incoming_trace_context_when_locally_unsampled() {
+    async fn before_proxy_keeps_incoming_sampled_trace_context_when_locally_unsampled() {
         let metrics = WorkloadMetrics::new(&json!({
             "sampling_percentage": 0.0,
             "tracing_providers": [{
@@ -1026,7 +1068,7 @@ mod tests {
         assert!(matches!(result, PluginResult::Continue));
         assert_eq!(
             ctx.metadata.get("trace_sampled").map(String::as_str),
-            Some("false")
+            Some("true")
         );
         assert_eq!(
             ctx.metadata.get("trace_id").map(String::as_str),
@@ -1044,6 +1086,69 @@ mod tests {
         assert_ne!(
             outgoing_traceparent,
             &format!("00-{trace_id}-{parent_span_id}-01")
+        );
+    }
+
+    #[tokio::test]
+    async fn before_proxy_keeps_incoming_unsampled_trace_context_when_locally_sampled() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "sampling_percentage": 100.0,
+            "tracing_providers": [{
+                "kind": "zipkin",
+                "config": {
+                    "url": "http://zipkin:9411/api/v2/spans"
+                }
+            }]
+        }))
+        .expect("zipkin provider accepted");
+
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let parent_span_id = "00f067aa0ba902b7";
+        let incoming_traceparent = format!("00-{trace_id}-{parent_span_id}-00");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        let mut headers = HashMap::from([(TRACEPARENT_HEADER.to_string(), incoming_traceparent)]);
+
+        let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            ctx.metadata.get("trace_sampled").map(String::as_str),
+            Some("false")
+        );
+        let outgoing_traceparent = headers
+            .get(TRACEPARENT_HEADER)
+            .expect("traceparent propagated despite local sampling");
+        assert!(outgoing_traceparent.starts_with(&format!("00-{trace_id}-")));
+        assert!(outgoing_traceparent.ends_with("-00"));
+        assert_ne!(
+            outgoing_traceparent,
+            &format!("00-{trace_id}-{parent_span_id}-00")
+        );
+    }
+
+    #[tokio::test]
+    async fn before_proxy_keeps_b3_sampling_decision_when_local_sampling_configured() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "sampling_percentage": 0.0
+        }))
+        .expect("sampling-only workload metrics accepted");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        let mut headers = HashMap::from([("x-b3-sampled".to_string(), "1".to_string())]);
+
+        let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            ctx.metadata.get("trace_sampled").map(String::as_str),
+            Some("true")
         );
     }
 
