@@ -1137,6 +1137,44 @@ mod tests {
     }
 
     #[test]
+    fn explicit_service_entry_cross_namespace_service_host_does_not_override_auto_service() {
+        let service_entry = K8sObject {
+            kind: "ServiceEntry".to_string(),
+            api_version: "networking.istio.io/v1".to_string(),
+            metadata: K8sMetadata {
+                name: "manual-reviews".to_string(),
+                namespace: "default".to_string(),
+                labels: HashMap::new(),
+                deletion_timestamp: None,
+            },
+            spec: json!({
+                "hosts": ["reviews.prod.svc.cluster.local"],
+                "ports": [{"number": 9080, "name": "http", "protocol": "HTTP"}]
+            }),
+            status: Value::Object(serde_json::Map::new()),
+        };
+        let mut prod_service = service();
+        prod_service.metadata.namespace = "prod".to_string();
+        let mut prod_pod = ready_pod("reviews-v1", "10.1.0.10");
+        prod_pod.metadata.namespace = "prod".to_string();
+        let mut prod_slice = endpoint_slice(vec![("reviews-v1", "10.1.0.10")]);
+        prod_slice.metadata.namespace = "prod".to_string();
+        prod_slice.spec["endpoints"][0]["targetRef"]["namespace"] = json!("prod");
+
+        let translation = translate_k8s_objects(
+            &[prod_service, prod_pod, prod_slice, service_entry],
+            options(),
+        )
+        .expect("core translation succeeds");
+
+        let mesh = translation.config.mesh.expect("mesh config");
+        assert_eq!(mesh.services.len(), 1);
+        assert_eq!(mesh.services[0].name, "reviews");
+        assert_eq!(mesh.services[0].namespace, "prod");
+        assert_eq!(mesh.service_entries.len(), 1);
+    }
+
+    #[test]
     fn service_entry_name_matching_service_does_not_override_unrelated_hosts() {
         let service_entry = K8sObject {
             kind: "ServiceEntry".to_string(),

@@ -525,7 +525,9 @@ fn collect_explicit_service_entry_keys(acc: &mut K8sAccumulator, object: &K8sObj
             &host,
             &object.metadata.namespace,
             &acc.options.cluster_domain,
-        ) {
+        )
+        .filter(|key| key.namespace == object.metadata.namespace)
+        {
             acc.record_explicit_service_entry(key);
         }
     }

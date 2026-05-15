@@ -80,6 +80,7 @@ impl MeshServiceDiscoverer {
             .workloads
             .iter()
             .any(|reference| reference.spiffe_id == workload.spiffe_id)
+            && workload.service_name == service.name
     }
 
     fn target_port_for_workload(
@@ -375,6 +376,31 @@ mod tests {
                 vec!["10.0.0.1"],
                 vec![8080],
             )],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            None,
+            1,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].host, "10.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn service_workload_refs_do_not_cross_match_same_spiffe_other_services() {
+        let shared_id = "spiffe://cluster.local/ns/ferrum/sa/shared";
+        let mesh = MeshConfig {
+            services: vec![service("api", vec![shared_id], vec![8080])],
+            workloads: vec![
+                workload(shared_id, "api", vec!["10.0.0.1"], vec![8080]),
+                workload(shared_id, "metrics", vec!["10.0.0.2"], vec![8080]),
+            ],
             ..MeshConfig::default()
         };
         let discoverer = MeshServiceDiscoverer::new(
