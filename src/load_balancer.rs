@@ -607,6 +607,21 @@ impl LoadBalancerCache {
             .unwrap_or(HashOnStrategy::Ip)
     }
 
+    /// Return the pre-computed port override that covers every target in an
+    /// upstream, if one exists. This keeps initial request dispatch O(1) for
+    /// large service-discovery upstreams.
+    #[inline]
+    pub fn initial_dispatch_port_override_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+    ) -> u16 {
+        snapshot
+            .balancers
+            .get(upstream_id)
+            .map(|b| b.initial_dispatch_port_override)
+            .unwrap_or(0)
+    }
+
     #[inline]
     pub fn get_upstream_from(
         snapshot: &LoadBalancerCacheInner,
@@ -901,6 +916,10 @@ pub struct LoadBalancer {
     /// Per-destination-port load-balancing state projected from
     /// DestinationRule `trafficPolicy.portLevelSettings[]`.
     port_overrides: HashMap<u16, PortLbState>,
+    /// If every target in this upstream belongs to the same overridden
+    /// destination port, initial selection can safely use that port lane before
+    /// a concrete target is chosen. Zero means mixed/unknown.
+    initial_dispatch_port_override: u16,
 }
 
 struct PortLbState {
@@ -1090,6 +1109,12 @@ impl LoadBalancer {
                 );
             }
         }
+        let initial_dispatch_port_override = port_states
+            .iter()
+            .find_map(|(&port, state)| {
+                (!targets.is_empty() && state.target_indices.len() == targets.len()).then_some(port)
+            })
+            .unwrap_or(0);
 
         Self {
             targets: targets.iter().cloned().map(Arc::new).collect(),
@@ -1111,6 +1136,7 @@ impl LoadBalancer {
             subset_wrr_needs_stale_check,
             subset_hash_rings,
             port_overrides: port_states,
+            initial_dispatch_port_override,
         }
     }
 

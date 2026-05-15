@@ -69,6 +69,48 @@ fn upstream_with_overrides(
 }
 
 #[test]
+fn initial_dispatch_port_override_requires_all_targets_on_overridden_port() {
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(8080, UpstreamPortOverride::default());
+
+    let mixed = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![target("a", 8080), target("b", 9090)],
+        port_overrides.clone(),
+    );
+    let mixed_config = GatewayConfig {
+        upstreams: vec![mixed],
+        ..GatewayConfig::default()
+    };
+    let mixed_cache = LoadBalancerCache::new(&mixed_config);
+    let mixed_snapshot = mixed_cache.load();
+
+    assert_eq!(
+        LoadBalancerCache::initial_dispatch_port_override_from(&mixed_snapshot, "u1"),
+        0,
+        "mixed-port upstreams must wait until a concrete target is selected"
+    );
+
+    let uniform = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![target("a", 8080), target("b", 8080)],
+        port_overrides,
+    );
+    let uniform_config = GatewayConfig {
+        upstreams: vec![uniform],
+        ..GatewayConfig::default()
+    };
+    let uniform_cache = LoadBalancerCache::new(&uniform_config);
+    let uniform_snapshot = uniform_cache.load();
+
+    assert_eq!(
+        LoadBalancerCache::initial_dispatch_port_override_from(&uniform_snapshot, "u1"),
+        8080,
+        "single-port upstreams can use the port override before selection"
+    );
+}
+
+#[test]
 fn port_wrr_zero_weight_fallback_uses_port_counter() {
     let mut port_overrides = HashMap::new();
     port_overrides.insert(

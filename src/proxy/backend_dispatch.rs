@@ -180,8 +180,10 @@ pub(crate) fn select_upstream_target(
     let balancers = &epoch.load_balancer;
 
     // Resolve the ejection cap from the upstream's passive health config.
-    let upstream_arc = LoadBalancerCache::get_upstream_from(balancers, upstream_id);
-    let dispatch_port = initial_dispatch_port(proxy, upstream_arc.as_deref());
+    let dispatch_port = initial_dispatch_port(
+        proxy,
+        LoadBalancerCache::initial_dispatch_port_override_from(balancers, upstream_id),
+    );
     let has_port_override = proxy
         .dispatch_port_overrides
         .as_ref()
@@ -194,11 +196,7 @@ pub(crate) fn select_upstream_target(
             dispatch_port,
         )
     } else {
-        upstream_arc
-            .as_ref()
-            .and_then(|u| u.health_checks.as_ref())
-            .and_then(|hc| hc.passive.as_ref())
-            .and_then(|p| p.max_ejection_percent)
+        LoadBalancerCache::max_ejection_percent_from(balancers, upstream_id)
     };
 
     let health_ctx = HealthContext {
@@ -289,37 +287,12 @@ pub(crate) fn select_upstream_target(
 }
 
 #[inline]
-pub(crate) fn initial_dispatch_port(proxy: &Proxy, upstream: Option<&Upstream>) -> u16 {
+pub(crate) fn initial_dispatch_port(proxy: &Proxy, upstream_port_override: u16) -> u16 {
     if proxy.backend_port != 0 {
         return proxy.backend_port;
     }
 
-    let Some(overrides) = proxy.dispatch_port_overrides.as_ref() else {
-        return 0;
-    };
-
-    if let Some(upstream) = upstream {
-        let mut port = None;
-        for target in &upstream.targets {
-            match port {
-                Some(existing) if existing != target.port => return 0,
-                Some(_) => {}
-                None => port = Some(target.port),
-            }
-        }
-        if let Some(port) = port
-            && overrides.contains_key(&port)
-        {
-            return port;
-        }
-        return 0;
-    }
-
-    if overrides.len() == 1 {
-        overrides.keys().next().copied().unwrap_or(0)
-    } else {
-        0
-    }
+    upstream_port_override
 }
 
 /// Replace a wildcard upstream target host (for example `*.example.com`) with
@@ -587,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_dispatch_port_requires_all_targets_on_overridden_port() {
+    fn initial_dispatch_port_uses_precomputed_upstream_override() {
         let mut proxy: Proxy = serde_json::from_value(serde_json::json!({
             "backend_host": "unused.local",
             "backend_port": 0,
@@ -597,16 +570,9 @@ mod tests {
             8080,
             crate::config::types::ResolvedPortOverride::default(),
         )]));
-        let upstream: Upstream = serde_json::from_value(serde_json::json!({
-            "id": "mixed",
-            "targets": [
-                {"host": "10.0.0.1", "port": 8080},
-                {"host": "10.0.0.2", "port": 9090}
-            ]
-        }))
-        .expect("minimal upstream should deserialize");
 
-        assert_eq!(initial_dispatch_port(&proxy, Some(&upstream)), 0);
+        assert_eq!(initial_dispatch_port(&proxy, 0), 0);
+        assert_eq!(initial_dispatch_port(&proxy, 8080), 8080);
     }
 
     #[tokio::test]
