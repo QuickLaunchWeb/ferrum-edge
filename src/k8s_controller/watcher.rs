@@ -321,6 +321,8 @@ pub async fn start_crd_watchers(
             let mut watcher_shutdown = shutdown.clone();
             let cleanup_scope = scope.clone();
             let task_kind = kind.clone();
+            let task_api_version = api_version.clone();
+            let task_store_set = store_set.clone();
             let watcher_config = watcher::Config::default();
 
             let handle = tokio::spawn(async move {
@@ -343,11 +345,29 @@ pub async fn start_crd_watchers(
                                     change_notifier.notify_change();
                                 }
                                 Ok(None) => {
-                                    info!(
+                                    error!(
                                         kind = %task_kind,
+                                        api_version = %task_api_version,
                                         scope = %cleanup_scope,
-                                        "Watch stream ended; retaining last reflector snapshot"
+                                        "CRD watcher stream ended unexpectedly; \
+                                         removing stale store so reprobe will restart"
                                     );
+                                    let removed = task_store_set
+                                        .lock()
+                                        .await
+                                        .remove_store_for_scope(
+                                            &task_api_version,
+                                            &task_kind,
+                                            &cleanup_scope,
+                                        );
+                                    if !removed {
+                                        debug!(
+                                            kind = %task_kind,
+                                            api_version = %task_api_version,
+                                            scope = %cleanup_scope,
+                                            "Stale store already absent at stream end"
+                                        );
+                                    }
                                     return;
                                 }
                                 Err(e) => {
@@ -433,6 +453,8 @@ pub async fn start_crd_watchers(
                 let mut watcher_shutdown = shutdown.clone();
                 let cleanup_scope = scope.clone();
                 let task_kind = kind.clone();
+                let task_api_version = api_version.clone();
+                let task_store_set = store_set.clone();
                 let watcher_config = watcher::Config::default();
 
                 let handle = tokio::spawn(async move {
@@ -455,11 +477,29 @@ pub async fn start_crd_watchers(
                                         change_notifier.notify_change();
                                     }
                                     Ok(None) => {
-                                        info!(
+                                        error!(
                                             kind = %task_kind,
+                                            api_version = %task_api_version,
                                             scope = %cleanup_scope,
-                                            "Watch stream ended; retaining last reflector snapshot"
+                                            "K8s core watcher stream ended unexpectedly; \
+                                             removing stale store so reprobe will restart"
                                         );
+                                        let removed = task_store_set
+                                            .lock()
+                                            .await
+                                            .remove_store_for_scope(
+                                                &task_api_version,
+                                                &task_kind,
+                                                &cleanup_scope,
+                                            );
+                                        if !removed {
+                                            debug!(
+                                                kind = %task_kind,
+                                                api_version = %task_api_version,
+                                                scope = %cleanup_scope,
+                                                "Stale store already absent at stream end"
+                                            );
+                                        }
                                         return;
                                     }
                                     Err(e) => {
