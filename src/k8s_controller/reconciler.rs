@@ -504,6 +504,7 @@ fn stable_config_value(config: &GatewayConfig) -> Value {
     sort_top_level_collection(&mut value, "plugin_configs", "id");
     sort_top_level_collection(&mut value, "upstreams", "id");
     sort_string_array(&mut value, "known_namespaces");
+    sort_mesh_collection(&mut value, "workloads", "spiffe_id");
     value
 }
 
@@ -546,12 +547,30 @@ fn sort_string_array(value: &mut Value, field: &str) {
     items.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
 }
 
+fn sort_mesh_collection(value: &mut Value, field: &str, key: &str) {
+    let Some(items) = value
+        .get_mut("mesh")
+        .and_then(Value::as_object_mut)
+        .and_then(|mesh| mesh.get_mut(field))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+
+    items.sort_by(|left, right| {
+        let left_key = left.get(key).and_then(Value::as_str).unwrap_or_default();
+        let right_key = right.get(key).and_then(Value::as_str).unwrap_or_default();
+        left_key.cmp(right_key)
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::types::{PluginConfig, PluginScope, Proxy, Upstream};
+    use crate::identity::spiffe::SpiffeId;
     use crate::k8s_controller::resource_store::CrdResourceStore;
-    use crate::modes::mesh::config::MeshConfig;
+    use crate::modes::mesh::config::{MeshConfig, Workload, WorkloadSelector};
     use chrono::{Duration as ChronoDuration, Utc};
     use kube::api::ApiResource;
     use kube::runtime::reflector;
@@ -600,6 +619,27 @@ mod tests {
         .expect("test upstream should deserialize")
     }
 
+    fn mesh_workload(service_account: &str) -> Workload {
+        let trust_domain = TrustDomain::new("cluster.local").expect("test trust domain");
+        Workload {
+            spiffe_id: SpiffeId::new(format!(
+                "spiffe://cluster.local/ns/default/sa/{service_account}"
+            ))
+            .expect("test SPIFFE ID"),
+            selector: WorkloadSelector::default(),
+            service_name: "reviews".to_string(),
+            addresses: vec!["10.1.0.10".to_string()],
+            ports: Vec::new(),
+            trust_domain,
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some(service_account.to_string()),
+        }
+    }
+
     #[test]
     fn content_change_detects_same_count_plugin_edit() {
         let mut old_config = GatewayConfig::default();
@@ -637,6 +677,24 @@ mod tests {
             .push(plugin_config("a", json!({"value": 1})));
         let mut new_config = old_config.clone();
         new_config.plugin_configs.reverse();
+
+        assert!(!gateway_config_content_changed(&new_config, &old_config));
+    }
+
+    #[test]
+    fn content_change_ignores_mesh_workload_order() {
+        let mut old_config = GatewayConfig::default();
+        old_config.mesh = Some(Box::new(MeshConfig {
+            workloads: vec![mesh_workload("b"), mesh_workload("a")],
+            ..MeshConfig::default()
+        }));
+        let mut new_config = old_config.clone();
+        new_config
+            .mesh
+            .as_mut()
+            .expect("mesh config")
+            .workloads
+            .reverse();
 
         assert!(!gateway_config_content_changed(&new_config, &old_config));
     }

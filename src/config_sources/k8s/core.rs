@@ -66,7 +66,6 @@ struct CoreEndpoint {
     addresses: Vec<String>,
     ready: bool,
     node_name: Option<String>,
-    zone: Option<String>,
 }
 
 pub(super) fn is_core_resource_kind(kind: &str) -> bool {
@@ -99,6 +98,26 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
     let mut service_keys: Vec<K8sServiceKey> = acc.core.services.keys().cloned().collect();
     service_keys.sort();
 
+    let mut endpoint_slice_indices_by_service: HashMap<K8sServiceKey, Vec<usize>> = HashMap::new();
+    for (index, slice) in acc.core.endpoint_slices.iter().enumerate() {
+        endpoint_slice_indices_by_service
+            .entry(slice.service_key.clone())
+            .or_default()
+            .push(index);
+    }
+
+    let mut workload_refs_by_service: HashMap<K8sServiceKey, BTreeSet<String>> = HashMap::new();
+    for workload in &acc.mesh.workloads {
+        if let Some(key) =
+            K8sServiceKey::new(workload.namespace.clone(), workload.service_name.clone())
+        {
+            workload_refs_by_service
+                .entry(key)
+                .or_default()
+                .insert(workload.spiffe_id.as_str().to_string());
+        }
+    }
+
     for key in service_keys {
         if acc.explicit_service_entries.contains(&key) {
             continue;
@@ -107,15 +126,17 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
         let Some(service) = acc.core.services.get(&key) else {
             continue;
         };
-        let mut workload_ref_strings = BTreeSet::new();
-        for workload in &acc.mesh.workloads {
-            if workload.namespace == key.namespace && workload.service_name == key.name {
-                workload_ref_strings.insert(workload.spiffe_id.as_str().to_string());
-            }
-        }
+        let mut workload_ref_strings = workload_refs_by_service.remove(&key).unwrap_or_default();
 
         if !acc.explicit_workload_services.contains(&key) {
-            let auto_workloads = auto_workloads_for_service(acc, &key)?;
+            let auto_workloads = auto_workloads_for_service(
+                acc,
+                &key,
+                endpoint_slice_indices_by_service
+                    .get(&key)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            )?;
             for workload in auto_workloads {
                 workload_ref_strings.insert(workload.spiffe_id.as_str().to_string());
                 acc.mesh.workloads.push(workload);
@@ -238,18 +259,6 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
                 addresses: string_array_from_value(endpoint, "addresses"),
                 ready: endpoint_is_ready(endpoint),
                 node_name: string_field(endpoint, "nodeName").map(ToOwned::to_owned),
-                zone: string_field(endpoint, "zone")
-                    .or_else(|| {
-                        endpoint
-                            .get("deprecatedTopology")
-                            .and_then(|topology| {
-                                topology.get("topology.kubernetes.io/zone").or_else(|| {
-                                    topology.get("failure-domain.beta.kubernetes.io/zone")
-                                })
-                            })
-                            .and_then(Value::as_str)
-                    })
-                    .map(ToOwned::to_owned),
             }
         })
         .collect();
@@ -272,15 +281,14 @@ fn collect_node(acc: &mut K8sAccumulator, object: &K8sObject) {
 fn auto_workloads_for_service(
     acc: &K8sAccumulator,
     service_key: &K8sServiceKey,
+    endpoint_slice_indices: &[usize],
 ) -> Result<Vec<Workload>, K8sTranslateError> {
     let mut seen_pods = BTreeSet::new();
     let mut workloads = Vec::new();
-    for slice in acc
-        .core
-        .endpoint_slices
-        .iter()
-        .filter(|slice| slice.service_key == *service_key)
-    {
+    for &slice_index in endpoint_slice_indices {
+        let Some(slice) = acc.core.endpoint_slices.get(slice_index) else {
+            continue;
+        };
         for endpoint in &slice.endpoints {
             if !endpoint.ready {
                 continue;
@@ -324,9 +332,7 @@ fn workload_from_pod(
     addresses.sort();
     addresses.dedup();
     let node_name = endpoint.node_name.as_deref().or(pod.node_name.as_deref());
-    let locality = node_name
-        .and_then(|node| acc.core.node_localities.get(node).cloned())
-        .or_else(|| endpoint.zone.as_ref().map(|zone| format!("//{zone}")));
+    let locality = node_name.and_then(|node| acc.core.node_localities.get(node).cloned());
 
     Ok(Workload {
         spiffe_id,
@@ -467,14 +473,12 @@ fn endpoint_is_ready(endpoint: &Value) -> bool {
     {
         return false;
     }
-    conditions
-        .get("ready")
+    let ready = conditions.get("ready").and_then(Value::as_bool);
+    let serving = conditions
+        .get("serving")
         .and_then(Value::as_bool)
-        .unwrap_or(true)
-        && conditions
-            .get("serving")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
+        .unwrap_or_else(|| ready.unwrap_or(true));
+    ready.unwrap_or(true) && serving
 }
 
 fn string_array_from_value(value: &Value, field: &str) -> Vec<String> {
@@ -705,9 +709,61 @@ mod tests {
     }
 
     #[test]
+    fn pod_with_deletion_timestamp_is_not_surfaced() {
+        let mut pod = ready_pod("reviews-v1", "10.1.0.10");
+        pod.metadata.deletion_timestamp = Some("2026-05-14T12:00:00Z".to_string());
+
+        let translation = translate_k8s_objects(
+            &[
+                service(),
+                pod,
+                endpoint_slice(vec![("reviews-v1", "10.1.0.10")]),
+            ],
+            options(),
+        )
+        .expect("core translation succeeds");
+
+        let mesh = translation.config.mesh.expect("mesh config");
+        assert_eq!(mesh.services[0].workloads.len(), 0);
+        assert_eq!(mesh.workloads.len(), 0);
+    }
+
+    #[test]
     fn endpoint_slice_ready_false_is_not_surfaced() {
         let mut slice = endpoint_slice(vec![("reviews-v1", "10.1.0.10")]);
         slice.spec["endpoints"][0]["conditions"]["ready"] = json!(false);
+
+        let translation = translate_k8s_objects(
+            &[service(), ready_pod("reviews-v1", "10.1.0.10"), slice],
+            options(),
+        )
+        .expect("core translation succeeds");
+
+        let mesh = translation.config.mesh.expect("mesh config");
+        assert_eq!(mesh.services[0].workloads.len(), 0);
+        assert_eq!(mesh.workloads.len(), 0);
+    }
+
+    #[test]
+    fn endpoint_slice_terminating_is_not_surfaced() {
+        let mut slice = endpoint_slice(vec![("reviews-v1", "10.1.0.10")]);
+        slice.spec["endpoints"][0]["conditions"]["terminating"] = json!(true);
+
+        let translation = translate_k8s_objects(
+            &[service(), ready_pod("reviews-v1", "10.1.0.10"), slice],
+            options(),
+        )
+        .expect("core translation succeeds");
+
+        let mesh = translation.config.mesh.expect("mesh config");
+        assert_eq!(mesh.services[0].workloads.len(), 0);
+        assert_eq!(mesh.workloads.len(), 0);
+    }
+
+    #[test]
+    fn endpoint_slice_serving_defaults_to_ready() {
+        let mut slice = endpoint_slice(vec![("reviews-v1", "10.1.0.10")]);
+        slice.spec["endpoints"][0]["conditions"] = json!({"ready": false});
 
         let translation = translate_k8s_objects(
             &[service(), ready_pod("reviews-v1", "10.1.0.10"), slice],
@@ -749,6 +805,21 @@ mod tests {
             mesh.workloads[0].locality.as_deref(),
             Some("us-east1/us-east1-b")
         );
+    }
+
+    #[test]
+    fn endpoint_zone_without_node_region_does_not_emit_locality() {
+        let mut slice = endpoint_slice(vec![("reviews-v1", "10.1.0.10")]);
+        slice.spec["endpoints"][0]["zone"] = json!("us-east1-b");
+
+        let translation = translate_k8s_objects(
+            &[service(), ready_pod("reviews-v1", "10.1.0.10"), slice],
+            options(),
+        )
+        .expect("core translation succeeds");
+
+        let mesh = translation.config.mesh.expect("mesh config");
+        assert_eq!(mesh.workloads[0].locality, None);
     }
 
     #[test]

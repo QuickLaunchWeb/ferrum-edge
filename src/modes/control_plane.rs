@@ -518,6 +518,12 @@ pub async fn run(
             }
         }
     } else {
+        if env_config.k8s_pod_discovery_enabled {
+            warn!(
+                "FERRUM_K8S_POD_DISCOVERY_ENABLED=true has no effect because \
+                 FERRUM_K8S_CONTROLLER_ENABLED=false"
+            );
+        }
         None
     };
 

@@ -411,9 +411,9 @@ where
             if acc.options.pod_discovery_enabled {
                 core::collect(&mut acc, object)?;
             }
-        } else if object.kind == "WorkloadEntry" {
+        } else if acc.options.pod_discovery_enabled && object.kind == "WorkloadEntry" {
             collect_explicit_workload_service(&mut acc, object);
-        } else if object.kind == "ServiceEntry" {
+        } else if acc.options.pod_discovery_enabled && object.kind == "ServiceEntry" {
             collect_explicit_service_entry_keys(&mut acc, object);
         } else if acc.options.pod_discovery_enabled && core::is_core_resource_kind(&object.kind) {
             core::collect(&mut acc, object)?;
