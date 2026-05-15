@@ -13,7 +13,8 @@ use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::warn;
@@ -549,6 +550,7 @@ struct BufferedTraceExporter {
     provider_name: &'static str,
     hostname: String,
     sender: mpsc::Sender<SpanData>,
+    deferred_start: Mutex<Option<(mpsc::Receiver<SpanData>, TraceHttpExporterConfig)>>,
 }
 
 impl BufferedTraceExporter {
@@ -556,12 +558,40 @@ impl BufferedTraceExporter {
         let hostname = validate_endpoint_for_provider(cfg.provider_name, &cfg.endpoint)?;
         let (sender, receiver) = mpsc::channel(buffer_capacity);
         let provider_name = cfg.provider_name;
-        tokio::spawn(trace_export_flush_loop(receiver, cfg));
+        let deferred_start = if let Ok(handle) = Handle::try_current() {
+            handle.spawn(trace_export_flush_loop(receiver, cfg));
+            Mutex::new(None)
+        } else {
+            Mutex::new(Some((receiver, cfg)))
+        };
         Ok(Self {
             provider_name,
             hostname,
             sender,
+            deferred_start,
         })
+    }
+
+    fn ensure_started(&self) -> Result<(), String> {
+        let mut deferred = self
+            .deferred_start
+            .lock()
+            .map_err(|_| "trace exporter deferred startup lock poisoned".to_string())?;
+        let Some((receiver, cfg)) = deferred.take() else {
+            return Ok(());
+        };
+        match Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(trace_export_flush_loop(receiver, cfg));
+                Ok(())
+            }
+            Err(error) => {
+                *deferred = Some((receiver, cfg));
+                Err(format!(
+                    "trace exporter flush task has no Tokio runtime: {error}"
+                ))
+            }
+        }
     }
 }
 
@@ -575,6 +605,7 @@ impl TraceExporter for BufferedTraceExporter {
     }
 
     fn try_export(&self, span: SpanData) -> Result<(), String> {
+        self.ensure_started()?;
         self.sender.try_send(span).map_err(|e| e.to_string())
     }
 }

@@ -878,6 +878,22 @@ mod tests {
         assert!(err.contains("invalid tracing_provider config"), "{err}");
     }
 
+    #[test]
+    fn tracing_provider_config_is_safe_without_tokio_runtime() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "tracing_provider": {
+                "kind": "zipkin",
+                "config": {
+                    "url": "http://zipkin:9411/api/v2/spans"
+                }
+            }
+        }))
+        .expect("validation-time construction should not require a Tokio runtime");
+
+        assert_eq!(metrics.tracing_providers().len(), 1);
+        assert_eq!(metrics.warmup_hostnames(), vec!["zipkin".to_string()]);
+    }
+
     #[tokio::test]
     async fn tracing_providers_array_round_trips() {
         let metrics = WorkloadMetrics::new(&json!({

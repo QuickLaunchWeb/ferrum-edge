@@ -2303,6 +2303,7 @@ fn telemetry_tracing_mode(
     };
     match mode {
         "SERVER" | "server" => Ok(Some(TelemetryTracingMode::Server)),
+        "CLIENT_AND_SERVER" | "client_and_server" => Ok(Some(TelemetryTracingMode::Server)),
         "CLIENT" | "client" => Ok(Some(TelemetryTracingMode::Client)),
         other => Err(invalid_resource(
             object,
@@ -4584,6 +4585,43 @@ mod tests {
         {
             TracingProvider::Zipkin { url } => {
                 assert_eq!(url, "http://server-zipkin:9411/api/v2/spans");
+            }
+            other => panic!("expected Zipkin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telemetry_tracing_client_and_server_mode_is_kept_for_server_span_export() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "match": {"mode": "CLIENT_AND_SERVER"},
+                        "providers": [{
+                            "name": "zipkin",
+                            "url": "http://shared-zipkin:9411/api/v2/spans"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("server tracing config");
+        match tracing
+            .providers
+            .first()
+            .expect("shared provider translated")
+        {
+            TracingProvider::Zipkin { url } => {
+                assert_eq!(url, "http://shared-zipkin:9411/api/v2/spans");
             }
             other => panic!("expected Zipkin, got {other:?}"),
         }
