@@ -505,6 +505,7 @@ fn stable_config_value(config: &GatewayConfig) -> Value {
     sort_top_level_collection(&mut value, "upstreams", "id");
     sort_string_array(&mut value, "known_namespaces");
     sort_mesh_collection(&mut value, "workloads", "spiffe_id");
+    sort_mesh_collection(&mut value, "services", "name");
     sort_mesh_service_workloads(&mut value);
     value
 }
@@ -827,6 +828,30 @@ mod tests {
         let new_config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
                 services: vec![mesh_service_with_workloads(vec![workload_a, workload_b])],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        assert!(!gateway_config_content_changed(&new_config, &old_config));
+    }
+
+    #[test]
+    fn content_change_ignores_mesh_service_order() {
+        let mut service_a = mesh_service_with_workloads(vec![mesh_workload_ref("a")]);
+        service_a.name = "api".to_string();
+        let mut service_b = mesh_service_with_workloads(vec![mesh_workload_ref("b")]);
+        service_b.name = "reviews".to_string();
+        let old_config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service_b.clone(), service_a.clone()],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let new_config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service_a, service_b],
                 ..MeshConfig::default()
             })),
             ..GatewayConfig::default()

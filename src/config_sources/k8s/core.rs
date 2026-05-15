@@ -528,7 +528,7 @@ fn workload_port_protocol(protocol: Option<&str>) -> AppProtocol {
 
 fn app_protocol_from_hint(value: &str) -> Option<AppProtocol> {
     let value = value.to_ascii_lowercase();
-    if value.contains("grpc") || value.starts_with("grpc") {
+    if value.contains("grpc") {
         Some(AppProtocol::Grpc)
     } else if value.contains("http2") || value.contains("h2c") {
         Some(AppProtocol::Http2)
