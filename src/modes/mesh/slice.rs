@@ -842,6 +842,7 @@ fn sidecar_host_match_namespace<'a>(
         && sidecar.namespace == root_namespace
         && sidecar.namespace != workload_namespace
     {
+        // Root-namespace defaults expand `./*` against the workload's namespace, not the root namespace.
         workload_namespace
     } else {
         sidecar.namespace.as_str()

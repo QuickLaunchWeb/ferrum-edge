@@ -1204,7 +1204,7 @@ pub fn default_istio_root_namespace() -> String {
 }
 
 fn is_default_istio_root_namespace(value: &str) -> bool {
-    value == "istio-system"
+    value == default_istio_root_namespace()
 }
 
 impl Default for MeshConfig {
