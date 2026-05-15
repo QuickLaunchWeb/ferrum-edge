@@ -382,9 +382,10 @@ impl MeshSlice {
                 service_entry_applies_to_workload(entry, effective_namespace, &effective_labels)
             })
             .filter_map(|entry| {
-                applicable_sidecar
-                    .and_then(|sidecar| narrow_service_entry_ports(entry, sidecar))
-                    .or_else(|| applicable_sidecar.is_none().then(|| entry.clone()))
+                let Some(sidecar) = applicable_sidecar else {
+                    return Some(entry.clone());
+                };
+                narrow_service_entry_ports(entry, sidecar)
             })
             .collect();
         let request_authentications: Vec<MeshRequestAuthentication> = mesh
