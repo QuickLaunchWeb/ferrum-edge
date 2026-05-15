@@ -196,6 +196,8 @@ impl Default for NodeAgentMetrics {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodInfo {
     pub proxy_port: u16,
+    /// Reserved for future cgroup-aware BPF policy; current node-agent
+    /// enrollment writes `0` because IP-to-proxy-port capture is sufficient.
     pub cgroup_id: u64,
 }
 

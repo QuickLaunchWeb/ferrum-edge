@@ -726,7 +726,7 @@ impl MetricsRegistry {
         } else {
             output.push_str(&format!(
                 "ferrum_rate_limit_exceeded_total{{{}}} {}\n",
-                &ns_label[1..], // strip leading comma
+                namespace_label_body(&ns_label),
                 self.rate_limit_exceeded.load(Ordering::Relaxed)
             ));
         }
@@ -822,7 +822,7 @@ impl MetricsRegistry {
         } else {
             output.push_str(&format!(
                 "ferrum_mesh_dns_upstream_id_exhaustions_total{{{}}} {}\n",
-                &ns_label[1..],
+                namespace_label_body(&ns_label),
                 mesh_dns_exhaustions
             ));
         }
@@ -887,8 +887,16 @@ fn render_process_counter(output: &mut String, metric_name: &str, value: u64, ns
     if ns_label.is_empty() {
         output.push_str(&format!("{metric_name} {value}\n"));
     } else {
-        output.push_str(&format!("{metric_name}{{{}}} {value}\n", &ns_label[1..]));
+        output.push_str(&format!(
+            "{metric_name}{{{}}} {value}\n",
+            namespace_label_body(ns_label)
+        ));
     }
+}
+
+fn namespace_label_body(ns_label: &str) -> &str {
+    debug_assert!(ns_label.starts_with(','));
+    ns_label.strip_prefix(',').unwrap_or(ns_label)
 }
 
 /// Render a single histogram's buckets, sum, and count into the output buffer.
