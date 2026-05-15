@@ -860,31 +860,56 @@ fn sidecar_egress_port_admission(
         return None;
     }
 
-    let mut admitted_ports = BTreeSet::new();
-    for egress_entry in sidecar_egress {
-        let host_matches = egress_entry.hosts.iter().any(|raw_pattern| {
+    let host_matches = |egress_entry: &MeshSidecarEgress| {
+        egress_entry.hosts.iter().any(|raw_pattern| {
             sidecar_host_pattern_matches(
                 MeshSidecarEgress::parse_host_pattern(raw_pattern),
                 sidecar_namespace,
                 resource_namespace,
                 host_candidates,
             )
-        });
-        if !host_matches {
-            continue;
-        }
+        })
+    };
 
-        match (egress_entry.port, resource_ports) {
-            (None, _) | (Some(_), None) => return Some(SidecarPortAdmission::All),
-            (Some(port), Some(resource_ports)) => {
-                if resource_ports.contains(&port) {
-                    admitted_ports.insert(port);
-                }
-            }
+    let Some(resource_ports) = resource_ports else {
+        return sidecar_egress
+            .iter()
+            .any(host_matches)
+            .then_some(SidecarPortAdmission::All);
+    };
+
+    let resource_port_set: BTreeSet<u16> = resource_ports.iter().copied().collect();
+    if resource_port_set.is_empty() {
+        return None;
+    }
+
+    let specific_ports: BTreeSet<u16> = sidecar_egress
+        .iter()
+        .filter_map(|egress_entry| egress_entry.port)
+        .collect();
+    let mut admitted_ports = BTreeSet::new();
+    for port in &resource_port_set {
+        let has_specific_listener = specific_ports.contains(port);
+        let admitted = sidecar_egress.iter().any(|egress_entry| {
+            let port_applies = if has_specific_listener {
+                egress_entry.port == Some(*port)
+            } else {
+                egress_entry.port.is_none()
+            };
+            port_applies && host_matches(egress_entry)
+        });
+        if admitted {
+            admitted_ports.insert(*port);
         }
     }
 
-    (!admitted_ports.is_empty()).then_some(SidecarPortAdmission::Ports(admitted_ports))
+    if admitted_ports.is_empty() {
+        None
+    } else if admitted_ports == resource_port_set {
+        Some(SidecarPortAdmission::All)
+    } else {
+        Some(SidecarPortAdmission::Ports(admitted_ports))
+    }
 }
 
 /// Match a parsed [`SidecarHostPattern`] against a resource's namespace and
@@ -3435,6 +3460,42 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
         assert_eq!(slice.services.len(), 1);
         assert_eq!(port_numbers(&slice.services[0].ports), vec![80, 8080]);
+    }
+
+    #[test]
+    fn sidecar_narrowing_specific_port_overrides_portless_host_entry_for_that_port() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar_with_ports(
+                "ports-sc",
+                "alpha",
+                None,
+                vec![(vec!["./*"], None), (vec!["./payments"], Some(443))],
+            )],
+            services: vec![
+                make_service_with_ports("alpha", "reviews", &[80, 443]),
+                make_service_with_ports("alpha", "payments", &[443]),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+
+        let reviews = slice
+            .services
+            .iter()
+            .find(|service| service.name == "reviews")
+            .expect("reviews service");
+        assert_eq!(
+            port_numbers(&reviews.ports),
+            vec![80],
+            "portless ./ * should not admit 443 when a specific 443 listener exists"
+        );
+        let payments = slice
+            .services
+            .iter()
+            .find(|service| service.name == "payments")
+            .expect("payments service");
+        assert_eq!(port_numbers(&payments.ports), vec![443]);
     }
 
     #[test]
