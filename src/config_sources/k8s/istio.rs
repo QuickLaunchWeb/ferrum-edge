@@ -1171,6 +1171,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         service_raw,
         &object.metadata.namespace,
         &acc.options.cluster_domain,
+        &acc.known_namespaces,
     );
     match service_key.as_ref() {
         Some(key) if key.namespace != object.metadata.namespace => {
@@ -3186,15 +3187,26 @@ mod tests {
 
     #[test]
     fn workload_entry_two_label_cross_namespace_service_host_fails_closed() {
+        let mut prod_service = object(
+            "Service",
+            serde_json::json!({
+                "ports": [{"port": 80}]
+            }),
+        );
+        prod_service.metadata.name = "reviews".to_string();
+        prod_service.metadata.namespace = "prod".to_string();
         let err = translate_k8s_objects(
-            &[object(
-                "WorkloadEntry",
-                serde_json::json!({
-                    "address": "10.0.1.5",
-                    "service": "reviews.prod"
-                }),
-            )],
-            options(),
+            &[
+                prod_service,
+                object(
+                    "WorkloadEntry",
+                    serde_json::json!({
+                        "address": "10.0.1.5",
+                        "service": "reviews.prod"
+                    }),
+                ),
+            ],
+            options().with_source_namespaces(Vec::new()),
         )
         .expect_err("two-label cross-namespace WorkloadEntry service host must fail closed");
 
@@ -3211,6 +3223,24 @@ mod tests {
             err.contains("cross-namespace"),
             "error should identify the unsupported cross-namespace reference: {err}"
         );
+    }
+
+    #[test]
+    fn workload_entry_two_label_dns_service_name_is_preserved() {
+        let result = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5",
+                    "service": "example.com"
+                }),
+            )],
+            options(),
+        )
+        .expect("two-label DNS WorkloadEntry service should remain valid");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.workloads[0].service_name, "example.com");
     }
 
     #[test]

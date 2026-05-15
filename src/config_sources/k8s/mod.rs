@@ -569,12 +569,19 @@ pub(crate) fn workload_entry_service_key_from_host(
     host: &str,
     default_namespace: &str,
     cluster_domain: &str,
+    known_namespaces: &HashSet<String>,
 ) -> Option<K8sServiceKey> {
     service_key_from_host(host, default_namespace, cluster_domain).or_else(|| {
         let host = normalized_service_host(host)?;
         let parts: Vec<&str> = host.split('.').collect();
         match parts.as_slice() {
-            [name, namespace] => K8sServiceKey::new((*namespace).to_string(), (*name).to_string()),
+            [name, namespace]
+                if known_namespaces
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(namespace)) =>
+            {
+                K8sServiceKey::new((*namespace).to_string(), (*name).to_string())
+            }
             _ => None,
         }
     })
@@ -1507,20 +1514,45 @@ mod tests {
     }
 
     #[test]
-    fn workload_entry_service_key_from_host_parses_two_label_service_namespace_refs() {
+    fn workload_entry_service_key_from_host_parses_known_two_label_namespace_refs() {
+        let known_namespaces = HashSet::from(["prod".to_string()]);
         assert_eq!(
-            workload_entry_service_key_from_host("reviews.prod", "default", "cluster.local"),
+            workload_entry_service_key_from_host(
+                "reviews.prod",
+                "default",
+                "cluster.local",
+                &known_namespaces,
+            ),
             Some(K8sServiceKey {
                 namespace: "prod".to_string(),
                 name: "reviews".to_string(),
             })
         );
         assert_eq!(
-            workload_entry_service_key_from_host("reviews.prod.", "default", "cluster.local"),
+            workload_entry_service_key_from_host(
+                "reviews.prod.",
+                "default",
+                "cluster.local",
+                &known_namespaces,
+            ),
             Some(K8sServiceKey {
                 namespace: "prod".to_string(),
                 name: "reviews".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn workload_entry_service_key_from_host_preserves_unknown_two_label_dns_names() {
+        let known_namespaces = HashSet::from(["default".to_string()]);
+        assert_eq!(
+            workload_entry_service_key_from_host(
+                "example.com",
+                "default",
+                "cluster.local",
+                &known_namespaces,
+            ),
+            None
         );
     }
 }
