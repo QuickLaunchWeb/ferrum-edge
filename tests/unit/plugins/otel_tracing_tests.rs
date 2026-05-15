@@ -1013,6 +1013,40 @@ async fn test_otel_tracing_error_span_events() {
 }
 
 #[tokio::test]
+async fn test_otel_tracing_clamps_negative_duration_for_otlp() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = new_otel(&json!({
+        "endpoint": format!("{}/v1/traces", mock_server.uri()),
+        "batch_size": 1,
+        "flush_interval_ms": 100
+    }));
+
+    let mut summary = make_summary(make_trace_metadata());
+    summary.latency_total_ms = -5.0;
+    plugin.log(&summary).await;
+
+    let payload = received_json(&mock_server).await;
+    let span = otlp_span(&payload);
+    let start_ns = span["startTimeUnixNano"]
+        .as_str()
+        .expect("startTimeUnixNano")
+        .parse::<i64>()
+        .expect("numeric start time");
+    let end_ns = span["endTimeUnixNano"]
+        .as_str()
+        .expect("endTimeUnixNano")
+        .parse::<i64>()
+        .expect("numeric end time");
+    assert_eq!(end_ns, start_ns);
+}
+
+#[tokio::test]
 async fn test_otel_tracing_deployment_environment() {
     let mock_server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))

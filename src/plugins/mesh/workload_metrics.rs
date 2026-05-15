@@ -95,7 +95,22 @@ impl WorkloadMetrics {
             .unwrap_or_default();
         let trust_domain_aliases =
             parse_trust_domain_aliases(config).map_err(|e| format!("workload_metrics: {e}"))?;
-        let sampling_percentage = config.get("sampling_percentage").and_then(Value::as_f64);
+        let sampling_percentage = match config.get("sampling_percentage") {
+            Some(value) => {
+                let Some(percentage) = value.as_f64() else {
+                    return Err(
+                        "workload_metrics: sampling_percentage must be a number".to_string()
+                    );
+                };
+                if !percentage.is_finite() || !(0.0..=100.0).contains(&percentage) {
+                    return Err(format!(
+                        "workload_metrics: sampling_percentage must be between 0.0 and 100.0 (got {percentage})"
+                    ));
+                }
+                Some(percentage)
+            }
+            None => None,
+        };
         let custom_tags = config
             .get("custom_tags")
             .and_then(Value::as_object)
@@ -1000,6 +1015,29 @@ mod tests {
         assert!(
             !metrics.should_export_metadata(&metadata),
             "export should rely on the request-time sampling decision"
+        );
+    }
+
+    #[test]
+    fn invalid_sampling_percentage_is_rejected() {
+        let err = WorkloadMetrics::new(&json!({
+            "sampling_percentage": 150.0
+        }))
+        .err()
+        .expect("out-of-range sampling should fail");
+        assert!(
+            err.contains("sampling_percentage must be between 0.0 and 100.0"),
+            "{err}"
+        );
+
+        let err = WorkloadMetrics::new(&json!({
+            "sampling_percentage": "100"
+        }))
+        .err()
+        .expect("non-numeric sampling should fail");
+        assert!(
+            err.contains("sampling_percentage must be a number"),
+            "{err}"
         );
     }
 

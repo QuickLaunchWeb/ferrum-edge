@@ -2092,6 +2092,14 @@ fn telemetry(
                                     .or_else(|| {
                                         let env_tag = val.get("environment")?;
                                         let name = env_tag.get("name").and_then(Value::as_str)?;
+                                        if telemetry_custom_tag_env_var_is_sensitive(name) {
+                                            tracing::warn!(
+                                                tag = %key,
+                                                env_var = %name,
+                                                "dropping telemetry custom tag that references a sensitive environment variable"
+                                            );
+                                            return None;
+                                        }
                                         match std::env::var(name) {
                                             Ok(value) => Some(value),
                                             Err(error) => {
@@ -2250,6 +2258,33 @@ fn telemetry_sampling_percentage(
         ));
     }
     Ok(Some(sampling))
+}
+
+fn telemetry_custom_tag_env_var_is_sensitive(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "DATABASE_URL"
+            | "DB_URL"
+            | "AWS_SECRET_ACCESS_KEY"
+            | "GOOGLE_APPLICATION_CREDENTIALS"
+            | "KUBECONFIG"
+    ) {
+        return true;
+    }
+    upper.starts_with("FERRUM_")
+        && [
+            "SECRET",
+            "PASSWORD",
+            "PASSWD",
+            "TOKEN",
+            "PRIVATE_KEY",
+            "CLIENT_KEY",
+            "DB_URL",
+            "DATABASE_URL",
+        ]
+        .iter()
+        .any(|marker| upper.contains(marker))
 }
 
 fn extend_unique_tracing_providers(
@@ -4129,6 +4164,38 @@ mod tests {
             tracing.custom_tags.get("region").map(String::as_str),
             Some("us-east-1")
         );
+    }
+
+    #[test]
+    fn telemetry_environment_custom_tag_drops_sensitive_env_reference() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "customTags": {
+                            "admin_secret": {
+                                "environment": {
+                                    "name": "FERRUM_ADMIN_JWT_SECRET",
+                                    "defaultValue": "must-not-leak"
+                                }
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+
+        assert!(!tracing.custom_tags.contains_key("admin_secret"));
     }
 
     #[test]

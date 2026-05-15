@@ -994,7 +994,7 @@ fn build_otlp_payload(
 
             // Parse start time from ISO 8601 timestamp
             let start_ns = timestamp_nanos(&s.timestamp_received);
-            let end_ns = start_ns + (s.duration_ms * 1_000_000.0) as i64;
+            let end_ns = start_ns + (s.duration_ms.max(0.0) * 1_000_000.0) as i64;
 
             let mut attributes = vec![
                 otlp_attribute("http.request.method", &s.http_method),
