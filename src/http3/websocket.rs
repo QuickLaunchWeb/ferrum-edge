@@ -464,9 +464,8 @@ pub(crate) async fn handle_h3_websocket(
                         && let Some(next) = {
                             let retry_override_port =
                                 crate::proxy::retry_port_override_dispatch_port(
-                                    &epoch,
-                                    upstream_id,
                                     &proxy,
+                                    prev_target,
                                 );
                             let health_ctx = crate::load_balancer::HealthContext {
                                 active_unhealthy: &state.health_checker.active_unhealthy_targets,

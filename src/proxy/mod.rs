@@ -4322,7 +4322,7 @@ async fn handle_websocket_request_authenticated(
                         && let Some(ref hash_key) = lb_hash_key
                         && let Some(next) = {
                             let retry_override_port =
-                                retry_port_override_dispatch_port(&epoch, upstream_id, &proxy);
+                                retry_port_override_dispatch_port(&proxy, prev_target);
                             let health_ctx = crate::load_balancer::HealthContext {
                                 active_unhealthy: &state.health_checker.active_unhealthy_targets,
                                 proxy_passive: state
@@ -7963,7 +7963,7 @@ async fn handle_proxy_request_inner(
                     && let Some(ref hash_key) = lb_hash_key
                     && let Some(next) = {
                         let retry_override_port =
-                            retry_port_override_dispatch_port(&epoch, upstream_id, &proxy);
+                            retry_port_override_dispatch_port(&proxy, prev_target);
                         let health_ctx = crate::load_balancer::HealthContext {
                             active_unhealthy: &state.health_checker.active_unhealthy_targets,
                             proxy_passive: state
@@ -8836,7 +8836,7 @@ async fn handle_proxy_request_inner(
                 && let Some(ref hash_key) = lb_hash_key
                 && let Some(next) = {
                     let retry_override_port =
-                        retry_port_override_dispatch_port(&epoch, upstream_id, &proxy);
+                        retry_port_override_dispatch_port(&proxy, prev_target);
                     let health_ctx = crate::load_balancer::HealthContext {
                         active_unhealthy: &state.health_checker.active_unhealthy_targets,
                         proxy_passive: state
@@ -9741,13 +9741,18 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     std::borrow::Cow::Owned(owned)
 }
 
+/// Resolve the per-port retry lane after a concrete target has failed.
+///
+/// Initial selection may use the full upstream for mixed-port target sets when
+/// no request destination port is known yet. Retry is different: we have a
+/// failed `prev_target`, so staying in that target's configured port lane
+/// avoids switching destination ports and bypassing port-scoped LB/passive
+/// policy on the retry attempt.
 pub(crate) fn retry_port_override_dispatch_port(
-    epoch: &RequestEpoch,
-    upstream_id: &str,
     proxy: &Proxy,
+    prev_target: &UpstreamTarget,
 ) -> Option<u16> {
-    let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
-    let dispatch_port = backend_dispatch::initial_dispatch_port(proxy, upstream.as_deref());
+    let dispatch_port = prev_target.port;
     proxy
         .dispatch_port_overrides
         .as_ref()
@@ -13211,7 +13216,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_port_override_dispatch_port_matches_initial_mixed_port_scope() {
+    fn retry_port_override_dispatch_port_uses_selected_target_port() {
         let mut proxy = test_proxy(ResponseBodyMode::Stream);
         proxy.upstream_id = Some("u1".to_string());
         proxy.backend_port = 0;
@@ -13223,61 +13228,30 @@ mod tests {
             },
         )]));
 
-        let upstream = Upstream {
-            id: "u1".to_string(),
-            name: Some("u1".to_string()),
-            namespace: "ferrum".to_string(),
-            targets: vec![
-                UpstreamTarget {
-                    host: "a".to_string(),
-                    port: 8080,
-                    weight: 1,
-                    tags: HashMap::new(),
-                    path: None,
-                },
-                UpstreamTarget {
-                    host: "b".to_string(),
-                    port: 9090,
-                    weight: 1,
-                    tags: HashMap::new(),
-                    path: None,
-                },
-            ],
-            algorithm: crate::config::types::LoadBalancerAlgorithm::RoundRobin,
-            hash_on: None,
-            hash_on_cookie_config: None,
-            health_checks: None,
-            service_discovery: None,
-            subsets: None,
-            port_overrides: HashMap::new(),
-            backend_tls_client_cert_path: None,
-            backend_tls_client_key_path: None,
-            backend_tls_verify_server_cert: true,
-            backend_tls_server_ca_cert_path: None,
-            api_spec_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+        let selected_overridden_target = UpstreamTarget {
+            host: "a".to_string(),
+            port: 8080,
+            weight: 1,
+            tags: HashMap::new(),
+            path: None,
         };
-        let config = GatewayConfig {
-            proxies: vec![proxy.clone()],
-            upstreams: vec![upstream],
-            ..GatewayConfig::default()
+        let selected_non_overridden_target = UpstreamTarget {
+            host: "b".to_string(),
+            port: 9090,
+            weight: 1,
+            tags: HashMap::new(),
+            path: None,
         };
-        let plugin_cache = PluginCache::new(&config).expect("plugin cache");
-        let consumer_index = ConsumerIndex::new(&config.consumers);
-        let lb_cache = LoadBalancerCache::new(&config);
-        let epoch_store = RequestEpochStore::from_runtime_parts(
-            config,
-            &plugin_cache,
-            &consumer_index,
-            &lb_cache,
-        );
-        let epoch = epoch_store.load();
 
         assert_eq!(
-            retry_port_override_dispatch_port(&epoch, "u1", &proxy),
+            retry_port_override_dispatch_port(&proxy, &selected_overridden_target),
+            Some(8080),
+            "retries should stay in the failed target's per-port lane when one exists"
+        );
+        assert_eq!(
+            retry_port_override_dispatch_port(&proxy, &selected_non_overridden_target),
             None,
-            "retries must not narrow to a selected target's port when the initial mixed-port dispatch used the full upstream"
+            "targets without a configured port override keep upstream-level retry selection"
         );
     }
 
