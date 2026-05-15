@@ -199,41 +199,25 @@ impl IptablesPlan {
                 true
             })
             .collect();
-        if config.include_outbound_ports.is_empty() {
-            for cidr in include_cidrs {
-                commands.push(idempotent_append(
-                    "nat",
-                    "FERRUM_MESH_OUTBOUND",
-                    &format!(
-                        "-p tcp -d {cidr} -j REDIRECT --to-ports {}",
-                        config.outbound_port
-                    ),
-                ));
-            }
-        } else if include_cidrs.is_empty() {
-            for port in &config.include_outbound_ports {
-                commands.push(idempotent_append(
-                    "nat",
-                    "FERRUM_MESH_OUTBOUND",
-                    &format!(
-                        "-p tcp --dport {port} -j REDIRECT --to-ports {}",
-                        config.outbound_port
-                    ),
-                ));
-            }
-        } else {
-            for cidr in include_cidrs {
-                for port in &config.include_outbound_ports {
-                    commands.push(idempotent_append(
-                        "nat",
-                        "FERRUM_MESH_OUTBOUND",
-                        &format!(
-                            "-p tcp -d {cidr} --dport {port} -j REDIRECT --to-ports {}",
-                            config.outbound_port
-                        ),
-                    ));
-                }
-            }
+        for port in &config.include_outbound_ports {
+            commands.push(idempotent_append(
+                "nat",
+                "FERRUM_MESH_OUTBOUND",
+                &format!(
+                    "-p tcp --dport {port} -j REDIRECT --to-ports {}",
+                    config.outbound_port
+                ),
+            ));
+        }
+        for cidr in include_cidrs {
+            commands.push(idempotent_append(
+                "nat",
+                "FERRUM_MESH_OUTBOUND",
+                &format!(
+                    "-p tcp -d {cidr} -j REDIRECT --to-ports {}",
+                    config.outbound_port
+                ),
+            ));
         }
         // Inbound port exclusions MUST be appended before the catch-all
         // REDIRECT below — once REDIRECT fires the chain returns, so any
@@ -794,23 +778,22 @@ mod tests {
         for port in [5432, 9092] {
             assert!(
                 plan.commands.iter().any(|cmd| cmd.contains(&format!(
-                    "-p tcp -d 0.0.0.0/0 --dport {port} -j REDIRECT --to-ports 15001"
+                    "-p tcp --dport {port} -j REDIRECT --to-ports 15001"
                 ))),
                 "includeOutboundPorts REDIRECT missing for port {port}: {:?}",
                 plan.commands
             );
         }
         assert!(
-            !plan
-                .commands
+            plan.commands
                 .iter()
                 .any(|cmd| cmd.contains("-p tcp -d 0.0.0.0/0 -j REDIRECT")),
-            "port-scoped includes should replace the CIDR-only catch-all redirect"
+            "CIDR include rules should remain additive with includeOutboundPorts"
         );
     }
 
     #[test]
-    fn iptables_plan_combines_include_ports_with_include_cidrs() {
+    fn iptables_plan_keeps_include_ports_additive_with_include_cidrs() {
         let mut config = CaptureConfig::explicit(15006, 15001);
         config.mode = CaptureMode::Iptables;
         config.include_cidrs = vec!["10.0.0.0/8".to_string()];
@@ -818,18 +801,27 @@ mod tests {
 
         let plan = IptablesPlan::for_config(&config);
 
+        let port_rule = plan
+            .commands
+            .iter()
+            .position(|cmd| cmd.contains("-p tcp --dport 5432 -j REDIRECT --to-ports 15001"))
+            .expect("includeOutboundPorts should redirect port 5432 regardless of destination IP");
+        let cidr_rule = plan
+            .commands
+            .iter()
+            .position(|cmd| cmd.contains("-p tcp -d 10.0.0.0/8 -j REDIRECT --to-ports 15001"))
+            .expect("include CIDR should still redirect all ports inside the CIDR");
         assert!(
-            plan.commands.iter().any(|cmd| cmd
-                .contains("-p tcp -d 10.0.0.0/8 --dport 5432 -j REDIRECT --to-ports 15001")),
-            "includeOutboundPorts should narrow the configured include CIDR: {:?}",
+            port_rule < cidr_rule,
+            "port-only includes should be evaluated before CIDR includes: {:?}",
             plan.commands
         );
         assert!(
             !plan
                 .commands
                 .iter()
-                .any(|cmd| cmd.contains("-p tcp -d 10.0.0.0/8 -j REDIRECT")),
-            "CIDR-only redirect should not remain when ports narrow the include scope"
+                .any(|cmd| cmd.contains("-d 10.0.0.0/8 --dport 5432")),
+            "includeOutboundPorts and include CIDRs should be additive, not intersected"
         );
     }
 
