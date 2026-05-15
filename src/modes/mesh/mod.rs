@@ -4901,11 +4901,14 @@ mod tests {
                 let mut local = workload("reviews-local", "reviews");
                 local.addresses = vec!["10.0.0.5".to_string()];
                 local.cluster = Some("cluster-a".to_string());
+                local.service_name = "reviews".to_string();
                 let mut remote = workload("reviews-remote", "reviews");
                 remote.addresses = vec!["172.16.0.5".to_string()];
                 remote.cluster = Some("cluster-b".to_string());
+                remote.service_name = "reviews".to_string();
                 let mut clusterless = workload("reviews-clusterless", "reviews");
                 clusterless.addresses = vec!["10.0.0.6".to_string()];
+                clusterless.service_name = "reviews".to_string();
 
                 let config = GatewayConfig {
                     mesh: Some(Box::new(MeshConfig {
