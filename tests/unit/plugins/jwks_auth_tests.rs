@@ -623,6 +623,7 @@ async fn test_jwks_auth_strips_authorization_when_forward_original_token_false()
         default_client(),
     )
     .unwrap();
+    assert!(plugin.modifies_request_headers());
     plugin.warmup_jwks().await;
 
     let consumers: Vec<ferrum_edge::config::types::Consumer> = Vec::new();

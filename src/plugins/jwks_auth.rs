@@ -312,9 +312,14 @@ impl JwksAuth {
             });
         }
 
-        let strip_authorization_on_success = providers
-            .iter()
-            .any(|provider| !provider.forward_original_token);
+        let strip_authorization_on_success = providers.iter().any(|provider| {
+            !provider.forward_original_token
+                && (provider.token_locations.is_empty()
+                    || provider
+                        .token_locations
+                        .iter()
+                        .any(|location| matches!(location, TokenLocation::Header(_))))
+        });
         let has_custom_query_token_locations = providers.iter().any(|provider| {
             provider
                 .token_locations

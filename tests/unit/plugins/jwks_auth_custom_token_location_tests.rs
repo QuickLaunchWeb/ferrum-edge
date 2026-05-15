@@ -210,6 +210,7 @@ async fn custom_header_token_is_stripped_when_forward_original_token_false() {
         default_client(),
     )
     .unwrap();
+    assert!(plugin.modifies_request_headers());
     let mut ctx = make_ctx();
     ctx.headers.insert(
         "x-token".to_string(),
@@ -245,6 +246,7 @@ async fn custom_query_token_marks_param_for_backend_strip() {
         default_client(),
     )
     .unwrap();
+    assert!(!plugin.modifies_request_headers());
     let mut ctx = make_ctx();
     ctx.query_params
         .insert("access_token".to_string(), token_for("query-user"));
