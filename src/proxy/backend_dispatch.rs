@@ -181,7 +181,7 @@ pub(crate) fn select_upstream_target(
 
     // Resolve the ejection cap from the upstream's passive health config.
     let upstream_arc = LoadBalancerCache::get_upstream_from(balancers, upstream_id);
-    let dispatch_port = proxy.backend_port;
+    let dispatch_port = initial_dispatch_port(proxy, upstream_arc.as_deref());
     let has_port_override = proxy
         .dispatch_port_overrides
         .as_ref()
@@ -285,6 +285,40 @@ pub(crate) fn select_upstream_target(
                 sticky_cookie_needed: false,
             }
         }
+    }
+}
+
+#[inline]
+fn initial_dispatch_port(proxy: &Proxy, upstream: Option<&Upstream>) -> u16 {
+    if proxy.backend_port != 0 {
+        return proxy.backend_port;
+    }
+
+    let Some(overrides) = proxy.dispatch_port_overrides.as_ref() else {
+        return 0;
+    };
+
+    if let Some(upstream) = upstream {
+        let mut port = None;
+        for target in &upstream.targets {
+            if !overrides.contains_key(&target.port) {
+                continue;
+            }
+            match port {
+                Some(existing) if existing != target.port => return 0,
+                Some(_) => {}
+                None => port = Some(target.port),
+            }
+        }
+        if let Some(port) = port {
+            return port;
+        }
+    }
+
+    if overrides.len() == 1 {
+        overrides.keys().next().copied().unwrap_or(0)
+    } else {
+        0
     }
 }
 
@@ -550,5 +584,52 @@ mod tests {
             Some("canary.svc:9090"),
             "direct backend overrides must partition circuit breaker state by effective host:port"
         );
+    }
+
+    #[tokio::test]
+    async fn upstream_selection_uses_port_override_when_proxy_backend_port_is_unset() {
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "consumers": [],
+                "plugin_configs": [],
+                "proxies": [{
+                    "id": "mesh-egress",
+                    "listen_path": "/",
+                    "backend_scheme": "http",
+                    "backend_host": "unused.local",
+                    "backend_port": 0,
+                    "upstream_id": "mesh-upstream"
+                }],
+                "upstreams": [{
+                    "id": "mesh-upstream",
+                    "targets": [
+                        {"host": "10.0.0.1", "port": 8080},
+                        {"host": "10.0.0.2", "port": 8080}
+                    ],
+                    "algorithm": "round_robin",
+                    "port_overrides": {
+                        "8080": {
+                            "algorithm": "consistent_hashing",
+                            "hash_on": "header:x-user"
+                        }
+                    }
+                }]
+            }))
+            .expect("test config should deserialize");
+        config.normalize_fields();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let (state, _) = crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+            .expect("test proxy state should build");
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+        let mut headers = HashMap::new();
+        headers.insert("x-user".to_string(), "alice".to_string());
+
+        let selection = select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &headers);
+
+        assert_eq!(selection.lb_hash_key.as_deref(), Some("alice"));
+        assert_eq!(selection.target.as_ref().map(|t| t.port), Some(8080));
     }
 }
