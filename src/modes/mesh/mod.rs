@@ -831,12 +831,17 @@ fn build_east_west_service_targets(
     let mut used_workload_indices = std::collections::HashSet::new();
 
     for workload_ref in &service.workloads {
+        let has_matching_service_metadata = workloads.iter().any(|workload| {
+            workload.spiffe_id == workload_ref.spiffe_id
+                && workload.namespace == service.namespace
+                && workload.service_name == service.name
+        });
         let Some((workload_index, workload)) =
             workloads.iter().enumerate().find(|(idx, workload)| {
                 !used_workload_indices.contains(idx)
                     && workload.spiffe_id == workload_ref.spiffe_id
                     && workload.namespace == service.namespace
-                    && workload.service_name == service.name
+                    && (workload.service_name == service.name || !has_matching_service_metadata)
             })
         else {
             continue;
@@ -4878,6 +4883,31 @@ mod tests {
         let hosts: Vec<&str> = targets.iter().map(|target| target.host.as_str()).collect();
         assert_eq!(hosts, vec!["10.0.0.5", "10.0.0.6"]);
         assert!(targets.iter().all(|target| target.port == 9080));
+    }
+
+    #[test]
+    fn east_west_service_targets_preserve_explicit_refs_with_stale_service_metadata() {
+        let spiffe = SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews").unwrap();
+        let mut legacy = workload("legacy-reviews", "legacy-reviews");
+        legacy.spiffe_id = spiffe.clone();
+        legacy.addresses = vec!["10.0.0.5".to_string()];
+        let service = MeshService {
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 9080,
+                protocol: AppProtocol::Http,
+                name: None,
+            }],
+            workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
+            protocol_overrides: HashMap::new(),
+        };
+
+        let targets = build_east_west_service_targets(&service, &[legacy], None);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].host, "10.0.0.5");
+        assert_eq!(targets[0].port, 9080);
     }
 
     #[test]

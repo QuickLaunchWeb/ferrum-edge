@@ -152,16 +152,11 @@ pub const K8S_CORE_RESOURCES: &[CoreResourceSpec] = &[
         plural: "endpointslices",
         namespaced: true,
     },
-    // Node labels provide topology.kubernetes.io/{region,zone} for workload
-    // locality. Cluster-scoped watch only; namespace watch lists do not apply.
-    CoreResourceSpec {
-        group: "",
-        version: "v1",
-        kind: "Node",
-        plural: "nodes",
-        namespaced: false,
-    },
 ];
+
+// Node labels can enrich workloads with topology.kubernetes.io/{region,zone},
+// but locality is optional. Keep Node out of the unconditional pod-discovery
+// watcher set so namespaced discovery does not require cluster-scoped RBAC.
 
 fn watch_scopes(namespaces: &[String]) -> Vec<Option<String>> {
     if namespaces.is_empty() {
@@ -544,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn k8s_core_resources_cover_pod_service_endpointslice_and_node() {
+    fn k8s_core_resources_cover_required_namespaced_pod_discovery_inputs() {
         let kinds: HashSet<&str> = K8S_CORE_RESOURCES
             .iter()
             .map(|resource| resource.kind)
@@ -552,13 +547,9 @@ mod tests {
         assert!(kinds.contains("Pod"));
         assert!(kinds.contains("Service"));
         assert!(kinds.contains("EndpointSlice"));
-        assert!(kinds.contains("Node"));
         assert!(
-            K8S_CORE_RESOURCES
-                .iter()
-                .find(|resource| resource.kind == "Node")
-                .is_some_and(|resource| !resource.namespaced),
-            "Node must be cluster-scoped so namespace watch lists do not create invalid Node APIs"
+            !kinds.contains("Node"),
+            "Node locality is optional and must not require cluster-scoped RBAC for pod discovery"
         );
     }
 }
