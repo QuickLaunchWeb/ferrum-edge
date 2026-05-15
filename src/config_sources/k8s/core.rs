@@ -532,10 +532,10 @@ fn app_protocol_from_hint(value: &str) -> Option<AppProtocol> {
         Some(AppProtocol::Grpc)
     } else if value.contains("http2") || value.contains("h2c") {
         Some(AppProtocol::Http2)
-    } else if value.starts_with("http") || value == "kubernetes.io/ws" {
-        Some(AppProtocol::Http)
     } else if value.starts_with("tls") || value == "https" {
         Some(AppProtocol::Tls)
+    } else if value.starts_with("http") || value == "kubernetes.io/ws" {
+        Some(AppProtocol::Http)
     } else if value.starts_with("mongo") {
         Some(AppProtocol::Mongo)
     } else if value.starts_with("redis") {
@@ -645,6 +645,14 @@ mod tests {
                 }]
             }),
         )
+    }
+
+    #[test]
+    fn app_protocol_hints_classify_https_as_tls_before_generic_http() {
+        assert_eq!(app_protocol_from_hint("https"), Some(AppProtocol::Tls));
+        assert_eq!(app_protocol_from_hint("HTTPS"), Some(AppProtocol::Tls));
+        assert_eq!(app_protocol_from_hint("http"), Some(AppProtocol::Http));
+        assert_eq!(app_protocol_from_hint("http2"), Some(AppProtocol::Http2));
     }
 
     fn endpoint_slice(pods: Vec<(&str, &str)>) -> K8sObject {
