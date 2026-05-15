@@ -801,7 +801,7 @@ impl Http3ConnectionPool {
         use std::fmt::Write;
         buf.clear();
         // Key shape:
-        //   host|port|index|dns_override|ca|mtls_cert|mtls_key|verify
+        //   host|port|index|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify
         //
         // This must cover every dimension that affects QUIC connection
         // identity *and* matches the backend-capability registry key for
@@ -818,35 +818,13 @@ impl Http3ConnectionPool {
             index,
             proxy.dns_override.as_deref().unwrap_or_default(),
         );
-        buf.push_str(
-            proxy
-                .resolved_tls
-                .server_ca_cert_path
-                .as_deref()
-                .unwrap_or_default(),
+        crate::tls::backend::append_backend_tls_pool_key_fields(
+            buf,
+            &proxy.resolved_tls,
+            proxy.resolved_tls.client_cert_path.as_deref(),
+            proxy.resolved_tls.client_key_path.as_deref(),
+            proxy.resolved_tls.verify_server_cert,
         );
-        buf.push('|');
-        buf.push_str(
-            proxy
-                .resolved_tls
-                .client_cert_path
-                .as_deref()
-                .unwrap_or_default(),
-        );
-        buf.push('|');
-        buf.push_str(
-            proxy
-                .resolved_tls
-                .client_key_path
-                .as_deref()
-                .unwrap_or_default(),
-        );
-        buf.push('|');
-        buf.push(if proxy.resolved_tls.verify_server_cert {
-            '1'
-        } else {
-            '0'
-        });
     }
 
     /// Pool key for the retry / upstream-target path.

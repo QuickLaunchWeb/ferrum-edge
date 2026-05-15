@@ -74,6 +74,18 @@ fn mesh_route_dispatch_referenced_upstream(
         .map(ToOwned::to_owned)
 }
 
+fn upstream_backend_tls_san_allow_list_json(
+    upstream: &Upstream,
+) -> Result<Option<String>, anyhow::Error> {
+    if upstream.backend_tls_san_allow_list.is_empty() {
+        Ok(None)
+    } else {
+        serde_json::to_string(&upstream.backend_tls_san_allow_list)
+            .map(Some)
+            .map_err(Into::into)
+    }
+}
+
 fn declared_proxy_plugin_association_ids_from_spec(
     spec: &crate::config::types::ApiSpec,
 ) -> Result<HashSet<String>, anyhow::Error> {
@@ -1661,9 +1673,10 @@ impl DatabaseStore {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(upstream)?;
 
         sqlx::query(
-            &self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, backend_tls_sni, backend_tls_san_allow_list, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&upstream.id)
         .bind(&upstream.namespace)
@@ -1679,6 +1692,8 @@ impl DatabaseStore {
         .bind(&upstream.backend_tls_client_key_path)
         .bind(upstream.backend_tls_verify_server_cert as i32)
         .bind(&upstream.backend_tls_server_ca_cert_path)
+        .bind(&upstream.backend_tls_sni)
+        .bind(&backend_tls_san_allow_list_json)
         .bind(upstream.created_at.to_rfc3339())
         .bind(upstream.updated_at.to_rfc3339())
         .execute(&self.pool())
@@ -1714,9 +1729,10 @@ impl DatabaseStore {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(upstream)?;
 
         sqlx::query(
-            &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, subsets=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, subsets=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, backend_tls_sni=?, backend_tls_san_allow_list=?, updated_at=? WHERE id=?")
         )
         .bind(&upstream.name)
         .bind(&targets_json)
@@ -1730,6 +1746,8 @@ impl DatabaseStore {
         .bind(&upstream.backend_tls_client_key_path)
         .bind(upstream.backend_tls_verify_server_cert as i32)
         .bind(&upstream.backend_tls_server_ca_cert_path)
+        .bind(&upstream.backend_tls_sni)
+        .bind(&backend_tls_san_allow_list_json)
         .bind(Utc::now().to_rfc3339())
         .bind(&upstream.id)
         .execute(&self.pool())
@@ -3028,7 +3046,7 @@ impl DatabaseStore {
         upstreams: &[Upstream],
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
-        let sql = self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql = self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, backend_tls_sni, backend_tls_san_allow_list, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
         for upstream in upstreams {
             let targets_json = serde_json::to_string(&upstream.targets)?;
@@ -3054,6 +3072,8 @@ impl DatabaseStore {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            let backend_tls_san_allow_list_json =
+                upstream_backend_tls_san_allow_list_json(upstream)?;
             sqlx::query(&sql)
                 .bind(&upstream.id)
                 .bind(&upstream.namespace)
@@ -3069,6 +3089,8 @@ impl DatabaseStore {
                 .bind(&upstream.backend_tls_client_key_path)
                 .bind(upstream.backend_tls_verify_server_cert as i32)
                 .bind(&upstream.backend_tls_server_ca_cert_path)
+                .bind(&upstream.backend_tls_sni)
+                .bind(&backend_tls_san_allow_list_json)
                 .bind(upstream.created_at.to_rfc3339())
                 .bind(upstream.updated_at.to_rfc3339())
                 .execute(&mut *tx)
@@ -3428,13 +3450,15 @@ impl DatabaseStore {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(u)?;
 
             sqlx::query(&self.q("INSERT INTO upstreams \
                  (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, \
                   health_checks, service_discovery, subsets, backend_tls_client_cert_path, \
                   backend_tls_client_key_path, backend_tls_verify_server_cert, \
-                  backend_tls_server_ca_cert_path, api_spec_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+                  backend_tls_server_ca_cert_path, backend_tls_sni, \
+                  backend_tls_san_allow_list, api_spec_id, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
             .bind(&u.id)
             .bind(&u.namespace)
             .bind(&u.name)
@@ -3449,6 +3473,8 @@ impl DatabaseStore {
             .bind(&u.backend_tls_client_key_path)
             .bind(u.backend_tls_verify_server_cert as i32)
             .bind(&u.backend_tls_server_ca_cert_path)
+            .bind(&u.backend_tls_sni)
+            .bind(&backend_tls_san_allow_list_json)
             .bind(&spec.id)
             .bind(u.created_at.to_rfc3339())
             .bind(u.updated_at.to_rfc3339())
@@ -3780,13 +3806,15 @@ impl DatabaseStore {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(u)?;
 
             sqlx::query(&self.q("INSERT INTO upstreams \
                  (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, \
                   health_checks, service_discovery, subsets, backend_tls_client_cert_path, \
                   backend_tls_client_key_path, backend_tls_verify_server_cert, \
-                  backend_tls_server_ca_cert_path, api_spec_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+                  backend_tls_server_ca_cert_path, backend_tls_sni, \
+                  backend_tls_san_allow_list, api_spec_id, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
             .bind(&u.id)
             .bind(&u.namespace)
             .bind(&u.name)
@@ -3801,6 +3829,8 @@ impl DatabaseStore {
             .bind(&u.backend_tls_client_key_path)
             .bind(u.backend_tls_verify_server_cert as i32)
             .bind(&u.backend_tls_server_ca_cert_path)
+            .bind(&u.backend_tls_sni)
+            .bind(&backend_tls_san_allow_list_json)
             .bind(&spec.id)
             .bind(u.created_at.to_rfc3339())
             .bind(u.updated_at.to_rfc3339())
@@ -5461,6 +5491,20 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         Err(_) => None,
     };
 
+    let backend_tls_san_allow_list =
+        match row.try_get::<Option<String>, _>("backend_tls_san_allow_list") {
+            Ok(Some(s)) => serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
+                anyhow::anyhow!(
+                    "Upstream {}: failed to parse backend_tls_san_allow_list JSON: {}",
+                    id_preview,
+                    e
+                )
+            })?,
+            Ok(None) => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+    let backend_tls_sni: Option<String> = row.try_get("backend_tls_sni")?;
+
     Ok(Upstream {
         id: row.try_get("id")?,
         namespace: row
@@ -5482,6 +5526,8 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
         backend_tls_verify_server_cert,
         backend_tls_server_ca_cert_path: row.try_get("backend_tls_server_ca_cert_path").ok(),
+        backend_tls_sni,
+        backend_tls_san_allow_list,
         // See row_to_proxy for the rationale: preserve here so admin reads
         // get the real owning spec id; runtime callers strip via
         // strip_api_spec_id_from_runtime_config.

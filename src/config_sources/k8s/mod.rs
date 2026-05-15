@@ -1154,6 +1154,8 @@ pub(crate) fn upstream_for_route(
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
         api_spec_id: None,
         created_at: now,
         updated_at: now,

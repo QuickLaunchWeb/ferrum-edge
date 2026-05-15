@@ -126,16 +126,17 @@ async fn connection_pool_key_direct_backend_format() {
     let pool = pool_with_defaults();
     let proxy = minimal_proxy();
     let key = pool.pool_key_for_warmup(&proxy);
-    // Direct backend: d=host:port|protocol|dns|ca|mtls|verify
+    // Direct backend:
+    // d=host:port|protocol|dns|ca|mtls_cert|mtls_key|sni|sans|verify
     assert!(
         key.starts_with("d=backend.example.com:8080|"),
         "key should start with d= prefix: {key}"
     );
     // BackendScheme::Http = 0
     assert!(key.contains("|0|"), "key should contain protocol 0: {key}");
-    // No DNS override, no CA, no mTLS, verify=true (1)
+    // No DNS override, no CA, no mTLS, no SNI, no SAN digest, verify=true (1)
     assert!(
-        key.ends_with("|||1"),
+        key.ends_with("|||||1"),
         "key should end with empty dns/ca/mtls and verify=1: {key}"
     );
 }
@@ -196,6 +197,58 @@ async fn connection_pool_key_with_mtls_client_cert() {
 }
 
 #[tokio::test]
+async fn connection_pool_key_with_backend_tls_sni_and_sans() {
+    let pool = pool_with_defaults();
+    let mut p1 = minimal_proxy();
+    p1.resolved_tls.sni = Some("reviews.mesh.internal".to_string());
+    p1.resolved_tls.san_allow_list = vec!["reviews.mesh.internal".to_string()];
+    p1.resolved_tls.recompute_san_digest();
+    let mut p2 = p1.clone();
+    p2.resolved_tls.sni = Some("ratings.mesh.internal".to_string());
+
+    assert_ne!(
+        pool.pool_key_for_warmup(&p1),
+        pool.pool_key_for_warmup(&p2),
+        "backend TLS SNI must separate generic HTTP pool keys"
+    );
+
+    p2.resolved_tls.sni = p1.resolved_tls.sni.clone();
+    p2.resolved_tls.san_allow_list = vec!["ratings.mesh.internal".to_string()];
+    p2.resolved_tls.recompute_san_digest();
+    assert_ne!(
+        pool.pool_key_for_warmup(&p1),
+        pool.pool_key_for_warmup(&p2),
+        "backend TLS SAN allow-list must separate generic HTTP pool keys"
+    );
+}
+
+#[tokio::test]
+async fn connection_pool_key_canonicalizes_backend_tls_san_allow_list() {
+    let pool = pool_with_defaults();
+    let mut p1 = minimal_proxy();
+    p1.resolved_tls.sni = Some("reviews.mesh.internal".to_string());
+    p1.resolved_tls.san_allow_list = vec![
+        "ratings.mesh.internal".to_string(),
+        "reviews.mesh.internal".to_string(),
+        "reviews.mesh.internal".to_string(),
+    ];
+    p1.resolved_tls.recompute_san_digest();
+
+    let mut p2 = p1.clone();
+    p2.resolved_tls.san_allow_list = vec![
+        "reviews.mesh.internal".to_string(),
+        "ratings.mesh.internal".to_string(),
+    ];
+    p2.resolved_tls.recompute_san_digest();
+
+    assert_eq!(
+        pool.pool_key_for_warmup(&p1),
+        pool.pool_key_for_warmup(&p2),
+        "backend TLS SAN allow-list order and duplicates must not fragment generic HTTP pools"
+    );
+}
+
+#[tokio::test]
 async fn connection_pool_key_verify_disabled() {
     let pool = pool_with_defaults();
     let mut proxy = minimal_proxy();
@@ -227,8 +280,8 @@ async fn connection_pool_key_pipe_delimiter_count() {
     let key = pool.pool_key_for_warmup(&proxy);
     let pipe_count = key.chars().filter(|c| *c == '|').count();
     assert_eq!(
-        pipe_count, 5,
-        "6 fields need 5 pipe delimiters, got {pipe_count} in key: {key}"
+        pipe_count, 8,
+        "9 fields need 8 pipe delimiters, got {pipe_count} in key: {key}"
     );
 }
 
@@ -378,9 +431,9 @@ async fn connection_pool_key_policy_fields_do_not_fragment() {
 fn h2_pool_key_basic_format() {
     let proxy = minimal_proxy();
     let key = Http2ConnectionPool::pool_key_for_warmup(&proxy);
-    // Format: host|port|dns|ca|mtls|verify
+    // Format: host|port|dns|ca|mtls_cert|mtls_key|sni|sans|verify
     assert_eq!(
-        key, "backend.example.com|8080||||1",
+        key, "backend.example.com|8080|||||||1",
         "basic H2 key format mismatch"
     );
 }
@@ -417,6 +470,31 @@ fn h2_pool_key_with_mtls_cert() {
     assert!(
         key.contains("|/certs/client.pem|"),
         "H2 key should contain mTLS cert path: {key}"
+    );
+}
+
+#[test]
+fn h2_pool_key_with_backend_tls_sni_and_sans() {
+    let mut p1 = minimal_proxy();
+    p1.resolved_tls.sni = Some("reviews.mesh.internal".to_string());
+    p1.resolved_tls.san_allow_list = vec!["reviews.mesh.internal".to_string()];
+    p1.resolved_tls.recompute_san_digest();
+    let mut p2 = p1.clone();
+    p2.resolved_tls.sni = Some("ratings.mesh.internal".to_string());
+
+    assert_ne!(
+        Http2ConnectionPool::pool_key_for_warmup(&p1),
+        Http2ConnectionPool::pool_key_for_warmup(&p2),
+        "backend TLS SNI must separate H2 pool keys"
+    );
+
+    p2.resolved_tls.sni = p1.resolved_tls.sni.clone();
+    p2.resolved_tls.san_allow_list = vec!["ratings.mesh.internal".to_string()];
+    p2.resolved_tls.recompute_san_digest();
+    assert_ne!(
+        Http2ConnectionPool::pool_key_for_warmup(&p1),
+        Http2ConnectionPool::pool_key_for_warmup(&p2),
+        "backend TLS SAN allow-list must separate H2 pool keys"
     );
 }
 
@@ -475,8 +553,8 @@ fn h2_pool_key_pipe_delimiter_count() {
     let key = Http2ConnectionPool::pool_key_for_warmup(&proxy);
     let pipe_count = key.chars().filter(|c| *c == '|').count();
     assert_eq!(
-        pipe_count, 5,
-        "6 fields need 5 pipe delimiters in H2 key, got {pipe_count}: {key}"
+        pipe_count, 8,
+        "9 fields need 8 pipe delimiters in H2 key, got {pipe_count}: {key}"
     );
 }
 
@@ -635,7 +713,7 @@ async fn connection_pool_and_h2_pool_keys_have_same_delimiter() {
     // Neither should contain field-level colons (only in host:port which is expected)
     for key in [&conn_key, &h2_key] {
         let pipe_count = key.chars().filter(|c| *c == '|').count();
-        assert_eq!(pipe_count, 5, "key should use | as delimiter: {key}");
+        assert_eq!(pipe_count, 8, "key should use | as delimiter: {key}");
     }
 }
 
@@ -647,10 +725,10 @@ async fn connection_pool_and_h2_pool_keys_have_same_delimiter() {
 fn h3_pool_key_basic_format() {
     let proxy = minimal_proxy();
     let key = Http3ConnectionPool::pool_key(&proxy, 0);
-    // Format: host|port|index|dns_override|ca|mtls_cert|mtls_key|verify
+    // Format: host|port|index|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify
     // (all TLS fields empty by default, verify=true → trailing "1")
     assert_eq!(
-        key, "backend.example.com|8080|0|||||1",
+        key, "backend.example.com|8080|0|||||||1",
         "basic H3 key format mismatch"
     );
 }
@@ -734,6 +812,31 @@ fn h3_pool_key_with_mtls_cert() {
 }
 
 #[test]
+fn h3_pool_key_with_backend_tls_sni_and_sans() {
+    let mut p1 = minimal_proxy();
+    p1.resolved_tls.sni = Some("reviews.mesh.internal".to_string());
+    p1.resolved_tls.san_allow_list = vec!["reviews.mesh.internal".to_string()];
+    p1.resolved_tls.recompute_san_digest();
+    let mut p2 = p1.clone();
+    p2.resolved_tls.sni = Some("ratings.mesh.internal".to_string());
+
+    assert_ne!(
+        Http3ConnectionPool::pool_key(&p1, 0),
+        Http3ConnectionPool::pool_key(&p2, 0),
+        "backend TLS SNI must separate H3 pool keys"
+    );
+
+    p2.resolved_tls.sni = p1.resolved_tls.sni.clone();
+    p2.resolved_tls.san_allow_list = vec!["ratings.mesh.internal".to_string()];
+    p2.resolved_tls.recompute_san_digest();
+    assert_ne!(
+        Http3ConnectionPool::pool_key(&p1, 0),
+        Http3ConnectionPool::pool_key(&p2, 0),
+        "backend TLS SAN allow-list must separate H3 pool keys"
+    );
+}
+
+#[test]
 fn h3_pool_key_verify_disabled() {
     let mut proxy = minimal_proxy();
     proxy.backend_tls_verify_server_cert = false;
@@ -812,10 +915,10 @@ fn h3_pool_key_pipe_delimiter_count() {
     let proxy = minimal_proxy();
     let key = Http3ConnectionPool::pool_key(&proxy, 0);
     let pipe_count = key.chars().filter(|c| *c == '|').count();
-    // Shape: host|port|index|dns_override|ca|mtls_cert|mtls_key|verify = 8 fields → 7 pipes.
+    // Shape: host|port|index|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify = 10 fields → 9 pipes.
     assert_eq!(
-        pipe_count, 7,
-        "8 fields need 7 pipe delimiters in H3 key, got {pipe_count}: {key}"
+        pipe_count, 9,
+        "10 fields need 9 pipe delimiters in H3 key, got {pipe_count}: {key}"
     );
 }
 
@@ -905,10 +1008,10 @@ fn h3_pool_key_full_tls_config() {
     proxy.resolved_tls.client_key_path = Some("/client/key.pem".to_string());
     proxy.resolved_tls.verify_server_cert = false;
     let key = Http3ConnectionPool::pool_key(&proxy, 2);
-    // Shape: host|port|index|dns_override|ca|mtls_cert|mtls_key|verify
+    // Shape: host|port|index|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify
     // dns_override is empty here, so we get an empty field between index and CA.
     assert_eq!(
-        key, "backend.example.com|8080|2||/ca/bundle.pem|/client/cert.pem|/client/key.pem|0",
+        key, "backend.example.com|8080|2||/ca/bundle.pem|/client/cert.pem|/client/key.pem|||0",
         "full TLS config H3 key format mismatch"
     );
 }
@@ -964,11 +1067,11 @@ fn h3_pool_key_for_target_different_ports() {
 fn h3_pool_key_for_target_pipe_delimiter_count() {
     let proxy = minimal_proxy();
     let key = Http3ConnectionPool::pool_key_for_target(&proxy, "host.com", 443, 0);
-    // Shape: host|port|index|dns_override|ca|mtls_cert|mtls_key|verify = 7 pipes.
+    // Shape: host|port|index|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify = 9 pipes.
     let pipe_count = key.chars().filter(|c| *c == '|').count();
     assert_eq!(
-        pipe_count, 7,
-        "8 fields need 7 pipe delimiters in target key, got {pipe_count}: {key}"
+        pipe_count, 9,
+        "10 fields need 9 pipe delimiters in target key, got {pipe_count}: {key}"
     );
 }
 
@@ -1087,8 +1190,8 @@ async fn all_three_pools_use_pipe_delimiter() {
             "{name} key should use | delimiter: {key}"
         );
         assert!(
-            !key.contains("||||||"),
-            "{name} key should not have excessive empty fields: {key}"
+            key.contains("||"),
+            "{name} key should include empty SAN-digest field: {key}"
         );
     }
 }
@@ -1134,6 +1237,33 @@ fn backend_capability_key_includes_tls_identity_fields() {
     assert_ne!(
         key1, key2,
         "capability key must distinguish different TLS identities"
+    );
+}
+
+#[test]
+fn backend_capability_key_includes_backend_tls_sni_and_sans() {
+    let mut p1 = minimal_proxy();
+    p1.backend_scheme = Some(BackendScheme::Https);
+    p1.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    p1.resolved_tls.sni = Some("reviews.mesh.internal".to_string());
+    p1.resolved_tls.san_allow_list = vec!["reviews.mesh.internal".to_string()];
+    p1.resolved_tls.recompute_san_digest();
+
+    let mut p2 = p1.clone();
+    p2.resolved_tls.sni = Some("ratings.mesh.internal".to_string());
+    assert_ne!(
+        capability_key(&p1),
+        capability_key(&p2),
+        "capability key must distinguish backend TLS SNI"
+    );
+
+    p2.resolved_tls.sni = p1.resolved_tls.sni.clone();
+    p2.resolved_tls.san_allow_list = vec!["ratings.mesh.internal".to_string()];
+    p2.resolved_tls.recompute_san_digest();
+    assert_ne!(
+        capability_key(&p1),
+        capability_key(&p2),
+        "capability key must distinguish backend TLS SAN allow-lists"
     );
 }
 
