@@ -132,30 +132,12 @@ async fn start_http_text_server(port: u16, body: &'static str) {
     }
 }
 
-/// Build the gateway binary (debug profile).
-///
-/// Honors `FERRUM_SKIP_GATEWAY_BUILD=1` (set by CI when a prebuilt binary is
-/// already on disk) — without this short-circuit every test invocation racks
-/// up cargo's filesystem lock and serializes parallel nextest runs.
+/// Build the gateway binary. Thin wrapper over the shared
+/// [`crate::common::ensure_gateway_built`] so this file's tests share the
+/// same `OnceLock` memoization and `FERRUM_SKIP_GATEWAY_BUILD=1` contract as
+/// the [`crate::common::TestGateway`] builder.
 fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var_os("FERRUM_SKIP_GATEWAY_BUILD").is_some() {
-        if std::path::Path::new("./target/debug/ferrum-edge").exists()
-            || std::path::Path::new("./target/release/ferrum-edge").exists()
-        {
-            return Ok(());
-        }
-        return Err(
-            "FERRUM_SKIP_GATEWAY_BUILD set but ferrum-edge binary not found in ./target/debug/ or ./target/release/".into(),
-        );
-    }
-    let output = std::process::Command::new("cargo")
-        .args(["build", "--bin", "ferrum-edge"])
-        .output()?;
-    if !output.status.success() {
-        eprintln!("Build stderr: {}", String::from_utf8_lossy(&output.stderr));
-        return Err("Failed to build gateway binary".into());
-    }
-    Ok(())
+    crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
 /// Find the gateway binary path.

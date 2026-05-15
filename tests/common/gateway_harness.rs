@@ -1073,7 +1073,11 @@ fn locate_binary(
 /// into `target/debug/` (or `target/release/`) by an upstream job. With
 /// nextest (one process per test) that single env var saves N cargo
 /// fingerprint checks per shard, where N is the number of tests.
-fn ensure_gateway_built() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+///
+/// Exposed publicly so functional tests with their own subprocess helpers
+/// (rather than [`TestGateway`]) share the same skip-build contract without
+/// duplicating the env-var + path-existence dance.
+pub fn ensure_gateway_built() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
     let result = RESULT.get_or_init(|| -> Result<(), String> {
         if std::env::var_os("FERRUM_SKIP_GATEWAY_BUILD").is_some() {

@@ -154,21 +154,10 @@ fn start_gateway_in_file_mode(
     http_port: u16,
     admin_port: u16,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    // Honor `FERRUM_SKIP_GATEWAY_BUILD=1` (set by CI when a prebuilt binary
-    // is already on disk). Without the short-circuit, every test invocation
-    // acquires cargo's filesystem lock and serializes parallel nextest runs.
-    let skip_build = std::env::var_os("FERRUM_SKIP_GATEWAY_BUILD").is_some();
-    if !skip_build {
-        let build_output = std::process::Command::new("cargo")
-            .args(["build", "--bin", "ferrum-edge"])
-            .output()?;
-
-        if !build_output.status.success() {
-            eprintln!("Failed to build gateway binary");
-            eprintln!("stderr: {}", String::from_utf8_lossy(&build_output.stderr));
-            return Err("Build failed".into());
-        }
-    }
+    // Build (or verify the prebuilt artifact) via the shared helper so this
+    // file shares the `OnceLock` memoization and `FERRUM_SKIP_GATEWAY_BUILD=1`
+    // contract used by the [`crate::common::TestGateway`] builder.
+    crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
     let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
         "./target/debug/ferrum-edge"
