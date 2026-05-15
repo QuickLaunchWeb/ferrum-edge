@@ -163,7 +163,7 @@ async fn mixed_providers_keep_authorization_fallback_for_default_provider() {
 }
 
 #[tokio::test]
-async fn custom_header_rejects_missing_prefix() {
+async fn custom_header_missing_prefix_is_ignored() {
     let plugin = plugin_with_custom_locations();
     let mut ctx = make_ctx();
     ctx.headers
@@ -172,7 +172,24 @@ async fn custom_header_rejects_missing_prefix() {
     let result = plugin
         .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
         .await;
-    assert_reject(result, Some(401));
+    assert_continue(result);
+    assert!(ctx.authenticated_identity.is_none());
+}
+
+#[tokio::test]
+async fn custom_header_missing_prefix_continues_to_later_location() {
+    let plugin = plugin_with_custom_locations();
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("x-token".to_string(), token_for("header-user"));
+    ctx.query_params
+        .insert("access_token".to_string(), token_for("query-user"));
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("query-user"));
 }
 
 #[tokio::test]

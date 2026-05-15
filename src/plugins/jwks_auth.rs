@@ -774,11 +774,7 @@ fn extract_location_value(value: &str, prefix: Option<&str>) -> TokenLocationExt
     let token = match prefix {
         Some(prefix) => match value.strip_prefix(prefix) {
             Some(token) => token,
-            None => {
-                return TokenLocationExtract::Credential(ExtractedCredential::InvalidFormat(
-                    r#"{"error":"Missing configured token prefix"}"#.to_string(),
-                ));
-            }
+            None => return TokenLocationExtract::Missing,
         },
         None => value,
     };
