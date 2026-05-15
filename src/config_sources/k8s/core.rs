@@ -106,7 +106,7 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
             .push(index);
     }
 
-    let mut workload_refs_by_service: HashMap<K8sServiceKey, BTreeSet<String>> = HashMap::new();
+    let mut workload_refs_by_service: HashMap<K8sServiceKey, Vec<String>> = HashMap::new();
     for workload in &acc.mesh.workloads {
         if let Some(key) =
             K8sServiceKey::new(workload.namespace.clone(), workload.service_name.clone())
@@ -114,7 +114,7 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
             workload_refs_by_service
                 .entry(key)
                 .or_default()
-                .insert(workload.spiffe_id.as_str().to_string());
+                .push(workload.spiffe_id.as_str().to_string());
         }
     }
 
@@ -138,7 +138,7 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
                     .unwrap_or(&[]),
             )?;
             for workload in auto_workloads {
-                workload_ref_strings.insert(workload.spiffe_id.as_str().to_string());
+                workload_ref_strings.push(workload.spiffe_id.as_str().to_string());
                 acc.mesh.workloads.push(workload);
             }
         }
@@ -685,6 +685,37 @@ mod tests {
     }
 
     #[test]
+    fn replicated_pods_with_same_service_account_keep_distinct_workload_refs() {
+        let translation = translate_k8s_objects(
+            &[
+                service(),
+                ready_pod("reviews-v1", "10.1.0.10"),
+                ready_pod("reviews-v2", "10.1.0.11"),
+                endpoint_slice(vec![
+                    ("reviews-v1", "10.1.0.10"),
+                    ("reviews-v2", "10.1.0.11"),
+                ]),
+            ],
+            options(),
+        )
+        .expect("core translation succeeds");
+
+        let mesh = translation.config.mesh.expect("mesh config");
+        assert_eq!(mesh.workloads.len(), 2);
+        assert_eq!(mesh.services[0].workloads.len(), 2);
+        assert_eq!(
+            mesh.services[0].workloads[0].spiffe_id, mesh.services[0].workloads[1].spiffe_id,
+            "replicated Pods share the same service-account SPIFFE ID"
+        );
+        let addresses: Vec<&str> = mesh
+            .workloads
+            .iter()
+            .flat_map(|workload| workload.addresses.iter().map(String::as_str))
+            .collect();
+        assert_eq!(addresses, vec!["10.1.0.10", "10.1.0.11"]);
+    }
+
+    #[test]
     fn pod_without_ready_condition_is_not_surfaced() {
         let mut pod = ready_pod("reviews-v1", "10.1.0.10");
         pod.status = json!({
@@ -889,6 +920,41 @@ mod tests {
 
         let mesh = translation.config.mesh.expect("mesh config");
         assert!(mesh.services.is_empty());
+        assert_eq!(mesh.service_entries.len(), 1);
+    }
+
+    #[test]
+    fn service_entry_name_matching_service_does_not_override_unrelated_hosts() {
+        let service_entry = K8sObject {
+            kind: "ServiceEntry".to_string(),
+            api_version: "networking.istio.io/v1".to_string(),
+            metadata: K8sMetadata {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                labels: HashMap::new(),
+                deletion_timestamp: None,
+            },
+            spec: json!({
+                "hosts": ["api.external.example.com"],
+                "ports": [{"number": 443, "name": "https", "protocol": "HTTPS"}]
+            }),
+            status: Value::Object(serde_json::Map::new()),
+        };
+
+        let translation = translate_k8s_objects(
+            &[
+                service(),
+                ready_pod("reviews-v1", "10.1.0.10"),
+                endpoint_slice(vec![("reviews-v1", "10.1.0.10")]),
+                service_entry,
+            ],
+            options(),
+        )
+        .expect("core translation succeeds");
+
+        let mesh = translation.config.mesh.expect("mesh config");
+        assert_eq!(mesh.services.len(), 1);
+        assert_eq!(mesh.services[0].name, "reviews");
         assert_eq!(mesh.service_entries.len(), 1);
     }
 

@@ -828,14 +828,20 @@ fn build_east_west_service_targets(
     local_cluster: Option<&str>,
 ) -> Vec<UpstreamTarget> {
     let mut targets = Vec::new();
+    let mut used_workload_indices = std::collections::HashSet::new();
 
     for workload_ref in &service.workloads {
-        let Some(workload) = workloads
-            .iter()
-            .find(|w| w.spiffe_id == workload_ref.spiffe_id)
+        let Some((workload_index, workload)) =
+            workloads.iter().enumerate().find(|(idx, workload)| {
+                !used_workload_indices.contains(idx)
+                    && workload.spiffe_id == workload_ref.spiffe_id
+                    && workload.namespace == service.namespace
+                    && workload.service_name == service.name
+            })
         else {
             continue;
         };
+        used_workload_indices.insert(workload_index);
         if local_cluster.is_some_and(|local_cluster| {
             workload
                 .cluster
@@ -4837,6 +4843,41 @@ mod tests {
                 assert_eq!(ratings_upstream.targets[0].port, 3000);
             },
         );
+    }
+
+    #[test]
+    fn east_west_service_targets_preserve_replicas_sharing_spiffe_id() {
+        let shared_spiffe = SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews").unwrap();
+        let mut first = workload("reviews", "reviews");
+        first.spiffe_id = shared_spiffe.clone();
+        first.addresses = vec!["10.0.0.5".to_string()];
+        let mut second = workload("reviews", "reviews");
+        second.spiffe_id = shared_spiffe.clone();
+        second.addresses = vec!["10.0.0.6".to_string()];
+        let service = MeshService {
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 9080,
+                protocol: AppProtocol::Http,
+                name: None,
+            }],
+            workloads: vec![
+                crate::modes::mesh::config::WorkloadRef {
+                    spiffe_id: shared_spiffe.clone(),
+                },
+                crate::modes::mesh::config::WorkloadRef {
+                    spiffe_id: shared_spiffe,
+                },
+            ],
+            protocol_overrides: HashMap::new(),
+        };
+
+        let targets = build_east_west_service_targets(&service, &[first, second], None);
+
+        let hosts: Vec<&str> = targets.iter().map(|target| target.host.as_str()).collect();
+        assert_eq!(hosts, vec!["10.0.0.5", "10.0.0.6"]);
+        assert!(targets.iter().all(|target| target.port == 9080));
     }
 
     #[test]

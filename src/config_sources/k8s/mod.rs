@@ -502,12 +502,6 @@ fn collect_explicit_workload_service(acc: &mut K8sAccumulator, object: &K8sObjec
 }
 
 fn collect_explicit_service_entry_keys(acc: &mut K8sAccumulator, object: &K8sObject) {
-    if let Some(key) = K8sServiceKey::new(
-        object.metadata.namespace.clone(),
-        object.metadata.name.clone(),
-    ) {
-        acc.record_explicit_service_entry(key);
-    }
     for host in string_array(&object.spec, "hosts") {
         if let Some(key) = service_key_from_host(
             &host,
