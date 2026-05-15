@@ -1081,9 +1081,7 @@ fn apply_traffic_policy_to_port_override(
     }
     if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
         slot.algorithm = Some(algorithm);
-    }
-    if let Some(hash_on) = mesh_hash_on_to_ferrum(&policy.load_balancer) {
-        slot.hash_on = Some(hash_on);
+        slot.hash_on = mesh_hash_on_to_ferrum(&policy.load_balancer);
     }
     if let Some(ref od) = policy.outlier_detection {
         let mut passive = slot.passive_health_check.clone().unwrap_or_default();
@@ -4049,6 +4047,72 @@ mod tests {
         assert_eq!(passive.unhealthy_window_seconds, 30);
         assert_eq!(passive.healthy_after_seconds, 60);
         assert_eq!(passive.max_ejection_percent, Some(40));
+    }
+
+    #[test]
+    fn destination_rule_per_port_non_hash_policy_clears_stale_hash_key() {
+        let mut config = GatewayConfig {
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        let mut hash_policy = HashMap::new();
+        hash_policy.insert(
+            8080,
+            MeshTrafficPolicy {
+                load_balancer: Some(MeshLoadBalancer::ConsistentHash(
+                    crate::modes::mesh::config::MeshConsistentHash {
+                        http_header_name: Some("x-user".to_string()),
+                        http_cookie_name: None,
+                        use_source_ip: false,
+                    },
+                )),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        let mut random_policy = HashMap::new();
+        random_policy.insert(
+            8080,
+            MeshTrafficPolicy {
+                load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        let slice = MeshSlice {
+            destination_rules: vec![
+                MeshDestinationRule {
+                    name: "a-hash".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: None,
+                    port_level_settings: hash_policy,
+                    subsets: Vec::new(),
+                },
+                MeshDestinationRule {
+                    name: "b-random".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: None,
+                    port_level_settings: random_policy,
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &slice);
+
+        let port = config.upstreams[0]
+            .port_overrides
+            .get(&8080)
+            .expect("port 8080 override");
+        assert_eq!(port.algorithm, Some(LoadBalancerAlgorithm::Random));
+        assert!(
+            port.hash_on.is_none(),
+            "later non-hash policy must clear an earlier hash key"
+        );
     }
 
     #[test]
