@@ -381,9 +381,9 @@ impl MeshSlice {
             .filter(|entry| {
                 service_entry_applies_to_workload(entry, effective_namespace, &effective_labels)
             })
-            .filter_map(|entry| {
+            .flat_map(|entry| {
                 let Some(sidecar) = applicable_sidecar else {
-                    return Some(entry.clone());
+                    return vec![entry.clone()];
                 };
                 narrow_service_entry_ports(entry, sidecar)
             })
@@ -786,41 +786,67 @@ fn narrow_service_ports(
 fn narrow_service_entry_ports(
     entry: &ServiceEntry,
     sidecar: ResolvedSidecarEgress<'_>,
-) -> Option<ServiceEntry> {
+) -> Vec<ServiceEntry> {
     let host_refs: Vec<&str> = entry.hosts.iter().map(String::as_str).collect();
     let resource_ports: Vec<u16> = entry.ports.iter().map(|port| port.port).collect();
-    let admission = sidecar_egress_port_admission(
-        sidecar.namespace,
-        sidecar.egress,
-        entry.namespace.as_str(),
-        &host_refs,
-        Some(&resource_ports),
-    )?;
-    Some(match admission {
-        SidecarPortAdmission::All => entry.clone(),
-        SidecarPortAdmission::Ports(admitted_ports) => {
+    if resource_ports.is_empty() {
+        return sidecar_egress_port_admission(
+            sidecar.namespace,
+            sidecar.egress,
+            entry.namespace.as_str(),
+            &host_refs,
+            Some(&resource_ports),
+        )
+        .map(|_| vec![entry.clone()])
+        .unwrap_or_default();
+    }
+
+    let resource_port_set: BTreeSet<u16> = resource_ports.iter().copied().collect();
+    let mut hosts_by_ports: BTreeMap<BTreeSet<u16>, Vec<String>> = BTreeMap::new();
+    for host in &entry.hosts {
+        let admission = sidecar_egress_port_admission(
+            sidecar.namespace,
+            sidecar.egress,
+            entry.namespace.as_str(),
+            &[host.as_str()],
+            Some(&resource_ports),
+        );
+        let Some(admitted_ports) = admission.map(|admission| match admission {
+            SidecarPortAdmission::All => resource_port_set.clone(),
+            SidecarPortAdmission::Ports(ports) => ports,
+        }) else {
+            continue;
+        };
+        if !admitted_ports.is_empty() {
+            hosts_by_ports
+                .entry(admitted_ports)
+                .or_default()
+                .push(host.clone());
+        }
+    }
+
+    hosts_by_ports
+        .into_iter()
+        .filter_map(|(admitted_ports, hosts)| {
             let ports = entry
                 .ports
                 .iter()
                 .filter(|port| admitted_ports.contains(&port.port))
                 .cloned()
                 .collect::<Vec<_>>();
-            if ports.is_empty() {
-                return None;
-            }
-            ServiceEntry {
+            (!ports.is_empty()).then(|| ServiceEntry {
                 name: entry.name.clone(),
                 namespace: entry.namespace.clone(),
-                hosts: entry.hosts.clone(),
+                hosts,
                 endpoints: entry.endpoints.clone(),
                 resolution: entry.resolution,
                 location: entry.location,
                 ports,
                 export_to: entry.export_to.clone(),
                 workload_selector: entry.workload_selector.clone(),
-            }
-        }
-    })
+            })
+        })
+        .collect()
 }
 
 /// Returns `true` when the Sidecar's egress scope admits a resource whose
@@ -830,9 +856,9 @@ fn narrow_service_entry_ports(
 /// For host-scoped resources such as `MeshDestinationRule`, `resource_ports`
 /// is `None` and any matching host admits the resource. For port-carrying
 /// resources, `resource_ports` narrows admission to the union of matching
-/// `spec.egress[].port.number` values. For `ServiceEntry` we pass all `hosts`
-/// and require at least one to match — matching Istio behavior where any host
-/// of a ServiceEntry being in scope brings the whole entry into scope.
+/// `spec.egress[].port.number` values. Port-carrying multi-host
+/// `ServiceEntry` resources call this per host so allowed host-port pairs do
+/// not become a Cartesian product.
 ///
 /// An empty `egress` list is treated as "allow nothing" — Istio treats an
 /// explicit empty egress list this way. An empty `host_candidates` slice
@@ -3415,6 +3441,54 @@ mod tests {
         assert_eq!(port_numbers(&slice.services[0].ports), vec![8080]);
         assert_eq!(slice.service_entries.len(), 1);
         assert_eq!(port_numbers(&slice.service_entries[0].ports), vec![8443]);
+    }
+
+    #[test]
+    fn sidecar_narrowing_preserves_service_entry_host_port_pairs() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar_with_ports(
+                "ports-sc",
+                "alpha",
+                None,
+                vec![
+                    (vec!["*/api.example.com"], Some(443)),
+                    (vec!["*/db.example.com"], Some(5432)),
+                ],
+            )],
+            service_entries: vec![ServiceEntry {
+                name: "external".into(),
+                namespace: "alpha".into(),
+                hosts: vec!["api.example.com".into(), "db.example.com".into()],
+                endpoints: Vec::new(),
+                resolution: crate::modes::mesh::config::Resolution::None,
+                location: ServiceEntryLocation::MeshExternal,
+                ports: vec![
+                    ServicePort {
+                        port: 443,
+                        protocol: AppProtocol::Http2,
+                        name: None,
+                    },
+                    ServicePort {
+                        port: 5432,
+                        protocol: AppProtocol::Tcp,
+                        name: None,
+                    },
+                ],
+                export_to: vec!["*".into()],
+                workload_selector: None,
+            }],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+
+        let mut ports_by_host = BTreeMap::new();
+        for entry in &slice.service_entries {
+            assert_eq!(entry.hosts.len(), 1);
+            ports_by_host.insert(entry.hosts[0].as_str(), port_numbers(&entry.ports));
+        }
+        assert_eq!(ports_by_host.get("api.example.com"), Some(&vec![443]));
+        assert_eq!(ports_by_host.get("db.example.com"), Some(&vec![5432]));
     }
 
     #[test]
