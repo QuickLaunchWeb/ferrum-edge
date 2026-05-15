@@ -4755,7 +4755,9 @@ fn collect_forwardable_websocket_headers(
             .iter()
             .filter_map(|value| value.to_str().ok())
             .collect();
-        if sanitized_value_preserves_raw_values(&raw_values, sanitized_value) {
+        if sanitized_value_preserves_raw_values(&raw_values, sanitized_value)
+            || sanitized_value == &materialized_raw_header_value(name.as_str(), &raw_values)
+        {
             preserved_raw_names.insert(lower_name);
             for value in raw_values {
                 forwarded.push((name.as_str().to_string(), value.to_string()));
@@ -4794,6 +4796,14 @@ fn sanitized_value_preserves_raw_values(raw_values: &[&str], sanitized_value: &s
                 .all(|raw_value| sanitized_values.next() == Some(raw_value))
                 && sanitized_values.next().is_none()
         }
+    }
+}
+
+fn materialized_raw_header_value(name: &str, raw_values: &[&str]) -> String {
+    if matches!(name, "baggage" | "sec-websocket-protocol") {
+        raw_values.join(",")
+    } else {
+        raw_values.last().copied().unwrap_or_default().to_string()
     }
 }
 
@@ -13341,6 +13351,38 @@ mod tests {
             .collect();
 
         assert_eq!(protocols, vec!["superchat"]);
+    }
+
+    #[test]
+    fn websocket_forwardable_headers_preserve_repeated_non_list_raw_values_when_unmodified() {
+        let mut raw = hyper::HeaderMap::new();
+        raw.append(
+            "x-forwarded-for",
+            hyper::header::HeaderValue::from_static("203.0.113.1"),
+        );
+        raw.append(
+            "x-forwarded-for",
+            hyper::header::HeaderValue::from_static("198.51.100.2"),
+        );
+
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/ws".to_string(),
+        );
+        ctx.set_raw_headers(raw.clone());
+        ctx.materialize_headers();
+
+        let forwarded = collect_forwardable_websocket_headers(&raw, &ctx.headers);
+        let xff_values: Vec<&str> = forwarded
+            .iter()
+            .filter_map(|(name, value)| {
+                name.eq_ignore_ascii_case("x-forwarded-for")
+                    .then_some(value.as_str())
+            })
+            .collect();
+
+        assert_eq!(xff_values, vec!["203.0.113.1", "198.51.100.2"]);
     }
 
     #[test]
