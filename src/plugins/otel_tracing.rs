@@ -1391,7 +1391,12 @@ fn datadog_traces_endpoint(agent_url: &str) -> Result<String, String> {
     Ok(url.to_string())
 }
 
-fn build_traceparent(version: &str, trace_id: &str, span_id: &str, flags: &str) -> String {
+pub(crate) fn build_traceparent(
+    version: &str,
+    trace_id: &str,
+    span_id: &str,
+    flags: &str,
+) -> String {
     let mut traceparent =
         String::with_capacity(version.len() + trace_id.len() + span_id.len() + flags.len() + 3);
     traceparent.push_str(version);
