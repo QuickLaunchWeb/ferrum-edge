@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -550,6 +551,7 @@ struct BufferedTraceExporter {
     provider_name: &'static str,
     hostname: String,
     sender: mpsc::Sender<SpanData>,
+    started: AtomicBool,
     deferred_start: Mutex<Option<(mpsc::Receiver<SpanData>, TraceHttpExporterConfig)>>,
 }
 
@@ -558,31 +560,40 @@ impl BufferedTraceExporter {
         let hostname = validate_endpoint_for_provider(cfg.provider_name, &cfg.endpoint)?;
         let (sender, receiver) = mpsc::channel(buffer_capacity);
         let provider_name = cfg.provider_name;
-        let deferred_start = if let Ok(handle) = Handle::try_current() {
+        let (started, deferred_start) = if let Ok(handle) = Handle::try_current() {
             handle.spawn(trace_export_flush_loop(receiver, cfg));
-            Mutex::new(None)
+            (true, Mutex::new(None))
         } else {
-            Mutex::new(Some((receiver, cfg)))
+            (false, Mutex::new(Some((receiver, cfg))))
         };
         Ok(Self {
             provider_name,
             hostname,
             sender,
+            started: AtomicBool::new(started),
             deferred_start,
         })
     }
 
     fn ensure_started(&self) -> Result<(), String> {
+        if self.started.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let mut deferred = self
             .deferred_start
             .lock()
             .map_err(|_| "trace exporter deferred startup lock poisoned".to_string())?;
+        if self.started.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let Some((receiver, cfg)) = deferred.take() else {
+            self.started.store(true, Ordering::Release);
             return Ok(());
         };
         match Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(trace_export_flush_loop(receiver, cfg));
+                self.started.store(true, Ordering::Release);
                 Ok(())
             }
             Err(error) => {
@@ -605,7 +616,9 @@ impl TraceExporter for BufferedTraceExporter {
     }
 
     fn try_export(&self, span: SpanData) -> Result<(), String> {
-        self.ensure_started()?;
+        if !self.started.load(Ordering::Acquire) {
+            self.ensure_started()?;
+        }
         self.sender.try_send(span).map_err(|e| e.to_string())
     }
 }
@@ -1565,6 +1578,55 @@ mod tests {
             stream_bytes_sent: None,
             stream_bytes_received: None,
         }
+    }
+
+    fn test_trace_http_exporter_config() -> TraceHttpExporterConfig {
+        TraceHttpExporterConfig {
+            provider_name: "workload_metrics",
+            endpoint: "http://collector:4318/v1/traces".to_string(),
+            authorization: None,
+            custom_headers: Vec::new(),
+            http_client: PluginHttpClient::default(),
+            batch_size: 16,
+            flush_interval: Duration::from_secs(60),
+            max_retries: 0,
+            retry_delay: Duration::from_millis(1),
+            service_name: "ferrum-edge".to_string(),
+            deployment_environment: None,
+            payload_kind: TracePayloadKind::Otlp,
+        }
+    }
+
+    #[test]
+    fn buffered_trace_exporter_defers_start_without_runtime() {
+        let exporter = BufferedTraceExporter::new(test_trace_http_exporter_config(), 8)
+            .expect("exporter config accepted");
+
+        assert!(!exporter.started.load(Ordering::Acquire));
+        assert!(
+            exporter
+                .try_export(test_span(
+                    "4bf92f3577b34da6a3ce929d0e0e4736",
+                    "00f067aa0ba902b7"
+                ))
+                .is_err(),
+            "enqueue should report missing runtime instead of silently dropping deferred startup"
+        );
+        assert!(
+            !exporter.started.load(Ordering::Acquire),
+            "failed deferred startup must stay retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_trace_exporter_marks_started_when_runtime_available() {
+        let exporter = BufferedTraceExporter::new(test_trace_http_exporter_config(), 8)
+            .expect("exporter config accepted");
+
+        assert!(
+            exporter.started.load(Ordering::Acquire),
+            "exporter constructed inside a runtime should enter steady-state without per-span locking"
+        );
     }
 
     #[test]
