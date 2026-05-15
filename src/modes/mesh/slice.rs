@@ -772,9 +772,11 @@ fn narrow_service_ports(
                 .map(|(port, protocol)| (*port, *protocol))
                 .collect();
             MeshService {
+                name: service.name.clone(),
+                namespace: service.namespace.clone(),
                 ports,
+                workloads: service.workloads.clone(),
                 protocol_overrides,
-                ..service.clone()
             }
         }
     })
@@ -806,8 +808,15 @@ fn narrow_service_entry_ports(
                 return None;
             }
             ServiceEntry {
+                name: entry.name.clone(),
+                namespace: entry.namespace.clone(),
+                hosts: entry.hosts.clone(),
+                endpoints: entry.endpoints.clone(),
+                resolution: entry.resolution,
+                location: entry.location,
                 ports,
-                ..entry.clone()
+                export_to: entry.export_to.clone(),
+                workload_selector: entry.workload_selector.clone(),
             }
         }
     })
@@ -886,6 +895,8 @@ fn sidecar_egress_port_admission(
             .then_some(SidecarPortAdmission::All);
     }
 
+    // Istio precedence: a port-specific egress entry owns that listener;
+    // portless entries only cover ports with no dedicated listener.
     let specific_ports: BTreeSet<u16> = sidecar_egress
         .iter()
         .filter_map(|egress_entry| egress_entry.port)
