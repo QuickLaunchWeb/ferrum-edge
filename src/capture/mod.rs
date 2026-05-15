@@ -270,6 +270,7 @@ impl IptablesPlan {
         iptables_script(&self.v4_commands, &self.v6_commands, ip6tables_mode, true)
     }
 
+    #[cfg(test)]
     pub fn cleanup_script(include_v6: bool, ip6tables_mode: Ip6TablesMode) -> String {
         let v4_commands = Self::cleanup_commands();
         let v6_commands = if include_v6 {
