@@ -39,6 +39,7 @@ pub struct JwksKeyStore {
     jwks_uri: String,
     http_client: PluginHttpClient,
     fetch_lock: Arc<Mutex<()>>,
+    refreshable: bool,
 }
 
 /// Raw JWKS response from the endpoint.
@@ -86,12 +87,33 @@ impl JwksKeyStore {
             jwks_uri,
             http_client,
             fetch_lock: Arc::new(Mutex::new(())),
+            refreshable: true,
         }
+    }
+
+    /// Create a non-refreshing key store from inline JWKS JSON.
+    pub fn from_inline_jwks(jwks_json: &str) -> Result<Self, String> {
+        let jwks: JwksResponse = serde_json::from_str(jwks_json)
+            .map_err(|e| format!("inline JWKS parse failed: {}", e))?;
+        let keys = Self::parse_jwks_response(&jwks)?;
+
+        Ok(Self {
+            keys: Arc::new(ArcSwap::from_pointee(keys)),
+            jwks_uri: "inline".to_string(),
+            http_client: PluginHttpClient::default(),
+            fetch_lock: Arc::new(Mutex::new(())),
+            refreshable: false,
+        })
     }
 
     /// Get the JWKS URI this store fetches keys from.
     pub fn jwks_uri(&self) -> &str {
         &self.jwks_uri
+    }
+
+    /// Whether this store fetches keys from an external JWKS URI.
+    pub fn is_refreshable(&self) -> bool {
+        self.refreshable
     }
 
     /// Look up a cached key by its key ID (`kid`).
@@ -129,6 +151,10 @@ impl JwksKeyStore {
     }
 
     async fn fetch_keys_unlocked(&self) -> Result<usize, String> {
+        if !self.refreshable {
+            return Ok(self.keys.load().len());
+        }
+
         debug!("Fetching JWKS keys from {}", self.jwks_uri);
 
         let req = self.http_client.get().get(&self.jwks_uri);
@@ -147,6 +173,15 @@ impl JwksKeyStore {
             .await
             .map_err(|e| format!("JWKS parse failed: {}", e))?;
 
+        let new_keys = Self::parse_jwks_response(&jwks)?;
+        let count = new_keys.len();
+
+        self.keys.store(Arc::new(new_keys));
+        debug!("JWKS key store updated: {} keys cached", count);
+        Ok(count)
+    }
+
+    fn parse_jwks_response(jwks: &JwksResponse) -> Result<HashMap<String, CachedJwk>, String> {
         let total_keys = jwks.keys.len();
         let mut new_keys = HashMap::new();
 
@@ -179,9 +214,7 @@ impl JwksKeyStore {
             );
         }
 
-        self.keys.store(Arc::new(new_keys));
-        debug!("JWKS key store updated: {} keys cached", count);
-        Ok(count)
+        Ok(new_keys)
     }
 
     /// Start a background task that refreshes keys periodically.

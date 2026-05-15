@@ -92,6 +92,8 @@ PRs: format → tests (parallel) → lint → perf regression → build 5 target
 
 **`/health` DB check cached 15s via lock-free `ArcSwap`** (`AdminState.CachedDbHealthResult`). Endpoints unauthenticated; without caching an attacker could flood `SELECT 1` and exhaust `FERRUM_DB_POOL_MAX_CONNECTIONS` (default 32). Do not remove. Response includes `database.pool` stats when connected.
 
+**`/metrics/runtime` JSON response cached via lock-free `ArcSwap`** (`runtime_metrics_cache()`). Endpoint is JWT-authenticated; without caching, aggressive polling would amplify system sampling and serialization work. Do not remove.
+
 **`GET /cluster`** (JWT-auth): CP returns connected DPs (from `DpNodeRegistry`, auto-removed on stream drop via `TrackedStream`); DP returns CP connection state (from `DpCpConnectionState`, primary vs fallback, `last_config_received_at`).
 
 ### Core Design Principles
@@ -139,7 +141,7 @@ At startup, before config load. Env var suffixes resolve the base name: `_VAULT`
 - `src/proxy/` — `mod.rs` (handle_proxy_request), `hbone_proxy.rs` (HBONE transport handler), `handler.rs`, `body.rs` (ProxyBody + Coalescing adapters), `grpc_proxy.rs`, `http2_pool.rs`, `tcp_proxy.rs`, `udp_proxy.rs`, `udp_batch.rs`, `sni.rs`, `stream_listener.rs`, `client_ip.rs`
 - `src/plugins/` — `mod.rs` (trait + priorities), `utils/`, per-plugin files; `src/plugins/mesh/` — mesh plugins (authz, spiffe_identity, workload_metrics, Prometheus/OTel helpers)
 - `src/grpc/` — `cp_server.rs`, `dp_client.rs`, `mesh_server.rs`, `mesh_registry.rs`; `src/http3/` — QUIC server + `Http3ConnectionPool`
-- `src/{dtls,dns,secrets,tls,service_discovery}/`
+- `src/{dtls,dns,notifications,secrets,tls,service_discovery}/` — `notifications/` is a reusable, plugin-agnostic notification layer (Slack/Teams/Discord/webhook channels + `${var}` templating + bounded-concurrency dispatch). Used by `src/plugins/proxy_alerts/`; reusable from non-plugin callers (overload manager, mesh policy enforcement, custom plugins) without depending on `proxy_alerts`. Schema: [docs/notifications.md](docs/notifications.md).
 - Top-level utilities: `overload.rs`, `load_balancer.rs`, `health_check.rs`, `circuit_breaker.rs`, `retry.rs`, `pool/`, `connection_pool.rs`, `router_cache.rs`, `plugin_cache.rs`, `consumer_index.rs`, `config_delta.rs`, `date_cache.rs`, `lazy_timeout.rs`, `socket_opts.rs`, `tls_offload.rs`
 - `custom_plugins/` — auto-discovered by `build.rs`; supports `plugin_migrations()`
 

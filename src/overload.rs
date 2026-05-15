@@ -425,7 +425,7 @@ impl Default for OverloadConfig {
 
 /// Count open file descriptors for the current process.
 #[cfg(target_os = "linux")]
-fn count_open_fds() -> u64 {
+pub(crate) fn count_open_fds() -> u64 {
     // On Linux, /proc/self/fd is the canonical way to count open FDs.
     std::fs::read_dir("/proc/self/fd")
         .map(|d| d.count() as u64)
@@ -433,7 +433,7 @@ fn count_open_fds() -> u64 {
 }
 
 #[cfg(target_os = "macos")]
-fn count_open_fds() -> u64 {
+pub(crate) fn count_open_fds() -> u64 {
     // On macOS, use proc_pidinfo via the libc FFI constants.
     // PROC_PIDLISTFDS = 1, sizeof(proc_fdinfo) = 8
     const PROC_PIDLISTFDS: i32 = 1;
@@ -456,7 +456,7 @@ fn count_open_fds() -> u64 {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn count_open_fds() -> u64 {
+pub(crate) fn count_open_fds() -> u64 {
     0 // FD monitoring not available on this platform
 }
 
@@ -499,7 +499,7 @@ pub struct RaiseFdLimitResult {
 }
 
 /// Get the maximum file descriptor limit (soft limit).
-fn get_fd_limit() -> u64 {
+pub(crate) fn get_fd_limit() -> u64 {
     #[cfg(unix)]
     {
         get_fd_rlimit_pair().0

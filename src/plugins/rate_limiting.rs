@@ -161,7 +161,7 @@ impl RateLimiting {
     }
 
     fn reject(&self, key: &str, outcome: &RateLimitOutcome) -> PluginResult {
-        let mut headers = HashMap::new();
+        let mut headers = HashMap::with_capacity(4);
         if self.expose_headers {
             if let Some(limit) = outcome.limit {
                 headers.insert("x-ratelimit-limit".to_string(), limit.to_string());

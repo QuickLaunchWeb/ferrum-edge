@@ -182,10 +182,13 @@ ferrum-ebpf-common = { path = "ebpf/ferrum-ebpf-common" }
 # under high concurrency (50k+ connections). Not available on Windows.
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # recvmmsg/sendmmsg for batched UDP datagram I/O, io_uring for splice (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
 io-uring = "0.7"
 # eBPF program loader (optional, behind `ebpf` feature)
 aya = { version = "0.13", optional = true }

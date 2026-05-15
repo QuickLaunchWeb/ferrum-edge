@@ -368,12 +368,14 @@ Each `MeshJwtRule` specifies:
 | Field | Description |
 |---|---|
 | `issuer` | Expected JWT issuer (`iss` claim) |
-| `audiences` | Accepted audience values (`aud` claim) |
+| `audiences` | Accepted audience values (`aud` claim); any configured value may match |
 | `jwks_uri` | URL to fetch the JWKS key set |
-| `jwks` | Inline JWKS JSON (alternative to `jwks_uri`) |
+| `jwks` | Inline JWKS JSON (alternative to `jwks_uri`); keys are loaded from config without a fetch loop |
 | `from_headers` | Headers to extract the JWT from (with optional prefix stripping) |
 | `from_params` | Query parameters to extract the JWT from |
 | `forward_original_token` | Whether to forward the original token to the backend |
+
+Each JWT rule resolves token locations independently. Rules with custom `from_headers` or `from_params` check those locations in declaration order; rules without custom locations continue to use the standard `Authorization: Bearer ...` lookup. When `forward_original_token: false`, the backend-bound request strips the matched rule's configured token headers or query parameters (or `Authorization` for standard lookup).
 
 ## PeerAuthentication
 
@@ -583,7 +585,7 @@ Each `spec.egress[].hosts` entry follows Istio scope-host syntax:
 
 The `host` portion may itself be a single-label DNS wildcard (e.g. `*/*.example.com` admits `api.example.com` but not `example.com` nor `a.b.example.com`). This is the same single-label wildcard semantic Ferrum uses elsewhere (`config::types::wildcard_matches`, mesh DNS proxy); operators relying on deeper-than-one-label wildcards should list the additional surfaces explicitly. `MeshService` entries match their short name, `{name}.{namespace}`, `{name}.{namespace}.svc`, and `{name}.{namespace}.svc.{cluster_domain}` aliases. On the control plane this suffix follows `FERRUM_K8S_CLUSTER_DOMAIN`; in local mesh mode it follows `FERRUM_MESH_CLUSTER_DOMAIN`.
 
-When Kubernetes `spec.egress` is omitted, Istio inherits the namespace-default outbound scope; Ferrum preserves that distinction so an ingress-only workload Sidecar does not override a namespace default. If no namespace default Sidecar exists, omitted egress is treated as no narrowing. An explicit native/file `egress: []` or `~/*` trims all service config from the slice. The optional `spec.egress[].port.number` is parsed and recorded but does not yet narrow by listener port — port matching for egress is a follow-up.
+When Kubernetes `spec.egress` is omitted, Istio inherits the namespace-default outbound scope; Ferrum preserves that distinction so an ingress-only workload Sidecar does not override a namespace default. If no namespace default Sidecar exists, omitted egress is treated as no narrowing. An explicit native/file `egress: []` or `~/*` trims all service config from the slice. When an admitted egress host also sets `spec.egress[].port.number`, Ferrum narrows matching `MeshService` and `ServiceEntry` port lists to the union of admitted ports; `DestinationRule` resources remain host-scoped because they do not carry a resource port list in the slice.
 
 When multiple `Sidecar` resources in the same namespace apply at the same scope tier (two namespace-defaults, or two workload-scoped Sidecars both matching the same workload), the resolver picks the ASCII-smallest `name` as the deterministic tiebreak so reconciles are stable across pods and restarts.
 

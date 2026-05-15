@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -420,7 +420,6 @@ fn sidecar(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, 
 
     let mut egress = Vec::new();
     let mut egress_inherits_defaults = false;
-    let mut port_scopes = BTreeSet::new();
     match object.spec.get("egress") {
         None => {
             // Istio: omitted egress inherits the namespace default outbound
@@ -470,19 +469,9 @@ fn sidecar(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, 
                     )?,
                     None => None,
                 };
-                if let Some(port) = port {
-                    port_scopes.insert(port);
-                }
                 egress.push(MeshSidecarEgress { hosts, port });
             }
         }
-    }
-
-    if !port_scopes.is_empty() {
-        acc.warnings.push(format!(
-            "Sidecar {}/{} uses egress port scoping {:?}, but Ferrum currently narrows Sidecar egress by host only; the port field is parsed and preserved but not enforced",
-            object.metadata.namespace, object.metadata.name, port_scopes
-        ));
     }
 
     Ok(MeshSidecar {
@@ -584,14 +573,17 @@ fn jwt_from_headers(object: &K8sObject, rule: &Value) -> Result<Vec<JwtHeader>, 
                 )
             })?;
             let prefix = match header.get("prefix") {
-                Some(prefix) => Some(prefix.as_str().ok_or_else(|| {
-                    invalid_resource(
-                        object,
-                        format!(
-                            "RequestAuthentication jwtRules[].fromHeaders[{index}].prefix must be a string"
-                        ),
-                    )
-                })?),
+                Some(prefix) => {
+                    let prefix = prefix.as_str().ok_or_else(|| {
+                        invalid_resource(
+                            object,
+                            format!(
+                                "RequestAuthentication jwtRules[].fromHeaders[{index}].prefix must be a string"
+                            ),
+                        )
+                    })?;
+                    (!prefix.is_empty()).then_some(prefix)
+                }
                 None => None,
             };
             Ok(JwtHeader {
@@ -3899,7 +3891,8 @@ mod tests {
                         "audiences": ["my-app"],
                         "fromHeaders": [
                             {"name": "Authorization", "prefix": "Bearer "},
-                            {"name": "X-Custom-Token"}
+                            {"name": "X-Custom-Token"},
+                            {"name": "X-Raw-Token", "prefix": ""}
                         ],
                         "fromParams": ["access_token"],
                         "forwardOriginalToken": true
@@ -3926,11 +3919,13 @@ mod tests {
             Some("https://www.googleapis.com/oauth2/v3/certs")
         );
         assert_eq!(rule.audiences, vec!["my-app"]);
-        assert_eq!(rule.from_headers.len(), 2);
+        assert_eq!(rule.from_headers.len(), 3);
         assert_eq!(rule.from_headers[0].name, "Authorization");
         assert_eq!(rule.from_headers[0].prefix.as_deref(), Some("Bearer "));
         assert_eq!(rule.from_headers[1].name, "X-Custom-Token");
         assert!(rule.from_headers[1].prefix.is_none());
+        assert_eq!(rule.from_headers[2].name, "X-Raw-Token");
+        assert!(rule.from_headers[2].prefix.is_none());
         assert_eq!(rule.from_params, vec!["access_token"]);
         assert!(rule.forward_original_token);
     }
@@ -9394,19 +9389,19 @@ mod tests {
         .expect("translation succeeds");
 
         // Sidecar must NOT produce the old Phase-D warning. Port scoping is
-        // parsed but not enforced yet, so that unsupported field gets a focused
-        // warning instead.
+        // parsed into the mesh model and enforced later when the Sidecar
+        // enforcement gate is enabled.
         assert!(
             !result.warnings.iter().any(|w| w.contains("Phase D")),
             "Sidecar translation must not emit the deferred warning; warnings = {:?}",
             result.warnings
         );
         assert!(
-            result
+            !result
                 .warnings
                 .iter()
-                .any(|w| { w.contains("egress port scoping") && w.contains("host only") }),
-            "Sidecar egress port should emit a host-only warning; warnings = {:?}",
+                .any(|w| w.contains("egress port scoping")),
+            "Sidecar egress port should not emit a stale unsupported warning; warnings = {:?}",
             result.warnings
         );
 

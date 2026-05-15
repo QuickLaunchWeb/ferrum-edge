@@ -424,6 +424,13 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` | No | `false` | Track streaming response total latency (adds per-stream overhead) |
+| `FERRUM_METRICS_SYSTEM_SAMPLE_INTERVAL_MS` | No | `1000` | Background sampler interval for `/metrics/runtime` system metrics (minimum 100ms) |
+| `FERRUM_METRICS_WINDOW_1M_SECONDS` | No | `60` | Short status-code/request-rate window exposed by `/metrics/runtime` |
+| `FERRUM_METRICS_WINDOW_5M_SECONDS` | No | `300` | Long status-code/request-rate window exposed by `/metrics/runtime` |
+| `FERRUM_METRICS_LOG_COUNTER_ENABLED` | No | `true` | Count Ferrum tracing events by level and bounded category for `/metrics/runtime`, after applying the output `FERRUM_LOG_LEVEL` / `RUST_LOG` filter |
+| `FERRUM_METRICS_RUNTIME_CACHE_MS` | No | `1000` | Admin JSON cache TTL for `GET /metrics/runtime` |
+| `FERRUM_METRICS_POOL_TRACKING_ENABLED` | No | `true` | Count backend pool creation, failure, and eviction churn in `/metrics/runtime` |
+| `FERRUM_METRICS_STATUS_TRACKING_ENABLED` | No | `true` | Count extra 1m/5m HTTP status windows for `/metrics/runtime`; disable to remove the additional per-request status-window counters |
 | `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` | No | `1000` | Threshold (ms) for logging slow plugin outbound HTTP calls |
 | `FERRUM_PLUGIN_HTTP_MAX_RETRIES` | No | `0` | Retry count for safe plugin outbound HTTP calls on transport failures (JWKS/OIDC fetches, etc.) |
 | `FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS` | No | `100` | Delay between plugin HTTP transport retry attempts |

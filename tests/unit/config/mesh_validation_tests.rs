@@ -3,10 +3,11 @@
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, EastWestGateway, MeshConfig, MeshEndpoint, MeshPolicy, MeshRule, MeshService,
-    MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch,
-    RemoteCluster, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, TrustBundle,
-    TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
+    AppProtocol, EastWestGateway, JwtHeader, MeshConfig, MeshEndpoint, MeshJwtRule, MeshPolicy,
+    MeshRequestAuthentication, MeshRule, MeshService, MultiClusterConfig, PeerAuthentication,
+    PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, RequestMatch, Resolution,
+    ServiceEntry, ServiceEntryLocation, TrustBundle, TrustBundleSet, Workload, WorkloadPort,
+    WorkloadRef, WorkloadSelector, validate_mesh_config,
 };
 use std::collections::HashMap;
 
@@ -333,6 +334,33 @@ fn peer_authentication_requires_namespace() {
         errors
             .iter()
             .any(|e| e.contains("namespace must not be empty"))
+    );
+}
+
+#[test]
+fn request_authentication_accepts_inline_jwks_multi_audience_and_custom_locations() {
+    let ra = MeshRequestAuthentication {
+        name: "jwt".into(),
+        namespace: "default".into(),
+        scope: PolicyScope::MeshWide,
+        jwt_rules: vec![MeshJwtRule {
+            issuer: "https://issuer.example.com".into(),
+            audiences: vec!["api-a".into(), "api-b".into()],
+            jwks_uri: None,
+            jwks: Some(r#"{"keys":[]}"#.into()),
+            from_headers: vec![JwtHeader {
+                name: "X-Token".into(),
+                prefix: Some("Token ".into()),
+            }],
+            from_params: vec!["access_token".into()],
+            forward_original_token: false,
+        }],
+    };
+
+    let errors = validate_mesh_config(&[], &[], &[], &[], &[], &[ra], None);
+    assert!(
+        errors.is_empty(),
+        "expected inline jwks, multi-audience, and custom locations to validate, got: {errors:?}"
     );
 }
 
