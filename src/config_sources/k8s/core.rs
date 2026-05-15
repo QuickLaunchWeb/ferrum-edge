@@ -545,6 +545,8 @@ fn service_app_protocol(port_entry: &Value, port_name: Option<&str>) -> AppProto
 fn workload_port_protocol(protocol: Option<&str>) -> AppProtocol {
     match protocol.unwrap_or("TCP").to_ascii_uppercase().as_str() {
         "TCP" => AppProtocol::Tcp,
+        // The mesh AppProtocol model has no UDP variant today; keep UDP/other
+        // transport hints unknown until UDP workload routing consumes them.
         _ => AppProtocol::Unknown,
     }
 }
