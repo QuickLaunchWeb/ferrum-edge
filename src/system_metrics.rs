@@ -383,7 +383,28 @@ fn process_memory_bytes() -> (u64, u64) {
     )
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn process_memory_bytes() -> (u64, u64) {
+    let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info>::uninit();
+    let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+    #[allow(deprecated)]
+    let task = unsafe { libc::mach_task_self() };
+    let rc = unsafe {
+        libc::task_info(
+            task,
+            libc::MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr() as libc::task_info_t,
+            &mut count,
+        )
+    };
+    if rc != libc::KERN_SUCCESS {
+        return (0, 0);
+    }
+    let info = unsafe { info.assume_init() };
+    (info.resident_size, info.virtual_size)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn process_memory_bytes() -> (u64, u64) {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
@@ -391,9 +412,6 @@ fn process_memory_bytes() -> (u64, u64) {
         return (0, 0);
     }
     let usage = unsafe { usage.assume_init() };
-    #[cfg(target_os = "macos")]
-    let rss = usage.ru_maxrss as u64;
-    #[cfg(not(target_os = "macos"))]
     let rss = (usage.ru_maxrss as u64).saturating_mul(1024);
     (rss, 0)
 }

@@ -153,12 +153,16 @@ pub struct RuntimeMetrics {
     cache_ttl_ms: AtomicU64,
     client_disconnects: CachePadded<AtomicU64>,
     reqwest_active_backend_requests: CachePadded<AtomicU64>,
+    status_count_window_1m: DashMap<u16, AtomicU64>,
+    status_count_window_5m: DashMap<u16, AtomicU64>,
     status_current_1m: DashMap<u16, CachePadded<AtomicU64>>,
     status_current_5m: DashMap<u16, CachePadded<AtomicU64>>,
     requests_current_1m: CachePadded<AtomicU64>,
     requests_current_5m: CachePadded<AtomicU64>,
     requests_window_1m: CachePadded<AtomicU64>,
     requests_window_5m: CachePadded<AtomicU64>,
+    requests_count_window_1m: CachePadded<AtomicU64>,
+    requests_count_window_5m: CachePadded<AtomicU64>,
 }
 
 impl Default for RuntimeMetrics {
@@ -197,12 +201,16 @@ impl RuntimeMetrics {
             cache_ttl_ms: AtomicU64::new(1000),
             client_disconnects: CachePadded::new(AtomicU64::new(0)),
             reqwest_active_backend_requests: CachePadded::new(AtomicU64::new(0)),
+            status_count_window_1m: DashMap::new(),
+            status_count_window_5m: DashMap::new(),
             status_current_1m: DashMap::new(),
             status_current_5m: DashMap::new(),
             requests_current_1m: CachePadded::new(AtomicU64::new(0)),
             requests_current_5m: CachePadded::new(AtomicU64::new(0)),
             requests_window_1m: CachePadded::new(AtomicU64::new(0)),
             requests_window_5m: CachePadded::new(AtomicU64::new(0)),
+            requests_count_window_1m: CachePadded::new(AtomicU64::new(0)),
+            requests_count_window_5m: CachePadded::new(AtomicU64::new(0)),
         }
     }
 
@@ -398,27 +406,40 @@ impl RuntimeMetrics {
             return;
         }
 
-        if self.error_entry_count.load(Ordering::Relaxed)
-            >= self.max_error_entries.load(Ordering::Relaxed)
-        {
-            return;
-        }
-
-        // Determine new-vs-existing atomically via the Entry API. A prior
-        // `contains_key` + `entry` split would race two concurrent inserts of
-        // the same (class, proxy_id) into both bumping `error_entry_count`
-        // even though only one of them actually creates an entry — drifting
-        // the count above the real cardinality and clamping the cap early.
+        // Determine new-vs-existing via the Entry API, then reserve capacity
+        // before inserting a vacant key. This keeps the cap strict even when
+        // many distinct (class, proxy_id) pairs arrive concurrently.
         let class_map = map.entry(class).or_default();
         match class_map.entry(Arc::<str>::from(proxy_id)) {
             dashmap::mapref::entry::Entry::Occupied(occupied) => {
                 occupied.get().fetch_add(1, Ordering::Relaxed);
             }
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                if !self.try_reserve_error_entry() {
+                    return;
+                }
                 vacant
                     .insert(CachePadded::new(AtomicU64::new(0)))
                     .fetch_add(1, Ordering::Relaxed);
-                self.error_entry_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn try_reserve_error_entry(&self) -> bool {
+        let max = self.max_error_entries.load(Ordering::Relaxed);
+        let mut observed = self.error_entry_count.load(Ordering::Relaxed);
+        loop {
+            if observed >= max {
+                return false;
+            }
+            match self.error_entry_count.compare_exchange_weak(
+                observed,
+                observed + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => observed = actual,
             }
         }
     }
@@ -439,35 +460,52 @@ impl RuntimeMetrics {
     }
 
     fn rotate_status_window(&self, window: StatusWindow) {
-        let (current, published, request_current, request_published, seconds) = match window {
+        let (
+            current,
+            published_rate,
+            published_count,
+            request_current,
+            request_rate_published,
+            request_count_published,
+            seconds,
+        ) = match window {
             StatusWindow::OneMinute(seconds) => (
                 &self.status_current_1m,
                 &self.status_window_1m,
+                &self.status_count_window_1m,
                 &self.requests_current_1m,
                 &self.requests_window_1m,
+                &self.requests_count_window_1m,
                 seconds,
             ),
             StatusWindow::FiveMinutes(seconds) => (
                 &self.status_current_5m,
                 &self.status_window_5m,
+                &self.status_count_window_5m,
                 &self.requests_current_5m,
                 &self.requests_window_5m,
+                &self.requests_count_window_5m,
                 seconds,
             ),
         };
 
         let seconds = seconds.max(1);
         let request_delta = request_current.swap(0, Ordering::Relaxed);
-        request_published.store(rounding_div(request_delta, seconds), Ordering::Relaxed);
+        request_rate_published.store(rounding_div(request_delta, seconds), Ordering::Relaxed);
+        request_count_published.store(request_delta, Ordering::Relaxed);
 
         for entry in current.iter() {
             let code = *entry.key();
             let delta = entry.value().swap(0, Ordering::Relaxed);
             let rate = rounding_div(delta, seconds);
-            published
+            published_rate
                 .entry(code)
                 .or_insert_with(|| AtomicU64::new(0))
                 .store(rate, Ordering::Relaxed);
+            published_count
+                .entry(code)
+                .or_insert_with(|| AtomicU64::new(0))
+                .store(delta, Ordering::Relaxed);
         }
 
         self.status_window_rotated_at
@@ -657,12 +695,16 @@ fn build_http_snapshot(
         .unwrap_or_default();
     let rate_1m = status_map_from_dashmap(&metrics.status_window_1m);
     let rate_5m = status_map_from_dashmap(&metrics.status_window_5m);
+    let count_1m = status_map_from_dashmap(&metrics.status_count_window_1m);
+    let count_5m = status_map_from_dashmap(&metrics.status_count_window_5m);
 
     let percent_total = percent_map(&totals, total_requests);
     let requests_1m = metrics.requests_window_1m.load(Ordering::Relaxed);
     let requests_5m = metrics.requests_window_5m.load(Ordering::Relaxed);
-    let percent_1m = percent_map(&rate_1m, requests_1m);
-    let percent_5m = percent_map(&rate_5m, requests_5m);
+    let request_count_1m = metrics.requests_count_window_1m.load(Ordering::Relaxed);
+    let request_count_5m = metrics.requests_count_window_5m.load(Ordering::Relaxed);
+    let percent_1m = percent_map(&count_1m, request_count_1m);
+    let percent_5m = percent_map(&count_5m, request_count_5m);
 
     HttpSnapshot {
         total_requests,
@@ -973,6 +1015,27 @@ mod tests {
     }
 
     #[test]
+    fn error_entry_count_respects_configured_cap() {
+        let metrics = RuntimeMetrics::new();
+        metrics.configure(2, true, true, 1000);
+
+        metrics.record_http_error(Some("proxy-a"), ErrorClass::ConnectionTimeout);
+        metrics.record_http_error(Some("proxy-b"), ErrorClass::ConnectionTimeout);
+        metrics.record_http_error(Some("proxy-c"), ErrorClass::ConnectionTimeout);
+
+        assert_eq!(metrics.error_entry_count.load(Ordering::Relaxed), 2);
+        let snapshot = build_errors_snapshot(&metrics);
+        assert_eq!(
+            snapshot
+                .by_proxy
+                .get("proxy-c")
+                .and_then(|classes| classes.get("connection_timeout"))
+                .copied(),
+            None
+        );
+    }
+
+    #[test]
     fn status_window_rotation_publishes_rates() {
         let metrics = RuntimeMetrics::new();
         for _ in 0..120 {
@@ -988,6 +1051,17 @@ mod tests {
                 .get(&200)
                 .map(|v| v.load(Ordering::Relaxed)),
             Some(2)
+        );
+        assert_eq!(
+            metrics.requests_count_window_1m.load(Ordering::Relaxed),
+            120
+        );
+        assert_eq!(
+            metrics
+                .status_count_window_1m
+                .get(&200)
+                .map(|v| v.load(Ordering::Relaxed)),
+            Some(120)
         );
     }
 
@@ -1009,6 +1083,32 @@ mod tests {
                 .map(|v| v.load(Ordering::Relaxed)),
             Some(1)
         );
+        assert_eq!(metrics.requests_count_window_1m.load(Ordering::Relaxed), 59);
+        assert_eq!(
+            metrics
+                .status_count_window_1m
+                .get(&200)
+                .map(|v| v.load(Ordering::Relaxed)),
+            Some(59)
+        );
+    }
+
+    #[test]
+    fn status_window_percentages_use_counts_not_rounded_rates() {
+        let metrics = RuntimeMetrics::new();
+        for _ in 0..30 {
+            metrics.record_http_status(200);
+            metrics.record_http_status(500);
+        }
+
+        metrics.rotate_status_window(StatusWindow::OneMinute(60));
+        let snapshot = build_http_snapshot(&metrics, None);
+
+        assert_eq!(snapshot.requests_per_second_1m, 1);
+        assert_eq!(snapshot.status_codes.rate_1m.get("200"), Some(&1));
+        assert_eq!(snapshot.status_codes.rate_1m.get("500"), Some(&1));
+        assert_eq!(snapshot.status_codes.percent_1m.get("200"), Some(&50.0));
+        assert_eq!(snapshot.status_codes.percent_1m.get("500"), Some(&50.0));
     }
 
     #[test]
@@ -1085,7 +1185,9 @@ mod tests {
         metrics.rotate_status_window(StatusWindow::OneMinute(60));
 
         assert_eq!(metrics.requests_window_1m.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.requests_count_window_1m.load(Ordering::Relaxed), 0);
         assert!(metrics.status_window_1m.is_empty());
+        assert!(metrics.status_count_window_1m.is_empty());
     }
 
     #[test]
