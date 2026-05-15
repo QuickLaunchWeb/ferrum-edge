@@ -722,7 +722,7 @@ fn split_canonical_service_host(host: &str) -> Option<(&str, &str)> {
 /// Returns `None` if no Sidecar in `sidecars` applies to the workload.
 fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
     sidecars: &'a [MeshSidecar],
-    workload_namespace: &str,
+    workload_namespace: &'a str,
     workload_labels: &L,
     istio_root_namespace: &str,
 ) -> Option<ResolvedSidecarEgress<'a>> {
@@ -791,7 +791,11 @@ fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
             && !namespace_default.egress_inherits_defaults
         {
             return Some(ResolvedSidecarEgress {
-                namespace: namespace_default.namespace.as_str(),
+                namespace: sidecar_host_match_namespace(
+                    namespace_default,
+                    workload_namespace,
+                    root_namespace,
+                ),
                 egress: &namespace_default.egress,
             });
         }
@@ -800,7 +804,11 @@ fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
             && !root_namespace_default.egress_inherits_defaults
         {
             return Some(ResolvedSidecarEgress {
-                namespace: root_namespace_default.namespace.as_str(),
+                namespace: sidecar_host_match_namespace(
+                    root_namespace_default,
+                    workload_namespace,
+                    root_namespace,
+                ),
                 egress: &root_namespace_default.egress,
             });
         }
@@ -808,9 +816,24 @@ fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
     }
 
     Some(ResolvedSidecarEgress {
-        namespace: selected.namespace.as_str(),
+        namespace: sidecar_host_match_namespace(selected, workload_namespace, root_namespace),
         egress: &selected.egress,
     })
+}
+
+fn sidecar_host_match_namespace<'a>(
+    sidecar: &'a MeshSidecar,
+    workload_namespace: &'a str,
+    root_namespace: &str,
+) -> &'a str {
+    if !root_namespace.is_empty()
+        && sidecar.namespace == root_namespace
+        && sidecar.namespace != workload_namespace
+    {
+        workload_namespace
+    } else {
+        sidecar.namespace.as_str()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3851,6 +3874,38 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
         assert_eq!(slice.service_entries.len(), 1);
         assert_eq!(slice.service_entries[0].name, "reviews-beta");
+    }
+
+    #[test]
+    fn sidecar_root_namespace_default_same_namespace_host_uses_workload_namespace() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "mesh-default",
+                "istio-system",
+                None,
+                vec![vec!["./*"]],
+            )],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews-alpha",
+                    "alpha",
+                    "reviews.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "control-root",
+                    "istio-system",
+                    "control.istio-system.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+
+        assert_eq!(slice.service_entries.len(), 1);
+        assert_eq!(slice.service_entries[0].name, "reviews-alpha");
     }
 
     #[test]
