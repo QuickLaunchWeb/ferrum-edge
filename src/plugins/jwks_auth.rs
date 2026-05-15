@@ -831,10 +831,12 @@ impl super::Plugin for JwksAuth {
 
         if strip_authorization || !strip_headers.is_empty() {
             headers.retain(|name, _| {
-                !(strip_authorization && name.eq_ignore_ascii_case("authorization"))
-                    && !strip_headers
+                let strip_current = (strip_authorization
+                    && name.eq_ignore_ascii_case("authorization"))
+                    || strip_headers
                         .iter()
-                        .any(|header| name.eq_ignore_ascii_case(header))
+                        .any(|header| name.eq_ignore_ascii_case(header));
+                !strip_current
             });
         }
         for header in strip_headers {
