@@ -604,6 +604,8 @@ fn setup_commands_for_plan(plan: &IptablesPlan, ip6tables_mode: Ip6TablesMode) -
 
     commands.extend(plan.v4_commands.iter().cloned());
     match ip6tables_mode {
+        // The node agent runs commands one-by-one for clearer fallback errors, so
+        // auto-mode probes are wrapped per command instead of batched like the init script.
         Ip6TablesMode::Auto => commands.extend(
             plan.v6_commands
                 .iter()
@@ -619,6 +621,8 @@ fn cleanup_commands_for_plan(include_v6: bool, ip6tables_mode: Ip6TablesMode) ->
     let mut commands = IptablesPlan::cleanup_commands();
     if include_v6 {
         match ip6tables_mode {
+            // Keep cleanup best-effort per command; stale v6 chains from an earlier
+            // config should not make node-agent fallback cleanup fail.
             Ip6TablesMode::Auto | Ip6TablesMode::Disabled => commands.extend(
                 IptablesPlan::cleanup_v6_commands()
                     .iter()

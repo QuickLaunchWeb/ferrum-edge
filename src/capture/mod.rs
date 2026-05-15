@@ -444,10 +444,12 @@ fn iptables_script(
     v4_commands: &[String],
     v6_commands: &[String],
     ip6tables_mode: Ip6TablesMode,
-    require_v6_preflight: bool,
+    emit_required_mode_preflight: bool,
 ) -> String {
     let mut chunks = Vec::new();
-    if require_v6_preflight && !v6_commands.is_empty() && ip6tables_mode == Ip6TablesMode::Required
+    if emit_required_mode_preflight
+        && !v6_commands.is_empty()
+        && ip6tables_mode == Ip6TablesMode::Required
     {
         chunks.push(format!(
             "command -v ip6tables >/dev/null 2>&1 || {{ echo \"ip6tables is required for IPv6 mesh capture\" >&2; exit 1; }}\n\
@@ -981,6 +983,12 @@ mod tests {
                 cmd.contains("FERRUM_MESH_OUTBOUND") && cmd.contains("REDIRECT --to-ports 15001")
             }),
             "no outbound REDIRECT should be emitted when the only include CIDR is IPv6"
+        );
+        assert!(
+            plan.v4_commands.iter().any(|cmd| {
+                cmd.contains("FERRUM_MESH_INBOUND") && cmd.contains("REDIRECT --to-ports 15006")
+            }),
+            "IPv4 inbound REDIRECT must remain active even when the only include CIDR is IPv6"
         );
         assert!(
             plan.v6_commands.iter().any(|cmd| {
