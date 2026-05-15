@@ -564,9 +564,10 @@ When `FERRUM_MESH_SIDECAR_ENFORCED=true`, the `MeshSlice` projection narrows `se
 Most specific wins:
 
 1. **Workload-scoped** Sidecar (`spec.workloadSelector.matchLabels` matches the workload's labels)
-2. **Namespace-default** Sidecar (no `workloadSelector`)
-3. **Root-namespace default** Sidecar (no `workloadSelector`, in `FERRUM_K8S_ISTIO_ROOT_NAMESPACE`, default `istio-system`)
-4. **No Sidecar applies** → no narrowing (existing behavior)
+2. **Root-namespace workload-scoped** Sidecar (`workloadSelector` in `FERRUM_K8S_ISTIO_ROOT_NAMESPACE`, applied mesh-wide to matching labels)
+3. **Namespace-default** Sidecar (no `workloadSelector`)
+4. **Root-namespace default** Sidecar (no `workloadSelector`, in `FERRUM_K8S_ISTIO_ROOT_NAMESPACE`, default `istio-system`)
+5. **No Sidecar applies** → no narrowing (existing behavior)
 
 ### Host Pattern Syntax
 

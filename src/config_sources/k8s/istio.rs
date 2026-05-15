@@ -380,8 +380,8 @@ fn peer_authentication(
 ///
 /// Parses:
 ///   - `spec.workloadSelector.matchLabels` → [`MeshSidecar::workload_selector`]
-///     with the Sidecar's own namespace (a `Sidecar` only ever targets
-///     workloads in its own namespace, per Istio semantics).
+///     with the Sidecar's own namespace, except Sidecars in the Istio root
+///     namespace use a mesh-wide selector (`namespace: None`).
 ///   - `spec.egress[].hosts` → [`MeshSidecarEgress::hosts`] (verbatim — the
 ///     slice builder parses each entry via `MeshSidecarEgress::parse_host_pattern`).
 ///   - `spec.egress[].port.number` → [`MeshSidecarEgress::port`] (optional).
@@ -397,9 +397,11 @@ fn sidecar(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, 
             if labels.is_empty() {
                 None
             } else {
+                let is_root_namespace =
+                    object.metadata.namespace == acc.options.istio_root_namespace;
                 Some(WorkloadSelector {
                     labels,
-                    namespace: Some(object.metadata.namespace.clone()),
+                    namespace: (!is_root_namespace).then(|| object.metadata.namespace.clone()),
                 })
             }
         }
@@ -9248,6 +9250,34 @@ mod tests {
         assert_eq!(mesh.istio_root_namespace, "default");
         assert_eq!(mesh.sidecars.len(), 1);
         assert_eq!(mesh.sidecars[0].namespace, "default");
+    }
+
+    #[test]
+    fn sidecar_root_namespace_workload_selector_is_mesh_wide() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "workloadSelector": {"matchLabels": {"app": "frontend"}},
+                    "egress": [
+                        {"hosts": ["*/*"]}
+                    ]
+                }),
+            )],
+            options().with_istio_root_namespace("default".to_string()),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let selector = mesh.sidecars[0]
+            .workload_selector
+            .as_ref()
+            .expect("selector should be preserved");
+        assert_eq!(selector.namespace, None);
+        assert_eq!(
+            selector.labels.get("app").map(String::as_str),
+            Some("frontend")
+        );
     }
 
     #[test]

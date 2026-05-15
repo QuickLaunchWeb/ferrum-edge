@@ -141,6 +141,43 @@ impl std::fmt::Display for DbTlsMode {
     }
 }
 
+fn validate_k8s_namespace(ns: &str) -> Result<(), String> {
+    if ns.is_empty() {
+        return Err("namespace must not be empty".to_string());
+    }
+    if ns.len() > 63 {
+        return Err(format!(
+            "namespace must be at most 63 characters, got {}",
+            ns.len()
+        ));
+    }
+    let mut chars = ns.chars();
+    let first = chars.next().expect("checked non-empty");
+    let last = ns.chars().last().expect("checked non-empty");
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return Err(format!(
+            "namespace '{}' is invalid: must start with lowercase alphanumeric",
+            ns
+        ));
+    }
+    if !last.is_ascii_lowercase() && !last.is_ascii_digit() {
+        return Err(format!(
+            "namespace '{}' is invalid: must end with lowercase alphanumeric",
+            ns
+        ));
+    }
+    if !ns
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(format!(
+            "namespace '{}' is invalid: use lowercase alphanumeric characters or '-'",
+            ns
+        ));
+    }
+    Ok(())
+}
+
 /// Check whether an IP address falls within private/reserved ranges.
 ///
 /// Private/reserved ranges (denied in `Public` mode, allowed in `Private` mode):
@@ -592,6 +629,10 @@ pub struct EnvConfig {
     /// translator. Hosts like `<svc>.<ns>.svc.<cluster_domain>` are accepted.
     /// Default: "cluster.local".
     pub k8s_cluster_domain: String,
+    /// Istio root namespace used by the K8s translator when resolving
+    /// mesh-wide Istio resources such as root-namespace Sidecar defaults.
+    /// Default: "istio-system".
+    pub k8s_istio_root_namespace: String,
 
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
@@ -1318,6 +1359,7 @@ impl Default for EnvConfig {
             k8s_watch_gateway_api_crds: true,
             k8s_trust_domain: "cluster.local".to_string(),
             k8s_cluster_domain: "cluster.local".to_string(),
+            k8s_istio_root_namespace: "istio-system".to_string(),
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -1609,6 +1651,7 @@ impl EnvConfig {
             k8s_watch_gateway_api_crds: bool = "FERRUM_K8S_WATCH_GATEWAY_API_CRDS" => true;
             k8s_trust_domain: String = "FERRUM_K8S_TRUST_DOMAIN" => "cluster.local".to_string();
             k8s_cluster_domain: String = "FERRUM_K8S_CLUSTER_DOMAIN" => "cluster.local".to_string();
+            k8s_istio_root_namespace: String = "FERRUM_K8S_ISTIO_ROOT_NAMESPACE" => "istio-system".to_string();
             dp_grpc_tls_ca_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CA_CERT_PATH";
             dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
@@ -1972,6 +2015,7 @@ impl EnvConfig {
             k8s_watch_gateway_api_crds,
             k8s_trust_domain,
             k8s_cluster_domain,
+            k8s_istio_root_namespace,
             dp_grpc_tls_ca_cert_path,
             dp_grpc_tls_client_cert_path,
             dp_grpc_tls_client_key_path,
@@ -2544,6 +2588,8 @@ impl EnvConfig {
         // Validate namespace
         crate::config::types::validate_namespace(&self.namespace)
             .map_err(|e| format!("Invalid FERRUM_NAMESPACE: {}", e))?;
+        validate_k8s_namespace(&self.k8s_istio_root_namespace)
+            .map_err(|e| format!("Invalid FERRUM_K8S_ISTIO_ROOT_NAMESPACE: {}", e))?;
 
         // Validate TLS version settings
         match self.tls_min_version.as_str() {

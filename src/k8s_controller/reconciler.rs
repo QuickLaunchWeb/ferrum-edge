@@ -26,6 +26,7 @@ pub struct ReconcilerConfig {
     pub namespace: String,
     pub trust_domain: String,
     pub cluster_domain: String,
+    pub istio_root_namespace: String,
     pub watch_namespaces: Vec<String>,
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
@@ -94,6 +95,7 @@ pub fn spawn_reconcile_loop(
                 mesh_registry: &broadcasters.mesh_registry,
                 namespace: &reconciler_config.namespace,
                 cluster_domain: &reconciler_config.cluster_domain,
+                istio_root_namespace: &reconciler_config.istio_root_namespace,
                 watch_namespaces: &reconciler_config.watch_namespaces,
                 trust_domain: &trust_domain,
                 vs_header_routing_experimental: reconciler_config.vs_header_routing_experimental,
@@ -124,6 +126,7 @@ pub fn spawn_reconcile_loop(
                             mesh_registry: &broadcasters.mesh_registry,
                             namespace: &reconciler_config.namespace,
                             cluster_domain: &reconciler_config.cluster_domain,
+                            istio_root_namespace: &reconciler_config.istio_root_namespace,
                             watch_namespaces: &reconciler_config.watch_namespaces,
                             trust_domain: &trust_domain,
                             vs_header_routing_experimental: reconciler_config.vs_header_routing_experimental,
@@ -148,6 +151,7 @@ pub fn spawn_reconcile_loop(
                             mesh_registry: &broadcasters.mesh_registry,
                             namespace: &reconciler_config.namespace,
                             cluster_domain: &reconciler_config.cluster_domain,
+                            istio_root_namespace: &reconciler_config.istio_root_namespace,
                             watch_namespaces: &reconciler_config.watch_namespaces,
                             trust_domain: &trust_domain,
                             vs_header_routing_experimental: reconciler_config.vs_header_routing_experimental,
@@ -309,6 +313,7 @@ struct ReconcileContext<'a> {
     mesh_registry: &'a Arc<MeshNodeRegistry>,
     namespace: &'a str,
     cluster_domain: &'a str,
+    istio_root_namespace: &'a str,
     watch_namespaces: &'a [String],
     trust_domain: &'a TrustDomain,
     vs_header_routing_experimental: bool,
@@ -334,6 +339,7 @@ async fn do_reconcile(
 
     let options = K8sTranslationOptions::new(ctx.namespace.to_string(), ctx.trust_domain.clone())
         .with_cluster_domain(ctx.cluster_domain.to_string())
+        .with_istio_root_namespace(ctx.istio_root_namespace.to_string())
         .with_source_namespaces(ctx.watch_namespaces.to_vec())
         .with_vs_header_routing_experimental(ctx.vs_header_routing_experimental);
     let Some(translation) = translate_with_skip_retries(&objects, options, ctx.metrics) else {
