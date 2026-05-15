@@ -939,7 +939,7 @@ fn include_outbound_ports_for_pod(pod: &Value) -> Result<Vec<u16>, String> {
         {
             IncludePortList::Absent => {}
             IncludePortList::All => {
-                if saw_wildcard || !ports.is_empty() {
+                if !ports.is_empty() {
                     return Err(format!(
                         "invalid {key}: wildcard '*' cannot be combined with explicit includeOutboundPorts"
                     ));
@@ -2005,6 +2005,28 @@ mod tests {
         assert!(
             capture.include_outbound_ports.is_empty(),
             "wildcard includeOutboundPorts means all ports, so no port filter should be carried"
+        );
+    }
+
+    #[test]
+    fn capture_config_accepts_duplicate_include_outbound_ports_wildcard_aliases() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/includeOutboundPorts": "*",
+                    "ferrum.io/includeOutboundPorts": "*"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+
+        let capture = capture_config(&config, &pod).expect("duplicate wildcard aliases accepted");
+
+        assert!(
+            capture.include_outbound_ports.is_empty(),
+            "duplicate wildcard aliases should still mean all ports"
         );
     }
 
