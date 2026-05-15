@@ -4800,7 +4800,7 @@ fn sanitized_value_preserves_raw_values(raw_values: &[&str], sanitized_value: &s
 }
 
 fn materialized_raw_header_value(name: &str, raw_values: &[&str]) -> String {
-    if matches!(name, "baggage" | "sec-websocket-protocol") {
+    if crate::plugins::is_comma_folded_list_header(name) {
         raw_values.join(",")
     } else {
         raw_values.last().copied().unwrap_or_default().to_string()

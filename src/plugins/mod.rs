@@ -628,7 +628,7 @@ impl RequestContext {
                     // spec), and hyper normalizes HTTP/1.1 header names to
                     // lowercase at parse time. No `to_lowercase()` needed.
                     let key = name.as_str();
-                    if matches!(key, "baggage" | "sec-websocket-protocol") {
+                    if is_comma_folded_list_header(key) {
                         // These are list headers, so multiple field lines are
                         // equivalent to one comma-separated value. Preserve that
                         // before raw headers are consumed by materialization.
@@ -745,6 +745,10 @@ impl RequestContext {
             .as_ref()
             .and_then(|consumer| consumer.custom_id.as_deref())
     }
+}
+
+pub(crate) fn is_comma_folded_list_header(name: &str) -> bool {
+    matches!(name, "baggage" | "sec-websocket-protocol")
 }
 
 fn dispatch_port_overrides_from_upstream(upstream: &Upstream) -> Option<HashMap<u16, u64>> {
