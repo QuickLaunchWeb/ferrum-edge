@@ -431,6 +431,8 @@ impl PluginHttpClient {
     /// The returned client uses pooled connections - no per-call overhead.
     /// Prefer [`execute`] over calling `.send()` directly so that slow
     /// outbound calls are automatically logged with the destination URL.
+    /// Use [`execute_redacted`] instead when the URL itself contains a secret
+    /// token, such as incoming-webhook URLs.
     pub fn get(&self) -> &reqwest::Client {
         &self.client
     }
@@ -453,7 +455,32 @@ impl PluginHttpClient {
         label: &str,
     ) -> Result<reqwest::Response, reqwest::Error> {
         let request = request.build()?;
-        self.execute_request(request, label, None).await
+        self.execute_request(request, label, None, None).await
+    }
+
+    /// Send a pre-built request while logging only a caller-supplied redacted
+    /// URL and returning a sanitized error string.
+    ///
+    /// This is for webhook-style endpoints whose path/query embeds credentials.
+    /// The underlying request still uses the full URL, but slow-call and retry
+    /// logs use `redacted_url`, and transport errors are reduced to
+    /// `ErrorClass` so `reqwest::Error` cannot print the secret URL.
+    pub async fn execute_redacted(
+        &self,
+        request: reqwest::RequestBuilder,
+        label: &str,
+        redacted_url: &str,
+    ) -> Result<reqwest::Response, String> {
+        let request = request.build().map_err(|e| {
+            let error_class = classify_reqwest_error(&e);
+            format!("{error_class} building request to {redacted_url}")
+        })?;
+        self.execute_request(request, label, None, Some(redacted_url))
+            .await
+            .map_err(|e| {
+                let error_class = classify_reqwest_error(&e);
+                format!("{error_class} calling {redacted_url}")
+            })
     }
 
     /// Send a request and accumulate the elapsed time into a shared counter.
@@ -470,7 +497,7 @@ impl PluginHttpClient {
         accumulator: &AtomicU64,
     ) -> Result<reqwest::Response, reqwest::Error> {
         let request = request.build()?;
-        self.execute_request(request, label, Some(accumulator))
+        self.execute_request(request, label, Some(accumulator), None)
             .await
     }
 
@@ -479,8 +506,10 @@ impl PluginHttpClient {
         request: reqwest::Request,
         label: &str,
         accumulator: Option<&AtomicU64>,
+        log_url_override: Option<&str>,
     ) -> Result<reqwest::Response, reqwest::Error> {
         let url = request.url().to_string();
+        let log_url = log_url_override.unwrap_or(&url).to_string();
         let method = request.method().clone();
         let total_start = std::time::Instant::now();
         let retry_template = request.try_clone();
@@ -511,7 +540,7 @@ impl PluginHttpClient {
                     tracing::warn!(
                         plugin = label,
                         method = %method,
-                        url = %url,
+                        url = %log_url,
                         attempt = attempt + 1,
                         max_retries = self.max_retries,
                         retry_delay_ms = self.retry_delay.as_millis() as u64,
@@ -523,17 +552,17 @@ impl PluginHttpClient {
                 tokio::time::sleep(self.retry_delay).await;
 
                 let Some(template) = retry_template.as_ref() else {
-                    return self.finish_request(result, label, &url, total_start);
+                    return self.finish_request(result, label, &log_url, total_start);
                 };
                 let Some(next_request) = template.try_clone() else {
-                    return self.finish_request(result, label, &url, total_start);
+                    return self.finish_request(result, label, &log_url, total_start);
                 };
                 current_request = next_request;
                 attempt += 1;
                 continue;
             }
 
-            return self.finish_request(result, label, &url, total_start);
+            return self.finish_request(result, label, &log_url, total_start);
         }
     }
 

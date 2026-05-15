@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -24,7 +24,11 @@ use super::{
     port_from_u64, proxy_for_route, request_termination_plugin_for_proxy, resource_id,
     selector_from_istio, string_array, string_field, string_map, upstream_for_route,
 };
-use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT, PluginConfig, Proxy, RetryConfig};
+use crate::config::types::{
+    BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
+    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH, MAX_TARGET_WEIGHT, PluginConfig, Proxy,
+    RetryConfig, validate_backend_tls_san_allow_list_entry, validate_backend_tls_sni,
+};
 
 const URI_LESS_MATCH_LISTEN_PATH: &str = "~.*";
 
@@ -391,7 +395,7 @@ fn peer_authentication(
 /// are deliberately not translated yet — egress scoping is the immediate
 /// compatibility gap; the other surfaces stay in the documented "deferred"
 /// table until separate PRs land them.
-fn sidecar(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
+fn sidecar(_acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
     let workload_selector = match object.spec.get("workloadSelector") {
         Some(selector_value) => {
             let labels = selector_from_istio(Some(selector_value));
@@ -409,7 +413,6 @@ fn sidecar(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, 
 
     let mut egress = Vec::new();
     let mut egress_inherits_defaults = false;
-    let mut port_scopes = BTreeSet::new();
     match object.spec.get("egress") {
         None => {
             // Istio: omitted egress inherits the namespace default outbound
@@ -459,19 +462,9 @@ fn sidecar(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, 
                     )?,
                     None => None,
                 };
-                if let Some(port) = port {
-                    port_scopes.insert(port);
-                }
                 egress.push(MeshSidecarEgress { hosts, port });
             }
         }
-    }
-
-    if !port_scopes.is_empty() {
-        acc.warnings.push(format!(
-            "Sidecar {}/{} uses egress port scoping {:?}, but Ferrum currently narrows Sidecar egress by host only; the port field is parsed and preserved but not enforced",
-            object.metadata.namespace, object.metadata.name, port_scopes
-        ));
     }
 
     Ok(MeshSidecar {
@@ -573,14 +566,17 @@ fn jwt_from_headers(object: &K8sObject, rule: &Value) -> Result<Vec<JwtHeader>, 
                 )
             })?;
             let prefix = match header.get("prefix") {
-                Some(prefix) => Some(prefix.as_str().ok_or_else(|| {
-                    invalid_resource(
-                        object,
-                        format!(
-                            "RequestAuthentication jwtRules[].fromHeaders[{index}].prefix must be a string"
-                        ),
-                    )
-                })?),
+                Some(prefix) => {
+                    let prefix = prefix.as_str().ok_or_else(|| {
+                        invalid_resource(
+                            object,
+                            format!(
+                                "RequestAuthentication jwtRules[].fromHeaders[{index}].prefix must be a string"
+                            ),
+                        )
+                    })?;
+                    (!prefix.is_empty()).then_some(prefix)
+                }
                 None => None,
             };
             Ok(JwtHeader {
@@ -846,6 +842,42 @@ fn translate_client_tls_settings(
     let client_certificate = string_field(value, "clientCertificate").map(ToOwned::to_owned);
     let private_key = string_field(value, "privateKey").map(ToOwned::to_owned);
     let subject_alt_names = string_array(value, "subjectAltNames");
+    if subject_alt_names.len() > MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.tls.subjectAltNames must not have more than {} entries (got {})",
+                MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
+                subject_alt_names.len()
+            ),
+        ));
+    }
+    for (idx, san) in subject_alt_names.iter().enumerate() {
+        if san.len() > MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "trafficPolicy.tls.subjectAltNames[{idx}] must not exceed {} characters (got {})",
+                    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
+                    san.len()
+                ),
+            ));
+        }
+        if let Err(e) = validate_backend_tls_san_allow_list_entry(san) {
+            return Err(invalid_resource(
+                object,
+                format!("trafficPolicy.tls.subjectAltNames[{idx}]: {e}"),
+            ));
+        }
+    }
+    if let Some(ref sni_value) = sni
+        && let Err(e) = validate_backend_tls_sni(sni_value)
+    {
+        return Err(invalid_resource(
+            object,
+            format!("trafficPolicy.tls.sni: {e}"),
+        ));
+    }
     let insecure_skip_verify = value
         .get("insecureSkipVerify")
         .and_then(Value::as_bool)
@@ -3742,7 +3774,8 @@ mod tests {
                         "audiences": ["my-app"],
                         "fromHeaders": [
                             {"name": "Authorization", "prefix": "Bearer "},
-                            {"name": "X-Custom-Token"}
+                            {"name": "X-Custom-Token"},
+                            {"name": "X-Raw-Token", "prefix": ""}
                         ],
                         "fromParams": ["access_token"],
                         "forwardOriginalToken": true
@@ -3769,11 +3802,13 @@ mod tests {
             Some("https://www.googleapis.com/oauth2/v3/certs")
         );
         assert_eq!(rule.audiences, vec!["my-app"]);
-        assert_eq!(rule.from_headers.len(), 2);
+        assert_eq!(rule.from_headers.len(), 3);
         assert_eq!(rule.from_headers[0].name, "Authorization");
         assert_eq!(rule.from_headers[0].prefix.as_deref(), Some("Bearer "));
         assert_eq!(rule.from_headers[1].name, "X-Custom-Token");
         assert!(rule.from_headers[1].prefix.is_none());
+        assert_eq!(rule.from_headers[2].name, "X-Raw-Token");
+        assert!(rule.from_headers[2].prefix.is_none());
         assert_eq!(rule.from_params, vec!["access_token"]);
         assert!(rule.forward_original_token);
     }
@@ -8143,6 +8178,112 @@ mod tests {
     }
 
     #[test]
+    fn translates_destination_rule_tls_rejects_too_many_subject_alt_names() {
+        let too_many_sans: Vec<String> = (0..=MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES)
+            .map(|i| format!("san-{i}.example.com"))
+            .collect();
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "subjectAltNames": too_many_sans
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("too many subjectAltNames must fail");
+
+        assert!(
+            err.to_string()
+                .contains("subjectAltNames must not have more than"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_rejects_overlong_subject_alt_name() {
+        let overlong_san = format!(
+            "{}.example.com",
+            "a".repeat(MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH)
+        );
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "subjectAltNames": [overlong_san]
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("overlong subjectAltNames entry must fail");
+
+        assert!(
+            err.to_string()
+                .contains("subjectAltNames[0] must not exceed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_rejects_invalid_sni() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "sni": "*.mesh.internal"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("wildcard SNI must fail");
+
+        assert!(
+            err.to_string().contains("trafficPolicy.tls.sni"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_rejects_invalid_san_content() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "subjectAltNames": ["spiffe://cluster.local"]
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("SPIFFE URI without path must fail");
+
+        assert!(err.to_string().contains("subjectAltNames[0]"), "got: {err}");
+    }
+
+    #[test]
     fn translates_destination_rule_tls_mutual_rejects_missing_cert_or_key() {
         // MUTUAL requires BOTH clientCertificate AND privateKey.
         let err = translate_k8s_objects(
@@ -9117,19 +9258,19 @@ mod tests {
         .expect("translation succeeds");
 
         // Sidecar must NOT produce the old Phase-D warning. Port scoping is
-        // parsed but not enforced yet, so that unsupported field gets a focused
-        // warning instead.
+        // parsed into the mesh model and enforced later when the Sidecar
+        // enforcement gate is enabled.
         assert!(
             !result.warnings.iter().any(|w| w.contains("Phase D")),
             "Sidecar translation must not emit the deferred warning; warnings = {:?}",
             result.warnings
         );
         assert!(
-            result
+            !result
                 .warnings
                 .iter()
-                .any(|w| { w.contains("egress port scoping") && w.contains("host only") }),
-            "Sidecar egress port should emit a host-only warning; warnings = {:?}",
+                .any(|w| w.contains("egress port scoping")),
+            "Sidecar egress port should not emit a stale unsupported warning; warnings = {:?}",
             result.warnings
         );
 

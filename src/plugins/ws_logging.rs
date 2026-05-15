@@ -68,6 +68,7 @@ struct WsDisconnectLogEntry {
     frames_client_to_backend: u64,
     frames_backend_to_client: u64,
     direction: Option<Direction>,
+    io_side: Option<crate::proxy::tcp_proxy::StreamIoSide>,
     error_class: Option<crate::retry::ErrorClass>,
     #[serde(
         skip_serializing_if = "HashMap::is_empty",
@@ -93,6 +94,7 @@ impl From<&WsDisconnectContext> for WsDisconnectLogEntry {
             frames_client_to_backend: ctx.frames_client_to_backend,
             frames_backend_to_client: ctx.frames_backend_to_client,
             direction: ctx.direction,
+            io_side: ctx.io_side,
             error_class: ctx.error_class,
             metadata: ctx.metadata.clone(),
         }

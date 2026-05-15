@@ -807,7 +807,10 @@ pub enum ResponseBody {
     Buffered(Vec<u8>),
     /// Body is still attached to the backend response and will be streamed
     /// to the client. The status code and headers have already been extracted.
-    Streaming(reqwest::Response),
+    Streaming {
+        response: reqwest::Response,
+        reqwest_backend_guard: Option<crate::runtime_metrics::ReqwestBackendRequestGuard>,
+    },
     /// Body from hyper's HTTP/2 client (used by Http2ConnectionPool for
     /// proper H2 stream multiplexing over persistent connections).
     StreamingH2(hyper::Response<hyper::body::Incoming>),
@@ -844,7 +847,7 @@ impl BackendResponse {
     pub fn body_bytes(&self) -> &[u8] {
         match &self.body {
             ResponseBody::Buffered(b) => b,
-            ResponseBody::Streaming(_)
+            ResponseBody::Streaming { .. }
             | ResponseBody::StreamingH2(_)
             | ResponseBody::StreamingH3(_) => &[],
         }
@@ -856,7 +859,7 @@ impl BackendResponse {
     pub fn into_buffered_body(self) -> Vec<u8> {
         match self.body {
             ResponseBody::Buffered(b) => b,
-            ResponseBody::Streaming(_)
+            ResponseBody::Streaming { .. }
             | ResponseBody::StreamingH2(_)
             | ResponseBody::StreamingH3(_) => {
                 warn!("attempted to extract buffered body from a streaming response");

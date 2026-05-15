@@ -1,9 +1,16 @@
 //! JWT authentication for the Admin API.
 //!
-//! Validates all six required claims (`iss`, `sub`, `exp`, `iat`, `nbf`, `jti`)
-//! and enforces a max-TTL to prevent very long-lived tokens. When
-//! `FERRUM_ADMIN_JWT_SECRET` is not set, a random secret is generated at startup
-//! so externally-crafted tokens are always rejected (safe default).
+//! This module only *validates* admin JWTs — it never mints them. Operators
+//! pre-sign tokens externally with the configured secret. Verification checks
+//! all six required claims (`iss`, `sub`, `exp`, `iat`, `nbf`, `jti`) and
+//! enforces a max-TTL to prevent very long-lived tokens.
+//!
+//! [`create_jwt_manager_from_env`] requires `FERRUM_ADMIN_JWT_SECRET` to be set
+//! and non-empty, with a minimum length of
+//! [`crate::config::types::MIN_JWT_SECRET_LENGTH`]; otherwise it returns
+//! [`JwtError::VerificationFailed`]. The random-secret fallback used by
+//! read-only file mode (so externally-crafted tokens can never validate) is
+//! handled at the call site that constructs the admin state, not here.
 
 use jsonwebtoken::{
     Algorithm, DecodingKey, TokenData, Validation, decode, errors::Error as JwtEncodeError,

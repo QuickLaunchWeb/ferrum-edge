@@ -154,20 +154,17 @@ fn start_gateway_in_file_mode(
     http_port: u16,
     admin_port: u16,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let build_output = std::process::Command::new("cargo")
-        .args(["build", "--bin", "ferrum-edge"])
-        .output()?;
-
-    if !build_output.status.success() {
-        eprintln!("Failed to build gateway binary");
-        eprintln!("stderr: {}", String::from_utf8_lossy(&build_output.stderr));
-        return Err("Build failed".into());
-    }
+    // Build (or verify the prebuilt artifact) via the shared helper so this
+    // file shares the `OnceLock` memoization and `FERRUM_SKIP_GATEWAY_BUILD=1`
+    // contract used by the [`crate::common::TestGateway`] builder.
+    crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
     let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
         "./target/debug/ferrum-edge"
-    } else {
+    } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
         "./target/release/ferrum-edge"
+    } else {
+        return Err("ferrum-edge binary not found in ./target/debug/ or ./target/release/".into());
     };
 
     let child = std::process::Command::new(binary_path)

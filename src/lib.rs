@@ -33,6 +33,7 @@ pub mod lazy_timeout;
 pub mod load_balancer;
 pub mod metrics;
 pub mod modes;
+pub mod notifications;
 pub mod overload;
 pub mod plugin_cache;
 pub mod plugins;
@@ -41,10 +42,13 @@ pub mod proxy;
 pub mod request_epoch;
 pub mod retry;
 pub mod router_cache;
+pub mod runtime_metrics;
+pub mod runtime_metrics_tracing_layer;
 pub mod secrets;
 pub mod service_discovery;
 pub mod socket_opts;
 pub mod startup;
+pub mod system_metrics;
 pub mod tls;
 pub mod tls_offload;
 pub mod util;
@@ -433,7 +437,11 @@ pub mod _test_support {
         ws_disconnect_plugins: &[Arc<dyn Plugin>],
         proxy_id: &str,
         session_meta: &crate::proxy::WsSessionMeta,
-        failure: Option<(crate::plugins::Direction, crate::retry::ErrorClass)>,
+        failure: Option<(
+            crate::plugins::Direction,
+            crate::retry::ErrorClass,
+            Option<StreamIoSide>,
+        )>,
     ) {
         crate::proxy::fire_ws_tunnel_disconnect_hooks(
             ws_disconnect_plugins,

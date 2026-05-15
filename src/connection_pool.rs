@@ -13,7 +13,9 @@ use crate::config::types::Proxy;
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::pool::{GenericPool, PoolManager};
 use crate::tls::TlsPolicy;
-use crate::tls::backend::{BackendTlsConfigBuilder, BackendTlsConfigCache};
+use crate::tls::backend::{
+    BackendTlsConfigBuilder, BackendTlsConfigCache, append_backend_tls_pool_key_fields,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -152,28 +154,20 @@ impl PoolManager for ReqwestPoolManager {
         let _ = write!(buf, "{}|", scheme_disc);
         buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
         buf.push('|');
-        buf.push_str(
-            proxy
-                .resolved_tls
-                .server_ca_cert_path
-                .as_deref()
-                .unwrap_or_default(),
-        );
-        buf.push('|');
-        buf.push_str(
-            proxy
-                .resolved_tls
-                .client_cert_path
-                .as_deref()
-                .or(self
-                    .global_env_config
-                    .backend_tls_client_cert_path
-                    .as_deref())
-                .unwrap_or_default(),
-        );
-        buf.push('|');
         let verify = proxy.resolved_tls.verify_server_cert && !self.global_env_config.tls_no_verify;
-        buf.push(if verify { '1' } else { '0' });
+        append_backend_tls_pool_key_fields(
+            buf,
+            &proxy.resolved_tls,
+            proxy.resolved_tls.client_cert_path.as_deref().or(self
+                .global_env_config
+                .backend_tls_client_cert_path
+                .as_deref()),
+            proxy.resolved_tls.client_key_path.as_deref().or(self
+                .global_env_config
+                .backend_tls_client_key_path
+                .as_deref()),
+            verify,
+        );
     }
 
     async fn create(&self, _key: &str, proxy: &Proxy) -> Result<reqwest::Client> {
@@ -187,6 +181,10 @@ impl PoolManager for ReqwestPoolManager {
 
     fn destroy(&self, conn: Self::Connection) {
         drop(conn);
+    }
+
+    fn runtime_metrics_kind(&self) -> Option<crate::runtime_metrics::PoolKind> {
+        Some(crate::runtime_metrics::PoolKind::HttpReqwest)
     }
 }
 
