@@ -1842,6 +1842,60 @@ mod tests {
     }
 
     #[test]
+    fn delta_explicit_rds_subscription_unsubscribe_removes_route() {
+        let config = gateway_config_with_services(&["api", "admin"], 0);
+        let server = test_server(config.clone());
+        let stream_config = XdsStreamConfig::new(config);
+        let mut subscriptions = HashMap::new();
+        let requested = "route/default/api".to_string();
+
+        let subscribe_request = DeltaDiscoveryRequest {
+            type_url: super::super::translator::RDS_TYPE_URL.to_string(),
+            resource_names_subscribe: vec![requested.clone()],
+            ..DeltaDiscoveryRequest::default()
+        };
+        let (subscribe_snapshot, subscribe_response) = server
+            .delta_response_for_stream_request(
+                "node-a",
+                &stream_config,
+                &mut subscriptions,
+                &subscribe_request,
+                None,
+            )
+            .expect("initial RDS subscribe should produce a response");
+        assert_eq!(
+            delta_route_names(&subscribe_response),
+            vec![requested.clone()]
+        );
+
+        let unsubscribe_request = DeltaDiscoveryRequest {
+            type_url: super::super::translator::RDS_TYPE_URL.to_string(),
+            resource_names_unsubscribe: vec![requested.clone()],
+            ..DeltaDiscoveryRequest::default()
+        };
+        let (_, unsubscribe_response) = server
+            .delta_response_for_stream_request(
+                "node-a",
+                &stream_config,
+                &mut subscriptions,
+                &unsubscribe_request,
+                Some(subscribe_snapshot.as_ref()),
+            )
+            .expect("RDS unsubscribe should produce a response");
+
+        assert!(
+            !delta_route_names(&unsubscribe_response).contains(&requested),
+            "unsubscribed route should not appear in response resources"
+        );
+        assert_eq!(unsubscribe_response.removed_resources, vec![requested]);
+        let subscription = subscriptions
+            .get(super::super::translator::RDS_TYPE_URL)
+            .expect("RDS subscription should still be tracked");
+        assert!(!subscription.wildcard);
+        assert!(subscription.resource_names.is_empty());
+    }
+
+    #[test]
     fn sotw_request_returns_exact_snapshot_for_stream_state() {
         let config = gateway_config_with_named_service("old", 0);
         let server = test_server(config.clone());
