@@ -4721,13 +4721,14 @@ fn collect_forwardable_proxy_headers(headers: &HashMap<String, String>) -> Vec<(
 }
 
 /// Collect backend WebSocket headers while preserving repeated client-provided
-/// values when the sanitized proxy header map still allows that header name.
+/// values when the sanitized proxy header map still represents the full raw set.
 ///
 /// `RequestContext::headers` is a `HashMap`, so repeated fields are necessarily
-/// collapsed after materialization. The raw `HeaderMap` is still available from
-/// the upgrade request; use it to retain handshake-equivalent repeated headers
-/// such as multiple `Sec-WebSocket-Protocol` values, while still honoring
-/// plugin-driven strips and rewrites reflected in `proxy_headers`.
+/// collapsed or comma-folded after materialization. The raw `HeaderMap` is
+/// still available from the upgrade request; use it to retain handshake-
+/// equivalent repeated headers such as multiple `Sec-WebSocket-Protocol`
+/// values, while still honoring plugin-driven strips and rewrites reflected in
+/// `proxy_headers`.
 fn collect_forwardable_websocket_headers(
     raw_headers: &hyper::HeaderMap,
     proxy_headers: &HashMap<String, String>,
@@ -4754,7 +4755,7 @@ fn collect_forwardable_websocket_headers(
             .iter()
             .filter_map(|value| value.to_str().ok())
             .collect();
-        if raw_values.iter().any(|value| *value == sanitized_value) {
+        if sanitized_value_preserves_raw_values(&raw_values, sanitized_value) {
             preserved_raw_names.insert(lower_name);
             for value in raw_values {
                 forwarded.push((name.as_str().to_string(), value.to_string()));
@@ -4779,6 +4780,21 @@ fn collect_forwardable_websocket_headers(
     }
 
     forwarded
+}
+
+fn sanitized_value_preserves_raw_values(raw_values: &[&str], sanitized_value: &str) -> bool {
+    match raw_values {
+        [] => false,
+        [only] => *only == sanitized_value,
+        _ => {
+            let mut sanitized_values = sanitized_value.split(',').map(str::trim);
+            raw_values
+                .iter()
+                .map(|value| value.trim())
+                .all(|raw_value| sanitized_values.next() == Some(raw_value))
+                && sanitized_values.next().is_none()
+        }
+    }
 }
 
 fn proxy_header_entry_case_insensitive<'a>(
@@ -13253,7 +13269,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_forwardable_headers_preserve_repeated_raw_values() {
+    fn websocket_forwardable_headers_preserve_repeated_raw_values_when_sanitized_keeps_full_set() {
         let mut raw = hyper::HeaderMap::new();
         raw.append(
             "sec-websocket-protocol",
@@ -13265,11 +13281,15 @@ mod tests {
         );
         raw.append("x-token", hyper::header::HeaderValue::from_static("secret"));
 
-        let mut sanitized = HashMap::new();
-        sanitized.insert(
-            "sec-websocket-protocol".to_string(),
-            "superchat".to_string(),
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/ws".to_string(),
         );
+        ctx.set_raw_headers(raw.clone());
+        ctx.materialize_headers();
+        let mut sanitized = ctx.headers;
+        sanitized.remove("x-token");
         sanitized.insert("x-added-by-plugin".to_string(), "kept".to_string());
 
         let forwarded = collect_forwardable_websocket_headers(&raw, &sanitized);
@@ -13291,6 +13311,36 @@ mod tests {
         assert!(forwarded.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("x-added-by-plugin") && value == "kept"
         }));
+    }
+
+    #[test]
+    fn websocket_forwardable_headers_do_not_restore_raw_duplicates_after_sanitized_rewrite() {
+        let mut raw = hyper::HeaderMap::new();
+        raw.append(
+            "sec-websocket-protocol",
+            hyper::header::HeaderValue::from_static("chat"),
+        );
+        raw.append(
+            "sec-websocket-protocol",
+            hyper::header::HeaderValue::from_static("superchat"),
+        );
+
+        let mut sanitized = HashMap::new();
+        sanitized.insert(
+            "sec-websocket-protocol".to_string(),
+            "superchat".to_string(),
+        );
+
+        let forwarded = collect_forwardable_websocket_headers(&raw, &sanitized);
+        let protocols: Vec<&str> = forwarded
+            .iter()
+            .filter_map(|(name, value)| {
+                name.eq_ignore_ascii_case("sec-websocket-protocol")
+                    .then_some(value.as_str())
+            })
+            .collect();
+
+        assert_eq!(protocols, vec!["superchat"]);
     }
 
     #[test]

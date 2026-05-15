@@ -628,10 +628,10 @@ impl RequestContext {
                     // spec), and hyper normalizes HTTP/1.1 header names to
                     // lowercase at parse time. No `to_lowercase()` needed.
                     let key = name.as_str();
-                    if key == "baggage" {
-                        // W3C baggage is a list header, so multiple field lines
-                        // are equivalent to one comma-separated value. Preserve
-                        // that before raw headers are consumed by materialization.
+                    if matches!(key, "baggage" | "sec-websocket-protocol") {
+                        // These are list headers, so multiple field lines are
+                        // equivalent to one comma-separated value. Preserve that
+                        // before raw headers are consumed by materialization.
                         self.headers
                             .entry(key.to_owned())
                             .and_modify(|existing| {
