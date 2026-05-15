@@ -485,7 +485,7 @@ fn algorithm_port_override_without_hash_on_clears_upstream_hash_strategy() {
 }
 
 #[test]
-fn non_algorithm_port_override_preserves_upstream_hash_strategy() {
+fn non_algorithm_port_override_does_not_inherit_upstream_hash_strategy() {
     let mut port_overrides = HashMap::new();
     port_overrides.insert(
         8080,
@@ -509,8 +509,23 @@ fn non_algorithm_port_override_preserves_upstream_hash_strategy() {
 
     assert_eq!(
         LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "u1", 8080),
-        HashOnStrategy::Header("x-user-id".to_string()),
-        "non-LB port overrides should preserve upstream sticky hash state"
+        HashOnStrategy::Ip,
+        "non-LB port overrides should not inherit upstream sticky hash state"
+    );
+
+    let port_sequence: Vec<String> = (0..2)
+        .map(|_| {
+            LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "same-key", 8080, None)
+                .expect("port selection")
+                .target
+                .host
+                .clone()
+        })
+        .collect();
+    assert_eq!(
+        port_sequence,
+        vec!["a", "b"],
+        "non-LB port overrides should use their own default round-robin lane"
     );
 }
 
