@@ -162,6 +162,12 @@ pub async fn run(
     );
 
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+    crate::runtime_metrics::global().configure(
+        env_config.status_counts_max_entries,
+        env_config.runtime_metrics_pool_tracking_enabled,
+        env_config.runtime_metrics_status_tracking_enabled,
+        env_config.runtime_metrics_cache_ttl_ms,
+    );
 
     let grpc_secret = match env_config.cp_dp_grpc_jwt_secret.clone() {
         Some(secret) if !secret.is_empty() => secret,
@@ -952,6 +958,16 @@ pub async fn run(
             }
         })
     };
+    let runtime_system_handle = crate::system_metrics::start_sampler(
+        None,
+        env_config.runtime_metrics_system_sample_interval_ms,
+        shutdown_tx.subscribe(),
+    );
+    let runtime_window_handle = crate::runtime_metrics::start_window_rotator(
+        env_config.runtime_metrics_window_1m_seconds,
+        env_config.runtime_metrics_window_5m_seconds,
+        shutdown_tx.subscribe(),
+    );
 
     // Wait for ALL listener handles to exit, or the shutdown signal if no
     // listeners were spawned (e.g., admin_http=0, no admin TLS, gRPC port=0).
@@ -1012,7 +1028,12 @@ pub async fn run(
     // cap as the pre-refactor inline timeout — a stuck DB poll is never
     // allowed to wedge graceful shutdown.
     crate::modes::file::join_background_handles(
-        vec![db_poll_handle, mesh_registry_reaper_handle],
+        vec![
+            db_poll_handle,
+            mesh_registry_reaper_handle,
+            runtime_system_handle,
+            runtime_window_handle,
+        ],
         Duration::from_secs(5),
     )
     .await;

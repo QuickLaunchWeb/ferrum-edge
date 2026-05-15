@@ -4,7 +4,7 @@ info:
   description: |
     RESTful API for managing the Ferrum Edge configuration at runtime.
 
-    All endpoints except `/health`, `/status`, `/metrics`, and `/overload`
+    All endpoints except `/health`, `/status`, exact `/metrics`, and `/overload`
     require JWT bearer token authentication via the
     `Authorization: Bearer <token>` header.
 
@@ -191,6 +191,38 @@ paths:
                 # HELP ferrum_requests_total Total number of requests processed
                 # TYPE ferrum_requests_total counter
                 ferrum_requests_total{proxy_id="my-api",method="GET",status_code="200"} 42
+
+  /metrics/runtime:
+    get:
+      operationId: getRuntimeMetrics
+      summary: Runtime host metrics (JSON)
+      description: |
+        Returns a JWT-authenticated JSON snapshot for "how is this host doing
+        right now?": process CPU and memory, file descriptors, ephemeral-port
+        pressure, HTTP status rates, error classes, DNS cache outcomes, pool
+        churn, TCP resets, log-event counters, and the inline overload state.
+
+        The response is cached briefly (default 1000 ms, configurable with
+        `FERRUM_METRICS_RUNTIME_CACHE_MS`) because system metrics are sampled in
+        the background. Log counters mirror tracing events allowed by
+        `FERRUM_LOG_LEVEL` / `RUST_LOG`; the extra 1m/5m HTTP status windows
+        can be disabled with `FERRUM_METRICS_STATUS_TRACKING_ENABLED=false`.
+      tags: [Metrics]
+      responses:
+        "200":
+          description: Runtime metrics snapshot
+          headers:
+            X-Cache:
+              schema:
+                type: string
+                enum: [hit, miss]
+              description: Whether this response was served from the runtime metrics cache
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuntimeMetricsSnapshot"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   # ── Charges ────────────────────────────────────────────────────────
   /charges:
@@ -3881,6 +3913,179 @@ components:
             reject_new_requests:
               type: boolean
               description: Whether new requests/streams are being rejected with 503
+
+    # ── Runtime metrics ─────────────────────────────────────────────
+    RuntimeMetricsSnapshot:
+      type: object
+      required: [timestamp, uptime_seconds, mode, ferrum_version, system, http, errors, dns, connections, logs, overload]
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        uptime_seconds:
+          type: integer
+          format: uint64
+        mode:
+          type: string
+          enum: [database, file, cp, dp, mesh, injector, migrate]
+        ferrum_version:
+          type: string
+        system:
+          $ref: "#/components/schemas/RuntimeSystemSnapshot"
+        http:
+          $ref: "#/components/schemas/RuntimeHttpSnapshot"
+        errors:
+          $ref: "#/components/schemas/RuntimeErrorsSnapshot"
+        dns:
+          $ref: "#/components/schemas/RuntimeDnsSnapshot"
+        connections:
+          $ref: "#/components/schemas/RuntimeConnectionsSnapshot"
+        logs:
+          $ref: "#/components/schemas/RuntimeLogsSnapshot"
+        overload:
+          $ref: "#/components/schemas/OverloadSnapshot"
+
+    RuntimeSystemSnapshot:
+      type: object
+      required: [sampled_at_unix_ms, platform, cpu, memory, file_descriptors, ephemeral_ports]
+      properties:
+        sampled_at_unix_ms:
+          type: integer
+          format: uint64
+        platform:
+          type: string
+          enum: [linux, macos, windows, other]
+        cpu:
+          type: object
+          properties:
+            process_percent: { type: number, format: float }
+            system_percent: { type: [number, "null"], format: float }
+            cgroup_quota_percent: { type: [number, "null"], format: float }
+            cpu_count: { type: integer }
+        memory:
+          type: object
+          properties:
+            rss_bytes: { type: integer, format: uint64 }
+            virtual_bytes: { type: integer, format: uint64 }
+            host_percent: { type: [number, "null"], format: float }
+            cgroup_percent: { type: [number, "null"], format: float }
+            cgroup_limit_bytes: { type: [integer, "null"], format: uint64 }
+            jemalloc_allocated_bytes: { type: [integer, "null"], format: uint64 }
+            jemalloc_resident_bytes: { type: [integer, "null"], format: uint64 }
+        file_descriptors:
+          type: object
+          properties:
+            current: { type: integer, format: uint64 }
+            max: { type: integer, format: uint64 }
+            ratio: { type: number, format: double }
+        ephemeral_ports:
+          type: object
+          properties:
+            range_low: { type: [integer, "null"] }
+            range_high: { type: [integer, "null"] }
+            range_size: { type: [integer, "null"] }
+            exhaustion_events: { type: integer, format: uint64 }
+            active_outbound_estimate: { type: integer, format: uint64 }
+
+    RuntimeHttpSnapshot:
+      type: object
+      properties:
+        total_requests: { type: integer, format: uint64 }
+        requests_per_second_1s: { type: integer, format: uint64 }
+        requests_per_second_1m: { type: integer, format: uint64 }
+        requests_per_second_5m: { type: integer, format: uint64 }
+        client_disconnects: { type: integer, format: uint64 }
+        status_codes:
+          type: object
+          properties:
+            totals:
+              type: object
+              additionalProperties: { type: integer, format: uint64 }
+            rate_1s:
+              type: object
+              additionalProperties: { type: integer, format: uint64 }
+            rate_1m:
+              type: object
+              additionalProperties: { type: integer, format: uint64 }
+            rate_5m:
+              type: object
+              additionalProperties: { type: integer, format: uint64 }
+            percent_total:
+              type: object
+              additionalProperties: { type: number, format: double }
+            percent_1m:
+              type: object
+              additionalProperties: { type: number, format: double }
+            percent_5m:
+              type: object
+              additionalProperties: { type: number, format: double }
+
+    RuntimeErrorsSnapshot:
+      type: object
+      properties:
+        by_class:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              http: { type: integer, format: uint64 }
+              grpc: { type: integer, format: uint64 }
+              stream: { type: integer, format: uint64 }
+              body: { type: integer, format: uint64 }
+        by_proxy:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties:
+              type: integer
+              format: uint64
+
+    RuntimeDnsSnapshot:
+      type: object
+      properties:
+        lookups_total: { type: integer, format: uint64 }
+        cache_hits: { type: integer, format: uint64 }
+        cache_misses: { type: integer, format: uint64 }
+        stale_serves: { type: integer, format: uint64 }
+        errors: { type: integer, format: uint64 }
+        hit_ratio: { type: number, format: double }
+        error_ratio: { type: number, format: double }
+        cache_entries: { type: integer }
+
+    RuntimeConnectionsSnapshot:
+      type: object
+      properties:
+        active: { type: integer, format: uint64 }
+        active_requests: { type: integer, format: uint64 }
+        pool_handshakes_total: { type: object, additionalProperties: { type: integer, format: uint64 } }
+        pool_evictions_total: { type: object, additionalProperties: { type: integer, format: uint64 } }
+        pool_failures_total: { type: object, additionalProperties: { type: integer, format: uint64 } }
+        tcp_rst_observed:
+          type: object
+          properties:
+            by_proxy:
+              type: object
+              additionalProperties:
+                type: object
+                additionalProperties: { type: integer, format: uint64 }
+            total: { type: integer, format: uint64 }
+
+    RuntimeLogsSnapshot:
+      type: object
+      description: Ferrum project tracing event counters after applying the output log-level filter.
+      properties:
+        by_level:
+          type: object
+          additionalProperties:
+            type: integer
+            format: uint64
+        by_category:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties:
+              type: integer
+              format: uint64
 
     # ── Admin metrics ───────────────────────────────────────────────
     AdminMetrics:

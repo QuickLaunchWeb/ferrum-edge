@@ -2311,6 +2311,12 @@ async fn serve_mesh_runtime(
         Some(tls_policy.clone()),
         Some(shutdown_tx.subscribe()),
     )?;
+    crate::runtime_metrics::global().configure(
+        env_config.status_counts_max_entries,
+        env_config.runtime_metrics_pool_tracking_enabled,
+        env_config.runtime_metrics_status_tracking_enabled,
+        env_config.runtime_metrics_cache_ttl_ms,
+    );
     proxy_state
         .stream_listener_manager
         .set_global_shutdown_rx(shutdown_tx.subscribe());
@@ -2346,6 +2352,16 @@ async fn serve_mesh_runtime(
         proxy_state.status_counts.clone(),
         proxy_state.windowed_metrics.clone(),
         env_config.status_metrics_window_seconds,
+        shutdown_tx.subscribe(),
+    );
+    let runtime_system_handle = crate::system_metrics::start_sampler(
+        Some(proxy_state.clone()),
+        env_config.runtime_metrics_system_sample_interval_ms,
+        shutdown_tx.subscribe(),
+    );
+    let runtime_window_handle = crate::runtime_metrics::start_window_rotator(
+        env_config.runtime_metrics_window_1m_seconds,
+        env_config.runtime_metrics_window_5m_seconds,
         shutdown_tx.subscribe(),
     );
     // Start mesh DNS proxy if enabled
@@ -2500,6 +2516,8 @@ async fn serve_mesh_runtime(
                     dns_handle,
                     overload_handle,
                     metrics_handle,
+                    runtime_system_handle,
+                    runtime_window_handle,
                     mesh_apply_handle,
                 ],
                 dns_retry_handle,
@@ -2523,6 +2541,8 @@ async fn serve_mesh_runtime(
                 dns_handle,
                 overload_handle,
                 metrics_handle,
+                runtime_system_handle,
+                runtime_window_handle,
                 mesh_apply_handle,
             ],
             dns_retry_handle,
