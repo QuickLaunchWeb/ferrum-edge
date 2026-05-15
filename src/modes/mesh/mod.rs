@@ -2019,19 +2019,15 @@ fn merge_tracing_config(
         current.disable_span_reporting = next.disable_span_reporting;
     }
     if !next.custom_tags.is_empty() {
-        current.custom_tags.extend(next.custom_tags.clone());
+        current.custom_tags.clone_from(&next.custom_tags);
     }
     if !next.custom_header_tags.is_empty() {
         current
             .custom_header_tags
-            .extend(next.custom_header_tags.clone());
+            .clone_from(&next.custom_header_tags);
     }
     if !next.providers.is_empty() {
-        for provider in &next.providers {
-            if !current.providers.contains(provider) {
-                current.providers.push(provider.clone());
-            }
-        }
+        current.providers.clone_from(&next.providers);
     }
 }
 
@@ -4390,7 +4386,7 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_tracing_merge_adds_tags_and_providers_across_scopes() {
+    fn telemetry_tracing_merge_replaces_tags_and_providers_across_scopes() {
         let mesh_slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
@@ -4462,32 +4458,19 @@ mod tests {
             tracing.custom_tags.get("env").map(String::as_str),
             Some("prod")
         );
-        assert_eq!(
-            tracing.custom_tags.get("mesh").map(String::as_str),
-            Some("ferrum")
-        );
+        assert!(!tracing.custom_tags.contains_key("mesh"));
         assert_eq!(
             tracing.custom_tags.get("region").map(String::as_str),
             Some("us-east")
         );
-        assert_eq!(
-            tracing
-                .custom_header_tags
-                .get("mesh-tenant")
-                .map(String::as_str),
-            Some("x-mesh-tenant")
-        );
+        assert!(!tracing.custom_header_tags.contains_key("mesh-tenant"));
         assert_eq!(
             tracing.custom_header_tags.get("tenant").map(String::as_str),
             Some("x-tenant")
         );
-        assert_eq!(tracing.providers.len(), 2);
+        assert_eq!(tracing.providers.len(), 1);
         assert!(matches!(
             tracing.providers.first(),
-            Some(TracingProvider::Zipkin { .. })
-        ));
-        assert!(matches!(
-            tracing.providers.get(1),
             Some(TracingProvider::OpenTelemetry { .. })
         ));
     }
