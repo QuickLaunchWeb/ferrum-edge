@@ -169,6 +169,22 @@ impl RecoveryGate {
     /// Used by the dispatch path so Trigger/Resolve transitions can be
     /// committed only after at least one notification channel accepts the
     /// event. Non-notifying outcomes still use [`Self::observe`] directly.
+    ///
+    /// # Concurrency: deliberate TOCTOU + commit-or-drop
+    ///
+    /// `evaluate()` reads state without a lock and `observe()` commits the
+    /// transition later, after dispatch permits + cooldowns are reserved. The
+    /// dispatch loop in `mod.rs` gates the commit on the freshly-observed
+    /// outcome still matching the originally-evaluated `event_action`; if the
+    /// state shifted between evaluate and observe (high-frequency
+    /// breach/recover oscillation, or a sibling worker racing the same
+    /// rule/proxy), the dispatch is dropped rather than fired against stale
+    /// reasoning.
+    ///
+    /// This is by design: under concurrent oscillation a missed alert is
+    /// preferable to a phantom alert. Adding a lock to make evaluate+commit
+    /// atomic would serialise every observation through a single critical
+    /// section per `(rule, proxy)` and defeat the lock-free hot path.
     pub fn evaluate(
         &self,
         rule_id: u32,

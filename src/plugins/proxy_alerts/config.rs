@@ -33,6 +33,13 @@ const MAX_RESOLVED_WINDOW_SECONDS: u32 = 86_400;
 #[derive(Debug)]
 pub struct ProxyAlertsConfig {
     pub enabled: bool,
+    /// Bounded-concurrency semaphore size for outbound notification
+    /// dispatches. Default `8` is intentionally conservative: alert storms
+    /// during a partial channel outage should be VISIBLE (drops trigger
+    /// `warn!` log lines) rather than silently BUFFERED behind a slow
+    /// channel. Operators with wide fanout (e.g. Slack + Teams + PagerDuty +
+    /// Discord all firing simultaneously) should bump this to 16-32; see
+    /// `docs/proxy_alerts.md` for tuning guidance.
     pub max_concurrent_dispatches: usize,
     pub quiet_hours: Vec<QuietHourWindow>,
     /// Channels indexed by name; kept around for admin debug surfaces and
