@@ -541,7 +541,6 @@ pub(crate) fn service_key_from_host(
     let parts: Vec<&str> = host.split('.').collect();
     match parts.as_slice() {
         [name] => K8sServiceKey::new(default_namespace.to_string(), (*name).to_string()),
-        [name, namespace] => K8sServiceKey::new((*namespace).to_string(), (*name).to_string()),
         [name, namespace, "svc"] => {
             K8sServiceKey::new((*namespace).to_string(), (*name).to_string())
         }
@@ -1425,5 +1424,46 @@ mod tests {
         assert_eq!(port_from_u64(&object, 65_535, "port").unwrap(), 65_535);
         assert!(port_from_u64(&object, 65_536, "port").is_err());
         assert!(port_from_u64(&object, u64::MAX, "port").is_err());
+    }
+
+    #[test]
+    fn service_key_from_host_accepts_unambiguous_kubernetes_service_forms() {
+        assert_eq!(
+            service_key_from_host("reviews", "default", "cluster.local"),
+            Some(K8sServiceKey {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            })
+        );
+        assert_eq!(
+            service_key_from_host("reviews.default.svc", "ignored", "cluster.local"),
+            Some(K8sServiceKey {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            })
+        );
+        assert_eq!(
+            service_key_from_host(
+                "reviews.default.svc.cluster.local.",
+                "ignored",
+                "cluster.local"
+            ),
+            Some(K8sServiceKey {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn service_key_from_host_rejects_ambiguous_two_label_hosts() {
+        assert_eq!(
+            service_key_from_host("example.com", "default", "cluster.local"),
+            None
+        );
+        assert_eq!(
+            service_key_from_host("reviews.default", "ignored", "cluster.local"),
+            None
+        );
     }
 }
