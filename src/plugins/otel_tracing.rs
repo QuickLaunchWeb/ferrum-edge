@@ -1436,9 +1436,14 @@ pub(crate) fn ensure_trace_metadata(
 }
 
 pub(crate) fn trace_is_sampled(metadata: &HashMap<String, String>) -> bool {
-    !metadata
-        .get("trace_sampled")
-        .is_some_and(|value| value.eq_ignore_ascii_case("false"))
+    if let Some(value) = metadata.get("trace_sampled") {
+        return value.eq_ignore_ascii_case("true");
+    }
+    metadata
+        .get(TRACEPARENT_HEADER)
+        .and_then(|value| OtelTracing::parse_traceparent(value))
+        .and_then(|parsed| u8::from_str_radix(parsed.flags, 16).ok())
+        .is_some_and(|flags| flags & 0x01 == 0x01)
 }
 
 fn header_value_case_insensitive<'a>(

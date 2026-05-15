@@ -67,6 +67,17 @@ fn make_trace_metadata() -> HashMap<String, String> {
             "abcdef1234567890abcdef1234567890".to_string(),
         ),
         ("span_id".to_string(), "1234567890abcdef".to_string()),
+        ("trace_sampled".to_string(), "true".to_string()),
+    ])
+}
+
+fn make_trace_metadata_without_sampling() -> HashMap<String, String> {
+    HashMap::from([
+        (
+            "trace_id".to_string(),
+            "abcdef1234567890abcdef1234567890".to_string(),
+        ),
+        ("span_id".to_string(), "1234567890abcdef".to_string()),
     ])
 }
 
@@ -586,6 +597,35 @@ async fn test_workload_metrics_multi_provider_fanout() {
         otlp_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
         "GET /api/test"
     );
+}
+
+#[tokio::test]
+async fn test_workload_metrics_provider_without_sampling_does_not_export() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "tracing_providers": [{
+            "kind": "opentelemetry",
+            "config": {
+                "endpoint": format!("{}/v1/traces", mock_server.uri())
+            }
+        }]
+    }))
+    .expect("workload metrics with otlp provider");
+
+    plugin
+        .log(&make_summary(make_trace_metadata_without_sampling()))
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(mock_server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

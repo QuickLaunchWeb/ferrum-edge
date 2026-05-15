@@ -41,7 +41,7 @@ pub struct WorkloadMetrics {
     labels: HashMap<String, String>,
     trust_domain_aliases: Vec<TrustDomain>,
     /// Tracing sampling percentage 0.0–100.0 (from Telemetry CRD).
-    sampling_percentage: f64,
+    sampling_percentage: Option<f64>,
     /// Custom tags injected into every transaction's metadata.
     custom_tags: HashMap<String, String>,
     /// Custom tags populated from request headers.
@@ -95,10 +95,7 @@ impl WorkloadMetrics {
             .unwrap_or_default();
         let trust_domain_aliases =
             parse_trust_domain_aliases(config).map_err(|e| format!("workload_metrics: {e}"))?;
-        let sampling_percentage = config
-            .get("sampling_percentage")
-            .and_then(Value::as_f64)
-            .unwrap_or(100.0);
+        let sampling_percentage = config.get("sampling_percentage").and_then(Value::as_f64);
         let custom_tags = config
             .get("custom_tags")
             .and_then(Value::as_object)
@@ -177,7 +174,9 @@ impl WorkloadMetrics {
     }
 
     fn trace_context_enabled(&self) -> bool {
-        !self.tracing_providers.is_empty()
+        self.span_reporting_disabled
+            || self.sampling_percentage.is_some()
+            || !self.tracing_providers.is_empty()
     }
 
     fn annotate_http_context(&self, ctx: &mut RequestContext, headers: &HashMap<String, String>) {
@@ -302,8 +301,8 @@ impl WorkloadMetrics {
         metadata: &mut HashMap<String, String>,
         headers: &HashMap<String, String>,
     ) {
-        if self.sampling_percentage < 100.0 {
-            let sampled = trace_sampled(self.sampling_percentage);
+        if let Some(sampling_percentage) = self.sampling_percentage {
+            let sampled = trace_sampled(sampling_percentage);
             metadata.insert(
                 "trace_sampled".to_string(),
                 if sampled { "true" } else { "false" }.to_string(),
@@ -442,6 +441,10 @@ impl Plugin for WorkloadMetrics {
             response_headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
         }
         PluginResult::Continue
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        self.trace_context_enabled()
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
@@ -1048,6 +1051,7 @@ mod tests {
     async fn disable_span_reporting_keeps_provider_config_but_builds_no_exporters() {
         let metrics = WorkloadMetrics::new(&json!({
             "span_reporting_disabled": true,
+            "sampling_percentage": 100.0,
             "tracing_providers": [{
                 "kind": "zipkin",
                 "config": {
@@ -1074,6 +1078,36 @@ mod tests {
         assert!(ctx.metadata.contains_key("trace_id"));
         assert!(ctx.metadata.contains_key("span_id"));
         assert!(ctx.metadata.contains_key(TRACEPARENT_HEADER));
+        assert!(headers.contains_key(TRACEPARENT_HEADER));
+    }
+
+    #[tokio::test]
+    async fn disable_span_reporting_without_providers_propagates_incoming_trace_context() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "span_reporting_disabled": true
+        }))
+        .expect("disabled tracing without providers accepted");
+        assert!(metrics.span_reporting_disabled());
+        assert!(metrics.tracing_providers().is_empty());
+        assert!(metrics.modifies_request_headers());
+
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let parent_span_id = "00f067aa0ba902b7";
+        let incoming_traceparent = format!("00-{trace_id}-{parent_span_id}-01");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        let mut headers = HashMap::from([(TRACEPARENT_HEADER.to_string(), incoming_traceparent)]);
+
+        let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            ctx.metadata.get("trace_id").map(String::as_str),
+            Some(trace_id)
+        );
         assert!(headers.contains_key(TRACEPARENT_HEADER));
     }
 }
