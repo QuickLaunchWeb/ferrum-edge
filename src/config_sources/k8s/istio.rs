@@ -2088,12 +2088,18 @@ fn telemetry(
                                     .get("literal")
                                     .and_then(|l| l.get("value"))
                                     .and_then(Value::as_str)
+                                    .map(str::to_string)
                                     .or_else(|| {
-                                        val.get("environment")
-                                            .and_then(|e| e.get("name"))
-                                            .and_then(Value::as_str)
+                                        let env_tag = val.get("environment")?;
+                                        let name = env_tag.get("name").and_then(Value::as_str)?;
+                                        std::env::var(name).ok().or_else(|| {
+                                            env_tag
+                                                .get("defaultValue")
+                                                .and_then(Value::as_str)
+                                                .map(str::to_string)
+                                        })
                                     });
-                                value.map(|v| (key.clone(), v.to_string()))
+                                value.map(|v| (key.clone(), v))
                             })
                             .collect()
                     })
@@ -4039,6 +4045,41 @@ mod tests {
             Some("us-east")
         );
         assert!(!tracing.custom_tags.contains_key("tenant"));
+    }
+
+    #[test]
+    fn telemetry_environment_custom_tag_uses_default_when_env_missing() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "customTags": {
+                            "region": {
+                                "environment": {
+                                    "name": "FERRUM_TEST_TELEMETRY_REGION_UNSET",
+                                    "defaultValue": "us-east-1"
+                                }
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+
+        assert_eq!(
+            tracing.custom_tags.get("region").map(String::as_str),
+            Some("us-east-1")
+        );
     }
 
     #[test]

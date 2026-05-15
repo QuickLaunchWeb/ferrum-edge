@@ -356,8 +356,8 @@ impl WorkloadMetrics {
         if metadata_has_sampling_decision(metadata) {
             return false;
         }
-        // No upstream decision was present. Use local sampling so direct stream
-        // summaries can still produce spans even though they never saw headers.
+        // Defensive fallback for metadata producers that bypassed
+        // apply_telemetry_metadata() but still carry local sampling config.
         self.sampling_percentage.is_some_and(trace_sampled)
     }
 

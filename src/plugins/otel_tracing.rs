@@ -1453,6 +1453,10 @@ pub(crate) fn ensure_trace_metadata(
     metadata.insert(TRACEPARENT_HEADER.to_string(), generated.traceparent);
 }
 
+/// Return true only when metadata carries an affirmative sampling decision.
+///
+/// Missing `trace_sampled` and traceparent flags are treated as not sampled;
+/// callers that want fallback local sampling should apply it explicitly.
 pub(crate) fn trace_is_sampled(metadata: &HashMap<String, String>) -> bool {
     if let Some(value) = metadata.get("trace_sampled") {
         return value.eq_ignore_ascii_case("true");
