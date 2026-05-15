@@ -786,18 +786,20 @@ fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
         .or(namespace_default)
         .or(root_namespace_default)?;
     if selected.egress_inherits_defaults {
-        if let Some(namespace_default) = namespace_default
-            && !std::ptr::eq(selected, namespace_default)
-            && !namespace_default.egress_inherits_defaults
-        {
-            return Some(ResolvedSidecarEgress {
-                namespace: sidecar_host_match_namespace(
-                    namespace_default,
-                    workload_namespace,
-                    root_namespace,
-                ),
-                egress: &namespace_default.egress,
-            });
+        if let Some(namespace_default) = namespace_default {
+            if !std::ptr::eq(selected, namespace_default)
+                && !namespace_default.egress_inherits_defaults
+            {
+                return Some(ResolvedSidecarEgress {
+                    namespace: sidecar_host_match_namespace(
+                        namespace_default,
+                        workload_namespace,
+                        root_namespace,
+                    ),
+                    egress: &namespace_default.egress,
+                });
+            }
+            return None;
         }
         if let Some(root_namespace_default) = root_namespace_default
             && !std::ptr::eq(selected, root_namespace_default)
@@ -3976,6 +3978,45 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
         assert_eq!(slice.service_entries.len(), 1);
         assert_eq!(slice.service_entries[0].name, "payments-gamma");
+    }
+
+    #[test]
+    fn sidecar_namespace_default_with_omitted_egress_blocks_root_default_fallback() {
+        let mesh = MeshConfig {
+            sidecars: vec![
+                make_sidecar("mesh-default", "istio-system", None, vec![vec!["beta/*"]]),
+                MeshSidecar {
+                    name: "namespace-default".into(),
+                    namespace: "alpha".into(),
+                    workload_selector: None,
+                    egress_inherits_defaults: true,
+                    egress: Vec::new(),
+                },
+            ],
+            service_entries: vec![
+                make_se_with_host(
+                    "reviews-alpha",
+                    "alpha",
+                    "reviews.alpha.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+                make_se_with_host(
+                    "reviews-beta",
+                    "beta",
+                    "reviews.beta.svc.cluster.local",
+                    vec!["*".into()],
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        let names: BTreeSet<&str> = slice
+            .service_entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, BTreeSet::from(["reviews-alpha", "reviews-beta"]));
     }
 
     #[test]
