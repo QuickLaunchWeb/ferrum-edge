@@ -5,7 +5,7 @@ use serde_json::json;
 use super::jwks_auth_support::{
     build_rsa_jwks_from_pem, create_rs256_token, default_client, make_ctx,
 };
-use super::plugin_utils::assert_continue;
+use super::plugin_utils::{assert_continue, assert_reject};
 
 #[tokio::test]
 async fn inline_jwks_verifies_token_without_network() {
@@ -64,4 +64,33 @@ fn inline_jwks_rejects_malformed_json() {
             .unwrap()
             .contains("inline JWKS parse failed")
     );
+}
+
+#[tokio::test]
+async fn inline_jwks_with_no_keys_rejects_tokens() {
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "issuer": "https://issuer.example.com",
+                "jwks": {"keys": []}
+            }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let token = create_rs256_token(
+        &json!({
+            "iss": "https://issuer.example.com",
+            "sub": "no-key-user"
+        }),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+    );
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_reject(result, Some(401));
 }

@@ -55,6 +55,8 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, upgrade::OnUpgrade};
 use hyper_util::rt::TokioIo;
+use percent_encoding::percent_decode_str;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -4130,6 +4132,7 @@ async fn handle_websocket_request_authenticated(
     is_tls: bool,
     cb_is_half_open_probe: bool,
     requires_ws_frame_hooks: bool,
+    query_string: String,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -4138,7 +4141,6 @@ async fn handle_websocket_request_authenticated(
     );
 
     // Build backend URL using upstream target if available
-    let query_string = req.uri().query().unwrap_or("").to_string();
     let (effective_host, effective_port) = if let Some(ref target) = upstream_target {
         (target.host.as_str(), target.port)
     } else {
@@ -7515,6 +7517,7 @@ async fn handle_proxy_request_inner(
     );
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+    let effective_query_string = query_string_after_plugin_strips(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
     // Istio VirtualService header/method match). When no overrides are set,
@@ -7632,6 +7635,7 @@ async fn handle_proxy_request_inner(
             is_tls,
             cb_is_half_open_probe,
             requires_ws_frame_hooks,
+            effective_query_string.to_string(),
         )
         .await;
     }
@@ -7655,7 +7659,7 @@ async fn handle_proxy_request_inner(
         let mut grpc_backend_url = build_backend_url_with_target(
             grpc_dispatch_proxy,
             &path,
-            &query_string,
+            effective_query_string.as_ref(),
             grpc_effective_host,
             grpc_effective_port,
             strip_len,
@@ -7954,7 +7958,7 @@ async fn handle_proxy_request_inner(
                     grpc_backend_url = build_backend_url_with_target(
                         &proxy,
                         &path,
-                        &query_string,
+                        effective_query_string.as_ref(),
                         &next.host,
                         next.port,
                         strip_len,
@@ -8614,7 +8618,7 @@ async fn handle_proxy_request_inner(
     let backend_url = build_backend_url_with_target(
         &proxy,
         &path,
-        &query_string,
+        effective_query_string.as_ref(),
         effective_host,
         effective_port,
         strip_len,
@@ -8784,7 +8788,7 @@ async fn handle_proxy_request_inner(
                 current_url = build_backend_url_with_target(
                     &proxy,
                     &path,
-                    &query_string,
+                    effective_query_string.as_ref(),
                     &next.host,
                     next.port,
                     strip_len,
@@ -10848,6 +10852,50 @@ pub(crate) fn build_sticky_cookie_header(
 
 pub(crate) fn strip_query_params(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
+}
+
+pub(crate) fn query_string_after_plugin_strips<'a>(
+    ctx: &RequestContext,
+    query_string: &'a str,
+) -> Cow<'a, str> {
+    if query_string.is_empty() {
+        return Cow::Borrowed(query_string);
+    }
+
+    let strip_names: HashSet<&str> = ctx
+        .metadata
+        .keys()
+        .filter_map(|key| {
+            key.strip_prefix(crate::plugins::jwks_auth::STRIP_QUERY_PARAM_METADATA_PREFIX)
+        })
+        .collect();
+    if strip_names.is_empty() {
+        return Cow::Borrowed(query_string);
+    }
+
+    let mut stripped = String::with_capacity(query_string.len());
+    let mut removed_any = false;
+    for pair in query_string.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
+        let decoded_name = percent_decode_str(raw_name).decode_utf8_lossy();
+        if strip_names.contains(raw_name) || strip_names.contains(decoded_name.as_ref()) {
+            removed_any = true;
+            continue;
+        }
+        if !stripped.is_empty() {
+            stripped.push('&');
+        }
+        stripped.push_str(pair);
+    }
+
+    if removed_any {
+        Cow::Owned(stripped)
+    } else {
+        Cow::Borrowed(query_string)
+    }
 }
 
 pub(crate) fn record_status(state: &ProxyState, status: u16) {
@@ -13094,6 +13142,35 @@ mod tests {
         );
 
         assert_eq!(url, "ws://backend.local:8080/?token=1");
+    }
+
+    #[test]
+    fn query_string_after_plugin_strips_removes_marked_token_params() {
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        ctx.metadata.insert(
+            format!(
+                "{}{}",
+                crate::plugins::jwks_auth::STRIP_QUERY_PARAM_METADATA_PREFIX,
+                "access_token"
+            ),
+            "true".to_string(),
+        );
+        ctx.metadata.insert(
+            format!(
+                "{}{}",
+                crate::plugins::jwks_auth::STRIP_QUERY_PARAM_METADATA_PREFIX,
+                "encoded token"
+            ),
+            "true".to_string(),
+        );
+
+        let stripped = query_string_after_plugin_strips(
+            &ctx,
+            "a=1&access_token=secret&encoded%20token=secret2&keep=2",
+        );
+
+        assert_eq!(stripped.as_ref(), "a=1&keep=2");
     }
 
     fn route_delta_proxy(

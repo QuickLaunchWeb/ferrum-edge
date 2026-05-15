@@ -5076,12 +5076,47 @@ components:
               discovery_url:
                 type: string
                 description: OIDC discovery URL (auto-discovers jwks_uri)
+              jwks:
+                oneOf:
+                  - type: string
+                  - type: object
+                description: Inline JWKS JSON string or object
               issuer:
                 type: string
                 description: Expected JWT iss claim — routes tokens to this provider
               audience:
                 type: string
                 description: Expected JWT aud claim
+              audiences:
+                type: array
+                items:
+                  type: string
+                description: Accepted JWT aud claims; OR matched
+              from_headers:
+                type: array
+                items:
+                  type: object
+                  required: [name]
+                  properties:
+                    name:
+                      type: string
+                      description: Header name to read the token from
+                    prefix:
+                      type: string
+                      description: Optional token prefix to strip; empty string is treated as no prefix
+                description: Custom header token locations
+              from_params:
+                type: array
+                items:
+                  type: string
+                description: Custom query parameter token locations
+              forward_original_token:
+                type: boolean
+                default: true
+                description: Whether to forward the token-bearing header or query parameter upstream
+              require_exp:
+                type: boolean
+                description: Per-provider override for requiring an exp claim
               required_scopes:
                 type: array
                 items:
@@ -5120,6 +5155,10 @@ components:
         consumer_header_claim:
           type: string
           description: JWT claim for X-Consumer-Username header (default same as consumer_identity_claim)
+        require_exp:
+          type: boolean
+          default: true
+          description: Global default for requiring an exp claim
         jwks_refresh_interval_secs:
           type: integer
           format: uint64

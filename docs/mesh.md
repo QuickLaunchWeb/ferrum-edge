@@ -375,7 +375,7 @@ Each `MeshJwtRule` specifies:
 | `from_params` | Query parameters to extract the JWT from |
 | `forward_original_token` | Whether to forward the original token to the backend |
 
-When no custom `from_headers` or `from_params` locations are configured, the injected `jwks_auth` plugin uses the standard `Authorization: Bearer ...` lookup. Custom locations are checked in declaration order and suppress that default fallback.
+Each JWT rule resolves token locations independently. Rules with custom `from_headers` or `from_params` check those locations in declaration order; rules without custom locations continue to use the standard `Authorization: Bearer ...` lookup. When `forward_original_token: false`, the backend-bound request strips the matched rule's configured token headers or query parameters (or `Authorization` for standard lookup).
 
 ## PeerAuthentication
 

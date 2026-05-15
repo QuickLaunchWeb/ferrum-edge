@@ -21,6 +21,9 @@ use super::{PluginResult, RequestContext};
 
 /// Default JWKS refresh interval: 15 minutes.
 const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
+const STRIP_AUTHORIZATION_METADATA_KEY: &str = "jwks_auth.strip_authorization";
+const STRIP_HEADER_METADATA_PREFIX: &str = "jwks_auth.strip_header.";
+pub(crate) const STRIP_QUERY_PARAM_METADATA_PREFIX: &str = "jwks_auth.strip_query_param.";
 
 /// JWKS authentication plugin.
 ///
@@ -40,6 +43,9 @@ const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
 ///   context for downstream use (logging, rate limiting, consumer header).
 /// - **Shared JWKS cache**: Stores keyed by resolved `jwks_uri` are shared
 ///   across plugin instances — no duplicate fetches or refresh tasks.
+/// - **Small provider sets**: Token extraction is intentionally linear over
+///   configured providers and their token locations. Mesh and direct gateway
+///   configurations are expected to keep JWT provider/location cardinality low.
 ///
 /// ## Configuration
 ///
@@ -77,7 +83,6 @@ pub struct JwksAuth {
     /// Defaults to `consumer_identity_claim` if not set separately.
     consumer_header_claim: String,
     strip_authorization_on_success: bool,
-    has_custom_token_locations: bool,
     has_custom_query_token_locations: bool,
 }
 
@@ -101,7 +106,7 @@ struct JwksProvider {
     consumer_identity_claim: Option<String>,
     /// Per-provider override for the consumer header claim.
     consumer_header_claim: Option<String>,
-    /// Whether to forward the original Authorization header upstream.
+    /// Whether to forward the original token-bearing header or query param upstream.
     forward_original_token: bool,
     /// Whether this provider requires tokens to include an `exp` claim.
     require_exp: bool,
@@ -301,9 +306,6 @@ impl JwksAuth {
         let strip_authorization_on_success = providers
             .iter()
             .any(|provider| !provider.forward_original_token);
-        let has_custom_token_locations = providers
-            .iter()
-            .any(|provider| !provider.token_locations.is_empty());
         let has_custom_query_token_locations = providers.iter().any(|provider| {
             provider
                 .token_locations
@@ -318,7 +320,6 @@ impl JwksAuth {
             consumer_identity_claim,
             consumer_header_claim,
             strip_authorization_on_success,
-            has_custom_token_locations,
             has_custom_query_token_locations,
         })
     }
@@ -390,17 +391,28 @@ impl JwksAuth {
         VerifyOutcome::success(consumer, identity, header_value)
     }
 
-    /// Try to validate a token against all configured providers.
+    /// Try to validate a token against the allowed configured providers.
     ///
     /// Returns `Ok((claims, provider_index))` on first successful validation,
     /// or `Err(status_code, body)` if no provider validates the token.
-    async fn validate_token(&self, token: &str) -> Result<(Value, usize), (u16, &'static str)> {
+    async fn validate_token_for_providers(
+        &self,
+        token: &str,
+        provider_indices: &[usize],
+    ) -> Result<(Value, usize), (u16, &'static str)> {
+        if provider_indices.is_empty() {
+            return Err((401, r#"{"error":"Invalid or unrecognized JWT"}"#));
+        }
+
         // Peek at the unverified issuer to try matching a specific provider first
         let unverified_issuer = peek_issuer(token);
 
         // If we have an issuer, try matching providers with that issuer first
         if let Some(ref iss) = unverified_issuer {
-            for (idx, prov) in self.providers.iter().enumerate() {
+            for &idx in provider_indices {
+                let Some(prov) = self.providers.get(idx) else {
+                    continue;
+                };
                 if prov.issuer.as_deref() == Some(iss.as_str())
                     && let Some(claims) = try_validate_with_provider(prov, token).await
                 {
@@ -410,13 +422,23 @@ impl JwksAuth {
         }
 
         // Fall through: try all providers (handles no-issuer tokens or issuer mismatch)
-        for (idx, prov) in self.providers.iter().enumerate() {
+        for &idx in provider_indices {
+            let Some(prov) = self.providers.get(idx) else {
+                continue;
+            };
             if let Some(claims) = try_validate_with_provider(prov, token).await {
                 return Ok((claims, idx));
             }
         }
 
         Err((401, r#"{"error":"Invalid or unrecognized JWT"}"#))
+    }
+
+    /// Try to validate a token against all configured providers.
+    async fn validate_token(&self, token: &str) -> Result<(Value, usize), (u16, &'static str)> {
+        let provider_indices: Vec<usize> = (0..self.providers.len()).collect();
+        self.validate_token_for_providers(token, &provider_indices)
+            .await
     }
 
     /// Check required_scopes and required_roles for a matched provider.
@@ -472,16 +494,22 @@ impl JwksAuth {
         ctx: &mut RequestContext,
         consumer_index: &ConsumerIndex,
     ) -> PluginResult {
-        let credential = self.extract(ctx);
+        let credential = self.extract_jwks_credential(ctx);
 
         match credential {
-            ExtractedCredential::Missing => {
+            JwksExtractedCredential::Missing => {
                 debug!("jwks_auth: no credential present");
                 PluginResult::Continue
             }
-            ExtractedCredential::InvalidFormat(body) => reject(401, body),
-            ExtractedCredential::BearerToken(token) => {
-                let (claims, provider_idx) = match self.validate_token(&token).await {
+            JwksExtractedCredential::InvalidFormat(body) => reject(401, body),
+            JwksExtractedCredential::BearerToken {
+                token,
+                provider_indices,
+            } => {
+                let (claims, provider_idx) = match self
+                    .validate_token_for_providers(&token, &provider_indices)
+                    .await
+                {
                     Ok(result) => result,
                     Err((status, body)) => return reject(status, body.to_string()),
                 };
@@ -524,10 +552,7 @@ impl JwksAuth {
                         set_request_principal_metadata(&claims, ctx);
 
                         if !provider.forward_original_token {
-                            ctx.metadata.insert(
-                                "jwks_auth.strip_authorization".to_string(),
-                                "true".to_string(),
-                            );
+                            mark_original_token_stripping_metadata(ctx, provider);
                         }
                         PluginResult::Continue
                     }
@@ -540,7 +565,64 @@ impl JwksAuth {
                     VerifyOutcome::Internal(body) => reject(500, body),
                 }
             }
-            _ => PluginResult::Continue,
+        }
+    }
+
+    fn extract_jwks_credential(&self, ctx: &RequestContext) -> JwksExtractedCredential {
+        for (idx, provider) in self.providers.iter().enumerate() {
+            if provider.token_locations.is_empty() {
+                continue;
+            }
+
+            for location in &provider.token_locations {
+                match extract_from_location(location, ctx) {
+                    TokenLocationExtract::Missing => {}
+                    TokenLocationExtract::Credential(ExtractedCredential::InvalidFormat(body)) => {
+                        return JwksExtractedCredential::InvalidFormat(body);
+                    }
+                    TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token)) => {
+                        let mut provider_indices = Vec::with_capacity(1);
+                        provider_indices.push(idx);
+                        for (other_idx, other_provider) in self.providers.iter().enumerate() {
+                            if other_idx != idx
+                                && !other_provider.token_locations.is_empty()
+                                && provider_locations_extract_token(other_provider, ctx, &token)
+                            {
+                                provider_indices.push(other_idx);
+                            }
+                        }
+                        provider_indices.sort_unstable();
+                        provider_indices.dedup();
+                        return JwksExtractedCredential::BearerToken {
+                            token,
+                            provider_indices,
+                        };
+                    }
+                    TokenLocationExtract::Credential(_) => {}
+                }
+            }
+        }
+
+        let provider_indices: Vec<usize> = self
+            .providers
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, provider)| provider.token_locations.is_empty().then_some(idx))
+            .collect();
+        if provider_indices.is_empty() {
+            return JwksExtractedCredential::Missing;
+        }
+
+        match extract_authorization_bearer(ctx) {
+            ExtractedCredential::Missing => JwksExtractedCredential::Missing,
+            ExtractedCredential::InvalidFormat(body) => {
+                JwksExtractedCredential::InvalidFormat(body)
+            }
+            ExtractedCredential::BearerToken(token) => JwksExtractedCredential::BearerToken {
+                token,
+                provider_indices,
+            },
+            _ => JwksExtractedCredential::Missing,
         }
     }
 }
@@ -552,19 +634,15 @@ impl AuthMechanism for JwksAuth {
     }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
-        if self.has_custom_token_locations {
-            for provider in &self.providers {
-                for location in &provider.token_locations {
-                    match extract_from_location(location, ctx) {
-                        TokenLocationExtract::Missing => {}
-                        TokenLocationExtract::Credential(credential) => return credential,
-                    }
-                }
+        match self.extract_jwks_credential(ctx) {
+            JwksExtractedCredential::Missing => ExtractedCredential::Missing,
+            JwksExtractedCredential::InvalidFormat(body) => {
+                ExtractedCredential::InvalidFormat(body)
             }
-            return ExtractedCredential::Missing;
+            JwksExtractedCredential::BearerToken { token, .. } => {
+                ExtractedCredential::BearerToken(token)
+            }
         }
-
-        extract_authorization_bearer(ctx)
     }
 
     async fn verify(
@@ -615,6 +693,58 @@ fn extract_authorization_bearer(ctx: &RequestContext) -> ExtractedCredential {
 enum TokenLocationExtract {
     Missing,
     Credential(ExtractedCredential),
+}
+
+enum JwksExtractedCredential {
+    BearerToken {
+        token: String,
+        provider_indices: Vec<usize>,
+    },
+    InvalidFormat(String),
+    Missing,
+}
+
+fn provider_locations_extract_token(
+    provider: &JwksProvider,
+    ctx: &RequestContext,
+    expected_token: &str,
+) -> bool {
+    provider
+        .token_locations
+        .iter()
+        .any(|location| match extract_from_location(location, ctx) {
+            TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token)) => {
+                token == expected_token
+            }
+            _ => false,
+        })
+}
+
+fn mark_original_token_stripping_metadata(ctx: &mut RequestContext, provider: &JwksProvider) {
+    if provider.token_locations.is_empty() {
+        ctx.metadata.insert(
+            STRIP_AUTHORIZATION_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        return;
+    }
+
+    for location in &provider.token_locations {
+        match location {
+            TokenLocation::Header(header) => {
+                ctx.metadata.insert(
+                    format!("{STRIP_HEADER_METADATA_PREFIX}{}", header.name),
+                    "true".to_string(),
+                );
+            }
+            TokenLocation::QueryParam(name) => {
+                ctx.metadata.insert(
+                    format!("{STRIP_QUERY_PARAM_METADATA_PREFIX}{name}"),
+                    "true".to_string(),
+                );
+            }
+        }
+    }
 }
 
 fn extract_from_location(location: &TokenLocation, ctx: &RequestContext) -> TokenLocationExtract {
@@ -687,12 +817,28 @@ impl super::Plugin for JwksAuth {
         ctx: &mut RequestContext,
         headers: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
-        if ctx
+        let strip_authorization = ctx
             .metadata
-            .remove("jwks_auth.strip_authorization")
-            .is_some()
-        {
-            headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+            .remove(STRIP_AUTHORIZATION_METADATA_KEY)
+            .is_some();
+        let strip_headers: Vec<String> = ctx
+            .metadata
+            .keys()
+            .filter_map(|key| key.strip_prefix(STRIP_HEADER_METADATA_PREFIX))
+            .map(ToOwned::to_owned)
+            .collect();
+
+        if strip_authorization || !strip_headers.is_empty() {
+            headers.retain(|name, _| {
+                !(strip_authorization && name.eq_ignore_ascii_case("authorization"))
+                    && !strip_headers
+                        .iter()
+                        .any(|header| name.eq_ignore_ascii_case(header))
+            });
+        }
+        for header in strip_headers {
+            ctx.metadata
+                .remove(&format!("{STRIP_HEADER_METADATA_PREFIX}{header}"));
         }
         PluginResult::Continue
     }
@@ -1093,14 +1239,8 @@ fn parse_token_locations(
                 .as_str()
                 .to_string();
             let prefix = match object.get("prefix") {
-                Some(Value::String(raw)) => {
-                    if raw.is_empty() {
-                        return Err(format!(
-                            "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}].prefix' must not be empty"
-                        ));
-                    }
-                    Some(raw.clone())
-                }
+                Some(Value::String(raw)) if raw.is_empty() => None,
+                Some(Value::String(raw)) => Some(raw.clone()),
                 Some(Value::Null) | None => None,
                 Some(value) => {
                     return Err(format!(
