@@ -683,11 +683,13 @@ mod tests {
 
     #[test]
     fn content_change_ignores_mesh_workload_order() {
-        let mut old_config = GatewayConfig::default();
-        old_config.mesh = Some(Box::new(MeshConfig {
-            workloads: vec![mesh_workload("b"), mesh_workload("a")],
-            ..MeshConfig::default()
-        }));
+        let old_config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![mesh_workload("b"), mesh_workload("a")],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
         let mut new_config = old_config.clone();
         new_config
             .mesh
