@@ -116,6 +116,7 @@ jobs:
     if: github.event_name == 'pull_request'
     needs: build-gateway-binary
     runs-on: ubuntu-latest
+    environment: ci-tests
     strategy:
       fail-fast: false
       matrix:
@@ -400,6 +401,7 @@ jobs:
     name: Performance Regression Check
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    environment: ci-perf
     steps:
       - uses: actions/checkout@v6
 
@@ -503,6 +505,7 @@ jobs:
   build-binaries:
     name: Build (${{ matrix.asset_name }})
     if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    environment: ci-build
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

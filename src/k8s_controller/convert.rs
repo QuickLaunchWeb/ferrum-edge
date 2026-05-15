@@ -28,11 +28,7 @@ pub fn dynamic_object_to_k8s_object(
             .map(|ts| ts.0.to_string()),
     };
 
-    let spec = obj
-        .data
-        .get("spec")
-        .cloned()
-        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    let spec = dynamic_object_spec(&obj.data);
     let status = obj
         .data
         .get("status")
@@ -46,6 +42,20 @@ pub fn dynamic_object_to_k8s_object(
         spec,
         status,
     }
+}
+
+fn dynamic_object_spec(data: &serde_json::Value) -> serde_json::Value {
+    if let Some(spec) = data.get("spec") {
+        return spec.clone();
+    }
+
+    let serde_json::Value::Object(map) = data else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+
+    let mut spec = map.clone();
+    spec.remove("status");
+    serde_json::Value::Object(spec)
 }
 
 #[cfg(test)]
@@ -79,6 +89,37 @@ mod tests {
         assert_eq!(result.metadata.name, "my-policy");
         assert_eq!(result.metadata.namespace, "prod");
         assert_eq!(result.spec, spec);
+    }
+
+    #[test]
+    fn converts_spec_less_endpoint_slice_top_level_fields() {
+        let dyn_obj = DynamicObject {
+            metadata: ObjectMeta {
+                name: Some("reviews-abc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            types: None,
+            data: json!({
+                "addressType": "IPv4",
+                "endpoints": [
+                    {
+                        "addresses": ["10.0.0.5"],
+                        "targetRef": {"kind": "Pod", "name": "reviews-1"}
+                    }
+                ],
+                "ports": [{"name": "http", "port": 8080}],
+                "status": {"ignored": true}
+            }),
+        };
+
+        let result = dynamic_object_to_k8s_object(&dyn_obj, "discovery.k8s.io/v1", "EndpointSlice");
+
+        assert_eq!(result.spec["addressType"], "IPv4");
+        assert!(result.spec.get("endpoints").is_some());
+        assert!(result.spec.get("ports").is_some());
+        assert!(result.spec.get("status").is_none());
+        assert_eq!(result.status, json!({"ignored": true}));
     }
 
     #[test]
