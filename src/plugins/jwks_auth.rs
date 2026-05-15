@@ -641,7 +641,10 @@ impl JwksAuth {
                 token,
                 provider_indices,
             },
-            _ => JwksExtractedCredential::Missing,
+            ExtractedCredential::ApiKey(_)
+            | ExtractedCredential::BasicAuth { .. }
+            | ExtractedCredential::HmacAuth { .. }
+            | ExtractedCredential::MtlsCert { .. } => JwksExtractedCredential::Missing,
         }
     }
 }

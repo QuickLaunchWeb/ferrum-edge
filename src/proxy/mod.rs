@@ -4789,6 +4789,9 @@ fn sanitized_value_preserves_raw_values(raw_values: &[&str], sanitized_value: &s
         [] => false,
         [only] => *only == sanitized_value,
         _ => {
+            // This exact fast-path only applies to list-style values where
+            // individual raw values do not contain literal commas. If that is
+            // not true, callers fall back to the shared materialized form.
             let mut sanitized_values = sanitized_value.split(',').map(str::trim);
             raw_values
                 .iter()
