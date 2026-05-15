@@ -453,7 +453,7 @@ fn iptables_script(
         let v6_script = v6_commands.join("\n");
         match ip6tables_mode {
             Ip6TablesMode::Auto => chunks.push(format!(
-                "if command -v ip6tables >/dev/null 2>&1; then\n{v6_script}\nelse\necho \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
+                "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -L >/dev/null 2>&1; then\n{v6_script}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\necho \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
             )),
             Ip6TablesMode::Required => chunks.push(v6_script),
             Ip6TablesMode::Disabled => {}
@@ -961,6 +961,8 @@ mod tests {
         let script = IptablesPlan::for_config(&config).script(Ip6TablesMode::Auto);
 
         assert!(script.contains("command -v ip6tables"));
+        assert!(script.contains("ip6tables -t nat -L"));
+        assert!(script.contains("ip6tables nat table unavailable"));
         assert!(script.contains("skipping IPv6 mesh capture rules"));
         assert!(script.contains("ip6tables -t nat"));
     }
