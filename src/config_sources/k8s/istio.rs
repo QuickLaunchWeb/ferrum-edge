@@ -22,8 +22,8 @@ use super::{
     mesh_route_dispatch_has_unsupported_predicate, mesh_route_dispatch_plugin_from_rules,
     mesh_route_dispatch_rules_for_proxy, optional_port_field, parse_istio_duration_ms,
     port_from_u64, proxy_for_route, request_termination_plugin_for_proxy, resource_id,
-    selector_from_istio, service_key_from_host, string_array, string_field, string_map,
-    upstream_for_route,
+    selector_from_istio, string_array, string_field, string_map, upstream_for_route,
+    workload_entry_service_key_from_host,
 };
 use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT, PluginConfig, Proxy, RetryConfig};
 
@@ -1167,7 +1167,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         .get("service")
         .and_then(Value::as_str)
         .unwrap_or(&object.metadata.name);
-    let service_key = service_key_from_host(
+    let service_key = workload_entry_service_key_from_host(
         service_raw,
         &object.metadata.namespace,
         &acc.options.cluster_domain,
@@ -3176,6 +3176,35 @@ mod tests {
         );
         assert!(
             err.contains("reviews.prod.svc.cluster.local"),
+            "error should include the offending host: {err}"
+        );
+        assert!(
+            err.contains("cross-namespace"),
+            "error should identify the unsupported cross-namespace reference: {err}"
+        );
+    }
+
+    #[test]
+    fn workload_entry_two_label_cross_namespace_service_host_fails_closed() {
+        let err = translate_k8s_objects(
+            &[object(
+                "WorkloadEntry",
+                serde_json::json!({
+                    "address": "10.0.1.5",
+                    "service": "reviews.prod"
+                }),
+            )],
+            options(),
+        )
+        .expect_err("two-label cross-namespace WorkloadEntry service host must fail closed");
+
+        let err = err.to_string();
+        assert!(
+            err.contains("WorkloadEntry.service"),
+            "error should mention WorkloadEntry.service: {err}"
+        );
+        assert!(
+            err.contains("reviews.prod"),
             "error should include the offending host: {err}"
         );
         assert!(

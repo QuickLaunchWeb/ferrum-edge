@@ -538,10 +538,7 @@ pub(crate) fn service_key_from_host(
     default_namespace: &str,
     cluster_domain: &str,
 ) -> Option<K8sServiceKey> {
-    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    if host.is_empty() || host.contains('*') {
-        return None;
-    }
+    let host = normalized_service_host(host)?;
     let parts: Vec<&str> = host.split('.').collect();
     match parts.as_slice() {
         [name] => K8sServiceKey::new(default_namespace.to_string(), (*name).to_string()),
@@ -566,6 +563,29 @@ pub(crate) fn service_key_from_host(
         }
         _ => None,
     }
+}
+
+pub(crate) fn workload_entry_service_key_from_host(
+    host: &str,
+    default_namespace: &str,
+    cluster_domain: &str,
+) -> Option<K8sServiceKey> {
+    service_key_from_host(host, default_namespace, cluster_domain).or_else(|| {
+        let host = normalized_service_host(host)?;
+        let parts: Vec<&str> = host.split('.').collect();
+        match parts.as_slice() {
+            [name, namespace] => K8sServiceKey::new((*namespace).to_string(), (*name).to_string()),
+            _ => None,
+        }
+    })
+}
+
+fn normalized_service_host(host: &str) -> Option<String> {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || host.contains('*') {
+        return None;
+    }
+    Some(host)
 }
 
 pub(crate) fn invalid_resource(
@@ -1483,6 +1503,24 @@ mod tests {
         assert_eq!(
             service_key_from_host("reviews.prod", "default", "cluster.local"),
             None
+        );
+    }
+
+    #[test]
+    fn workload_entry_service_key_from_host_parses_two_label_service_namespace_refs() {
+        assert_eq!(
+            workload_entry_service_key_from_host("reviews.prod", "default", "cluster.local"),
+            Some(K8sServiceKey {
+                namespace: "prod".to_string(),
+                name: "reviews".to_string(),
+            })
+        );
+        assert_eq!(
+            workload_entry_service_key_from_host("reviews.prod.", "default", "cluster.local"),
+            Some(K8sServiceKey {
+                namespace: "prod".to_string(),
+                name: "reviews".to_string(),
+            })
         );
     }
 }
