@@ -983,7 +983,6 @@ fn apply_destination_rules(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
-    let mut touched_upstream_ids = std::collections::HashSet::new();
     let mut sorted_destination_rules: Vec<&MeshDestinationRule> =
         mesh_slice.destination_rules.iter().collect();
     sorted_destination_rules.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
@@ -1014,8 +1013,6 @@ fn apply_destination_rules(
 
         for idx in matching_upstream_indices {
             let upstream = &mut config.upstreams[idx];
-            let before_upstream_projection = serde_json::to_value(&*upstream).ok();
-
             if let Some(ref policy) = dr.traffic_policy {
                 apply_traffic_policy_to_upstream(upstream, policy, runtime);
             }
@@ -1118,27 +1115,6 @@ fn apply_destination_rules(
                         proxy.updated_at = now;
                     }
                 }
-            }
-
-            let upstream_changed = serde_json::to_value(&*upstream)
-                .map(|after| before_upstream_projection.as_ref() != Some(&after))
-                .unwrap_or(true);
-            if upstream_changed {
-                upstream.updated_at = chrono::Utc::now();
-                touched_upstream_ids.insert(upstream.id.clone());
-            }
-        }
-    }
-
-    if !touched_upstream_ids.is_empty() {
-        let now = chrono::Utc::now();
-        for proxy in &mut config.proxies {
-            if proxy
-                .upstream_id
-                .as_deref()
-                .is_some_and(|upstream_id| touched_upstream_ids.contains(upstream_id))
-            {
-                proxy.updated_at = now;
             }
         }
     }
@@ -4120,52 +4096,6 @@ mod tests {
         assert_eq!(
             upstream.backend_tls_san_allow_list,
             vec!["reviews.mesh.internal".to_string()]
-        );
-    }
-
-    #[test]
-    fn destination_rule_tls_projection_bumps_referencing_proxy_timestamps() {
-        let stale = chrono::Utc::now() - chrono::Duration::hours(1);
-        let mut config = GatewayConfig {
-            proxies: vec![destination_rule_test_proxy("p1", "u1")],
-            upstreams: vec![destination_rule_test_upstream(
-                "u1",
-                "reviews.default.svc.cluster.local",
-            )],
-            ..GatewayConfig::default()
-        };
-        config.proxies[0].updated_at = stale;
-        config.upstreams[0].updated_at = stale;
-
-        let slice = MeshSlice {
-            destination_rules: vec![MeshDestinationRule {
-                name: "reviews-dr".to_string(),
-                namespace: "default".to_string(),
-                host: "reviews.default.svc.cluster.local".to_string(),
-                traffic_policy: Some(MeshTrafficPolicy {
-                    tls: Some(MeshTrafficPolicyTls {
-                        mode: MtlsMode::Simple,
-                        sni: Some("reviews.mesh.internal".to_string()),
-                        subject_alt_names: vec!["reviews.mesh.internal".to_string()],
-                        ..MeshTrafficPolicyTls::default()
-                    }),
-                    ..MeshTrafficPolicy::default()
-                }),
-                port_level_settings: HashMap::new(),
-                subsets: Vec::new(),
-            }],
-            ..MeshSlice::default()
-        };
-
-        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice);
-
-        assert!(
-            config.upstreams[0].updated_at > stale,
-            "DR-derived upstream TLS changes must make ConfigDelta see the upstream as modified"
-        );
-        assert!(
-            config.proxies[0].updated_at > stale,
-            "proxies referencing changed upstreams must rebuild cached route-table proxy Arcs"
         );
     }
 

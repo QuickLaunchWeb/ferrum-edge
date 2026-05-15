@@ -3812,7 +3812,18 @@ pub(crate) fn validate_backend_tls_san_allow_list_entry(san: &str) -> Result<(),
     if san.parse::<std::net::IpAddr>().is_ok() {
         return Ok(());
     }
-    if let Some(rest) = san.strip_prefix("spiffe://") {
+    let spiffe_rest = san
+        .strip_prefix("spiffe://")
+        .or_else(|| san.strip_prefix("SPIFFE://"))
+        .or_else(|| {
+            let lower = san.get(..9)?;
+            if lower.eq_ignore_ascii_case("spiffe://") {
+                Some(&san[9..])
+            } else {
+                None
+            }
+        });
+    if let Some(rest) = spiffe_rest {
         let has_path = rest
             .find('/')
             .is_some_and(|slash| slash > 0 && slash + 1 < rest.len());
@@ -3831,7 +3842,11 @@ pub(crate) fn validate_backend_tls_san_allow_list_entry(san: &str) -> Result<(),
 }
 
 pub(crate) fn normalize_backend_tls_san_allow_list_entry(san: &mut String) {
-    if san.strip_prefix("spiffe://").is_some() || san.parse::<std::net::IpAddr>().is_ok() {
+    if san
+        .get(..9)
+        .is_some_and(|s| s.eq_ignore_ascii_case("spiffe://"))
+        || san.parse::<std::net::IpAddr>().is_ok()
+    {
         return;
     }
     *san = san.to_ascii_lowercase();
