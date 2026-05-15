@@ -929,6 +929,8 @@ fn include_outbound_ports_for_pod(pod: &Value) -> Result<Vec<u16>, String> {
         .and_then(Value::as_object);
     let mut ports = Vec::new();
     let mut saw_wildcard = false;
+    let mut wildcard_key: Option<&str> = None;
+    let mut explicit_ports_key: Option<&str> = None;
     for key in [
         ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
         FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
@@ -943,17 +945,25 @@ fn include_outbound_ports_for_pod(pod: &Value) -> Result<Vec<u16>, String> {
             IncludePortList::Absent => {}
             IncludePortList::All => {
                 if !ports.is_empty() {
+                    let explicit_key =
+                        explicit_ports_key.unwrap_or("another includeOutboundPorts annotation");
                     return Err(format!(
-                        "invalid {key}: wildcard '*' cannot be combined with explicit includeOutboundPorts"
+                        "invalid {key}: wildcard '*' cannot be combined with explicit includeOutboundPorts in {explicit_key}"
                     ));
                 }
                 saw_wildcard = true;
+                wildcard_key.get_or_insert(key);
             }
             IncludePortList::Ports(annotation_ports) => {
                 if saw_wildcard && !annotation_ports.is_empty() {
+                    let wildcard_key =
+                        wildcard_key.unwrap_or("another includeOutboundPorts annotation");
                     return Err(format!(
-                        "invalid {key}: wildcard '*' cannot be combined with explicit includeOutboundPorts"
+                        "invalid {key}: explicit includeOutboundPorts cannot be combined with wildcard '*' in {wildcard_key}"
                     ));
+                }
+                if !annotation_ports.is_empty() {
+                    explicit_ports_key.get_or_insert(key);
                 }
                 ports.extend(annotation_ports);
             }
@@ -2117,7 +2127,8 @@ mod tests {
         let err = capture_config(&config, &pod).expect_err("mixed wildcard aliases rejected");
 
         assert!(err.contains("ferrum.io/includeOutboundPorts"));
-        assert!(err.contains("wildcard '*' cannot be combined"));
+        assert!(err.contains("traffic.sidecar.istio.io/includeOutboundPorts"));
+        assert!(err.contains("cannot be combined with wildcard '*'"));
     }
 
     // Deduplication on the exclude-CIDR path: a CIDR repeated across env and
