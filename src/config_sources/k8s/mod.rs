@@ -542,7 +542,7 @@ pub(crate) fn service_key_from_host(
     let parts: Vec<&str> = host.split('.').collect();
     match parts.as_slice() {
         [name] => K8sServiceKey::new(default_namespace.to_string(), (*name).to_string()),
-        [name, namespace] if namespace.eq_ignore_ascii_case(default_namespace) => {
+        [name, namespace] if *namespace == default_namespace => {
             K8sServiceKey::new((*namespace).to_string(), (*name).to_string())
         }
         [_, _] => None,
@@ -575,11 +575,7 @@ pub(crate) fn workload_entry_service_key_from_host(
         let host = normalized_service_host(host)?;
         let parts: Vec<&str> = host.split('.').collect();
         match parts.as_slice() {
-            [name, namespace]
-                if known_namespaces
-                    .iter()
-                    .any(|known| known.eq_ignore_ascii_case(namespace)) =>
-            {
+            [name, namespace] if known_namespaces.iter().any(|known| known == namespace) => {
                 K8sServiceKey::new((*namespace).to_string(), (*name).to_string())
             }
             _ => None,
@@ -588,11 +584,11 @@ pub(crate) fn workload_entry_service_key_from_host(
 }
 
 fn normalized_service_host(host: &str) -> Option<String> {
-    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let host = host.trim().trim_end_matches('.');
     if host.is_empty() || host.contains('*') {
         return None;
     }
-    Some(host)
+    Some(host.to_string())
 }
 
 pub(crate) fn invalid_resource(
@@ -1495,6 +1491,36 @@ mod tests {
                 name: "reviews".to_string(),
             })
         );
+        assert_eq!(
+            service_key_from_host(
+                "reviews.default.svc.Cluster.Local",
+                "ignored",
+                "cluster.local"
+            ),
+            Some(K8sServiceKey {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn service_key_from_host_preserves_service_and_namespace_case() {
+        assert_eq!(
+            service_key_from_host(
+                "Reviews.Default.svc.cluster.local",
+                "ignored",
+                "cluster.local"
+            ),
+            Some(K8sServiceKey {
+                namespace: "Default".to_string(),
+                name: "Reviews".to_string(),
+            })
+        );
+        assert_eq!(
+            service_key_from_host("reviews.Default", "default", "cluster.local"),
+            None
+        );
     }
 
     #[test]
@@ -1539,6 +1565,15 @@ mod tests {
                 namespace: "prod".to_string(),
                 name: "reviews".to_string(),
             })
+        );
+        assert_eq!(
+            workload_entry_service_key_from_host(
+                "reviews.Prod",
+                "default",
+                "cluster.local",
+                &known_namespaces,
+            ),
+            None
         );
     }
 
