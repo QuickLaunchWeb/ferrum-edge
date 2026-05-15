@@ -18,7 +18,7 @@ use kube::api::Api;
 use kube::runtime::watcher::{self as kube_watcher, Event};
 use tracing::{debug, error, info, warn};
 
-use crate::capture::{CaptureConfig, Ip6TablesMode, IptablesPlan};
+use crate::capture::{CaptureConfig, Ip6TablesMode, IptablesPlan, XTABLES_LOCK_WAIT_SECONDS};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::ebpf::cgroup;
@@ -594,11 +594,10 @@ fn setup_commands_for_plan(plan: &IptablesPlan, ip6tables_mode: Ip6TablesMode) -
     );
 
     if !plan.v6_commands.is_empty() && ip6tables_mode == Ip6TablesMode::Required {
-        commands.push(
-            "command -v ip6tables >/dev/null 2>&1 || { echo \"ip6tables is required for IPv6 mesh capture\" >&2; exit 1; }\n\
-             ip6tables -t nat -w 5 -L >/dev/null 2>&1 || { echo \"ip6tables nat table is required for IPv6 mesh capture\" >&2; exit 1; }"
-                .to_string(),
-        );
+        commands.push(format!(
+            "command -v ip6tables >/dev/null 2>&1 || {{ echo \"ip6tables is required for IPv6 mesh capture\" >&2; exit 1; }}\n\
+             ip6tables -t nat -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1 || {{ echo \"ip6tables nat table is required for IPv6 mesh capture\" >&2; exit 1; }}"
+        ));
     }
 
     commands.extend(plan.v4_commands.iter().cloned());
@@ -631,7 +630,7 @@ fn cleanup_commands_for_plan(include_v6: bool, ip6tables_mode: Ip6TablesMode) ->
 
 fn ip6tables_auto_wrapped_command(cmd: &str) -> String {
     format!(
-        "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -w 5 -L >/dev/null 2>&1; then\n    {cmd}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\necho \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
+        "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1; then\n    {cmd}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\necho \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
     )
 }
 

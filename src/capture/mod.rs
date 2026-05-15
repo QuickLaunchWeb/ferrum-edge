@@ -11,7 +11,7 @@ use tracing::warn;
 use crate::config::conf_file::resolve_ferrum_var;
 
 pub const DEFAULT_PROXY_UID: u32 = 1337;
-const XTABLES_LOCK_WAIT_SECONDS: u8 = 5;
+pub(crate) const XTABLES_LOCK_WAIT_SECONDS: u8 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureMode {
@@ -235,6 +235,7 @@ impl IptablesPlan {
 pub struct EbpfPlan {
     pub enabled: bool,
     pub fallback: IptablesPlan,
+    pub ip6tables_mode: Ip6TablesMode,
     pub required_kernel: &'static str,
 }
 
@@ -244,12 +245,13 @@ impl EbpfPlan {
         Self {
             enabled: config.mode == CaptureMode::Ebpf,
             fallback: IptablesPlan::for_config(config),
+            ip6tables_mode: config.ip6tables_mode,
             required_kernel: "5.7",
         }
     }
 
     pub fn fallback_script(&self) -> String {
-        let fallback_cmds = self.fallback.script(Ip6TablesMode::Auto);
+        let fallback_cmds = self.fallback.script(self.ip6tables_mode);
         let (major, minor) = parse_kernel_requirement(self.required_kernel);
         format!(
             "MAJOR=$(uname -r | cut -d. -f1)\n\
@@ -442,11 +444,10 @@ fn iptables_script(
     let mut chunks = Vec::new();
     if require_v6_preflight && !v6_commands.is_empty() && ip6tables_mode == Ip6TablesMode::Required
     {
-        chunks.push(
-            "command -v ip6tables >/dev/null 2>&1 || { echo \"ip6tables is required for IPv6 mesh capture\" >&2; exit 1; }\n\
-             ip6tables -t nat -w 5 -L >/dev/null 2>&1 || { echo \"ip6tables nat table is required for IPv6 mesh capture\" >&2; exit 1; }"
-                .to_string(),
-        );
+        chunks.push(format!(
+            "command -v ip6tables >/dev/null 2>&1 || {{ echo \"ip6tables is required for IPv6 mesh capture\" >&2; exit 1; }}\n\
+             ip6tables -t nat -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1 || {{ echo \"ip6tables nat table is required for IPv6 mesh capture\" >&2; exit 1; }}"
+        ));
     }
     if !v4_commands.is_empty() {
         chunks.push(v4_commands.join("\n"));
@@ -455,7 +456,7 @@ fn iptables_script(
         let v6_script = v6_commands.join("\n");
         match ip6tables_mode {
             Ip6TablesMode::Auto => chunks.push(format!(
-                "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -w 5 -L >/dev/null 2>&1; then\n{v6_script}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\necho \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
+                "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1; then\n{v6_script}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\necho \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
             )),
             Ip6TablesMode::Required => chunks.push(v6_script),
             Ip6TablesMode::Disabled => {}
@@ -558,6 +559,7 @@ mod tests {
 
         assert!(plan.enabled);
         assert_eq!(plan.required_kernel, "5.7");
+        assert_eq!(plan.ip6tables_mode, Ip6TablesMode::Auto);
         assert!(
             plan.fallback
                 .v4_commands
@@ -587,6 +589,21 @@ mod tests {
         assert!(script.contains("supports eBPF"));
         assert!(script.contains("--to-ports 15001"));
         assert!(script.contains("--to-ports 15006"));
+    }
+
+    #[test]
+    fn ebpf_fallback_script_preserves_required_ip6tables_mode() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Ebpf;
+        config.ip6tables_mode = Ip6TablesMode::Required;
+        config.include_cidrs = vec!["fd00::/8".to_string()];
+
+        let plan = EbpfPlan::for_config(&config);
+        let script = plan.fallback_script();
+
+        assert_eq!(plan.ip6tables_mode, Ip6TablesMode::Required);
+        assert!(script.contains("ip6tables is required for IPv6 mesh capture"));
+        assert!(script.contains("ip6tables nat table is required for IPv6 mesh capture"));
     }
 
     #[test]
