@@ -773,16 +773,23 @@ fn narrow_service_ports(
                 .map(|(port, protocol)| (*port, *protocol))
                 .collect();
             MeshService {
-                name: service.name.clone(),
-                namespace: service.namespace.clone(),
                 ports,
-                workloads: service.workloads.clone(),
                 protocol_overrides,
+                ..service.clone()
             }
         }
     })
 }
 
+/// Returns the per-host narrowed `ServiceEntry` projections that satisfy the
+/// resolved Sidecar egress scope.
+///
+/// Hosts that share the same admitted port-set are grouped into a single
+/// returned entry; hosts that admit different port-sets produce separate
+/// entries that all carry the original entry's `name`. As a result the
+/// returned `Vec` MAY contain MULTIPLE entries with the same `name` — this is
+/// part of the contract. Downstream code MUST NOT assume one name maps to one
+/// entry (e.g. do not key materialization caches solely by `entry.name`).
 fn narrow_service_entry_ports(
     entry: &ServiceEntry,
     sidecar: ResolvedSidecarEgress<'_>,
@@ -835,15 +842,9 @@ fn narrow_service_entry_ports(
                 .cloned()
                 .collect::<Vec<_>>();
             (!ports.is_empty()).then(|| ServiceEntry {
-                name: entry.name.clone(),
-                namespace: entry.namespace.clone(),
                 hosts,
-                endpoints: entry.endpoints.clone(),
-                resolution: entry.resolution,
-                location: entry.location,
                 ports,
-                export_to: entry.export_to.clone(),
-                workload_selector: entry.workload_selector.clone(),
+                ..entry.clone()
             })
         })
         .collect()
