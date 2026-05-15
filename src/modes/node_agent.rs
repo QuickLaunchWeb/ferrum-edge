@@ -18,7 +18,7 @@ use kube::api::Api;
 use kube::runtime::watcher::{self as kube_watcher, Event};
 use tracing::{debug, error, info, warn};
 
-use crate::capture::{CaptureConfig, IptablesPlan};
+use crate::capture::{CaptureConfig, Ip6TablesMode, IptablesPlan};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::ebpf::cgroup;
@@ -540,26 +540,29 @@ where
 
             let plan = IptablesPlan::for_config(&config.capture_config);
             let include_v6_cleanup = !plan.v6_commands.is_empty();
-            execute(
-                vec![plan.script(config.capture_config.ip6tables_mode)],
-                "setup",
-            )
-            .await?;
+            let setup = setup_commands_for_plan(&plan, config.capture_config.ip6tables_mode);
+            if let Err(setup_err) = execute(setup, "setup").await {
+                let cleanup = cleanup_commands_for_plan(
+                    include_v6_cleanup,
+                    config.capture_config.ip6tables_mode,
+                );
+                if let Err(cleanup_err) = execute(cleanup, "cleanup").await {
+                    warn!(
+                        error = %cleanup_err,
+                        "Failed to clean up iptables fallback rules after setup failure"
+                    );
+                }
+                return Err(setup_err);
+            }
 
             info!("Iptables fallback rules applied, awaiting shutdown signal");
 
             wait_for_shutdown(shutdown_tx).await;
 
             info!("Shutdown signal received, cleaning up iptables rules");
-            if let Err(e) = execute(
-                vec![IptablesPlan::cleanup_script(
-                    include_v6_cleanup,
-                    config.capture_config.ip6tables_mode,
-                )],
-                "cleanup",
-            )
-            .await
-            {
+            let cleanup =
+                cleanup_commands_for_plan(include_v6_cleanup, config.capture_config.ip6tables_mode);
+            if let Err(e) = execute(cleanup, "cleanup").await {
                 warn!(error = %e, "Failed to clean up iptables fallback rules");
             }
 
@@ -583,6 +586,54 @@ where
             );
         }
     }
+}
+
+fn setup_commands_for_plan(plan: &IptablesPlan, ip6tables_mode: Ip6TablesMode) -> Vec<String> {
+    let mut commands = Vec::with_capacity(
+        plan.v4_commands.len() + plan.v6_commands.len() + usize::from(!plan.v6_commands.is_empty()),
+    );
+
+    if !plan.v6_commands.is_empty() && ip6tables_mode == Ip6TablesMode::Required {
+        commands.push(
+            "command -v ip6tables >/dev/null 2>&1 || { echo \"ip6tables is required for IPv6 mesh capture\" >&2; exit 1; }\n\
+             ip6tables -t nat -L >/dev/null 2>&1 || { echo \"ip6tables nat table is required for IPv6 mesh capture\" >&2; exit 1; }"
+                .to_string(),
+        );
+    }
+
+    commands.extend(plan.v4_commands.iter().cloned());
+    match ip6tables_mode {
+        Ip6TablesMode::Auto => commands.extend(
+            plan.v6_commands
+                .iter()
+                .map(|cmd| ip6tables_auto_wrapped_command(cmd)),
+        ),
+        Ip6TablesMode::Required => commands.extend(plan.v6_commands.iter().cloned()),
+        Ip6TablesMode::Disabled => {}
+    }
+    commands
+}
+
+fn cleanup_commands_for_plan(include_v6: bool, ip6tables_mode: Ip6TablesMode) -> Vec<String> {
+    let mut commands = IptablesPlan::cleanup_commands();
+    if include_v6 {
+        match ip6tables_mode {
+            Ip6TablesMode::Auto => commands.extend(
+                IptablesPlan::cleanup_v6_commands()
+                    .iter()
+                    .map(|cmd| ip6tables_auto_wrapped_command(cmd)),
+            ),
+            Ip6TablesMode::Required => commands.extend(IptablesPlan::cleanup_v6_commands()),
+            Ip6TablesMode::Disabled => {}
+        }
+    }
+    commands
+}
+
+fn ip6tables_auto_wrapped_command(cmd: &str) -> String {
+    format!(
+        "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -L >/dev/null 2>&1; then\n    {cmd}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\necho \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
+    )
 }
 
 /// Execute a list of shell commands (iptables/ip6tables setup or cleanup)
@@ -800,13 +851,21 @@ mod tests {
 
         let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let phases_for_runner = std::sync::Arc::clone(&phases);
+        let command_counts =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(&'static str, usize)>::new()));
+        let command_counts_for_runner = std::sync::Arc::clone(&command_counts);
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            handle_fallback_with(&config, &probe, &shutdown_tx, move |_, phase| {
+            handle_fallback_with(&config, &probe, &shutdown_tx, move |commands, phase| {
                 let phases = std::sync::Arc::clone(&phases_for_runner);
+                let command_counts = std::sync::Arc::clone(&command_counts_for_runner);
                 async move {
                     phases.lock().expect("phases mutex").push(phase);
+                    command_counts
+                        .lock()
+                        .expect("command counts mutex")
+                        .push((phase, commands.len()));
                     Ok(())
                 }
             }),
@@ -817,6 +876,13 @@ mod tests {
         assert_eq!(
             *phases.lock().expect("phases mutex"),
             vec!["setup", "cleanup"]
+        );
+        let command_counts = command_counts.lock().expect("command counts mutex");
+        assert!(
+            command_counts
+                .iter()
+                .any(|(phase, count)| *phase == "setup" && *count > 1),
+            "fallback setup should execute individual plan commands, got {command_counts:?}"
         );
     }
 
@@ -840,9 +906,19 @@ mod tests {
         let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let phases_for_runner = std::sync::Arc::clone(&phases);
 
-        let result = handle_fallback_with(&config, &probe, &shutdown_tx, move |_, phase| {
+        let result = handle_fallback_with(&config, &probe, &shutdown_tx, move |commands, phase| {
             let phases = std::sync::Arc::clone(&phases_for_runner);
             async move {
+                if phase == "setup" {
+                    assert!(
+                        commands.len() > 1,
+                        "setup should pass individual commands, got {commands:?}"
+                    );
+                    assert!(
+                        commands.iter().all(|cmd| !cmd.contains('\n')),
+                        "v4-only setup should not be collapsed into a shell script: {commands:?}"
+                    );
+                }
                 phases.lock().expect("phases mutex").push(phase);
                 anyhow::bail!("setup failed")
             }
@@ -850,7 +926,10 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert_eq!(*phases.lock().expect("phases mutex"), vec!["setup"]);
+        assert_eq!(
+            *phases.lock().expect("phases mutex"),
+            vec!["setup", "cleanup"]
+        );
     }
 
     #[test]
