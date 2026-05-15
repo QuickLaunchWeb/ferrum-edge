@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -419,7 +419,6 @@ fn sidecar(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, 
 
     let mut egress = Vec::new();
     let mut egress_inherits_defaults = false;
-    let mut port_scopes = BTreeSet::new();
     match object.spec.get("egress") {
         None => {
             // Istio: omitted egress inherits the namespace default outbound
@@ -469,19 +468,9 @@ fn sidecar(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<MeshSidecar, 
                     )?,
                     None => None,
                 };
-                if let Some(port) = port {
-                    port_scopes.insert(port);
-                }
                 egress.push(MeshSidecarEgress { hosts, port });
             }
         }
-    }
-
-    if !port_scopes.is_empty() {
-        acc.warnings.push(format!(
-            "Sidecar {}/{} uses egress port scoping {:?}, but Ferrum currently narrows Sidecar egress by host only; the port field is parsed and preserved but not enforced",
-            object.metadata.namespace, object.metadata.name, port_scopes
-        ));
     }
 
     Ok(MeshSidecar {
@@ -9275,19 +9264,19 @@ mod tests {
         .expect("translation succeeds");
 
         // Sidecar must NOT produce the old Phase-D warning. Port scoping is
-        // parsed but not enforced yet, so that unsupported field gets a focused
-        // warning instead.
+        // parsed into the mesh model and enforced later when the Sidecar
+        // enforcement gate is enabled.
         assert!(
             !result.warnings.iter().any(|w| w.contains("Phase D")),
             "Sidecar translation must not emit the deferred warning; warnings = {:?}",
             result.warnings
         );
         assert!(
-            result
+            !result
                 .warnings
                 .iter()
-                .any(|w| { w.contains("egress port scoping") && w.contains("host only") }),
-            "Sidecar egress port should emit a host-only warning; warnings = {:?}",
+                .any(|w| w.contains("egress port scoping")),
+            "Sidecar egress port should not emit a stale unsupported warning; warnings = {:?}",
             result.warnings
         );
 
