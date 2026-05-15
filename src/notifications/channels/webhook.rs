@@ -157,6 +157,9 @@ impl WebhookChannel {
         self.render_body_from_vars(&vars)
     }
 
+    /// Render using caller-supplied variables plus generic notification variables.
+    /// Generic notification variables win on key collisions so callers cannot
+    /// accidentally override `${title}`, `${severity}`, etc.
     pub fn render_body_with_vars(
         &self,
         n: &Notification,

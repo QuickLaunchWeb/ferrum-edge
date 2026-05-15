@@ -204,6 +204,25 @@ pub(super) fn resolve_optional_string(
     Ok(None)
 }
 
+pub(super) fn validate_webhook_url(url: &str, channel: &str, kind: &str) -> Result<(), String> {
+    let parsed = Url::parse(url)
+        .map_err(|e| format!("channel '{channel}' ({kind}): invalid 'webhook_url': {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        s => {
+            return Err(format!(
+                "channel '{channel}' ({kind}): 'webhook_url' must use http:// or https:// (got '{s}')"
+            ));
+        }
+    }
+    if parsed.host_str().is_none() {
+        return Err(format!(
+            "channel '{channel}' ({kind}): 'webhook_url' must include a hostname"
+        ));
+    }
+    Ok(())
+}
+
 /// Redact a webhook endpoint for logs/errors. Incoming webhook credentials
 /// commonly live in the URL path or query string, so keep only scheme/host/port.
 pub(super) fn redacted_endpoint_url(raw: &str) -> String {

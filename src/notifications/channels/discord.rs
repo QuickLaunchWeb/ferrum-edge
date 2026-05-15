@@ -5,12 +5,11 @@
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use url::Url;
 
 use crate::plugins::utils::http_client::PluginHttpClient;
 
 use super::super::notification::Notification;
-use super::{redacted_endpoint_url, resolve_optional_string};
+use super::{redacted_endpoint_url, resolve_optional_string, validate_webhook_url};
 
 #[derive(Debug, Clone)]
 pub struct DiscordChannel {
@@ -24,7 +23,7 @@ impl DiscordChannel {
         let webhook_url =
             resolve_optional_string(value, "webhook_url", "webhook_url_env", name)?
                 .ok_or_else(|| format!("channel '{name}' (discord): 'webhook_url' is required"))?;
-        validate_webhook_url(&webhook_url, name)?;
+        validate_webhook_url(&webhook_url, name, "discord")?;
         let username = take_optional_string(value, "username", name)?;
         Ok(Self {
             name: Arc::from(name),
@@ -105,23 +104,4 @@ fn take_optional_string(value: &Value, key: &str, channel: &str) -> Result<Optio
             .ok_or_else(|| format!("channel '{channel}' (discord): '{key}' must be a string")),
         None => Ok(None),
     }
-}
-
-fn validate_webhook_url(url: &str, channel: &str) -> Result<(), String> {
-    let parsed = Url::parse(url)
-        .map_err(|e| format!("channel '{channel}' (discord): invalid 'webhook_url': {e}"))?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        s => {
-            return Err(format!(
-                "channel '{channel}' (discord): 'webhook_url' must use http:// or https:// (got '{s}')"
-            ));
-        }
-    }
-    if parsed.host_str().is_none() {
-        return Err(format!(
-            "channel '{channel}' (discord): 'webhook_url' must include a hostname"
-        ));
-    }
-    Ok(())
 }
