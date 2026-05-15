@@ -259,6 +259,12 @@ enum IncludePortList {
     Ports(Vec<u16>),
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct IncludeOutboundPorts {
+    all_ports: bool,
+    ports: Vec<u16>,
+}
+
 fn parse_include_port_list(raw: Option<&str>) -> Result<IncludePortList, String> {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(IncludePortList::Absent);
@@ -869,7 +875,9 @@ fn capture_config(config: &InjectorConfig, pod: &Value) -> Result<CaptureConfig,
     let mut capture = CaptureConfig::explicit(15006, 15001);
     capture.mode = config.capture_mode;
     capture.proxy_uid = Some(config.proxy_uid.unwrap_or(DEFAULT_PROXY_UID));
-    capture.include_outbound_ports = include_outbound_ports_for_pod(pod)?;
+    let include_outbound_ports = include_outbound_ports_for_pod(pod)?;
+    capture.include_all_outbound_ports = include_outbound_ports.all_ports;
+    capture.include_outbound_ports = include_outbound_ports.ports;
     capture.exclude_ports = exclude_outbound_ports_for_pod(config, pod)?;
     capture.exclude_inbound_ports = exclude_inbound_ports_for_pod(config, pod)?;
 
@@ -923,7 +931,9 @@ fn capture_config(config: &InjectorConfig, pod: &Value) -> Result<CaptureConfig,
     Ok(capture)
 }
 
-fn include_outbound_ports_for_pod(pod: &Value) -> Result<Vec<u16>, String> {
+// includeOutboundPorts is annotation-only: unlike excludeOutboundPorts, there
+// is no injector-level/env default that seeds this list.
+fn include_outbound_ports_for_pod(pod: &Value) -> Result<IncludeOutboundPorts, String> {
     let annotations = pod
         .pointer("/metadata/annotations")
         .and_then(Value::as_object);
@@ -970,11 +980,17 @@ fn include_outbound_ports_for_pod(pod: &Value) -> Result<Vec<u16>, String> {
         }
     }
     if saw_wildcard {
-        return Ok(Vec::new());
+        return Ok(IncludeOutboundPorts {
+            all_ports: true,
+            ports: Vec::new(),
+        });
     }
     ports.sort_unstable();
     ports.dedup();
-    Ok(ports)
+    Ok(IncludeOutboundPorts {
+        all_ports: false,
+        ports,
+    })
 }
 
 fn exclude_outbound_ports_for_pod(
@@ -1342,8 +1358,47 @@ mod tests {
             .expect("iptables plan");
 
         assert!(
-            commands.contains("-p tcp -d 0.0.0.0/0 -j REDIRECT --to-ports 15001"),
+            commands.contains("-p tcp -j REDIRECT --to-ports 15001"),
             "wildcard includeOutboundPorts should capture all ports: {commands}"
+        );
+        assert!(
+            !commands.contains("--dport"),
+            "wildcard includeOutboundPorts should not emit port-narrowing rules: {commands}"
+        );
+    }
+
+    #[test]
+    fn patch_wildcard_include_outbound_ports_overrides_explicit_cidr_narrowing() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/includeOutboundIPRanges": "10.0.0.0/8",
+                    "traffic.sidecar.istio.io/includeOutboundPorts": "*"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+        let init = patch
+            .iter()
+            .find(|op| op.path == "/spec/initContainers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("init container");
+        let commands = init
+            .pointer("/args/0")
+            .and_then(Value::as_str)
+            .expect("iptables plan");
+
+        assert!(
+            commands.contains("-p tcp -j REDIRECT --to-ports 15001"),
+            "wildcard includeOutboundPorts should capture all destinations even when includeOutboundIPRanges is explicit: {commands}"
+        );
+        assert!(
+            !commands.contains("-p tcp -d 10.0.0.0/8 -j REDIRECT"),
+            "wildcard includeOutboundPorts makes explicit CIDR-only redirect redundant: {commands}"
         );
         assert!(
             !commands.contains("--dport"),
@@ -2074,6 +2129,10 @@ mod tests {
         let capture = capture_config(&config, &pod).expect("capture config");
 
         assert!(
+            capture.include_all_outbound_ports,
+            "wildcard includeOutboundPorts must stay distinct from absent includeOutboundPorts"
+        );
+        assert!(
             capture.include_outbound_ports.is_empty(),
             "wildcard includeOutboundPorts means all ports, so no port filter should be carried"
         );
@@ -2094,6 +2153,10 @@ mod tests {
 
         let capture = capture_config(&config, &pod).expect("capture config");
 
+        assert!(
+            capture.include_all_outbound_ports,
+            "Ferrum wildcard includeOutboundPorts must stay distinct from absent includeOutboundPorts"
+        );
         assert!(
             capture.include_outbound_ports.is_empty(),
             "Ferrum wildcard includeOutboundPorts means all ports, so no port filter should be carried"
@@ -2116,6 +2179,10 @@ mod tests {
 
         let capture = capture_config(&config, &pod).expect("duplicate wildcard aliases accepted");
 
+        assert!(
+            capture.include_all_outbound_ports,
+            "duplicate wildcard aliases should preserve the all-ports marker"
+        );
         assert!(
             capture.include_outbound_ports.is_empty(),
             "duplicate wildcard aliases should still mean all ports"

@@ -43,6 +43,10 @@ pub struct CaptureConfig {
     /// than the implicit catch-all default. When includeOutboundPorts is set,
     /// the implicit default must not swallow all ports before port rules match.
     pub include_cidrs_explicit: bool,
+    /// True when includeOutboundPorts was explicitly set to `*`. This must be
+    /// distinct from an empty `include_outbound_ports`, which means the
+    /// annotation was absent or empty and CIDR includes should drive capture.
+    pub include_all_outbound_ports: bool,
     pub include_outbound_ports: Vec<u16>,
     pub exclude_cidrs: Vec<String>,
     pub exclude_ports: Vec<u16>,
@@ -61,6 +65,7 @@ impl CaptureConfig {
             outbound_port,
             include_cidrs: vec!["0.0.0.0/0".to_string()],
             include_cidrs_explicit: false,
+            include_all_outbound_ports: false,
             include_outbound_ports: Vec::new(),
             exclude_cidrs: Vec::new(),
             exclude_ports: Vec::new(),
@@ -102,6 +107,7 @@ impl CaptureConfig {
             outbound_port: 15001,
             include_cidrs,
             include_cidrs_explicit,
+            include_all_outbound_ports: false,
             include_outbound_ports: Vec::new(),
             exclude_cidrs,
             exclude_ports,
@@ -191,46 +197,55 @@ impl IptablesPlan {
                 &format!("-m owner --uid-owner {uid} -j RETURN"),
             ));
         }
-        let include_cidrs: Vec<&String> = config
-            .include_cidrs
-            .iter()
-            .filter(|cidr| {
-                if !is_ipv4_cidr(cidr) {
-                    warn!(
-                        cidr = %cidr,
-                        "Skipping non-IPv4 CIDR in outbound include list (ip6tables fan-out not yet implemented)"
-                    );
-                    return false;
+        if config.include_all_outbound_ports {
+            commands.push(idempotent_append(
+                "nat",
+                "FERRUM_MESH_OUTBOUND",
+                &format!("-p tcp -j REDIRECT --to-ports {}", config.outbound_port),
+            ));
+        } else {
+            let include_cidrs: Vec<&String> = config
+                .include_cidrs
+                .iter()
+                .filter(|cidr| {
+                    if !is_ipv4_cidr(cidr) {
+                        warn!(
+                            cidr = %cidr,
+                            "Skipping non-IPv4 CIDR in outbound include list (ip6tables fan-out not yet implemented)"
+                        );
+                        return false;
+                    }
+                    true
+                })
+                .collect();
+            // includeOutboundPorts without an explicit include-CIDR annotation
+            // means "capture only these ports" rather than "add these ports to
+            // the implicit 0.0.0.0/0 catch-all". Explicit include CIDRs stay
+            // additive.
+            let emit_include_cidrs =
+                config.include_outbound_ports.is_empty() || config.include_cidrs_explicit;
+            if emit_include_cidrs {
+                for cidr in include_cidrs {
+                    commands.push(idempotent_append(
+                        "nat",
+                        "FERRUM_MESH_OUTBOUND",
+                        &format!(
+                            "-p tcp -d {cidr} -j REDIRECT --to-ports {}",
+                            config.outbound_port
+                        ),
+                    ));
                 }
-                true
-            })
-            .collect();
-        // includeOutboundPorts without an explicit include-CIDR annotation means
-        // "capture only these ports" rather than "add these ports to the
-        // implicit 0.0.0.0/0 catch-all". Explicit include CIDRs stay additive.
-        let emit_include_cidrs =
-            config.include_outbound_ports.is_empty() || config.include_cidrs_explicit;
-        if emit_include_cidrs {
-            for cidr in include_cidrs {
+            }
+            for port in &config.include_outbound_ports {
                 commands.push(idempotent_append(
                     "nat",
                     "FERRUM_MESH_OUTBOUND",
                     &format!(
-                        "-p tcp -d {cidr} -j REDIRECT --to-ports {}",
+                        "-p tcp --dport {port} -j REDIRECT --to-ports {}",
                         config.outbound_port
                     ),
                 ));
             }
-        }
-        for port in &config.include_outbound_ports {
-            commands.push(idempotent_append(
-                "nat",
-                "FERRUM_MESH_OUTBOUND",
-                &format!(
-                    "-p tcp --dport {port} -j REDIRECT --to-ports {}",
-                    config.outbound_port
-                ),
-            ));
         }
         // Inbound port exclusions MUST be appended before the catch-all
         // REDIRECT below — once REDIRECT fires the chain returns, so any
@@ -838,6 +853,30 @@ mod tests {
                 .iter()
                 .any(|cmd| cmd.contains("-p tcp -d 10.0.0.0/8 --dport 5432 -j REDIRECT")),
             "includeOutboundPorts must be additive, not intersected with include CIDRs"
+        );
+    }
+
+    #[test]
+    fn iptables_plan_wildcard_include_ports_redirects_all_destinations() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.include_cidrs = vec!["10.0.0.0/8".to_string()];
+        config.include_cidrs_explicit = true;
+        config.include_all_outbound_ports = true;
+
+        let plan = IptablesPlan::for_config(&config);
+
+        assert!(
+            plan.commands
+                .iter()
+                .any(|cmd| cmd.contains("-p tcp -j REDIRECT --to-ports 15001")),
+            "wildcard includeOutboundPorts must redirect all outbound ports regardless of destination IP: {:?}",
+            plan.commands
+        );
+        assert!(
+            !plan.commands.iter().any(|cmd| cmd.contains("--dport")),
+            "wildcard includeOutboundPorts should not emit port-narrowing rules: {:?}",
+            plan.commands
         );
     }
 
