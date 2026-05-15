@@ -344,6 +344,16 @@ impl WorkloadMetrics {
         }
     }
 
+    fn should_export_metadata(&self, metadata: &HashMap<String, String>) -> bool {
+        if trace_is_sampled(metadata) {
+            return true;
+        }
+        if metadata_has_sampling_decision(metadata) {
+            return false;
+        }
+        self.sampling_percentage.is_some_and(trace_sampled)
+    }
+
     fn insert_source_workload_labels(
         &self,
         metadata: &mut HashMap<String, String>,
@@ -488,14 +498,14 @@ impl Plugin for WorkloadMetrics {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        if !trace_is_sampled(&summary.metadata) {
+        if !self.should_export_metadata(&summary.metadata) {
             return;
         }
         self.export_span(SpanData::from_stream_summary(summary, &self.service_name));
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        if !trace_is_sampled(&summary.metadata) {
+        if !self.should_export_metadata(&summary.metadata) {
             return;
         }
         self.export_span(SpanData::from_transaction_summary(
@@ -674,6 +684,14 @@ fn existing_sampling_decision(
             header_value(headers, TRACEPARENT_HEADER).and_then(traceparent_sampling_decision)
         })
         .or_else(|| b3_sampling_decision(headers))
+}
+
+fn metadata_has_sampling_decision(metadata: &HashMap<String, String>) -> bool {
+    metadata.contains_key("trace_sampled")
+        || metadata
+            .get(TRACEPARENT_HEADER)
+            .and_then(|value| traceparent_sampling_decision(value))
+            .is_some()
 }
 
 fn traceparent_sampling_decision(value: &str) -> Option<bool> {
