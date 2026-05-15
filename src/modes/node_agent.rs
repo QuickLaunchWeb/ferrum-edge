@@ -623,12 +623,12 @@ fn cleanup_commands_for_plan(include_v6: bool, ip6tables_mode: Ip6TablesMode) ->
         match ip6tables_mode {
             // Keep cleanup best-effort per command; stale v6 chains from an earlier
             // config should not make node-agent fallback cleanup fail.
-            Ip6TablesMode::Auto | Ip6TablesMode::Disabled => commands.extend(
-                IptablesPlan::cleanup_v6_commands()
-                    .iter()
-                    .map(|cmd| ip6tables_auto_wrapped_command(cmd)),
-            ),
-            Ip6TablesMode::Required => commands.extend(IptablesPlan::cleanup_v6_commands()),
+            Ip6TablesMode::Auto | Ip6TablesMode::Disabled | Ip6TablesMode::Required => commands
+                .extend(
+                    IptablesPlan::cleanup_v6_commands()
+                        .iter()
+                        .map(|cmd| ip6tables_auto_wrapped_command(cmd)),
+                ),
         }
     }
     commands
@@ -904,6 +904,24 @@ mod tests {
                 .iter()
                 .any(|cmd| cmd.contains("ip6tables -t nat -w 5 -L")),
             "disabled-mode IPv6 cleanup should remain best-effort behind the auto nat probe"
+        );
+    }
+
+    #[test]
+    fn cleanup_commands_wrap_required_ipv6_teardown_best_effort() {
+        let commands = cleanup_commands_for_plan(true, Ip6TablesMode::Required);
+
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| cmd.contains("ip6tables -t nat -w 5 -L")),
+            "required-mode cleanup should still probe ip6tables instead of emitting noisy bare commands"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| cmd.contains("ip6tables not found; skipping IPv6 mesh capture rules")),
+            "required-mode cleanup should remain best-effort when ip6tables is absent"
         );
     }
 

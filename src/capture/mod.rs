@@ -177,6 +177,7 @@ fn parse_proxy_uid(raw: &str) -> Result<u32, String> {
 pub struct IptablesPlan {
     pub v4_commands: Vec<String>,
     pub v6_commands: Vec<String>,
+    pub ip6tables_mode: Ip6TablesMode,
 }
 
 impl IptablesPlan {
@@ -204,6 +205,7 @@ impl IptablesPlan {
         Self {
             v4_commands,
             v6_commands,
+            ip6tables_mode: config.ip6tables_mode,
         }
     }
 
@@ -253,7 +255,7 @@ impl EbpfPlan {
     }
 
     pub fn fallback_script(&self) -> String {
-        let fallback_cmds = self.fallback.script(self.ip6tables_mode);
+        let fallback_cmds = self.fallback.script();
         let (major, minor) = parse_kernel_requirement(self.required_kernel);
         format!(
             "MAJOR=$(uname -r | cut -d. -f1)\n\
@@ -271,8 +273,13 @@ impl EbpfPlan {
 }
 
 impl IptablesPlan {
-    pub fn script(&self, ip6tables_mode: Ip6TablesMode) -> String {
-        iptables_script(&self.v4_commands, &self.v6_commands, ip6tables_mode, true)
+    pub fn script(&self) -> String {
+        iptables_script(
+            &self.v4_commands,
+            &self.v6_commands,
+            self.ip6tables_mode,
+            true,
+        )
     }
 
     #[cfg(test)]
@@ -348,7 +355,7 @@ fn commands_for_family(
     binary: &str,
     config: &CaptureConfig,
     family: CidrFamily,
-    always_emit: bool,
+    emit_inbound_regardless: bool,
 ) -> Vec<String> {
     let include_cidrs: Vec<&str> = config
         .include_cidrs
@@ -362,7 +369,9 @@ fn commands_for_family(
         .filter(|cidr| cidr_family(cidr) == Some(family))
         .map(String::as_str)
         .collect();
-    if !always_emit && include_cidrs.is_empty() && exclude_cidrs.is_empty() {
+    // Inbound capture is protocol-wide for an active address family; IPv4
+    // therefore keeps inbound chains even when only IPv6 outbound CIDRs exist.
+    if !emit_inbound_regardless && include_cidrs.is_empty() && exclude_cidrs.is_empty() {
         return Vec::new();
     }
 
@@ -1005,7 +1014,7 @@ mod tests {
         config.mode = CaptureMode::Iptables;
         config.include_cidrs = vec!["fd00::/8".to_string()];
 
-        let script = IptablesPlan::for_config(&config).script(Ip6TablesMode::Auto);
+        let script = IptablesPlan::for_config(&config).script();
 
         assert!(script.contains("command -v ip6tables"));
         assert!(script.contains("ip6tables -t nat -w 5 -L"));
@@ -1022,7 +1031,7 @@ mod tests {
         config.include_cidrs = vec!["fd00::/8".to_string()];
 
         let plan = IptablesPlan::for_config(&config);
-        let script = plan.script(config.ip6tables_mode);
+        let script = plan.script();
 
         assert!(script.contains("ip6tables is required for IPv6 mesh capture"));
         assert!(script.contains("ip6tables nat table is required for IPv6 mesh capture"));

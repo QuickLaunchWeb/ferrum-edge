@@ -787,7 +787,7 @@ fn sidecar_container(config: &InjectorConfig, pod: &Value, namespace: &str) -> V
 
 fn init_container(config: &InjectorConfig, pod: &Value) -> Result<Value, String> {
     let plan = IptablesPlan::for_config(&capture_config(config, pod)?);
-    let script = plan.script(config.ip6tables_mode);
+    let script = plan.script();
     Ok(json!({
         "name": "ferrum-edge-init",
         "image": config.sidecar_image,
