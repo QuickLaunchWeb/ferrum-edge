@@ -211,16 +211,29 @@ impl IptablesPlan {
                 ));
             }
         } else {
-            for cidr in include_cidrs {
+            if include_cidrs.is_empty() {
                 for port in &config.include_outbound_ports {
                     commands.push(idempotent_append(
                         "nat",
                         "FERRUM_MESH_OUTBOUND",
                         &format!(
-                            "-p tcp -d {cidr} --dport {port} -j REDIRECT --to-ports {}",
+                            "-p tcp --dport {port} -j REDIRECT --to-ports {}",
                             config.outbound_port
                         ),
                     ));
+                }
+            } else {
+                for cidr in include_cidrs {
+                    for port in &config.include_outbound_ports {
+                        commands.push(idempotent_append(
+                            "nat",
+                            "FERRUM_MESH_OUTBOUND",
+                            &format!(
+                                "-p tcp -d {cidr} --dport {port} -j REDIRECT --to-ports {}",
+                                config.outbound_port
+                            ),
+                        ));
+                    }
                 }
             }
         }
@@ -836,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn iptables_plan_skips_redirect_when_include_ports_and_only_ipv6_cidrs() {
+    fn iptables_plan_falls_back_to_port_redirect_when_only_ipv6_include_cidrs_remain() {
         let mut config = CaptureConfig::explicit(15006, 15001);
         config.mode = CaptureMode::Iptables;
         config.include_cidrs = vec!["fd00::/8".to_string()];
@@ -845,10 +858,10 @@ mod tests {
         let plan = IptablesPlan::for_config(&config);
 
         assert!(
-            !plan.commands.iter().any(|cmd| {
-                cmd.contains("--dport 5432") && cmd.contains("-j REDIRECT --to-ports 15001")
-            }),
-            "includeOutboundPorts must not emit an unscoped IPv4 redirect after IPv6 CIDRs are stripped: {:?}",
+            plan.commands
+                .iter()
+                .any(|cmd| { cmd.contains("-p tcp --dport 5432 -j REDIRECT --to-ports 15001") }),
+            "includeOutboundPorts should still redirect explicit ports after IPv6 CIDRs are stripped: {:?}",
             plan.commands
         );
         assert!(
