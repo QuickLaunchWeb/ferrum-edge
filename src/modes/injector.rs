@@ -265,13 +265,21 @@ fn parse_include_port_list(raw: Option<&str>) -> Result<IncludePortList, String>
     };
 
     let mut ports = Vec::new();
+    let mut saw_wildcard = false;
     for token in raw
         .split(',')
         .map(str::trim)
         .filter(|token| !token.is_empty())
     {
         if token == "*" {
-            return Ok(IncludePortList::All);
+            if saw_wildcard || !ports.is_empty() {
+                return Err("wildcard '*' must be the only includeOutboundPorts token".to_string());
+            }
+            saw_wildcard = true;
+            continue;
+        }
+        if saw_wildcard {
+            return Err("wildcard '*' must be the only includeOutboundPorts token".to_string());
         }
         let port = token
             .parse::<u16>()
@@ -280,6 +288,9 @@ fn parse_include_port_list(raw: Option<&str>) -> Result<IncludePortList, String>
             return Err("port '0': port must be 1-65535".to_string());
         }
         ports.push(port);
+    }
+    if saw_wildcard {
+        return Ok(IncludePortList::All);
     }
     ports.sort_unstable();
     ports.dedup();
@@ -914,6 +925,7 @@ fn include_outbound_ports_for_pod(pod: &Value) -> Result<Vec<u16>, String> {
         .pointer("/metadata/annotations")
         .and_then(Value::as_object);
     let mut ports = Vec::new();
+    let mut saw_wildcard = false;
     for key in [
         ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
         FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
@@ -926,9 +938,26 @@ fn include_outbound_ports_for_pod(pod: &Value) -> Result<Vec<u16>, String> {
         .map_err(|e| format!("invalid {key}: {e}"))?
         {
             IncludePortList::Absent => {}
-            IncludePortList::All => return Ok(Vec::new()),
-            IncludePortList::Ports(annotation_ports) => ports.extend(annotation_ports),
+            IncludePortList::All => {
+                if saw_wildcard || !ports.is_empty() {
+                    return Err(format!(
+                        "invalid {key}: wildcard '*' cannot be combined with explicit includeOutboundPorts"
+                    ));
+                }
+                saw_wildcard = true;
+            }
+            IncludePortList::Ports(annotation_ports) => {
+                if saw_wildcard && !annotation_ports.is_empty() {
+                    return Err(format!(
+                        "invalid {key}: wildcard '*' cannot be combined with explicit includeOutboundPorts"
+                    ));
+                }
+                ports.extend(annotation_ports);
+            }
         }
+    }
+    if saw_wildcard {
+        return Ok(Vec::new());
     }
     ports.sort_unstable();
     ports.dedup();
@@ -1287,6 +1316,26 @@ mod tests {
             .expect_err("invalid annotation rejected");
 
         assert!(err.contains("traffic.sidecar.istio.io/includeOutboundPorts"));
+    }
+
+    #[test]
+    fn patch_rejects_mixed_wildcard_include_outbound_ports_annotation() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/includeOutboundPorts": "*,not-a-port"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+
+        let err = build_sidecar_patch_for_namespace(&pod, &config, None)
+            .expect_err("mixed wildcard annotation rejected");
+
+        assert!(err.contains("traffic.sidecar.istio.io/includeOutboundPorts"));
+        assert!(err.contains("wildcard '*' must be the only includeOutboundPorts token"));
     }
 
     #[test]
@@ -1944,8 +1993,7 @@ mod tests {
             "metadata": {
                 "labels": {"ferrum.io/mesh": "enabled"},
                 "annotations": {
-                    "traffic.sidecar.istio.io/includeOutboundPorts": "*",
-                    "ferrum.io/includeOutboundPorts": "5432"
+                    "traffic.sidecar.istio.io/includeOutboundPorts": "*"
                 }
             },
             "spec": {"containers": [{"name": "app", "image": "app:test"}]}
@@ -1958,6 +2006,26 @@ mod tests {
             capture.include_outbound_ports.is_empty(),
             "wildcard includeOutboundPorts means all ports, so no port filter should be carried"
         );
+    }
+
+    #[test]
+    fn capture_config_rejects_wildcard_include_outbound_ports_across_aliases() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/includeOutboundPorts": "*",
+                    "ferrum.io/includeOutboundPorts": "5432"
+                }
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+
+        let err = capture_config(&config, &pod).expect_err("mixed wildcard aliases rejected");
+
+        assert!(err.contains("ferrum.io/includeOutboundPorts"));
+        assert!(err.contains("wildcard '*' cannot be combined"));
     }
 
     // Deduplication on the exclude-CIDR path: a CIDR repeated across env and
