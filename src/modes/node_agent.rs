@@ -606,7 +606,7 @@ fn setup_commands_for_plan(plan: &IptablesPlan) -> Vec<String> {
         Ip6TablesMode::Auto => commands.extend(
             plan.v6_commands
                 .iter()
-                .map(|cmd| ip6tables_auto_wrapped_command(cmd)),
+                .map(|cmd| ip6tables_best_effort_wrapped_command(cmd)),
         ),
         Ip6TablesMode::Required => commands.extend(plan.v6_commands.iter().cloned()),
         Ip6TablesMode::Disabled => {}
@@ -622,13 +622,13 @@ fn cleanup_commands_for_plan(include_v6: bool) -> Vec<String> {
         commands.extend(
             IptablesPlan::cleanup_v6_commands()
                 .iter()
-                .map(|cmd| ip6tables_auto_wrapped_command(cmd)),
+                .map(|cmd| ip6tables_best_effort_wrapped_command(cmd)),
         );
     }
     commands
 }
 
-fn ip6tables_auto_wrapped_command(cmd: &str) -> String {
+fn ip6tables_best_effort_wrapped_command(cmd: &str) -> String {
     format!(
         "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1; then\n    {cmd}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\n  echo \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
     )

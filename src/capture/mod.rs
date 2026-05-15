@@ -193,12 +193,12 @@ impl IptablesPlan {
             .any(|cidr| cidr_family(cidr) == Some(CidrFamily::V6));
         let v6_commands = if v6_enabled && v6_has_cidrs {
             commands_for_family("ip6tables", config, CidrFamily::V6, false)
+        } else if v6_has_cidrs {
+            warn!(
+                "Skipping IPv6 mesh capture rules because FERRUM_MESH_IP6TABLES_ENABLED is disabled"
+            );
+            Vec::new()
         } else {
-            if v6_has_cidrs {
-                warn!(
-                    "Skipping IPv6 mesh capture rules because FERRUM_MESH_IP6TABLES_ENABLED=false"
-                );
-            }
             Vec::new()
         };
 
