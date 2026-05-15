@@ -476,7 +476,12 @@ fn iptables_script(
                 v6_script.replace('\n', "\n    ")
             )),
             Ip6TablesMode::Required => chunks.push(v6_script),
-            Ip6TablesMode::Disabled => {}
+            Ip6TablesMode::Disabled => {
+                debug_assert!(
+                    v6_commands.is_empty(),
+                    "IptablesPlan::for_config must clear v6 commands when ip6tables is disabled"
+                );
+            }
         }
     }
     chunks.join("\n")
