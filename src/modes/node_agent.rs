@@ -825,8 +825,7 @@ mod tests {
         };
 
         let err = initialize_backend(&mut backend, &config)
-            .err()
-            .expect("capture-config failure should abort initialization");
+            .expect_err("capture-config failure should abort initialization");
 
         assert!(err.to_string().contains("capture config update failed"));
         assert!(backend.programs_loaded);
@@ -1299,8 +1298,10 @@ mod tests {
 
     #[tokio::test]
     async fn admin_listener_http_port_zero_spawns_no_tasks() {
-        let mut env_config = EnvConfig::default();
-        env_config.admin_http_port = 0;
+        let env_config = EnvConfig {
+            admin_http_port: 0,
+            ..EnvConfig::default()
+        };
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let startup_ready = Arc::new(AtomicBool::new(false));
 
@@ -1313,16 +1314,17 @@ mod tests {
 
     #[tokio::test]
     async fn admin_listener_invalid_allowed_cidrs_returns_error() {
-        let mut env_config = EnvConfig::default();
-        env_config.admin_http_port = 18081;
-        env_config.admin_allowed_cidrs = "not-a-cidr".to_string();
+        let env_config = EnvConfig {
+            admin_http_port: 18081,
+            admin_allowed_cidrs: "not-a-cidr".to_string(),
+            ..EnvConfig::default()
+        };
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let startup_ready = Arc::new(AtomicBool::new(false));
 
         let err = start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready)
             .await
-            .err()
-            .expect("invalid CIDR should fail before spawning");
+            .expect_err("invalid CIDR should fail before spawning");
 
         assert!(err.to_string().contains("FERRUM_ADMIN_ALLOWED_CIDRS"));
     }
