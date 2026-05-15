@@ -51,7 +51,6 @@ pub struct WorkloadMetrics {
     /// Provider-specific tracing backends surfaced from Istio Telemetry CRD
     /// via the mesh slice. These also enable trace-context propagation when
     /// span reporting is disabled.
-    #[allow(dead_code)]
     tracing_providers: Vec<TracingProvider>,
     trace_exporters: Vec<Arc<dyn TraceExporter>>,
     span_reporting_disabled: bool,
