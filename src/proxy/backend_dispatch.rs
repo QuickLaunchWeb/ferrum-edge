@@ -301,18 +301,18 @@ fn initial_dispatch_port(proxy: &Proxy, upstream: Option<&Upstream>) -> u16 {
     if let Some(upstream) = upstream {
         let mut port = None;
         for target in &upstream.targets {
-            if !overrides.contains_key(&target.port) {
-                continue;
-            }
             match port {
                 Some(existing) if existing != target.port => return 0,
                 Some(_) => {}
                 None => port = Some(target.port),
             }
         }
-        if let Some(port) = port {
+        if let Some(port) = port
+            && overrides.contains_key(&port)
+        {
             return port;
         }
+        return 0;
     }
 
     if overrides.len() == 1 {
@@ -586,6 +586,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn initial_dispatch_port_requires_all_targets_on_overridden_port() {
+        let mut proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "backend_host": "unused.local",
+            "backend_port": 0,
+        }))
+        .expect("minimal proxy should deserialize");
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080,
+            crate::config::types::ResolvedPortOverride::default(),
+        )]));
+        let upstream: Upstream = serde_json::from_value(serde_json::json!({
+            "id": "mixed",
+            "targets": [
+                {"host": "10.0.0.1", "port": 8080},
+                {"host": "10.0.0.2", "port": 9090}
+            ]
+        }))
+        .expect("minimal upstream should deserialize");
+
+        assert_eq!(initial_dispatch_port(&proxy, Some(&upstream)), 0);
+    }
+
     #[tokio::test]
     async fn upstream_selection_uses_port_override_when_proxy_backend_port_is_unset() {
         let mut config: crate::config::types::GatewayConfig =
@@ -631,5 +654,58 @@ mod tests {
 
         assert_eq!(selection.lb_hash_key.as_deref(), Some("alice"));
         assert_eq!(selection.target.as_ref().map(|t| t.port), Some(8080));
+    }
+
+    #[tokio::test]
+    async fn upstream_selection_does_not_apply_partial_port_override_before_selection() {
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "consumers": [],
+                "plugin_configs": [],
+                "proxies": [{
+                    "id": "mesh-egress",
+                    "listen_path": "/",
+                    "backend_scheme": "http",
+                    "backend_host": "unused.local",
+                    "backend_port": 0,
+                    "upstream_id": "mesh-upstream"
+                }],
+                "upstreams": [{
+                    "id": "mesh-upstream",
+                    "targets": [
+                        {"host": "10.0.0.1", "port": 8080},
+                        {"host": "10.0.0.2", "port": 9090}
+                    ],
+                    "algorithm": "round_robin",
+                    "port_overrides": {
+                        "8080": {
+                            "algorithm": "consistent_hashing",
+                            "hash_on": "header:x-user"
+                        }
+                    }
+                }]
+            }))
+            .expect("test config should deserialize");
+        config.normalize_fields();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let (state, _) = crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+            .expect("test proxy state should build");
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+        let mut headers = HashMap::new();
+        headers.insert("x-user".to_string(), "alice".to_string());
+
+        let first = select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &headers);
+        let second = select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &headers);
+
+        assert_eq!(first.lb_hash_key.as_deref(), Some("192.0.2.10"));
+        assert_eq!(second.lb_hash_key.as_deref(), Some("192.0.2.10"));
+        assert_ne!(
+            first.target.as_ref().map(|t| t.port),
+            second.target.as_ref().map(|t| t.port),
+            "mixed-port upstreams must keep using the upstream-level balancer until a target is selected"
+        );
     }
 }
