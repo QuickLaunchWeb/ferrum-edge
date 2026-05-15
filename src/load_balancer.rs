@@ -1109,12 +1109,22 @@ impl LoadBalancer {
                 );
             }
         }
-        let initial_dispatch_port_override = port_states
-            .iter()
-            .find_map(|(&port, state)| {
-                (!targets.is_empty() && state.target_indices.len() == targets.len()).then_some(port)
-            })
-            .unwrap_or(0);
+        let mut initial_dispatch_port_override = 0;
+        let mut full_coverage_port_count = 0usize;
+        for (&port, state) in &port_states {
+            if !targets.is_empty() && state.target_indices.len() == targets.len() {
+                full_coverage_port_count += 1;
+                initial_dispatch_port_override = if full_coverage_port_count == 1 {
+                    port
+                } else {
+                    0
+                };
+            }
+        }
+        debug_assert!(
+            full_coverage_port_count <= 1,
+            "at most one destination port can cover every target in one upstream"
+        );
 
         Self {
             targets: targets.iter().cloned().map(Arc::new).collect(),
