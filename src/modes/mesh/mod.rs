@@ -1800,7 +1800,7 @@ fn inject_mesh_global_plugins(
         if tracing.disable_span_reporting.unwrap_or(false) {
             workload_metrics_config["span_reporting_disabled"] = serde_json::json!(true);
         }
-        if !tracing.providers.is_empty() && !tracing.disable_span_reporting.unwrap_or(false) {
+        if !tracing.providers.is_empty() {
             workload_metrics_config["tracing_providers"] = serde_json::json!(tracing.providers);
         }
     }
@@ -4459,6 +4459,66 @@ mod tests {
         assert_eq!(
             workload_metrics.config["sampling_percentage"],
             serde_json::json!(10.0)
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_preserves_provider_when_span_reporting_disabled() {
+        let runtime = test_mesh_runtime_config();
+        let mesh_slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            version: chrono::Utc::now().to_rfc3339(),
+            telemetry_resources: vec![MeshTelemetryResource {
+                name: "api-tracing".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
+                config: MeshTelemetryConfig {
+                    tracing: Some(MeshTracingConfig {
+                        mode: None,
+                        sampling_percentage: Some(100.0),
+                        disable_span_reporting: Some(true),
+                        custom_tags: HashMap::new(),
+                        custom_header_tags: HashMap::new(),
+                        providers: vec![TracingProvider::Zipkin {
+                            url: "http://zipkin.istio-system:9411/api/v2/spans".to_string(),
+                        }],
+                    }),
+                    ..MeshTelemetryConfig::default()
+                },
+            }],
+            ..MeshSlice::default()
+        };
+
+        let prepared =
+            gateway_config_from_mesh_slice(&mesh_slice, &runtime).expect("mesh slice config");
+        let workload_metrics = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+            .expect("workload_metrics plugin injected");
+
+        assert_eq!(
+            workload_metrics.config["span_reporting_disabled"],
+            serde_json::json!(true)
+        );
+        let providers = workload_metrics
+            .config
+            .get("tracing_providers")
+            .and_then(serde_json::Value::as_array)
+            .expect("tracing_providers kept for propagation");
+        assert_eq!(
+            providers
+                .first()
+                .and_then(|provider| provider.get("kind"))
+                .and_then(serde_json::Value::as_str),
+            Some("zipkin")
         );
     }
 

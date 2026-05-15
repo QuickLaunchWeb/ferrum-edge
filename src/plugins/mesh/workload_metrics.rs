@@ -16,7 +16,7 @@ use crate::modes::mesh::config::TracingProvider;
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::plugins::mesh::authz::parse_trust_domain_aliases;
 use crate::plugins::otel_tracing::{
-    SpanData, TraceExporter, ensure_trace_metadata, trace_exporters_from_providers,
+    OtelTracing, SpanData, TraceExporter, ensure_trace_metadata, trace_exporters_from_providers,
     trace_is_sampled,
 };
 use crate::plugins::utils::PluginHttpClient;
@@ -184,7 +184,7 @@ impl WorkloadMetrics {
     fn annotate_http_context(&self, ctx: &mut RequestContext, headers: &HashMap<String, String>) {
         self.insert_common_metadata(&mut ctx.metadata);
         self.apply_telemetry_metadata(&mut ctx.metadata, headers);
-        if self.trace_context_enabled() && trace_is_sampled(&ctx.metadata) {
+        if self.should_ensure_http_trace_context(&ctx.metadata, headers) {
             ensure_trace_metadata(&mut ctx.metadata, headers);
             if let Some(tracestate) = header_value(headers, TRACESTATE_HEADER) {
                 ctx.metadata
@@ -270,6 +270,15 @@ impl WorkloadMetrics {
             ctx.metadata
                 .insert("mesh.destination.service".to_string(), destination);
         }
+    }
+
+    fn should_ensure_http_trace_context(
+        &self,
+        metadata: &HashMap<String, String>,
+        headers: &HashMap<String, String>,
+    ) -> bool {
+        self.trace_context_enabled()
+            && (trace_is_sampled(metadata) || has_valid_traceparent(headers))
     }
 
     fn trust_domain_allowed(&self, peer_td: &TrustDomain, baggage_td: &TrustDomain) -> bool {
@@ -698,6 +707,12 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
     })
 }
 
+fn has_valid_traceparent(headers: &HashMap<String, String>) -> bool {
+    header_value(headers, TRACEPARENT_HEADER)
+        .and_then(OtelTracing::parse_traceparent)
+        .is_some()
+}
+
 fn insert_source_spiffe_labels(metadata: &mut HashMap<String, String>, identity: &SpiffeId) {
     metadata.insert(MESH_SOURCE_PRINCIPAL.to_string(), identity.to_string());
     metadata.insert(
@@ -978,6 +993,55 @@ mod tests {
         assert_eq!(
             response_headers.get(TRACEPARENT_HEADER),
             headers.get(TRACEPARENT_HEADER)
+        );
+    }
+
+    #[tokio::test]
+    async fn before_proxy_propagates_incoming_trace_context_when_locally_unsampled() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "sampling_percentage": 0.0,
+            "tracing_providers": [{
+                "kind": "zipkin",
+                "config": {
+                    "url": "http://zipkin:9411/api/v2/spans"
+                }
+            }]
+        }))
+        .expect("zipkin provider accepted");
+
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let parent_span_id = "00f067aa0ba902b7";
+        let incoming_traceparent = format!("00-{trace_id}-{parent_span_id}-01");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        let mut headers = HashMap::from([(TRACEPARENT_HEADER.to_string(), incoming_traceparent)]);
+
+        let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            ctx.metadata.get("trace_sampled").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            ctx.metadata.get("trace_id").map(String::as_str),
+            Some(trace_id)
+        );
+        assert_eq!(
+            ctx.metadata.get("parent_span_id").map(String::as_str),
+            Some(parent_span_id)
+        );
+        let outgoing_traceparent = headers
+            .get(TRACEPARENT_HEADER)
+            .expect("traceparent propagated despite local sampling");
+        assert!(outgoing_traceparent.starts_with(&format!("00-{trace_id}-")));
+        assert!(outgoing_traceparent.ends_with("-01"));
+        assert_ne!(
+            outgoing_traceparent,
+            &format!("00-{trace_id}-{parent_span_id}-01")
         );
     }
 
