@@ -134,8 +134,10 @@ impl V001SqlBuilder {
             // unique PKs, so the cleanup helpers intentionally scan across
             // namespaces (a cross-namespace reference is real and must be
             // caught). MongoDB has a matching `{plugin_name, enabled}` partial
-            // index with `partialFilterExpression: {enabled: true}`.
-            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_plugin_name_enabled ON plugin_configs (plugin_name, enabled)",
+            // index with `partialFilterExpression: {enabled: true}`; the
+            // SQL helper applies the same `WHERE enabled = 1` filter on
+            // Postgres/SQLite (MySQL has no partial-index equivalent).
+            self.mesh_route_dispatch_index_sql(),
             // Note: no standalone namespace index on api_specs — the compound
             // indexes below (namespace + updated_at / spec_version / etc.) all
             // have namespace as the leading column and serve namespace-only lookups.
@@ -212,6 +214,23 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_title ON api_specs (namespace, title(255))"
         } else {
             "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_title ON api_specs (namespace, title)"
+        }
+    }
+
+    fn mesh_route_dispatch_index_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            // MySQL lacks SQL-standard partial indexes; index every row.
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_plugin_name_enabled \
+             ON plugin_configs (plugin_name, enabled)"
+        } else {
+            // Postgres and SQLite both support partial indexes. The
+            // `mesh_route_dispatch_plugin_configs_tx` helper only ever asks
+            // for `enabled != 0`, so filtering disabled rows out of the index
+            // halves index size and write amplification in deployments with
+            // many disabled plugin_configs — matching the MongoDB
+            // `partialFilterExpression: {enabled: true}` companion index.
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_plugin_name_enabled \
+             ON plugin_configs (plugin_name) WHERE enabled = 1"
         }
     }
 
@@ -666,6 +685,58 @@ mod tests {
         assert!(
             sql.contains("backend_tls_san_allow_list MEDIUMTEXT"),
             "SAN allow-list JSON can exceed MySQL TEXT when every allowed entry is near the per-entry cap"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // mesh_route_dispatch index — partial on Postgres/SQLite (matches
+    // MongoDB's `partialFilterExpression: {enabled: true}`), full on
+    // MySQL which lacks SQL-standard partial indexes.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_mysql_mesh_route_dispatch_index_is_full() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.mesh_route_dispatch_index_sql();
+        assert!(
+            sql.contains("idx_plugin_configs_plugin_name_enabled"),
+            "MySQL must still create the mesh_route_dispatch perf index"
+        );
+        assert!(
+            sql.contains("(plugin_name, enabled)"),
+            "MySQL has no partial-index support; the index must include enabled as a regular column"
+        );
+        assert!(
+            !sql.contains("WHERE"),
+            "MySQL cannot use a partial WHERE clause on a regular CREATE INDEX"
+        );
+    }
+
+    #[test]
+    fn test_postgres_mesh_route_dispatch_index_is_partial() {
+        let builder = V001SqlBuilder::new("postgres");
+        let sql = builder.mesh_route_dispatch_index_sql();
+        assert!(
+            sql.contains("idx_plugin_configs_plugin_name_enabled"),
+            "Postgres must create the mesh_route_dispatch perf index"
+        );
+        assert!(
+            sql.contains("(plugin_name)") && sql.contains("WHERE enabled = 1"),
+            "Postgres should use a partial index keyed on plugin_name filtered by enabled = 1"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_mesh_route_dispatch_index_is_partial() {
+        let builder = V001SqlBuilder::new("sqlite");
+        let sql = builder.mesh_route_dispatch_index_sql();
+        assert!(
+            sql.contains("idx_plugin_configs_plugin_name_enabled"),
+            "SQLite must create the mesh_route_dispatch perf index"
+        );
+        assert!(
+            sql.contains("(plugin_name)") && sql.contains("WHERE enabled = 1"),
+            "SQLite should use a partial index keyed on plugin_name filtered by enabled = 1"
         );
     }
 
