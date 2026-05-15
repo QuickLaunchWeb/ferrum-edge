@@ -541,6 +541,10 @@ pub(crate) fn service_key_from_host(
     let parts: Vec<&str> = host.split('.').collect();
     match parts.as_slice() {
         [name] => K8sServiceKey::new(default_namespace.to_string(), (*name).to_string()),
+        [name, namespace] if namespace.eq_ignore_ascii_case(default_namespace) => {
+            K8sServiceKey::new((*namespace).to_string(), (*name).to_string())
+        }
+        [_, _] => None,
         [name, namespace, "svc"] => {
             K8sServiceKey::new((*namespace).to_string(), (*name).to_string())
         }
@@ -1443,6 +1447,13 @@ mod tests {
             })
         );
         assert_eq!(
+            service_key_from_host("reviews.default", "default", "cluster.local"),
+            Some(K8sServiceKey {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            })
+        );
+        assert_eq!(
             service_key_from_host(
                 "reviews.default.svc.cluster.local.",
                 "ignored",
@@ -1463,6 +1474,10 @@ mod tests {
         );
         assert_eq!(
             service_key_from_host("reviews.default", "ignored", "cluster.local"),
+            None
+        );
+        assert_eq!(
+            service_key_from_host("reviews.prod", "default", "cluster.local"),
             None
         );
     }

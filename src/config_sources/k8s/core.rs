@@ -1033,6 +1033,42 @@ mod tests {
     }
 
     #[test]
+    fn explicit_workload_entry_same_namespace_service_host_overrides_auto_pod_workload() {
+        let workload_entry = K8sObject {
+            kind: "WorkloadEntry".to_string(),
+            api_version: "networking.istio.io/v1".to_string(),
+            metadata: K8sMetadata {
+                name: "vm-reviews".to_string(),
+                namespace: "default".to_string(),
+                labels: HashMap::new(),
+                deletion_timestamp: None,
+            },
+            spec: json!({
+                "service": "reviews.default",
+                "address": "10.2.0.1",
+                "serviceAccount": "reviews"
+            }),
+            status: Value::Object(serde_json::Map::new()),
+        };
+
+        let translation = translate_k8s_objects(
+            &[
+                service(),
+                ready_pod("reviews-v1", "10.1.0.10"),
+                endpoint_slice(vec![("reviews-v1", "10.1.0.10")]),
+                workload_entry,
+            ],
+            options(),
+        )
+        .expect("core translation succeeds");
+
+        let mesh = translation.config.mesh.expect("mesh config");
+        assert_eq!(mesh.workloads.len(), 1);
+        assert_eq!(mesh.workloads[0].addresses, vec!["10.2.0.1"]);
+        assert_eq!(mesh.services[0].workloads.len(), 1);
+    }
+
+    #[test]
     fn explicit_service_entry_overrides_auto_service() {
         let service_entry = K8sObject {
             kind: "ServiceEntry".to_string(),
@@ -1045,6 +1081,40 @@ mod tests {
             },
             spec: json!({
                 "hosts": ["reviews.default.svc.cluster.local"],
+                "ports": [{"number": 9080, "name": "http", "protocol": "HTTP"}]
+            }),
+            status: Value::Object(serde_json::Map::new()),
+        };
+
+        let translation = translate_k8s_objects(
+            &[
+                service(),
+                ready_pod("reviews-v1", "10.1.0.10"),
+                endpoint_slice(vec![("reviews-v1", "10.1.0.10")]),
+                service_entry,
+            ],
+            options(),
+        )
+        .expect("core translation succeeds");
+
+        let mesh = translation.config.mesh.expect("mesh config");
+        assert!(mesh.services.is_empty());
+        assert_eq!(mesh.service_entries.len(), 1);
+    }
+
+    #[test]
+    fn explicit_service_entry_same_namespace_service_host_overrides_auto_service() {
+        let service_entry = K8sObject {
+            kind: "ServiceEntry".to_string(),
+            api_version: "networking.istio.io/v1".to_string(),
+            metadata: K8sMetadata {
+                name: "manual-reviews".to_string(),
+                namespace: "default".to_string(),
+                labels: HashMap::new(),
+                deletion_timestamp: None,
+            },
+            spec: json!({
+                "hosts": ["reviews.default"],
                 "ports": [{"number": 9080, "name": "http", "protocol": "HTTP"}]
             }),
             status: Value::Object(serde_json::Map::new()),
