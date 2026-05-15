@@ -123,6 +123,7 @@ pub struct RuntimeMetrics {
     pub grpc_errors_by_class: ErrorCounterMap,
     pub body_errors_by_class: ErrorCounterMap,
     pub stream_errors_by_class: ErrorCounterMap,
+    error_entry_count: AtomicUsize,
 
     pub dns_lookups_total: CachePadded<AtomicU64>,
     pub dns_cache_hits: CachePadded<AtomicU64>,
@@ -173,6 +174,7 @@ impl RuntimeMetrics {
             grpc_errors_by_class: DashMap::new(),
             body_errors_by_class: DashMap::new(),
             stream_errors_by_class: DashMap::new(),
+            error_entry_count: AtomicUsize::new(0),
             dns_lookups_total: CachePadded::new(AtomicU64::new(0)),
             dns_cache_hits: CachePadded::new(AtomicU64::new(0)),
             dns_cache_misses: CachePadded::new(AtomicU64::new(0)),
@@ -396,15 +398,21 @@ impl RuntimeMetrics {
             return;
         }
 
-        if error_map_len(map) >= self.max_error_entries.load(Ordering::Relaxed) {
+        if self.error_entry_count.load(Ordering::Relaxed)
+            >= self.max_error_entries.load(Ordering::Relaxed)
+        {
             return;
         }
 
-        map.entry(class)
-            .or_default()
+        let class_map = map.entry(class).or_default();
+        let is_new = !class_map.contains_key(proxy_id);
+        class_map
             .entry(Arc::<str>::from(proxy_id))
             .or_insert_with(|| CachePadded::new(AtomicU64::new(0)))
             .fetch_add(1, Ordering::Relaxed);
+        if is_new {
+            self.error_entry_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn increment_pool_map(&self, map: &DashMap<PoolKind, CachePadded<AtomicU64>>, kind: PoolKind) {
@@ -442,12 +450,12 @@ impl RuntimeMetrics {
 
         let seconds = seconds.max(1);
         let request_delta = request_current.swap(0, Ordering::Relaxed);
-        request_published.store(request_delta / seconds, Ordering::Relaxed);
+        request_published.store(rounding_div(request_delta, seconds), Ordering::Relaxed);
 
         for entry in current.iter() {
             let code = *entry.key();
             let delta = entry.value().swap(0, Ordering::Relaxed);
-            let rate = delta / seconds;
+            let rate = rounding_div(delta, seconds);
             published
                 .entry(code)
                 .or_insert_with(|| AtomicU64::new(0))
@@ -479,10 +487,6 @@ fn increment_status_map(map: &DashMap<u16, CachePadded<AtomicU64>>, status: u16)
             .or_insert_with(|| CachePadded::new(AtomicU64::new(0)))
             .fetch_add(1, Ordering::Relaxed);
     }
-}
-
-fn error_map_len(map: &ErrorCounterMap) -> usize {
-    map.iter().map(|entry| entry.value().len()).sum()
 }
 
 enum StatusWindow {
@@ -641,10 +645,10 @@ fn build_http_snapshot(
         .map(|ps| status_map_from_dashmap(&ps.status_counts))
         .unwrap_or_default();
     let rate_1s = proxy_state
-        .map(|ps| status_rate_map_from_dashmap(&ps.windowed_metrics.status_codes_per_second))
+        .map(|ps| status_map_from_dashmap(&ps.windowed_metrics.status_codes_per_second))
         .unwrap_or_default();
-    let rate_1m = status_rate_map_from_dashmap(&metrics.status_window_1m);
-    let rate_5m = status_rate_map_from_dashmap(&metrics.status_window_5m);
+    let rate_1m = status_map_from_dashmap(&metrics.status_window_1m);
+    let rate_5m = status_map_from_dashmap(&metrics.status_window_5m);
 
     let percent_total = percent_map(&totals, total_requests);
     let requests_1m = metrics.requests_window_1m.load(Ordering::Relaxed);
@@ -671,17 +675,6 @@ fn build_http_snapshot(
 }
 
 fn status_map_from_dashmap(map: &DashMap<u16, AtomicU64>) -> BTreeMap<String, u64> {
-    let mut out = BTreeMap::new();
-    for entry in map.iter() {
-        out.insert(
-            entry.key().to_string(),
-            entry.value().load(Ordering::Relaxed),
-        );
-    }
-    out
-}
-
-fn status_rate_map_from_dashmap(map: &DashMap<u16, AtomicU64>) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
     for entry in map.iter() {
         out.insert(
@@ -765,6 +758,9 @@ fn fold_error_map(
     }
 }
 
+// Covers the shared DnsCache only; the mesh DNS proxy (dns_proxy.rs) resolves
+// from its own DnsResolutionTable and upstream forwarder — those lookups are
+// not counted here.
 fn build_dns_snapshot(
     metrics: &RuntimeMetrics,
     proxy_state: Option<&crate::proxy::ProxyState>,
@@ -893,6 +889,10 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
     }
 }
 
+fn rounding_div(numerator: u64, denominator: u64) -> u64 {
+    (numerator + denominator / 2) / denominator
+}
+
 fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -965,6 +965,26 @@ mod tests {
                 .get(&200)
                 .map(|v| v.load(Ordering::Relaxed)),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn status_window_rotation_rounds_instead_of_truncating() {
+        let metrics = RuntimeMetrics::new();
+        // 59 requests in 60 seconds: truncation gives 0, rounding gives 1.
+        for _ in 0..59 {
+            metrics.record_http_status(200);
+        }
+
+        metrics.rotate_status_window(StatusWindow::OneMinute(60));
+
+        assert_eq!(metrics.requests_window_1m.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics
+                .status_window_1m
+                .get(&200)
+                .map(|v| v.load(Ordering::Relaxed)),
+            Some(1)
         );
     }
 

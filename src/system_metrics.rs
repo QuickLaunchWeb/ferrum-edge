@@ -249,6 +249,8 @@ fn ephemeral_snapshot(
         };
     };
 
+    // Includes in-flight TCP/TLS handshakes (guard created before send()),
+    // so the estimate slightly over-counts during connect bursts.
     let reqwest_backend_requests =
         crate::runtime_metrics::global_ref().reqwest_active_backend_requests();
     let stream_backend_sessions = ps.stream_listener_manager.active_backend_session_estimate();

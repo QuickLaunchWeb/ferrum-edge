@@ -521,7 +521,7 @@ async fn test_runtime_metrics_endpoint_requires_jwt_and_returns_system_json() {
     assert_eq!(last_body["overload"]["level"].as_str(), Some("normal"));
 }
 
-/// Test 7: `/restore` body-size limit — POST a 2 MiB body with a 1 MiB limit → 413.
+/// Test 8: `/restore` body-size limit — POST a 2 MiB body with a 1 MiB limit → 413.
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_restore_body_size_limit() {
@@ -655,7 +655,7 @@ async fn test_restore_body_size_limit() {
     }
 }
 
-/// Test 8: `/restore` with malformed JSON → 400 with parse error in body.
+/// Test 9: `/restore` with malformed JSON → 400 with parse error in body.
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_restore_malformed_json() {
