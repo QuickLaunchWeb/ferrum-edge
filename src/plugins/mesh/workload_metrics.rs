@@ -174,6 +174,8 @@ impl WorkloadMetrics {
     }
 
     fn trace_context_enabled(&self) -> bool {
+        // Span export can be disabled while propagation stays enabled; Telemetry
+        // provider config and sampling still require trace metadata on the request.
         self.span_reporting_disabled
             || self.sampling_percentage.is_some()
             || !self.tracing_providers.is_empty()
@@ -354,6 +356,8 @@ impl WorkloadMetrics {
         if metadata_has_sampling_decision(metadata) {
             return false;
         }
+        // No upstream decision was present. Use local sampling so direct stream
+        // summaries can still produce spans even though they never saw headers.
         self.sampling_percentage.is_some_and(trace_sampled)
     }
 
@@ -404,7 +408,10 @@ impl WorkloadMetrics {
         let Some(span) = span else {
             return;
         };
-        for exporter in &self.trace_exporters {
+        let Some((last_exporter, earlier_exporters)) = self.trace_exporters.split_last() else {
+            return;
+        };
+        for exporter in earlier_exporters {
             if let Err(error) = exporter.try_export(span.clone()) {
                 tracing::warn!(
                     provider = exporter.provider_name(),
@@ -412,6 +419,13 @@ impl WorkloadMetrics {
                     error
                 );
             }
+        }
+        if let Err(error) = last_exporter.try_export(span) {
+            tracing::warn!(
+                provider = last_exporter.provider_name(),
+                "workload_metrics tracing export buffer full — dropping span: {}",
+                error
+            );
         }
     }
 }
