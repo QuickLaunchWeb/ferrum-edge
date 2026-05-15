@@ -1102,7 +1102,6 @@ fn apply_destination_rules(
                     if proxy.upstream_id.as_deref() == Some(upstream_id.as_str())
                         && proxy.backend_connect_timeout_ms != timeout_ms
                     {
-                        let now = chrono::Utc::now();
                         debug!(
                             proxy = %proxy.id,
                             upstream = %upstream_id,
@@ -1112,7 +1111,6 @@ fn apply_destination_rules(
                             "DestinationRule overriding proxy backend_connect_timeout_ms"
                         );
                         proxy.backend_connect_timeout_ms = timeout_ms;
-                        proxy.updated_at = now;
                     }
                 }
             }

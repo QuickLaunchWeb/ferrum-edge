@@ -27,7 +27,7 @@ use super::{
 use crate::config::types::{
     BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
     MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH, MAX_TARGET_WEIGHT, PluginConfig, Proxy,
-    RetryConfig,
+    RetryConfig, validate_backend_tls_san_allow_list_entry, validate_backend_tls_sni,
 };
 
 const URI_LESS_MATCH_LISTEN_PATH: &str = "~.*";
@@ -877,6 +877,20 @@ fn translate_client_tls_settings(
                 ),
             ));
         }
+        if let Err(e) = validate_backend_tls_san_allow_list_entry(san) {
+            return Err(invalid_resource(
+                object,
+                format!("trafficPolicy.tls.subjectAltNames[{idx}]: {e}"),
+            ));
+        }
+    }
+    if let Some(ref sni_value) = sni
+        && let Err(e) = validate_backend_tls_sni(sni_value)
+    {
+        return Err(invalid_resource(
+            object,
+            format!("trafficPolicy.tls.sni: {e}"),
+        ));
     }
     let insecure_skip_verify = value
         .get("insecureSkipVerify")
@@ -8231,6 +8245,53 @@ mod tests {
                 .contains("subjectAltNames[0] must not exceed"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_rejects_invalid_sni() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "sni": "*.mesh.internal"
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("wildcard SNI must fail");
+
+        assert!(
+            err.to_string().contains("trafficPolicy.tls.sni"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn translates_destination_rule_tls_rejects_invalid_san_content() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "SIMPLE",
+                            "subjectAltNames": ["spiffe://cluster.local"]
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("SPIFFE URI without path must fail");
+
+        assert!(err.to_string().contains("subjectAltNames[0]"), "got: {err}");
     }
 
     #[test]

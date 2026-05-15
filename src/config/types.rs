@@ -3822,17 +3822,13 @@ pub(crate) fn validate_backend_tls_san_allow_list_entry(san: &str) -> Result<(),
     if san.parse::<std::net::IpAddr>().is_ok() {
         return Ok(());
     }
-    let spiffe_rest = san
-        .strip_prefix("spiffe://")
-        .or_else(|| san.strip_prefix("SPIFFE://"))
-        .or_else(|| {
-            let lower = san.get(..9)?;
-            if lower.eq_ignore_ascii_case("spiffe://") {
-                Some(&san[9..])
-            } else {
-                None
-            }
-        });
+    let spiffe_rest = san.get(..9).and_then(|prefix| {
+        if prefix.eq_ignore_ascii_case("spiffe://") {
+            Some(&san[9..])
+        } else {
+            None
+        }
+    });
     if let Some(rest) = spiffe_rest {
         let has_path = rest
             .find('/')
