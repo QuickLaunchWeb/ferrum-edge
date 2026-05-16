@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use crate::identity::spiffe::{SpiffeId, TrustDomain};
 use crate::identity::{JwtAuthority as IdentityJwtAuthority, TrustBundle as IdentityTrustBundle};
@@ -423,27 +424,45 @@ pub struct MeshTelemetryConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshTracingConfig {
+    /// Optional Istio tracing mode selector. Ferrum emits server-side gateway
+    /// spans in this phase, so translation only carries entries applying to
+    /// server mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<TelemetryTracingMode>,
     /// Sampling percentage 0.0–100.0. `None` inherits from less-specific Telemetry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling_percentage: Option<f64>,
+    /// Istio `disableSpanReporting`.
+    #[serde(
+        default,
+        alias = "disableSpanReporting",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub disable_span_reporting: Option<bool>,
     /// Literal/environment custom tags injected into every span / transaction metadata.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_tags: HashMap<String, String>,
     /// Custom tags resolved from request headers at runtime.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_header_tags: HashMap<String, String>,
-    /// Provider-specific tracing backend (Zipkin / Datadog / Lightstep / OpenTelemetry).
+    /// Provider-specific tracing backends (Zipkin / Datadog / Lightstep / OpenTelemetry).
     ///
-    /// Mirrors Istio's `Telemetry.tracing[].providers[]`. Old DPs reading new
-    /// slices ignore this field (serde defaults to `None`); new DPs reading
-    /// old slices behave identically to today (provider is `None`, no
-    /// behavior change). A future mesh-wide-default surface (Istio
-    /// `meshConfig.defaultProviders`) can be threaded in alongside without
-    /// changing this field — the slice merge already picks the most-specific
-    /// applicable Telemetry's provider, and the default-providers map would
-    /// simply seed `None` slots before merge.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<TracingProvider>,
+    /// The legacy singular `provider` spelling deserializes into this vector
+    /// for back-compat, but new slices serialize only `providers`.
+    #[serde(
+        default,
+        alias = "provider",
+        deserialize_with = "deserialize_tracing_providers",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub providers: Vec<TracingProvider>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryTracingMode {
+    Client,
+    Server,
 }
 
 /// Tracing backend selection for a `MeshTracingConfig`.
@@ -454,7 +473,7 @@ pub struct MeshTracingConfig {
 /// shim on older DPs (serde will simply fail to deserialise an unknown
 /// variant and the slice update is rejected at slice-apply time, consistent
 /// with the rest of the mesh slice contract).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "config")]
 pub enum TracingProvider {
     Zipkin {
@@ -467,12 +486,55 @@ pub enum TracingProvider {
     },
     Lightstep {
         collector_url: String,
-        access_token: String,
+        #[serde(alias = "accessTokenEnv")]
+        access_token_env: String,
     },
     #[serde(rename = "opentelemetry")]
     OpenTelemetry {
         endpoint: String,
     },
+}
+
+impl fmt::Debug for TracingProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zipkin { url } => f.debug_struct("Zipkin").field("url", url).finish(),
+            Self::Datadog { agent_url, service } => f
+                .debug_struct("Datadog")
+                .field("agent_url", agent_url)
+                .field("service", service)
+                .finish(),
+            Self::Lightstep {
+                collector_url,
+                access_token_env,
+            } => f
+                .debug_struct("Lightstep")
+                .field("collector_url", collector_url)
+                .field("access_token_env", access_token_env)
+                .finish(),
+            Self::OpenTelemetry { endpoint } => f
+                .debug_struct("OpenTelemetry")
+                .field("endpoint", endpoint)
+                .finish(),
+        }
+    }
+}
+
+fn deserialize_tracing_providers<'de, D>(deserializer: D) -> Result<Vec<TracingProvider>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    if value.is_array() {
+        serde_json::from_value(value).map_err(serde::de::Error::custom)
+    } else {
+        serde_json::from_value(value)
+            .map(|provider| vec![provider])
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

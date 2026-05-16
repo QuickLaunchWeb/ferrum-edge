@@ -1,10 +1,11 @@
 //! Tests for otel_tracing plugin
 
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, TransactionSummary,
-    otel_tracing::OtelTracing, utils::PluginHttpClient,
+    ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, StreamTransactionSummary,
+    TransactionSummary, mesh::workload_metrics::WorkloadMetrics, otel_tracing::OtelTracing,
+    utils::PluginHttpClient,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 fn new_otel(config: &serde_json::Value) -> OtelTracing {
@@ -58,6 +59,99 @@ fn make_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         mirror: false,
         metadata,
     }
+}
+
+fn make_trace_metadata() -> HashMap<String, String> {
+    HashMap::from([
+        (
+            "trace_id".to_string(),
+            "abcdef1234567890abcdef1234567890".to_string(),
+        ),
+        ("span_id".to_string(), "1234567890abcdef".to_string()),
+        ("trace_sampled".to_string(), "true".to_string()),
+    ])
+}
+
+fn make_trace_metadata_without_sampling() -> HashMap<String, String> {
+    HashMap::from([
+        (
+            "trace_id".to_string(),
+            "abcdef1234567890abcdef1234567890".to_string(),
+        ),
+        ("span_id".to_string(), "1234567890abcdef".to_string()),
+    ])
+}
+
+fn make_stream_summary(metadata: HashMap<String, String>) -> StreamTransactionSummary {
+    StreamTransactionSummary {
+        namespace: "ferrum".to_string(),
+        proxy_id: "tcp-proxy".to_string(),
+        proxy_name: Some("postgres".to_string()),
+        client_ip: "10.0.0.1".to_string(),
+        consumer_username: Some("alice".to_string()),
+        auth_method: None,
+        backend_target: "10.0.0.20:5432".to_string(),
+        backend_resolved_ip: Some("10.0.0.20".to_string()),
+        protocol: "tcp".to_string(),
+        listen_port: 5432,
+        duration_ms: 42.0,
+        bytes_sent: 128,
+        bytes_received: 512,
+        connection_error: None,
+        error_class: None,
+        disconnect_direction: None,
+        disconnect_cause: None,
+        timestamp_connected: "2026-03-23T12:00:00Z".to_string(),
+        timestamp_disconnected: "2026-03-23T12:00:00.042Z".to_string(),
+        sni_hostname: None,
+        metadata,
+    }
+}
+
+async fn received_json(server: &wiremock::MockServer) -> serde_json::Value {
+    for _ in 0..20 {
+        if let Some(requests) = server.received_requests().await
+            && let Some(request) = requests.first()
+        {
+            return request.body_json().expect("valid JSON body");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("mock server did not receive exporter request");
+}
+
+async fn assert_no_requests(server: &wiremock::MockServer) {
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+fn otlp_span(payload: &Value) -> &Value {
+    &payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+}
+
+fn otlp_attr_value<'a>(span: &'a Value, key: &str) -> Option<&'a Value> {
+    span.get("attributes")?
+        .as_array()?
+        .iter()
+        .find(|attr| attr.get("key").and_then(Value::as_str) == Some(key))
+        .and_then(|attr| attr.get("value"))
+}
+
+fn otlp_string_attr<'a>(span: &'a Value, key: &str) -> Option<&'a str> {
+    otlp_attr_value(span, key).and_then(|value| value.get("stringValue")?.as_str())
+}
+
+fn otlp_bool_attr(span: &Value, key: &str) -> Option<bool> {
+    otlp_attr_value(span, key).and_then(|value| value.get("boolValue")?.as_bool())
+}
+
+fn otlp_resource_string_attr<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
+    payload["resourceSpans"][0]["resource"]["attributes"]
+        .as_array()?
+        .iter()
+        .find(|attr| attr.get("key").and_then(Value::as_str) == Some(key))
+        .and_then(|attr| attr.get("value"))
+        .and_then(|value| value.get("stringValue")?.as_str())
 }
 
 fn make_rich_summary(metadata: HashMap<String, String>) -> TransactionSummary {
@@ -386,6 +480,340 @@ async fn test_otel_tracing_with_otlp_endpoint() {
 }
 
 #[tokio::test]
+async fn test_otel_tracing_exports_stream_disconnect_span() {
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/traces"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = new_otel(&json!({
+        "endpoint": format!("{}/v1/traces", mock_server.uri()),
+        "batch_size": 1,
+        "flush_interval_ms": 100
+    }));
+
+    plugin
+        .on_stream_disconnect(&make_stream_summary(make_trace_metadata()))
+        .await;
+
+    let payload = received_json(&mock_server).await;
+    let span = &payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+    assert_eq!(span["name"], "tcp 10.0.0.20:5432");
+    let attributes = span["attributes"].as_array().expect("span attributes");
+    let protocol = attributes
+        .iter()
+        .find(|attribute| attribute["key"].as_str() == Some("network.protocol.name"))
+        .expect("network protocol attribute");
+    assert_eq!(protocol["value"]["stringValue"], "tcp");
+    let bytes_sent = attributes
+        .iter()
+        .find(|attribute| attribute["key"].as_str() == Some("gateway.stream.bytes_sent"))
+        .expect("bytes sent attribute");
+    assert_eq!(bytes_sent["value"]["intValue"], "128");
+}
+
+#[tokio::test]
+async fn test_workload_metrics_opentelemetry_exporter_payload() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/traces"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "tracing_providers": [{
+            "kind": "opentelemetry",
+            "config": {
+                "endpoint": format!("{}/v1/traces", mock_server.uri())
+            }
+        }]
+    }))
+    .expect("workload metrics with otlp provider");
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    let payload = received_json(&mock_server).await;
+    assert_eq!(
+        otlp_resource_string_attr(&payload, "service.name"),
+        Some("reviews")
+    );
+    assert_eq!(
+        payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
+        "GET /api/test"
+    );
+}
+
+#[tokio::test]
+async fn test_workload_metrics_zipkin_exporter_payload() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/api/v2/spans"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "tracing_providers": [{
+            "kind": "zipkin",
+            "config": {
+                "url": format!("{}/api/v2/spans", mock_server.uri())
+            }
+        }]
+    }))
+    .expect("workload metrics with zipkin provider");
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    let payload = received_json(&mock_server).await;
+    assert_eq!(payload[0]["localEndpoint"]["serviceName"], "reviews");
+    assert_eq!(payload[0]["name"], "GET /api/test");
+    assert_eq!(payload[0]["tags"]["http.status_code"], "200");
+}
+
+#[tokio::test]
+async fn test_workload_metrics_datadog_exporter_payload() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("PUT"))
+        .and(wiremock::matchers::path("/v0.3/traces"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews-default",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "tracing_providers": [{
+            "kind": "datadog",
+            "config": {
+                "agent_url": mock_server.uri(),
+                "service": "reviews"
+            }
+        }]
+    }))
+    .expect("workload metrics with datadog provider");
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    let payload = received_json(&mock_server).await;
+    assert_eq!(payload[0][0]["service"], "reviews");
+    assert_eq!(payload[0][0]["resource"], "GET /api/test");
+    assert_eq!(payload[0][0]["meta"]["http.method"], "GET");
+}
+
+#[tokio::test]
+async fn test_workload_metrics_lightstep_exporter_uses_otlp_bearer_payload() {
+    // SAFETY: This test uses a unique process env key and only reads it during
+    // plugin construction. No other test in this module mutates the same key.
+    unsafe { std::env::set_var("FERRUM_TEST_LIGHTSTEP_TOKEN", "test-token") };
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/traces/otlp"))
+        .and(wiremock::matchers::header(
+            "Authorization",
+            "Bearer test-token",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "tracing_providers": [{
+            "kind": "lightstep",
+            "config": {
+                "collector_url": format!("{}/traces/otlp", mock_server.uri()),
+                "access_token_env": "FERRUM_TEST_LIGHTSTEP_TOKEN"
+            }
+        }]
+    }))
+    .expect("workload metrics with lightstep provider");
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    let payload = received_json(&mock_server).await;
+    assert_eq!(
+        payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
+        "GET /api/test"
+    );
+    // SAFETY: Paired cleanup for the unique key set above.
+    unsafe { std::env::remove_var("FERRUM_TEST_LIGHTSTEP_TOKEN") };
+}
+
+#[tokio::test]
+async fn test_workload_metrics_multi_provider_fanout() {
+    let zipkin = wiremock::MockServer::start().await;
+    let otlp = wiremock::MockServer::start().await;
+    for (server, path) in [(&zipkin, "/api/v2/spans"), (&otlp, "/v1/traces")] {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(path))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "tracing_providers": [
+            {
+                "kind": "zipkin",
+                "config": {
+                    "url": format!("{}/api/v2/spans", zipkin.uri())
+                }
+            },
+            {
+                "kind": "opentelemetry",
+                "config": {
+                    "endpoint": format!("{}/v1/traces", otlp.uri())
+                }
+            }
+        ]
+    }))
+    .expect("workload metrics with multiple providers");
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    let zipkin_payload = received_json(&zipkin).await;
+    let otlp_payload = received_json(&otlp).await;
+    assert_eq!(zipkin_payload[0]["name"], "GET /api/test");
+    assert_eq!(
+        otlp_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
+        "GET /api/test"
+    );
+}
+
+#[tokio::test]
+async fn test_otel_tracing_batches_two_spans_before_export() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = new_otel(&json!({
+        "endpoint": format!("{}/v1/traces", mock_server.uri()),
+        "batch_size": 2,
+        "flush_interval_ms": 5000
+    }));
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+    let mut second_metadata = make_trace_metadata();
+    second_metadata.insert("span_id".to_string(), "fedcba0987654321".to_string());
+    plugin.log(&make_summary(second_metadata)).await;
+
+    let payload = received_json(&mock_server).await;
+    let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .expect("OTLP spans");
+    assert_eq!(spans.len(), 2);
+}
+
+#[tokio::test]
+async fn test_workload_metrics_provider_without_sampling_does_not_export() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "tracing_providers": [{
+            "kind": "opentelemetry",
+            "config": {
+                "endpoint": format!("{}/v1/traces", mock_server.uri())
+            }
+        }]
+    }))
+    .expect("workload metrics with otlp provider");
+
+    plugin
+        .log(&make_summary(make_trace_metadata_without_sampling()))
+        .await;
+    drop(plugin);
+    assert_no_requests(&mock_server).await;
+}
+
+#[tokio::test]
+async fn test_workload_metrics_explicit_unsampled_metadata_does_not_export() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "tracing_providers": [{
+            "kind": "opentelemetry",
+            "config": {
+                "endpoint": format!("{}/v1/traces", mock_server.uri())
+            }
+        }]
+    }))
+    .expect("workload metrics with otlp provider");
+
+    let mut metadata = make_trace_metadata();
+    metadata.insert("trace_sampled".to_string(), "false".to_string());
+    plugin.log(&make_summary(metadata)).await;
+    drop(plugin);
+    assert_no_requests(&mock_server).await;
+}
+
+#[tokio::test]
+async fn test_workload_metrics_disable_span_reporting_suppresses_export() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "span_reporting_disabled": true,
+        "batch_size": 1,
+        "tracing_providers": [{
+            "kind": "zipkin",
+            "config": {
+                "url": format!("{}/api/v2/spans", mock_server.uri())
+            }
+        }]
+    }))
+    .expect("disabled workload metrics tracing provider");
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+    drop(plugin);
+    assert_no_requests(&mock_server).await;
+}
+
+#[tokio::test]
 async fn test_otel_tracing_otlp_with_authorization() {
     let mock_server = wiremock::MockServer::start().await;
 
@@ -519,11 +947,28 @@ async fn test_otel_tracing_rich_span_attributes() {
     let summary = make_rich_summary(metadata);
     plugin.log(&summary).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    // Verify the mock was called (wiremock expect handles this)
-    // The rich attributes (user_agent, route, backend_target, etc.) are included
-    // in the OTLP payload — we verify they don't break serialization or export.
+    let payload = received_json(&mock_server).await;
+    let span = otlp_span(&payload);
+    assert_eq!(span["name"], "POST /api/llm/chat");
+    assert_eq!(otlp_string_attr(span, "enduser.id"), Some("alice"));
+    assert_eq!(
+        otlp_string_attr(span, "user_agent.original"),
+        Some("MyApp/1.0")
+    );
+    assert_eq!(otlp_string_attr(span, "gateway.proxy.id"), Some("proxy-1"));
+    assert_eq!(otlp_string_attr(span, "http.route"), Some("llm-service"));
+    assert_eq!(
+        otlp_string_attr(span, "server.address"),
+        Some("http://backend:8080/chat")
+    );
+    assert_eq!(
+        otlp_string_attr(span, "server.socket.address"),
+        Some("10.1.2.3")
+    );
+    assert_eq!(
+        otlp_bool_attr(span, "gateway.response.streamed"),
+        Some(true)
+    );
 }
 
 #[tokio::test]
@@ -559,15 +1004,74 @@ async fn test_otel_tracing_error_span_events() {
 
     plugin.log(&summary).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let payload = received_json(&mock_server).await;
+    let span = otlp_span(&payload);
+    assert_eq!(span["status"]["code"], 2);
+    let event_names: Vec<&str> = span["events"]
+        .as_array()
+        .expect("span events")
+        .iter()
+        .filter_map(|event| event["name"].as_str())
+        .collect();
+    assert!(event_names.contains(&"exception"));
+    assert!(event_names.contains(&"client.disconnect"));
+}
+
+#[tokio::test]
+async fn test_otel_tracing_clamps_negative_duration_for_otlp() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = new_otel(&json!({
+        "endpoint": format!("{}/v1/traces", mock_server.uri()),
+        "batch_size": 1,
+        "flush_interval_ms": 100
+    }));
+
+    let mut summary = make_summary(make_trace_metadata());
+    summary.latency_total_ms = -5.0;
+    plugin.log(&summary).await;
+
+    let payload = received_json(&mock_server).await;
+    let span = otlp_span(&payload);
+    let start_ns = span["startTimeUnixNano"]
+        .as_str()
+        .expect("startTimeUnixNano")
+        .parse::<i64>()
+        .expect("numeric start time");
+    let end_ns = span["endTimeUnixNano"]
+        .as_str()
+        .expect("endTimeUnixNano")
+        .parse::<i64>()
+        .expect("numeric end time");
+    assert_eq!(end_ns, start_ns);
 }
 
 #[tokio::test]
 async fn test_otel_tracing_deployment_environment() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
     let plugin = new_otel(&json!({
-        "deployment_environment": "production"
+        "endpoint": format!("{}/v1/traces", mock_server.uri()),
+        "deployment_environment": "production",
+        "batch_size": 1,
+        "flush_interval_ms": 100
     }));
 
-    // Plugin should be created with environment set
-    assert_eq!(plugin.name(), "otel_tracing");
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    let payload = received_json(&mock_server).await;
+    assert_eq!(
+        otlp_resource_string_attr(&payload, "deployment.environment"),
+        Some("production")
+    );
 }

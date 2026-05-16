@@ -1944,7 +1944,7 @@ pub fn create_plugin_with_http_client(
             http_client,
         )?))),
         "workload_metrics" => Ok(Some(Arc::new(
-            mesh::workload_metrics::WorkloadMetrics::new(config)?,
+            mesh::workload_metrics::WorkloadMetrics::new_with_http_client(config, http_client)?,
         ))),
         "access_log" => Ok(Some(Arc::new(access_log::AccessLog::new(config)?))),
         _ => {
