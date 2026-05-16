@@ -4118,3 +4118,48 @@ fn test_pool_shard_amount_zero_kept_as_auto_sentinel() {
         },
     );
 }
+
+#[test]
+fn test_k8s_istio_root_namespace_defaults_to_istio_system() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_K8S_ISTIO_ROOT_NAMESPACE");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.k8s_istio_root_namespace, "istio-system");
+        },
+    );
+}
+
+#[test]
+fn test_k8s_istio_root_namespace_parsed_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_K8S_ISTIO_ROOT_NAMESPACE", "istio-config"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.k8s_istio_root_namespace, "istio-config");
+        },
+    );
+}
+
+#[test]
+fn test_k8s_istio_root_namespace_rejects_invalid_k8s_namespace() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_K8S_ISTIO_ROOT_NAMESPACE", "Istio_System"),
+        ],
+        || {
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(err.contains("FERRUM_K8S_ISTIO_ROOT_NAMESPACE"));
+        },
+    );
+}

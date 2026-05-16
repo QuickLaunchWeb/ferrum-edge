@@ -559,6 +559,7 @@ fn gateway_config_from_mesh_slice(
             trust_bundles: slice.trust_bundles.clone(),
             multi_cluster: slice.multi_cluster.clone(),
             outbound_traffic_policy: slice.outbound_traffic_policy,
+            ..MeshConfig::default()
         })),
         loaded_at,
         ..GatewayConfig::default()
