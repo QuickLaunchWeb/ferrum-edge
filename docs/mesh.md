@@ -1080,7 +1080,7 @@ Delta-xDS subscriptions across the same type URLs are additive: `resource_names_
 Delta-xDS responses ship only resources the client doesn't already have. Each resource carries a content-derived per-resource version — the first 8 bytes (16 hex chars) of `SHA-256(type_url || 0x00 || name || 0x00 || value)`, independent of the aggregate snapshot version. The truncation is a wire-size optimization: at typical mesh-resource cardinalities (~10k per type URL) the birthday-bound collision probability sits around 3e-12, and the delta filter additionally byte-compares `value` against the previous snapshot before skipping a resource so a hash collision on its own cannot suppress a real content change. Two snapshots that contain byte-identical bytes for a resource produce identical resource versions, so:
 
 - `DeltaDiscoveryRequest.initial_resource_versions` lets a client report what it currently has after a reconnect — resources whose versions match are skipped on the response.
-- Resources that were on the previous response over the same stream and whose bytes haven't changed are skipped on the next response.
+- Resources that were on the previous ACKed response for the same type URL and whose bytes haven't changed are skipped on the next response.
 - Explicit `resource_names_subscribe` always re-flows the resource even when unchanged, so a re-subscribe always returns a fresh copy.
 
 ECDS `TypedExtensionConfig` resources remain a staged follow-up in the GAP-2L track.

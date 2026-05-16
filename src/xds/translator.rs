@@ -31,9 +31,9 @@ pub fn translate_mesh_slice_to_snapshot(slice: &MeshSlice) -> XdsSnapshot {
     // Per-resource versions are content-derived so two snapshots with the
     // same resource bytes carry identical resource versions. This is the
     // basis for delta xDS wire-byte reduction: clients that report the
-    // resource via `initial_resource_versions` (or that previously received
-    // it on this stream) get the resource skipped on the next response when
-    // its content hasn't changed. The aggregate `snapshot.version` still
+    // resource via `initial_resource_versions` (or that previously ACKed it on
+    // this stream) get the resource skipped on the next response when its
+    // content hasn't changed. The aggregate `snapshot.version` still
     // changes whenever any resource bytes change.
     //
     // The per-resource hash deliberately excludes `slice.version` so a slice

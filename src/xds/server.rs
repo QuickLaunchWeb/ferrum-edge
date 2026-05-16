@@ -379,7 +379,7 @@ impl XdsAdsServer {
         //      version map, sent in the first delta request after a
         //      reconnect; or
         //   2. the server-side `previous` snapshot, when we know what the
-        //      client received last over this stream.
+        //      client ACKed last for this type URL over this stream.
         //
         // If neither source has the resource, treat it as new and include
         // it. `resource.version` is always server-computed (see
@@ -390,6 +390,8 @@ impl XdsAdsServer {
         // `value` byte-equality check against the previous snapshot is a
         // defensive guard against the 64-bit truncation in the per-resource
         // hash.
+        let explicit_wildcard_subscribe =
+            explicitly_subscribed_names.iter().any(|name| name == "*");
         let explicit_subscribe_set: HashSet<&str> = explicitly_subscribed_names
             .iter()
             .map(String::as_str)
@@ -400,7 +402,9 @@ impl XdsAdsServer {
         let resources: Vec<_> = candidates
             .into_iter()
             .filter(|resource| {
-                if explicit_subscribe_set.contains(resource.name.as_str()) {
+                if explicit_wildcard_subscribe
+                    || explicit_subscribe_set.contains(resource.name.as_str())
+                {
                     return true;
                 }
                 if let Some(client_version) = initial_resource_versions.get(&resource.name)
@@ -656,7 +660,25 @@ impl XdsAdsServer {
         request: &DeltaDiscoveryRequest,
         previous: Option<&XdsSnapshot>,
     ) -> Option<(Arc<XdsSnapshot>, DeltaDiscoveryResponse)> {
-        self.delta_response_for_request_with_fingerprint(
+        let _ = self.record_and_log_delta_ack(node_id, request);
+        self.delta_response_for_stream_request_without_ack(
+            node_id,
+            stream_config,
+            subscriptions,
+            request,
+            previous,
+        )
+    }
+
+    fn delta_response_for_stream_request_without_ack(
+        &self,
+        node_id: &str,
+        stream_config: &XdsStreamConfig,
+        subscriptions: &mut HashMap<String, XdsSubscription>,
+        request: &DeltaDiscoveryRequest,
+        previous: Option<&XdsSnapshot>,
+    ) -> Option<(Arc<XdsSnapshot>, DeltaDiscoveryResponse)> {
+        self.delta_response_for_request_with_fingerprint_without_ack(
             node_id,
             &stream_config.config,
             &stream_config.fingerprint,
@@ -675,32 +697,26 @@ impl XdsAdsServer {
         request: &DeltaDiscoveryRequest,
         previous: Option<&XdsSnapshot>,
     ) -> Option<(Arc<XdsSnapshot>, DeltaDiscoveryResponse)> {
-        if !request.response_nonce.is_empty() {
-            match self.record_delta_ack(node_id, request) {
-                AckOutcome::Acked | AckOutcome::VersionDrift { .. } => debug!(
-                    node_id = %node_id,
-                    type_url = %request.type_url,
-                    "xDS delta ACK accepted"
-                ),
-                AckOutcome::Nacked { message } => {
-                    warn!(
-                        node_id = %node_id,
-                        type_url = %request.type_url,
-                        error = %message,
-                        "xDS delta NACK received"
-                    );
-                }
-                outcome => {
-                    warn!(
-                        node_id = %node_id,
-                        type_url = %request.type_url,
-                        outcome = ?outcome,
-                        "xDS delta ACK ignored"
-                    );
-                }
-            }
-        }
+        let _ = self.record_and_log_delta_ack(node_id, request);
+        self.delta_response_for_request_with_fingerprint_without_ack(
+            node_id,
+            config,
+            fingerprint,
+            subscriptions,
+            request,
+            previous,
+        )
+    }
 
+    fn delta_response_for_request_with_fingerprint_without_ack(
+        &self,
+        node_id: &str,
+        config: &GatewayConfig,
+        fingerprint: &XdsConfigFingerprint,
+        subscriptions: &mut HashMap<String, XdsSubscription>,
+        request: &DeltaDiscoveryRequest,
+        previous: Option<&XdsSnapshot>,
+    ) -> Option<(Arc<XdsSnapshot>, DeltaDiscoveryResponse)> {
         let previous_subscription = subscriptions.get(&request.type_url);
         let (subscription, resource_names_changed, explicit_subscription_request) =
             build_delta_subscription(
@@ -729,6 +745,41 @@ impl XdsAdsServer {
         } else {
             None
         }
+    }
+
+    fn record_and_log_delta_ack(
+        &self,
+        node_id: &str,
+        request: &DeltaDiscoveryRequest,
+    ) -> Option<AckOutcome> {
+        if request.response_nonce.is_empty() {
+            return None;
+        }
+        let outcome = self.record_delta_ack(node_id, request);
+        match &outcome {
+            AckOutcome::Acked | AckOutcome::VersionDrift { .. } => debug!(
+                node_id = %node_id,
+                type_url = %request.type_url,
+                "xDS delta ACK accepted"
+            ),
+            AckOutcome::Nacked { message } => {
+                warn!(
+                    node_id = %node_id,
+                    type_url = %request.type_url,
+                    error = %message,
+                    "xDS delta NACK received"
+                );
+            }
+            outcome => {
+                warn!(
+                    node_id = %node_id,
+                    type_url = %request.type_url,
+                    outcome = ?outcome,
+                    "xDS delta ACK ignored"
+                );
+            }
+        }
+        Some(outcome)
     }
 
     fn delta_responses_for_subscriptions(
@@ -787,6 +838,35 @@ impl XdsAdsServer {
             &stream_config.fingerprint,
             previous,
         )
+    }
+
+    fn delta_responses_for_stream_config_with_previous_by_type(
+        &self,
+        node_id: &str,
+        subscriptions: &HashMap<String, XdsSubscription>,
+        stream_config: &XdsStreamConfig,
+        previous_by_type: &HashMap<String, Arc<XdsSnapshot>>,
+    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
+        let snapshot = self.snapshot_for_stream_config(node_id, stream_config);
+        let responses = subscriptions
+            .values()
+            .filter_map(|subscription| {
+                let previous = previous_by_type
+                    .get(&subscription.type_url)
+                    .map(Arc::as_ref);
+                subscription_resources_changed(previous, &snapshot, subscription).then(|| {
+                    self.delta_response(
+                        &snapshot,
+                        previous,
+                        subscription,
+                        &HashMap::new(),
+                        &[],
+                        &[],
+                    )
+                })
+            })
+            .collect();
+        (snapshot, responses)
     }
 
     fn delta_responses_for_subscriptions_from_config_with_fingerprint(
@@ -1087,7 +1167,9 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             let mut subscriptions: HashMap<String, XdsSubscription> = HashMap::new();
             let mut stream_config =
                 XdsStreamConfig::new(server.config.load_full().as_ref().clone());
-            let mut last_snapshot: Option<Arc<XdsSnapshot>> = None;
+            let mut last_sent_snapshot_by_type: HashMap<String, Arc<XdsSnapshot>> = HashMap::new();
+            let mut last_accepted_snapshot_by_type: HashMap<String, Arc<XdsSnapshot>> =
+                HashMap::new();
             loop {
                 tokio::select! {
                     maybe_request = requests.next() => {
@@ -1124,18 +1206,28 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             server.catch_up_pending_updates(&mut updates, &mut stream_config);
                         }
 
-                        let previous = last_snapshot.clone();
-                        if let Some((snapshot, response)) = server.delta_response_for_stream_request(
+                        let ack_outcome = server.record_and_log_delta_ack(&current_node_id, &request);
+                        remember_delta_accepted_snapshot(
+                            ack_outcome.as_ref(),
+                            &request.type_url,
+                            &last_sent_snapshot_by_type,
+                            &mut last_accepted_snapshot_by_type,
+                        );
+                        let previous = last_accepted_snapshot_by_type
+                            .get(&request.type_url)
+                            .cloned();
+                        if let Some((snapshot, response)) = server.delta_response_for_stream_request_without_ack(
                             &current_node_id,
                             &stream_config,
                             &mut subscriptions,
                             &request,
                             previous.as_deref(),
                         ) {
-                            last_snapshot = Some(snapshot);
+                            let response_type_url = response.type_url.clone();
                             if tx.send(Ok(response)).await.is_err() {
                                 return;
                             }
+                            last_sent_snapshot_by_type.insert(response_type_url, snapshot);
                         }
                     }
                     update = updates.recv() => {
@@ -1151,17 +1243,19 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
-                                let (snapshot, responses) = server.delta_responses_for_stream_config_with_previous(
+                                let (snapshot, responses) = server.delta_responses_for_stream_config_with_previous_by_type(
                                     current_node_id,
                                     &subscriptions,
                                     &stream_config,
-                                    last_snapshot.as_deref(),
+                                    &last_accepted_snapshot_by_type,
                                 );
-                                last_snapshot = Some(snapshot);
                                 for response in responses {
+                                    let response_type_url = response.type_url.clone();
                                     if tx.send(Ok(response)).await.is_err() {
                                         return;
                                     }
+                                    last_sent_snapshot_by_type
+                                        .insert(response_type_url, Arc::clone(&snapshot));
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -1175,17 +1269,19 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
-                                let (snapshot, responses) = server.delta_responses_for_stream_config_with_previous(
+                                let (snapshot, responses) = server.delta_responses_for_stream_config_with_previous_by_type(
                                     current_node_id,
                                     &subscriptions,
                                     &stream_config,
-                                    last_snapshot.as_deref(),
+                                    &last_accepted_snapshot_by_type,
                                 );
-                                last_snapshot = Some(snapshot);
                                 for response in responses {
+                                    let response_type_url = response.type_url.clone();
                                     if tx.send(Ok(response)).await.is_err() {
                                         return;
                                     }
+                                    last_sent_snapshot_by_type
+                                        .insert(response_type_url, Arc::clone(&snapshot));
                                 }
                             }
                             Err(broadcast::error::RecvError::Closed) => return,
@@ -1219,6 +1315,23 @@ fn resolve_stream_node_id(
         (Some(current), Some(requested)) => Err(Status::invalid_argument(format!(
             "xDS Node.id cannot change on an established stream: {current} -> {requested}"
         ))),
+    }
+}
+
+fn remember_delta_accepted_snapshot(
+    ack_outcome: Option<&AckOutcome>,
+    type_url: &str,
+    last_sent_by_type: &HashMap<String, Arc<XdsSnapshot>>,
+    last_accepted_by_type: &mut HashMap<String, Arc<XdsSnapshot>>,
+) {
+    if !matches!(
+        ack_outcome,
+        Some(AckOutcome::Acked | AckOutcome::VersionDrift { .. })
+    ) {
+        return;
+    }
+    if let Some(snapshot) = last_sent_by_type.get(type_url) {
+        last_accepted_by_type.insert(type_url.to_string(), Arc::clone(snapshot));
     }
 }
 
@@ -2470,7 +2583,7 @@ mod tests {
     // - Resources known via `initial_resource_versions` with a matching version
     //   are omitted (the client already has the same bytes).
     // - Resources whose previous snapshot version + value match are omitted
-    //   (no change since the last response on this stream).
+    //   (no change since the last ACKed response for this type URL).
     // - Explicit re-subscribes still re-flow a fresh copy of the resource.
 
     #[test]
@@ -2618,6 +2731,77 @@ mod tests {
             vec![cluster_name],
             "explicit re-subscribe should re-flow the resource even when unchanged"
         );
+    }
+
+    #[test]
+    fn delta_response_resends_explicit_wildcard_resubscribed_unchanged_resources() {
+        let server = test_server(gateway_config_with_services(&["api", "admin"], 0));
+        let previous = server.snapshot_for_config(
+            "node-a",
+            &gateway_config_with_services(&["api", "admin"], 0),
+        );
+        let next_snapshot = server.snapshot_for_config(
+            "node-a",
+            &gateway_config_with_services(&["api", "admin"], 0),
+        );
+
+        let response = server.delta_response(
+            &next_snapshot,
+            Some(&previous),
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
+            &HashMap::new(),
+            &["*".to_string()],
+            &[],
+        );
+
+        let mut names: Vec<_> = response.resources.iter().map(|r| r.name.clone()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "cluster/default/admin/8080".to_string(),
+                "cluster/default/api/8080".to_string(),
+            ],
+            "explicit wildcard re-subscribe should re-flow unchanged resources"
+        );
+    }
+
+    #[test]
+    fn delta_ack_baseline_advances_on_ack_but_not_nack() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let snapshot = server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
+        let type_url = super::super::translator::CDS_TYPE_URL.to_string();
+        let last_sent = HashMap::from([(type_url.clone(), Arc::clone(&snapshot))]);
+        let mut last_accepted = HashMap::new();
+
+        remember_delta_accepted_snapshot(
+            Some(&AckOutcome::Nacked {
+                message: "invalid cluster".to_string(),
+            }),
+            &type_url,
+            &last_sent,
+            &mut last_accepted,
+        );
+        assert!(
+            last_accepted.is_empty(),
+            "NACKed delta responses must not become the skip baseline"
+        );
+
+        remember_delta_accepted_snapshot(
+            Some(&AckOutcome::Acked),
+            &type_url,
+            &last_sent,
+            &mut last_accepted,
+        );
+        let accepted = last_accepted
+            .get(&type_url)
+            .expect("ACK should promote the last sent snapshot");
+        assert!(Arc::ptr_eq(accepted, &snapshot));
     }
 
     #[test]
