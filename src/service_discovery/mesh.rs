@@ -223,6 +223,7 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
                     port: selected_port.port,
                     weight: self.default_weight,
                     tags: Self::tags_for_target(service, workload, &selected_port),
+                    locality: workload.locality.clone(),
                     path: None,
                 });
             }

@@ -3538,8 +3538,8 @@ mod tests {
     #[test]
     fn workload_entry_weight_zero_is_accepted() {
         // Istio uses `weight: 0` to mean "drain / no traffic". The translator
-        // must not reject it; the runtime LB layer is responsible for
-        // interpreting the value once locality-aware routing is wired.
+        // must not reject it; the runtime LB layer interprets the value when
+        // building weighted locality-aware target sets.
         let result = translate_k8s_objects(
             &[object(
                 "WorkloadEntry",
