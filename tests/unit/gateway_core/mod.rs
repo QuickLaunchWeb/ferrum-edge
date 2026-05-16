@@ -27,6 +27,7 @@ mod request_context_tests;
 mod response_body_mode_tests;
 mod retry_tests;
 mod router_cache_tests;
+mod runtime_metrics_tests;
 mod service_discovery_tests;
 mod sni_tests;
 mod socket_opts_tests;

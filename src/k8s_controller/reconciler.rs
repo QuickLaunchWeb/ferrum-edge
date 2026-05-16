@@ -33,6 +33,7 @@ pub struct ReconcilerConfig {
     /// `mesh_route_dispatch` plugin instance for routes with method/header/
     /// query-param predicates. Default false (existing behavior).
     pub vs_header_routing_experimental: bool,
+    pub pod_discovery_enabled: bool,
 }
 
 pub struct ReconcileBroadcasters {
@@ -97,6 +98,7 @@ pub fn spawn_reconcile_loop(
                 watch_namespaces: &reconciler_config.watch_namespaces,
                 trust_domain: &trust_domain,
                 vs_header_routing_experimental: reconciler_config.vs_header_routing_experimental,
+                pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
                 metrics: &metrics,
             },
         )
@@ -127,6 +129,7 @@ pub fn spawn_reconcile_loop(
                             watch_namespaces: &reconciler_config.watch_namespaces,
                             trust_domain: &trust_domain,
                             vs_header_routing_experimental: reconciler_config.vs_header_routing_experimental,
+                            pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
                             metrics: &metrics,
                         },
                     ).await;
@@ -151,6 +154,7 @@ pub fn spawn_reconcile_loop(
                             watch_namespaces: &reconciler_config.watch_namespaces,
                             trust_domain: &trust_domain,
                             vs_header_routing_experimental: reconciler_config.vs_header_routing_experimental,
+                            pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
                             metrics: &metrics,
                         },
                     ).await;
@@ -312,6 +316,7 @@ struct ReconcileContext<'a> {
     watch_namespaces: &'a [String],
     trust_domain: &'a TrustDomain,
     vs_header_routing_experimental: bool,
+    pod_discovery_enabled: bool,
     metrics: &'a ControllerMetrics,
 }
 
@@ -335,7 +340,8 @@ async fn do_reconcile(
     let options = K8sTranslationOptions::new(ctx.namespace.to_string(), ctx.trust_domain.clone())
         .with_cluster_domain(ctx.cluster_domain.to_string())
         .with_source_namespaces(ctx.watch_namespaces.to_vec())
-        .with_vs_header_routing_experimental(ctx.vs_header_routing_experimental);
+        .with_vs_header_routing_experimental(ctx.vs_header_routing_experimental)
+        .with_pod_discovery_enabled(ctx.pod_discovery_enabled);
     let Some(translation) = translate_with_skip_retries(&objects, options, ctx.metrics) else {
         return;
     };
@@ -498,6 +504,9 @@ fn stable_config_value(config: &GatewayConfig) -> Value {
     sort_top_level_collection(&mut value, "plugin_configs", "id");
     sort_top_level_collection(&mut value, "upstreams", "id");
     sort_string_array(&mut value, "known_namespaces");
+    sort_mesh_collection(&mut value, "workloads", "spiffe_id");
+    sort_mesh_collection(&mut value, "services", "name");
+    sort_mesh_service_workloads(&mut value);
     value
 }
 
@@ -540,16 +549,99 @@ fn sort_string_array(value: &mut Value, field: &str) {
     items.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
 }
 
+fn sort_mesh_collection(value: &mut Value, field: &str, key: &str) {
+    let Some(items) = value
+        .get_mut("mesh")
+        .and_then(Value::as_object_mut)
+        .and_then(|mesh| mesh.get_mut(field))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+
+    items.sort_by_cached_key(|item| {
+        (
+            item.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            canonical_json_sort_key(item),
+        )
+    });
+}
+
+fn sort_mesh_service_workloads(value: &mut Value) {
+    let Some(services) = value
+        .get_mut("mesh")
+        .and_then(Value::as_object_mut)
+        .and_then(|mesh| mesh.get_mut("services"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+
+    for service in services {
+        let Some(workloads) = service.get_mut("workloads").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        workloads.sort_by_cached_key(|item| {
+            (
+                item.get("spiffe_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                canonical_json_sort_key(item),
+            )
+        });
+    }
+}
+
+fn canonical_json_sort_key(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            let mut key = String::from("{");
+            for (index, (name, child)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    key.push(',');
+                }
+                key.push_str(&serde_json::to_string(name).unwrap_or_default());
+                key.push(':');
+                key.push_str(&canonical_json_sort_key(child));
+            }
+            key.push('}');
+            key
+        }
+        Value::Array(items) => {
+            let mut key = String::from("[");
+            for (index, child) in items.iter().enumerate() {
+                if index > 0 {
+                    key.push(',');
+                }
+                key.push_str(&canonical_json_sort_key(child));
+            }
+            key.push(']');
+            key
+        }
+        _ => value.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::types::{PluginConfig, PluginScope, Proxy, Upstream};
+    use crate::identity::spiffe::SpiffeId;
     use crate::k8s_controller::resource_store::CrdResourceStore;
-    use crate::modes::mesh::config::MeshConfig;
+    use crate::modes::mesh::config::{
+        MeshConfig, MeshService, Workload, WorkloadRef, WorkloadSelector,
+    };
     use chrono::{Duration as ChronoDuration, Utc};
     use kube::api::ApiResource;
     use kube::runtime::reflector;
     use serde_json::json;
+    use std::collections::HashMap;
 
     fn plugin_config(id: &str, config: Value) -> PluginConfig {
         PluginConfig {
@@ -594,6 +686,46 @@ mod tests {
         .expect("test upstream should deserialize")
     }
 
+    fn mesh_workload(service_account: &str) -> Workload {
+        let trust_domain = TrustDomain::new("cluster.local").expect("test trust domain");
+        Workload {
+            spiffe_id: SpiffeId::new(format!(
+                "spiffe://cluster.local/ns/default/sa/{service_account}"
+            ))
+            .expect("test SPIFFE ID"),
+            selector: WorkloadSelector::default(),
+            service_name: "reviews".to_string(),
+            addresses: vec!["10.1.0.10".to_string()],
+            ports: Vec::new(),
+            trust_domain,
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some(service_account.to_string()),
+        }
+    }
+
+    fn mesh_workload_ref(service_account: &str) -> WorkloadRef {
+        WorkloadRef {
+            spiffe_id: SpiffeId::new(format!(
+                "spiffe://cluster.local/ns/default/sa/{service_account}"
+            ))
+            .expect("test SPIFFE ID"),
+        }
+    }
+
+    fn mesh_service_with_workloads(workloads: Vec<WorkloadRef>) -> MeshService {
+        MeshService {
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ports: Vec::new(),
+            workloads,
+            protocol_overrides: HashMap::new(),
+        }
+    }
+
     #[test]
     fn content_change_detects_same_count_plugin_edit() {
         let mut old_config = GatewayConfig::default();
@@ -631,6 +763,99 @@ mod tests {
             .push(plugin_config("a", json!({"value": 1})));
         let mut new_config = old_config.clone();
         new_config.plugin_configs.reverse();
+
+        assert!(!gateway_config_content_changed(&new_config, &old_config));
+    }
+
+    #[test]
+    fn content_change_ignores_mesh_workload_order() {
+        let old_config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![mesh_workload("b"), mesh_workload("a")],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let mut new_config = old_config.clone();
+        new_config
+            .mesh
+            .as_mut()
+            .expect("mesh config")
+            .workloads
+            .reverse();
+
+        assert!(!gateway_config_content_changed(&new_config, &old_config));
+    }
+
+    #[test]
+    fn content_change_ignores_duplicate_spiffe_mesh_workload_order() {
+        let mut workload_a = mesh_workload("reviews");
+        workload_a.addresses = vec!["10.1.0.10".to_string()];
+        let mut workload_b = mesh_workload("reviews");
+        workload_b.addresses = vec!["10.1.0.11".to_string()];
+        let old_config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![workload_a, workload_b],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let mut new_config = old_config.clone();
+        new_config
+            .mesh
+            .as_mut()
+            .expect("mesh config")
+            .workloads
+            .reverse();
+
+        assert!(!gateway_config_content_changed(&new_config, &old_config));
+    }
+
+    #[test]
+    fn content_change_ignores_mesh_service_workload_ref_order() {
+        let workload_a = mesh_workload_ref("a");
+        let workload_b = mesh_workload_ref("b");
+        let old_config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![mesh_service_with_workloads(vec![
+                    workload_b.clone(),
+                    workload_a.clone(),
+                ])],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let new_config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![mesh_service_with_workloads(vec![workload_a, workload_b])],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        assert!(!gateway_config_content_changed(&new_config, &old_config));
+    }
+
+    #[test]
+    fn content_change_ignores_mesh_service_order() {
+        let mut service_a = mesh_service_with_workloads(vec![mesh_workload_ref("a")]);
+        service_a.name = "api".to_string();
+        let mut service_b = mesh_service_with_workloads(vec![mesh_workload_ref("b")]);
+        service_b.name = "reviews".to_string();
+        let old_config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service_b.clone(), service_a.clone()],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let new_config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service_a, service_b],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
 
         assert!(!gateway_config_content_changed(&new_config, &old_config));
     }

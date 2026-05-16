@@ -226,8 +226,12 @@ The Istio `AuthorizationPolicy` translator only consumes the four positive-match
 
 Service / namespace names embedded in destination hosts are matched case-sensitively against the collected Kubernetes object metadata (matching how the API server stores those names). The trailing cluster-domain suffix is matched case-insensitively per DNS semantics, so `<svc>.<ns>.svc.Cluster.Local` resolves the same as `<svc>.<ns>.svc.cluster.local`, but `Reviews.Default.svc.cluster.local` will not match a Service whose stored name is `reviews` in namespace `default`.
 
+`FERRUM_K8S_POD_DISCOVERY_ENABLED=true` enables the CP-side native Kubernetes registry bridge when `FERRUM_K8S_CONTROLLER_ENABLED=true`. The controller watches Pods, Services, and EndpointSlices; translates ready Pods into mesh workloads; translates Services into mesh services using `spec.ports[]`; and links Services to Pods through EndpointSlices. Pending, terminating, failed, succeeded, or not-ready Pods are not surfaced. Explicit Istio `WorkloadEntry` / `ServiceEntry` resources override the auto-derived Pod/Service entries for the same service. The controller service account needs `get`, `list`, and `watch` permissions for namespaced `pods`, `services`, and `endpointslices`. Set `FERRUM_K8S_NODE_LOCALITY_ENABLED=true` only when the controller service account also has cluster-scoped `nodes` permissions; then Node topology labels are copied into workload locality.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
+| `FERRUM_K8S_POD_DISCOVERY_ENABLED` | No | `false` | Enables opt-in native Kubernetes Pod/Service/EndpointSlice discovery in the CP K8s controller |
+| `FERRUM_K8S_NODE_LOCALITY_ENABLED` | No | `false` | Enables optional cluster-scoped Node watching so topology labels can enrich auto-discovered pod workload locality |
 | `FERRUM_K8S_CLUSTER_DOMAIN` | No | `cluster.local` | Kubernetes cluster DNS domain used by the source translator for FQDN host matching. VirtualService destinations of the form `<svc>.<ns>.svc.<cluster_domain>` (and bare/short forms) resolve port names against the matching `Service` |
 | `FERRUM_INJECTOR_LISTEN_ADDR` | Injector mode | `0.0.0.0:9443` | Admission webhook bind address for `POST /mutate` |
 | `FERRUM_INJECTOR_SIDECAR_IMAGE` | No | `ferrum-edge:latest` | Image injected into workload pods as the Ferrum mesh sidecar |
@@ -420,6 +424,13 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` | No | `false` | Track streaming response total latency (adds per-stream overhead) |
+| `FERRUM_METRICS_SYSTEM_SAMPLE_INTERVAL_MS` | No | `1000` | Background sampler interval for `/metrics/runtime` system metrics (minimum 100ms) |
+| `FERRUM_METRICS_WINDOW_1M_SECONDS` | No | `60` | Short status-code/request-rate window exposed by `/metrics/runtime` |
+| `FERRUM_METRICS_WINDOW_5M_SECONDS` | No | `300` | Long status-code/request-rate window exposed by `/metrics/runtime` |
+| `FERRUM_METRICS_LOG_COUNTER_ENABLED` | No | `true` | Count Ferrum tracing events by level and bounded category for `/metrics/runtime`, after applying the output `FERRUM_LOG_LEVEL` / `RUST_LOG` filter |
+| `FERRUM_METRICS_RUNTIME_CACHE_MS` | No | `1000` | Admin JSON cache TTL for `GET /metrics/runtime` |
+| `FERRUM_METRICS_POOL_TRACKING_ENABLED` | No | `true` | Count backend pool creation, failure, and eviction churn in `/metrics/runtime` |
+| `FERRUM_METRICS_STATUS_TRACKING_ENABLED` | No | `true` | Count extra 1m/5m HTTP status windows for `/metrics/runtime`; disable to remove the additional per-request status-window counters |
 | `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` | No | `1000` | Threshold (ms) for logging slow plugin outbound HTTP calls |
 | `FERRUM_PLUGIN_HTTP_MAX_RETRIES` | No | `0` | Retry count for safe plugin outbound HTTP calls on transport failures (JWKS/OIDC fetches, etc.) |
 | `FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS` | No | `100` | Delay between plugin HTTP transport retry attempts |

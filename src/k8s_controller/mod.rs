@@ -25,7 +25,7 @@ use crate::grpc::proto::ConfigUpdate;
 use metrics::ControllerMetrics;
 use reconciler::{ReconcileBroadcasters, ReconcilerConfig, spawn_reconcile_loop};
 use resource_store::ResourceStoreSet;
-use watcher::{spawn_crd_reprobe_task, start_crd_watchers};
+use watcher::{WatcherSelection, spawn_crd_reprobe_task, start_crd_watchers};
 
 pub struct K8sControllerConfig {
     pub namespace: String,
@@ -34,6 +34,8 @@ pub struct K8sControllerConfig {
     pub watch_namespaces: Vec<String>,
     pub watch_istio: bool,
     pub watch_gateway_api: bool,
+    pub pod_discovery_enabled: bool,
+    pub watch_node_locality: bool,
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
     pub kubeconfig_path: Option<String>,
@@ -73,21 +75,28 @@ pub async fn start_k8s_controller(
     info!(
         watch_istio = controller_config.watch_istio,
         watch_gateway_api = controller_config.watch_gateway_api,
+        pod_discovery_enabled = controller_config.pod_discovery_enabled,
+        watch_node_locality = controller_config.watch_node_locality,
         watch_namespaces = ?controller_config.watch_namespaces,
         namespace = controller_config.namespace,
-        "Starting Kubernetes CRD controller"
+        "Starting Kubernetes controller"
     );
 
     let client = build_kube_client(&controller_config.kubeconfig_path).await?;
 
     let store_set = Arc::new(tokio::sync::Mutex::new(ResourceStoreSet::new()));
     let metrics = Arc::new(ControllerMetrics::new());
+    let watcher_selection = WatcherSelection {
+        watch_istio: controller_config.watch_istio,
+        watch_gateway_api: controller_config.watch_gateway_api,
+        watch_core: controller_config.pod_discovery_enabled,
+        watch_node_locality: controller_config.watch_node_locality,
+    };
 
     let watcher_handles = start_crd_watchers(
         client.clone(),
         store_set.clone(),
-        controller_config.watch_istio,
-        controller_config.watch_gateway_api,
+        watcher_selection,
         controller_config.watch_namespaces.clone(),
         shutdown.clone(),
     )
@@ -103,6 +112,7 @@ pub async fn start_k8s_controller(
         debounce_ms: controller_config.debounce_ms,
         full_sync_interval_secs: controller_config.full_sync_interval_secs,
         vs_header_routing_experimental: controller_config.vs_header_routing_experimental,
+        pod_discovery_enabled: controller_config.pod_discovery_enabled,
     };
 
     let reconciler_handle = spawn_reconcile_loop(
@@ -122,8 +132,7 @@ pub async fn start_k8s_controller(
     let reprobe_handle = spawn_crd_reprobe_task(
         client,
         store_set,
-        controller_config.watch_istio,
-        controller_config.watch_gateway_api,
+        watcher_selection,
         controller_config.watch_namespaces,
         shutdown,
         Duration::from_secs(300),

@@ -849,14 +849,27 @@ fn build_east_west_service_targets(
     local_cluster: Option<&str>,
 ) -> Vec<UpstreamTarget> {
     let mut targets = Vec::new();
+    // WorkloadRefs are intentionally matched one-to-one by workload index:
+    // replicated pods can share a SPIFFE ID and still produce distinct targets.
+    let mut used_workload_indices = std::collections::HashSet::new();
 
     for workload_ref in &service.workloads {
-        let Some(workload) = workloads
-            .iter()
-            .find(|w| w.spiffe_id == workload_ref.spiffe_id)
+        let has_matching_service_metadata = workloads.iter().any(|workload| {
+            workload.spiffe_id == workload_ref.spiffe_id
+                && workload.namespace == service.namespace
+                && workload.service_name == service.name
+        });
+        let Some((workload_index, workload)) =
+            workloads.iter().enumerate().find(|(idx, workload)| {
+                !used_workload_indices.contains(idx)
+                    && workload.spiffe_id == workload_ref.spiffe_id
+                    && workload.namespace == service.namespace
+                    && (workload.service_name == service.name || !has_matching_service_metadata)
+            })
         else {
             continue;
         };
+        used_workload_indices.insert(workload_index);
         if local_cluster.is_some_and(|local_cluster| {
             workload
                 .cluster
@@ -2075,16 +2088,33 @@ fn inject_mesh_request_auth_plugin(
 
 /// Build a single `jwks_auth` provider configuration from a [`MeshJwtRule`].
 fn build_jwks_provider_config(rule: &MeshJwtRule) -> Option<serde_json::Value> {
-    let uri = rule.jwks_uri.as_ref()?;
-
     let mut provider = serde_json::json!({
         "issuer": rule.issuer,
-        "jwks_uri": uri,
         "forward_original_token": rule.forward_original_token,
     });
 
+    if let Some(uri) = &rule.jwks_uri {
+        provider["jwks_uri"] = serde_json::json!(uri);
+    } else if let Some(jwks) = &rule.jwks {
+        provider["jwks"] = serde_json::json!(jwks);
+    } else {
+        warn!(
+            issuer = %rule.issuer,
+            "Skipping MeshRequestAuthentication JWT rule with no jwks_uri or jwks"
+        );
+        return None;
+    }
+
     if !rule.audiences.is_empty() {
-        provider["audience"] = serde_json::json!(rule.audiences[0]);
+        provider["audiences"] = serde_json::json!(rule.audiences);
+    }
+
+    if !rule.from_headers.is_empty() {
+        provider["from_headers"] = serde_json::json!(rule.from_headers);
+    }
+
+    if !rule.from_params.is_empty() {
+        provider["from_params"] = serde_json::json!(rule.from_params);
     }
 
     Some(provider)
@@ -2298,6 +2328,12 @@ async fn serve_mesh_runtime(
         Some(tls_policy.clone()),
         Some(shutdown_tx.subscribe()),
     )?;
+    crate::runtime_metrics::global().configure(
+        env_config.status_counts_max_entries,
+        env_config.runtime_metrics_pool_tracking_enabled,
+        env_config.runtime_metrics_status_tracking_enabled,
+        env_config.runtime_metrics_cache_ttl_ms,
+    );
     proxy_state
         .stream_listener_manager
         .set_global_shutdown_rx(shutdown_tx.subscribe());
@@ -2333,6 +2369,16 @@ async fn serve_mesh_runtime(
         proxy_state.status_counts.clone(),
         proxy_state.windowed_metrics.clone(),
         env_config.status_metrics_window_seconds,
+        shutdown_tx.subscribe(),
+    );
+    let runtime_system_handle = crate::system_metrics::start_sampler(
+        Some(proxy_state.clone()),
+        env_config.runtime_metrics_system_sample_interval_ms,
+        shutdown_tx.subscribe(),
+    );
+    let runtime_window_handle = crate::runtime_metrics::start_window_rotator(
+        env_config.runtime_metrics_window_1m_seconds,
+        env_config.runtime_metrics_window_5m_seconds,
         shutdown_tx.subscribe(),
     );
     // Start mesh DNS proxy if enabled
@@ -2487,6 +2533,8 @@ async fn serve_mesh_runtime(
                     dns_handle,
                     overload_handle,
                     metrics_handle,
+                    runtime_system_handle,
+                    runtime_window_handle,
                     mesh_apply_handle,
                 ],
                 dns_retry_handle,
@@ -2510,6 +2558,8 @@ async fn serve_mesh_runtime(
                 dns_handle,
                 overload_handle,
                 metrics_handle,
+                runtime_system_handle,
+                runtime_window_handle,
                 mesh_apply_handle,
             ],
             dns_retry_handle,
@@ -2956,10 +3006,10 @@ mod tests {
     use crate::dns::{DnsCache, DnsConfig};
     use crate::identity::{SpiffeId, TrustDomain};
     use crate::modes::mesh::config::{
-        AccessLogFilter, AppProtocol, EastWestGateway, MeshAccessLoggingConfig, MeshConfig,
-        MeshEndpoint, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule, MeshService,
-        MeshTelemetryResource, MeshTracingConfig, MultiClusterConfig, PolicyAction, PolicyScope,
-        PrincipalMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+        AccessLogFilter, AppProtocol, EastWestGateway, JwtHeader, MeshAccessLoggingConfig,
+        MeshConfig, MeshEndpoint, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule,
+        MeshService, MeshTelemetryResource, MeshTracingConfig, MultiClusterConfig, PolicyAction,
+        PolicyScope, PrincipalMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
         TracingProvider, Workload, WorkloadPort, WorkloadSelector,
     };
     use std::collections::{BTreeMap, HashMap};
@@ -5280,6 +5330,66 @@ mod tests {
     }
 
     #[test]
+    fn east_west_service_targets_preserve_replicas_sharing_spiffe_id() {
+        let shared_spiffe = SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews").unwrap();
+        let mut first = workload("reviews", "reviews");
+        first.spiffe_id = shared_spiffe.clone();
+        first.addresses = vec!["10.0.0.5".to_string()];
+        let mut second = workload("reviews", "reviews");
+        second.spiffe_id = shared_spiffe.clone();
+        second.addresses = vec!["10.0.0.6".to_string()];
+        let service = MeshService {
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 9080,
+                protocol: AppProtocol::Http,
+                name: None,
+            }],
+            workloads: vec![
+                crate::modes::mesh::config::WorkloadRef {
+                    spiffe_id: shared_spiffe.clone(),
+                },
+                crate::modes::mesh::config::WorkloadRef {
+                    spiffe_id: shared_spiffe,
+                },
+            ],
+            protocol_overrides: HashMap::new(),
+        };
+
+        let targets = build_east_west_service_targets(&service, &[first, second], None);
+
+        let hosts: Vec<&str> = targets.iter().map(|target| target.host.as_str()).collect();
+        assert_eq!(hosts, vec!["10.0.0.5", "10.0.0.6"]);
+        assert!(targets.iter().all(|target| target.port == 9080));
+    }
+
+    #[test]
+    fn east_west_service_targets_preserve_explicit_refs_with_stale_service_metadata() {
+        let spiffe = SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews").unwrap();
+        let mut legacy = workload("legacy-reviews", "legacy-reviews");
+        legacy.spiffe_id = spiffe.clone();
+        legacy.addresses = vec!["10.0.0.5".to_string()];
+        let service = MeshService {
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 9080,
+                protocol: AppProtocol::Http,
+                name: None,
+            }],
+            workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
+            protocol_overrides: HashMap::new(),
+        };
+
+        let targets = build_east_west_service_targets(&service, &[legacy], None);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].host, "10.0.0.5");
+        assert_eq!(targets[0].port, 9080);
+    }
+
+    #[test]
     fn east_west_gateway_service_targets_ignore_remote_cluster_workloads() {
         with_mesh_env(
             &[
@@ -5300,11 +5410,14 @@ mod tests {
                 let mut local = workload("reviews-local", "reviews");
                 local.addresses = vec!["10.0.0.5".to_string()];
                 local.cluster = Some("cluster-a".to_string());
+                local.service_name = "reviews".to_string();
                 let mut remote = workload("reviews-remote", "reviews");
                 remote.addresses = vec!["172.16.0.5".to_string()];
                 remote.cluster = Some("cluster-b".to_string());
+                remote.service_name = "reviews".to_string();
                 let mut clusterless = workload("reviews-clusterless", "reviews");
                 clusterless.addresses = vec!["10.0.0.6".to_string()];
+                clusterless.service_name = "reviews".to_string();
 
                 let config = GatewayConfig {
                     mesh: Some(Box::new(MeshConfig {
@@ -6012,13 +6125,81 @@ mod tests {
 
         let provider = &jwks.config["providers"][0];
         assert_eq!(
-            provider.get("audience").and_then(|v| v.as_str()),
-            Some("my-api"),
-            "first audience should be set"
+            provider
+                .get("audiences")
+                .and_then(|v| v.as_array())
+                .cloned(),
+            Some(vec![serde_json::json!("my-api")]),
+            "audiences should be set"
         );
         assert_eq!(
             provider.get("jwks_uri").and_then(|v| v.as_str()),
             Some("https://auth.example.com/jwks")
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_request_auth_jwks_config_emits_inline_jwks_and_custom_locations() {
+        let runtime = test_mesh_runtime_config();
+        let inline_jwks = r#"{"keys":[]}"#.to_string();
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                request_authentications: vec![MeshRequestAuthentication {
+                    name: "with-inline".to_string(),
+                    namespace: "default".to_string(),
+                    scope: PolicyScope::MeshWide,
+                    jwt_rules: vec![MeshJwtRule {
+                        issuer: "https://auth.example.com".to_string(),
+                        audiences: vec!["my-api".to_string()],
+                        jwks_uri: None,
+                        jwks: Some(inline_jwks.clone()),
+                        from_headers: vec![
+                            JwtHeader {
+                                name: "X-Token".to_string(),
+                                prefix: Some("Token ".to_string()),
+                            },
+                            JwtHeader {
+                                name: "X-Raw-Token".to_string(),
+                                prefix: Some(String::new()),
+                            },
+                        ],
+                        from_params: vec!["access_token".to_string()],
+                        forward_original_token: false,
+                    }],
+                }],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let jwks = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID)
+            .expect("jwks_auth plugin");
+
+        let provider = &jwks.config["providers"][0];
+        assert_eq!(
+            provider.get("jwks").and_then(|v| v.as_str()),
+            Some(inline_jwks.as_str())
+        );
+        assert_eq!(
+            provider.get("from_headers"),
+            Some(&serde_json::json!([
+                {"name": "X-Token", "prefix": "Token "},
+                {"name": "X-Raw-Token", "prefix": ""}
+            ]))
+        );
+        assert_eq!(
+            provider.get("from_params"),
+            Some(&serde_json::json!(["access_token"]))
+        );
+        assert_eq!(
+            provider
+                .get("forward_original_token")
+                .and_then(|value| value.as_bool()),
+            Some(false)
         );
     }
 

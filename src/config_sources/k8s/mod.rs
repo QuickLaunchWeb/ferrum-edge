@@ -4,6 +4,7 @@
 //! supported Istio + Gateway API surface into Ferrum's canonical Layer 2 model.
 //! Unsupported resources fail closed when silent translation would be unsafe.
 
+mod core;
 mod gateway_api;
 mod istio;
 
@@ -31,6 +32,12 @@ pub struct K8sMetadata {
     pub namespace: String,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
+    #[serde(
+        default,
+        rename = "deletionTimestamp",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub deletion_timestamp: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -42,6 +49,8 @@ pub struct K8sObject {
     pub metadata: K8sMetadata,
     #[serde(default)]
     pub spec: Value,
+    #[serde(default, skip_serializing_if = "is_empty_object")]
+    pub status: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +66,9 @@ pub struct K8sTranslationOptions {
     /// silently dropped — preserving existing behavior. Operator opts in via
     /// `FERRUM_MESH_VS_HEADER_ROUTING_EXPERIMENTAL`.
     pub vs_header_routing_experimental: bool,
+    /// Opt-in core Kubernetes Pod/Service/EndpointSlice discovery. Default
+    /// false for the first rollout so operators can enable it deliberately.
+    pub pod_discovery_enabled: bool,
     source_namespaces: Option<HashSet<String>>,
 }
 
@@ -70,12 +82,18 @@ impl K8sTranslationOptions {
             istio_root_namespace: "istio-system".to_string(),
             cluster_domain: "cluster.local".to_string(),
             vs_header_routing_experimental: false,
+            pod_discovery_enabled: false,
             source_namespaces: Some(source_namespaces),
         }
     }
 
     pub fn with_vs_header_routing_experimental(mut self, enabled: bool) -> Self {
         self.vs_header_routing_experimental = enabled;
+        self
+    }
+
+    pub fn with_pod_discovery_enabled(mut self, enabled: bool) -> Self {
+        self.pod_discovery_enabled = enabled;
         self
     }
 
@@ -166,6 +184,23 @@ pub(crate) enum SourceKind {
     GatewayApi,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct K8sServiceKey {
+    pub namespace: String,
+    pub name: String,
+}
+
+impl K8sServiceKey {
+    pub(crate) fn new(namespace: impl Into<String>, name: impl Into<String>) -> Option<Self> {
+        let namespace = namespace.into();
+        let name = name.into();
+        if namespace.trim().is_empty() || name.trim().is_empty() {
+            return None;
+        }
+        Some(Self { namespace, name })
+    }
+}
+
 pub(crate) struct K8sAccumulator {
     pub options: K8sTranslationOptions,
     pub config: GatewayConfig,
@@ -181,6 +216,9 @@ pub(crate) struct K8sAccumulator {
     /// The nested shape lets `lookup_service_port` borrow `&str` arguments
     /// directly — no per-lookup `.to_string()` allocations.
     service_port_names: HashMap<String, HashMap<String, HashMap<String, u16>>>,
+    core: core::CoreState,
+    explicit_workload_services: HashSet<K8sServiceKey>,
+    explicit_service_entries: HashSet<K8sServiceKey>,
 }
 
 impl K8sAccumulator {
@@ -194,6 +232,9 @@ impl K8sAccumulator {
             proxy_sources: HashMap::new(),
             known_namespaces: HashSet::new(),
             service_port_names: HashMap::new(),
+            core: core::CoreState::default(),
+            explicit_workload_services: HashSet::new(),
+            explicit_service_entries: HashSet::new(),
         }
     }
 
@@ -215,6 +256,14 @@ impl K8sAccumulator {
 
     fn observe_namespace(&mut self, namespace: &str) {
         self.known_namespaces.insert(namespace.to_string());
+    }
+
+    fn record_explicit_workload_service(&mut self, key: K8sServiceKey) {
+        self.explicit_workload_services.insert(key);
+    }
+
+    fn record_explicit_service_entry(&mut self, key: K8sServiceKey) {
+        self.explicit_service_entries.insert(key);
     }
 
     pub(crate) fn add_reference_grant(
@@ -351,22 +400,31 @@ where
     let mut acc = K8sAccumulator::new(options);
 
     for object in objects.iter().filter(|object| include(object)) {
-        if !acc.options.includes_namespace(&object.metadata.namespace) {
+        if !includes_object_namespace(&acc.options, object) {
             continue;
         }
-        acc.observe_namespace(&object.metadata.namespace);
+        observe_object_namespace(&mut acc, object);
         if object.kind == "ReferenceGrant" {
             gateway_api::collect_reference_grant(&mut acc, object)?;
         } else if object.kind == "Service" {
             collect_service(&mut acc, object)?;
+            if acc.options.pod_discovery_enabled {
+                core::collect(&mut acc, object)?;
+            }
+        } else if acc.options.pod_discovery_enabled && object.kind == "WorkloadEntry" {
+            collect_explicit_workload_service(&mut acc, object);
+        } else if acc.options.pod_discovery_enabled && object.kind == "ServiceEntry" {
+            collect_explicit_service_entry_keys(&mut acc, object);
+        } else if acc.options.pod_discovery_enabled && core::is_core_resource_kind(&object.kind) {
+            core::collect(&mut acc, object)?;
         }
     }
 
     for object in objects.iter().filter(|object| include(object)) {
-        if !acc.options.includes_namespace(&object.metadata.namespace) {
+        if !includes_object_namespace(&acc.options, object) {
             continue;
         }
-        acc.observe_namespace(&object.metadata.namespace);
+        observe_object_namespace(&mut acc, object);
 
         if object.kind == "EnvoyFilter" {
             return Err(K8sTranslateError::Unsupported(UnsupportedK8sResource {
@@ -383,6 +441,10 @@ where
             continue;
         }
 
+        if core::is_core_resource_kind(&object.kind) {
+            continue;
+        }
+
         if istio::translate(&mut acc, object)? || gateway_api::translate(&mut acc, object)? {
             continue;
         }
@@ -393,7 +455,23 @@ where
         ));
     }
 
+    if acc.options.pod_discovery_enabled {
+        core::finalize(&mut acc)?;
+    }
+
     Ok(acc.finish())
+}
+
+fn includes_object_namespace(options: &K8sTranslationOptions, object: &K8sObject) -> bool {
+    options.includes_namespace(&object.metadata.namespace)
+        || (options.pod_discovery_enabled
+            && core::is_cluster_scoped_core_resource_kind(&object.kind))
+}
+
+fn observe_object_namespace(acc: &mut K8sAccumulator, object: &K8sObject) {
+    if !core::is_cluster_scoped_core_resource_kind(&object.kind) {
+        acc.observe_namespace(&object.metadata.namespace);
+    }
 }
 
 /// Collect the `ports[].name → port` map from a core/v1 Service so later
@@ -426,6 +504,81 @@ pub(crate) fn collect_service(
         .or_default()
         .insert(object.metadata.name.clone(), port_names);
     Ok(())
+}
+
+fn collect_explicit_workload_service(acc: &mut K8sAccumulator, object: &K8sObject) {
+    let service = string_field(&object.spec, "service").unwrap_or(&object.metadata.name);
+    if let Some(key) = service_key_from_host(
+        service,
+        &object.metadata.namespace,
+        &acc.options.cluster_domain,
+    )
+    .filter(|key| key.namespace == object.metadata.namespace)
+    {
+        acc.record_explicit_workload_service(key);
+    }
+}
+
+fn collect_explicit_service_entry_keys(acc: &mut K8sAccumulator, object: &K8sObject) {
+    for host in string_array(&object.spec, "hosts") {
+        if let Some(key) = service_key_from_host(
+            &host,
+            &object.metadata.namespace,
+            &acc.options.cluster_domain,
+        )
+        .filter(|key| key.namespace == object.metadata.namespace)
+        {
+            acc.record_explicit_service_entry(key);
+        }
+    }
+}
+
+pub(crate) fn service_key_from_host(
+    host: &str,
+    default_namespace: &str,
+    cluster_domain: &str,
+) -> Option<K8sServiceKey> {
+    let host = normalized_service_host(host)?;
+    let parts: Vec<&str> = host.split('.').collect();
+    match parts.as_slice() {
+        [name] => K8sServiceKey::new(default_namespace.to_string(), (*name).to_string()),
+        [name, namespace] if *namespace == default_namespace => {
+            K8sServiceKey::new((*namespace).to_string(), (*name).to_string())
+        }
+        [_, _] => None,
+        [name, namespace, "svc"] => {
+            K8sServiceKey::new((*namespace).to_string(), (*name).to_string())
+        }
+        [name, namespace, "svc", rest @ ..] => {
+            let suffix = rest.join(".");
+            let cluster_domain = cluster_domain
+                .trim()
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            if suffix.eq_ignore_ascii_case(&cluster_domain) {
+                K8sServiceKey::new((*namespace).to_string(), (*name).to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn workload_entry_service_key_from_host(
+    host: &str,
+    default_namespace: &str,
+    cluster_domain: &str,
+) -> Option<K8sServiceKey> {
+    service_key_from_host(host, default_namespace, cluster_domain)
+}
+
+fn normalized_service_host(host: &str) -> Option<String> {
+    let host = host.trim().trim_end_matches('.');
+    if host.is_empty() || host.contains('*') {
+        return None;
+    }
+    Some(host.to_string())
 }
 
 pub(crate) fn invalid_resource(
@@ -494,6 +647,10 @@ pub(crate) fn selector_from_istio(value: Option<&Value>) -> HashMap<String, Stri
         .and_then(|selector| selector.get("matchLabels"))
         .map(string_map)
         .unwrap_or_default()
+}
+
+fn is_empty_object(value: &Value) -> bool {
+    value.as_object().is_none_or(serde_json::Map::is_empty)
 }
 
 pub(crate) struct RouteProxySpec {
@@ -1191,8 +1348,10 @@ mod tests {
                 name: "sample".to_string(),
                 namespace: "default".to_string(),
                 labels: HashMap::new(),
+                deletion_timestamp: None,
             },
             spec,
+            status: Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -1288,5 +1447,118 @@ mod tests {
         assert_eq!(port_from_u64(&object, 65_535, "port").unwrap(), 65_535);
         assert!(port_from_u64(&object, 65_536, "port").is_err());
         assert!(port_from_u64(&object, u64::MAX, "port").is_err());
+    }
+
+    #[test]
+    fn service_key_from_host_accepts_unambiguous_kubernetes_service_forms() {
+        assert_eq!(
+            service_key_from_host("reviews", "default", "cluster.local"),
+            Some(K8sServiceKey {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            })
+        );
+        assert_eq!(
+            service_key_from_host("reviews.default.svc", "ignored", "cluster.local"),
+            Some(K8sServiceKey {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            })
+        );
+        assert_eq!(
+            service_key_from_host("reviews.default", "default", "cluster.local"),
+            Some(K8sServiceKey {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            })
+        );
+        assert_eq!(
+            service_key_from_host(
+                "reviews.default.svc.cluster.local.",
+                "ignored",
+                "cluster.local"
+            ),
+            Some(K8sServiceKey {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            })
+        );
+        assert_eq!(
+            service_key_from_host(
+                "reviews.default.svc.Cluster.Local",
+                "ignored",
+                "cluster.local"
+            ),
+            Some(K8sServiceKey {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn service_key_from_host_preserves_service_and_namespace_case() {
+        assert_eq!(
+            service_key_from_host(
+                "Reviews.Default.svc.cluster.local",
+                "ignored",
+                "cluster.local"
+            ),
+            Some(K8sServiceKey {
+                namespace: "Default".to_string(),
+                name: "Reviews".to_string(),
+            })
+        );
+        assert_eq!(
+            service_key_from_host("reviews.Default", "default", "cluster.local"),
+            None
+        );
+    }
+
+    #[test]
+    fn service_key_from_host_rejects_ambiguous_two_label_hosts() {
+        assert_eq!(
+            service_key_from_host("example.com", "default", "cluster.local"),
+            None
+        );
+        assert_eq!(
+            service_key_from_host("reviews.default", "ignored", "cluster.local"),
+            None
+        );
+        assert_eq!(
+            service_key_from_host("reviews.prod", "default", "cluster.local"),
+            None
+        );
+    }
+
+    #[test]
+    fn workload_entry_service_key_from_host_rejects_cross_namespace_two_label_refs() {
+        assert_eq!(
+            workload_entry_service_key_from_host("reviews.default", "default", "cluster.local",),
+            Some(K8sServiceKey {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            })
+        );
+        assert_eq!(
+            workload_entry_service_key_from_host("reviews.prod", "default", "cluster.local",),
+            None
+        );
+        assert_eq!(
+            workload_entry_service_key_from_host("reviews.prod.", "default", "cluster.local",),
+            None
+        );
+        assert_eq!(
+            workload_entry_service_key_from_host("reviews.Prod", "default", "cluster.local",),
+            None
+        );
+    }
+
+    #[test]
+    fn workload_entry_service_key_from_host_preserves_unknown_two_label_dns_names() {
+        assert_eq!(
+            workload_entry_service_key_from_host("example.com", "default", "cluster.local",),
+            None
+        );
     }
 }

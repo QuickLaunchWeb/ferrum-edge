@@ -51,6 +51,7 @@ pub mod mesh_route_dispatch;
 pub mod mtls_auth;
 pub mod otel_tracing;
 pub mod prometheus_metrics;
+pub mod proxy_alerts;
 pub mod rate_limiting;
 pub mod request_deduplication;
 pub mod request_mirror;
@@ -203,8 +204,10 @@ pub enum WebSocketFrameDirection {
 /// Mirrors the information made available on `StreamTransactionSummary`
 /// for TCP/UDP streams so logging/metrics plugins have parity across all
 /// three protocols. `direction` identifies which half of the frame relay
-/// terminated first — `None` indicates a clean close initiated by both
-/// peers or an upgrade that never established frame flow.
+/// terminated first and `io_side` identifies whether that half failed while
+/// reading from its source or writing to its destination. `None` for both
+/// indicates a clean close initiated by either peer or an upgrade that never
+/// established frame flow.
 ///
 /// Populated once per accepted WebSocket upgrade, including H2 Extended
 /// CONNECT (RFC 8441) sessions. The frame relay code should construct
@@ -230,6 +233,10 @@ pub struct WsDisconnectContext {
     /// Which direction observed the first terminating error. `None` for
     /// clean close initiated by either peer.
     pub direction: Option<Direction>,
+    /// Which I/O side inside the failing direction observed the error. This
+    /// disambiguates `BackendToClient` reads from the backend versus writes to
+    /// a disconnected client.
+    pub io_side: Option<crate::proxy::tcp_proxy::StreamIoSide>,
     /// Classification of the terminating error, if any.
     pub error_class: Option<crate::retry::ErrorClass>,
     /// Consumer identity associated with the upgrade (copied from
@@ -630,10 +637,10 @@ impl RequestContext {
                     // spec), and hyper normalizes HTTP/1.1 header names to
                     // lowercase at parse time. No `to_lowercase()` needed.
                     let key = name.as_str();
-                    if key == "baggage" {
-                        // W3C baggage is a list header, so multiple field lines
-                        // are equivalent to one comma-separated value. Preserve
-                        // that before raw headers are consumed by materialization.
+                    if is_comma_folded_list_header(key) {
+                        // These are list headers, so multiple field lines are
+                        // equivalent to one comma-separated value. Preserve that
+                        // before raw headers are consumed by materialization.
                         self.headers
                             .entry(key.to_owned())
                             .and_modify(|existing| {
@@ -747,6 +754,15 @@ impl RequestContext {
             .as_ref()
             .and_then(|consumer| consumer.custom_id.as_deref())
     }
+}
+
+/// Headers that are materialized by comma-folding repeated request values.
+///
+/// This is used both when `RequestContext` is built and when the WebSocket
+/// proxy path reconstructs the materialized form to decide whether raw
+/// repeated headers can be preserved for the backend handshake.
+pub(crate) fn is_comma_folded_list_header(name: &str) -> bool {
+    matches!(name, "baggage" | "sec-websocket-protocol")
 }
 
 fn dispatch_port_overrides_from_upstream(
@@ -1073,6 +1089,9 @@ impl TransactionSummary {
 /// spawned mirror task maximum time to complete. The mirror entry uses the
 /// same `TransactionSummary` schema with `mirror: true` so existing log
 /// pipelines work without changes.
+///
+/// Some proxy paths call this with an empty plugin slice so runtime transaction
+/// metrics still see no-plugin error and streaming-disconnect outcomes.
 pub async fn log_with_mirror(
     plugins: &[Arc<dyn Plugin>],
     summary: &TransactionSummary,
@@ -1081,6 +1100,7 @@ pub async fn log_with_mirror(
     for plugin in plugins {
         plugin.log(summary).await;
     }
+    crate::runtime_metrics::global_ref().record_transaction(summary);
     if let Some(mirror_result) = ctx.collect_mirror_result().await {
         let mirror_summary = summary.as_mirror_entry(mirror_result);
         for plugin in plugins {
@@ -1294,6 +1314,7 @@ pub mod priority {
     pub const LOKI_LOGGING: u16 = 9155;
     pub const UDP_LOGGING: u16 = 9160;
     pub const TRANSACTION_DEBUGGER: u16 = 9200;
+    pub const PROXY_ALERTS: u16 = 9250;
     pub const PROMETHEUS_METRICS: u16 = 9300;
     pub const API_CHARGEBACK: u16 = 9350;
     pub const WORKLOAD_METRICS: u16 = 9360;
@@ -1870,6 +1891,10 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.namespace(),
         )?))),
+        "proxy_alerts" => Ok(Some(Arc::new(proxy_alerts::ProxyAlerts::new(
+            config,
+            http_client.clone(),
+        )?))),
         "api_chargeback" => Ok(Some(Arc::new(api_chargeback::ApiChargeback::new(
             config,
             http_client.namespace(),
@@ -2012,6 +2037,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "response_mock",
         "serverless_function",
         "prometheus_metrics",
+        "proxy_alerts",
         "otel_tracing",
         "ai_token_metrics",
         "ai_request_guard",

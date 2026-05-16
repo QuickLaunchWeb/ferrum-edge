@@ -249,6 +249,7 @@ async fn test_all_plugins_available() {
         "ai_federation",
         "api_chargeback",
         "fault_injection",
+        "proxy_alerts",
     ]
     .into_iter()
     .collect();
@@ -352,6 +353,16 @@ async fn test_plugin_creation_all_plugins() {
             "mesh_outbound_registry" => {
                 json!({"registry": ["reviews.default.svc.cluster.local"]})
             }
+            "proxy_alerts" => json!({
+                "channels": {
+                    "ops": { "type": "slack", "webhook_url": "https://hooks.slack.com/x" }
+                },
+                "rules": [{
+                    "name": "r", "type": "error_rate",
+                    "status_codes": [500], "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
             _ => json!({}),
         };
         let plugin = create_plugin(plugin_name, &config);

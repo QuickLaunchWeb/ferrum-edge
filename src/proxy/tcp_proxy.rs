@@ -161,7 +161,8 @@ pub(crate) const STREAM_SPLICE_IDLE_TIMEOUT_PREFIX: &str = "TCP idle timeout";
 /// | `ClientToBackend` | Write | Backend  |
 /// | `BackendToClient` | Read  | Backend  |
 /// | `BackendToClient` | Write | Client   |
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[doc(hidden)]
 pub enum StreamIoSide {
     /// Failure reading from the source socket of this half.
@@ -499,12 +500,34 @@ impl CachedBackendTlsConfig {
 #[derive(Default)]
 pub struct TcpProxyMetrics {
     pub active_connections: AtomicU64,
+    pub active_backend_connections: AtomicU64,
     pub total_connections: AtomicU64,
     pub bytes_in: AtomicU64,
     pub bytes_out: AtomicU64,
     /// Bytes transferred via splice(2) zero-copy (Linux only, plaintext paths).
     /// When non-zero, indicates splice was used instead of userspace copy.
     pub splice_bytes_transferred: AtomicU64,
+}
+
+struct TcpBackendSessionGuard<'a> {
+    metrics: &'a TcpProxyMetrics,
+}
+
+impl<'a> TcpBackendSessionGuard<'a> {
+    fn new(metrics: &'a TcpProxyMetrics) -> Self {
+        metrics
+            .active_backend_connections
+            .fetch_add(1, Ordering::Relaxed);
+        Self { metrics }
+    }
+}
+
+impl Drop for TcpBackendSessionGuard<'_> {
+    fn drop(&mut self) {
+        self.metrics
+            .active_backend_connections
+            .fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Configuration for starting a TCP proxy listener.
@@ -866,6 +889,7 @@ async fn run_tcp_accept_loop(
                         ktls_enabled,
                         io_uring_splice_enabled,
                         &overload_for_conn,
+                        metrics.as_ref(),
                     )
                     .await;
 
@@ -982,10 +1006,13 @@ async fn run_tcp_accept_loop(
                         }
                     };
 
-                    // Run on_stream_disconnect plugins (logging, metrics, etc.)
-                    if !plugins.is_empty() {
+                    if !plugins.is_empty() || error_class.is_some() {
                         let disconnected_wall_at = chrono::Utc::now();
-                        let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
+                        let consumer_username = if !plugins.is_empty() {
+                            stream_ctx.effective_identity().map(str::to_owned)
+                        } else {
+                            None
+                        };
                         let summary = StreamTransactionSummary {
                             namespace: proxy_namespace,
                             proxy_id: final_proxy_id,
@@ -1007,10 +1034,25 @@ async fn run_tcp_accept_loop(
                             timestamp_connected: connected_wall_at.to_rfc3339(),
                             timestamp_disconnected: disconnected_wall_at.to_rfc3339(),
                             sni_hostname: stream_ctx.sni_hostname.clone(),
-                            metadata: stream_ctx.take_metadata(),
+                            metadata: if !plugins.is_empty() {
+                                stream_ctx.take_metadata()
+                            } else {
+                                Default::default()
+                            },
                         };
-                        for plugin in plugins.iter() {
-                            plugin.on_stream_disconnect(&summary).await;
+                        crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
+                        if summary.error_class == Some(crate::retry::ErrorClass::ConnectionReset)
+                            && let Some(direction) = summary.disconnect_direction
+                        {
+                            crate::runtime_metrics::global_ref()
+                                .record_tcp_rst(&summary.proxy_id, direction);
+                        }
+
+                        // Run on_stream_disconnect plugins (logging, metrics, etc.)
+                        if !plugins.is_empty() {
+                            for plugin in plugins.iter() {
+                                plugin.on_stream_disconnect(&summary).await;
+                            }
                         }
                     }
 
@@ -1089,6 +1131,79 @@ struct TcpBackendInfo {
     backend_resolved_ip: Option<String>,
 }
 
+thread_local! {
+    /// Per-thread scratch buffer for formatting `host:port` strings on the
+    /// TCP connection hot path. Reused across every accepted connection and
+    /// every retry attempt so the `host:port` formatting cost on the
+    /// per-connection path is a single allocation (the final `clone()` into
+    /// the owned `String` slot on `TcpBackendInfo`) rather than two
+    /// short-lived `format!()` allocations.
+    ///
+    /// `backend_target` must remain an owned `String` because it eventually
+    /// moves into `StreamTransactionSummary.backend_target: String` which
+    /// crosses an `.await` (logger dispatch) and is serialized into JSON
+    /// log sinks — so we still hand the caller an owned value, but build it
+    /// off a reused buffer instead of paying a fresh `format!()` allocation
+    /// every time. Mirrors the zero-allocation pool-key pattern in
+    /// `http2_pool.rs`.
+    static BACKEND_TARGET_BUF: RefCell<String> = RefCell::new(String::with_capacity(64));
+}
+
+/// Format `host:port` into the thread-local scratch buffer and return a freshly
+/// owned `String`. Reuses the buffer's capacity across calls on the same
+/// tokio worker thread so the per-connection formatting cost is a single
+/// owned-`String` allocation instead of two (one for the `format!()` macro's
+/// internal buffer, one for the owned result).
+fn format_backend_target(host: &str, port: u16) -> String {
+    use std::fmt::Write;
+    BACKEND_TARGET_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        // Writing into a `String` cannot fail — `fmt::Error` for `String`
+        // requires the formatter itself to error, which `Display` for
+        // `&str` / `u16` never does.
+        let _ = write!(buf, "{}:{}", host, port);
+        buf.clone()
+    })
+}
+
+#[cfg(test)]
+mod backend_target_format_tests {
+    use super::{BACKEND_TARGET_BUF, format_backend_target};
+
+    #[test]
+    fn formats_host_port_pair_byte_for_byte_like_format_macro() {
+        assert_eq!(format_backend_target("db-host", 5432), "db-host:5432");
+        assert_eq!(format_backend_target("10.0.0.1", 80), "10.0.0.1:80");
+        // IPv6 literals flow through as-is — callers are responsible for
+        // bracketing if the consumer requires URL-style framing.
+        assert_eq!(
+            format_backend_target("[::1]", 443),
+            format!("{}:{}", "[::1]", 443)
+        );
+    }
+
+    #[test]
+    fn reuses_thread_local_buffer_capacity_across_calls() {
+        // First call grows the buffer to whatever the formatted length needs.
+        let _ = format_backend_target("backend-with-a-fairly-long-hostname.example", 65535);
+        let capacity_after_first = BACKEND_TARGET_BUF.with(|cell| cell.borrow().capacity());
+
+        // Second call with a shorter target should reuse — never shrink —
+        // the existing capacity. We only assert non-shrinkage, since
+        // `String::clear()` is allowed to keep capacity but `String::clone()`
+        // returns a freshly sized allocation regardless.
+        let _ = format_backend_target("h", 1);
+        let capacity_after_second = BACKEND_TARGET_BUF.with(|cell| cell.borrow().capacity());
+
+        assert!(
+            capacity_after_second >= capacity_after_first,
+            "thread-local buffer must reuse capacity across calls \
+             (before={capacity_after_first}, after={capacity_after_second})"
+        );
+    }
+}
+
 /// Result of a TCP connection: backend info (always present) plus the outcome.
 struct TcpConnectionResult {
     backend: TcpBackendInfo,
@@ -1134,6 +1249,7 @@ async fn handle_tcp_connection(
     ktls_enabled: bool,
     io_uring_splice_enabled: bool,
     overload: &crate::overload::OverloadState,
+    metrics: &TcpProxyMetrics,
 ) -> TcpConnectionResult {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
@@ -1167,6 +1283,7 @@ async fn handle_tcp_connection(
         ktls_enabled,
         io_uring_splice_enabled,
         overload,
+        metrics,
     )
     .await;
 
@@ -1224,6 +1341,7 @@ async fn handle_tcp_connection_inner(
     ktls_enabled: bool,
     io_uring_splice_enabled: bool,
     overload: &crate::overload::OverloadState,
+    metrics: &TcpProxyMetrics,
 ) -> Result<TcpConnectionSuccess, anyhow::Error> {
     // Bound the passthrough SNI peek by the same deadline as terminating-TLS
     // handshakes. Without this, a peer that opens a TCP connection and never
@@ -1286,7 +1404,7 @@ async fn handle_tcp_connection_inner(
 
         // Populate backend target as soon as it's known — even if DNS or connect fails,
         // the log will show which target was attempted.
-        backend_info.backend_target = format!("{}:{}", backend_host, backend_port);
+        backend_info.backend_target = format_backend_target(&backend_host, backend_port);
 
         let cb_target_key = proxy
             .upstream_id
@@ -1662,7 +1780,7 @@ async fn handle_tcp_connection_inner(
                             };
                             // Update backend info to reflect the retry target.
                             backend_info.backend_target =
-                                format!("{}:{}", current_host, current_port);
+                                format_backend_target(&current_host, current_port);
                             backend_info.backend_resolved_ip = None;
                             attempt += 1;
                             continue;
@@ -1712,7 +1830,8 @@ async fn handle_tcp_connection_inner(
                         is_half_open_probe: false,
                     };
                     // Update backend info to reflect the retry target.
-                    backend_info.backend_target = format!("{}:{}", current_host, current_port);
+                    backend_info.backend_target =
+                        format_backend_target(&current_host, current_port);
                     backend_info.backend_resolved_ip = None;
                     last_connect_err = Some(anyhow::anyhow!(err_msg));
                     attempt += 1;
@@ -1776,7 +1895,8 @@ async fn handle_tcp_connection_inner(
                         is_half_open_probe: false,
                     };
                     // Update backend info to reflect the retry target.
-                    backend_info.backend_target = format!("{}:{}", current_host, current_port);
+                    backend_info.backend_target =
+                        format_backend_target(&current_host, current_port);
                     backend_info.backend_resolved_ip = None;
                     last_connect_err = Some(e);
                     attempt += 1;
@@ -1791,6 +1911,7 @@ async fn handle_tcp_connection_inner(
     };
     let (_backend_socket_addr, backend_stream) = backend_addr;
     let _ = last_connect_err; // consumed by retry loop logging
+    let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
 
     // Start bidirectional copy. From here, no retries — bytes may be exchanged.
     let mut used_splice = false;
