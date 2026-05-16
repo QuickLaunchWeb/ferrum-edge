@@ -9,13 +9,11 @@
 # Keep host-specific linker choices in ~/.cargo/config.toml rather than this
 # checked-in file so GitHub-hosted macOS runners keep using their default linker.
 #
-# macOS local example — install LLVM with `brew install llvm`
+# macOS local example — install LLD with `brew install lld`
 # [target.aarch64-apple-darwin]
-# linker = "/opt/homebrew/opt/llvm/bin/clang"
 # rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 #
 # [target.x86_64-apple-darwin]
-# linker = "/usr/local/opt/llvm/bin/clang"
 # rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 #
 # Linux — install mold: `sudo apt-get install mold` (fastest linker)
