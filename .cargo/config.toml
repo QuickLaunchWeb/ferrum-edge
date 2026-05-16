@@ -6,10 +6,12 @@
 # ── Linker optimisations (optional) ──────────────────────────────────────
 # Using a faster linker can cut link times by 2-5x. Uncomment the section
 # that matches your platform after installing the required linker.
+# Keep host-specific linker choices in ~/.cargo/config.toml rather than this
+# checked-in file so GitHub-hosted macOS runners keep using their default linker.
 #
-# macOS — install lld: `brew install llvm` then add to PATH
-[target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/bin/ld64.lld"]
+# macOS local example — install LLD with `brew install lld`
+# [target.aarch64-apple-darwin]
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 #
 # [target.x86_64-apple-darwin]
 # rustflags = ["-C", "link-arg=-fuse-ld=lld"]
@@ -25,10 +27,8 @@ rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/bin/ld64.lld"]
 
 # ── sccache (optional) ──────────────────────────────────────────────────
 # sccache caches compiled crates across branches and clean builds.
-# Install: cargo install sccache
-# Then uncomment the next two lines, or set RUSTC_WRAPPER=sccache in your
-# shell profile (~/.zshrc / ~/.bashrc).
-#
+# Install locally with: cargo install sccache
+# CI workflows that compile Rust install/start sccache explicitly.
 [build]
 rustc-wrapper = "sccache"
 

@@ -241,6 +241,7 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
                 port,
                 weight,
                 tags,
+                locality: None,
                 path: None,
             });
         }

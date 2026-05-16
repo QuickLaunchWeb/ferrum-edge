@@ -701,6 +701,7 @@ mod tests {
             port: 8080,
             weight: 100,
             tags,
+            locality: None,
             path: None,
         };
 

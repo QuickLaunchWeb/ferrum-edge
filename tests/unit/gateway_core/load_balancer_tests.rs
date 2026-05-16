@@ -27,6 +27,7 @@ fn make_targets(n: usize) -> Vec<UpstreamTarget> {
             port: 8080,
             weight: 1,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         })
         .collect()
@@ -39,6 +40,7 @@ fn make_weighted_targets() -> Vec<UpstreamTarget> {
             port: 8080,
             weight: 5,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         },
         UpstreamTarget {
@@ -46,6 +48,7 @@ fn make_weighted_targets() -> Vec<UpstreamTarget> {
             port: 8080,
             weight: 1,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         },
     ]
@@ -226,6 +229,7 @@ fn test_load_balancer_cache() {
             service_discovery: None,
             subsets: None,
             port_overrides: HashMap::new(),
+            source_locality: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
@@ -603,6 +607,7 @@ fn test_least_latency_cache_record_and_select() {
             service_discovery: None,
             subsets: None,
             port_overrides: HashMap::new(),
+            source_locality: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
@@ -903,6 +908,7 @@ fn test_least_latency_record_for_nonexistent_target() {
         port: 9999,
         weight: 1,
         tags: HashMap::new(),
+        locality: None,
         path: None,
     };
 
@@ -1036,6 +1042,7 @@ fn test_load_balancer_cache_get_hash_on_strategy() {
             service_discovery: None,
             subsets: None,
             port_overrides: HashMap::new(),
+            source_locality: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
@@ -1076,6 +1083,7 @@ fn make_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
         service_discovery: None,
         subsets: None,
         port_overrides: HashMap::new(),
+        source_locality: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
@@ -1145,6 +1153,7 @@ fn test_apply_delta_modify_upstream_targets() {
         port: 9999,
         weight: 1,
         tags: HashMap::new(),
+        locality: None,
         path: None,
     };
     let modified_u1 = make_upstream("u1", vec![new_target]);
@@ -1324,6 +1333,7 @@ fn test_wrr_all_zero_weights_falls_back_to_round_robin() {
             port: 8080,
             weight: 0,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         },
         UpstreamTarget {
@@ -1331,6 +1341,7 @@ fn test_wrr_all_zero_weights_falls_back_to_round_robin() {
             port: 8080,
             weight: 0,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         },
     ];
@@ -1361,6 +1372,7 @@ fn test_wrr_mixed_zero_and_nonzero_weights() {
             port: 8080,
             weight: 10,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         },
         UpstreamTarget {
@@ -1368,6 +1380,7 @@ fn test_wrr_mixed_zero_and_nonzero_weights() {
             port: 8080,
             weight: 0,
             tags: HashMap::new(),
+            locality: None,
             path: None,
         },
     ];
@@ -1757,6 +1770,7 @@ fn make_tagged_targets() -> Vec<UpstreamTarget> {
             port: 8080,
             weight: 1,
             tags: HashMap::from([("version".to_string(), "v1".to_string())]),
+            locality: None,
             path: None,
         },
         UpstreamTarget {
@@ -1764,6 +1778,7 @@ fn make_tagged_targets() -> Vec<UpstreamTarget> {
             port: 8080,
             weight: 1,
             tags: HashMap::from([("version".to_string(), "v1".to_string())]),
+            locality: None,
             path: None,
         },
         UpstreamTarget {
@@ -1771,6 +1786,7 @@ fn make_tagged_targets() -> Vec<UpstreamTarget> {
             port: 8080,
             weight: 1,
             tags: HashMap::from([("version".to_string(), "v2".to_string())]),
+            locality: None,
             path: None,
         },
         UpstreamTarget {
@@ -1781,6 +1797,7 @@ fn make_tagged_targets() -> Vec<UpstreamTarget> {
                 ("version".to_string(), "v2".to_string()),
                 ("region".to_string(), "us-east".to_string()),
             ]),
+            locality: None,
             path: None,
         },
     ]
@@ -2115,6 +2132,7 @@ fn update_targets_preserves_existing_subsets() {
         port: 8080,
         weight: 1,
         tags: HashMap::from([("version".to_string(), "v2".to_string())]),
+        locality: None,
         path: None,
     });
 

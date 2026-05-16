@@ -76,8 +76,7 @@ pub struct Workload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
     /// Istio `WorkloadEntry.locality` — slash-delimited
-    /// `region/zone/subzone` string for locality-aware routing. Pure
-    /// metadata at this phase; locality-aware LB consumes it once wired.
+    /// `region/zone/subzone` string consumed by locality-aware routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality: Option<String>,
     /// Istio `WorkloadEntry.serviceAccount` — kept separately from
