@@ -253,6 +253,8 @@ pub(super) async fn drain_response_body_redacted(
         ));
     }
 
+    // We only need to drain for connection reuse; measuring streams and
+    // discards chunks instead of buffering bytes we will never inspect.
     measure_response_body_bounded(resp, RESPONSE_BODY_DRAIN_LIMIT_BYTES)
         .await
         .map(|_| ())
@@ -261,7 +263,7 @@ pub(super) async fn drain_response_body_redacted(
                 read_so_far,
                 max_bytes,
             } => format!(
-                "{channel} dispatch response body exceeded drain limit {max_bytes} bytes after reading {read_so_far} bytes from {redacted_url}"
+                "{channel} dispatch response body exceeds drain limit {max_bytes} bytes after reading {read_so_far} bytes from {redacted_url}"
             ),
             BoundedReadError::Stream(e) => {
                 format!(

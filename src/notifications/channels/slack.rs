@@ -99,12 +99,12 @@ impl SlackChannel {
             .await
             .map_err(|e| format!("slack dispatch failed: {e}"))?;
         let status = resp.status();
-        drain_response_body_redacted(resp, "slack", &redacted_url).await?;
         if !status.is_success() {
             return Err(format!(
                 "slack dispatch returned non-success status {status}"
             ));
         }
+        drain_response_body_redacted(resp, "slack", &redacted_url).await?;
         Ok(())
     }
 }

@@ -21,7 +21,7 @@ Reusable, plugin-agnostic notification infrastructure. Lives at `src/notificatio
 - `webhook_url` (Slack/Teams/Discord) and `url` (generic webhook) MUST be `http://` or `https://` with a host.
 - For each URL field there is a sibling `*_env` form (`webhook_url_env: "MY_ENV"`) that resolves via `std::env::var()` at construction. Combine with the gateway's secret resolver (`_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP` env-var suffixes) to keep credentials out of config files.
 - Dispatch slow-call/error logs redact endpoint paths, query strings, and userinfo because incoming webhook credentials commonly live inside the URL.
-- Response bodies are discarded after dispatch with a 1 MiB streaming drain limit. Oversized endpoint responses fail the send without buffering the whole body.
+- Response bodies are discarded after dispatch with a 1 MiB cap: responses advertising `Content-Length > 1 MiB` are rejected before any bytes are read, and otherwise the body is streamed and aborted once the running total crosses 1 MiB. Either path fails the send without buffering the whole body.
 
 ### Slack (Incoming Webhook)
 

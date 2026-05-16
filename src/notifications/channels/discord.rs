@@ -85,12 +85,12 @@ impl DiscordChannel {
             .await
             .map_err(|e| format!("discord dispatch failed: {e}"))?;
         let status = resp.status();
-        drain_response_body_redacted(resp, "discord", &redacted_url).await?;
         if !status.is_success() {
             return Err(format!(
                 "discord dispatch returned non-success status {status}"
             ));
         }
+        drain_response_body_redacted(resp, "discord", &redacted_url).await?;
         Ok(())
     }
 }
