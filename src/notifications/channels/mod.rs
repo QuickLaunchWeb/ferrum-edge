@@ -13,6 +13,7 @@ use serde_json::Value;
 use url::Url;
 
 use crate::plugins::utils::http_client::PluginHttpClient;
+use crate::plugins::utils::response_body::{BoundedReadError, measure_response_body_bounded};
 
 use super::notification::Notification;
 
@@ -20,6 +21,8 @@ pub mod discord;
 pub mod slack;
 pub mod teams;
 pub mod webhook;
+
+const RESPONSE_BODY_DRAIN_LIMIT_BYTES: usize = 1024 * 1024;
 
 #[allow(unused_imports)]
 pub use discord::DiscordChannel;
@@ -242,12 +245,31 @@ pub(super) async fn drain_response_body_redacted(
     channel: &str,
     redacted_url: &str,
 ) -> Result<(), String> {
-    resp.bytes().await.map(|_| ()).map_err(|e| {
-        format!(
-            "{channel} dispatch body read failed: {} reading response from {redacted_url}",
-            reqwest_error_class(&e)
-        )
-    })
+    if let Some(content_length) = resp.content_length()
+        && content_length > RESPONSE_BODY_DRAIN_LIMIT_BYTES as u64
+    {
+        return Err(format!(
+            "{channel} dispatch response body length {content_length} exceeds drain limit {RESPONSE_BODY_DRAIN_LIMIT_BYTES} bytes reading response from {redacted_url}"
+        ));
+    }
+
+    measure_response_body_bounded(resp, RESPONSE_BODY_DRAIN_LIMIT_BYTES)
+        .await
+        .map(|_| ())
+        .map_err(|e| match e {
+            BoundedReadError::LimitExceeded {
+                read_so_far,
+                max_bytes,
+            } => format!(
+                "{channel} dispatch response body exceeded drain limit {max_bytes} bytes after reading {read_so_far} bytes from {redacted_url}"
+            ),
+            BoundedReadError::Stream(e) => {
+                format!(
+                    "{channel} dispatch body read failed: {} reading response from {redacted_url}",
+                    reqwest_error_class(&e)
+                )
+            }
+        })
 }
 
 fn reqwest_error_class(error: &reqwest::Error) -> &'static str {

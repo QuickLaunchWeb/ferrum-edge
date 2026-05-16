@@ -486,6 +486,41 @@ async fn webhook_body_read_error_redacts_secret_url() {
     assert!(!err.contains("abc123"), "got: {err}");
 }
 
+#[tokio::test]
+async fn webhook_oversized_response_body_is_rejected_and_redacted() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0; 1024];
+        let _ = socket.read(&mut buf).await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048577\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    let webhook = WebhookChannel::new(
+        "pd",
+        &json!({
+            "type": "webhook",
+            "url": format!("http://{addr}/hooks/TOKEN123?routing_key=abc123"),
+            "body_template": "x",
+        }),
+    )
+    .unwrap();
+    let err = webhook
+        .dispatch(&fixed_notification(), &PluginHttpClient::default())
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+
+    assert!(err.contains("exceeds drain limit"), "got: {err}");
+    assert!(err.contains("redacted"), "got: {err}");
+    assert!(!err.contains("TOKEN123"), "got: {err}");
+    assert!(!err.contains("abc123"), "got: {err}");
+}
+
 // -------------------------------------------------- env-var resolution helper
 
 #[test]
