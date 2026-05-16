@@ -544,7 +544,6 @@ fn ecds_type_url_appears_in_xds_type_urls_inventory() {
         "ECDS_TYPE_URL must be in XDS_TYPE_URLS"
     );
 }
-
 #[test]
 fn translator_round_trips_binary_value_bytes() {
     // Binary payload with NULs and high bytes — exercises the base64 codec.

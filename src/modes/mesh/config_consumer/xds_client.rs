@@ -19,8 +19,8 @@ use crate::modes::mesh::slice::MeshSlice;
 use crate::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::xds::proto::{self, DiscoveryRequest, Node, Status};
 use crate::xds::translator::{
-    CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL, SDS_TYPE_URL,
-    XDS_TYPE_URLS,
+    CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, FERRUM_ECDS_DESTINATION_RULE_TYPE_URL, LDS_TYPE_URL,
+    RDS_TYPE_URL, SDS_TYPE_URL, XDS_TYPE_URLS,
 };
 
 const INITIAL_TYPE_URL_ORDER: [&str; 6] = [
@@ -238,6 +238,13 @@ struct ResourceAccumulator {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AccumulatedResource {
     name: String,
+    /// Raw protobuf bytes of the resource. Captured only for type URLs whose
+    /// reverse-translation needs the full payload (currently ECDS, where the
+    /// inner `TypedExtensionConfig.typed_config.value` carries the
+    /// operator's opaque DR JSON). The other type URLs only need the name
+    /// for service-port reconstruction, so storing bytes there would be
+    /// wasted memory under high resource cardinality.
+    bytes: Vec<u8>,
 }
 
 impl ResourceAccumulator {
@@ -274,7 +281,14 @@ impl ResourceAccumulator {
                     "xDS resource for type_url '{type_url}' has an empty name"
                 ));
             }
-            accumulated.push(AccumulatedResource { name });
+            // Only ECDS reverse-translation reads the full bytes back. Other
+            // resource types only carry routing names, so skip the allocation.
+            let bytes = if type_url == ECDS_TYPE_URL {
+                resource.value.clone()
+            } else {
+                Vec::new()
+            };
+            accumulated.push(AccumulatedResource { name, bytes });
         }
 
         self.resources_by_type
@@ -728,12 +742,12 @@ pub struct XdsConfigConsumer {
 
 impl XdsConfigConsumer {
     pub fn new(config: XdsClientConfig, state: MeshRuntimeState) -> Self {
-        warn!(
-            node_id = %config.node_id,
-            "xDS config protocol cannot recover Istio DestinationRule traffic policy from CDS/EDS; \
-             outlier detection, connection pool, load balancer, and subsets configured via DRs will not be applied. \
-             Use FERRUM_MESH_CONFIG_PROTOCOL=native if DR translation is required."
-        );
+        // GAP-2K replaces the historical one-shot startup warning with a
+        // per-slice debug emitted from `reverse_translate` when a slice has
+        // CDS clusters but no ECDS DR-carrier resources. The constructor
+        // intentionally stays quiet: it has no view into whether the CP
+        // will ship the carrier path, and warning unconditionally would
+        // spam every operator who DOES emit DR-carrier resources.
         Self { config, state }
     }
 
@@ -782,6 +796,68 @@ fn reverse_translate(
                 resource.name, parsed.namespace, parsed.service
             ));
         }
+    }
+
+    // GAP-2K: Recover full `MeshDestinationRule` semantics from ECDS resources
+    // carrying the Ferrum-specific DR carrier type_url. Operators opt in
+    // CP-side by wrapping the original DR JSON in a TypedExtensionConfig with
+    // `inner.type_url == FERRUM_ECDS_DESTINATION_RULE_TYPE_URL`. Resources
+    // with other inner type_urls are silently skipped — they belong to
+    // unrelated extension configs.
+    let mut destination_rules = Vec::new();
+    let mut dr_carrier_seen = false;
+    for resource in accumulator.resources(ECDS_TYPE_URL) {
+        let typed_extension = match proto::TypedExtensionConfig::decode(resource.bytes.as_slice()) {
+            Ok(value) => value,
+            Err(e) => {
+                warn!(
+                    resource_name = %resource.name,
+                    error = %e,
+                    "xDS ECDS resource failed TypedExtensionConfig decode; skipping"
+                );
+                continue;
+            }
+        };
+        let Some(inner) = typed_extension.typed_config else {
+            continue;
+        };
+        if inner.type_url != FERRUM_ECDS_DESTINATION_RULE_TYPE_URL {
+            continue;
+        }
+        dr_carrier_seen = true;
+        match serde_json::from_slice::<crate::modes::mesh::config::MeshDestinationRule>(
+            &inner.value,
+        ) {
+            Ok(dr) => {
+                debug!(
+                    name = %dr.name,
+                    namespace = %dr.namespace,
+                    "Recovered MeshDestinationRule from xDS ECDS carrier"
+                );
+                destination_rules.push(dr);
+            }
+            Err(e) => {
+                warn!(
+                    resource_name = %typed_extension.name,
+                    inner_type_url = %inner.type_url,
+                    error = %e,
+                    "xDS ECDS DR-carrier payload failed JSON decode; DR will be missing from slice"
+                );
+            }
+        }
+    }
+    if !dr_carrier_seen && !accumulator.resources(CDS_TYPE_URL).is_empty() {
+        // Per-DR diagnostic replaces the historical one-shot startup warning.
+        // Operators using standard xDS without the carrier path see this once
+        // per slice apply with the exact list of fields that cannot be
+        // round-tripped from CDS/EDS. The carrier path silences this log.
+        debug!(
+            "xDS slice has no DR-carrier ECDS resources; per-cluster DR fields \
+             (connectTimeout, loadBalancer, outlierDetection, subsets, tls.sni, \
+             tls.subjectAltNames, tls.mode) are not recoverable from CDS/EDS alone. \
+             Set FERRUM_MESH_CONFIG_PROTOCOL=native or have the CP emit Ferrum \
+             DR-carrier ECDS resources to round-trip full DR semantics."
+        );
     }
 
     let services = service_ports
@@ -843,10 +919,15 @@ fn reverse_translate(
         // DestinationRule traffic policy is not exposed via standard xDS — its
         // semantics are baked into Envoy Cluster (LB algorithm, outlier
         // detection, connection pool) before the CP emits CDS, so we cannot
-        // round-trip it back into a `MeshDestinationRule`. Operators relying
-        // on DR translation must use `FERRUM_MESH_CONFIG_PROTOCOL=native`;
-        // see docs/mesh.md ("DestinationRule support matrix").
-        destination_rules: Vec::new(),
+        // round-trip it back into a `MeshDestinationRule` directly.
+        //
+        // GAP-2K: when the CP wraps the original DR JSON in an ECDS
+        // TypedExtensionConfig with `type_url ==
+        // FERRUM_ECDS_DESTINATION_RULE_TYPE_URL`, the loop above recovers it
+        // into `destination_rules`. Operators not running that carrier path
+        // still need `FERRUM_MESH_CONFIG_PROTOCOL=native` for full DR
+        // semantics; see docs/mesh.md ("DestinationRule support matrix").
+        destination_rules,
         // ProxyConfig is config-time and not exposed via standard xDS — the
         // CP would have already applied concurrency/image/env-var changes
         // before emitting CDS, so it cannot be round-tripped here. Operators
@@ -1715,5 +1796,203 @@ mod tests {
             .expect("all types are present");
 
         assert_eq!(service_port_map(&translated), service_port_map(&original));
+    }
+
+    // ── GAP-2K: ECDS DR-carrier path ──
+    //
+    // When the CP wraps the original DestinationRule JSON in an ECDS
+    // TypedExtensionConfig with `type_url ==
+    // FERRUM_ECDS_DESTINATION_RULE_TYPE_URL`, the DP reverse-translates the
+    // payload back into a full `MeshDestinationRule` and adds it to
+    // `slice.destination_rules`. Other ECDS payloads are silently skipped.
+
+    fn dr_carrier_resource(name: &str, dr_json: &str) -> proto::Any {
+        use prost::Message;
+        let typed_extension = proto::TypedExtensionConfig {
+            name: name.to_string(),
+            typed_config: Some(proto::Any {
+                type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+                value: dr_json.as_bytes().to_vec(),
+            }),
+        };
+        let mut value = Vec::new();
+        typed_extension
+            .encode(&mut value)
+            .expect("TypedExtensionConfig encode");
+        proto::Any {
+            type_url: ECDS_TYPE_URL.to_string(),
+            value,
+        }
+    }
+
+    fn primed_accumulator() -> ResourceAccumulator {
+        let mut accumulator = ResourceAccumulator::new();
+        accumulator
+            .apply_sotw_response(
+                CDS_TYPE_URL,
+                &[proto::Any {
+                    type_url: CDS_TYPE_URL.to_string(),
+                    value: prost::Message::encode_to_vec(&proto::Cluster {
+                        name: "cluster/default/api/8080".to_string(),
+                    }),
+                }],
+                "v1",
+            )
+            .expect("CDS apply");
+        accumulator
+            .apply_sotw_response(EDS_TYPE_URL, &[], "v1")
+            .expect("EDS apply");
+        accumulator
+            .apply_sotw_response(LDS_TYPE_URL, &[], "v1")
+            .expect("LDS apply");
+        accumulator
+            .apply_sotw_response(RDS_TYPE_URL, &[], "v1")
+            .expect("RDS apply");
+        accumulator
+            .apply_sotw_response(SDS_TYPE_URL, &[], "v1")
+            .expect("SDS apply");
+        accumulator
+    }
+
+    #[test]
+    fn ecds_dr_carrier_payload_recovers_destination_rule() {
+        use crate::modes::mesh::config::{MeshLoadBalancer, MeshSimpleLb};
+        let dr_json = r#"{
+            "name": "api-dr",
+            "namespace": "default",
+            "host": "api.default.svc.cluster.local",
+            "traffic_policy": {
+                "load_balancer": {"simple": "ROUND_ROBIN"}
+            }
+        }"#;
+        let mut accumulator = primed_accumulator();
+        accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[dr_carrier_resource("api-dr", dr_json)],
+                "v1",
+            )
+            .expect("ECDS apply");
+
+        let slice = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("reverse translate")
+            .expect("all required types present");
+        assert_eq!(slice.destination_rules.len(), 1);
+        let dr = &slice.destination_rules[0];
+        assert_eq!(dr.name, "api-dr");
+        assert_eq!(dr.namespace, "default");
+        assert_eq!(dr.host, "api.default.svc.cluster.local");
+        // Pin nested DR semantics round-trip — the whole point of the carrier
+        // path is that fields baked out of CDS/EDS (LB algorithm, etc.) come
+        // back intact. Without this assertion the test would pass even if the
+        // inner JSON were silently truncated to {name, namespace, host}.
+        let policy = dr
+            .traffic_policy
+            .as_ref()
+            .expect("traffic_policy should round-trip from ECDS DR-carrier");
+        match policy.load_balancer.as_ref() {
+            Some(MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin)) => {}
+            other => panic!("expected Simple(RoundRobin) load balancer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ecds_non_dr_carrier_payload_is_silently_skipped() {
+        let mut accumulator = primed_accumulator();
+        let other_type_url = "type.googleapis.com/some.unrelated.extension";
+        let other_extension = proto::TypedExtensionConfig {
+            name: "other-extension".to_string(),
+            typed_config: Some(proto::Any {
+                type_url: other_type_url.to_string(),
+                value: b"opaque".to_vec(),
+            }),
+        };
+        let mut value = Vec::new();
+        prost::Message::encode(&other_extension, &mut value).expect("encode");
+        let other_any = proto::Any {
+            type_url: ECDS_TYPE_URL.to_string(),
+            value,
+        };
+        accumulator
+            .apply_sotw_response(ECDS_TYPE_URL, &[other_any], "v1")
+            .expect("ECDS apply");
+
+        let slice = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("reverse translate")
+            .expect("all required types present");
+        assert!(slice.destination_rules.is_empty());
+    }
+
+    #[test]
+    fn ecds_dr_carrier_invalid_json_skips_dr_without_failing_slice() {
+        let mut accumulator = primed_accumulator();
+        accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[dr_carrier_resource("api-dr", "{not valid json}")],
+                "v1",
+            )
+            .expect("ECDS apply");
+
+        let slice = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("reverse translate should not fail on bad inner JSON")
+            .expect("all required types present");
+        assert!(slice.destination_rules.is_empty());
+    }
+
+    #[test]
+    fn ecds_mixed_resources_only_valid_carrier_makes_it_through() {
+        // Mixed slice: one valid DR-carrier + one unrelated inner type_url
+        // + one DR-carrier with invalid JSON. The valid DR must land in the
+        // slice; the others are silently skipped / warned. This pins the
+        // "bad payloads do not fail the whole slice" guarantee at the
+        // boundary where multiple ECDS resources coexist on the same
+        // response.
+        let valid_dr_json = r#"{
+            "name": "valid-dr",
+            "namespace": "default",
+            "host": "valid.default.svc.cluster.local"
+        }"#;
+
+        let other_extension = proto::TypedExtensionConfig {
+            name: "unrelated-ext".to_string(),
+            typed_config: Some(proto::Any {
+                type_url: "type.googleapis.com/some.unrelated.extension".to_string(),
+                value: b"opaque".to_vec(),
+            }),
+        };
+        let mut other_value = Vec::new();
+        prost::Message::encode(&other_extension, &mut other_value).expect("encode");
+        let other_any = proto::Any {
+            type_url: ECDS_TYPE_URL.to_string(),
+            value: other_value,
+        };
+
+        let mut accumulator = primed_accumulator();
+        accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[
+                    dr_carrier_resource("valid-dr", valid_dr_json),
+                    other_any,
+                    dr_carrier_resource("bad-json-dr", "{not valid json}"),
+                ],
+                "v1",
+            )
+            .expect("ECDS apply");
+
+        let slice = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("reverse translate should not fail on mixed payloads")
+            .expect("all required types present");
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "valid-dr");
+        assert_eq!(
+            slice.destination_rules[0].host,
+            "valid.default.svc.cluster.local"
+        );
     }
 }

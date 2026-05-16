@@ -84,13 +84,15 @@ The Ferrum-native protocol uses the `MeshConfigSync.MeshSubscribe` gRPC streamin
 
 ### xDS ADS
 
-Standard Envoy xDS Aggregated Discovery Service client. Consumes CDS, EDS, LDS, RDS, and SDS resource types via state-of-the-world mode with incremental version tracking.
+Standard Envoy xDS Aggregated Discovery Service client. Consumes CDS, EDS, LDS, RDS, SDS, and ECDS resource types via state-of-the-world mode with incremental version tracking. ECDS is subscribed last as a richer-semantics overlay (see the DR-carrier bullet below); the slice still applies if no ECDS resources are returned.
 
 - **25ms debounce** on slice application to batch rapid resource updates.
 - **Multi-CP failover**: same URL list and backoff as native mode.
 - **Node identity**: `FERRUM_MESH_XDS_NODE_CLUSTER` sets the `node.cluster` field in DiscoveryRequest (defaults to `FERRUM_NAMESPACE`).
 - **Connect timeout**: `FERRUM_MESH_XDS_CONNECT_TIMEOUT_SECONDS` (default 10).
-- **DestinationRule limitation**: standard xDS bakes DestinationRule traffic policy (LB algorithm, outlier detection, connection pool, subsets) into the Envoy `Cluster` resource at the CP, so the original DR is not recoverable from CDS/EDS. Operators relying on Ferrum's DR translation must use `FERRUM_MESH_CONFIG_PROTOCOL=native`. The xDS consumer logs a warning at startup.
+- **DestinationRule support across xDS**: standard CDS/EDS bakes DR traffic policy (LB algorithm, outlier detection, connection pool, subsets) into the Envoy `Cluster` resource at the CP, so the original DR is not recoverable from CDS/EDS alone. Two carrier options for richer semantics:
+  - **Native protocol** (`FERRUM_MESH_CONFIG_PROTOCOL=native`): the CP pushes full `MeshDestinationRule` objects via `MeshConfigSync.MeshSubscribe`. Full semantics, recommended for greenfield Ferrum deployments.
+  - **xDS ECDS DR-carrier** (opt-in CP-side): the CP wraps the original DR JSON in a `TypedExtensionConfig` with inner `type_url == type.googleapis.com/ferrum.config.extension.v3.DestinationRuleCarrier` and ships it over ECDS. The DP recognizes the marker, deserializes the inner JSON as a `MeshDestinationRule`, and applies it locally. ECDS resources with other inner type URLs are silently skipped, so the channel coexists with unrelated ECDS consumers. When no carrier resources arrive in a slice with CDS clusters, the DP logs one debug line per slice apply listing the fields that cannot be round-tripped from CDS/EDS alone; the carrier path silences this log.
 
 ### Bootstrap Behavior
 
