@@ -25,12 +25,10 @@
 
 # ── sccache (optional) ──────────────────────────────────────────────────
 # sccache caches compiled crates across branches and clean builds.
-# Install: cargo install sccache
-# Then uncomment the next two lines, or set RUSTC_WRAPPER=sccache in your
-# shell profile (~/.zshrc / ~/.bashrc).
-#
-# [build]
-# rustc-wrapper = "sccache"
+# Install locally with: cargo install sccache
+# CI workflows that compile Rust install/start sccache explicitly.
+[build]
+rustc-wrapper = "sccache"
 
 # ── Network settings ────────────────────────────────────────────────────
 [net]
