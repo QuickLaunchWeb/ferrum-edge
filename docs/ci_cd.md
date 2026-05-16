@@ -40,12 +40,8 @@ Push to main
 
 ```
 Push tag v* (e.g., v0.2.0)
-    └─► Five target release builds
-            ├─ linux-x86_64
-            ├─ linux-aarch64 (ARM)
-            ├─ macos-x86_64
-            ├─ macos-aarch64 (Apple Silicon)
-            ├─ windows-x86_64
+    └─► Five target release builds (matrix: linux-x86_64 / linux-aarch64 /
+        macos-x86_64 / macos-aarch64 / windows-x86_64)
             └─► Push versioned Docker images to Docker Hub and GHCR
                     └─► Create Docker manifest tags
                             └─► Create GitHub Release with binaries and checksums
@@ -87,8 +83,7 @@ cargo build --bin ferrum-edge
 cargo nextest run --test functional_tests \
   --run-ignored=all \
   --no-fail-fast \
-  -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)' \
-  ...
+  -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)'
 ```
 
 **What it tests**:
@@ -446,6 +441,12 @@ chmod +x ferrum-edge-macos-x86_64
 gh release download v0.2.0 -p "ferrum-edge-macos-aarch64"
 chmod +x ferrum-edge-macos-aarch64
 ./ferrum-edge-macos-aarch64 run
+```
+
+**Windows x86_64** (Intel/AMD 64-bit)
+```powershell
+gh release download v0.2.0 -p "ferrum-edge-windows-x86_64.exe"
+./ferrum-edge-windows-x86_64.exe run
 ```
 
 ### Checksum Verification
