@@ -40,6 +40,8 @@ Node-scoped sidecarless waypoint for pods captured by the node agent. This topol
 
 At accept time the proxy reads the Linux `SO_COOKIE` value and looks up the corresponding `FERRUM_ORIG_DST4` / `FERRUM_ORIG_DST6` capture record. The record carries the original destination, pod UID, and a stable hash of the workload SPIFFE ID. The node-agent bridge must register records keyed by the accepted server-side socket cookie; source-pod connect cookies are different kernel sockets and are not used directly by the proxy. Unknown cookies, zero pod UIDs, missing workload hashes, missing pod identities, and SPIFFE-hash mismatches fail closed before TLS/HBONE processing. `/overload.node_waypoint_drops` reports per-reason counters for these fail-closed drops. This is a node-scoped Ferrum topology; Istio's service-scoped Ambient Waypoint API remains deferred.
 
+Operators inspect the currently enrolled pod identities via the JWT-authenticated admin endpoint `GET /node-waypoint/identities` — see [docs/admin_api.md](admin_api.md#node-waypoint-identities-mesh-nodewaypoint-topology) for the response shape. The endpoint returns 404 outside `NodeWaypoint` topology so unrelated DPs don't surface an empty stub list.
+
 ### East-West Gateway
 
 Multi-cluster SNI-routed passthrough gateway. Does not create listeners directly; instead materializes passthrough TCP proxies from `MultiClusterConfig.east_west_gateways` entries.
