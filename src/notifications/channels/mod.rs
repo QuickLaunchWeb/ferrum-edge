@@ -26,7 +26,11 @@ pub mod webhook;
 /// only a DoS guard so a misbehaving sink cannot make us stream an unbounded
 /// body just to keep the keep-alive connection reusable. The drain path counts
 /// and discards chunks instead of buffering them, so memory tracks the current
-/// response chunk and transport buffers rather than this full cap.
+/// response chunk and transport buffers rather than this full cap. Intentionally
+/// hardcoded rather than exposed as an env knob: it bounds adversarial behavior,
+/// not legitimate payload sizes (webhook ACKs are <1 KiB across Slack, Teams,
+/// Discord, and PagerDuty), so making it tunable would invite bikeshedding on a
+/// value that has no operator-meaningful target.
 const RESPONSE_BODY_DRAIN_LIMIT_BYTES_U64: u64 = 1024 * 1024;
 const RESPONSE_BODY_DRAIN_LIMIT_BYTES: usize = RESPONSE_BODY_DRAIN_LIMIT_BYTES_U64 as usize;
 
@@ -251,6 +255,11 @@ async fn drain_response_body_redacted(
     channel: &str,
     redacted_url: &str,
 ) -> Result<(), String> {
+    // Best-effort early reject when the peer advertises an oversized
+    // Content-Length: saves one chunk read and the connection-close cost
+    // on HTTP/1.x. `content_length()` returns `None` for chunked / HTTP/2/3
+    // responses without an explicit header, so the streaming check below
+    // is the load-bearing backstop — not a duplicate.
     if let Some(content_length) = resp.content_length()
         && content_length > RESPONSE_BODY_DRAIN_LIMIT_BYTES_U64
     {
@@ -261,8 +270,10 @@ async fn drain_response_body_redacted(
         ));
     }
 
-    // We only need to drain for connection reuse; measuring streams and
-    // discards chunks instead of buffering bytes we will never inspect.
+    // Reached only from `finalize_dispatch_response` after a 2xx status check,
+    // so this is the size-bounded drain on a successful response: it measures
+    // chunk lengths and discards the bytes, never buffering anything we will
+    // not inspect.
     measure_response_body_bounded(resp, RESPONSE_BODY_DRAIN_LIMIT_BYTES)
         .await
         .map(|_| ())
